@@ -83,6 +83,56 @@ namespace
     }
     thread_local float s_vuQPending = 0.0f;
     thread_local int   s_vuQDelay   = 0;
+    // G138: VU1 MAC/STATUS flag pipeline (default ON, kill DC2_VU1_NO_MACPIPE). Real VU1 FMAC
+    // results — and therefore the MAC flags FMEQ/FMAND/FMOR and the STATUS bits FSAND/FSEQ/FSOR
+    // read — become visible ~4 instruction pairs AFTER the FMAC issues, not immediately. The
+    // title transform packer's draw/cull gate depends on this: its FMEQ chain at 0x20c0/0x20c8/
+    // 0x2108 must read the MAC flags of the guard-plane SUBs at 0x20a0/0x20a8 and the OPMSUB
+    // winding test at 0x20c8 (4 pairs earlier), but the immediate model handed it the flags of
+    // the interleaved fog MINIy/ADDx ops instead -> the chain could never equal VI3 (0xD0|qw30)
+    // -> IBEQ @0x2128 never taken -> +2048 on every vertex -> ADC=1 -> the whole cavern culled
+    // (the G70..G137 blue-void/ALLNODRAW line). HW's .gs shows the SAME batches through the SAME
+    // microcode drawing their strip bodies selectively (G138 join: HW PRIMED/MIXED == runner
+    // ALLNODRAW strips, geometry-identical), which is only possible with pipelined flags.
+    // Model: a DEPTH-deep shift register of (mac,status) snapshots advanced once per executed
+    // instruction pair; flag-consuming lower ops read the snapshot from DEPTH pairs ago. The
+    // architectural m_state.mac/status stay immediate (they are the newest pipeline entry).
+    // Same class of fix as the G87 Q-register latency. Depth tunable DC2_VU1_MACPIPE_DEPTH.
+    bool g138_macpipe_enabled()
+    {
+        static const bool v = (std::getenv("DC2_VU1_NO_MACPIPE") == nullptr);
+        return v;
+    }
+    int g138_macpipe_depth()
+    {
+        static const int d = []() -> int {
+            const char *e = std::getenv("DC2_VU1_MACPIPE_DEPTH");
+            if (!e)
+                return 4;
+            const long v = std::strtol(e, nullptr, 0);
+            return (v >= 1 && v <= 7) ? static_cast<int>(v) : 4;
+        }();
+        return d;
+    }
+    thread_local uint32_t s_vuMacPipe[8] = {};
+    thread_local uint32_t s_vuStatusPipe[8] = {};
+    thread_local uint32_t s_vuMacVisible = 0u;
+    thread_local uint32_t s_vuStatusVisible = 0u;
+    // G139: same-pair upper->lower VF hazard (default ON, kill DC2_VU1_NO_PAIRHAZ). Real VU1
+    // FMAC results land ~4 cycles after issue, so a lower op in the SAME pair as an upper op
+    // always reads the register state from BEFORE that upper op. The immediate model committed
+    // the upper result first, so `SUB VF24.xyz,VF17,VF16 | SQ VF24 -> 5(VI6)` (title tri packer
+    // 0x1fa8) stored the raw edge-vector float bits as the middle vertex XYZ instead of the
+    // FTOI4 position from 4 pairs earlier (0x1f88) -> every tri's 2nd vertex exploded (the
+    // "beam shard" screen-spanning triangles; .w survived via the .xyz dest mask, which is why
+    // the ADC/fog stats still matched HW). Model: snapshot the upper's VF dest before
+    // execUpper, expose the OLD value to execLower, then re-apply the upper's masked lanes
+    // (the upper result lands later than the lower's same-cycle access, so the upper wins).
+    bool g139_pairhaz_enabled()
+    {
+        static const bool v = (std::getenv("DC2_VU1_NO_PAIRHAZ") == nullptr);
+        return v;
+    }
     // G39: when >0, trace loads (LQ/LQI/LQD/ILW/ILWR/MTIR/XTOP/XITOP) in the model kick so we
     // can see the vertex/matrix/translation source addresses and which read returns 0 on the
     // failing (2nd+) kicks. Armed per model kick; carries the kick index for labelling.
@@ -1168,7 +1218,9 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
             // G39: dump the FULL resident program (setup 0x0 + model trampoline 0x10 jumps to
             // 0x320; transform divides at 0xc28/0xc68; GIF packing ~0x1b00) so it can be
             // disassembled offline to find the multi-kick vertex/matrix addressing bug.
-            for (uint32_t a = 0x0u; a <= 0x1c90u && a + 8u <= codeSize; a += 8u)
+            // G140: dump the WHOLE microcode (was 0x1c90 cap) — the trifan/clip emitters
+            // live past 0x2180 and were never disassembled.
+            for (uint32_t a = 0x0u; a + 8u <= codeSize; a += 8u)
             {
                 uint32_t lo = 0u, up = 0u;
                 std::memcpy(&lo, vuCode + a, 4);
@@ -1339,7 +1391,16 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     // for the duration of one VU program) so costume/dungeon are untouched; the off-screen
     // strip-restart that HW's ADC performs is approximated by the G89 rasterizer guard band.
     // Legacy diagnostic DC2_G72_FORCEDRAW still forces regardless of scope.
-    static const bool s_g100native = (std::getenv("DC2_G100_NO_FORCEDRAW") == nullptr);
+    // G138: RETIRED BY DEFAULT. The gate is no longer "structurally never taken" — that was a
+    // double defect in the RUNNER, fixed at the root: (1) the lower-opcode table had FMEQ/FMAND
+    // swapped (0x18/0x1A) so the FMAND guard-mask cascade ran as FMEQ 0/1 compares, and (2) MAC
+    // flags were read un-pipelined so each FMAND saw the wrong FMAC's flags. With both fixed the
+    // natural per-vertex ADC is bit-exact vs the HW reference (G138 join), and forcing the gate
+    // OVER-draws (it overrides the faithful cull and double-draws the 0x1f68 3-vert loop).
+    // Re-enable the old band-aid with DC2_G100_FORCE_DRAW=1 (plus DC2_VU1_NO_FMSWAPFIX=1 +
+    // DC2_VU1_NO_MACPIPE=1 to reproduce the full pre-G138 render).
+    static const bool s_g100native = (std::getenv("DC2_G100_FORCE_DRAW") != nullptr &&
+                                      std::getenv("DC2_G100_NO_FORCEDRAW") == nullptr);
     static const bool s_g72force   = (std::getenv("DC2_G72_FORCEDRAW") != nullptr);
     // G101 A/B: disable the forced draw while KEEPING the rest of the G100 path (copy-off) so the
     // gate's NATURAL per-vertex cull (now that G71 computes the MAC flags VI7 feeds, and G99 fixed
@@ -2016,6 +2077,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (s_vuQDelay > 0 && --s_vuQDelay == 0)
             m_state.q = s_vuQPending;
 
+        // G138: advance the MAC/STATUS flag pipeline one instruction pair. Flag-consuming
+        // lower ops executed THIS pair (FMEQ/FMAND/FMOR/FSAND/FSEQ/FSOR) read the snapshot
+        // from DEPTH pairs ago via s_vuMacVisible/s_vuStatusVisible.
+        if (g138_macpipe_enabled())
+        {
+            const int g138d = g138_macpipe_depth();
+            s_vuMacVisible = s_vuMacPipe[g138d - 1];
+            s_vuStatusVisible = s_vuStatusPipe[g138d - 1];
+            for (int g138i = g138d - 1; g138i > 0; --g138i)
+            {
+                s_vuMacPipe[g138i] = s_vuMacPipe[g138i - 1];
+                s_vuStatusPipe[g138i] = s_vuStatusPipe[g138i - 1];
+            }
+        }
+
         if (iBit)
         {
             std::memcpy(&m_state.i, &lower, 4);
@@ -2025,7 +2101,33 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         {
             const uint32_t g106MacBeforeUpper = m_state.mac;
             const uint32_t g106StatusBeforeUpper = m_state.status;
+            // G139: locate the upper op's VF destination (fd for main-space ops; ft for
+            // ITOF/FTOI/ABS in the special group; none for ACC/CLIP writers) so the lower
+            // op of this pair can read the pre-upper value (see g139_pairhaz_enabled).
+            float *g139dst = nullptr;
+            float g139old[4], g139new[4];
+            if (g139_pairhaz_enabled())
+            {
+                const uint8_t g139op = (uint8_t)(upper & 0x3Fu);
+                if (g139op < 0x3Cu)
+                {
+                    g139dst = m_state.vf[(upper >> 6) & 0x1Fu];
+                }
+                else
+                {
+                    const uint8_t g139s2 = S2_FUNC(upper);
+                    if ((g139s2 >= 0x10u && g139s2 <= 0x17u) || g139s2 == 0x1Du)
+                        g139dst = m_state.vf[(upper >> 16) & 0x1Fu];
+                }
+                if (g139dst)
+                    std::memcpy(g139old, g139dst, 16);
+            }
             execUpper(upper);
+            if (g139dst)
+            {
+                std::memcpy(g139new, g139dst, 16);
+                std::memcpy(g139dst, g139old, 16);
+            }
             if (s_g106ParallelFlags)
             {
                 s_g106LowerMacRead = g106MacBeforeUpper;
@@ -2034,6 +2136,22 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             }
             execLower(lower, vuData, dataSize, gs, memory, upper);
             s_g106UseLowerFlagRead = false;
+            if (g139dst)
+            {
+                // The upper result lands after the lower's same-cycle access: overlay the
+                // upper's dest-masked lanes over whatever the lower left in the register.
+                const uint8_t g139m = (uint8_t)((upper >> 21) & 0xFu);
+                if (g139m & 0x8u) g139dst[0] = g139new[0];
+                if (g139m & 0x4u) g139dst[1] = g139new[1];
+                if (g139m & 0x2u) g139dst[2] = g139new[2];
+                if (g139m & 0x1u) g139dst[3] = g139new[3];
+            }
+        }
+        // G138: the newest pipeline entry is this pair's post-upper architectural flags.
+        if (g138_macpipe_enabled())
+        {
+            s_vuMacPipe[0] = m_state.mac;
+            s_vuStatusPipe[0] = m_state.status;
         }
         const uint32_t postExecPc = m_state.pc;
 
@@ -2190,6 +2308,162 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                                  h1[0], h1[1], h1[2], h1[3],
                                  oh1.valid, oh1.cmdOff, oh1.srcOff);
                 }
+            }
+        }
+
+        // G140: CLIP-route census (env DC2_G140_CLIP). The REAL trifan source is the
+        // selector-bit1 (fc4) CLIP dispatcher at 0x600: bit1 batches go to the CLIP
+        // packers 0x21b0 (tri) / 0x23e8 (tstrip) -> polygon clipper 0x2740 -> clipped
+        // polys emitted as TRIFANS from the template at VU 780 (XGKICK 0x2d88/0x2f38).
+        // HW's 1012 wall trifan verts come from here; the runner emits none. Count the
+        // route entries + the FCAND/FCOR gates + the emitted fan nloop to find which
+        // stage dies. Quiet unless enabled; startPc==0x10 only.
+        {
+            static const bool s_g140clip = (std::getenv("DC2_G140_CLIP") != nullptr);
+            if (s_g140clip && startPc == 0x10u)
+            {
+                // one-shot pc trace: record 800 executed pcs starting at a clipper entry
+                static std::atomic<int> s_trcState{0}; // 0=armed-wait 1=recording 2=done
+                static uint16_t s_trc[800];
+                static uint16_t s_trcVi11[800];
+                static int s_trcN = 0;
+                static std::atomic<uint32_t> s_trcSkip{0};
+                int st = s_trcState.load(std::memory_order_relaxed);
+                if (st == 0 && currentPc == 0x2740u &&
+                    s_trcSkip.fetch_add(1u, std::memory_order_relaxed) == 0u)
+                    s_trcState.store(1, std::memory_order_relaxed), st = 1;
+                if (st == 1)
+                {
+                    s_trc[s_trcN] = (uint16_t)currentPc;
+                    s_trcVi11[s_trcN] = (uint16_t)m_state.vi[11];
+                    ++s_trcN;
+                    if (s_trcN >= 800)
+                    {
+                        s_trcState.store(2, std::memory_order_relaxed);
+                        for (int i = 0; i < 800; i += 8)
+                            std::fprintf(stderr, "[G140:trc] %04x/%d %04x/%d %04x/%d %04x/%d %04x/%d %04x/%d %04x/%d %04x/%d\n",
+                                         s_trc[i], (int16_t)s_trcVi11[i], s_trc[i+1], (int16_t)s_trcVi11[i+1],
+                                         s_trc[i+2], (int16_t)s_trcVi11[i+2], s_trc[i+3], (int16_t)s_trcVi11[i+3],
+                                         s_trc[i+4], (int16_t)s_trcVi11[i+4], s_trc[i+5], (int16_t)s_trcVi11[i+5],
+                                         s_trc[i+6], (int16_t)s_trcVi11[i+6], s_trc[i+7], (int16_t)s_trcVi11[i+7]);
+                    }
+                }
+                static std::atomic<uint64_t> s_e21b0{0}, s_e23e8{0}, s_e2740{0}, s_k2d88{0}, s_k2f38{0};
+                static std::atomic<uint64_t> s_fcandHit{0}, s_fcandMiss{0}, s_fcorRej{0}, s_fanVerts{0};
+                static std::atomic<uint32_t> s_rep{0}, s_samp{0};
+                switch (currentPc)
+                {
+                case 0x21b0u: s_e21b0.fetch_add(1u, std::memory_order_relaxed); break;
+                case 0x23e8u: s_e23e8.fetch_add(1u, std::memory_order_relaxed); break;
+                case 0x2740u:
+                {
+                    s_e2740.fetch_add(1u, std::memory_order_relaxed);
+                    static std::atomic<uint32_t> s_entSamp{0};
+                    if (s_entSamp.fetch_add(1u, std::memory_order_relaxed) < 10u)
+                        std::fprintf(stderr,
+                            "[G140:ent] v18=(%.4g,%.4g,%.4g,%.4g) v19=(%.4g,%.4g,%.4g,%.4g) v20=(%.4g,%.4g,%.4g,%.4g)\n",
+                            m_state.vf[18][0], m_state.vf[18][1], m_state.vf[18][2], m_state.vf[18][3],
+                            m_state.vf[19][0], m_state.vf[19][1], m_state.vf[19][2], m_state.vf[19][3],
+                            m_state.vf[20][0], m_state.vf[20][1], m_state.vf[20][2], m_state.vf[20][3]);
+                    break;
+                }
+                // per-plane pass-end bail census: IBEQ VI0,VI11 -> 0x2f48 pcs
+                case 0x2988u: case 0x2a38u: case 0x2ae8u:
+                case 0x2b98u: case 0x2c48u: case 0x2cf8u:
+                {
+                    static std::atomic<uint64_t> s_passZero[6]{}, s_passLive[6]{};
+                    const uint32_t pi = currentPc == 0x2988u ? 0u : currentPc == 0x2a38u ? 1u :
+                                        currentPc == 0x2ae8u ? 2u : currentPc == 0x2b98u ? 3u :
+                                        currentPc == 0x2c48u ? 4u : 5u;
+                    const int16_t vi11 = (int16_t)m_state.vi[11];
+                    (vi11 == 0 ? s_passZero[pi] : s_passLive[pi]).fetch_add(1u, std::memory_order_relaxed);
+                    static std::atomic<uint32_t> s_passRep{0};
+                    if ((s_passRep.fetch_add(1u, std::memory_order_relaxed) % 4000u) == 0u)
+                        std::fprintf(stderr,
+                            "[G140:pass] z/l p0=%llu/%llu p1=%llu/%llu p2=%llu/%llu p3=%llu/%llu p4=%llu/%llu p5=%llu/%llu\n",
+                            (unsigned long long)s_passZero[0].load(), (unsigned long long)s_passLive[0].load(),
+                            (unsigned long long)s_passZero[1].load(), (unsigned long long)s_passLive[1].load(),
+                            (unsigned long long)s_passZero[2].load(), (unsigned long long)s_passLive[2].load(),
+                            (unsigned long long)s_passZero[3].load(), (unsigned long long)s_passLive[3].load(),
+                            (unsigned long long)s_passZero[4].load(), (unsigned long long)s_passLive[4].load(),
+                            (unsigned long long)s_passZero[5].load(), (unsigned long long)s_passLive[5].load());
+                    break;
+                }
+                case 0x2d08u: // emit path entered (survived all 6 planes)
+                {
+                    static std::atomic<uint64_t> s_emit{0};
+                    const uint64_t e = s_emit.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    if (e <= 24u || (e % 2000u) == 0u)
+                        std::fprintf(stderr, "[G140:emit] n=%llu vi11=%d\n",
+                                     (unsigned long long)e, (int)(int16_t)m_state.vi[11]);
+                    break;
+                }
+                case 0x30d0u: // FCGET VI1 just executed
+                {
+                    static std::atomic<uint32_t> s_fcSamp{0};
+                    if (s_fcSamp.fetch_add(1u, std::memory_order_relaxed) < 40u)
+                        std::fprintf(stderr, "[G140:fcget] vi1=0x%03x vi5=0x%x vi6=0x%x clip=0x%06x\n",
+                                     (uint32_t)(uint16_t)m_state.vi[1], (uint32_t)(uint16_t)m_state.vi[5],
+                                     (uint32_t)(uint16_t)m_state.vi[6], m_state.clip & 0xFFFFFFu);
+                    break;
+                }
+                case 0x30e8u: case 0x3108u: // A/B inside-test IBEQ just executed
+                {
+                    static std::atomic<uint32_t> s_ibSamp{0};
+                    if (s_ibSamp.fetch_add(1u, std::memory_order_relaxed) < 24u)
+                        std::fprintf(stderr, "[G140:ib] pc=0x%x vi1=0x%x vi4=0x%x vi5=0x%x vi6=0x%x post=0x%x\n",
+                                     currentPc, (uint32_t)(uint16_t)m_state.vi[1], (uint32_t)(uint16_t)m_state.vi[4],
+                                     (uint32_t)(uint16_t)m_state.vi[5], (uint32_t)(uint16_t)m_state.vi[6], postExecPc);
+                    break;
+                }
+                case 0x30b0u: // both CLIPw executed; VF17=A pos, VF21=B pos
+                {
+                    static std::atomic<uint32_t> s_cwSamp{0};
+                    if (s_cwSamp.fetch_add(1u, std::memory_order_relaxed) < 18u)
+                        std::fprintf(stderr,
+                            "[G140:cw] vi8=0x%x A=(%.4g,%.4g,%.4g,%.4g) B=(%.4g,%.4g,%.4g,%.4g) clip12=0x%03x\n",
+                            (uint32_t)(uint16_t)m_state.vi[8],
+                            m_state.vf[17][0], m_state.vf[17][1], m_state.vf[17][2], m_state.vf[17][3],
+                            m_state.vf[21][0], m_state.vf[21][1], m_state.vf[21][2], m_state.vf[21][3],
+                            m_state.clip & 0xFFFu);
+                    break;
+                }
+                case 0x22d8u: case 0x2548u:
+                    // FCAND VI1,0x3ffff just executed this pair (lower). VI1!=0 => tri touches a plane.
+                    if (m_state.vi[1] != 0) s_fcandHit.fetch_add(1u, std::memory_order_relaxed);
+                    else s_fcandMiss.fetch_add(1u, std::memory_order_relaxed);
+                    break;
+                case 0x22e0u: case 0x2550u:
+                    break;
+                case 0x2d88u:
+                case 0x2f38u:
+                {
+                    (currentPc == 0x2d88u ? s_k2d88 : s_k2f38).fetch_add(1u, std::memory_order_relaxed);
+                    // VI7 = kick addr (780). Read the fan giftag nloop being kicked.
+                    const uint32_t kickQw = static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[7])) & 0x3FFu;
+                    if (vuData && kickQw * 16u + 16u <= dataSize)
+                    {
+                        uint32_t w0 = 0u, w1 = 0u;
+                        std::memcpy(&w0, vuData + kickQw * 16u, 4);
+                        std::memcpy(&w1, vuData + kickQw * 16u + 4u, 4);
+                        const uint32_t nloop = w0 & 0x7FFFu;
+                        s_fanVerts.fetch_add(nloop, std::memory_order_relaxed);
+                        if (s_samp.fetch_add(1u, std::memory_order_relaxed) < 24u)
+                            std::fprintf(stderr, "[G140:fan] pc=0x%x kickQw=0x%x w0=%08x w1=%08x nloop=%u\n",
+                                         currentPc, kickQw, w0, w1, nloop);
+                    }
+                    break;
+                }
+                default: break;
+                }
+                if ((s_rep.fetch_add(1u, std::memory_order_relaxed) % 400000u) == 0u)
+                    std::fprintf(stderr,
+                        "[G140:clip] e21b0=%llu e23e8=%llu clip2740=%llu kick2d88=%llu kick2f38=%llu "
+                        "fcandHit=%llu fcandMiss=%llu fanVerts=%llu\n",
+                        (unsigned long long)s_e21b0.load(), (unsigned long long)s_e23e8.load(),
+                        (unsigned long long)s_e2740.load(), (unsigned long long)s_k2d88.load(),
+                        (unsigned long long)s_k2f38.load(), (unsigned long long)s_fcandHit.load(),
+                        (unsigned long long)s_fcandMiss.load(), (unsigned long long)s_fanVerts.load());
             }
         }
 
@@ -3214,7 +3488,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     case 0x14: // FSEQ
     {
         uint16_t imm12 = instr & 0xFFF;
-        const uint32_t statusRead = s_g106UseLowerFlagRead ? s_g106LowerStatusRead : m_state.status;
+        const uint32_t statusRead = g138_macpipe_enabled() ? s_vuStatusVisible
+                                    : (s_g106UseLowerFlagRead ? s_g106LowerStatusRead : m_state.status);
         if (1 != 0)
             m_state.vi[1] = ((statusRead & 0xFFF) == imm12) ? 1 : 0;
         return;
@@ -3227,7 +3502,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     case 0x16: // FSAND
     {
         uint16_t imm12 = instr & 0xFFF;
-        const uint32_t statusRead = s_g106UseLowerFlagRead ? s_g106LowerStatusRead : m_state.status;
+        const uint32_t statusRead = g138_macpipe_enabled() ? s_vuStatusVisible
+                                    : (s_g106UseLowerFlagRead ? s_g106LowerStatusRead : m_state.status);
         if (1 != 0)
             m_state.vi[1] = (int32_t)(statusRead & imm12);
         return;
@@ -3235,36 +3511,82 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
     case 0x17: // FSOR
     {
         uint16_t imm12 = instr & 0xFFF;
-        const uint32_t statusRead = s_g106UseLowerFlagRead ? s_g106LowerStatusRead : m_state.status;
+        const uint32_t statusRead = g138_macpipe_enabled() ? s_vuStatusVisible
+                                    : (s_g106UseLowerFlagRead ? s_g106LowerStatusRead : m_state.status);
         if (1 != 0)
             m_state.vi[1] = ((statusRead | imm12) == 0xFFF) ? 1 : 0;
         return;
     }
-    case 0x18: // FMAND
+    // G138: the MAC-flag lower opcodes were mis-mapped vs the real VU lower-opcode table
+    // (PCSX2 VUops.cpp _LOWER_OPCODE[128]): 0x18=FMEQ, 0x1A=FMAND, 0x1B=FMOR, 0x1C=FCGET.
+    // The old runner had 0x18=FMAND / 0x1A=FMEQ (SWAPPED) and FMOR parked on 0x1C. Every
+    // "FMEQ" in the G70..G137 title-gate disassemblies was therefore really FMAND: the
+    // transform packers' draw gate is an FMAND mask cascade (VI = mac & 0xD0 accumulated
+    // over the guard-plane SUBs, winding bit 0x20 IORed in, IBEQ against 0xD0|qw30 = draw
+    // iff inside-guard AND front-facing) — impossible under FMEQ's 0/1 results, which is
+    // why the gate never fired and the whole cavern emitted ADC=1 (blue void / G100 band-
+    // aid). Fix is global (all VU1 programs decoded through the swapped slots). Kill-switch
+    // DC2_VU1_NO_FMSWAPFIX restores the old mapping for A/B.
+    case 0x18: // real VU: FMEQ (old runner: FMAND)
     {
         uint8_t it = LIT(instr);
         uint8_t is = LIS(instr);
-        const uint32_t macRead = s_g106UseLowerFlagRead ? s_g106LowerMacRead : m_state.mac;
+        static const bool s_fmFixed = (std::getenv("DC2_VU1_NO_FMSWAPFIX") == nullptr);
+        const uint32_t macRead = g138_macpipe_enabled() ? s_vuMacVisible
+                                 : (s_g106UseLowerFlagRead ? s_g106LowerMacRead : m_state.mac);
         if (it != 0)
-            m_state.vi[it] = (int32_t)(macRead & (uint32_t)(uint16_t)m_state.vi[is]);
+        {
+            if (s_fmFixed)
+                m_state.vi[it] = ((macRead & 0xFFFF) == (uint32_t)(uint16_t)m_state.vi[is]) ? 1 : 0;
+            else
+                m_state.vi[it] = (int32_t)(macRead & (uint32_t)(uint16_t)m_state.vi[is]);
+        }
         return;
     }
-    case 0x1A: // FMEQ
+    case 0x1A: // real VU: FMAND (old runner: FMEQ)
     {
         uint8_t it = LIT(instr);
         uint8_t is = LIS(instr);
-        const uint32_t macRead = s_g106UseLowerFlagRead ? s_g106LowerMacRead : m_state.mac;
+        static const bool s_fmFixed = (std::getenv("DC2_VU1_NO_FMSWAPFIX") == nullptr);
+        const uint32_t macRead = g138_macpipe_enabled() ? s_vuMacVisible
+                                 : (s_g106UseLowerFlagRead ? s_g106LowerMacRead : m_state.mac);
         if (it != 0)
-            m_state.vi[it] = ((macRead & 0xFFFF) == (uint32_t)(uint16_t)m_state.vi[is]) ? 1 : 0;
+        {
+            if (s_fmFixed)
+                m_state.vi[it] = (int32_t)(macRead & (uint32_t)(uint16_t)m_state.vi[is]);
+            else
+                m_state.vi[it] = ((macRead & 0xFFFF) == (uint32_t)(uint16_t)m_state.vi[is]) ? 1 : 0;
+        }
         return;
     }
-    case 0x1C: // FMOR
+    case 0x1B: // real VU: FMOR (old runner: unmapped)
     {
         uint8_t it = LIT(instr);
         uint8_t is = LIS(instr);
-        const uint32_t macRead = s_g106UseLowerFlagRead ? s_g106LowerMacRead : m_state.mac;
-        if (it != 0)
+        static const bool s_fmFixed = (std::getenv("DC2_VU1_NO_FMSWAPFIX") == nullptr);
+        const uint32_t macRead = g138_macpipe_enabled() ? s_vuMacVisible
+                                 : (s_g106UseLowerFlagRead ? s_g106LowerMacRead : m_state.mac);
+        if (s_fmFixed && it != 0)
             m_state.vi[it] = (int32_t)(macRead | (uint32_t)(uint16_t)m_state.vi[is]);
+        return;
+    }
+    case 0x1C: // real VU: FCGET (old runner: FMOR)
+    {
+        uint8_t it = LIT(instr);
+        uint8_t is = LIS(instr);
+        static const bool s_fmFixed = (std::getenv("DC2_VU1_NO_FMSWAPFIX") == nullptr);
+        if (s_fmFixed)
+        {
+            if (it != 0)
+                m_state.vi[it] = (int32_t)(m_state.clip & 0xFFFu);
+        }
+        else
+        {
+            const uint32_t macRead = g138_macpipe_enabled() ? s_vuMacVisible
+                                     : (s_g106UseLowerFlagRead ? s_g106LowerMacRead : m_state.mac);
+            if (it != 0)
+                m_state.vi[it] = (int32_t)(macRead | (uint32_t)(uint16_t)m_state.vi[is]);
+        }
         return;
     }
     case 0x20: // B (unconditional branch)
@@ -3418,10 +3740,20 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             // templates present) -- it cannot synthesise geometry. Scoped to the 3 exact gate PCs
             // inside the map emit subroutine. Kill: DC2_G64_NO_ENABLE_FIX. Diagnostic (pre-repair
             // VI1): DC2_G63_GATE -> [G63:gate].
+            // G140 (2026-07-06): G64 RETIRED BY DEFAULT — the premise was wrong. 0x3088 is NOT a
+            // "per-mesh enable gate": it is the polygon CLIPPER's per-edge inside/outside test
+            // (VI1 = FCGET clip flags of edge verts A/B; VI5/VI6 = the plane bit for A/B). ORing
+            // the mask into VI1 marks EVERY vertex OUTSIDE every plane -> the Sutherland-Hodgman
+            // passes always end with 0 verts -> the fan emitters (XGKICK 780 @0x2d88/0x2f38)
+            // NEVER fire -> the clipped bottom strip + water pool trifans (HW 1012 verts/frame)
+            // were missing from the title. With G64 off the runner emits the same alternating
+            // empty/real trifan giftags as HW (00008000/0000800N 302ec000). The geometry G64
+            // was credited with (rock tristrips) is actually gated by the transform packers'
+            // FMAND cascade, fixed at the root by G138/G139. Re-enable: DC2_G64_FORCE_ENABLE_FIX.
             if (m_state.pc == 0x30d8u || m_state.pc == 0x30f8u || m_state.pc == 0x3168u)
             {
                 static const bool s_g63gate = (std::getenv("DC2_G63_GATE") != nullptr);
-                static const bool s_g64noEnable = (std::getenv("DC2_G64_NO_ENABLE_FIX") != nullptr);
+                static const bool s_g64noEnable = (std::getenv("DC2_G64_FORCE_ENABLE_FIX") == nullptr);
                 if (s_g63gate)
                 {
                     static std::atomic<uint32_t> s_g63n{0};
@@ -4820,6 +5152,12 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             auto g96Submit = [&](const uint8_t *pkt, uint32_t bytes)
             {
                 extern std::atomic<bool> g_dc2TitleRockScope;
+                // G138: publish the packer PC for the PATH1 record the GS-stream dump is
+                // about to write (see g138DumpSubmit in ps2_memory.cpp).
+                {
+                    extern std::atomic<uint32_t> g_dc2G138XgPc;
+                    g_dc2G138XgPc.store(m_state.pc, std::memory_order_relaxed);
+                }
                 static const bool s_g106pc2180Tfan = (std::getenv("DC2_G106_PC2180_TFAN") != nullptr);
                 static const bool s_g106pc2180Stat = (std::getenv("DC2_G106_PC2180_STAT") != nullptr);
                 static const bool s_g107StripAdcStat = (std::getenv("DC2_G107_STRIP_ADC_STAT") != nullptr);
