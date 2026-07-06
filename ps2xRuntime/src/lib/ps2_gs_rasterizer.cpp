@@ -308,7 +308,11 @@ namespace
 
     bool g104TriClipEnabled()
     {
-        static const bool enabled = std::getenv("DC2_G104_NO_TRI_CLIP") == nullptr;
+        // G139: RETIRED by default. The G138 FM-swap/MAC-pipeline root fix plus the G139
+        // same-pair VF hazard fix make the natural VU gate + positions HW-faithful; the
+        // rasterizer-side near-plane tri clip is no longer needed (A/B g100_g139nb_keepz.png
+        // == g100_g139fix.png). Re-enable with DC2_G104_FORCE_TRI_CLIP=1.
+        static const bool enabled = std::getenv("DC2_G104_FORCE_TRI_CLIP") != nullptr;
         return enabled;
     }
 
@@ -2971,7 +2975,11 @@ void GSRasterizer::drawTriangle(GS *gs)
         // would keep a sliver; we lose it) removes the wedges cleanly with at most a
         // one-triangle-deep ragged edge. Title-scoped (inside g104TitleRockTriangle). Kill
         // with DC2_G128_NO_BEHIND_DROP=1 to restore the G125/G126 homog-clip-only behaviour.
-        static const bool s_g128NoBehindDrop = envFlagEnabled("DC2_G128_NO_BEHIND_DROP");
+        // G139: RETIRED by default (was default-ON). Natural gate + fixed VU positions leave no
+        // straddler wedges to drop (A/B g100_g139nb_keepz.png). Re-enable DC2_G128_FORCE_BEHIND_DROP=1.
+        static const bool s_g128NoBehindDrop =
+            std::getenv("DC2_G128_FORCE_BEHIND_DROP") == nullptr ||
+            envFlagEnabled("DC2_G128_NO_BEHIND_DROP");
         static std::atomic<uint64_t> s_g128BehindDrop{0};
         if (!s_g128NoBehindDrop)
         {
@@ -3233,7 +3241,11 @@ void GSRasterizer::drawTriangle(GS *gs)
     // segments were wrongly drawn. Scoped to the title rock (tme + fbp!=0x139 + rock tbp range) so
     // dungeon/costume are untouched. Default-ON; kill DC2_G89_NO_GUARD_CULL; guard DC2_G89_GUARD.
     {
-        static const bool s_g89off = (std::getenv("DC2_G89_NO_GUARD_CULL") != nullptr);
+        // G139: RETIRED by default (was default-ON). The natural FMAND guard gate (G138) is the
+        // real HW cull; the spatial guard approximation is obsolete (A/B g100_g139nb_keepz.png).
+        // Re-enable with DC2_G89_FORCE_GUARD_CULL=1 (DC2_G89_GUARD still tunes the width).
+        static const bool s_g89off = (std::getenv("DC2_G89_FORCE_GUARD_CULL") == nullptr) ||
+                                     (std::getenv("DC2_G89_NO_GUARD_CULL") != nullptr);
         if (!g_g104TriClipReentry && !s_g89off && g_dc2TitleRockScope.load(std::memory_order_relaxed) &&
             gs->m_prim.tme && ctx.frame.fbp != 0x139u &&
             ctx.tex0.tbp0 >= 0x2720u && ctx.tex0.tbp0 <= 0x3960u)
