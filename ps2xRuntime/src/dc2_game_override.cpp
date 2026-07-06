@@ -177,6 +177,7 @@ namespace ps2_stubs
 {
     void setPadOverrideState(uint16_t buttons, uint8_t lx, uint8_t ly, uint8_t rx, uint8_t ry);
     void clearPadOverrideState();
+    void sceDevctl(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime); // Kernel/Stubs/FileIO.cpp: no-HDD fail (-11)
 }
 
 // PHASE G34: set while inside DrawDivSprite4 (the model RTT->display composite) so the GS
@@ -11058,7 +11059,11 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     bindAddressHandler(runtime, 0x00116590u, "sceMount");
     bindAddressHandler(runtime, 0x00116800u, "sceUmount");
     bindAddressHandler(runtime, 0x00116820u, "sceLseek64");
-    bindAddressHandler(runtime, 0x00116A58u, "sceDevctl");
+    // sceDevctl is only reached from HddConectCheck/CheckInstallSpace; the name-based bind
+    // cannot resolve it (not in PS2_STUB_LIST), which left the recompiled TODO wrapper live
+    // and fatally throwing "Unimplemented PS2 stub called: sceDevctl". Register the real
+    // no-HDD stub directly so the HDD probe fails cleanly (-11 -> retail no-HDD path).
+    runtime.registerFunction(0x00116A58u, &ps2_stubs::sceDevctl);
     bindAddressHandler(runtime, 0x00116C90u, "sceSymlink");
     bindAddressHandler(runtime, 0x00116E70u, "sceReadlink");
 
