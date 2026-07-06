@@ -12,6 +12,12 @@
 
 std::atomic<uint32_t> g_dc2G136TraceActive{0};
 std::atomic<uint32_t> g_dc2G136TraceSeq{0};
+// G138: last VU1 XGKICK program counter (packer entry), published by ps2_vu1.cpp just
+// before it submits the kicked packet on PATH1, so the G138 GS-stream dump can attribute
+// each PATH1 record to its VU packer without changing the submit signature.
+std::atomic<uint32_t> g_dc2G138XgPc{0};
+// G138: title scope flag (defined in dc2_game_override.cpp).
+extern std::atomic<bool> g_dc2TitleRockScope;
 
 namespace
 {
@@ -1695,10 +1701,133 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
         m_gifArbiter->drain();
 }
 
+// ---------------------------------------------------------------------------
+// G138: title-scoped GS-stream dump (default OFF, DC2_G138_GSDUMP=<path>).
+// Writes every submitted GIF packet into a minimal PCSX2-v9-shaped .gs container
+// (44-byte header + 0x2000 zero "priv regs" + type-0 transfer records) so the
+// existing tools/g1xx_hw_*.py parsers can consume the RUNNER stream directly and
+// A/B it against ref/dumps/new_game_via_debug.gs. PATH1 records are preceded by
+// a synthetic 32-byte A+D NOP record carrying the VU packer PC (reg addr 0x0f is
+// a GS NOP, ignored by the old parsers, decoded by tools/g138_hw_slice.py).
+// Bounded by DC2_G138_GSDUMP_MAX records (default 200000).
+namespace
+{
+    struct Dc2G138GsDump
+    {
+        FILE *file = nullptr;
+        uint32_t records = 0u;
+        uint32_t maxRecords = 200000u;
+        bool closed = false;
+    };
+
+    Dc2G138GsDump &g138Dump()
+    {
+        static Dc2G138GsDump d;
+        return d;
+    }
+
+    const char *g138DumpPath()
+    {
+        static const char *path = std::getenv("DC2_G138_GSDUMP");
+        return path;
+    }
+
+    void g138WriteRecord(uint8_t path, const uint8_t *data, uint32_t sizeBytes)
+    {
+        Dc2G138GsDump &d = g138Dump();
+        if (d.closed)
+            return;
+        if (!d.file)
+        {
+            const char *p = g138DumpPath();
+            if (!p || !p[0])
+            {
+                d.closed = true;
+                return;
+            }
+            static const uint32_t maxEnv = []() -> uint32_t {
+                const char *e = std::getenv("DC2_G138_GSDUMP_MAX");
+                if (!e)
+                    return 200000u;
+                const long v = std::strtol(e, nullptr, 0);
+                return (v > 0) ? static_cast<uint32_t>(v) : 200000u;
+            }();
+            d.maxRecords = maxEnv;
+            d.file = std::fopen(p, "wb");
+            if (!d.file)
+            {
+                std::fprintf(stderr, "[G138:gsdump] fopen failed: %s\n", p);
+                d.closed = true;
+                return;
+            }
+            // 8-byte magic + 9 u32 header fields (sv,ss,so,sz,crc,sw,sh,sho,shs).
+            // sho=36/shs=0 => state offset 44, ss=0 => records begin at 44+0x2000,
+            // matching what parse_header() in the g1xx tools computes.
+            uint8_t hdr[44] = {};
+            std::memcpy(hdr, "G138GSD\0", 8);
+            uint32_t fields[9] = {1u, 0u, 0u, 0u, 0u, 640u, 448u, 36u, 0u};
+            std::memcpy(hdr + 8, fields, sizeof(fields));
+            std::fwrite(hdr, 1, sizeof(hdr), d.file);
+            static const uint8_t zeros[0x800] = {};
+            for (int i = 0; i < 4; ++i)
+                std::fwrite(zeros, 1, sizeof(zeros), d.file);
+            std::fprintf(stderr, "[G138:gsdump] writing %s (max %u records)\n", p, d.maxRecords);
+        }
+        if (d.records >= d.maxRecords)
+        {
+            std::fclose(d.file);
+            d.file = nullptr;
+            d.closed = true;
+            std::fprintf(stderr, "[G138:gsdump] record cap %u reached, file closed\n", d.maxRecords);
+            return;
+        }
+        const uint8_t type = 0u;
+        const int32_t size = static_cast<int32_t>(sizeBytes);
+        std::fwrite(&type, 1, 1, d.file);
+        std::fwrite(&path, 1, 1, d.file);
+        std::fwrite(&size, 4, 1, d.file);
+        std::fwrite(data, 1, sizeBytes, d.file);
+        ++d.records;
+        if ((d.records & 0x3FFu) == 0u)
+            std::fflush(d.file);
+    }
+
+    void g138DumpSubmit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes)
+    {
+        if (!g138DumpPath())
+            return;
+        if (!g_dc2TitleRockScope.load(std::memory_order_relaxed))
+            return;
+        // PCSX2 dump path byte convention: 0=P1(old) 1=P2 2=P3 3=P1(new).
+        uint8_t path = 2u;
+        if (pathId == GifPathId::Path1)
+            path = 3u;
+        else if (pathId == GifPathId::Path2)
+            path = 1u;
+        if (pathId == GifPathId::Path1)
+        {
+            const uint32_t pc = g_dc2G138XgPc.load(std::memory_order_relaxed);
+            uint8_t marker[32] = {};
+            const uint64_t tagLo = 1ull | (1ull << 15) | (1ull << 60); // nloop=1 eop=1 nreg=1
+            const uint64_t tagHi = 0x0Eull;                            // PACKED A+D
+            const uint64_t adData = pc;
+            const uint64_t adAddr = 0x0Full;                           // GS NOP register
+            std::memcpy(marker + 0, &tagLo, 8);
+            std::memcpy(marker + 8, &tagHi, 8);
+            std::memcpy(marker + 16, &adData, 8);
+            std::memcpy(marker + 24, &adAddr, 8);
+            g138WriteRecord(path, marker, sizeof(marker));
+        }
+        g138WriteRecord(path, data, sizeBytes);
+    }
+}
+
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
     if (!data || sizeBytes < 16)
         return;
+
+    g138DumpSubmit(pathId, data, sizeBytes);
 
     if (vu1_trace_enabled())
     {
