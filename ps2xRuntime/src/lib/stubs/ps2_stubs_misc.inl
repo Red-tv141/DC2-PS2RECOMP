@@ -1,3 +1,6 @@
+// Phase B — ISO bridge: defined in ps2_runtime.cpp, inside namespace ps2_stubs.
+bool isoFindFileForStubs(const char *isoPath, uint32_t *lbaOut, uint32_t *sizeOut);
+
 void calloc_r(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     const uint32_t count = getRegU32(ctx, 5); // $a1
@@ -619,6 +622,29 @@ void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         }
     }
 
+    // Phase B — ISO mount fallback: resolve files that live only inside the ISO image.
+    if (!found)
+    {
+        std::string upperPath = normalizedPath;
+        std::replace(upperPath.begin(), upperPath.end(), '\\', '/');
+        std::transform(upperPath.begin(), upperPath.end(), upperPath.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+        const std::string isoPath = "/" + upperPath;
+
+        uint32_t isoLba = 0, isoSize = 0;
+        if (isoFindFileForStubs(isoPath.c_str(), &isoLba, &isoSize))
+        {
+            resolvedEntry.baseLbn   = isoLba;
+            resolvedEntry.sizeBytes = isoSize;
+            resolvedEntry.sectors   = sectorsForBytes(static_cast<uint64_t>(isoSize));
+            resolvedEntry.hostPath.clear();
+            found = true;
+            std::cout << "[sceCdSearchFile:ISO] path=\"" << sanitizeForLog(path)
+                      << "\" iso_lba=0x" << std::hex << isoLba
+                      << " size=0x" << isoSize << std::dec << std::endl;
+        }
+    }
+
     if (!found)
     {
         static std::string lastFailedPath;
@@ -656,6 +682,7 @@ void sceCdSearchFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         return;
     }
 
+    g_lastCdError = 0;
     g_cdStreamingLbn = resolvedEntry.baseLbn;
     if (shouldTrace)
     {
@@ -2292,8 +2319,17 @@ void scePadGetState(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     (void)rdram;
     (void)runtime;
-    // Pad state constants used by libpad: 6 means stable and ready.
-    setReturnS32(ctx, 6);
+    // Walk the real PS2 SDK pad-init sequence per port so polling loops see
+    // state transitions and exit: FindPad(1) x2 → FindCTP1(2) → ExecCmd(5) → Stable(6).
+    static uint32_t calls[2] = {0, 0};
+    const int port = static_cast<int>(getRegU32(ctx, 4)) & 1;
+    const uint32_t n = calls[port]++;
+    int32_t state;
+    if (n < 2)       state = 1;
+    else if (n == 2) state = 2;
+    else if (n == 3) state = 5;
+    else             state = 6;
+    setReturnS32(ctx, state);
 }
 
 void scePadInfoAct(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -4428,3 +4464,33 @@ void write(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     ps2_syscalls::fioWrite(rdram, ctx, runtime);
 }
+
+void realloc_r(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
+
+void memalign_r(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
+
+void memalign(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
+
+void sceDevVif0Reset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
+
+void sceDevVu0Reset(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
+
+void setMpegCompatLayout(const PS2MpegCompatLayout &layout)
+{
+}
+

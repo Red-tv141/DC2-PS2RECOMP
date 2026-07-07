@@ -933,3 +933,29 @@ void RegisterExitHandler(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 
     setReturnS32(ctx, 0);
 }
+
+void GetOsdConfigParam2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
+
+void SetOsdConfigParam2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
+
+void InitTLB(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
+
+void Copy(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
+
+void GetEntryAddress(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
+

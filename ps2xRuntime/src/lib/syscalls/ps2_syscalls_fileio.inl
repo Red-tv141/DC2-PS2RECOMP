@@ -1,3 +1,206 @@
+// Phase B — ISO-backed file descriptors.
+// Forward declarations of helpers defined in ps2_runtime.cpp (same namespace).
+bool isoFindFileForFio(const char *path, uint32_t *lbaOut, uint32_t *sizeOut);
+bool isoReadSectorForFio(uint32_t lba, uint32_t count, void *dst);
+
+namespace
+{
+    constexpr uint32_t kIsoSectorSize = 2048u;
+    static const bool kFioTrace = true;
+
+    struct IsoFdEntry
+    {
+        uint32_t lba;
+        uint32_t size;        // logical size visible to caller
+        uint64_t cursor;      // logical cursor 0..size
+        uint64_t baseOffset;  // byte offset within the underlying ISO file (0 for plain ISO files,
+                              // entry offset within DATA.DAT for Phase F6 archive fds)
+    };
+
+    std::unordered_map<int, IsoFdEntry> g_isoFds;
+    std::mutex g_isoFdMutex;
+
+    static int allocateIsoFd(uint32_t lba, uint32_t size)
+    {
+        int fd;
+        {
+            std::lock_guard<std::mutex> fdLock(g_fd_mutex);
+            fd = g_nextFd++;
+        }
+        {
+            std::lock_guard<std::mutex> isoLock(g_isoFdMutex);
+            g_isoFds[fd] = IsoFdEntry{lba, size, 0u, 0u};
+        }
+        return fd;
+    }
+
+    static int allocateArchiveFd(uint32_t datLba, uint32_t offsetInDat, uint32_t size)
+    {
+        int fd;
+        {
+            std::lock_guard<std::mutex> fdLock(g_fd_mutex);
+            fd = g_nextFd++;
+        }
+        {
+            std::lock_guard<std::mutex> isoLock(g_isoFdMutex);
+            g_isoFds[fd] = IsoFdEntry{datLba, size, 0u, static_cast<uint64_t>(offsetInDat)};
+        }
+        return fd;
+    }
+
+    // ---- Phase F6: DATA.HD2 / DATA.DAT archive index ----
+    struct DataArchiveEntry
+    {
+        uint32_t offsetInDat;
+        uint32_t size;
+    };
+
+    static std::unordered_map<std::string, DataArchiveEntry> g_dataArchive;
+    static std::once_flag g_dataArchiveLoaded;
+    static uint32_t g_datDatLba = 0;
+    static uint32_t g_datDatSize = 0;
+
+    static std::string archiveNormalize(const std::string &path)
+    {
+        std::string s = path;
+        if (!s.empty() && (s.front() == '/' || s.front() == '\\'))
+            s.erase(s.begin());
+        for (auto &c : s)
+        {
+            if (c == '\\') c = '/';
+            else c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return s;
+    }
+
+    static void loadDataArchiveIndex()
+    {
+        uint32_t hd2Lba = 0, hd2Size = 0;
+        if (!isoFindFileForFio("/DATA.HD2", &hd2Lba, &hd2Size))
+        {
+            std::cerr << "[Phase F6] DATA.HD2 not found in ISO\n";
+            return;
+        }
+        if (!isoFindFileForFio("/DATA.DAT", &g_datDatLba, &g_datDatSize))
+        {
+            std::cerr << "[Phase F6] DATA.DAT not found in ISO\n";
+            return;
+        }
+
+        const uint32_t sectorCount = (hd2Size + kIsoSectorSize - 1) / kIsoSectorSize;
+        std::vector<uint8_t> buf(static_cast<size_t>(sectorCount) * kIsoSectorSize, 0);
+        for (uint32_t i = 0; i < sectorCount; ++i)
+        {
+            if (!isoReadSectorForFio(hd2Lba + i, 1u, buf.data() + i * kIsoSectorSize))
+            {
+                std::cerr << "[Phase F6] failed to read DATA.HD2 sector " << i << "\n";
+                return;
+            }
+        }
+        buf.resize(hd2Size);
+
+        // Entries are 32 bytes; first entry's nameOffset doubles as the entry-table end.
+        // Stop when nameOffset is out of range or non-monotonic.
+        auto rd32 = [&](size_t off) -> uint32_t {
+            return static_cast<uint32_t>(buf[off]) |
+                   (static_cast<uint32_t>(buf[off + 1]) << 8) |
+                   (static_cast<uint32_t>(buf[off + 2]) << 16) |
+                   (static_cast<uint32_t>(buf[off + 3]) << 24);
+        };
+
+        if (buf.size() < 32) return;
+        const uint32_t firstNameOff = rd32(0);
+        if (firstNameOff < 32 || firstNameOff > buf.size()) return;
+        const uint32_t entryCount = firstNameOff / 32u;
+
+        size_t added = 0;
+        for (uint32_t i = 0; i < entryCount; ++i)
+        {
+            const size_t e = static_cast<size_t>(i) * 32u;
+            const uint32_t nameOff = rd32(e + 0x00);
+            const uint32_t offDat  = rd32(e + 0x10);
+            const uint32_t size    = rd32(e + 0x14);
+            if (nameOff < firstNameOff || nameOff >= buf.size()) continue;
+
+            // Read NUL-terminated name from name table
+            size_t end = nameOff;
+            while (end < buf.size() && buf[end] != 0) ++end;
+            std::string raw(reinterpret_cast<const char *>(&buf[nameOff]), end - nameOff);
+            if (raw.empty()) continue;
+
+            std::string key = archiveNormalize(raw);
+            g_dataArchive.emplace(std::move(key), DataArchiveEntry{offDat, size});
+            ++added;
+        }
+
+        std::cout << "[Phase F6] loaded DATA archive index: " << added
+                  << " entries (DAT lba=0x" << std::hex << g_datDatLba
+                  << " size=0x" << g_datDatSize << std::dec << ")\n";
+    }
+
+    static bool dataArchiveLookup(const std::string &isoPath,
+                                  uint32_t *datLbaOut,
+                                  uint32_t *offsetOut,
+                                  uint32_t *sizeOut)
+    {
+        std::call_once(g_dataArchiveLoaded, loadDataArchiveIndex);
+        if (g_datDatLba == 0 || g_dataArchive.empty()) return false;
+
+        const std::string key = archiveNormalize(isoPath);
+        auto it = g_dataArchive.find(key);
+        if (it == g_dataArchive.end()) return false;
+
+        *datLbaOut  = g_datDatLba;
+        *offsetOut  = it->second.offsetInDat;
+        *sizeOut    = it->second.size;
+        return true;
+    }
+
+    // Normalize cdrom0:\FOO\BAR;1  →  /FOO/BAR  (uppercase, no ;N suffix)
+    // Returns empty string for paths that are not cdrom/host prefixed.
+    static std::string extractIsoPath(const char *ps2Path)
+    {
+        if (!ps2Path || !*ps2Path)
+            return {};
+
+        std::string p(ps2Path);
+        std::string lower(p.size(), '\0');
+        std::transform(p.begin(), p.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        std::size_t prefixLen = 0;
+        if (lower.rfind("cdrom0:", 0) == 0)       prefixLen = 7;
+        else if (lower.rfind("cdrom:", 0) == 0)   prefixLen = 6;
+        else if (lower.rfind("cdfs:", 0) == 0)    prefixLen = 5;
+        else if (lower.rfind("host0:", 0) == 0)   prefixLen = 6;
+        else if (lower.rfind("host:", 0) == 0)    prefixLen = 5;
+
+        std::string suffix = p.substr(prefixLen);
+
+        // Backslash → forward slash
+        std::replace(suffix.begin(), suffix.end(), '\\', '/');
+
+        // Strip ;N version suffix
+        const auto sc = suffix.rfind(';');
+        if (sc != std::string::npos)
+        {
+            bool allDigits = (sc + 1 < suffix.size());
+            for (std::size_t i = sc + 1; allDigits && i < suffix.size(); ++i)
+                allDigits = std::isdigit(static_cast<unsigned char>(suffix[i])) != 0;
+            if (allDigits)
+                suffix.erase(sc);
+        }
+
+        // Trim leading slashes then uppercase
+        while (!suffix.empty() && suffix.front() == '/')
+            suffix.erase(suffix.begin());
+        std::transform(suffix.begin(), suffix.end(), suffix.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+
+        return suffix.empty() ? std::string{} : "/" + suffix;
+    }
+}
+
 static int allocatePs2Fd(FILE *file)
 {
     if (!file)
@@ -90,13 +293,40 @@ void fioOpen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     }
 
     const char *mode = translateFioMode(flags);
-    std::cout << "fioOpen: '" << hostPath << "' flags=0x" << std::hex << flags << std::dec << " mode='" << mode << "'" << std::endl;
+    if (kFioTrace)
+        std::cout << "[FIO] sceOpen(\"" << ps2Path << "\") " << std::endl;
 
     FILE *fp = ::fopen(hostPath.c_str(), mode);
     if (!fp)
     {
+        // Phase B — ISO mount fallback for cdrom/host paths not on host filesystem
+        const std::string isoPath = extractIsoPath(ps2Path);
+        if (!isoPath.empty())
+        {
+            uint32_t lba = 0, sz = 0;
+            if (isoFindFileForFio(isoPath.c_str(), &lba, &sz))
+            {
+                const int isoFd = allocateIsoFd(lba, sz);
+                if (kFioTrace)
+                    std::cout << "[FIO] sceOpen(\"" << ps2Path << "\") = " << isoFd << std::endl;
+                setReturnS32(ctx, isoFd);
+                return;
+            }
+
+            // Phase F6 — DATA.DAT archive fallback
+            uint32_t arcLba = 0, arcOff = 0, arcSz = 0;
+            if (dataArchiveLookup(isoPath, &arcLba, &arcOff, &arcSz))
+            {
+                const int arcFd = allocateArchiveFd(arcLba, arcOff, arcSz);
+                std::cout << "[Phase F6:archive] '" << isoPath << "' offset=0x"
+                          << std::hex << arcOff << " size=0x" << arcSz
+                          << std::dec << " fd=" << arcFd << "\n";
+                setReturnS32(ctx, arcFd);
+                return;
+            }
+        }
         std::cerr << "fioOpen error: fopen failed for '" << hostPath << "': " << strerror(errno) << std::endl;
-        setReturnS32(ctx, -1); // e.g., -ENOENT, -EACCES
+        setReturnS32(ctx, -1);
         return;
     }
 
@@ -109,6 +339,9 @@ void fioOpen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         return;
     }
 
+    if (kFioTrace)
+        std::cout << "[FIO] sceOpen(\"" << ps2Path << "\") = " << ps2Fd << std::endl;
+
     // returns the PS2 file descriptor
     setReturnS32(ctx, ps2Fd);
 }
@@ -116,6 +349,16 @@ void fioOpen(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 void fioClose(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     int ps2Fd = (int)getRegU32(ctx, 4);
+
+    // Phase B — ISO fd fast-path
+    {
+        std::lock_guard<std::mutex> lock(g_isoFdMutex);
+        if (g_isoFds.erase(ps2Fd))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+    }
 
     FILE *fp = getHostFile(ps2Fd);
     if (!fp)
@@ -164,6 +407,55 @@ void fioRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     int ps2Fd = (int)getRegU32(ctx, 4);   // $a0
     uint32_t bufAddr = getRegU32(ctx, 5); // $a1
     size_t size = getRegU32(ctx, 6);      // $a2
+
+    // Phase B — ISO fd fast-path
+    {
+        std::lock_guard<std::mutex> isoLock(g_isoFdMutex);
+        auto it = g_isoFds.find(ps2Fd);
+        if (it != g_isoFds.end())
+        {
+            IsoFdEntry &e = it->second;
+            uint8_t *hostBuf = getMemPtr(rdram, bufAddr);
+            if (!hostBuf)
+            {
+                setReturnS32(ctx, -1);
+                return;
+            }
+            const uint64_t remaining = static_cast<uint64_t>(e.size) - e.cursor;
+            const size_t toRead = static_cast<size_t>(
+                std::min<uint64_t>(static_cast<uint64_t>(size), remaining));
+            if (toRead == 0)
+            {
+                setReturnS32(ctx, 0);
+                return;
+            }
+
+            size_t bytesRead = 0;
+            std::vector<uint8_t> sectorBuf(kIsoSectorSize);
+            const uint64_t physical = e.baseOffset + e.cursor;
+            uint32_t sector = e.lba + static_cast<uint32_t>(physical / kIsoSectorSize);
+            uint32_t secOff = static_cast<uint32_t>(physical % kIsoSectorSize);
+
+            while (bytesRead < toRead)
+            {
+                if (!isoReadSectorForFio(sector, 1u, sectorBuf.data()))
+                    break;
+                const size_t avail = kIsoSectorSize - secOff;
+                const size_t chunk = std::min(avail, toRead - bytesRead);
+                std::memcpy(hostBuf + bytesRead, sectorBuf.data() + secOff, chunk);
+                bytesRead += chunk;
+                ++sector;
+                secOff = 0u;
+            }
+
+            e.cursor += bytesRead;
+            if (kFioTrace)
+                std::cout << "[FIO] sceRead(fd=" << ps2Fd
+                          << ", n=" << size << ") = " << bytesRead << std::endl;
+            setReturnS32(ctx, static_cast<int32_t>(bytesRead));
+            return;
+        }
+    }
 
     uint8_t *hostBuf = getMemPtr(rdram, bufAddr);
     FILE *fp = getHostFile(ps2Fd);
@@ -229,6 +521,9 @@ void fioRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         }
     }
 
+    if (kFioTrace)
+        std::cout << "[FIO] sceRead(fd=" << ps2Fd
+                  << ", n=" << size << ") = " << bytesRead << std::endl;
     setReturnS32(ctx, (int32_t)bytesRead);
 }
 
@@ -277,8 +572,31 @@ void fioWrite(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 void fioLseek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     int ps2Fd = (int)getRegU32(ctx, 4);  // $a0
-    int32_t offset = getRegU32(ctx, 5);  // $a1 (PS2 seems to use 32-bit offset here commonly)
-    int whence = (int)getRegU32(ctx, 6); // $a2 (PS2 FIO_SEEK constants)
+    int32_t offset = getRegU32(ctx, 5);  // $a1
+    int whence = (int)getRegU32(ctx, 6); // $a2
+
+    // Phase B — ISO fd fast-path
+    {
+        std::lock_guard<std::mutex> lock(g_isoFdMutex);
+        auto it = g_isoFds.find(ps2Fd);
+        if (it != g_isoFds.end())
+        {
+            IsoFdEntry &e = it->second;
+            int64_t newPos;
+            switch (whence)
+            {
+            case PS2_FIO_SEEK_SET: newPos = static_cast<int64_t>(offset); break;
+            case PS2_FIO_SEEK_CUR: newPos = static_cast<int64_t>(e.cursor) + offset; break;
+            case PS2_FIO_SEEK_END: newPos = static_cast<int64_t>(e.size) + offset; break;
+            default: setReturnS32(ctx, -1); return;
+            }
+            if (newPos < 0) newPos = 0;
+            if (newPos > static_cast<int64_t>(e.size)) newPos = static_cast<int64_t>(e.size);
+            e.cursor = static_cast<uint64_t>(newPos);
+            setReturnS32(ctx, static_cast<int32_t>(newPos));
+            return;
+        }
+    }
 
     FILE *fp = getHostFile(ps2Fd);
     if (!fp)

@@ -238,6 +238,11 @@ void DeleteThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     setReturnS32(ctx, KE_OK);
 }
 
+} // namespace ps2_syscalls
+extern std::mutex g_guestThreadCtxMutex;
+extern std::unordered_map<int, R5900Context *> g_guestThreadCtxs;
+namespace ps2_syscalls {
+
 void StartThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     int tid = static_cast<int>(getRegU32(ctx, 4)); // $a0 = thread id
@@ -348,6 +353,13 @@ void StartThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
             threadCtx->pc = info->entry;
 
             g_currentThreadId = tid;
+
+            // F50.3: publish this worker's live context so the host hang watchdog
+            // (DC2_TRACE_HANG) can sample its per-instruction PC during an intra-function spin.
+            {
+                std::lock_guard<std::mutex> reg(g_guestThreadCtxMutex);
+                g_guestThreadCtxs[tid] = threadCtx;
+            }
 
             std::cout << "[StartThread] id=" << tid
                       << " entry=0x" << std::hex << info->entry
@@ -504,6 +516,12 @@ void StartThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
                 runtime->guestFree(detachedAutoStack);
             }
 
+            // F50.3: this worker's stack-local context is about to die; remove it.
+            {
+                std::lock_guard<std::mutex> reg(g_guestThreadCtxMutex);
+                g_guestThreadCtxs.erase(tid);
+            }
+
             // Notify anybody waiting for termination (like TerminateThread)
             info->cv.notify_all();
 
@@ -582,6 +600,13 @@ void TerminateThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
         tid = g_currentThreadId;
 
     auto info = (tid == g_currentThreadId) ? ensureCurrentThreadInfo(ctx) : lookupThreadInfo(tid);
+    static const bool s_termTrace = (std::getenv("DC2_TRACE_HANG") != nullptr);
+    if (s_termTrace)
+    {
+        std::fprintf(stderr, "[F50.3:term] tid=%d cur=%d ra=0x%x info=%d%s\n",
+                     tid, g_currentThreadId, getRegU32(ctx, 31), (info ? 1 : 0),
+                     (info ? (info->started ? " started" : " !started") : ""));
+    }
     if (!info)
     {
         setReturnS32(ctx, KE_UNKNOWN_THID);
@@ -607,12 +632,21 @@ void TerminateThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     }
     else
     {
+        if (s_termTrace)
+        {
+            std::fprintf(stderr, "[F50.3:term] tid=%d BLOCKING on cv.wait (started=%d status=%d)\n",
+                         tid, (int)info->started, info->status);
+        }
         // Block until the target thread actually finishes unwinding and becomes dormant
         std::unique_lock<std::mutex> lock(info->m);
         {
             PS2Runtime::GuestExecutionReleaseScope releaseGuestExecution(runtime);
             info->cv.wait(lock, [&]()
                           { return !info->started && info->status == THS_DORMANT; });
+        }
+        if (s_termTrace)
+        {
+            std::fprintf(stderr, "[F50.3:term] tid=%d cv.wait RELEASED\n", tid);
         }
     }
 

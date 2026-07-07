@@ -1,5 +1,6 @@
 void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
+    static const bool kFioTrace = true;
     const uint32_t a0 = getRegU32(ctx, 4); // usually lbn
     const uint32_t a1 = getRegU32(ctx, 5); // usually sector count
     const uint32_t a2 = getRegU32(ctx, 6); // usually destination buffer
@@ -110,10 +111,16 @@ void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     if (ok)
     {
         g_cdStreamingLbn = selected.lbn + selected.sectors;
+        if (kFioTrace)
+            std::cout << "[CDVD] sceCdRead(lba=" << selected.lbn
+                      << ", n=" << selected.sectors << ") = 1" << std::endl;
         setReturnS32(ctx, 1); // command accepted/success
         return;
     }
 
+    if (kFioTrace)
+        std::cout << "[CDVD] sceCdRead(lba=" << selected.lbn
+                  << ", n=" << selected.sectors << ") = 0 (failed)" << std::endl;
     setReturnS32(ctx, 0);
 }
 
@@ -138,6 +145,7 @@ void builtin_set_imask(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     setReturnS32(ctx, 0);
 }
 
+/*
 void InitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     static int logCount = 0;
@@ -148,3 +156,4 @@ void InitThread(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     }
     setReturnS32(ctx, 1); // success
 }
+*/

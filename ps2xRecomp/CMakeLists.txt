@@ -13,7 +13,6 @@ FetchContent_Declare(
     elfio
     GIT_REPOSITORY https://github.com/serge1/ELFIO.git
     GIT_TAG 7d30a22fc5aac06adfe7887ae57f3701b6b5f913
-    GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(elfio)
 
@@ -136,3 +135,10 @@ install(TARGETS ps2_recomp ps2_recomp_lib
 install(DIRECTORY include/
     DESTINATION include
 )
+
+include("${CMAKE_SOURCE_DIR}/ps2xRuntime/cmake/ReleaseMode.cmake")
+
+if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+    EnableFastReleaseMode(ps2_recomp_lib)
+    EnableFastReleaseMode(ps2_recomp)
+endif()

@@ -1,13 +1,225 @@
-#include "ps2_memory.h"
+#include "runtime/ps2_memory.h"
+#include "ps2_log.h"
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
+#include <chrono>
 #include <string>
 #include <vector>
 
+std::atomic<uint32_t> g_dc2G136TraceActive{0};
+std::atomic<uint32_t> g_dc2G136TraceSeq{0};
+// G138: last VU1 XGKICK program counter (packer entry), published by ps2_vu1.cpp just
+// before it submits the kicked packet on PATH1, so the G138 GS-stream dump can attribute
+// each PATH1 record to its VU packer without changing the submit signature.
+std::atomic<uint32_t> g_dc2G138XgPc{0};
+std::atomic<uint64_t> g_g146GifSubmitNs{0};
+// G138: title scope flag (defined in dc2_game_override.cpp).
+extern std::atomic<bool> g_dc2TitleRockScope;
+
 namespace
 {
+    struct G146PerfScope
+    {
+        bool on = false;
+        std::chrono::steady_clock::time_point t0;
+        std::atomic<uint64_t> *dst = nullptr;
+
+        explicit G146PerfScope(std::atomic<uint64_t> &target)
+        {
+        static const bool s_on = (std::getenv("DC2_PERF") != nullptr) ||
+                                 (std::getenv("DC2_G146_PERF") != nullptr) ||
+                                 (std::getenv("DC2_G147_PERF") != nullptr);
+            on = s_on;
+            dst = &target;
+            if (on)
+                t0 = std::chrono::steady_clock::now();
+        }
+
+        ~G146PerfScope()
+        {
+            if (!on || !dst)
+                return;
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            dst->fetch_add(static_cast<uint64_t>(ns), std::memory_order_relaxed);
+        }
+    };
+
+    bool envFlagEnabled(const char *name)
+    {
+        const char *value = std::getenv(name);
+        return value != nullptr &&
+               value[0] != '\0' &&
+               std::strcmp(value, "0") != 0 &&
+               std::strcmp(value, "false") != 0 &&
+               std::strcmp(value, "FALSE") != 0 &&
+               std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "OFF") != 0;
+    }
+
+    bool phaseDiagnosticsEnabled()
+    {
+        static const bool enabled = envFlagEnabled("DC2_PHASE_TRACE");
+        return enabled;
+    }
+
+    bool f50_12_trace_enabled()
+    {
+        static const bool enabled = envFlagEnabled("DC2_TRACE_F50_12");
+        return enabled;
+    }
+
+    bool vu1_trace_enabled()
+    {
+        static const bool enabled = envFlagEnabled("DC2_TRACE_VU1");
+        return enabled;
+    }
+
+    bool g136_trace_enabled()
+    {
+        static const bool enabled = envFlagEnabled("DC2_G136_TRACE");
+        return enabled;
+    }
+
+    uint32_t g136_env_u32(const char *name, uint32_t fallback)
+    {
+        const char *value = std::getenv(name);
+        if (!value || value[0] == '\0')
+            return fallback;
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 0);
+        if (end == value)
+            return fallback;
+        return static_cast<uint32_t>(parsed);
+    }
+
+    uint32_t g136_target_packet()
+    {
+        static const uint32_t value = g136_env_u32("DC2_G136_PACKET", 0x00439e10u);
+        return value & 0x1FFFFFFFu;
+    }
+
+    uint32_t g136_target_bulk()
+    {
+        static const uint32_t value = g136_env_u32("DC2_G136_BULK", 0x00907e10u);
+        return value & 0x1FFFFFFFu;
+    }
+
+    uint32_t g136_trace_limit()
+    {
+        static const uint32_t value = g136_env_u32("DC2_G136_LIMIT", 2u);
+        return value;
+    }
+
+    uint32_t g136_qword_limit()
+    {
+        static const uint32_t value = std::min<uint32_t>(g136_env_u32("DC2_G136_QW", 4u), 16u);
+        return value;
+    }
+
+    std::atomic<uint32_t> s_g136PendingChains{0};
+    std::atomic<uint32_t> s_g136PendingSeq{0};
+    std::atomic<uint32_t> s_g136ArmedChains{0};
+
+    bool g136_addr_matches(uint32_t addr, uint32_t target)
+    {
+        return (addr & 0x1FFFFFFFu) == target;
+    }
+
+    void g136_log_qwords(const uint8_t *base, uint32_t maxBytes, uint32_t qwords,
+                         const char *label, uint32_t seq, uint32_t addr)
+    {
+        const uint32_t capped = std::min<uint32_t>(qwords, g136_qword_limit());
+        for (uint32_t q = 0u; q < capped; ++q)
+        {
+            const uint32_t off = q * 16u;
+            if (off + 16u > maxBytes)
+                break;
+            uint32_t w[4] = {};
+            std::memcpy(w, base + off, sizeof(w));
+            std::fprintf(stderr,
+                         "[G136:%s] seq=%u base=0x%x q=%u %08x %08x %08x %08x\n",
+                         label, seq, addr, q, w[0], w[1], w[2], w[3]);
+        }
+    }
+
+    // F51.7: scan a GIF packet submitted on a given path; report PRIM / TEX0.tbp /
+    // first decoded XYZ2 verts. Helps locate which path delivers the dungeon map
+    // (tbp=0x3220) and what XYZ it carries.
+    void f517_scan_submit(int pathId, const uint8_t *data, uint32_t sizeBytes)
+    {
+        if (!vu1_trace_enabled() || !data || sizeBytes < 16u)
+            return;
+        static std::atomic<uint32_t> s_scan{0};
+        static std::atomic<uint32_t> s_mapHit{0};
+
+        uint32_t offset = 0u, tagIndex = 0u;
+        uint32_t curTbp = 0xFFFFFFFFu, curPsm = 0xFFFFFFFFu, prim = 0xFFFFFFFFu;
+        uint32_t verts = 0u;
+        uint32_t firstX = 0u, firstY = 0u, firstZ = 0u; bool haveVert = false;
+        auto ld = [&](uint32_t off) -> uint64_t { uint64_t v=0; std::memcpy(&v, data+off, 8); return v; };
+
+        while (offset + 16u <= sizeBytes && tagIndex < 512u)
+        {
+            const uint64_t tagLo = ld(offset);
+            const uint64_t tagHi = ld(offset + 8u);
+            offset += 16u;
+            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+            const uint8_t flg = static_cast<uint8_t>((tagLo >> 58u) & 0x3u);
+            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60u) & 0xFu);
+            if (nreg == 0u) nreg = 16u;
+            if (((tagLo >> 46u) & 0x1u) != 0u) prim = static_cast<uint32_t>((tagLo >> 47u) & 0x7FFu);
+            uint8_t regs[16];
+            for (uint32_t i = 0u; i < nreg; ++i) regs[i] = static_cast<uint8_t>((tagHi >> (i * 4u)) & 0xFu);
+
+            if (flg == 0u) // PACKED
+            {
+                for (uint32_t loop = 0u; loop < nloop; ++loop)
+                    for (uint32_t r = 0u; r < nreg; ++r)
+                    {
+                        if (offset + 16u > sizeBytes) goto done;
+                        const uint64_t lo = ld(offset), hi = ld(offset + 8u);
+                        offset += 16u;
+                        uint8_t rd = regs[r];
+                        uint64_t dv = lo;
+                        if (rd == 0x0Eu) { rd = static_cast<uint8_t>(hi & 0xFFu); }
+                        if (rd == 0x06u) { curTbp = static_cast<uint32_t>(dv & 0x3FFFu); curPsm = static_cast<uint32_t>((dv >> 20u) & 0x3Fu); }
+                        else if (rd == 0x05u || rd == 0x0Du) { ++verts; if (!haveVert) { firstX=(uint32_t)(lo&0xFFFFu); firstY=(uint32_t)((lo>>32)&0xFFFFu); firstZ=(uint32_t)(hi&0xFFFFFFFFu); haveVert=true; } }
+                    }
+            }
+            else if (flg == 1u) // REGLIST
+            {
+                uint32_t total = nloop * nreg;
+                uint32_t adv = ((total + 1u) / 2u) * 16u; // 2 regs per qword
+                if (offset + adv > sizeBytes) goto done;
+                offset += adv;
+            }
+            else if (flg == 2u) // IMAGE
+            {
+                const uint64_t ib = static_cast<uint64_t>(nloop) * 16ull;
+                if (ib > static_cast<uint64_t>(sizeBytes - offset)) goto done;
+                offset += static_cast<uint32_t>(ib);
+            }
+            else goto done;
+            ++tagIndex;
+        }
+    done:
+        const bool mapHit = (curTbp == 0x3220u);
+        const uint32_t n = s_scan.fetch_add(1u, std::memory_order_relaxed);
+        const bool logIt = (n < 48u) || (mapHit && (s_mapHit.fetch_add(1u, std::memory_order_relaxed) < 64u));
+        if (!logIt) return;
+        const char *pname = (pathId == 1) ? "P1" : (pathId == 2) ? "P2" : "P3";
+        std::fprintf(stderr,
+                     "[F51.7:submit] n=%u path=%s bytes=%u prim=0x%x tbp=0x%x psm=0x%x verts=%u v0=(%.1f,%.1f,z=0x%x) map=%u\n",
+                     n, pname, sizeBytes, prim, curTbp, curPsm, verts,
+                     firstX / 16.0f, firstY / 16.0f, firstZ, mapHit ? 1u : 0u);
+    }
+
     inline void inRange(uint32_t offset, size_t bytes, size_t regionSize, const char *op, uint32_t address)
     {
         if (static_cast<uint64_t>(offset) + static_cast<uint64_t>(bytes) > static_cast<uint64_t>(regionSize))
@@ -167,6 +379,10 @@ bool PS2Memory::initialize(size_t ramSize)
     m_gsWriteCount.store(0, std::memory_order_relaxed);
     m_vifWriteCount.store(0, std::memory_order_relaxed);
     m_codeRegions.clear();
+    m_path3Masked = false;
+    m_path3MaskedFifo.clear();
+    m_vif1PendingPath2ImageQwc = 0u;
+    m_vif1PendingPath2DirectHl = false;
 
     try
     {
@@ -195,6 +411,8 @@ bool PS2Memory::initialize(size_t ramSize)
         memset(&gs_regs, 0, sizeof(gs_regs));
         gs_regs.dispfb1 = (0ULL << 0) | (10ULL << 9) | (0ULL << 15) | (0ULL << 32) | (0ULL << 43);
         gs_regs.display1 = (0ULL << 0) | (0ULL << 12) | (0ULL << 23) | (0ULL << 27) | (639ULL << 32) | (447ULL << 44);
+        gs_regs.dispfb2 = gs_regs.dispfb1;
+        gs_regs.display2 = gs_regs.display1;
 
         // Allocate GS VRAM (4MB)
         m_gsVRAM = new uint8_t[PS2_GS_VRAM_SIZE];
@@ -702,16 +920,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
     {
         if (address == 0x10002010)
         {
+            m_ioRegisters[address] = value & ~(1u << 31);
             if (value & (1u << 30))
             {
                 m_ioRegisters[0x10002000] = 0;
-                m_ioRegisters[0x10002010] = 0;
                 m_ioRegisters[0x10002020] = 0;
                 m_ioRegisters[0x10002030] = 0;
-            }
-            else
-            {
-                m_ioRegisters[address] = value & ~(1u << 31);
             }
         }
         else
@@ -747,10 +961,12 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
         switch (address)
         {
-        case 0x10003C10u: // VIF1_FBRST
+        case 0x10003C10u:     // VIF1_FBRST
             if (value & 0x1u) // RST
             {
                 std::memset(&vif1_regs, 0, sizeof(vif1_regs));
+                m_vif1PendingPath2ImageQwc = 0u;
+                m_vif1PendingPath2DirectHl = false;
             }
             if (value & 0x8u) // STC
             {
@@ -823,6 +1039,100 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
             const uint32_t qwc = m_ioRegisters[channelBase + 0x20];
             m_dmaStartCount.fetch_add(1, std::memory_order_relaxed);
 
+            // =================================================================
+            // PHASE G26 — EE scratchpad DMA channels: SPR_FROM (ch8 @0x1000D000,
+            // scratchpad -> RAM) and SPR_TO (ch9 @0x1000D400, RAM -> scratchpad).
+            // DC2's mg library stages each deform/character model VIF packet in the
+            // EE scratchpad (GetScrPad@0x13e3b0), then copies it into its reserved
+            // slot in the RAM-resident mgVif1Packet DMA chain via a fromSPR DMA
+            // (SendDMA@0x13e3d0), kicked by a single byte store to CHCR+1 (STR bit).
+            // That chain is streamed to VIF1/VU1 each frame. Without this copy the
+            // model packet (BASE/OFFSET/UNPACK verts/MSCAL) never lands in the chain
+            // -> VIF1 never sees it -> no XGKICK -> invisible 3D models. Registers:
+            // SADR(+0x80)=scratchpad end, MADR(+0x10)=RAM end, QWC(+0x20)=qwords.
+            // Confirmed live vs PCSX2 at the Select-Costume screen (G26).
+            // =================================================================
+            if (channelBase == 0x1000D000u || channelBase == 0x1000D400u)
+            {
+                const bool fromSpr = (channelBase == 0x1000D000u); // ch8: SPR -> RAM
+                const uint32_t sadr = m_ioRegisters[channelBase + 0x80u];
+                const uint32_t mode = (value >> 2) & 0x3u;
+                uint32_t copied = 0u;
+                // mg stages fixed-size packets and uses normal (non-chain) mode.
+                if (qwc > 0u && mode == 0u)
+                {
+                    const uint32_t sprOff = isScratchpad(sadr)
+                                                ? ps2ScratchpadOffset(sadr)
+                                                : (sadr & (PS2_SCRATCHPAD_SIZE - 1u));
+                    const uint32_t ramOff = madr & PS2_RAM_MASK;
+                    uint64_t bytes64 = static_cast<uint64_t>(qwc) * 16ull;
+                    uint32_t n = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu
+                                                           : static_cast<uint32_t>(bytes64);
+                    // Clamp to both buffers (defensive; SADR/MADR are guest-supplied).
+                    if (sprOff >= PS2_SCRATCHPAD_SIZE) n = 0u;
+                    else if (sprOff + n > PS2_SCRATCHPAD_SIZE) n = PS2_SCRATCHPAD_SIZE - sprOff;
+                    if (ramOff >= PS2_RAM_SIZE) n = 0u;
+                    else if (ramOff + n > PS2_RAM_SIZE) n = PS2_RAM_SIZE - ramOff;
+                    if (n > 0u)
+                    {
+                        if (fromSpr)
+                            std::memcpy(m_rdram + ramOff, m_scratchpad + sprOff, n);
+                        else
+                            std::memcpy(m_scratchpad + sprOff, m_rdram + ramOff, n);
+                        copied = n;
+                    }
+                }
+                // Mark the channel transfer complete: clear STR, drain QWC.
+                m_ioRegisters[channelBase] = value & ~0x100u;
+                m_ioRegisters[channelBase + 0x20u] = 0u;
+
+                if (vu1_trace_enabled())
+                {
+                    static std::atomic<uint32_t> s_g26n{0};
+                    const uint32_t gn = s_g26n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    if (gn <= 48u || (gn % 256u) == 0u)
+                    {
+                        uint32_t dst0 = 0u;
+                        const uint32_t r = madr & PS2_RAM_MASK;
+                        if (fromSpr && copied >= 4u && r + 4u <= PS2_RAM_SIZE)
+                            std::memcpy(&dst0, m_rdram + r, sizeof(dst0));
+                        std::fprintf(stderr,
+                                     "[G26:spr] n=%u ch=%s madr=0x%08x sadr=0x%08x qwc=%u mode=%u copied=%u dst0=0x%08x\n",
+                                     gn, fromSpr ? "FROM" : "TO", madr, sadr, qwc, mode, copied, dst0);
+                    }
+                }
+                return true;
+            }
+
+            // PHASE F30: chcr1 probe (VIF1 DMA channel = 0x10009000)
+            if (phaseDiagnosticsEnabled() && channelBase == 0x10009000)
+            {
+                static std::atomic<uint32_t> s_f30Chcr1{0};
+                const uint32_t n = s_f30Chcr1.fetch_add(1, std::memory_order_relaxed) + 1u;
+                if (n <= 12u || (n % 64u) == 0u)
+                {
+                    std::fprintf(stderr,
+                                 "[F30:chcr1] n=%u chcr=0x%08x madr=0x%08x qwc=%u mode=%u\n",
+                                 n, value, madr, qwc, (value >> 2) & 0x3u);
+                }
+            }
+            if (f50_12_trace_enabled() && channelBase == 0x10009000)
+            {
+                static std::atomic<uint32_t> s_f512VifDma{0};
+                const uint32_t n = s_f512VifDma.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (n <= 96u || (n % 512u) == 0u)
+                {
+                    const uint32_t tadr = m_ioRegisters[channelBase + 0x30];
+                    const uint32_t asr0 = m_ioRegisters[channelBase + 0x40];
+                    const uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
+                    std::fprintf(stderr,
+                                 "[F512:vifdma] n=%u chcr=0x%08x madr=0x%08x qwc=%u tadr=0x%08x asr0=0x%08x asr1=0x%08x mode=%u tie=%u\n",
+                                 n, value, madr, qwc, tadr, asr0, asr1,
+                                 (value >> 2) & 0x3u,
+                                 (value & (1u << 7)) ? 1u : 0u);
+                }
+            }
+
             if ((channelBase == 0x1000A000 || channelBase == 0x10009000) && m_gsVRAM)
             {
                 auto enqueueTransfer = [&](uint32_t srcAddr, uint32_t qwCount)
@@ -856,21 +1166,34 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
                     const int kMaxChainTags = 4096;
                     std::vector<uint8_t> chainBuf;
+                    const bool g136Enabled = g136_trace_enabled() && channelBase == 0x10009000u;
+                    const uint32_t g136Packet = g136_target_packet();
+                    const uint32_t g136Bulk = g136_target_bulk();
+                    bool g136ChainArmed = false;
+                    uint32_t g136Seq = 0u;
+
+                    auto g136TryArm = [&]() -> bool
+                    {
+                        if (!g136Enabled)
+                            return false;
+                        if (g136ChainArmed)
+                            return true;
+                        const uint32_t n = s_g136ArmedChains.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                        const uint32_t limit = g136_trace_limit();
+                        if (limit != 0u && n > limit)
+                            return false;
+                        g136Seq = g_dc2G136TraceSeq.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                        g136ChainArmed = true;
+                        return true;
+                    };
 
                     auto appendData = [&](uint32_t srcAddr, uint32_t qwCount)
                     {
                         const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
                         uint32_t bytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
                         const bool scratch = isScratchpad(srcAddr);
-                        uint32_t src = 0;
-                        try
-                        {
-                            src = translateAddress(srcAddr);
-                        }
-                        catch (...)
-                        {
-                            return;
-                        }
+                        uint32_t src = 0; 
+                        src = translateAddress(srcAddr); 
                         const uint8_t *base2;
                         uint32_t maxSz2;
                         if (scratch)
@@ -883,19 +1206,62 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             base2 = m_rdram;
                             maxSz2 = PS2_RAM_SIZE;
                         }
-                        if (src >= maxSz2)
-                            return;
-                        if (src + bytes > maxSz2)
-                            bytes = maxSz2 - src;
-                        if (bytes == 0)
-                            return;
-                        chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + bytes);
+                        // PR131: wrap around the physical buffer (DMAC ring) instead
+                        // of truncating, so a chain that crosses the RAM/SPR boundary
+                        // is reassembled rather than dropped.
+                        while (bytes > 0)
+                        {
+                            if (src >= maxSz2)
+                                src = 0;
+                            uint32_t chunk = bytes;
+                            if (src + chunk > maxSz2)
+                                chunk = maxSz2 - src;
+                            if (chunk == 0)
+                                break;
+                            chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
+                            bytes -= chunk;
+                            src += chunk;
+                        }
+                    };
+
+                    auto appendVif1TagHi = [&](uint32_t dmaTagAddr, uint32_t id, uint32_t qwCount, bool appendZeroTagHi) -> bool
+                    {
+                        uint32_t tagPhys = 0u;
+                        const bool tagScratch = isScratchpad(dmaTagAddr);
+                        tagPhys = translateAddress(dmaTagAddr);
+                        
+                        const uint8_t *localBase = tagScratch ? m_scratchpad : m_rdram;
+                        const uint32_t localMax = tagScratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                        if (tagPhys + 16u > localMax)
+                            return false;
+
+                        uint64_t tagHi = 0u;
+                        std::memcpy(&tagHi, localBase + tagPhys + 8u, sizeof(tagHi));
+                        if (!appendZeroTagHi && tagHi == 0u)
+                            return false;
+
+                        // VIF1 packet helpers embed 8 bytes of VIF stream in the DMAtag's upper half.
+                        chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
+                        if (phaseDiagnosticsEnabled())
+                        {
+                            static std::atomic<uint32_t> s_f31VifChainTagHi{0};
+                            const uint32_t n = s_f31VifChainTagHi.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                            if (n <= 64u || (n % 512u) == 0u)
+                            {
+                                std::fprintf(stderr,
+                                             "[F31:vif-chain-taghi] n=%u id=%u qwc=%u force=%u hi=0x%016llx\n",
+                                             n, id, qwCount, appendZeroTagHi ? 1u : 0u,
+                                             static_cast<unsigned long long>(tagHi));
+                            }
+                        }
+                        return true;
                     };
 
                     int tagsProcessed = 0;
 
                     while (tagsProcessed < kMaxChainTags)
                     {
+                        const uint32_t currentTagAddr = tagAddr;
                         const bool tagInSPR = isScratchpad(tagAddr);
                         uint32_t physTag = 0;
                         try
@@ -997,8 +1363,88 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                         }
 
+                        if (f50_12_trace_enabled() && channelBase == 0x10009000u)
+                        {
+                            static std::atomic<uint32_t> s_f512VifChain{0};
+                            const uint32_t n = s_f512VifChain.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                            if (n <= 192u || (n % 1024u) == 0u)
+                            {
+                                uint64_t tagHi = 0u;
+                                std::memcpy(&tagHi, tp + 8u, sizeof(tagHi));
+                                std::fprintf(stderr,
+                                             "[F512:vifchain] n=%u tagIndex=%d tagAddr=0x%08x phys=0x%08x spr=%u id=%u qwc=%u addr=0x%08x dataAddr=0x%08x nextTag=0x%08x payload=%u irq=%u end=%u hi=0x%016llx\n",
+                                             n, tagsProcessed, currentTagAddr, physTag, tagInSPR ? 1u : 0u,
+                                             id, tagQwc, addr, dataAddr, tagAddr,
+                                             hasPayload ? 1u : 0u, irq ? 1u : 0u, endChain ? 1u : 0u,
+                                             static_cast<unsigned long long>(tagHi));
+                            }
+                        }
+
+                        if (g136Enabled)
+                        {
+                            const bool packetHit =
+                                g136_addr_matches(currentTagAddr, g136Packet) ||
+                                g136_addr_matches(dataAddr, g136Packet) ||
+                                g136_addr_matches(addr, g136Packet);
+                            const bool bulkHit =
+                                g136_addr_matches(currentTagAddr, g136Bulk) ||
+                                g136_addr_matches(dataAddr, g136Bulk) ||
+                                g136_addr_matches(addr, g136Bulk);
+                            if ((packetHit || bulkHit) && g136TryArm())
+                            {
+                                uint64_t tagHi = 0u;
+                                std::memcpy(&tagHi, tp + 8u, sizeof(tagHi));
+                                std::fprintf(stderr,
+                                             "[G136:vifchain] seq=%u tagIndex=%d tagAddr=0x%08x id=%u qwc=%u addr=0x%08x dataAddr=0x%08x nextTag=0x%08x hitPacket=%u hitBulk=%u hi=0x%016llx\n",
+                                             g136Seq, tagsProcessed, currentTagAddr, id, tagQwc, addr, dataAddr,
+                                             tagAddr, packetHit ? 1u : 0u, bulkHit ? 1u : 0u,
+                                             static_cast<unsigned long long>(tagHi));
+
+                                if (hasPayload && tagQwc != 0u)
+                                {
+                                    try
+                                    {
+                                        const bool dataScratch = isScratchpad(dataAddr);
+                                        const uint32_t physData = translateAddress(dataAddr);
+                                        const uint8_t *dataBase = dataScratch ? m_scratchpad : m_rdram;
+                                        const uint32_t dataMax = dataScratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                                        if (physData < dataMax)
+                                        {
+                                            const uint32_t available = dataMax - physData;
+                                            const uint32_t payloadBytes = std::min<uint32_t>(
+                                                static_cast<uint32_t>(std::min<uint64_t>(static_cast<uint64_t>(tagQwc) * 16ull, 0xFFFFFFFFull)),
+                                                available);
+                                            g136_log_qwords(dataBase + physData, payloadBytes, tagQwc,
+                                                           "srcqw", g136Seq, dataAddr);
+                                        }
+                                    }
+                                    catch (...)
+                                    {
+                                        std::fprintf(stderr,
+                                                     "[G136:srcqw] seq=%u base=0x%x unreadable\n",
+                                                     g136Seq, dataAddr);
+                                    }
+                                }
+                            }
+                        }
+
                         if (hasPayload)
-                            appendData(dataAddr, tagQwc);
+                        {
+                            const bool vif1Chain = channelBase == 0x10009000u;
+                            const bool compactVif1LocalPayload =
+                                vif1Chain && (id == 1u || id == 2u || id == 5u || id == 6u || id == 7u);
+                            if (vif1Chain)
+                            {
+                                appendVif1TagHi(currentTagAddr, id, tagQwc, compactVif1LocalPayload);
+                                appendData(dataAddr, tagQwc);
+                            }
+                            else
+                                appendData(dataAddr, tagQwc);
+                        }
+                        else if (channelBase == 0x10009000u)
+                        {
+                            appendVif1TagHi(currentTagAddr, id, tagQwc, false);
+                        }
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)
@@ -1013,16 +1459,37 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                     if (!chainBuf.empty())
                     {
+                        if (g136ChainArmed && channelBase == 0x10009000u)
+                        {
+                            s_g136PendingChains.fetch_add(1u, std::memory_order_relaxed);
+                            s_g136PendingSeq.store(g136Seq, std::memory_order_relaxed);
+                            std::fprintf(stderr,
+                                         "[G136:arm] seq=%u streamBytes=%zu packet=0x%x bulk=0x%x pending=%u\n",
+                                         g136Seq, chainBuf.size(), g136Packet, g136Bulk,
+                                         s_g136PendingChains.load(std::memory_order_relaxed));
+                            g136_log_qwords(chainBuf.data(),
+                                           static_cast<uint32_t>(std::min<size_t>(chainBuf.size(), 0xFFFFFFFFu)),
+                                           static_cast<uint32_t>(chainBuf.size() / 16u),
+                                           "streamqw", g136Seq, 0u);
+                        }
                         PendingTransfer pt;
                         pt.fromScratchpad = false;
                         pt.srcAddr = 0;
                         pt.qwc = 0;
                         pt.chainData = std::move(chainBuf);
                         if (channelBase == 0x1000A000)
+                        {
                             m_pendingGifTransfers.push_back(std::move(pt));
+                        }
                         else if (channelBase == 0x10009000)
+                        {
                             m_pendingVif1Transfers.push_back(std::move(pt));
+                        }
                     }
+                    // else if (channelBase == 0x10009000u)
+                    // {
+
+                    // }
                 }
                 else if (qwc > 0)
                 {
@@ -1082,22 +1549,40 @@ void PS2Memory::processPendingTransfers()
             }
             if (p.fromScratchpad)
             {
-                if (srcPhys + sizeBytes <= PS2_SCRATCHPAD_SIZE && sizeBytes >= 16)
+                uint32_t bytesLeft = sizeBytes;
+                while (bytesLeft >= 16)
                 {
+                    if (srcPhys >= PS2_SCRATCHPAD_SIZE)
+                        srcPhys = 0;
+                    uint32_t chunk = bytesLeft;
+                    if (srcPhys + chunk > PS2_SCRATCHPAD_SIZE)
+                        chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
+                    if (chunk == 0)
+                        break;
                     m_seenGifCopy = true;
                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-                    submitGifPacket(GifPathId::Path3, m_scratchpad + srcPhys, sizeBytes, false);
+                    submitGifPacket(GifPathId::Path3, m_scratchpad + srcPhys, chunk, false);
+                    bytesLeft -= chunk;
+                    srcPhys += chunk;
                 }
             }
-            else if (srcPhys < PS2_RAM_SIZE)
+            else
             {
-                if (static_cast<uint64_t>(srcPhys) + sizeBytes > PS2_RAM_SIZE)
-                    sizeBytes = PS2_RAM_SIZE - srcPhys;
-                if (sizeBytes >= 16)
+                uint32_t bytesLeft = sizeBytes;
+                while (bytesLeft >= 16)
                 {
+                    if (srcPhys >= PS2_RAM_SIZE)
+                        srcPhys = 0;
+                    uint32_t chunk = bytesLeft;
+                    if (srcPhys + chunk > PS2_RAM_SIZE)
+                        chunk = PS2_RAM_SIZE - srcPhys;
+                    if (chunk == 0)
+                        break;
                     m_seenGifCopy = true;
                     m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-                    submitGifPacket(GifPathId::Path3, m_rdram + srcPhys, sizeBytes, false);
+                    submitGifPacket(GifPathId::Path3, m_rdram + srcPhys, chunk, false);
+                    bytesLeft -= chunk;
+                    srcPhys += chunk;
                 }
             }
         }
@@ -1109,7 +1594,30 @@ void PS2Memory::processPendingTransfers()
     {
         if (!p.chainData.empty())
         {
+            uint32_t g136Seq = 0u;
+            if (g136_trace_enabled())
+            {
+                uint32_t pending = s_g136PendingChains.load(std::memory_order_relaxed);
+                while (pending != 0u &&
+                       !s_g136PendingChains.compare_exchange_weak(pending, pending - 1u,
+                                                                  std::memory_order_relaxed,
+                                                                  std::memory_order_relaxed))
+                {
+                }
+                if (pending != 0u)
+                {
+                    g136Seq = s_g136PendingSeq.exchange(0u, std::memory_order_relaxed);
+                    if (g136Seq == 0u)
+                        g136Seq = g_dc2G136TraceSeq.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    g_dc2G136TraceActive.store(g136Seq, std::memory_order_relaxed);
+                    std::fprintf(stderr,
+                                 "[G136:process] seq=%u streamBytes=%zu\n",
+                                 g136Seq, p.chainData.size());
+                }
+            }
             processVIF1Data(p.chainData.data(), static_cast<uint32_t>(p.chainData.size()));
+            if (g136Seq != 0u)
+                g_dc2G136TraceActive.store(0u, std::memory_order_relaxed);
         }
         else if (p.qwc > 0)
         {
@@ -1126,15 +1634,37 @@ void PS2Memory::processPendingTransfers()
             }
             if (p.fromScratchpad)
             {
-                if (srcPhys + sizeBytes <= PS2_SCRATCHPAD_SIZE && sizeBytes > 0u)
-                    processVIF1Data(m_scratchpad + srcPhys, sizeBytes);
+                uint32_t bytesLeft = sizeBytes;
+                while (bytesLeft > 0)
+                {
+                    if (srcPhys >= PS2_SCRATCHPAD_SIZE)
+                        srcPhys = 0;
+                    uint32_t chunk = bytesLeft;
+                    if (srcPhys + chunk > PS2_SCRATCHPAD_SIZE)
+                        chunk = PS2_SCRATCHPAD_SIZE - srcPhys;
+                    if (chunk == 0)
+                        break;
+                    processVIF1Data(m_scratchpad + srcPhys, chunk);
+                    bytesLeft -= chunk;
+                    srcPhys += chunk;
+                }
             }
-            else if (srcPhys < PS2_RAM_SIZE)
+            else
             {
-                if (srcPhys + sizeBytes > PS2_RAM_SIZE)
-                    sizeBytes = PS2_RAM_SIZE - srcPhys;
-                if (sizeBytes > 0)
-                    processVIF1Data(srcPhys, sizeBytes);
+                uint32_t bytesLeft = sizeBytes;
+                while (bytesLeft > 0)
+                {
+                    if (srcPhys >= PS2_RAM_SIZE)
+                        srcPhys = 0;
+                    uint32_t chunk = bytesLeft;
+                    if (srcPhys + chunk > PS2_RAM_SIZE)
+                        chunk = PS2_RAM_SIZE - srcPhys;
+                    if (chunk == 0)
+                        break;
+                    processVIF1Data(srcPhys, chunk);
+                    bytesLeft -= chunk;
+                    srcPhys += chunk;
+                }
             }
         }
     }
@@ -1200,10 +1730,141 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
         m_gifArbiter->drain();
 }
 
+// ---------------------------------------------------------------------------
+// G138: title-scoped GS-stream dump (default OFF, DC2_G138_GSDUMP=<path>).
+// Writes every submitted GIF packet into a minimal PCSX2-v9-shaped .gs container
+// (44-byte header + 0x2000 zero "priv regs" + type-0 transfer records) so the
+// existing tools/g1xx_hw_*.py parsers can consume the RUNNER stream directly and
+// A/B it against ref/dumps/new_game_via_debug.gs. PATH1 records are preceded by
+// a synthetic 32-byte A+D NOP record carrying the VU packer PC (reg addr 0x0f is
+// a GS NOP, ignored by the old parsers, decoded by tools/g138_hw_slice.py).
+// Bounded by DC2_G138_GSDUMP_MAX records (default 200000).
+namespace
+{
+    struct Dc2G138GsDump
+    {
+        FILE *file = nullptr;
+        uint32_t records = 0u;
+        uint32_t maxRecords = 200000u;
+        bool closed = false;
+    };
+
+    Dc2G138GsDump &g138Dump()
+    {
+        static Dc2G138GsDump d;
+        return d;
+    }
+
+    const char *g138DumpPath()
+    {
+        static const char *path = std::getenv("DC2_G138_GSDUMP");
+        return path;
+    }
+
+    void g138WriteRecord(uint8_t path, const uint8_t *data, uint32_t sizeBytes)
+    {
+        Dc2G138GsDump &d = g138Dump();
+        if (d.closed)
+            return;
+        if (!d.file)
+        {
+            const char *p = g138DumpPath();
+            if (!p || !p[0])
+            {
+                d.closed = true;
+                return;
+            }
+            static const uint32_t maxEnv = []() -> uint32_t {
+                const char *e = std::getenv("DC2_G138_GSDUMP_MAX");
+                if (!e)
+                    return 200000u;
+                const long v = std::strtol(e, nullptr, 0);
+                return (v > 0) ? static_cast<uint32_t>(v) : 200000u;
+            }();
+            d.maxRecords = maxEnv;
+            d.file = std::fopen(p, "wb");
+            if (!d.file)
+            {
+                std::fprintf(stderr, "[G138:gsdump] fopen failed: %s\n", p);
+                d.closed = true;
+                return;
+            }
+            // 8-byte magic + 9 u32 header fields (sv,ss,so,sz,crc,sw,sh,sho,shs).
+            // sho=36/shs=0 => state offset 44, ss=0 => records begin at 44+0x2000,
+            // matching what parse_header() in the g1xx tools computes.
+            uint8_t hdr[44] = {};
+            std::memcpy(hdr, "G138GSD\0", 8);
+            uint32_t fields[9] = {1u, 0u, 0u, 0u, 0u, 640u, 448u, 36u, 0u};
+            std::memcpy(hdr + 8, fields, sizeof(fields));
+            std::fwrite(hdr, 1, sizeof(hdr), d.file);
+            static const uint8_t zeros[0x800] = {};
+            for (int i = 0; i < 4; ++i)
+                std::fwrite(zeros, 1, sizeof(zeros), d.file);
+            std::fprintf(stderr, "[G138:gsdump] writing %s (max %u records)\n", p, d.maxRecords);
+        }
+        if (d.records >= d.maxRecords)
+        {
+            std::fclose(d.file);
+            d.file = nullptr;
+            d.closed = true;
+            std::fprintf(stderr, "[G138:gsdump] record cap %u reached, file closed\n", d.maxRecords);
+            return;
+        }
+        const uint8_t type = 0u;
+        const int32_t size = static_cast<int32_t>(sizeBytes);
+        std::fwrite(&type, 1, 1, d.file);
+        std::fwrite(&path, 1, 1, d.file);
+        std::fwrite(&size, 4, 1, d.file);
+        std::fwrite(data, 1, sizeBytes, d.file);
+        ++d.records;
+        if ((d.records & 0x3FFu) == 0u)
+            std::fflush(d.file);
+    }
+
+    void g138DumpSubmit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes)
+    {
+        if (!g138DumpPath())
+            return;
+        if (!g_dc2TitleRockScope.load(std::memory_order_relaxed))
+            return;
+        // PCSX2 dump path byte convention: 0=P1(old) 1=P2 2=P3 3=P1(new).
+        uint8_t path = 2u;
+        if (pathId == GifPathId::Path1)
+            path = 3u;
+        else if (pathId == GifPathId::Path2)
+            path = 1u;
+        if (pathId == GifPathId::Path1)
+        {
+            const uint32_t pc = g_dc2G138XgPc.load(std::memory_order_relaxed);
+            uint8_t marker[32] = {};
+            const uint64_t tagLo = 1ull | (1ull << 15) | (1ull << 60); // nloop=1 eop=1 nreg=1
+            const uint64_t tagHi = 0x0Eull;                            // PACKED A+D
+            const uint64_t adData = pc;
+            const uint64_t adAddr = 0x0Full;                           // GS NOP register
+            std::memcpy(marker + 0, &tagLo, 8);
+            std::memcpy(marker + 8, &tagHi, 8);
+            std::memcpy(marker + 16, &adData, 8);
+            std::memcpy(marker + 24, &adAddr, 8);
+            g138WriteRecord(path, marker, sizeof(marker));
+        }
+        g138WriteRecord(path, data, sizeBytes);
+    }
+}
+
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
+    G146PerfScope g146Scope(g_g146GifSubmitNs);
+
     if (!data || sizeBytes < 16)
         return;
+
+    g138DumpSubmit(pathId, data, sizeBytes);
+
+    if (vu1_trace_enabled())
+    {
+        const int pid = (pathId == GifPathId::Path1) ? 1 : (pathId == GifPathId::Path2) ? 2 : 3;
+        f517_scan_submit(pid, data, sizeBytes);
+    }
 
     if (pathId == GifPathId::Path3)
     {
@@ -1230,15 +1891,24 @@ void PS2Memory::processGIFPacket(uint32_t srcPhysAddr, uint32_t qwCount)
         return;
     const uint64_t bytes64 = static_cast<uint64_t>(qwCount) * 16ull;
     uint32_t sizeBytes = (bytes64 > 0xFFFFFFFFull) ? 0xFFFFFFFFu : static_cast<uint32_t>(bytes64);
-    if (srcPhysAddr >= PS2_RAM_SIZE)
-        return;
-    if (static_cast<uint64_t>(srcPhysAddr) + static_cast<uint64_t>(sizeBytes) > static_cast<uint64_t>(PS2_RAM_SIZE))
-        sizeBytes = PS2_RAM_SIZE - srcPhysAddr;
-    if (sizeBytes < 16)
-        return;
-    m_seenGifCopy = true;
-    m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
-    submitGifPacket(GifPathId::Path3, m_rdram + srcPhysAddr, sizeBytes);
+    uint32_t bytesLeft = sizeBytes;
+    while (bytesLeft >= 16)
+    {
+        if (srcPhysAddr >= PS2_RAM_SIZE)
+            srcPhysAddr = 0;
+        uint32_t chunk = bytesLeft;
+        if (srcPhysAddr + chunk > PS2_RAM_SIZE)
+            chunk = PS2_RAM_SIZE - srcPhysAddr;
+        if (chunk == 0)
+            break;
+
+        m_seenGifCopy = true;
+        m_gifCopyCount.fetch_add(1, std::memory_order_relaxed);
+        submitGifPacket(GifPathId::Path3, m_rdram + srcPhysAddr, chunk);
+
+        bytesLeft -= chunk;
+        srcPhysAddr += chunk;
+    }
 }
 
 void PS2Memory::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
@@ -1367,7 +2037,7 @@ void PS2Memory::registerCodeRegion(uint32_t start, uint32_t end)
     region.modified.resize(sizeInWords, false);
 
     m_codeRegions.push_back(region);
-    std::cout << "Registered code region: " << std::hex << start << " - " << end << std::dec << std::endl;
+    RUNTIME_LOG("Registered code region: " << std::hex << start << " - " << end << std::dec);
 }
 
 bool PS2Memory::isAddressInRegion(uint32_t address, const CodeRegion &region)
@@ -1413,7 +2083,7 @@ void PS2Memory::markModified(uint32_t address, uint32_t size)
             if (bitIndex < region.modified.size())
             {
                 region.modified[bitIndex] = true;
-                std::cout << "Marked code at " << std::hex << addr << std::dec << " as modified" << std::endl;
+                RUNTIME_LOG("Marked code at " << std::hex << addr << std::dec << " as modified");
             }
         }
     }

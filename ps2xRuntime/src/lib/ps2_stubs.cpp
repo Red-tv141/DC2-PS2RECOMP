@@ -2,6 +2,7 @@
 #include "ps2_runtime.h"
 #include "ps2_runtime_macros.h"
 #include "ps2_syscalls.h"
+#include "ps2_iso_mount.h"
 #include <iostream>
 #include <algorithm>
 #include <array>
@@ -217,6 +218,7 @@ namespace ps2_stubs
 #include "stubs/ps2_stubs_misc.inl"
 
 #include "stubs/ps2_stubs_gs.inl"
+#include "stubs/ps2_stubs_gifpk.inl"
 #include "stubs/ps2_stubs_residentEvilCV.inl"
 
     void TODO(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -280,4 +282,46 @@ namespace ps2_stubs
         g_padOverrideState = PadInputState{};
     }
 
+    bool isoFindFileForStubs(const char *isoPath, uint32_t *lbaOut, uint32_t *sizeOut)
+    {
+        if (!getGlobalIsoMount().isOpen())
+        {
+            const char *isoCandidates[] = {
+                "D:/ps2r/dc2/Dark Cloud 2 (USA) (v2.00).iso",
+                "Dark Cloud 2 (USA) (v2.00).iso",
+            };
+            for (const char *p : isoCandidates)
+            {
+                if (getGlobalIsoMount().open(p))
+                    break;
+            }
+        }
+        if (!getGlobalIsoMount().isOpen())
+            return false;
+
+        std::string key = isoPath;
+        if (key.starts_with("cdrom0:\\")) key = key.substr(8);
+        else if (key.starts_with("cdrom0:")) key = key.substr(7);
+        std::replace(key.begin(), key.end(), '\\', '/');
+        const auto semi = key.find_last_of(';');
+        if (semi != std::string::npos)
+        {
+            key.erase(semi);
+        }
+        if (!key.starts_with("/"))
+        {
+            key = "/" + key;
+        }
+
+        IsoFileInfo info{};
+        if (!getGlobalIsoMount().findFile(key, info))
+            return false;
+        *lbaOut = info.lba;
+        *sizeOut = info.size;
+        return true;
+    }
+
+    void clearMpegCompatLayout() {}
+    void resetMpegStubState() {}
+    void resetAudioStubState() {}
 }

@@ -318,6 +318,25 @@ namespace
         return resolved.lexically_normal();
     }
 
+    std::string pathFilenameToAscii(const std::filesystem::path &p)
+    {
+        std::wstring w = p.filename().wstring();
+        std::string s;
+        s.reserve(w.size());
+        for (wchar_t c : w)
+        {
+            if (c >= L'A' && c <= L'Z')
+                s.push_back(static_cast<char>(c - L'A' + 'a'));
+            else if (c >= L'a' && c <= L'z')
+                s.push_back(static_cast<char>(c));
+            else if (c >= 0 && c <= 127)
+                s.push_back(static_cast<char>(c));
+            else
+                s.push_back('?');
+        }
+        return s;
+    }
+
     bool resolveCaseInsensitivePath(const std::filesystem::path &root,
                                     const std::filesystem::path &relative,
                                     std::filesystem::path &resolvedOut)
@@ -334,7 +353,7 @@ namespace
             }
 
             bool matched = false;
-            const std::string needle = toLowerAscii(component.string());
+            const std::string needle = pathFilenameToAscii(component);
             std::error_code iterEc;
             for (const auto &entry : std::filesystem::directory_iterator(current, iterEc))
             {
@@ -343,7 +362,7 @@ namespace
                     break;
                 }
 
-                const std::string candidate = toLowerAscii(entry.path().filename().string());
+                const std::string candidate = pathFilenameToAscii(entry.path());
                 if (candidate == needle)
                 {
                     current = entry.path();
@@ -396,7 +415,7 @@ namespace
                 continue;
             }
 
-            const std::string leaf = toLowerAscii(entry.path().filename().string());
+            const std::string leaf = pathFilenameToAscii(entry.path());
             g_cdLeafIndex.emplace(leaf, entry.path());
         }
     }

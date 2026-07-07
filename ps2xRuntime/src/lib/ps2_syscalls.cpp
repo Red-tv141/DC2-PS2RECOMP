@@ -3,6 +3,8 @@
 #include "ps2_iop_audio.h"
 #include "ps2_runtime_macros.h"
 #include "ps2_stubs.h"
+#include "Kernel/Stubs/GS.h"
+#include "ps2_iso_mount.h"
 #include <iostream>
 #include <algorithm>
 #include <cctype>
@@ -436,5 +438,77 @@ namespace ps2_syscalls
     void detachAllGuestHostThreads()
     {
         detachAllHostThreads();
+    }
+
+    static std::once_flag g_isoMountOpened;
+    static void ensureIsoOpen()
+    {
+        std::call_once(g_isoMountOpened, []() {
+            const char *isoCandidates[] = {
+                "D:/ps2r/dc2/Dark Cloud 2 (USA) (v2.00).iso",
+                "Dark Cloud 2 (USA) (v2.00).iso",
+            };
+            for (const char *p : isoCandidates)
+            {
+                if (getGlobalIsoMount().open(p))
+                    return;
+            }
+            std::cerr << "[data] ISO mount: no candidate path opened\n";
+        });
+    }
+
+    bool isoFindFileForFio(const char *path, uint32_t *lbaOut, uint32_t *sizeOut)
+    {
+        ensureIsoOpen();
+        if (!getGlobalIsoMount().isOpen())
+            return false;
+        IsoFileInfo info{};
+        if (!getGlobalIsoMount().findFile(path, info))
+            return false;
+        *lbaOut = info.lba;
+        *sizeOut = info.size;
+        return true;
+    }
+
+    bool isoReadSectorForFio(uint32_t lba, uint32_t count, void *dst)
+    {
+        ensureIsoOpen();
+        return getGlobalIsoMount().readSector(lba, count, dst);
+    }
+
+    void clearDtxCompatLayout() {}
+    void setDtxCompatLayout(const PS2DtxCompatLayout &layout) { (void)layout; }
+    void clearSoundDriverCompatLayout() {}
+    void setSoundDriverCompatLayout(const PS2SoundDriverCompatLayout &layout) { (void)layout; }
+    void resetSoundDriverRpcState() {}
+    bool handleSoundDriverRpcService(uint8_t *rdram, PS2Runtime *runtime,
+                                     uint32_t sid, uint32_t rpcNum,
+                                     uint32_t sendBuf, uint32_t sendSize,
+                                     uint32_t recvBuf, uint32_t recvSize,
+                                     uint32_t &resultPtr,
+                                     bool &signalNowaitCompletion)
+    {
+        (void)rdram; (void)runtime; (void)sid; (void)rpcNum; (void)sendBuf; (void)sendSize; (void)recvBuf; (void)recvSize; (void)resultPtr; (void)signalNowaitCompletion;
+        return false;
+    }
+    void InitAlarm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, 0);
+    }
+    void iReleaseAlarm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, 0);
+    }
+    void ReleaseAlarm(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, 0);
+    }
+    void EnableCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, 0);
+    }
+    void DisableCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        setReturnS32(ctx, 0);
     }
 }

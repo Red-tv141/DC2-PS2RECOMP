@@ -373,8 +373,15 @@ void SifCallRpc(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 
     if (!handled && sid != 0 && runtime)
     {
-        if (!runtime->iop().handleRPC(sid, rpcNum, sendBuf, sendSize, recvBuf, recvSize) &&
-            sid == IOP_SID_LIBSD)
+        runtime->iop().init(rdram);
+        uint32_t iopResultPtr = 0u;
+        bool iopSignalNowait = false;
+        if (runtime->iop().handleRPC(runtime, sid, rpcNum, sendBuf, sendSize, recvBuf, recvSize, iopResultPtr, iopSignalNowait))
+        {
+            handled = true;
+            resultPtr = iopResultPtr;
+        }
+        else if (sid == IOP_SID_LIBSD)
         {
             const uint8_t *sendPtr = sendBuf ? getConstMemPtr(rdram, sendBuf) : nullptr;
             uint8_t *recvPtr = recvBuf ? getMemPtr(rdram, recvBuf) : nullptr;
