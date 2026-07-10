@@ -11,6 +11,7 @@
 #include <atomic>
 #include <mutex>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -23,9 +24,101 @@
 std::atomic<uint32_t> g_g37_seq{0};
 std::atomic<int> g_g37_armed{0};
 bool g_g37_seq_trace = (std::getenv("DC2_G37_SEQ") != nullptr);
+std::atomic<uint64_t> g_g146GsImageNs{0};
+std::atomic<uint64_t> g_g146GsLocalNs{0};
+std::atomic<uint64_t> g_g147GsGifPacketNs{0};
+std::atomic<uint64_t> g_g147GsGifPacketCount{0};
+std::atomic<uint64_t> g_g147DrawPrimitiveNs{0};
+std::atomic<uint64_t> g_g147DrawPrimitiveCount{0};
+std::atomic<uint64_t> g_g147GifTags{0};
+std::atomic<uint64_t> g_g147PackedRegs{0};
+std::atomic<uint64_t> g_g147ReglistRegs{0};
+std::atomic<uint64_t> g_g147ImageBytes{0};
+// G171: per-packed-regDesc (0x0-0xF) timing/count, measured around each writeRegisterPacked call
+// in the packet parse loop. Default-off (DC2_G171_STAT) — isolates which register type(s) inside
+// the ~28ms/frame "parserOther" serial GIF parse (G156 finding #3) actually dominate.
+std::atomic<uint64_t> g_g171RegNs[16]{};
+std::atomic<uint64_t> g_g171RegCount[16]{};
+// G171 follow-up: A+D (packed desc 0x0E) writes an arbitrary GS register by address (hi&0xFF);
+// bucket those separately by address to find which register dominates the 0x0E cost.
+std::atomic<uint64_t> g_g171AdNs[256]{};
+std::atomic<uint64_t> g_g171AdCount[256]{};
 
 namespace
 {
+    bool g146PerfEnabled()
+    {
+        static const bool s_on = (std::getenv("DC2_PERF") != nullptr) ||
+                                 (std::getenv("DC2_G146_PERF") != nullptr) ||
+                                 (std::getenv("DC2_G147_PERF") != nullptr);
+        return s_on;
+    }
+
+    bool g147PerfEnabled()
+    {
+        static const bool s_on = (std::getenv("DC2_G147_PERF") != nullptr);
+        return s_on;
+    }
+
+    bool g171PerfEnabled()
+    {
+        static const bool s_on = (std::getenv("DC2_G171_STAT") != nullptr);
+        return s_on;
+    }
+
+    struct G146PerfScope
+    {
+        bool on = false;
+        std::chrono::steady_clock::time_point t0;
+        std::atomic<uint64_t> *dst = nullptr;
+
+        explicit G146PerfScope(std::atomic<uint64_t> &target)
+        {
+            static const bool s_on = g146PerfEnabled();
+            on = s_on;
+            dst = &target;
+            if (on)
+                t0 = std::chrono::steady_clock::now();
+        }
+
+        ~G146PerfScope()
+        {
+            if (!on || !dst)
+                return;
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            dst->fetch_add(static_cast<uint64_t>(ns), std::memory_order_relaxed);
+        }
+    };
+
+    struct G147CountedPerfScope
+    {
+        bool on = false;
+        std::chrono::steady_clock::time_point t0;
+        std::atomic<uint64_t> *dstNs = nullptr;
+        std::atomic<uint64_t> *dstCount = nullptr;
+
+        G147CountedPerfScope(std::atomic<uint64_t> &targetNs, std::atomic<uint64_t> &targetCount)
+        {
+            static const bool s_on = g147PerfEnabled();
+            on = s_on;
+            dstNs = &targetNs;
+            dstCount = &targetCount;
+            if (on)
+                t0 = std::chrono::steady_clock::now();
+        }
+
+        ~G147CountedPerfScope()
+        {
+            if (!on || !dstNs || !dstCount)
+                return;
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            dstNs->fetch_add(static_cast<uint64_t>(ns), std::memory_order_relaxed);
+            dstCount->fetch_add(1u, std::memory_order_relaxed);
+        }
+    };
+
     // [G35] GIF register-sequence capture for the costume model composite. Armed when a CT32
     // 0x2720 TEX0 is bound; logs the subsequent TEX0/PRIM/XYZ register writes so we can see the
     // exact interleaving that clobbers the CT32 bind back to T8 before the sprite's vertices.
@@ -907,6 +1000,44 @@ void g124_note_stream(uint32_t sizeBytes)
     }
 }
 
+// G176: presentation-latch generation counter. The host present thread's UploadFrame
+// re-did the full snapshot copy + UpdateTexture GPU upload every host tick (~60Hz) even
+// though the latched snapshot only changes when latchHostPresentationFrame runs (once per
+// guest frame at the mgEndFrame boundary since G175, ~6.5Hz on the title). The counter
+// lets present skip that redundant work when the snapshot is unchanged. Incremented AFTER
+// the snapshot fields are written, still under s_g189HostPresentMutex (the bump-guard in
+// latchHostPresentationFrame), so a reader that observes a new generation and then takes
+// s_g189HostPresentMutex for the copy always sees the snapshot that generation describes (a
+// reader racing an in-progress latch at worst re-uploads one duplicate frame, never misses one).
+// File-static + extern accessor — same no-header idiom as g150_*/g175_*.
+static std::atomic<uint64_t> s_g176LatchGeneration{0ull};
+
+// G189 (2026-07-10): a DEDICATED mutex for the published host-presentation snapshot
+// (m_hostPresentationFrame + its w/h/fbp/preferred fields + m_hasHostPresentationFrame),
+// separate from the general recursive GS::m_stateMutex. Root cause: under
+// DC2_G157_PIPELINE=1 on a cheap/idle screen, the GS worker thread calls writeRegister()
+// (which locks m_stateMutex) at very high frequency while it's almost never idle; the present
+// thread's copyLatchedHostPresentationFrame() also needed m_stateMutex just to read this one
+// small published snapshot, and lost the race against the worker's near-constant lock churn
+// for seconds to minutes at a stretch (a lock-convoy/starvation hang, not a deadlock — see
+// plans/phase-G189-fix-log.md). This snapshot's real writer/reader relationship is:
+// latchHostPresentationFrame() (worker thread, ~once per guest frame) writes it,
+// copyLatchedHostPresentationFrame() (present thread, ~once per host tick) reads it, and
+// GS::reset() clears it once at startup — none of that needs to be serialized against the
+// GS worker's own VRAM/register-write traffic (the worker is documented elsewhere as the SOLE
+// writer of GS VRAM/state, so latchHostPresentationFrame's own VRAM reads need no mutual
+// exclusion against itself; the presentation registers it reads from m_privRegs are already
+// written by the EE thread WITHOUT any mutex, per ps2_memory.cpp's writeIORegister — gated
+// only by the G157 credit-wait timing, not by m_stateMutex). Splitting this into its own
+// low-traffic mutex removes the present thread from contending with writeRegister()'s
+// per-register calls entirely; it now only ever contends with the far rarer per-frame latch.
+static std::mutex s_g189HostPresentMutex;
+
+uint64_t g176_present_latch_generation()
+{
+    return s_g176LatchGeneration.load(std::memory_order_acquire);
+}
+
 GS::GS()
 {
     // F62: build the GSMem swizzle lookup tables once before any upload/sample
@@ -955,13 +1086,22 @@ void GS::reset()
     m_preferredDisplaySourceFrame = {};
     m_preferredDisplayDestFbp = 0;
     m_hasPreferredDisplaySource = false;
-    m_hostPresentationFrame.clear();
-    m_hostPresentationWidth = 0u;
-    m_hostPresentationHeight = 0u;
-    m_hostPresentationDisplayFbp = 0u;
-    m_hostPresentationSourceFbp = 0u;
-    m_hostPresentationUsedPreferred = false;
-    m_hasHostPresentationFrame = false;
+    // G189: the host-presentation snapshot fields are guarded by the dedicated
+    // s_g189HostPresentMutex, not m_stateMutex (already held above) — nest the lock rather
+    // than reordering, since this is the only site that ever takes both (safe: every other
+    // site takes at most one of the two, so there is no lock-order-inversion risk).
+    {
+        std::lock_guard<std::mutex> presentLock(s_g189HostPresentMutex);
+        m_hostPresentationFrame.clear();
+        m_hostPresentationWidth = 0u;
+        m_hostPresentationHeight = 0u;
+        m_hostPresentationDisplayFbp = 0u;
+        m_hostPresentationSourceFbp = 0u;
+        m_hostPresentationUsedPreferred = false;
+        m_hasHostPresentationFrame = false;
+    }
+    // G176: reset clears the snapshot — advance the generation so present re-reads it.
+    s_g176LatchGeneration.fetch_add(1ull, std::memory_order_release);
     s_pendingImageBytes = 0u;
     s_f31UploadPresentationCandidate = {};
 
@@ -1171,7 +1311,15 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
 
 void GS::latchHostPresentationFrame()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    // G189: dedicated mutex, not m_stateMutex — see s_g189HostPresentMutex's comment above.
+    std::lock_guard<std::mutex> lock(s_g189HostPresentMutex);
+    // Bump on EVERY exit path (success, dual-merge, clear-on-invalid) — any call can
+    // change the snapshot. Destructs before the lock_guard releases s_g189HostPresentMutex.
+    struct G176LatchBump
+    {
+        ~G176LatchBump() { s_g176LatchGeneration.fetch_add(1ull, std::memory_order_release); }
+    } g176Bump;
+    (void)g176Bump;
 
     // PHASE F30: latch state probe, retained only for explicit phase tracing.
     if (phaseDiagnosticsEnabled())
@@ -1632,7 +1780,8 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t *outSourceFbp,
                                           bool *outUsedPreferred) const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    // G189: dedicated mutex, not m_stateMutex — see s_g189HostPresentMutex's comment above.
+    std::lock_guard<std::mutex> lock(s_g189HostPresentMutex);
     if (!m_hasHostPresentationFrame || m_hostPresentationFrame.empty())
     {
         outPixels.clear();
@@ -1690,6 +1839,25 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
 
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    G147CountedPerfScope g147GifScope(g_g147GsGifPacketNs, g_g147GsGifPacketCount);
+    const bool g147On = g147PerfEnabled();
+    uint64_t g147Tags = 0ull;
+    uint64_t g147PackedRegs = 0ull;
+    uint64_t g147ReglistRegs = 0ull;
+    uint64_t g147ImageBytesLocal = 0ull;
+    auto g147FlushCounters = [&]() {
+        if (!g147On)
+            return;
+        if (g147Tags)
+            g_g147GifTags.fetch_add(g147Tags, std::memory_order_relaxed);
+        if (g147PackedRegs)
+            g_g147PackedRegs.fetch_add(g147PackedRegs, std::memory_order_relaxed);
+        if (g147ReglistRegs)
+            g_g147ReglistRegs.fetch_add(g147ReglistRegs, std::memory_order_relaxed);
+        if (g147ImageBytesLocal)
+            g_g147ImageBytes.fetch_add(g147ImageBytesLocal, std::memory_order_relaxed);
+    };
+
     std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
     if (!data || sizeBytes < 16 || !m_vram)
         return;
@@ -1761,10 +1929,14 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                              db, imageBytes, s_pendingImageBytes - imageBytes);
         }
         processImageData(data, imageBytes);
+        g147ImageBytesLocal += imageBytes;
         s_pendingImageBytes -= imageBytes;
         offset = imageBytes;
         if (s_pendingImageBytes != 0u)
+        {
+            g147FlushCounters();
             return;
+        }
     }
 
     while (offset + 16 <= sizeBytes)
@@ -1780,6 +1952,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xF);
         if (nreg == 0)
             nreg = 16;
+        ++g147Tags;
 
         bool pre = ((tagLo >> 46) & 1) != 0;
         if (pre)
@@ -1795,16 +1968,62 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         {
             m_hwregX = 0;
             m_hwregY = 0;
+            const bool g171On = g171PerfEnabled();
             for (uint32_t loop = 0; loop < nloop; ++loop)
             {
                 for (uint32_t r = 0; r < nreg; ++r)
                 {
                     if (offset + 16 > sizeBytes)
+                    {
+                        g147FlushCounters();
                         return;
+                    }
                     uint64_t lo = loadLE64(data + offset);
                     uint64_t hi = loadLE64(data + offset + 8);
                     offset += 16;
-                    writeRegisterPacked(regs[r], lo, hi);
+                    if (g171On)
+                    {
+                        const auto g171T0 = std::chrono::steady_clock::now();
+                        writeRegisterPacked(regs[r], lo, hi);
+                        const auto g171Ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - g171T0).count();
+                        const uint8_t g171Desc = regs[r] & 0xFu;
+                        g_g171RegNs[g171Desc].fetch_add(static_cast<uint64_t>(g171Ns), std::memory_order_relaxed);
+                        g_g171RegCount[g171Desc].fetch_add(1u, std::memory_order_relaxed);
+                        if (g171Desc == 0x0Eu)
+                        {
+                            const uint8_t g171AdAddr = static_cast<uint8_t>(hi & 0xFFu);
+                            g_g171AdNs[g171AdAddr].fetch_add(static_cast<uint64_t>(g171Ns), std::memory_order_relaxed);
+                            g_g171AdCount[g171AdAddr].fetch_add(1u, std::memory_order_relaxed);
+                            // G171 follow-up: identify WHAT is being drawn on the slow A+D XYZ2/XYZF2
+                            // vertex-kick path (candidate: non-deferred 2D sprite raster, since G144
+                            // only defers textured TRIS). Rate-limited trace on expensive calls only.
+                            if ((g171AdAddr == 0x04u || g171AdAddr == 0x05u) && g171Ns > 5000)
+                            {
+                                static std::atomic<uint32_t> s_g171SlowCount{0};
+                                const uint32_t sn = s_g171SlowCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                                if (sn <= 40u || (sn % 200u) == 0u)
+                                {
+                                    const GSContext &sctx = m_ctx[m_prim.ctxt & 1u];
+                                    const GSVertex &vA = m_vtxQueue[(m_vtxCount + kMaxVerts - 1) % kMaxVerts];
+                                    const GSVertex &vB = m_vtxQueue[(m_vtxCount + kMaxVerts - 2) % kMaxVerts];
+                                    std::fprintf(stderr,
+                                                 "[G171:slowad] sn=%u addr=0x%02x ns=%lld prim=%u tme=%u abe=%u fbp=0x%x fbw=%u psm=0x%x scissor=(%d,%d)-(%d,%d) vtx=(%.1f,%.1f)-(%.1f,%.1f)\n",
+                                                 sn, g171AdAddr, static_cast<long long>(g171Ns),
+                                                 static_cast<uint32_t>(m_prim.type),
+                                                 (unsigned)m_prim.tme, (unsigned)m_prim.abe,
+                                                 sctx.frame.fbp, sctx.frame.fbw, static_cast<uint32_t>(sctx.frame.psm),
+                                                 sctx.scissor.x0, sctx.scissor.y0, sctx.scissor.x1, sctx.scissor.y1,
+                                                 vA.x, vA.y, vB.x, vB.y);
+                                }
+                            }
+                        }
+                    }
+                    else
+                    {
+                        writeRegisterPacked(regs[r], lo, hi);
+                    }
+                    ++g147PackedRegs;
                 }
             }
         }
@@ -1815,9 +2034,13 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                 for (uint32_t r = 0; r < nreg; ++r)
                 {
                     if (offset + 8 > sizeBytes)
+                    {
+                        g147FlushCounters();
                         return;
+                    }
                     writeRegister(regs[r], loadLE64(data + offset));
                     offset += 8;
+                    ++g147ReglistRegs;
                 }
             }
             if ((nloop * nreg) & 1)
@@ -1890,14 +2113,17 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                             s_up[i].dbp, s_up[i].dpsm, (unsigned long long)s_up[i].n, (unsigned long long)s_up[i].nz);
             }
             processImageData(data + offset, imageBytes);
+            g147ImageBytesLocal += imageBytes;
             offset += imageBytes;
             if (imageBytes < expectedImageBytes)
             {
                 s_pendingImageBytes = expectedImageBytes - imageBytes;
+                g147FlushCounters();
                 return;
             }
         }
     }
+    g147FlushCounters();
 }
 
 void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
@@ -3023,10 +3249,50 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     }
 }
 
+// G144/G145: defined in ps2_gs_rasterizer.cpp; drains pending tile-binning deferred triangles
+// before transfers that overlap VRAM they depend on. Unknown ranges fall back to flushing.
+// G149: bump the de-swizzle texture-cache VRAM generation so stale decoded buffers are invalidated.
+extern void g149BumpVramGen();
+extern void g144FlushPendingUpload();
+extern void g144FlushPendingUploadRange(uint32_t dbp,
+                                        uint8_t dbw,
+                                        uint8_t dpsm,
+                                        uint32_t dsax,
+                                        uint32_t dsay,
+                                        uint32_t rrw,
+                                        uint32_t rrh);
+extern void g144FlushPendingLocalTransferRange(uint32_t sbp,
+                                               uint8_t sbw,
+                                               uint8_t spsm,
+                                               uint32_t ssax,
+                                               uint32_t ssay,
+                                               uint32_t dbp,
+                                               uint8_t dbw,
+                                               uint8_t dpsm,
+                                               uint32_t dsax,
+                                               uint32_t dsay,
+                                               uint32_t rrw,
+                                               uint32_t rrh);
+
 void GS::performLocalToLocalTransfer()
 {
+    G146PerfScope g146Scope(g_g146GsLocalNs);
+
+    const bool g145DirtyUpload = envFlagEnabled("DC2_G145_DIRTY_UPLOAD") &&
+                                 !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD");
+    if (!g145DirtyUpload)
+        g144FlushPendingUpload();
+
     if (!m_vram)
         return;
+
+    g149BumpVramGen(); // VRAM about to change: invalidate the de-swizzle texture cache
+    // G178: per-page write generations for the GPU-resident texture cache (no-op when off).
+    {
+        extern void g178NoteVramWriteRect(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+        g178NoteVramWriteRect(m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
+                              m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh);
+    }
 
     uint32_t sbp = m_bitbltbuf.sbp;
     uint8_t sbw = m_bitbltbuf.sbw;
@@ -3052,6 +3318,12 @@ void GS::performLocalToLocalTransfer()
     if (rrw == 0u || rrh == 0u)
     {
         return;
+    }
+
+    if (g145DirtyUpload)
+    {
+        g144FlushPendingLocalTransferRange(sbp, sbw, spsm, ssax, ssay,
+                                           dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
     }
 
     PS2_IF_AGRESSIVE_LOGS({
@@ -3322,7 +3594,10 @@ void GS::vertexKick(bool drawing)
     }
 
     if (drawing)
+    {
+        G147CountedPerfScope g147DrawScope(g_g147DrawPrimitiveNs, g_g147DrawPrimitiveCount);
         m_rasterizer.drawPrimitive(this);
+    }
 
     switch (m_prim.type)
     {
@@ -3353,6 +3628,14 @@ void GS::vertexKick(bool drawing)
 
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
+    G146PerfScope g146Scope(g_g146GsImageNs);
+
+    const bool g145DirtyUpload = envFlagEnabled("DC2_G145_DIRTY_UPLOAD") &&
+                                 !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD");
+    if (!g145DirtyUpload)
+        g144FlushPendingUpload();
+
+    // G145 opt-in: the deferred-triangle upload barrier is range-checked after host-to-local is confirmed.
     if (renderQualityTraceEnabled())
     {
         static std::atomic<int> s_f37PidEntry{0};
@@ -3378,6 +3661,26 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
     }
     if (m_trxdir != 0 || !m_vram)
         return;
+
+    g149BumpVramGen(); // host-to-local upload about to write VRAM: invalidate the texture cache
+    // G178: per-page write generations for the GPU-resident texture cache (no-op when off).
+    {
+        extern void g178NoteVramWriteRect(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+        g178NoteVramWriteRect(m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
+                              m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh);
+    }
+
+    // G145: flush only if this upload overlaps a pending deferred draw's texture/CLUT/target.
+    if (g145DirtyUpload)
+    {
+        g144FlushPendingUploadRange(m_bitbltbuf.dbp,
+                                    m_bitbltbuf.dbw,
+                                    m_bitbltbuf.dpsm,
+                                    m_trxpos.dsax,
+                                    m_trxpos.dsay,
+                                    m_trxreg.rrw,
+                                    m_trxreg.rrh);
+    }
 
     // [G37:seq] GS-order trace of writes to the 0x2720 work page (uploads), shared with the
     // rasterizer's RTT-draw + composite events, to pin what clobbers the model RTT before the
@@ -3434,11 +3737,25 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
     uint32_t dsax = m_trxpos.dsax;
     uint32_t dsay = m_trxpos.dsay;
 
+    // G155 (perf, bit-exact): the upload-preview candidate below (this full-buffer nonzero scan
+    // plus, for CT* uploads, a 512x448x4 RGBA assign+copy) is consumed ONLY by the default-off host
+    // upload-preview fallback (uploadPresentationFallbackEnabled -> the [F31:upload-present] latch)
+    // and by DC2_PHASE_TRACE traces. It never touches VRAM. In the normal render path it is pure
+    // dead work — the title streams ~1.9 MB of host->local image data/frame, so this scan alone is a
+    // ~1.9M byte compares/frame tax on the (MTGS worker) upload budget for no visible effect. Skip
+    // the scan unless a consumer is active; nonzeroBytes then stays 0 so the candidate block below is
+    // naturally skipped (bit-exact). Kill switch DC2_G155_NO_SKIP_PREVIEW forces the old scan.
     uint32_t nonzeroBytes = 0u;
-    for (uint32_t i = 0; i < sizeBytes; ++i)
+    static const bool s_g155PreviewNeeded =
+        uploadPresentationFallbackEnabled() || phaseDiagnosticsEnabled() ||
+        envFlagEnabled("DC2_G155_NO_SKIP_PREVIEW");
+    if (s_g155PreviewNeeded)
     {
-        if (data[i] != 0u)
-            ++nonzeroBytes;
+        for (uint32_t i = 0; i < sizeBytes; ++i)
+        {
+            if (data[i] != 0u)
+                ++nonzeroBytes;
+        }
     }
 
     if (nonzeroBytes != 0u && isHostPresentableUploadPsm(dpsm) && rrw != 0u && rrh != 0u)

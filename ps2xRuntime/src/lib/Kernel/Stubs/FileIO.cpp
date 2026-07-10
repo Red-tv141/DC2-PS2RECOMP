@@ -138,6 +138,25 @@ namespace ps2_stubs
         ps2_syscalls::fioWrite(rdram, ctx, runtime);
     }
 
+    void sceDevctl(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+    {
+        // int sceDevctl(const char *dev, int cmd, void *arg, size_t arglen, void *buf, size_t buflen)
+        // DC2 only calls this from HddConectCheck/CheckInstallSpace to probe the HDD.
+        // No dev9/HDD IOP module exists in the runtime, so fail like the real libc does
+        // when the fs RPC endpoint is absent (-11); the game then takes the no-HDD path.
+        static int logCount = 0;
+        if (logCount < 8)
+        {
+            const uint32_t devAddr = getRegU32(ctx, 4);
+            const char *dev = reinterpret_cast<const char *>(getMemPtr(rdram, devAddr));
+            std::cerr << "[stub] sceDevctl dev='" << (dev ? dev : "?")
+                      << "' cmd=0x" << std::hex << getRegU32(ctx, 5) << std::dec
+                      << " -> -11 (no HDD)" << std::endl;
+            ++logCount;
+        }
+        setReturnS32(ctx, -11);
+    }
+
     void cvFsSetDefDev(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         static int logCount = 0;

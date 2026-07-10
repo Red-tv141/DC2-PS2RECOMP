@@ -7,6 +7,7 @@
 #include <cstring>
 #include <stdexcept>
 #include <algorithm>
+#include <chrono>
 #include <string>
 #include <vector>
 
@@ -16,11 +17,39 @@ std::atomic<uint32_t> g_dc2G136TraceSeq{0};
 // before it submits the kicked packet on PATH1, so the G138 GS-stream dump can attribute
 // each PATH1 record to its VU packer without changing the submit signature.
 std::atomic<uint32_t> g_dc2G138XgPc{0};
+std::atomic<uint64_t> g_g146GifSubmitNs{0};
 // G138: title scope flag (defined in dc2_game_override.cpp).
 extern std::atomic<bool> g_dc2TitleRockScope;
 
 namespace
 {
+    struct G146PerfScope
+    {
+        bool on = false;
+        std::chrono::steady_clock::time_point t0;
+        std::atomic<uint64_t> *dst = nullptr;
+
+        explicit G146PerfScope(std::atomic<uint64_t> &target)
+        {
+        static const bool s_on = (std::getenv("DC2_PERF") != nullptr) ||
+                                 (std::getenv("DC2_G146_PERF") != nullptr) ||
+                                 (std::getenv("DC2_G147_PERF") != nullptr);
+            on = s_on;
+            dst = &target;
+            if (on)
+                t0 = std::chrono::steady_clock::now();
+        }
+
+        ~G146PerfScope()
+        {
+            if (!on || !dst)
+                return;
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            dst->fetch_add(static_cast<uint64_t>(ns), std::memory_order_relaxed);
+        }
+    };
+
     bool envFlagEnabled(const char *name)
     {
         const char *value = std::getenv(name);
@@ -858,6 +887,15 @@ void PS2Memory::write128(uint32_t address, __m128i value)
     }
 }
 
+// G157 (ps2_gif_arbiter.cpp, default OFF behind DC2_G157_PIPELINE=1 + DC2_G150_MTGS=1): the
+// pipelined MTGS worker latches presentation state (PMODE/DISPFB1/2/DISPLAY1/2/SMODE2) some time
+// after the EE thread has moved on to the next frame. Those 6 registers are written here,
+// directly and synchronously, completely outside the GifArbiter/worker FIFO — so without a gate
+// the EE could overwrite them for frame N+1 before the worker has latched frame N, silently
+// reintroducing the exact register-race that broke the original (v1) MTGS present-latch design.
+// No-op unless pipelining is actually enabled.
+extern void g150_pipeline_wait_register_slot();
+
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
     if (isGsPrivReg(address))
@@ -867,6 +905,24 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
         {
             const uint32_t off = address & 7u;
             const uint32_t regOff = (address - PS2_GS_PRIV_REG_BASE) & ~0x7u;
+
+            // G157: gate writes to the presentation-affecting registers only (pmode, smode2,
+            // dispfb1/2, display1/2) — not csr/imr/etc, which are written far more often and are
+            // irrelevant to latchHostPresentationFrame().
+            switch (regOff)
+            {
+            case 0x0000u: // pmode
+            case 0x0020u: // smode2
+            case 0x0070u: // dispfb1
+            case 0x0080u: // display1
+            case 0x0090u: // dispfb2
+            case 0x00A0u: // display2
+                g150_pipeline_wait_register_slot();
+                break;
+            default:
+                break;
+            }
+
             if (regOff == 0x1000u && off == 0u)
             {
                 constexpr uint32_t kW1cMask = 0x3u;
@@ -1824,6 +1880,8 @@ namespace
 
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
+    G146PerfScope g146Scope(g_g146GifSubmitNs);
+
     if (!data || sizeBytes < 16)
         return;
 

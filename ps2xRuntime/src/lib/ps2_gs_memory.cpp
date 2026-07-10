@@ -332,6 +332,17 @@ namespace GSMem
         return PixelStorageTraits<P8>::Read(PageTableP8, data, bp, bw, x, y);
     }
 
+    // G162: exposes the byte OFFSET a P8 texel would be read from, without reading it -- reuses
+    // the exact same live PageTableP8 addressing PixelStorageTraits<P8>::Read() uses internally
+    // (zero re-derivation of the block/column swizzle math), so a caller can precompute an
+    // offset table on the CPU (cheap: pure LUT-indexed arithmetic, no VRAM touch) and hand the
+    // actual scattered-byte GATHER to a different consumer (e.g. a GPU shader) while staying
+    // byte-for-byte consistent with ReadP8's addressing by construction.
+    u32 AddressP8(u32 bp, u32 bw, u32 x, u32 y)
+    {
+        return PixelStorageTraits<P8>::Address(PageTableP8, bp, bw, x, y);
+    }
+
     u32 ReadP8H(u8* data, u32 bp, u32 bw, u32 x, u32 y)
     {
         return PixelStorageTraits<P8H>::Read(PageTableC32, data, bp, bw, x, y);

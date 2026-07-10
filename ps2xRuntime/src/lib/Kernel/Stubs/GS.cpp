@@ -11,6 +11,11 @@
 // F60 spin diagnostics (defined in ps2_runtime.cpp).
 extern std::atomic<uint64_t> g_f60_gsSyncV;
 
+// G177 (defined in ps2_gif_arbiter.cpp): ordered-closure hand-off to the GS worker FIFO.
+// Returns false when MTGS is off / worker not running — caller applies inline.
+#include <functional>
+extern bool g150_enqueue_apply(std::function<void()> fn);
+
 namespace ps2_stubs
 {
     namespace
@@ -302,6 +307,68 @@ namespace ps2_stubs
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.xyz2a.reg & 0xFFu), clear.xyz2a.value);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.xyz2b.reg & 0xFFu), clear.xyz2b.value);
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.testb.reg & 0xFFu), clear.testb.value);
+        }
+
+        // G177: sceGsSwapDBuff / sceGsPutDrawEnv / sceGsPutDispEnv are STUBBED (DC2 calls
+        // sceGsSwapDBuff from mgEndFrame EVERY frame, alternating buffers), and their register
+        // writes used to be applied DIRECTLY from the EE thread (Support.h applyGsDispEnv /
+        // applyGsRegPairs): the 8 drawenv general registers (FRAME_1/ZBUF_1/XYOFFSET_1/SCISSOR_1/
+        // PRMODECONT/COLCLAMP/DTHE/TEST_1) poked the GS state machine BETWEEN the worker's queued
+        // packets (out of FIFO order), and the dispenv privileged registers mutated the gs_regs
+        // fields directly — bypassing BOTH the GifArbiter FIFO and the G157 pipeline
+        // register-slot gate in PS2Memory::writeIORegister (G157's whole-tree audit missed this
+        // site: it writes through a local `regs.` reference, not `gs_regs.`). Under
+        // DC2_G157_PIPELINE=1 the EE runs frame N+1's mgEndFrame while the worker is still
+        // drawing frame N, so the direct writes clobber frame N's draw state mid-stream — the
+        // G174 title-rock wrong-color race. Fix: route the drawenv registers through the arbiter
+        // as a synthesized A+D GIF packet (what the real sceGsPutDrawEnv does via GIF DMA), and
+        // the dispenv privileged registers through PS2Memory::writeIORegister (which carries the
+        // G157 gate). Kill-switch DC2_G177_DIRECT_DRAWENV=1 restores the old direct writes.
+        bool g177DirectDrawEnv()
+        {
+            static const bool enabled = envFlagEnabled("DC2_G177_DIRECT_DRAWENV");
+            return enabled;
+        }
+
+        void g177ApplyGsDispEnv(PS2Runtime *runtime, const GsDispEnvMem &env)
+        {
+            // DISPENV stays IMMEDIATE-on-EE (the exact pre-G177 behavior) in every mode. Two
+            // rerouting designs were built and REFUTED by measurement:
+            //  (1) via PS2Memory::writeIORegister (G157 gate) — ordering-correct but the
+            //      per-frame gate wait serialized the G157 pipeline, 9.3 → 6.8 fps;
+            //  (2) via the worker FIFO (g150_enqueue_apply) — no stall, but deferral breaks EE
+            //      PROGRAM ORDER against the guest's own later writes of the same privileged
+            //      registers: golden sweep went h=415 → h=416 with 27/28 frames out of band.
+            // The G174 rock-color race is the DRAWENV clobber (g177ApplyGsRegPairs below), not
+            // dispenv: dispenv feeds only the presentation latch. The residual (dispenv can
+            // reach the latch one frame early under DC2_G157_PIPELINE=1) is a bounded,
+            // presentation-only hazard that predates G177 — fixing it requires deferring ALL
+            // EE writers of these registers uniformly (a G157-gate redesign, its own phase).
+            applyGsDispEnv(runtime, env);
+        }
+
+        void g177ApplyGsRegPairs(PS2Runtime *runtime, const GsRegPairMem *pairs, size_t pairCount)
+        {
+            if (!runtime || !pairs || !runtime->syncCoreSubsystems())
+                return;
+            if (g177DirectDrawEnv())
+            {
+                applyGsRegPairs(runtime, pairs, pairCount);
+                return;
+            }
+            // A+D packed GIF packet: giftag, then one {data,reg} qword per register —
+            // GsRegPairMem already has exactly the A+D qword layout.
+            uint8_t buf[16u + 16u * 16u];
+            const size_t count = std::min<size_t>(pairCount, 16u);
+            const uint64_t tagLo = makeGiftagAplusD(static_cast<uint32_t>(count));
+            const uint64_t tagHi = 0xEull; // REGS[0] = A+D
+            std::memcpy(buf, &tagLo, sizeof(tagLo));
+            std::memcpy(buf + 8, &tagHi, sizeof(tagHi));
+            std::memcpy(buf + 16, pairs, count * sizeof(GsRegPairMem));
+            runtime->memory().submitGifPacket(GifPathId::Path3,
+                                              buf,
+                                              static_cast<uint32_t>(16u + count * sizeof(GsRegPairMem)),
+                                              true);
         }
 
         void refreshPacketBuilderPendingCount(uint8_t *rdram, PS2Runtime *runtime, uint32_t stateAddr);
@@ -1146,7 +1213,7 @@ namespace ps2_stubs
             setReturnS32(ctx, -1);
             return;
         }
-        applyGsDispEnv(runtime, env);
+        g177ApplyGsDispEnv(runtime, env);
         setReturnS32(ctx, 0);
     }
 
@@ -1159,7 +1226,7 @@ namespace ps2_stubs
             setReturnS32(ctx, -1);
             return;
         }
-        applyGsRegPairs(runtime, pairs, 8u);
+        g177ApplyGsRegPairs(runtime, pairs, 8u);
         setReturnS32(ctx, 0);
     }
 
@@ -1539,7 +1606,7 @@ namespace ps2_stubs
         const uint64_t debugDrawFrameReg = (which == 0u) ? db.draw01.frame1.value
                                                          : db.draw11.frame1.value;
 
-        applyGsDispEnv(runtime, db.disp[which]);
+        g177ApplyGsDispEnv(runtime, db.disp[which]);
         static uint32_t s_swapDbuffLogCount = 0u;
         if (s_swapDbuffLogCount < 32u)
         {
@@ -1560,8 +1627,8 @@ namespace ps2_stubs
         logSwapProbeStage(runtime, "swap-pre", which, debugDrawFrameReg, db.disp[which].dispfb, hasClearPacket);
         if (which == 0u)
         {
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw01), 8u);
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw02), 8u);
+            g177ApplyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw01), 8u);
+            g177ApplyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw02), 8u);
             if (hasSeededGsClearPacket(db.clear0))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u);
@@ -1573,8 +1640,8 @@ namespace ps2_stubs
         }
         else
         {
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw11), 8u);
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw12), 8u);
+            g177ApplyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw11), 8u);
+            g177ApplyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw12), 8u);
             if (hasSeededGsClearPacket(db.clear1))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
@@ -1619,14 +1686,14 @@ namespace ps2_stubs
             return;
         }
 
-        applyGsDispEnv(runtime, db.disp[which]);
+        g177ApplyGsDispEnv(runtime, db.disp[which]);
         if (which == 0u)
         {
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw0), 8u);
+            g177ApplyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw0), 8u);
         }
         else
         {
-            applyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw1), 8u);
+            g177ApplyGsRegPairs(runtime, reinterpret_cast<const GsRegPairMem *>(&db.draw1), 8u);
         }
 
         setReturnS32(ctx, static_cast<int32_t>(which ^ 1u));

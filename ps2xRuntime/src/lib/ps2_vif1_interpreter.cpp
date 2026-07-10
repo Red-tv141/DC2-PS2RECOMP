@@ -2,6 +2,7 @@
 #include "runtime/ps2_memory.h"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -12,6 +13,7 @@
 void g124_note_mscal(uint32_t startPC, const char *kind);
 void g124_note_stream(uint32_t sizeBytes);
 extern std::atomic<uint32_t> g_dc2G136TraceActive;
+std::atomic<uint64_t> g_g146Vif1Ns{0};
 
 struct Dc2G137VuOrigin
 {
@@ -61,6 +63,33 @@ enum VIFCmd : uint8_t
 
 namespace
 {
+    struct G146PerfScope
+    {
+        bool on = false;
+        std::chrono::steady_clock::time_point t0;
+        std::atomic<uint64_t> *dst = nullptr;
+
+        explicit G146PerfScope(std::atomic<uint64_t> &target)
+        {
+        static const bool s_on = (std::getenv("DC2_PERF") != nullptr) ||
+                                 (std::getenv("DC2_G146_PERF") != nullptr) ||
+                                 (std::getenv("DC2_G147_PERF") != nullptr);
+            on = s_on;
+            dst = &target;
+            if (on)
+                t0 = std::chrono::steady_clock::now();
+        }
+
+        ~G146PerfScope()
+        {
+            if (!on || !dst)
+                return;
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count();
+            dst->fetch_add(static_cast<uint64_t>(ns), std::memory_order_relaxed);
+        }
+    };
+
     bool envFlagEnabled(const char *name)
     {
         const char *value = std::getenv(name);
@@ -389,6 +418,8 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
 
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
+    G146PerfScope g146Scope(g_g146Vif1Ns);
+
     if (!data || !m_gsVRAM || sizeBytes == 0u)
         return;
 

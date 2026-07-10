@@ -536,6 +536,61 @@ PS2Runtime::GuestExecutionReleaseScope::~GuestExecutionReleaseScope()
     }
 }
 
+// G189 (diagnostic watchdog, DEFAULT OFF, DC2_G189_WATCHDOG=1): a real, reproducible hang under
+// DC2_G157_PIPELINE=1 was found on the recorded town->inventory route -- the present thread's
+// tick counter freezes permanently a few seconds after the inventory circular-map screen opens
+// (matches the user's live RTSS "drops to ~2Hz" report). See ps2_gif_arbiter.cpp for the
+// matching worker/EE-thread breadcrumbs and plans/phase-G189-fix-log.md for the investigation.
+namespace
+{
+    std::atomic<uint64_t> g_g189PresentTick{0};
+    std::atomic<int> g_g189PresentStage{0}; // 0 top-of-loop, 1 pre-copy, 2 post-copy/pre-upload, 3 post-upload
+
+    void g189StartWatchdogOnce()
+    {
+        static const bool s_on = (std::getenv("DC2_G189_WATCHDOG") != nullptr);
+        if (!s_on)
+            return;
+        static std::once_flag s_started;
+        std::call_once(s_started, [] {
+            std::thread([] {
+                extern int g189_worker_stage();
+                extern uint64_t g189_worker_n();
+                extern int g189_ee_stage();
+                uint64_t lastTick = std::numeric_limits<uint64_t>::max();
+                auto lastChange = std::chrono::steady_clock::now();
+                bool reported = false;
+                for (;;)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+                    const uint64_t tick = g_g189PresentTick.load(std::memory_order_relaxed);
+                    const auto now = std::chrono::steady_clock::now();
+                    if (tick != lastTick)
+                    {
+                        lastTick = tick;
+                        lastChange = now;
+                        reported = false;
+                        continue;
+                    }
+                    const double stuckMs = std::chrono::duration<double, std::milli>(now - lastChange).count();
+                    if (stuckMs > 2000.0 && !reported)
+                    {
+                        std::fprintf(stderr,
+                                     "[G189:watchdog] present tick STUCK at %llu for %.0fms | "
+                                     "presentStage=%d workerStage=%d workerN=%llu eeStage=%d\n",
+                                     (unsigned long long)tick, stuckMs,
+                                     g_g189PresentStage.load(std::memory_order_relaxed),
+                                     g189_worker_stage(),
+                                     (unsigned long long)g189_worker_n(),
+                                     g189_ee_stage());
+                        reported = true;
+                    }
+                }
+            }).detach();
+        });
+    }
+}
+
 static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -546,13 +601,78 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     static uint32_t s_lastWidth = 0u;
     static uint32_t s_lastHeight = 0u;
 
+    // G157: under pipelined MTGS the worker owns latching (ps2_gif_arbiter.cpp frame-boundary
+    // marker, gated so it always sees complete VRAM + still-correct registers). Calling
+    // latchHostPresentationFrame() here too could race the worker's in-progress draws for the
+    // NEXT frame, so present must only ever read the already-published snapshot in that mode.
+    // G175: the same race exists in EVERY mode, not just pipelined MTGS — this present-thread
+    // re-latch fires ~10x per guest frame and reads VRAM mid-frame while the guest (serial) or
+    // GS worker (MTGS) is still building it. On RTT-composited transitions (costume-screen exit
+    // fade) that latched just-cleared/partially-composited buffers: the nonzero-pixel ping-pong
+    // (full->partial->black->full) documented in PS2_PROJECT_STATE.md Known Issues #2. The guest
+    // frame-boundary latch (g150_frame_barrier at the mgEndFrame hook, all modes) is the sole
+    // valid presentation source; keep the per-tick latch only as a boot fallback until the first
+    // boundary latch exists. DC2_G175_TICK_RELATCH=1 restores the old per-tick behavior.
+    extern bool g150_pipeline_enabled();
+    extern uint64_t g175_frame_boundary_count();
+    static const bool s_g175TickRelatch = [] {
+        const char *v = std::getenv("DC2_G175_TICK_RELATCH");
+        return v && *v && *v != '0';
+    }();
     const uint64_t currentTick = ps2_syscalls::GetCurrentVSyncTick();
     if (!s_hasLatchedInitialFrame || currentTick != s_lastPresentationTick)
     {
-        rt->gs().latchHostPresentationFrame();
+        if (!g150_pipeline_enabled() &&
+            (s_g175TickRelatch || g175_frame_boundary_count() == 0ull))
+            rt->gs().latchHostPresentationFrame();
         s_lastPresentationTick = currentTick;
         s_hasLatchedInitialFrame = true;
     }
+
+    // G176 (GPU-raster arc option (a)): the latched snapshot only changes when a latch
+    // runs (guest frame boundary, ~6.5Hz on the title; per-tick only during boot fallback
+    // or DC2_G175_TICK_RELATCH=1), but this function ran the full m_stateMutex-held
+    // snapshot copy + convert + whole-frame UpdateTexture every host present tick (~60Hz)
+    // — ~90% redundant GPU upload + the exact main-thread GPU touch G167 measured as the
+    // cross-thread contention driver, plus per-tick m_stateMutex contention against the
+    // GS worker. Skip all of it when the latch generation is unchanged; frameTex already
+    // holds this snapshot and DrawTexturePro keeps presenting it every tick.
+    // Kill-switch DC2_G176_TICK_UPLOAD=1 restores the per-tick upload.
+    extern uint64_t g176_present_latch_generation();
+    static const bool s_g176TickUpload = [] {
+        const char *v = std::getenv("DC2_G176_TICK_UPLOAD");
+        return v && *v && *v != '0';
+    }();
+    static const bool s_g176Stat = [] {
+        const char *v = std::getenv("DC2_G176_STAT");
+        return v && *v && *v != '0';
+    }();
+    static uint64_t s_g176LastUploadedGen = std::numeric_limits<uint64_t>::max();
+    static uint32_t s_g176LastOutWidth = FB_WIDTH;
+    static uint32_t s_g176LastOutHeight = DEFAULT_DISPLAY_HEIGHT;
+    static uint64_t s_g176Skips = 0ull;
+    static uint64_t s_g176Uploads = 0ull;
+    // Read the generation BEFORE the copy: if a latch lands in between, we copy the newer
+    // snapshot but record the older generation, so the next tick re-uploads once
+    // (harmless duplicate). Reading after could record a generation whose snapshot we
+    // never copied (missed frame).
+    const uint64_t g176Gen = g176_present_latch_generation();
+    if (s_g176Stat && ((s_g176Skips + s_g176Uploads) % 600ull) == 599ull)
+    {
+        std::fprintf(stderr, "[G176:stat] ticks=%llu uploads=%llu skips=%llu gen=%llu\n",
+                     static_cast<unsigned long long>(s_g176Skips + s_g176Uploads + 1ull),
+                     static_cast<unsigned long long>(s_g176Uploads),
+                     static_cast<unsigned long long>(s_g176Skips),
+                     static_cast<unsigned long long>(g176Gen));
+    }
+    if (!s_g176TickUpload && g176Gen == s_g176LastUploadedGen)
+    {
+        ++s_g176Skips;
+        outWidth = s_g176LastOutWidth;
+        outHeight = s_g176LastOutHeight;
+        return;
+    }
+    ++s_g176Uploads;
 
     std::vector<uint8_t> scratch;
     uint32_t width = 0u;
@@ -572,6 +692,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         UnloadImage(blank);
         outWidth = FB_WIDTH;
         outHeight = DEFAULT_DISPLAY_HEIGHT;
+        s_g176LastUploadedGen = g176Gen;
+        s_g176LastOutWidth = outWidth;
+        s_g176LastOutHeight = outHeight;
         return;
     }
 
@@ -649,6 +772,9 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     UpdateTexture(tex, uploadBuffer.data());
     outWidth = width;
     outHeight = height;
+    s_g176LastUploadedGen = g176Gen;
+    s_g176LastOutWidth = outWidth;
+    s_g176LastOutHeight = outHeight;
 }
 
 PS2Runtime::PS2Runtime()
@@ -780,6 +906,36 @@ bool PS2Runtime::initialize(const char *title)
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
+        // G158a (default OFF, DC2_G158_GPURASTER=1): one-shot synthetic FBO/shader/readback
+        // round-trip proof on the just-created GL context. No effect on real rendering; see
+        // plans/phase-G158-fix-log.md. A no-op single boolean read when unset.
+        // G159: capture this (main-thread) HGLRC/HDC BEFORE the MTGS worker thread can exist, so
+        // g158RunWorkerContextTest() (ps2_gif_arbiter.cpp, runs later on the worker thread) can
+        // create a shared second context against it. Also a no-op when the env var is unset.
+        extern void g158CaptureMainContext();
+        extern void g158RunSelfTest();
+        g158CaptureMainContext();
+        g158RunSelfTest();
+        // G160 (default OFF, same DC2_G158_GPURASTER switch): G159 found sharing fails while the
+        // main context is current elsewhere; this releases it, shares+tests on a fresh dedicated
+        // GPU thread, then restores it here before raylib's own frame loop starts. Blocking
+        // (one-time startup stall) and a no-op when unset. See plans/phase-G160-fix-log.md.
+        extern void g158StartDedicatedGpuThread();
+        g158StartDedicatedGpuThread();
+        // G162 (default OFF, needs DC2_G158_GPURASTER=1 AND DC2_G162_GPU_DECODE=1): starts a
+        // SECOND, PERSISTENT dedicated GPU thread (same release-before-share pattern G160 just
+        // validated above) that stays alive for the process lifetime, draining PSMT8 texture
+        // de-swizzle+CLUT decode jobs submitted from G149's texture-cache build site. A no-op
+        // when either env var is unset. See plans/phase-G162-fix-log.md.
+        extern void g162StartPersistentDecoder();
+        g162StartPersistentDecoder();
+        // G178 (default ON since 2026-07-10, kill DC2_G178_NO_GPU=1): starts the persistent LLE
+        // GPU rasterizer backend thread (same release-before-share pattern as G160/G162 above;
+        // the main context capture above also fires for this lever). See
+        // plans/gpu-raster-arc-plan.md and plans/phase-G178-fix-log.md.
+        extern void g178StartPersistentBackend();
+        g178StartPersistentBackend();
+
         SetTargetFPS(60);
 
         return true;
@@ -1108,6 +1264,47 @@ bool PS2Runtime::hasFunction(uint32_t address) const
     return false;
 }
 
+// G186 watch state (see lookupFunction / the first-bad-pc handler)
+struct G186WatchChange
+{
+    uint32_t oldVal, newVal, prevAddr, nextAddr;
+};
+static G186WatchChange g_g186Ring[64];
+static uint32_t g_g186RingN = 0u;
+static const uint32_t g_g186WatchAddr = []() -> uint32_t {
+    const char *e = std::getenv("DC2_G186_WATCH");
+    return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 16)) : 0u;
+}();
+
+// G186 sp-balance trampoline (opt-in DC2_G186_SPBAL=1): every dispatched call is
+// wrapped so a callee that returns with a shifted guest $sp is named directly.
+// (Guest thread switches / longjmp-class flows legitimately change sp — read the
+// log with that in mind; the leak signature is a REPEATED same-address entry.)
+static const bool g_g186SpBal = (std::getenv("DC2_G186_SPBAL") != nullptr);
+bool g_g186SpBalArmed = false; // set by the G186 EditDraw probe (dc2_game_override.cpp)
+struct G186SpEnt
+{
+    PS2Runtime::RecompiledFunction fn;
+    uint32_t addr;
+};
+static thread_local std::vector<G186SpEnt> g_g186SpStack;
+static void g186SpBalTrampoline(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    G186SpEnt e = g_g186SpStack.back();
+    g_g186SpStack.pop_back();
+    const uint32_t spIn = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) : 0u;
+    e.fn(rdram, ctx, runtime);
+    const uint32_t spOut = ctx ? static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)) : 0u;
+    if (spOut != spIn)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = ++s_n;
+        if (g_g186SpBalArmed && n <= 8192u)
+            std::fprintf(stderr, "[G186:spbal] fn=0x%x spIn=0x%x spOut=0x%x delta=%d n=%u\n",
+                         e.addr, spIn, spOut, static_cast<int32_t>(spOut - spIn), n);
+    }
+}
+
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
@@ -1188,9 +1385,52 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         }
     }
 
+    // G186 (opt-in DC2_G186_WATCH=<hex guest addr>): watch one guest word at every
+    // dispatch boundary, keep a RING of the most recent changes, and dump it from the
+    // first-bad-pc handler. Same technique as the G58 saved-$ra clobber hunt, but
+    // address-configurable and crash-anchored (streaming hit its cap long before the
+    // crash; only the last few changes before first-bad-pc matter).
+    if (g_g186WatchAddr)
+    {
+        static uint32_t s_lastVal = 0u;
+        static uint32_t s_prevAddr = 0u;
+        uint8_t *rd = m_memory.getRDRAM();
+        if (rd)
+        {
+            const uint32_t v = readGuestU32Wrapped(rd, g_g186WatchAddr);
+            if (v != s_lastVal)
+            {
+                G186WatchChange &c = g_g186Ring[g_g186RingN++ & 63u];
+                c.oldVal = s_lastVal;
+                c.newVal = v;
+                c.prevAddr = s_prevAddr;
+                c.nextAddr = address;
+                if (g_g186RingN <= 32u)
+                    std::fprintf(stderr, "[G186:watch] 0x%x: 0x%x -> 0x%x after=0x%x next=0x%x\n",
+                                 g_g186WatchAddr, s_lastVal, v, s_prevAddr, address);
+                s_lastVal = v;
+            }
+        }
+        // Sentinel ring entries mark scope: EditDraw / DngMainDraw / EditLoop entries.
+        if (address == 0x001AE3D0u || address == 0x001CF090u || address == 0x001ABCF0u)
+        {
+            G186WatchChange &c = g_g186Ring[g_g186RingN++ & 63u];
+            c.oldVal = 0xEDEDEDEDu;
+            c.newVal = 0xEDEDEDEDu;
+            c.prevAddr = s_prevAddr;
+            c.nextAddr = address;
+        }
+        s_prevAddr = address;
+    }
+
     auto it = m_functionTable.find(address);
     if (it != m_functionTable.end())
     {
+        if (g_g186SpBal)
+        {
+            g_g186SpStack.push_back({it->second, address});
+            return g186SpBalTrampoline;
+        }
         return it->second;
     }
 
@@ -1239,6 +1479,43 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
                               << stackDump.str()
                               << std::dec << std::endl;
                     s_loggedContext = true;
+
+                    // G186: dump the watch ring (most recent changes of the watched word)
+                    if (g_g186WatchAddr)
+                    {
+                        const uint32_t n = g_g186RingN < 64u ? g_g186RingN : 64u;
+                        for (uint32_t i = 0; i < n; ++i)
+                        {
+                            const G186WatchChange &c = g_g186Ring[(g_g186RingN - n + i) & 63u];
+                            std::fprintf(stderr, "[G186:ring] %u/%u 0x%x: 0x%x -> 0x%x after=0x%x next=0x%x\n",
+                                         i + 1, n, g_g186WatchAddr, c.oldVal, c.newVal, c.prevAddr, c.nextAddr);
+                        }
+                    }
+
+                    // G186 (opt-in DC2_G186_BADPTR_DUMP=1): dump the entire guest RAM at the
+                    // moment of the FIRST bad indirect-call target so offline tooling can
+                    // locate which structure held the garbage pointer and A/B the same slots
+                    // against a paused PCSX2. One-shot per process.
+                    static const bool s_g186dump = (std::getenv("DC2_G186_BADPTR_DUMP") != nullptr);
+                    if (s_g186dump && rdram)
+                    {
+                        static std::atomic<bool> s_dumped{false};
+                        bool expected = false;
+                        if (s_dumped.compare_exchange_strong(expected, true))
+                        {
+                            const uint32_t t9 = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[25], 0));
+                            if (FILE *fp = std::fopen("captures/g186_badpc_ram.bin", "wb"))
+                            {
+                                std::fwrite(rdram, 1u, 0x02000000u, fp);
+                                std::fclose(fp);
+                                std::fprintf(stderr, "[G186:dump] wrote captures/g186_badpc_ram.bin bad=0x%x t9=0x%x\n", pc, t9);
+                            }
+                            else
+                            {
+                                std::fprintf(stderr, "[G186:dump] FAILED to open captures/g186_badpc_ram.bin (t9=0x%x)\n", t9);
+                            }
+                        }
+                    }
                 }
 
                 uint32_t recoveryPc = 0u;
@@ -2410,10 +2687,13 @@ void PS2Runtime::run()
 
     ps2_syscalls::EnsureVSyncWorkerRunning(m_memory.getRDRAM(), this);
 
+    g189StartWatchdogOnce();
     uint64_t tick = 0;
     while (!isStopRequested() && g_activeThreads.load(std::memory_order_relaxed) > 0)
     {
         tick++;
+        g_g189PresentTick.store(tick, std::memory_order_relaxed);
+        g_g189PresentStage.store(0, std::memory_order_relaxed);
         PS2_IF_AGRESSIVE_LOGS({
             if ((tick % 120) == 0)
             {
@@ -2488,12 +2768,26 @@ void PS2Runtime::run()
                 }
             }
         }
+        // G167 (MEASURE ONLY, DC2_G167_STARVE_MAIN=1, default off): skip the main thread's own
+        // GPU work (UploadFrame's UpdateTexture + DrawTexturePro) to test whether G165's
+        // cross-thread-GPU-contention hypothesis for the T8 GPU-decoder thread is correct -- if
+        // the decoder's draw/readback times (DC2_G164_PROFILE) drop when the main thread stops
+        // touching the GPU, the hypothesis is confirmed; if unchanged, something else dominates.
+        // Diagnostic only, never shipped as a real presentation path -- window goes black/frozen
+        // while set. See plans/phase-G167-fix-log.md.
+        static const bool s_g167StarveMain = (std::getenv("DC2_G167_STARVE_MAIN") != nullptr);
         uint32_t presentWidth = FB_WIDTH;
         uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        g_g189PresentStage.store(1, std::memory_order_relaxed);
+        if (!s_g167StarveMain)
+            UploadFrame(frameTex, this, presentWidth, presentHeight);
+        g_g189PresentStage.store(2, std::memory_order_relaxed);
 
         BeginDrawing();
         ClearBackground(BLACK);
+        g_g189PresentStage.store(3, std::memory_order_relaxed);
+        if (!s_g167StarveMain)
+        {
         const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
         const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
         const float screenWidth = static_cast<float>(GetScreenWidth());
@@ -2508,6 +2802,7 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        }
 
         if (dc2HudEnabled())
         {
@@ -2547,7 +2842,12 @@ void PS2Runtime::run()
         if (IsKeyPressed(KEY_F11)) {
             s_forceBlank = !s_forceBlank;
         }
-        const bool periodic = dc2FrameDumpEnabled() && (tick != 0) && (tick % 60 == 0);
+        static const uint64_t s_frameDumpEvery = []() -> uint64_t {
+            const char *e = std::getenv("DC2_FRAME_DUMP_EVERY");
+            const long v = e ? std::strtol(e, nullptr, 10) : 60;
+            return v > 0 ? static_cast<uint64_t>(v) : 60ull;
+        }();
+        const bool periodic = dc2FrameDumpEnabled() && (tick != 0) && (tick % s_frameDumpEvery == 0);
         const bool manual = IsKeyPressed(KEY_F12);
         if (periodic || manual) {
             dc2::dumpFramePpm(tick, s_forceBlank || manual, this);
@@ -2973,6 +3273,12 @@ void PS2Runtime::run()
     }
 
     requestStop();
+
+    // G150 MTGS: drain + join the GS worker thread BEFORE the game thread join / GS teardown. Also
+    // unblocks the game thread if it is parked in the frame-barrier backpressure wait. No-op unless
+    // DC2_G150_MTGS=1. Declared here (external linkage, defined in ps2_gif_arbiter.cpp).
+    extern void g150_shutdown();
+    g150_shutdown();
 
     const auto joinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     while (!gameThreadFinished.load(std::memory_order_acquire) &&

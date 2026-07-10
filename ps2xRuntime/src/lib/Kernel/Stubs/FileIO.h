@@ -24,5 +24,6 @@ namespace ps2_stubs
     void sceWrite(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void stat(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void write(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+    void sceDevctl(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
     void cvFsSetDefDev(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 }

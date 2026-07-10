@@ -7,8 +7,10 @@
 #include "runtime/ps2_gs_psmt8.h"
 #include "runtime/ps2_gs_memory.h"
 #include "ps2_log.h"
+#include "ps2_gs_gpu_lle.h" // G178: private front-end<->backend interface (default-off lever)
 #include <atomic>
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -17,14 +19,201 @@
 #include <iostream>
 #include <sstream>
 #include <map>
+#include <unordered_map>
+#include <unordered_set>
+#include <memory>
 #include <mutex>
+#include <thread>
+#include <condition_variable>
+#include <functional>
+#include <vector>
 
 using namespace GSInternal;
+
+// G141: measure-first perf scope (skill 17-performance-optimization.md), env-gated
+// (DC2_PERF=1), aggregate-only print. Self-contained per-TU; drawPrimitive runs on the
+// single game thread, no cross-thread sharing needed.
+// G141: global GS-rasterization nanosecond accumulator (external linkage) so mgEndFrame can
+// read a per-frame GS total and compute the non-overlapping GS-vs-VU1-vs-other split. The GS
+// raster runs SYNCHRONOUSLY inside VU1 XGKICK, so vu1.run time double-counts it — this global
+// lets the frame decomposition subtract it out.
+std::atomic<uint64_t> g_g141GsRasterNs{0};
+// G141 sub-profile: rasterizer coverage + primitive-type split (DC2_PERF). bboxPx = total
+// bounding-box pixels iterated, insidePx = passed the barycentric edge test, drawnPx = reached
+// writePixel. coverage = insidePx/bboxPx exposes bbox-scan waste; drawnPx/frame is the true
+// per-pixel raster load. triCalls/sprCalls tell whether 3D tris or 2D sprites dominate.
+std::atomic<uint64_t> g_g141TriCalls{0}, g_g141SpriteCalls{0};
+std::atomic<uint64_t> g_g141BboxPx{0}, g_g141InsidePx{0}, g_g141DrawnPx{0};
+std::atomic<uint64_t> g_g146G144FlushMidNs{0}, g_g146G144FlushUploadNs{0}, g_g146G144FlushFrameNs{0};
+std::atomic<uint64_t> g_g146G144FlushMidCount{0}, g_g146G144FlushUploadCount{0}, g_g146G144FlushFrameCount{0};
+// G148 (perf DIAGNOSIS, DEFAULT OFF, DC2_G148_SAMPLESTAT=1): decide whether a per-texture
+// de-swizzle/decode cache would help the sampler. The dominant sampler cost is the swizzled
+// texel fetch (ReadP8 + CLUT); the G142 texel-quad cache already skips the 4-tap refetch when
+// consecutive pixels share the SAME (u0,v0) taps. If the quad-HIT rate is high the swizzle reads
+// are already coherent and a de-swizzle cache buys little; if the MISS rate is high (perspective /
+// minified textures change taps every pixel) the swizzle+CLUT reads dominate and de-swizzling the
+// whole bound texture into a linear cache-hot RGBA buffer is the lever. These counters expose that
+// ratio + the point-sample leaf-read count. Measurement only (bit-identical output).
+std::atomic<uint64_t> g_g148TexSamples{0};   // total g141FastSample calls (textured tri pixels, fast path)
+std::atomic<uint64_t> g_g148QuadHit{0};      // bilinear: reused the cached 2x2 tap quad (coherent)
+std::atomic<uint64_t> g_g148QuadMiss{0};     // bilinear: rebuilt the quad (4x leaf read)
+std::atomic<uint64_t> g_g148PointSamp{0};    // point-filter samples (1x leaf read each)
+std::atomic<uint64_t> g_g148LeafReads{0};    // total g141SamplePoint leaf reads (ReadP8/readTexel + CLUT)
+
+// G149 (perf, DEFAULT OFF, DC2_G149_TEXCACHE=1): shared de-swizzle/decode texture cache. G148
+// measured the texel-quad cache hit at only ~10% -> ~1.18M swizzled leaf reads/frame ARE the ~50 ms
+// sampler. This decodes the bound texture ONCE into a linear CLUT-pre-applied RGBA buffer so each
+// g141SamplePoint becomes a single decoded[v*texW+u] read instead of swizzle-address math + a CLUT
+// resolve. Bit-exact BY CONSTRUCTION: the buffer is filled with the SAME leaf expression the
+// uncached path uses (verified per-pixel by DC2_G149_TCVERIFY). PROCESS-WIDE (not thread_local): the
+// G144 tilebin flush replays one texture's tris across up to 8 disjoint scanline bands on different
+// threads, so a thread_local decode would rebuild the texture up to 8x and can net-lose; the cache is
+// keyed on the full texture descriptor + a VRAM GENERATION counter (bumped on every image upload /
+// local transfer), built ONCE under a mutex per (key,gen), read lock-free by all band lanes.
+std::atomic<uint64_t> g_g149VramGen{1};  // bumped by g149BumpVramGen() on every VRAM write
+std::atomic<uint64_t> g_g149Hits{0};     // cache hits (decoded buffer reused)
+std::atomic<uint64_t> g_g149Builds{0};   // decode builds (one per distinct texture/gen)
+std::atomic<uint64_t> g_g149Ineligible{0}; // fast-path tris that could not use the cache
+std::atomic<uint64_t> g_g162GpuHits{0};     // G162: T8 decode builds that used the GPU path
+std::atomic<uint64_t> g_g162GpuFallback{0}; // G162: T8 decode builds that fell back to CPU
+namespace {
+struct G149Key
+{
+    uint32_t tbp0, tbw, cbp;
+    uint32_t tw, th;
+    uint32_t psm, cpsm, csm, csa;
+    uint32_t texa;   // packed aem/ta0/ta1 (affects applyTexa for CT16/CT24)
+    uint64_t gen;
+    bool operator==(const G149Key &o) const
+    {
+        return tbp0 == o.tbp0 && tbw == o.tbw && cbp == o.cbp && tw == o.tw && th == o.th &&
+               psm == o.psm && cpsm == o.cpsm && csm == o.csm && csa == o.csa &&
+               texa == o.texa && gen == o.gen;
+    }
+};
+struct G149KeyHash
+{
+    size_t operator()(const G149Key &k) const
+    {
+        uint64_t h = 1469598103934665603ull;
+        auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+        mix(k.tbp0); mix((static_cast<uint64_t>(k.tbw) << 32) | k.cbp);
+        mix((static_cast<uint64_t>(k.tw) << 32) | k.th);
+        mix((static_cast<uint64_t>(k.psm) << 24) | (k.cpsm << 16) | (k.csm << 8) | k.csa);
+        mix(k.texa); mix(k.gen);
+        return static_cast<size_t>(h);
+    }
+};
+// LAZY-fill decoded texture: `px` is the linear CLUT-pre-applied RGBA buffer, `valid[i]` marks which
+// texels have been decoded yet. Allocated (not decoded) at defer time; each texel is decoded ON FIRST
+// SAMPLE and memoized, so only SAMPLED texels ever cost a swizzle+CLUT read — and that cost is shared
+// across all 8 tilebin band lanes and every triangle using the texture (vs the eager variant that
+// decoded the WHOLE texture even when tris sample a fraction, a measured net loss). The concurrent
+// band writes are a BENIGN race: within one (key,gen) VRAM is constant so every thread decodes the
+// SAME value for a given texel; aligned 32-bit `px[i]` and byte `valid[i]` stores don't tear on x86.
+struct G149Tex
+{
+    std::vector<uint32_t> px;
+    std::vector<uint8_t> valid;
+};
+using G149Buf = std::shared_ptr<G149Tex>;
+// Guest-thread-only cache map: the G144 tilebin defer path (drawPrimitive, !t_g144InReplay) is the
+// SOLE accessor, so no mutex is needed. Entries hold a shared_ptr also stored in the G144Entry, so
+// band-replay threads use the buffer lock-free for the whole flush even if this map is later cleared.
+// Keyed on the texture descriptor + VRAM generation; cleared when the generation advances.
+std::unordered_map<G149Key, G149Buf, G149KeyHash> g_g149Map;
+uint64_t g_g149MapGen = 0;
+}
+// Called from the GS upload / local-transfer paths (ps2_gs_gpu.cpp) — any write to VRAM bumps the
+// generation so stale decoded buffers are never reused. Cheap monotonic increment.
+void g149BumpVramGen()
+{
+    g_g149VramGen.fetch_add(1u, std::memory_order_relaxed);
+}
+// Lock-free pointers into a lazily-filled decoded texture, valid only during a G144 band replay of an
+// eligible tri (set by the replay closures before drawTriangle; null otherwise). Read/written in
+// g141SamplePoint. Each band lane has its own copy of these pointers; the shared_ptr in the G144Entry
+// keeps the underlying buffers alive for the whole flush.
+static thread_local uint32_t *t_g149Px = nullptr;
+static thread_local uint8_t *t_g149Valid = nullptr;
+namespace {
+struct G146PerfScope
+{
+    bool on = false;
+    std::chrono::steady_clock::time_point t0;
+    std::atomic<uint64_t> *ns = nullptr;
+    std::atomic<uint64_t> *count = nullptr;
+
+    G146PerfScope(std::atomic<uint64_t> &targetNs, std::atomic<uint64_t> &targetCount)
+    {
+        static const bool s_on = (std::getenv("DC2_PERF") != nullptr) ||
+                                 (std::getenv("DC2_G146_PERF") != nullptr) ||
+                                 (std::getenv("DC2_G147_PERF") != nullptr);
+        on = s_on;
+        ns = &targetNs;
+        count = &targetCount;
+        if (on)
+            t0 = std::chrono::steady_clock::now();
+    }
+
+    ~G146PerfScope()
+    {
+        if (!on || !ns || !count)
+            return;
+        const auto elapsed = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count();
+        ns->fetch_add(static_cast<uint64_t>(elapsed), std::memory_order_relaxed);
+        count->fetch_add(1u, std::memory_order_relaxed);
+    }
+};
+
+struct G141PerfScope
+{
+    bool on;
+    std::chrono::steady_clock::time_point t0;
+    double *sum;
+    uint32_t *win;
+    const char *tag;
+    uint32_t window;
+    std::atomic<uint64_t> *accumNs = nullptr; // optional global ns accumulator
+    G141PerfScope(bool on_, double *sum_, uint32_t *win_, const char *tag_, uint32_t window_)
+        : on(on_), sum(sum_), win(win_), tag(tag_), window(window_)
+    {
+        if (on) t0 = std::chrono::steady_clock::now();
+    }
+    ~G141PerfScope()
+    {
+        if (!on) return;
+        const auto elapsed = std::chrono::steady_clock::now() - t0;
+        if (accumNs)
+            accumNs->fetch_add(
+                static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(elapsed).count()),
+                std::memory_order_relaxed);
+        *sum += std::chrono::duration<double, std::milli>(elapsed).count();
+        if (++(*win) >= window)
+        {
+            std::fprintf(stderr, "[G141:perf] %s avgUs=%.2f window=%u\n", tag,
+                         (*sum * 1000.0) / static_cast<double>(*win), *win);
+            *sum = 0.0;
+            *win = 0u;
+        }
+    }
+};
+} // namespace
 
 // G89: set by dc2_game_override.cpp::g67_title_scope each frame; gates the title-rock guard-band
 // cull in drawTriangle so it never fires outside the title-map scene. Defined here (external
 // linkage) and referenced via `extern` from the override.
 std::atomic<bool> g_dc2TitleRockScope{false};
+static thread_local bool t_g144TitleRockScopeOverride = false;
+static thread_local bool t_g144TitleRockScope = false;
+
+static bool g144EffectiveTitleRockScope()
+{
+    return t_g144TitleRockScopeOverride
+               ? t_g144TitleRockScope
+               : g_dc2TitleRockScope.load(std::memory_order_relaxed);
+}
 // G90: the logical title block currently being flushed by mgEndDraw (set by the override). Lets
 // the G88:geo probe tag each drawn rock triangle with its source block. -1 = none.
 std::atomic<int> g_dc2TitleCurBlock{-1};
@@ -43,6 +232,18 @@ namespace
                std::strcmp(value, "FALSE") != 0 &&
                std::strcmp(value, "off") != 0 &&
                std::strcmp(value, "OFF") != 0;
+    }
+
+    bool envFlagDisabled(const char *name)
+    {
+        const char *value = std::getenv(name);
+        return value != nullptr &&
+               (value[0] == '\0' ||
+                std::strcmp(value, "0") == 0 ||
+                std::strcmp(value, "false") == 0 ||
+                std::strcmp(value, "FALSE") == 0 ||
+                std::strcmp(value, "off") == 0 ||
+                std::strcmp(value, "OFF") == 0);
     }
 
     bool phaseDiagnosticsEnabled()
@@ -354,7 +555,7 @@ namespace
 
     bool g104TitleRockTriangle(bool primTme, uint32_t fbp, uint32_t tbp)
     {
-        return g_dc2TitleRockScope.load(std::memory_order_relaxed) &&
+        return g144EffectiveTitleRockScope() &&
                primTme &&
                fbp != 0x139u &&
                tbp >= 0x2720u &&
@@ -887,8 +1088,1407 @@ namespace
     }
 }
 
+// G143 (perf, DEFAULT OFF): persistent worker pool that rasterizes DISJOINT scanline ranges of a
+// single triangle concurrently. A dispatch (`run`) splits [y0,y1] into `lanes` contiguous chunks;
+// lane 0 runs on the CALLER, lanes 1..lanes-1 on workers; `run` blocks until all lanes finish, so
+// the triangle is fully drawn before drawTriangle returns (cross-triangle order preserved). Single
+// caller only (the guest thread inside a VU1 XGKICK) — dispatches never overlap. No allocation on
+// the hot path. Deadlock-safe: workers sleep on a generation counter; the barrier is a pending
+// countdown. Correct/exact ONLY when the lane job touches disjoint pixels + thread-local scratch.
+class GSRowPool
+{
+public:
+    static GSRowPool &instance()
+    {
+        static GSRowPool p;
+        return p;
+    }
+    int laneCap() const { return static_cast<int>(m_threads.size()) + 1; }
+
+    void run(int y0, int y1, int lanes, const std::function<void(int, int)> &job)
+    {
+        lanes = std::max(1, std::min(lanes, laneCap()));
+        if (lanes <= 1 || y1 < y0)
+        {
+            if (y1 >= y0)
+                job(y0, y1);
+            return;
+        }
+        const int total = y1 - y0 + 1;
+        auto bound = [&](int i) { return y0 + static_cast<int>(static_cast<int64_t>(total) * i / lanes); };
+
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_job = &job;
+            m_y0 = y0;
+            m_total = total;
+            m_lanes = lanes;
+            m_nextLane.store(1, std::memory_order_relaxed);
+            m_pending = static_cast<int>(m_threads.size()); // every worker wakes and reports
+            ++m_gen;
+        }
+        m_cvWork.notify_all();
+
+        // Caller runs lane 0 itself (no wasted thread).
+        job(bound(0), bound(1) - 1);
+
+        std::unique_lock<std::mutex> lk(m_mtx);
+        m_cvDone.wait(lk, [&] { return m_pending == 0; });
+        m_job = nullptr;
+    }
+
+private:
+    GSRowPool()
+    {
+        unsigned hc = std::thread::hardware_concurrency();
+        int n = (hc > 1u) ? static_cast<int>(hc) - 1 : 0;
+        n = std::min(n, 15);
+        for (int i = 0; i < n; ++i)
+            m_threads.emplace_back([this] { workerLoop(); });
+    }
+    ~GSRowPool()
+    {
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_stop = true;
+            ++m_gen;
+        }
+        m_cvWork.notify_all();
+        for (auto &t : m_threads)
+            if (t.joinable())
+                t.join();
+    }
+    void workerLoop()
+    {
+        uint64_t seen = 0;
+        std::unique_lock<std::mutex> lk(m_mtx);
+        for (;;)
+        {
+            m_cvWork.wait(lk, [&] { return m_stop || m_gen != seen; });
+            if (m_stop)
+                return;
+            seen = m_gen;
+            const std::function<void(int, int)> *job = m_job;
+            const int y0 = m_y0, total = m_total, lanes = m_lanes;
+            for (;;)
+            {
+                const int lane = m_nextLane.fetch_add(1, std::memory_order_relaxed);
+                if (lane >= lanes)
+                    break;
+                const int a = y0 + static_cast<int>(static_cast<int64_t>(total) * lane / lanes);
+                const int b = y0 + static_cast<int>(static_cast<int64_t>(total) * (lane + 1) / lanes) - 1;
+                lk.unlock();
+                if (job && b >= a)
+                    (*job)(a, b);
+                lk.lock();
+            }
+            if (--m_pending == 0)
+                m_cvDone.notify_one();
+        }
+    }
+
+    std::vector<std::thread> m_threads;
+    std::mutex m_mtx;
+    std::condition_variable m_cvWork, m_cvDone;
+    const std::function<void(int, int)> *m_job = nullptr;
+    int m_y0 = 0, m_total = 0, m_lanes = 1, m_pending = 0;
+    std::atomic<int> m_nextLane{0};
+    uint64_t m_gen = 0;
+    bool m_stop = false;
+};
+
+// ===== G144 FRAME-LEVEL TILE-BINNING (G168 DEFAULT 8 LANES, DC2_G144_NO_TILEBIN disables) =====
+// Defer deferrable triangles (fast-path textured tris to a display framebuffer, non-RTT) into a
+// display list instead of rasterizing each immediately; at a flush (a non-deferrable primitive, an
+// fbp change, or frame end) rasterize the WHOLE list with T threads, each owning a disjoint
+// horizontal BAND of scanlines and replaying every overlapping entry IN SUBMISSION ORDER clipped to
+// its band. Bit-exact by the SAME argument as G143 (disjoint rows ⇒ disjoint FB/Z writes; in-order
+// per band ⇒ Z/blend order preserved), but the parallelism now spans the WHOLE FRAME's triangle
+// stream (one dispatch, thousands of tris/thread) instead of one triangle — so it is not limited by
+// per-triangle size the way G143's intra-triangle row split is. A full POD snapshot of the exact GS
+// draw state drawTriangle reads (ctx/prim/texa/texclut/pabe/3 verts) makes each entry self-contained.
+struct G144Entry
+{
+    GSContext ctx;
+    GSPrimReg prim;
+    GSTexaReg texa;
+    GSTexClutReg texclut;
+    bool pabe;
+    bool titleRockScope;
+    GSVertex v[3];
+    int minY, maxY; // screen-space bbox rows (post-scissor) for band-overlap prefilter
+    G149Buf decoded; // G149: pre-decoded texture buffer (null unless texcache eligible); kept alive here
+};
+static std::vector<G144Entry> g_g144List;       // reused across frames (clear keeps capacity)
+static int g_g144Threads = -1;                  // -1 = env not read yet; 0/1 = off; >1 = lanes
+static uint32_t g_g144BlockFbp = 0xFFFFFFFFu;   // fbp of the current deferred block (flush on change)
+static GS *g_g144LastGs = nullptr;              // live GS for VRAM at flush (set each capture)
+// Flush closures, assigned ONCE inside GSRasterizer::drawPrimitive so they keep that member's friend
+// access to GS/private drawTriangle even when invoked later from g144FlushPending() (frame end).
+static std::function<void()> g_g144FlushFn;     // PARALLEL band replay (mid-frame, on guest thread)
+static std::function<void()> g_g144FlushSeqFn;  // SEQUENTIAL drain (frame end; no pool, full range)
+// Replay control (thread_local: each band lane its own; set only during a flush).
+static thread_local bool t_g144InReplay = false;
+static thread_local bool t_g144Banded = false;
+static thread_local int t_g144BandY0 = 0;
+static thread_local int t_g144BandY1 = 0;
+
+// ===== G156 probe (DEFAULT OFF, DC2_G156_STAT=1) — attribute the ~78 ms worker drawPrimitive. =====
+// G155 measured mid-flush=0, so the 78 ms billed to drawPrimitive under MTGS+G144 is NOT flush time.
+// It is either the deferred-snapshot cost (cheap, should be ~ms) OR inline serial raster of tris that
+// FAIL deferrable144 (drawTriangle on the single worker thread). This probe counts deferred vs inline
+// tris, TIMES the inline raster, and records WHY each inline tri was not deferrable — so G157 knows
+// whether the lever is "widen the defer eligibility → parallel 8-band replay" or "the sampler itself".
+static const bool g_g156Stat = (std::getenv("DC2_G156_STAT") != nullptr);
+static std::atomic<uint64_t> g_g156DeferredTri{0}; // tris deferred to g_g144List (parallel raster)
+static std::atomic<uint64_t> g_g156InlineTri{0};   // tris rasterized inline on the calling thread
+static std::atomic<uint64_t> g_g156InlineTriNs{0}; // wall-time of that inline drawTriangle
+static std::atomic<uint64_t> g_g156CaptureNs{0};   // wall-time of the deferred snapshot+push_back body
+static std::atomic<uint64_t> g_g156PrologueNs{0};  // wall-time from drawPrimitive entry to the capture
+static std::atomic<uint64_t> g_g156NoTme{0};       // inline reason: untextured (tme=0)
+static std::atomic<uint64_t> g_g156BadFbp{0};      // inline reason: fbp not 0x0/0x68 (RTT/other target)
+static std::atomic<uint64_t> g_g156Diag{0};        // inline reason: a diagnostic trace forced eager
+static void g156Report()
+{
+    std::fprintf(stderr,
+                 "[G156:draw] deferTri=%llu prologueMs=%.1f captureMs=%.1f (%.2f us/tri) inlineTri=%llu inlineMs=%.1f (%.2f us/tri) | notme=%llu badfbp=%llu diag=%llu\n",
+                 (unsigned long long)g_g156DeferredTri.load(std::memory_order_relaxed),
+                 g_g156PrologueNs.load(std::memory_order_relaxed) / 1e6,
+                 g_g156CaptureNs.load(std::memory_order_relaxed) / 1e6,
+                 g_g156DeferredTri.load(std::memory_order_relaxed)
+                     ? (double)g_g156CaptureNs.load(std::memory_order_relaxed) / 1e3 /
+                           (double)g_g156DeferredTri.load(std::memory_order_relaxed)
+                     : 0.0,
+                 (unsigned long long)g_g156InlineTri.load(std::memory_order_relaxed),
+                 g_g156InlineTriNs.load(std::memory_order_relaxed) / 1e6,
+                 g_g156InlineTri.load(std::memory_order_relaxed)
+                     ? (double)g_g156InlineTriNs.load(std::memory_order_relaxed) / 1e3 /
+                           (double)g_g156InlineTri.load(std::memory_order_relaxed)
+                     : 0.0,
+                 (unsigned long long)g_g156NoTme.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g156BadFbp.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g156Diag.load(std::memory_order_relaxed));
+    std::fflush(stderr);
+}
+
+struct G144BlockRange
+{
+    uint32_t first = 0;
+    uint32_t last = 0;
+    bool valid = false;
+};
+
+static bool g144PsmPageDims(uint8_t psm, uint32_t &pageW, uint32_t &pageH, bool &halfWidthBw)
+{
+    halfWidthBw = false;
+    switch (psm)
+    {
+    case GS_PSM_CT32:
+    case GS_PSM_CT24:
+    case GS_PSM_Z32:
+    case GS_PSM_Z24:
+    case GS_PSM_T8H:
+    case GS_PSM_T4HL:
+    case GS_PSM_T4HH:
+        pageW = 64u;
+        pageH = 32u;
+        return true;
+    case GS_PSM_CT16:
+    case GS_PSM_CT16S:
+    case GS_PSM_Z16:
+    case GS_PSM_Z16S:
+        pageW = 64u;
+        pageH = 64u;
+        return true;
+    case GS_PSM_T8:
+        pageW = 128u;
+        pageH = 64u;
+        halfWidthBw = true;
+        return true;
+    case GS_PSM_T4:
+        pageW = 128u;
+        pageH = 128u;
+        halfWidthBw = true;
+        return true;
+    default:
+        return false;
+    }
+}
+
+static G144BlockRange g144FullVramRange()
+{
+    return {0u, 0x3FFFu, true};
+}
+
+static G144BlockRange g144RangeForRect(uint32_t baseBlock,
+                                       uint8_t psm,
+                                       uint32_t bw,
+                                       uint32_t x,
+                                       uint32_t y,
+                                       uint32_t w,
+                                       uint32_t h)
+{
+    if (w == 0u || h == 0u)
+        return {};
+
+    uint32_t pageW = 0u, pageH = 0u;
+    bool halfWidthBw = false;
+    if (!g144PsmPageDims(psm, pageW, pageH, halfWidthBw))
+        return g144FullVramRange();
+
+    uint32_t pageBw = (bw != 0u) ? bw : 1u;
+    if (halfWidthBw)
+        pageBw = std::max<uint32_t>((pageBw + 1u) >> 1u, 1u);
+
+    const uint64_t x0Page = static_cast<uint64_t>(x) / pageW;
+    const uint64_t x1Page = (static_cast<uint64_t>(x) + static_cast<uint64_t>(w) - 1u) / pageW;
+    const uint64_t y0Page = static_cast<uint64_t>(y) / pageH;
+    const uint64_t y1Page = (static_cast<uint64_t>(y) + static_cast<uint64_t>(h) - 1u) / pageH;
+
+    const uint64_t firstPage = y0Page * pageBw + x0Page;
+    const uint64_t lastPage = y1Page * pageBw + x1Page;
+    const uint64_t firstBlock64 = static_cast<uint64_t>(baseBlock) + firstPage * 32u;
+    const uint64_t lastBlock64 = static_cast<uint64_t>(baseBlock) + lastPage * 32u + 31u;
+
+    if (firstBlock64 > 0x3FFFu)
+        return {};
+    return {static_cast<uint32_t>(firstBlock64),
+            static_cast<uint32_t>(std::min<uint64_t>(lastBlock64, 0x3FFFu)),
+            true};
+}
+
+static bool g144RangeOverlaps(const G144BlockRange &a, const G144BlockRange &b)
+{
+    return a.valid && b.valid && a.first <= b.last && b.first <= a.last;
+}
+
+static bool g144IsPalettedPsm(uint8_t psm)
+{
+    return psm == GS_PSM_T8 || psm == GS_PSM_T8H ||
+           psm == GS_PSM_T4 || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
+}
+
+static G144BlockRange g144TextureRange(const G144Entry &e)
+{
+    const GSTex0Reg &tex = e.ctx.tex0;
+    const uint32_t texW = 1u << std::min<uint8_t>(tex.tw, 15u);
+    const uint32_t texH = 1u << std::min<uint8_t>(tex.th, 15u);
+    return g144RangeForRect(tex.tbp0, tex.psm, tex.tbw, 0u, 0u, texW, texH);
+}
+
+static G144BlockRange g144ClutRange(const G144Entry &e)
+{
+    const GSTex0Reg &tex = e.ctx.tex0;
+    if (!g144IsPalettedPsm(tex.psm))
+        return {};
+
+    const uint32_t clutBw = (e.texclut.cbw != 0u) ? static_cast<uint32_t>(e.texclut.cbw) : 1u;
+    // The sampler may swizzle CSM1/CSA indices. Use the whole 16x16 CLUT tile so dirty-checking
+    // cannot miss a palette write because of index remapping.
+    return g144RangeForRect(tex.cbp, tex.cpsm, clutBw,
+                            static_cast<uint32_t>(e.texclut.cou),
+                            static_cast<uint32_t>(e.texclut.cov),
+                            16u, 16u);
+}
+
+static G144BlockRange g144TargetRange(const G144Entry &e)
+{
+    const GSContext &ctx = e.ctx;
+    const uint32_t baseBlock = framePageBaseToBlock(ctx.frame.fbp);
+    const uint32_t x0 = static_cast<uint32_t>(ctx.scissor.x0);
+    const uint32_t y0 = static_cast<uint32_t>(ctx.scissor.y0);
+    const uint32_t w = (ctx.scissor.x1 >= ctx.scissor.x0)
+                           ? (static_cast<uint32_t>(ctx.scissor.x1 - ctx.scissor.x0) + 1u)
+                           : 0u;
+    const uint32_t h = (ctx.scissor.y1 >= ctx.scissor.y0)
+                           ? (static_cast<uint32_t>(ctx.scissor.y1 - ctx.scissor.y0) + 1u)
+                           : 0u;
+    return g144RangeForRect(baseBlock, ctx.frame.psm, ctx.frame.fbw, x0, y0, w, h);
+}
+
+static bool g144PendingNeedsFlushForRanges(const G144BlockRange &src, const G144BlockRange &dst)
+{
+    if (g_g144List.empty())
+        return false;
+
+    for (const G144Entry &e : g_g144List)
+    {
+        const G144BlockRange target = g144TargetRange(e);
+        if (g144RangeOverlaps(dst, target) || g144RangeOverlaps(src, target))
+            return true;
+
+        if (g144RangeOverlaps(dst, g144TextureRange(e)) ||
+            g144RangeOverlaps(dst, g144ClutRange(e)))
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void g144DirtyStat(const char *kind, bool flushed)
+{
+    static const bool s_stat = (std::getenv("DC2_G145_DIRTY_STAT") != nullptr);
+    if (!s_stat)
+        return;
+
+    static std::atomic<uint64_t> s_flush{0};
+    static std::atomic<uint64_t> s_skip{0};
+    const uint64_t f = flushed ? (s_flush.fetch_add(1u, std::memory_order_relaxed) + 1u)
+                               : s_flush.load(std::memory_order_relaxed);
+    const uint64_t s = flushed ? s_skip.load(std::memory_order_relaxed)
+                               : (s_skip.fetch_add(1u, std::memory_order_relaxed) + 1u);
+    if ((flushed && f <= 32u) || (!flushed && s <= 32u) || (((f + s) & 0x3FFull) == 0ull))
+    {
+        std::fprintf(stderr, "[G145:dirty] kind=%s action=%s flush=%llu skip=%llu\n",
+                     kind, flushed ? "flush" : "skip",
+                     static_cast<unsigned long long>(f),
+                     static_cast<unsigned long long>(s));
+    }
+}
+
+// G166: extracted so BOTH the direct (single-texture) path and the batch-fallback path (any GPU
+// batch failure) can share the exact same, already-proven CPU decode expression -- never
+// duplicated inline. Identical math to the original inline T8 case (ReadP8 -> lookupCLUT).
+static void g149DecodeT8Cpu(GSRasterizer *self, GS *gs, uint32_t tbp0, uint32_t pageBwT8,
+                            uint32_t cbp, uint8_t cpsm, uint8_t csm, uint8_t csa, uint8_t texPsm,
+                            uint8_t *vram, int texW, int texH, uint32_t *outPx)
+{
+    for (int vv = 0; vv < texH; ++vv)
+        for (int uu = 0; uu < texW; ++uu)
+        {
+            const uint8_t idx = static_cast<uint8_t>(GSMem::ReadP8(vram, tbp0, pageBwT8,
+                                    static_cast<uint32_t>(uu), static_cast<uint32_t>(vv)));
+            outPx[static_cast<size_t>(vv) * static_cast<size_t>(texW) + static_cast<size_t>(uu)] =
+                self->lookupCLUT(gs, idx, cbp, cpsm, csm, csa, texPsm);
+        }
+}
+
+// G166 (default OFF, needs DC2_G162_GPU_DECODE): a T8 cache-miss with GPU decode enabled defers
+// its actual pixel fill to ONE per-frame batch (see g162ResolvePendingT8Batch below) instead of a
+// synchronous per-texture GPU round-trip -- G164/G165 isolated cross-thread draw+readback
+// synchronization, not buffer management, as the dominant remaining GPU-decode cost, and batching
+// amortizes that synchronization over the whole frame's requests instead of paying it ~8x/frame.
+// SAFE BY CONSTRUCTION: the placeholder `tex` is inserted into g_g149Map immediately (so later
+// triangles in the same frame needing the SAME texture get a normal cache hit, unchanged), but its
+// `px` is only filled at RESOLVE time -- which is guaranteed to run before any replay reads it,
+// because it is the first statement of both G144 flush closures (g_g144FlushFn/g_g144FlushSeqFn),
+// and replay of a frame's G144Entry list can only happen via one of those closures.
+struct G162PendingT8
+{
+    uint32_t tbp0 = 0, pageBwT8 = 0;
+    int texW = 0, texH = 0;
+    uint32_t clut256[256]{};
+    uint32_t cbp = 0; uint8_t cpsm = 0, csm = 0, csa = 0, texPsm = 0;
+    GSRasterizer *self = nullptr; GS *gs = nullptr; uint8_t *vram = nullptr; // CPU-fallback params
+    G149Buf tex;
+};
+static std::vector<G162PendingT8> g_g162Pending;
+
+// Resolves ALL pending T8 batch requests in one shot: tries the GPU batch first; on ANY failure
+// (decoder not ready, batch too large for the atlas, etc) falls back to the proven CPU decode for
+// every pending entry individually -- correctness never depends on the batch succeeding. Called
+// from the START of both G144 flush closures (before they read any e.decoded), so this must
+// complete before this function returns.
+static void g162ResolvePendingT8Batch()
+{
+    if (g_g162Pending.empty())
+        return;
+    extern bool g162DecodeT8Batch(int, const uint32_t *, const uint32_t *, const int *, const int *,
+                                  const uint32_t *, const uint8_t *, size_t, uint32_t **);
+
+    const int count = static_cast<int>(g_g162Pending.size());
+    std::vector<uint32_t> tbp0Arr(count), tbwArr(count), clutFlat(static_cast<size_t>(count) * 256u);
+    std::vector<int> texWArr(count), texHArr(count);
+    std::vector<uint32_t *> outPxArr(count);
+    for (int i = 0; i < count; ++i)
+    {
+        const G162PendingT8 &p = g_g162Pending[static_cast<size_t>(i)];
+        tbp0Arr[i] = p.tbp0; tbwArr[i] = p.pageBwT8;
+        texWArr[i] = p.texW; texHArr[i] = p.texH;
+        std::memcpy(&clutFlat[static_cast<size_t>(i) * 256u], p.clut256, sizeof(p.clut256));
+        outPxArr[i] = p.tex->px.data();
+    }
+    const bool ok = g162DecodeT8Batch(count, tbp0Arr.data(), tbwArr.data(), texWArr.data(),
+                                      texHArr.data(), clutFlat.data(),
+                                      g_g162Pending[0].vram, static_cast<size_t>(GSMem::MEMORY_SIZE),
+                                      outPxArr.data());
+    if (ok)
+    {
+        g_g162GpuHits.fetch_add(static_cast<uint64_t>(count), std::memory_order_relaxed);
+    }
+    else
+    {
+        g_g162GpuFallback.fetch_add(static_cast<uint64_t>(count), std::memory_order_relaxed);
+        for (const G162PendingT8 &p : g_g162Pending)
+            g149DecodeT8Cpu(p.self, p.gs, p.tbp0, p.pageBwT8, p.cbp, p.cpsm, p.csm, p.csa, p.texPsm,
+                            p.vram, p.texW, p.texH, p.tex->px.data());
+    }
+    g_g162Pending.clear();
+}
+
+// G149: fetch (or ALLOCATE, lazily) the decoded-texture buffer for the texture bound in `ctx`, at
+// DEFER time on the single guest thread. Returns null if the tri is not texcache-eligible (mirrors
+// g141FastSampleTri's PSM/tbw gate), uses a REGION wrap mode, or exceeds the cap. The buffer is NOT
+// decoded here — only allocated + zero-`valid`; texels are decoded lazily on first sample (see
+// g141SamplePoint), so only sampled texels ever cost a swizzle+CLUT read. Memoized in g_g149Map keyed
+// on descriptor + VRAM generation; the map is cleared when the generation advances (any VRAM upload).
+// Guest-thread-only (defer is pre-replay) ⇒ no mutex. `self`/`vram`/`texa` are unused now (decode is
+// deferred to sample time) but kept for signature stability.
+static G149Buf g149BuildDecoded(GSRasterizer *self, GS *gs, const GSContext &ctx,
+                                const GSTexaReg &texa, uint8_t *vram)
+{
+    (void)self; (void)gs; (void)vram;
+    static const bool s_on = (std::getenv("DC2_G149_TEXCACHE") != nullptr);
+    if (!s_on)
+        return nullptr;
+    static const size_t s_cap = []() {
+        const char *e = std::getenv("DC2_G149_CAP");
+        const size_t c = e ? static_cast<size_t>(std::strtoull(e, nullptr, 0)) : 262144u;
+        return c ? c : 262144u;
+    }();
+    static const bool s_t8GsmemDefault =
+        !(std::getenv("DC2_T8_GSMEM") && std::getenv("DC2_T8_GSMEM")[0] == '0');
+    static const bool s_t8AliasSet = (std::getenv("DC2_T8_ALIAS_TBW") != nullptr);
+
+    const uint8_t psm = ctx.tex0.psm;
+    const bool fastPsm =
+        psm == GS_PSM_CT32 || psm == GS_PSM_CT24 || psm == GS_PSM_CT16 || psm == GS_PSM_CT16S ||
+        psm == GS_PSM_T4 || psm == GS_PSM_T4HL || psm == GS_PSM_T4HH ||
+        (psm == GS_PSM_T8 && s_t8GsmemDefault && !s_t8AliasSet);
+    if (!fastPsm || ctx.tex0.tbw == 0u)
+    {
+        g_g149Ineligible.fetch_add(1u, std::memory_order_relaxed);
+        return nullptr;
+    }
+    const uint8_t wrapU = static_cast<uint8_t>(ctx.clamp & 0x3u);
+    const uint8_t wrapV = static_cast<uint8_t>((ctx.clamp >> 2u) & 0x3u);
+    if (!((wrapU == 0u || wrapU == 1u) && (wrapV == 0u || wrapV == 1u)))
+    {
+        g_g149Ineligible.fetch_add(1u, std::memory_order_relaxed);
+        return nullptr; // REGION_CLAMP/REPEAT can index outside [0,texW): let the normal sampler run
+    }
+    const int texW = 1 << ctx.tex0.tw;
+    const int texH = 1 << ctx.tex0.th;
+    const size_t texels = static_cast<size_t>(texW) * static_cast<size_t>(texH);
+    if (texels == 0 || texels > s_cap)
+    {
+        g_g149Ineligible.fetch_add(1u, std::memory_order_relaxed);
+        return nullptr;
+    }
+
+    G149Key key;
+    key.tbp0 = ctx.tex0.tbp0; key.tbw = ctx.tex0.tbw; key.cbp = ctx.tex0.cbp;
+    key.tw = static_cast<uint32_t>(texW); key.th = static_cast<uint32_t>(texH);
+    key.psm = psm; key.cpsm = ctx.tex0.cpsm; key.csm = ctx.tex0.csm; key.csa = ctx.tex0.csa;
+    key.texa = (static_cast<uint32_t>(texa.aem ? 1u : 0u) << 16) |
+               (static_cast<uint32_t>(texa.ta1) << 8) | static_cast<uint32_t>(texa.ta0);
+    key.gen = g_g149VramGen.load(std::memory_order_relaxed);
+
+    if (g_g149MapGen != key.gen) { g_g149Map.clear(); g_g149MapGen = key.gen; }
+    auto it = g_g149Map.find(key);
+    if (it != g_g149Map.end())
+    {
+        g_g149Hits.fetch_add(1u, std::memory_order_relaxed);
+        return it->second;
+    }
+
+    // EAGER decode: fill the whole texture ONCE now (guest thread), so band-replay reads are pure
+    // read-only linear lookups (no cross-thread writes → stable on the parallel path). Bit-exact:
+    // filled with the SAME leaf expression g141SamplePoint uses (readTexel*/ReadP8 → lookupCLUT →
+    // applyTexa) over uu,vv in [0,texW)x[0,texH). (A lazy per-texel fill would decode only sampled
+    // texels but requires cross-band writes to the shared buffer, which proved unstable — see fix-log.)
+    auto tex = std::make_shared<G149Tex>();
+    tex->px.resize(texels);
+    tex->valid.assign(texels, 1u); // eager: every texel already decoded
+    const uint32_t pageBwT8 = ((ctx.tex0.tbw >> 1u) != 0u) ? (ctx.tex0.tbw >> 1u) : 1u;
+
+    // G166 (default OFF, DC2_G162_GPU_DECODE=1, also needs DC2_G158_GPURASTER=1): defer this T8
+    // texture's decode to the per-frame batch resolved at G144's flush point (see
+    // g162ResolvePendingT8Batch above) instead of a synchronous per-texture GPU round-trip.
+    // `pageBwT8` (not the raw ctx.tex0.tbw) is passed through unchanged -- same value ReadP8 uses
+    // in the CPU fallback, so both paths address VRAM identically. `tex` is cached NOW (px filled
+    // in later, before any replay can read it) so later triangles in this frame needing the same
+    // texture get a normal cache hit. Bit-exactness verified by the EXISTING `DC2_G149_TCVERIFY`
+    // per-pixel A/B (zero new verify code): if this path is wrong, TCVERIFY's compare shows it.
+    if (psm == GS_PSM_T8)
+    {
+        static const bool s_gpuDecode = (std::getenv("DC2_G162_GPU_DECODE") != nullptr);
+        if (s_gpuDecode)
+        {
+            G162PendingT8 pend;
+            pend.tbp0 = ctx.tex0.tbp0; pend.pageBwT8 = pageBwT8;
+            pend.texW = texW; pend.texH = texH;
+            for (int i = 0; i < 256; ++i)
+                pend.clut256[i] = self->lookupCLUT(gs, static_cast<uint8_t>(i), ctx.tex0.cbp, ctx.tex0.cpsm,
+                                                   ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.psm);
+            pend.cbp = ctx.tex0.cbp; pend.cpsm = ctx.tex0.cpsm; pend.csm = ctx.tex0.csm;
+            pend.csa = ctx.tex0.csa; pend.texPsm = ctx.tex0.psm;
+            pend.self = self; pend.gs = gs; pend.vram = vram;
+            pend.tex = tex;
+            g_g162Pending.push_back(std::move(pend));
+            g_g149Builds.fetch_add(1u, std::memory_order_relaxed);
+            g_g149Map.emplace(key, tex);
+            return tex; // px filled by g162ResolvePendingT8Batch() before replay reads it
+        }
+    }
+
+    uint32_t *d = tex->px.data();
+    for (int vv = 0; vv < texH; ++vv)
+        for (int uu = 0; uu < texW; ++uu)
+        {
+            uint32_t c;
+            switch (psm)
+            {
+            case GS_PSM_CT32:
+            case GS_PSM_CT24:
+                c = applyTexa(texa, psm, self->readTexelPSMCT32(gs, ctx.tex0.tbp0, ctx.tex0.tbw, uu, vv));
+                break;
+            case GS_PSM_CT16:
+            case GS_PSM_CT16S:
+                c = applyTexa(texa, psm, self->readTexelPSMCT16(gs, ctx.tex0.tbp0, ctx.tex0.tbw, uu, vv));
+                break;
+            case GS_PSM_T8:
+            {
+                const uint8_t idx = static_cast<uint8_t>(GSMem::ReadP8(vram, ctx.tex0.tbp0, pageBwT8,
+                                        static_cast<uint32_t>(uu), static_cast<uint32_t>(vv)));
+                c = self->lookupCLUT(gs, idx, ctx.tex0.cbp, ctx.tex0.cpsm, ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.psm);
+                break;
+            }
+            default: // T4 / T4HL / T4HH
+            {
+                const uint32_t idx = self->readTexelPSMT4(gs, ctx.tex0.tbp0, ctx.tex0.tbw, uu, vv);
+                c = self->lookupCLUT(gs, static_cast<uint8_t>(idx), ctx.tex0.cbp, ctx.tex0.cpsm, ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.psm);
+                break;
+            }
+            }
+            d[static_cast<size_t>(vv) * static_cast<size_t>(texW) + static_cast<size_t>(uu)] = c;
+        }
+    g_g149Builds.fetch_add(1u, std::memory_order_relaxed);
+    g_g149Map.emplace(key, tex);
+    return tex;
+}
+
+// ============================== G178: LLE GPU rasterizer FRONT-END ==============================
+// (default OFF, DC2_G178_GPU=1; backend = ps2_gs_gpu_raster.cpp via ps2_gs_gpu_lle.h)
+//
+// Owns everything that needs this TU's proven GS semantics: per-entry eligibility validation,
+// fixed-point→float vertex translation (exact drawTriangle/drawSprite conventions), eager
+// whole-texture decode (the SAME leaf expressions as g149BuildDecoded), the per-page VRAM write
+// generations that keep the backend's GPU-resident texture cache honest, and the swizzled VRAM
+// read/write for framebuffer upload + readback (the SAME addrPSMCT32 calls writePixel uses).
+// A flush either renders ENTIRELY on the GPU (then reads back into VRAM, so presentation/dumps/
+// any downstream VRAM reader is unaffected) or falls back ENTIRELY to the proven CPU band replay
+// — never mixed within one flush.
+namespace
+{
+bool g178GpuOn()
+{
+    // G178 promoted to DEFAULT-ON (2026-07-10) — kill via DC2_G178_NO_GPU=1 or DC2_G178_GPU=0.
+    static const bool on = !envFlagEnabled("DC2_G178_NO_GPU") && !envFlagDisabled("DC2_G178_GPU");
+    return on;
+}
+constexpr uint32_t kG178PageCount = 512; // 4MB VRAM / 8KB GS page
+std::atomic<uint64_t> g_g178PageGen[kG178PageCount]; // zero-initialized
+
+// page geometry (pixels per GS page) by PSM — used only to compute conservative page RANGES.
+void g178PageDims(uint32_t psm, uint32_t &pw, uint32_t &ph)
+{
+    switch (psm)
+    {
+    case GS_PSM_T8: pw = 128; ph = 64; break;
+    case GS_PSM_T4: pw = 128; ph = 128; break;
+    case GS_PSM_CT16: case GS_PSM_CT16S: case GS_PSM_Z16: case GS_PSM_Z16S:
+        pw = 64; ph = 64; break;
+    default: pw = 64; ph = 32; break; // CT32/CT24/Z32/Z24
+    }
+}
+
+// Sum of write-generations over a conservative page range for a rect at BLOCK base `bp`.
+// Any VRAM write into the range changes the sum (each bump is a monotonic increment).
+uint64_t g178GenSumRect(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
+                        uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    uint32_t pw, ph;
+    g178PageDims(psm, pw, ph);
+    const uint32_t widthPages = std::max(1u, (std::max(1u, bw64) * 64u) / pw);
+    const uint32_t py0 = y / ph, py1 = (y + std::max(1u, h) - 1u) / ph;
+    const uint32_t px0 = x / pw, px1 = (x + std::max(1u, w) - 1u) / pw;
+    const uint32_t basePage = bpBlocks >> 5;
+    uint64_t sum = 0;
+    for (uint32_t py = py0; py <= py1; ++py)
+        for (uint32_t px = px0; px <= px1; ++px)
+        {
+            // +1 slack page for non-page-aligned block bases (over-coverage is safe: it can only
+            // cause a spurious re-decode, never a stale texture).
+            const uint32_t pg = basePage + py * widthPages + px;
+            sum += g_g178PageGen[pg & (kG178PageCount - 1)].load(std::memory_order_relaxed);
+            sum += g_g178PageGen[(pg + 1) & (kG178PageCount - 1)].load(std::memory_order_relaxed);
+        }
+    return sum;
+}
+
+void g178BumpRectImpl(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
+                      uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    uint32_t pw, ph;
+    g178PageDims(psm, pw, ph);
+    const uint32_t widthPages = std::max(1u, (std::max(1u, bw64) * 64u) / pw);
+    const uint32_t py0 = y / ph, py1 = (y + std::max(1u, h) - 1u) / ph;
+    const uint32_t px0 = x / pw, px1 = (x + std::max(1u, w) - 1u) / pw;
+    const uint32_t basePage = bpBlocks >> 5;
+    for (uint32_t py = py0; py <= py1; ++py)
+        for (uint32_t px = px0; px <= px1; ++px)
+        {
+            const uint32_t pg = basePage + py * widthPages + px;
+            g_g178PageGen[pg & (kG178PageCount - 1)].fetch_add(1u, std::memory_order_relaxed);
+            g_g178PageGen[(pg + 1) & (kG178PageCount - 1)].fetch_add(1u, std::memory_order_relaxed);
+        }
+}
+
+// FNV-1a over the full texture descriptor → the backend's cache key. Bit 63 forced so 0 stays
+// reserved for "untextured".
+uint64_t g178TexKey(const GSContext &ctx, const GSTexaReg &texa)
+{
+    uint64_t hsh = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) { hsh ^= v; hsh *= 1099511628211ull; };
+    mix(ctx.tex0.tbp0);
+    mix((static_cast<uint64_t>(ctx.tex0.tbw) << 32) | ctx.tex0.cbp);
+    mix((static_cast<uint64_t>(ctx.tex0.tw) << 40) | (static_cast<uint64_t>(ctx.tex0.th) << 32) |
+        (static_cast<uint64_t>(ctx.tex0.psm) << 24) | (static_cast<uint64_t>(ctx.tex0.cpsm) << 16) |
+        (static_cast<uint64_t>(ctx.tex0.csm) << 8) | ctx.tex0.csa);
+    mix((static_cast<uint64_t>(texa.aem ? 1u : 0u) << 16) |
+        (static_cast<uint64_t>(texa.ta1) << 8) | texa.ta0);
+    return hsh | (1ull << 63);
+}
+
+// Front-end registry entry: what the backend has resident, the page-gen sum its decode saw, and
+// a CONTENT hash of the source pages — DC2 re-uploads texture data every frame ("transfer is
+// cheaper than space"), so gen-only invalidation would re-decode everything every frame; the
+// hash detects byte-identical re-uploads and keeps the GPU copy resident.
+struct G178TexReg
+{
+    uint64_t genSum = 0;
+    uint64_t contentHash = 0;
+    int w = 0, h = 0;
+};
+std::unordered_map<uint64_t, G178TexReg> g_g178TexReg;
+
+// Collect the distinct VRAM page indices a texture's conservative range covers (same walk as
+// g178GenSumRect, deduped), then FNV-hash those pages' raw bytes. ~8-32 pages for title textures
+// — a sequential ~64-256KB hash, far cheaper than a swizzle+CLUT whole-texture decode.
+uint64_t g178HashPages(const uint8_t *vram, uint32_t vramSize,
+                       uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
+                       uint32_t w, uint32_t h,
+                       uint32_t clutBpBlocks)
+{
+    bool mark[kG178PageCount] = {};
+    auto collect = [&](uint32_t bp, uint32_t bw, uint32_t p, uint32_t ww, uint32_t hh) {
+        uint32_t pw, ph;
+        g178PageDims(p, pw, ph);
+        const uint32_t widthPages = std::max(1u, (std::max(1u, bw) * 64u) / pw);
+        const uint32_t py1 = (std::max(1u, hh) - 1u) / ph;
+        const uint32_t px1 = (std::max(1u, ww) - 1u) / pw;
+        const uint32_t basePage = bp >> 5;
+        for (uint32_t py = 0; py <= py1; ++py)
+            for (uint32_t px = 0; px <= px1; ++px)
+            {
+                const uint32_t pg = basePage + py * widthPages + px;
+                mark[pg & (kG178PageCount - 1)] = true;
+                mark[(pg + 1) & (kG178PageCount - 1)] = true;
+            }
+    };
+    collect(bpBlocks, bw64, psm, w, h);
+    collect(clutBpBlocks, 1, GS_PSM_CT32, 64, 32);
+    uint64_t hsh = 1469598103934665603ull;
+    for (uint32_t pg = 0; pg < kG178PageCount; ++pg)
+    {
+        if (!mark[pg])
+            continue;
+        const size_t off = static_cast<size_t>(pg) * 8192u;
+        if (off + 8192u > vramSize)
+            continue;
+        const uint8_t *p = vram + off;
+        for (size_t i = 0; i < 8192u; i += 8)
+        {
+            uint64_t v;
+            std::memcpy(&v, p + i, 8);
+            hsh ^= v;
+            hsh *= 1099511628211ull;
+        }
+    }
+    return hsh;
+}
+
+// Per-fbp framebuffer snapshot state: when the fb pages' gen sum is unchanged since our last
+// readback (and the row window is inside what we have ever uploaded/read back), the FBO already
+// equals VRAM and the upload can be skipped.
+struct G178FbSnap
+{
+    uint64_t genSum = 0;
+    int rowLo = 1 << 30, rowHi = -1; // rows ever covered by an upload/readback
+    bool valid = false;
+};
+std::map<uint32_t, G178FbSnap> g_g178FbSnap;
+
+// G178 stats ([G178:stat] every 300 flushes when enabled).
+std::atomic<uint64_t> g_g178Flushes{0}, g_g178GpuFlushes{0}, g_g178Fallbacks{0};
+std::atomic<uint64_t> g_g178TexDecodes{0}, g_g178TexHits{0}, g_g178TexHashHits{0};
+std::atomic<uint64_t> g_g178FbUploads{0}, g_g178FbUploadSkips{0};
+std::atomic<uint64_t> g_g178RejectState{0}, g_g178RejectBlend{0}, g_g178RejectTex{0};
+
+// GSRasterizer::lookupCLUT reads the CLUT WINDOW (cbw/cou/cov) from `gs->m_texclut` and the
+// alpha-key from `gs->m_texa` -- both LIVE state, correct for CPU inline/replay callers (which
+// install the entry's own snapshot as active state first) but WRONG for g178DecodeWhole, which
+// runs at flush time against whatever the game's live CLUT window has moved on to since this
+// entry was captured (e.g. a later glyph's differently-positioned CLUT slot inside a shared CLUT
+// bank). Same bug class as the T4HH nibble-plane fix above, second instance: replicate
+// lookupCLUT's logic here using the entry's OWN captured `texclut`/`texa`.
+uint32_t g178LookupClutFixed(uint8_t *vram, const GSTexaReg &texa, const GSTexClutReg &texclut,
+                             uint8_t index, uint32_t cbp, uint8_t cpsm, uint8_t csm, uint8_t csa,
+                             uint8_t sourcePsm)
+{
+    const uint32_t clutIndex = resolveClutIndex(index, csm, csa, sourcePsm);
+    const uint32_t clutWidth = (texclut.cbw != 0u) ? static_cast<uint32_t>(texclut.cbw) : 1u;
+    const uint32_t clutX = static_cast<uint32_t>(texclut.cou) + (clutIndex & 0x0Fu);
+    const uint32_t clutY = static_cast<uint32_t>(texclut.cov) + (clutIndex >> 4);
+    switch (cpsm)
+    {
+    case GS_PSM_CT32:
+        return applyTexa(texa, cpsm, GSMem::ReadCT32(vram, cbp, clutWidth, clutX, clutY));
+    case GS_PSM_CT24:
+        return applyTexa(texa, cpsm, GSMem::ReadCT24(vram, cbp, clutWidth, clutX, clutY));
+    case GS_PSM_CT16:
+        return applyTexa(texa, cpsm, decodePSMCT16(static_cast<uint16_t>(GSMem::ReadCT16(vram, cbp, clutWidth, clutX, clutY))));
+    case GS_PSM_CT16S:
+        return applyTexa(texa, cpsm, decodePSMCT16(static_cast<uint16_t>(GSMem::ReadCT16S(vram, cbp, clutWidth, clutX, clutY))));
+    default:
+        break;
+    }
+    return 0xFFFF00FFu;
+}
+
+// Eager whole-texture decode — the SAME leaf expressions as g149BuildDecoded's eager loop
+// (readTexel*/ReadP8 → lookupCLUT), so GPU sampling sees byte-identical texels to the CPU path.
+void g178DecodeWhole(GSRasterizer *self, GS *gs, uint8_t *vram, const GSContext &ctx,
+                     const GSTexaReg &texa, const GSTexClutReg &texclut, int texW, int texH,
+                     uint32_t *outPx)
+{
+    const uint8_t psm = ctx.tex0.psm;
+    const uint32_t pageBwT8 = ((ctx.tex0.tbw >> 1u) != 0u) ? (ctx.tex0.tbw >> 1u) : 1u;
+    for (int vv = 0; vv < texH; ++vv)
+        for (int uu = 0; uu < texW; ++uu)
+        {
+            uint32_t c;
+            switch (psm)
+            {
+            case GS_PSM_CT32:
+            case GS_PSM_CT24:
+                c = applyTexa(texa, psm, self->readTexelPSMCT32(gs, ctx.tex0.tbp0, ctx.tex0.tbw, uu, vv));
+                break;
+            case GS_PSM_CT16:
+            case GS_PSM_CT16S:
+                c = applyTexa(texa, psm, self->readTexelPSMCT16(gs, ctx.tex0.tbp0, ctx.tex0.tbw, uu, vv));
+                break;
+            case GS_PSM_T8:
+            {
+                const uint8_t idx = static_cast<uint8_t>(GSMem::ReadP8(vram, ctx.tex0.tbp0, pageBwT8,
+                                        static_cast<uint32_t>(uu), static_cast<uint32_t>(vv)));
+                c = g178LookupClutFixed(vram, texa, texclut, idx, ctx.tex0.cbp, ctx.tex0.cpsm,
+                                        ctx.tex0.csm, ctx.tex0.csa, psm);
+                break;
+            }
+            default: // T4 / T4HL / T4HH
+            {
+                // readTexelPSMT4 derives the HH/HL/plain split from gs->activeContext().tex0.psm
+                // (the LIVE GS state) -- correct for the CPU inline/replay paths (which install the
+                // entry's ctx as active before sampling) but WRONG here: g178DecodeWhole runs at
+                // flush time against whatever the game's active tex0.psm has moved on to since this
+                // entry was captured, silently reading the wrong nibble plane for T4HH/T4HL sources
+                // (e.g. the costume value-bar text atlas, tbp0=0x1a00 psm=T4HH per G5). Dispatch on
+                // this entry's OWN captured `psm` instead, calling GSMem's readers directly.
+                uint32_t idx;
+                if (psm == GS_PSM_T4HH)
+                    idx = GSMem::ReadP4HH(vram, ctx.tex0.tbp0, ctx.tex0.tbw,
+                                          static_cast<uint32_t>(uu), static_cast<uint32_t>(vv));
+                else if (psm == GS_PSM_T4HL)
+                    idx = GSMem::ReadP4HL(vram, ctx.tex0.tbp0, ctx.tex0.tbw,
+                                          static_cast<uint32_t>(uu), static_cast<uint32_t>(vv));
+                else
+                {
+                    const uint32_t pageBwT4 = ((ctx.tex0.tbw >> 1u) != 0u) ? (ctx.tex0.tbw >> 1u) : 1u;
+                    idx = GSMem::ReadP4(vram, ctx.tex0.tbp0, pageBwT4,
+                                        static_cast<uint32_t>(uu), static_cast<uint32_t>(vv));
+                }
+                c = g178LookupClutFixed(vram, texa, texclut, static_cast<uint8_t>(idx), ctx.tex0.cbp,
+                                        ctx.tex0.cpsm, ctx.tex0.csm, ctx.tex0.csa, psm);
+                break;
+            }
+            }
+            outPx[static_cast<size_t>(vv) * static_cast<size_t>(texW) + static_cast<size_t>(uu)] = c;
+        }
+}
+
+// Per-entry validation + draw-state derivation. Returns false → whole flush falls back to CPU.
+struct G178EntryState
+{
+    uint64_t texKey = 0;
+    int texW = 0, texH = 0;
+    uint8_t blend = 0, tfx = 0, tcc = 0;
+    uint8_t depthFunc = 0;
+    bool depthWrite = false, bilinear = false;
+    uint8_t wrapU = 0, wrapV = 0;
+    uint16_t scX0 = 0, scY0 = 0, scX1 = 0, scY1 = 0;
+    bool skip = false; // valid but draws nothing (e.g. ZTST=NEVER)
+};
+
+bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
+{
+    const GSContext &ctx = e.ctx;
+    // Frame target: CT32 display buffer, no channel masking, no dest-alpha tricks.
+    if (ctx.frame.psm != GS_PSM_CT32 || ctx.frame.fbmsk != 0u || ctx.frame.fbw == 0u ||
+        (ctx.fba & 1ull) != 0ull || e.pabe)
+    {
+        g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+        return false;
+    }
+    const uint64_t ts = ctx.test;
+    const uint32_t ate = static_cast<uint32_t>(ts & 1u);
+    const uint32_t atst = static_cast<uint32_t>((ts >> 1) & 7u);
+    const uint32_t aref = static_cast<uint32_t>((ts >> 4) & 0xffu);
+    const uint32_t date = static_cast<uint32_t>((ts >> 14) & 1u);
+    // Alpha test must be a structural no-op (title census: ATST=GEQUAL AREF=0 / ATST=ALWAYS).
+    if (date != 0u || (ate != 0u && !(atst == 1u || (atst == 5u && aref == 0u))))
+    {
+        g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+        return false;
+    }
+    // Scissor (inclusive) sanity; FBO rows capped at 512.
+    if (ctx.scissor.x1 < ctx.scissor.x0 || ctx.scissor.y1 < ctx.scissor.y0 ||
+        ctx.scissor.y1 >= 512u || ctx.scissor.x1 >= 1024u)
+    {
+        g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+        return false;
+    }
+    st.scX0 = ctx.scissor.x0; st.scY0 = ctx.scissor.y0;
+    st.scX1 = ctx.scissor.x1; st.scY1 = ctx.scissor.y1;
+
+    // Blend classification (writePixel's ((A-B)*C>>7)+D with the census-confirmed combos).
+    if (!e.prim.abe)
+        st.blend = 0;
+    else
+    {
+        const uint64_t al = ctx.alpha;
+        const uint32_t a = static_cast<uint32_t>(al & 3u), b = static_cast<uint32_t>((al >> 2) & 3u);
+        const uint32_t c = static_cast<uint32_t>((al >> 4) & 3u), d = static_cast<uint32_t>((al >> 6) & 3u);
+        if (a == b && d == 0u)
+            st.blend = 0; // (X-X)*C + Cs == Cs
+        else if (a == 0u && b == 1u && c == 0u && d == 1u)
+            st.blend = 1; // (Cs-Cd)*As + Cd
+        else if (a == 0u && b == 2u && c == 0u && d == 1u)
+            st.blend = 2; // Cs*As + Cd
+        else
+        {
+            g_g178RejectBlend.fetch_add(1u, std::memory_order_relaxed);
+            return false;
+        }
+    }
+
+    // Texture state.
+    if (e.prim.tme)
+    {
+        const uint8_t psm = ctx.tex0.psm;
+        const bool okPsm = psm == GS_PSM_CT32 || psm == GS_PSM_CT24 || psm == GS_PSM_CT16 ||
+                           psm == GS_PSM_CT16S || psm == GS_PSM_T8 || psm == GS_PSM_T4 ||
+                           psm == GS_PSM_T4HL || psm == GS_PSM_T4HH;
+        const uint8_t wu = static_cast<uint8_t>(ctx.clamp & 3u);
+        const uint8_t wv = static_cast<uint8_t>((ctx.clamp >> 2) & 3u);
+        st.texW = 1 << ctx.tex0.tw;
+        st.texH = 1 << ctx.tex0.th;
+        if (!okPsm || ctx.tex0.tbw == 0u || wu > 1u || wv > 1u ||
+            st.texW > 1024 || st.texH > 1024)
+        {
+            g_g178RejectTex.fetch_add(1u, std::memory_order_relaxed);
+            return false;
+        }
+        st.texKey = g178TexKey(ctx, e.texa);
+        st.tfx = ctx.tex0.tfx;
+        st.tcc = ctx.tex0.tcc;
+        st.bilinear = ((ctx.tex1 >> 5) & 1u) != 0u; // MMAG (the CPU fast path keys on the same bit class)
+        // G179: GL_REPEAT wraps the final NORMALIZED [0,1] UV -- under GL_NEAREST, a sample that
+        // floating-point-rounds to land exactly on (or a hair past) the wrap seam reads the
+        // texture's OPPOSITE edge instead of clamping, bleeding a stray row/column of an unrelated
+        // atlas cell into the draw (found on the debug-menu PSMT4HH font, which is REPEAT-wrapped
+        // per G5, and is always point-sampled per G8 -- DC2's 2D UI/text is never bilinear). GS
+        // hardware itself only cares about wrap for genuine out-of-declared-range addressing, which
+        // point-sampled UI glyphs never actually need (each glyph's own UV stays within one atlas
+        // cell) -- CLAMP_TO_EDGE removes the seam-bleed risk with no behavior change for in-range
+        // sampling. Bilinear-sampled REPEAT textures (tiled background art) are unaffected.
+        st.wrapU = st.bilinear ? wu : 1u;
+        st.wrapV = st.bilinear ? wv : 1u;
+    }
+
+    // Depth: the CPU rasterizer's SHIPPED title model — Z applies only to title-rock-scope tris
+    // (private per-fbp Z, g106TitleZScope); sprites never touch Z (drawSprite has no Z code).
+    st.depthFunc = 0;
+    st.depthWrite = false;
+    if (e.prim.type != GS_PRIM_SPRITE)
+    {
+        static const bool s_zTestDisabled = (std::getenv("DC2_NO_ZTEST") != nullptr);
+        const bool rockScope = e.titleRockScope && e.prim.tme && ctx.frame.fbp != 0x139u &&
+                               ctx.tex0.tbp0 >= 0x2720u && ctx.tex0.tbp0 <= 0x3960u;
+        const uint32_t zte = static_cast<uint32_t>((ts >> 16) & 1u);
+        const uint32_t ztst = static_cast<uint32_t>((ts >> 17) & 3u);
+        const bool zmsk = ((ctx.zbuf >> 32) & 1ull) != 0ull;
+        const uint32_t zpsm = static_cast<uint32_t>((ctx.zbuf >> 24) & 0xFu);
+        const bool zEnabled = !s_zTestDisabled && g106TitleZEnabled() && rockScope && zte != 0u;
+        if (zEnabled)
+        {
+            if (zpsm != 0u)
+            {
+                g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+                return false; // title is PSMZ32; other Z formats untested on this path
+            }
+            if (ztst == 0u)
+            {
+                st.skip = true; // NEVER: draws nothing
+                return true;
+            }
+            st.depthFunc = (ztst == 1u) ? 1 : (ztst == 2u ? 2 : 3);
+            st.depthWrite = !zmsk;
+        }
+    }
+    return true;
+}
+
+bool g178StateEqual(const G178EntryState &x, const G178EntryState &y)
+{
+    return x.texKey == y.texKey && x.blend == y.blend && x.tfx == y.tfx && x.tcc == y.tcc &&
+           x.depthFunc == y.depthFunc && x.depthWrite == y.depthWrite &&
+           x.bilinear == y.bilinear && x.wrapU == y.wrapU && x.wrapV == y.wrapV &&
+           x.scX0 == y.scX0 && x.scY0 == y.scY0 && x.scX1 == y.scX1 && x.scY1 == y.scY1;
+}
+
+void g178PushVertex(std::vector<G178Vtx> &out, const GSVertex &v, int ofx, int ofy,
+                    const GSVertex &colorSrc, bool tme, bool fst, int texW, int texH,
+                    float uvShiftU, float uvShiftV)
+{
+    G178Vtx o;
+    o.x = v.x - static_cast<float>(ofx);
+    o.y = v.y - static_cast<float>(ofy);
+    o.z = v.z;
+    o.r = colorSrc.r; o.g = colorSrc.g; o.b = colorSrc.b; o.a = colorSrc.a;
+    if (!tme)
+    {
+        o.sq = 0.0f; o.tq = 0.0f; o.iq = 1.0f;
+    }
+    else if (fst)
+    {
+        o.sq = (static_cast<float>(v.u) / 16.0f + uvShiftU) / static_cast<float>(texW);
+        o.tq = (static_cast<float>(v.v) / 16.0f + uvShiftV) / static_cast<float>(texH);
+        o.iq = 1.0f;
+    }
+    else
+    {
+        // CPU parity (drawTriangle STQ path): the rasterizer samples at texUf =
+        // interp_screen(s * 1/|q|) * texW — an AFFINE interpolation of the pre-divided
+        // coordinate (v.s is the GS's Q-premultiplied S). Emit s/|q| per vertex and interpolate
+        // it linearly (iq=1), NOT a perspective reconstruction — matching the shipped CPU
+        // sampler exactly is the phase-1 gate.
+        const float invQ = 1.0f / fabsQ(v.q);
+        o.sq = v.s * invQ;
+        o.tq = v.t * invQ;
+        o.iq = 1.0f;
+    }
+    out.push_back(o);
+}
+} // namespace
+
+// Extern bump hooks (called from ps2_gs_gpu.cpp's upload/local-transfer paths, next to the
+// existing g149BumpVramGen calls). `bpBlocks` is a BLOCK base (BITBLTBUF convention). No-op
+// unless the GPU lever is on.
+void g178NoteVramWriteRect(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
+                           uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (!g178GpuOn())
+        return;
+    g178BumpRectImpl(bpBlocks, bw64, psm, x, y, w, h);
+}
+
+// The whole-flush GPU attempt. Called from BOTH G144 flush closures (worker thread mid-frame /
+// EE thread at the frame barrier — never concurrently, see the barrier contract in
+// dc2_game_override.cpp). Returns true when the batch was rendered on the GPU AND its pixels are
+// already written back into guest VRAM — the caller must then skip the CPU replay and clear the
+// list. Any unsupported entry → false (caller runs the proven CPU replay for the WHOLE flush).
+static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t vramSize)
+{
+    if (!g178GpuOn() || g_g144List.empty() || vram == nullptr)
+        return false;
+    if (!g178_backend_ready())
+        return false;
+    g_g178Flushes.fetch_add(1u, std::memory_order_relaxed);
+
+    const uint32_t fbp = g_g144List[0].ctx.frame.fbp;
+    const uint32_t fbw = g_g144List[0].ctx.frame.fbw;
+    const int fbW = static_cast<int>(fbw) * 64;
+    constexpr int kFbH = 512;
+    if (fbW <= 0 || fbW > 1024)
+    {
+        g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+        g_g178FbSnap.clear();
+        return false;
+    }
+
+    // Pass 1: validate every entry + derive draw state. All-or-nothing.
+    static std::vector<G178EntryState> s_states;
+    s_states.clear();
+    s_states.reserve(g_g144List.size());
+    int rowLo = kFbH, rowHi = -1;
+    for (const G144Entry &e : g_g144List)
+    {
+        if (e.ctx.frame.fbp != fbp || e.ctx.frame.fbw != fbw)
+        {
+            g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+            g_g178FbSnap.clear();
+            return false; // mixed targets in one flush — shouldn't happen (block flush on fbp change)
+        }
+        G178EntryState st;
+        if (!g178ClassifyEntry(e, st))
+        {
+            g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+            g_g178FbSnap.clear(); // the CPU replay about to run writes VRAM the gens don't track
+            return false;
+        }
+        s_states.push_back(st);
+        if (!st.skip)
+        {
+            rowLo = std::min(rowLo, static_cast<int>(st.scY0));
+            rowHi = std::max(rowHi, static_cast<int>(st.scY1));
+        }
+    }
+    if (rowHi < rowLo)
+        return true; // everything skipped — nothing to draw, nothing to read back
+
+    // Pass 2: build the batch.
+    static G178Batch s_batch; // reused across flushes (keeps vector capacity)
+    s_batch.fbp = fbp;
+    s_batch.fbW = fbW;
+    s_batch.fbH = kFbH;
+    s_batch.texUploads.clear();
+    s_batch.verts.clear();
+    s_batch.draws.clear();
+
+    // Depth-clear on target change: mirror g106TitleZClearIfNeeded's fbp-transition semantics and
+    // keep the CPU private-Z state machine in sync for any CPU-fallback flush in between.
+    {
+        static uint32_t s_lastZFbp = 0xFFFFFFFFu;
+        s_batch.clearDepth = (s_lastZFbp != fbp);
+        s_lastZFbp = fbp;
+        g106TitleZClearIfNeeded(fbp);
+    }
+
+    // Framebuffer upload, GEN-GATED: skipped when (a) the fb pages' write-gen sum is unchanged
+    // since our last readback for this fbp (no CPU upload/inline draw touched them — GPU inline
+    // writes bump via the drawPrimitive hook, BITBLTs via the ps2_gs_gpu.cpp hooks, and a CPU-
+    // fallback flush invalidates the snapshot wholesale below), AND (b) this batch's row window
+    // is inside the rows we have ever uploaded/read back (FBO rows outside that are undefined).
+    // GL row order = bottom-first: buffer row r = GS row (kFbH-1-r).
+    const int rows = rowHi - rowLo + 1;
+    const uint32_t fbBlock = GSInternal::framePageBaseToBlock(fbp);
+    G178FbSnap &snap = g_g178FbSnap[fbp];
+    const uint64_t fbGenNow = g178GenSumRect(fbBlock, fbw, GS_PSM_CT32, 0, 0,
+                                             static_cast<uint32_t>(fbW), kFbH);
+    s_batch.uploadFb = !(snap.valid && snap.genSum == fbGenNow &&
+                         rowLo >= snap.rowLo && rowHi <= snap.rowHi);
+    if (s_batch.uploadFb)
+    {
+        g_g178FbUploads.fetch_add(1u, std::memory_order_relaxed);
+        s_batch.fbPixels.assign(static_cast<size_t>(fbW) * kFbH, 0u);
+        // Upload the union of this batch's window and everything previously covered, so the
+        // covered-row invariant stays true after a single upload.
+        const int upLo = snap.valid ? std::min(rowLo, snap.rowLo) : rowLo;
+        const int upHi = snap.valid ? std::max(rowHi, snap.rowHi) : rowHi;
+        for (int y = upLo; y <= upHi; ++y)
+        {
+            const size_t dstRow = static_cast<size_t>(kFbH - 1 - y) * fbW;
+            for (int x = 0; x < fbW; ++x)
+            {
+                const uint32_t off = GSPSMCT32::addrPSMCT32(fbBlock, fbw,
+                                                            static_cast<uint32_t>(x),
+                                                            static_cast<uint32_t>(y));
+                uint32_t px = 0;
+                if (off + 4u <= vramSize)
+                    std::memcpy(&px, vram + off, 4);
+                s_batch.fbPixels[dstRow + x] = px;
+            }
+        }
+        snap.rowLo = upLo;
+        snap.rowHi = upHi;
+    }
+    else
+    {
+        g_g178FbUploadSkips.fetch_add(1u, std::memory_order_relaxed);
+        s_batch.fbPixels.clear();
+    }
+
+    // Textures: decode + upload anything not resident or invalidated by page-gen changes.
+    static std::unordered_set<uint64_t> s_batchKeys;
+    s_batchKeys.clear();
+    for (size_t i = 0; i < g_g144List.size(); ++i)
+    {
+        const G178EntryState &st = s_states[i];
+        if (st.texKey == 0 || st.skip || s_batchKeys.count(st.texKey))
+            continue;
+        s_batchKeys.insert(st.texKey);
+        const G144Entry &e = g_g144List[i];
+        const GSContext &ctx = e.ctx;
+        const uint64_t genNow =
+            g178GenSumRect(ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0, 0,
+                           static_cast<uint32_t>(st.texW), static_cast<uint32_t>(st.texH)) +
+            g178GenSumRect(ctx.tex0.cbp, 1, GS_PSM_CT32, 0, 0, 64, 32); // CLUT page(s)
+        auto it = g_g178TexReg.find(st.texKey);
+        const bool backendHas = g178_backend_has_tex(st.texKey);
+        if (it != g_g178TexReg.end() && backendHas && it->second.genSum == genNow)
+        {
+            g_g178TexHits.fetch_add(1u, std::memory_order_relaxed);
+            continue;
+        }
+        // Gen mismatch (or unknown): DC2 re-uploads texture data every frame, usually byte-
+        // identical — hash the source pages before paying the swizzle+CLUT decode. Hash-equal +
+        // still resident → refresh the gen stamp and keep the GPU copy.
+        const uint64_t hashNow = g178HashPages(vram, vramSize, ctx.tex0.tbp0, ctx.tex0.tbw,
+                                               ctx.tex0.psm, static_cast<uint32_t>(st.texW),
+                                               static_cast<uint32_t>(st.texH), ctx.tex0.cbp);
+        if (it != g_g178TexReg.end() && backendHas && it->second.contentHash == hashNow)
+        {
+            it->second.genSum = genNow;
+            g_g178TexHashHits.fetch_add(1u, std::memory_order_relaxed);
+            continue;
+        }
+        G178TexUpload up;
+        up.key = st.texKey;
+        up.w = st.texW;
+        up.h = st.texH;
+        up.px.resize(static_cast<size_t>(st.texW) * st.texH);
+        g178DecodeWhole(self, gs, vram, ctx, e.texa, e.texclut, st.texW, st.texH, up.px.data());
+        s_batch.texUploads.push_back(std::move(up));
+        g_g178TexReg[st.texKey] = G178TexReg{genNow, hashNow, st.texW, st.texH};
+        g_g178TexDecodes.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    // Vertices + state-batched draw runs (submission order preserved — no sorting; blending
+    // depends on order).
+    for (size_t i = 0; i < g_g144List.size(); ++i)
+    {
+        const G178EntryState &st = s_states[i];
+        if (st.skip)
+            continue;
+        const G144Entry &e = g_g144List[i];
+        const int ofx = e.ctx.xyoffset.ofx >> 4;
+        const int ofy = e.ctx.xyoffset.ofy >> 4;
+        const int first = static_cast<int>(s_batch.verts.size());
+        if (e.prim.type == GS_PRIM_SPRITE)
+        {
+            // drawSprite: rect [min..max) exclusive right/bottom, FLAT color from v1, UV linearly
+            // interpolated with the G8 LEFT-EDGE (0.0) bias — GL samples at pixel centers (+0.5),
+            // so shift the UVs by -0.5 * (texel step per pixel) to reproduce the CPU convention.
+            const GSVertex &a = e.v[0];
+            const GSVertex &b = e.v[1];
+            float uvShiftU = 0.0f, uvShiftV = 0.0f;
+            if (e.prim.tme && e.prim.fst)
+            {
+                const float dxp = b.x - a.x; // positions are already pixel-unit floats (kick /16)
+                const float dyp = b.y - a.y;
+                if (dxp != 0.0f)
+                    uvShiftU = -0.5f * (static_cast<float>(b.u) - static_cast<float>(a.u)) / 16.0f / dxp;
+                if (dyp != 0.0f)
+                    uvShiftV = -0.5f * (static_cast<float>(b.v) - static_cast<float>(a.v)) / 16.0f / dyp;
+            }
+            GSVertex q0 = a, q1 = b;
+            // Two triangles covering the rect; UVs pair with the ORIGINAL corners (axis-aligned).
+            GSVertex c00 = q0, c11 = q1, c10 = q0, c01 = q0;
+            c10.x = q1.x; c10.u = q1.u; // (x1, y0)
+            c01.y = q1.y; c01.v = q1.v; // (x0, y1)
+            const bool tme = e.prim.tme, fst = e.prim.fst;
+            g178PushVertex(s_batch.verts, c00, ofx, ofy, b, tme, fst, st.texW, st.texH, uvShiftU, uvShiftV);
+            g178PushVertex(s_batch.verts, c10, ofx, ofy, b, tme, fst, st.texW, st.texH, uvShiftU, uvShiftV);
+            g178PushVertex(s_batch.verts, c11, ofx, ofy, b, tme, fst, st.texW, st.texH, uvShiftU, uvShiftV);
+            g178PushVertex(s_batch.verts, c00, ofx, ofy, b, tme, fst, st.texW, st.texH, uvShiftU, uvShiftV);
+            g178PushVertex(s_batch.verts, c11, ofx, ofy, b, tme, fst, st.texW, st.texH, uvShiftU, uvShiftV);
+            g178PushVertex(s_batch.verts, c01, ofx, ofy, b, tme, fst, st.texW, st.texH, uvShiftU, uvShiftV);
+        }
+        else
+        {
+            // Triangle: gouraud (iip=1) uses per-vertex color; flat uses v2's (drawTriangle).
+            const bool tme = e.prim.tme, fst = e.prim.fst, iip = e.prim.iip;
+            for (int k = 0; k < 3; ++k)
+                g178PushVertex(s_batch.verts, e.v[k], ofx, ofy, iip ? e.v[k] : e.v[2],
+                               tme, fst, st.texW, st.texH, 0.0f, 0.0f);
+        }
+        const int count = static_cast<int>(s_batch.verts.size()) - first;
+        if (!s_batch.draws.empty() && g178StateEqual(s_states[i], s_states[i - 1]) &&
+            s_batch.draws.back().firstVtx + s_batch.draws.back().vtxCount == first)
+        {
+            s_batch.draws.back().vtxCount += count;
+        }
+        else
+        {
+            G178Draw d;
+            d.firstVtx = first;
+            d.vtxCount = count;
+            d.texKey = st.texKey;
+            d.blend = st.blend;
+            d.tfx = st.tfx;
+            d.tcc = st.tcc;
+            d.depthFunc = st.depthFunc;
+            d.depthWrite = st.depthWrite;
+            d.bilinear = st.bilinear;
+            d.wrapU = st.wrapU;
+            d.wrapV = st.wrapV;
+            d.scX0 = st.scX0; d.scY0 = st.scY0; d.scX1 = st.scX1; d.scY1 = st.scY1;
+            s_batch.draws.push_back(d);
+        }
+    }
+
+    if (!g178_backend_submit(s_batch))
+    {
+        g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+        g_g178FbSnap.clear(); // the CPU replay about to run writes VRAM the gens don't track
+        return false;
+    }
+
+    // Write the rendered rows back into guest VRAM (same addressing as writePixel) so the
+    // present latch / frame dumps / any guest read sees the GPU result.
+    if (s_batch.readback.size() == static_cast<size_t>(fbW) * kFbH)
+    {
+        for (int y = rowLo; y <= rowHi; ++y)
+        {
+            const size_t srcRow = static_cast<size_t>(kFbH - 1 - y) * fbW;
+            for (int x = 0; x < fbW; ++x)
+            {
+                const uint32_t off = GSPSMCT32::addrPSMCT32(fbBlock, fbw,
+                                                            static_cast<uint32_t>(x),
+                                                            static_cast<uint32_t>(y));
+                if (off + 4u <= vramSize)
+                    std::memcpy(vram + off, &s_batch.readback[srcRow + x], 4);
+            }
+        }
+    }
+    // FBO == VRAM for this fbp now (the readback did not bump any page gen).
+    snap.genSum = fbGenNow;
+    snap.valid = true;
+    if (rowLo < snap.rowLo) snap.rowLo = rowLo;
+    if (rowHi > snap.rowHi) snap.rowHi = rowHi;
+
+    const uint64_t nGpu = g_g178GpuFlushes.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    static const bool s_stat = (std::getenv("DC2_G178_STAT") != nullptr);
+    if (s_stat && (nGpu % 300u) == 0u)
+        std::fprintf(stderr,
+            "[G178:stat] flushes=%llu gpu=%llu fallback=%llu texDecodes=%llu texHits=%llu "
+            "texHashHits=%llu fbUp=%llu fbSkip=%llu rej(state=%llu blend=%llu tex=%llu) "
+            "lastBatch(verts=%zu draws=%zu texUps=%zu rows=%d)\n",
+            (unsigned long long)g_g178Flushes.load(std::memory_order_relaxed),
+            (unsigned long long)nGpu,
+            (unsigned long long)g_g178Fallbacks.load(std::memory_order_relaxed),
+            (unsigned long long)g_g178TexDecodes.load(std::memory_order_relaxed),
+            (unsigned long long)g_g178TexHits.load(std::memory_order_relaxed),
+            (unsigned long long)g_g178TexHashHits.load(std::memory_order_relaxed),
+            (unsigned long long)g_g178FbUploads.load(std::memory_order_relaxed),
+            (unsigned long long)g_g178FbUploadSkips.load(std::memory_order_relaxed),
+            (unsigned long long)g_g178RejectState.load(std::memory_order_relaxed),
+            (unsigned long long)g_g178RejectBlend.load(std::memory_order_relaxed),
+            (unsigned long long)g_g178RejectTex.load(std::memory_order_relaxed),
+            s_batch.verts.size(), s_batch.draws.size(), s_batch.texUploads.size(), rows);
+    return true;
+}
+
+// ===== G161 (MEASURE ONLY, DEFAULT OFF, DC2_G161_STAT=1) — census the G158 plan's eligibility =====
+// gate against REAL G144-deferred title geometry, before writing any GPU shader/commit code. The
+// signed-off G158 plan (~/.claude/plans/snoopy-roaming-blanket.md) scoped GPU raster to a narrow
+// predicate specifically to dodge the two hardest risk classes (CLUT/swizzle decode in a shader,
+// and PS2-fixed-point-Z vs GPU-depth-float correctness): textured tri, abe==0 (no blend), fbp
+// already known 0x0/0x68 at this call site (G144's deferrable144 already enforced that), PSM in
+// {CT32,CT24,CT16,CT16S} (no CLUT4/T8/T4 -- palette lookup deliberately excluded), wrap in
+// {REPEAT,CLAMP}, texW*texH <= cap, alpha-test disabled (ctx.test bit0 = ATE). This function does
+// NOT touch VRAM, GL, or any new thread -- it only counts, at the exact site G144 already captures
+// deferred entries, whether each one *would* pass every clause of that gate. Answers the decisive
+// open question before any GPU-thread/shader engineering: is there any eligible geometry at all in
+// the title workload (suspected near-zero -- prior phases record the cavern as PSMT8, which this
+// gate deliberately excludes)? Same measure-before-build sequencing as G148 (measured the sampler
+// before G149 built -- and later refuted -- the CPU decode cache).
+namespace
+{
+std::atomic<uint64_t> g_g161Total{0};
+std::atomic<uint64_t> g_g161Eligible{0};
+std::atomic<uint64_t> g_g161BadPsm{0};
+std::atomic<uint64_t> g_g161BadWrap{0};
+std::atomic<uint64_t> g_g161Blend{0};
+std::atomic<uint64_t> g_g161Atest{0};
+std::atomic<uint64_t> g_g161TooBig{0};
+
+void g161Report()
+{
+    const uint64_t tot = g_g161Total.load(std::memory_order_relaxed);
+    const uint64_t elig = g_g161Eligible.load(std::memory_order_relaxed);
+    std::fprintf(stderr,
+                 "[G161:elig] eligible=%llu total=%llu (%.1f%%) badPsm=%llu badWrap=%llu blend=%llu atest=%llu tooBig=%llu\n",
+                 (unsigned long long)elig, (unsigned long long)tot,
+                 tot ? 100.0 * static_cast<double>(elig) / static_cast<double>(tot) : 0.0,
+                 (unsigned long long)g_g161BadPsm.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g161BadWrap.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g161Blend.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g161Atest.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g161TooBig.load(std::memory_order_relaxed));
+    std::fflush(stderr);
+}
+} // namespace
+
+static void g161CensusEligibility(const GSContext &ctx, bool abe)
+{
+    static const bool s_on = (std::getenv("DC2_G161_STAT") != nullptr);
+    if (!s_on)
+        return;
+    static const size_t s_cap = []() {
+        const char *e = std::getenv("DC2_G158_CAP");
+        const size_t c = e ? static_cast<size_t>(std::strtoull(e, nullptr, 0)) : 262144u;
+        return c ? c : 262144u;
+    }();
+
+    const uint64_t tot = g_g161Total.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    bool ok = true;
+    if (abe) { g_g161Blend.fetch_add(1u, std::memory_order_relaxed); ok = false; }
+    if ((ctx.test & 0x1u) != 0u) { g_g161Atest.fetch_add(1u, std::memory_order_relaxed); ok = false; }
+    const uint8_t psm = ctx.tex0.psm;
+    const bool goodPsm = psm == GS_PSM_CT32 || psm == GS_PSM_CT24 ||
+                         psm == GS_PSM_CT16 || psm == GS_PSM_CT16S;
+    if (!goodPsm) { g_g161BadPsm.fetch_add(1u, std::memory_order_relaxed); ok = false; }
+    const uint8_t wrapU = static_cast<uint8_t>(ctx.clamp & 0x3u);
+    const uint8_t wrapV = static_cast<uint8_t>((ctx.clamp >> 2u) & 0x3u);
+    if (!((wrapU == 0u || wrapU == 1u) && (wrapV == 0u || wrapV == 1u)))
+    {
+        g_g161BadWrap.fetch_add(1u, std::memory_order_relaxed);
+        ok = false;
+    }
+    const size_t texels = (static_cast<size_t>(1) << ctx.tex0.tw) * (static_cast<size_t>(1) << ctx.tex0.th);
+    if (texels == 0 || texels > s_cap) { g_g161TooBig.fetch_add(1u, std::memory_order_relaxed); ok = false; }
+
+    if (ok)
+        g_g161Eligible.fetch_add(1u, std::memory_order_relaxed);
+    if ((tot % 8000u) == 0u)
+        g161Report();
+}
+
 void GSRasterizer::drawPrimitive(GS *gs)
 {
+    static const bool s_g141PerfOn = (std::getenv("DC2_PERF") != nullptr);
+    static double s_g141Sum = 0.0;
+    static uint32_t s_g141Win = 0u;
+    G141PerfScope g141Scope(s_g141PerfOn, &s_g141Sum, &s_g141Win, "gs.drawPrimitive", 4000u);
+    g141Scope.accumNs = &g_g141GsRasterNs;
+    const std::chrono::steady_clock::time_point g156FnT0 =
+        g_g156Stat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+
     const auto &ctx = gs->activeContext();
     // G45: clear the costume model's PRIVATE Z buffer exactly once per costume frame, on the
     // fbp -> 0x139 transition (the first draw of each frame's model RTT pass). The old clear was
@@ -1521,6 +3121,337 @@ void GSRasterizer::drawPrimitive(GS *gs)
         gs->m_hasPreferredDisplaySource = false;
     }
 
+    if (s_g141PerfOn)
+    {
+        if (gs->m_prim.type == GS_PRIM_SPRITE)
+            g_g141SpriteCalls.fetch_add(1u, std::memory_order_relaxed);
+        else if (gs->m_prim.type == GS_PRIM_TRIANGLE || gs->m_prim.type == GS_PRIM_TRISTRIP ||
+                 gs->m_prim.type == GS_PRIM_TRIFAN)
+            g_g141TriCalls.fetch_add(1u, std::memory_order_relaxed);
+        static uint64_t s_covTick = 0ull;
+        if ((++s_covTick % 8000ull) == 0ull)
+        {
+            static uint64_t lb = 0, li = 0, ld = 0;
+            const uint64_t bb = g_g141BboxPx.load(std::memory_order_relaxed);
+            const uint64_t in = g_g141InsidePx.load(std::memory_order_relaxed);
+            const uint64_t dr = g_g141DrawnPx.load(std::memory_order_relaxed);
+            const uint64_t dbb = bb - lb, din = in - li, ddr = dr - ld;
+            lb = bb; li = in; ld = dr;
+            std::fprintf(stderr,
+                         "[G141:cov] triCalls=%llu sprCalls=%llu | per-8000-prim: bboxPx=%llu insidePx=%llu drawnPx=%llu coverage=%.0f%% overdraw=%.2fx\n",
+                         static_cast<unsigned long long>(g_g141TriCalls.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(g_g141SpriteCalls.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(dbb), static_cast<unsigned long long>(din),
+                         static_cast<unsigned long long>(ddr),
+                         dbb ? 100.0 * static_cast<double>(din) / static_cast<double>(dbb) : 0.0,
+                         din ? static_cast<double>(ddr) / static_cast<double>(din) : 0.0);
+        }
+    }
+
+    // ===== G144 frame-level tile-binning capture/flush (G168: DEFAULT 8 lanes) =====
+    // Runs AFTER the perf counters (so deferred tris still count) and BEFORE the switch (so the
+    // flush's parallel raster time is still inside this drawPrimitive's G141PerfScope → measurable).
+    if (g_g144Threads < 0)
+    {
+        const char *e144 = std::getenv("DC2_G144_TILEBIN");
+        int n144 = (envFlagEnabled("DC2_G144_NO_TILEBIN") || envFlagDisabled("DC2_G144_TILEBIN"))
+                       ? 0
+                       : (e144 ? std::atoi(e144) : 8);
+        g_g144Threads = (n144 < 0) ? 0 : (n144 > 16 ? 16 : n144);
+    }
+    if (g_g144Threads > 1 && !t_g144InReplay)
+    {
+        g_g144LastGs = gs;
+        // Assign the flush closure ONCE (keeps this member's friend access). Parallel band replay:
+        // each lane owns a disjoint scanline band and replays every overlapping entry IN SUBMISSION
+        // ORDER, clipped to its band via the thread_local clamp → disjoint pixel writes,
+        // order-preserved blend/Z. Bit-exact. Uses g_g144LastGs so g144FlushPending() (frame end)
+        // can invoke it too.
+        if (!g_g144FlushFn)
+        {
+            GSRasterizer *self = this;
+            g_g144FlushFn = [self]() {
+                // G166: resolve any batched T8 GPU-decode requests FIRST, unconditionally -- every
+                // e.decoded the replay below reads must already be pixel-filled (see
+                // g162ResolvePendingT8Batch's comment for why this ordering is safe by construction).
+                g162ResolvePendingT8Batch();
+                if (g_g144List.empty() || !g_g144LastGs)
+                    return;
+                // G178: whole-flush GPU attempt (default OFF, DC2_G178_GPU=1). On success the
+                // batch is already rendered AND read back into VRAM — skip the CPU replay
+                // entirely. On ANY unsupported entry it returns false having changed nothing,
+                // and the proven CPU band replay below runs for the whole flush.
+                if (g178TryFlushGpu(self, g_g144LastGs, g_g144LastGs->m_vram, g_g144LastGs->m_vramSize))
+                {
+                    g_g144List.clear();
+                    return;
+                }
+                // Pre-run the title-Z fbp-transition clear ONCE, single-threaded (replay skips it).
+                if (g106TitleZPrivateEnabled())
+                    g106TitleZClearIfNeeded(g_g144BlockFbp);
+                int y0 = 0x7fffffff, y1 = -0x7fffffff;
+                for (const auto &e : g_g144List)
+                {
+                    if (e.minY < y0) y0 = e.minY;
+                    if (e.maxY > y1) y1 = e.maxY;
+                }
+                if (y1 >= y0)
+                {
+                    GS *rgs = g_g144LastGs;
+                    GSRowPool::instance().run(y0, y1, g_g144Threads, [self, rgs](int a, int b) {
+                        static thread_local GS s_rg;
+                        s_rg.m_vram = rgs->m_vram;
+                        s_rg.m_vramSize = rgs->m_vramSize;
+                        s_rg.m_privRegs = rgs->m_privRegs;
+                        t_g144InReplay = true;
+                        t_g144Banded = true;
+                        t_g144BandY0 = a;
+                        t_g144BandY1 = b;
+                        for (const auto &e : g_g144List)
+                        {
+                            if (e.maxY < a || e.minY > b)
+                                continue; // bbox does not intersect this band
+                            s_rg.m_ctx[0] = e.ctx;
+                            s_rg.m_prim = e.prim;
+                            s_rg.m_prim.ctxt = false; // active context forced to m_ctx[0] = snapshot
+                            s_rg.m_texa = e.texa;
+                            s_rg.m_texclut = e.texclut;
+                            s_rg.m_pabe = e.pabe;
+                            t_g144TitleRockScopeOverride = true;
+                            t_g144TitleRockScope = e.titleRockScope;
+                            s_rg.m_vtxQueue[0] = e.v[0];
+                            s_rg.m_vtxQueue[1] = e.v[1];
+                            s_rg.m_vtxQueue[2] = e.v[2];
+                            if (e.decoded) { t_g149Px = e.decoded->px.data(); t_g149Valid = e.decoded->valid.data(); }
+                            else { t_g149Px = nullptr; t_g149Valid = nullptr; }
+                            // G172: widened G144 to also defer SPRITE entries (see the capture site);
+                            // dispatch by the captured primitive type instead of always drawTriangle.
+                            if (e.prim.type == GS_PRIM_SPRITE)
+                                self->drawSprite(&s_rg);
+                            else
+                                self->drawTriangle(&s_rg);
+                        }
+                        t_g149Px = nullptr; t_g149Valid = nullptr;
+                        t_g144TitleRockScopeOverride = false;
+                        t_g144InReplay = false;
+                        t_g144Banded = false;
+                    });
+                }
+                g_g144List.clear();
+            };
+            // Sequential drain (frame end): no pool, no bands — replay every entry full-range on the
+            // calling (guest) thread, in order. Correctness-safe fallback for the trailing tail.
+            g_g144FlushSeqFn = [self]() {
+                // G166: same unconditional resolve as g_g144FlushFn above (either closure may run
+                // first, e.g. under DC2_G144_SEQ, so both must resolve before reading e.decoded).
+                g162ResolvePendingT8Batch();
+                if (g_g144List.empty() || !g_g144LastGs)
+                    return;
+                // G178: same whole-flush GPU attempt as the parallel closure above.
+                if (g178TryFlushGpu(self, g_g144LastGs, g_g144LastGs->m_vram, g_g144LastGs->m_vramSize))
+                {
+                    g_g144List.clear();
+                    return;
+                }
+                if (g106TitleZPrivateEnabled())
+                    g106TitleZClearIfNeeded(g_g144BlockFbp);
+                static thread_local GS s_seq;
+                GS *rgs = g_g144LastGs;
+                s_seq.m_vram = rgs->m_vram;
+                s_seq.m_vramSize = rgs->m_vramSize;
+                s_seq.m_privRegs = rgs->m_privRegs;
+                t_g144InReplay = true;
+                t_g144Banded = false; // full row range
+                for (const auto &e : g_g144List)
+                {
+                    s_seq.m_ctx[0] = e.ctx;
+                    s_seq.m_prim = e.prim;
+                    s_seq.m_prim.ctxt = false;
+                    s_seq.m_texa = e.texa;
+                    s_seq.m_texclut = e.texclut;
+                    s_seq.m_pabe = e.pabe;
+                    t_g144TitleRockScopeOverride = true;
+                    t_g144TitleRockScope = e.titleRockScope;
+                    s_seq.m_vtxQueue[0] = e.v[0];
+                    s_seq.m_vtxQueue[1] = e.v[1];
+                    s_seq.m_vtxQueue[2] = e.v[2];
+                    if (e.decoded) { t_g149Px = e.decoded->px.data(); t_g149Valid = e.decoded->valid.data(); }
+                    else { t_g149Px = nullptr; t_g149Valid = nullptr; }
+                    // G172: see the parallel-replay closure above — dispatch by captured prim type.
+                    if (e.prim.type == GS_PRIM_SPRITE)
+                        self->drawSprite(&s_seq);
+                    else
+                        self->drawTriangle(&s_seq);
+                }
+                t_g149Px = nullptr; t_g149Valid = nullptr;
+                t_g144TitleRockScopeOverride = false;
+                t_g144InReplay = false;
+                g_g144List.clear();
+            };
+        }
+
+        const uint32_t pt144 = static_cast<uint32_t>(gs->m_prim.type);
+        const bool isTri144 = (pt144 == GS_PRIM_TRIANGLE || pt144 == GS_PRIM_TRISTRIP || pt144 == GS_PRIM_TRIFAN);
+        // G172: G171 found that EVERY sprite draw forced a full mid-frame flush of the pending
+        // triangle list (the "non-deferrable primitive" drain below) before rasterizing inline —
+        // with ~100+ sprites/frame (2D title UI: logo/press-start/menu overlays, all alpha-blended
+        // to fbp=0x0) this fragmented one large deferred batch into 100+ tiny ones, paying the
+        // parallel-dispatch overhead that many times over (measured ~76-79ms/frame, ~99% of the
+        // whole packed-register dispatch cost). Widen the SAME proven defer/band-replay path to
+        // GS_PRIM_SPRITE at the same display-framebuffer gate, so sprites replay in the same
+        // band-parallel pass as triangles instead of each forcing their own flush.
+        // G144 tile-bin is itself default-ON since G168. G172 sprite-widening (root-caused +
+        // fixed at G173, dungeon-3D soak clean at G187) is promoted to DEFAULT-ON here too —
+        // kill via DC2_G172_NO_SPRITE_DEFER=1 or DC2_G172_SPRITE_DEFER=0.
+        // G178: GPU mode needs sprites in the deferred list too (an inline sprite would blend
+        // against a VRAM framebuffer the GPU owns mid-frame) — force the proven G172/G173 sprite
+        // deferral on whenever the GPU lever is on (redundant now that it's default-on, kept for
+        // the kill-switch-off + GPU-on combination).
+        static const bool s_g172SpriteDefer =
+            (!envFlagEnabled("DC2_G172_NO_SPRITE_DEFER") && !envFlagDisabled("DC2_G172_SPRITE_DEFER")) ||
+            g178GpuOn();
+        const bool isSprite144 = s_g172SpriteDefer && (pt144 == GS_PRIM_SPRITE);
+        const bool diagOff144 = !renderQualityTraceEnabled() && !phaseDiagnosticsEnabled() && !f50_12_trace_enabled();
+        // Deferrable = a triangle/sprite to a DISPLAY framebuffer (0x0/0x68), never the RTT
+        // (0x139) or any diagnostic build. Static-texture 3D scene → no mid-block RTT sampling.
+        // Triangles still require textured (tme) as before; sprites defer whether textured or a
+        // solid fill (both are equally safe to replay — writePixel/sampleTexture are unchanged).
+        // G178: untextured triangles are as replay-safe as untextured sprites (drawTriangle is
+        // unchanged) — widen the tme gate under the GPU lever so display-fbp shade-only tris
+        // don't rasterize inline against a framebuffer the GPU owns mid-frame.
+        const bool deferrable144 = (isTri144 || isSprite144) && diagOff144 &&
+                                   (isTri144 ? (gs->m_prim.tme || g178GpuOn()) : true) &&
+                                   (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u);
+        // G156: count deferred vs inline tris + the non-deferrable reason (see g156Report). Report
+        // fires from HERE (every tri) so a line prints even if 100% defer (inline=0) or 100% inline.
+        if (g_g156Stat && isTri144)
+        {
+            if (deferrable144)
+                g_g156DeferredTri.fetch_add(1u, std::memory_order_relaxed);
+            else
+            {
+                g_g156InlineTri.fetch_add(1u, std::memory_order_relaxed);
+                if (!gs->m_prim.tme)
+                    g_g156NoTme.fetch_add(1u, std::memory_order_relaxed);
+                else if (ctx.frame.fbp != 0x0u && ctx.frame.fbp != 0x68u)
+                    g_g156BadFbp.fetch_add(1u, std::memory_order_relaxed);
+                else
+                    g_g156Diag.fetch_add(1u, std::memory_order_relaxed);
+            }
+            static std::atomic<uint64_t> s_g156Tick{0};
+            if ((s_g156Tick.fetch_add(1u, std::memory_order_relaxed) % 8000u) == 0u)
+                g156Report();
+        }
+        // DC2_G144_SEQ: route mid-frame flushes through the SEQUENTIAL (no-pool) path too — isolates
+        // deferral/ordering correctness from the parallel band logic.
+        static const bool s_g144Seq = (std::getenv("DC2_G144_SEQ") != nullptr);
+        const std::function<void()> &g144DoFlush = s_g144Seq ? g_g144FlushSeqFn : g_g144FlushFn;
+        auto g144TimedMidFlush = [&]() {
+            G146PerfScope g146FlushScope(g_g146G144FlushMidNs, g_g146G144FlushMidCount);
+            g144DoFlush();
+        };
+        if (deferrable144)
+        {
+            const std::chrono::steady_clock::time_point g156CapT0 =
+                g_g156Stat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            if (g_g156Stat)
+                g_g156PrologueNs.fetch_add(
+                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(g156CapT0 - g156FnT0)
+                        .count(),
+                    std::memory_order_relaxed);
+            if (!g_g144List.empty() && ctx.frame.fbp != g_g144BlockFbp)
+                g144TimedMidFlush(); // fbp changed → different target; drain before switching blocks
+            g_g144BlockFbp = ctx.frame.fbp;
+            // Screen bbox rows computed EXACTLY as drawTriangle/drawSprite (same ofy + scissor
+            // clamp) so the band prefilter is tight and never narrower than the real coverage.
+            const GSVertex &cv0 = gs->m_vtxQueue[0];
+            const GSVertex &cv1 = gs->m_vtxQueue[1];
+            const int cofy = ctx.xyoffset.ofy >> 4;
+            int crawMinY, crawMaxY;
+            G144Entry e;
+            if (isSprite144)
+            {
+                // Sprite bbox: 2-vertex unclipped rect, min/max SWAPPED (drawSprite's own formula),
+                // not the triangle 3-way min/max.
+                const float sfy0 = cv0.y - static_cast<float>(cofy);
+                const float sfy1 = cv1.y - static_cast<float>(cofy);
+                crawMinY = static_cast<int>(std::floor(std::min(sfy0, sfy1)));
+                crawMaxY = static_cast<int>(std::ceil(std::max(sfy0, sfy1)));
+                e.v[0] = cv0;
+                e.v[1] = cv1;
+                e.v[2] = GSVertex{};
+                // G172: hoist drawSprite()'s "looksLikeDisplayCopy" detection to capture time and
+                // apply it to the LIVE gs immediately (same instant it would fire inline) — this
+                // mutates gs->m_hasPreferredDisplaySource/m_preferredDisplaySourceFrame/
+                // m_preferredDisplayDestFbp, read later by latchHostPresentationFrame(). Duplicated
+                // (not shared) so the already-proven inline drawSprite() path is never touched;
+                // the replay's own drawSprite() call redundantly recomputes it on the throwaway
+                // scratch GS, which is harmless (never read back).
+                const int sox = ctx.xyoffset.ofx >> 4;
+                int sx0 = static_cast<int>(cv0.x) - sox;
+                int sx1 = static_cast<int>(cv1.x) - sox;
+                int sy0 = static_cast<int>(cv0.y) - cofy;
+                int sy1 = static_cast<int>(cv1.y) - cofy;
+                if (sx0 > sx1) std::swap(sx0, sx1);
+                if (sy0 > sy1) std::swap(sy0, sy1);
+                const uint64_t alphaReg = ctx.alpha;
+                const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
+                const uint8_t alphaFix = static_cast<uint8_t>((alphaReg >> 32) & 0xFFu);
+                const bool looksLikeDisplayCopy144 =
+                    gs->m_prim.tme && gs->m_prim.abe && gs->m_prim.fst && gs->m_prim.ctxt &&
+                    ctx.frame.fbp != ctx.tex0.tbp0 &&
+                    alphaMode == 0x64u && (alphaFix == 0x60u || alphaFix == 0x80u) &&
+                    sx0 <= 0 && sy0 <= 0 && sx1 >= 639 && sy1 >= 447;
+                if (looksLikeDisplayCopy144)
+                {
+                    gs->m_preferredDisplaySourceFrame = {ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0u};
+                    gs->m_preferredDisplayDestFbp = ctx.frame.fbp;
+                    gs->m_hasPreferredDisplaySource = true;
+                }
+            }
+            else
+            {
+                const GSVertex &cv2 = gs->m_vtxQueue[2];
+                const float cfy0 = cv0.y - static_cast<float>(cofy);
+                const float cfy1 = cv1.y - static_cast<float>(cofy);
+                const float cfy2 = cv2.y - static_cast<float>(cofy);
+                crawMinY = static_cast<int>(std::floor(std::min({cfy0, cfy1, cfy2})));
+                crawMaxY = static_cast<int>(std::ceil(std::max({cfy0, cfy1, cfy2})));
+                e.v[0] = cv0;
+                e.v[1] = cv1;
+                e.v[2] = cv2;
+            }
+            e.ctx = ctx;
+            e.prim = gs->m_prim;
+            e.texa = gs->m_texa;
+            e.texclut = gs->m_texclut;
+            e.pabe = gs->m_pabe;
+            e.titleRockScope = g_dc2TitleRockScope.load(std::memory_order_relaxed);
+            e.minY = clampInt(crawMinY, ctx.scissor.y0, ctx.scissor.y1);
+            e.maxY = clampInt(crawMaxY, ctx.scissor.y0, ctx.scissor.y1);
+            // G149: decode this tri's texture ONCE now (guest thread), so all band lanes read it
+            // lock-free at replay. Null unless texcache-enabled + eligible. Sprites never use the
+            // G149 texcache hook (drawSprite() samples VRAM directly, same as its inline path).
+            e.decoded = isSprite144 ? G149Buf{} : g149BuildDecoded(this, gs, ctx, gs->m_texa, gs->m_vram);
+            if (isTri144)
+                g161CensusEligibility(ctx, gs->m_prim.abe);
+            g_g144List.push_back(e);
+            if (g_g156Stat)
+                g_g156CaptureNs.fetch_add(
+                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - g156CapT0)
+                        .count(),
+                    std::memory_order_relaxed);
+            return; // deferred — rasterized later at flush
+        }
+        // Non-deferrable primitive (line/point/untextured-off-target/RTT sprite/etc — anything that
+        // didn't satisfy deferrable144 above, e.g. a sprite/tri to a non-display fbp like 0x139):
+        // drain the pending list FIRST so global submission order (3D under the 2D menu) is
+        // preserved, then draw this prim normally.
+        if (!g_g144List.empty())
+            g144TimedMidFlush();
+    }
+
     switch (gs->m_prim.type)
     {
     case GS_PRIM_SPRITE:
@@ -1529,7 +3460,21 @@ void GSRasterizer::drawPrimitive(GS *gs)
     case GS_PRIM_TRIANGLE:
     case GS_PRIM_TRISTRIP:
     case GS_PRIM_TRIFAN:
-        drawTriangle(gs);
+        // G156: time inline (non-deferred) tri raster on the calling thread. Under MTGS+G144 only
+        // NON-deferrable tris reach here (deferrable ones returned early), so inlineMs pairs with
+        // g_g156InlineTri. Replay calls drawTriangle directly (never this switch) → no double count.
+        if (g_g156Stat && !t_g144InReplay)
+        {
+            const auto g156T0 = std::chrono::steady_clock::now();
+            drawTriangle(gs);
+            g_g156InlineTriNs.fetch_add(
+                (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - g156T0)
+                    .count(),
+                std::memory_order_relaxed);
+        }
+        else
+            drawTriangle(gs);
         break;
     case GS_PRIM_LINE:
     case GS_PRIM_LINESTRIP:
@@ -1546,6 +3491,23 @@ void GSRasterizer::drawPrimitive(GS *gs)
     }
     default:
         break;
+    }
+
+    // G178: an INLINE (non-deferred) draw just wrote guest VRAM directly (e.g. the costume RTT at
+    // fbp=0x139). Bump the write generations of the pages its scissored frame region can touch so
+    // any GPU-resident texture decoded from those pages (RTT-as-texture) is re-decoded, not stale.
+    // Conservative (scissor rect ⊇ written pixels); a no-op single boolean read when the lever is
+    // off, and skipped during replay (replay is the GPU path's own CPU fallback, whose target is
+    // the display fb the front-end re-uploads unconditionally anyway).
+    if (g178GpuOn() && !t_g144InReplay)
+    {
+        const auto &ctx178 = gs->activeContext();
+        if (ctx178.scissor.x1 >= ctx178.scissor.x0 && ctx178.scissor.y1 >= ctx178.scissor.y0)
+            g178NoteVramWriteRect(GSInternal::framePageBaseToBlock(ctx178.frame.fbp),
+                                  ctx178.frame.fbw, ctx178.frame.psm,
+                                  ctx178.scissor.x0, ctx178.scissor.y0,
+                                  static_cast<uint32_t>(ctx178.scissor.x1 - ctx178.scissor.x0 + 1),
+                                  static_cast<uint32_t>(ctx178.scissor.y1 - ctx178.scissor.y0 + 1));
     }
 }
 
@@ -2612,9 +4574,20 @@ void GSRasterizer::drawSprite(GS *gs)
     }
 
     const int drawX0 = clampInt(unclippedX0, ctx.scissor.x0, ctx.scissor.x1);
-    const int drawY0 = clampInt(unclippedY0, ctx.scissor.y0, ctx.scissor.y1);
+    int drawY0 = clampInt(unclippedY0, ctx.scissor.y0, ctx.scissor.y1);
     const int drawX1 = clampInt(unclippedX1, ctx.scissor.x0, ctx.scissor.x1);
-    const int drawY1 = clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
+    int drawY1 = clampInt(unclippedY1, ctx.scissor.y0, ctx.scissor.y1);
+    // G173: during a tile-binning flush, restrict this sprite to the calling lane's scanline band,
+    // exactly like drawTriangle's clamp — without this, every lane whose band intersects the bbox
+    // replayed the FULL rect (cross-lane write races, alpha blend applied once per lane, submission
+    // order broken across bands = the G172 costume prompt-box regression). Row UV interpolation is
+    // anchored on unclippedY0, so clamping the row range is exact, not an approximation. If the
+    // intersection is empty the loops run zero iterations.
+    if (t_g144Banded)
+    {
+        if (drawY0 < t_g144BandY0) drawY0 = t_g144BandY0;
+        if (drawY1 > t_g144BandY1) drawY1 = t_g144BandY1;
+    }
 
     const uint64_t alphaReg = ctx.alpha;
     const uint8_t alphaMode = static_cast<uint8_t>(alphaReg & 0xFFu);
@@ -2915,6 +4888,224 @@ void GSRasterizer::drawSprite(GS *gs)
             for (int x = drawX0; x <= drawX1; ++x)
                 writePixel(gs, x, y, r, g, b, a);
     }
+}
+
+// G144: drain any trailing deferred triangles at frame end (called from the mgEndFrame override on
+// the GUEST thread, before the frame is presented) so tris submitted after the last non-deferrable
+// primitive still reach VRAM this frame. No-op when tile-binning is off or the list is empty. Same
+// thread as capture ⇒ no data race on g_g144List.
+static void g178CensusScan();
+
+void g144FlushPending()
+{
+    // G148 sampler-stat dump (DC2_G148_SAMPLESTAT=1). Fires once per guest frame (this runs from the
+    // mgEndFrame override). Prints cumulative + 30-frame-window deltas so we can read the steady-state
+    // quad hit/miss ratio and leaf-read volume that decide whether a de-swizzle cache is worthwhile.
+    {
+        static const bool s_g148Stat = (std::getenv("DC2_G148_SAMPLESTAT") != nullptr);
+        if (s_g148Stat)
+        {
+            static uint64_t s_frame = 0;
+            static uint64_t s_lastSamp = 0, s_lastHit = 0, s_lastMiss = 0, s_lastPoint = 0, s_lastLeaf = 0;
+            if ((++s_frame % 30ull) == 0ull)
+            {
+                const uint64_t samp = g_g148TexSamples.load(std::memory_order_relaxed);
+                const uint64_t hit = g_g148QuadHit.load(std::memory_order_relaxed);
+                const uint64_t miss = g_g148QuadMiss.load(std::memory_order_relaxed);
+                const uint64_t point = g_g148PointSamp.load(std::memory_order_relaxed);
+                const uint64_t leaf = g_g148LeafReads.load(std::memory_order_relaxed);
+                const uint64_t dSamp = samp - s_lastSamp;
+                const uint64_t dHit = hit - s_lastHit;
+                const uint64_t dMiss = miss - s_lastMiss;
+                const uint64_t dPoint = point - s_lastPoint;
+                const uint64_t dLeaf = leaf - s_lastLeaf;
+                const uint64_t bilinear = dHit + dMiss;
+                std::fprintf(stderr,
+                    "[G148:samplestat] frame=%llu win=30 | samples/f=%llu bilinear/f=%llu point/f=%llu "
+                    "quadHit=%.1f%% leafReads/f=%llu leafPerSample=%.2f\n",
+                    (unsigned long long)s_frame,
+                    (unsigned long long)(dSamp / 30ull),
+                    (unsigned long long)(bilinear / 30ull),
+                    (unsigned long long)(dPoint / 30ull),
+                    bilinear ? 100.0 * (double)dHit / (double)bilinear : 0.0,
+                    (unsigned long long)(dLeaf / 30ull),
+                    dSamp ? (double)dLeaf / (double)dSamp : 0.0);
+                s_lastSamp = samp; s_lastHit = hit; s_lastMiss = miss; s_lastPoint = point; s_lastLeaf = leaf;
+            }
+        }
+    }
+    // G149 cache stats (DC2_G149_TEXCACHE=1): builds/hits/ineligible per 30-frame window. A high
+    // hit:build ratio means the decode is amortized across many triangles/bands (the intended win);
+    // builds ≈ hits means thrash (VRAM gen churning) — check the upload cadence.
+    {
+        static const bool s_g149Stat = (std::getenv("DC2_G149_TEXCACHE") != nullptr);
+        if (s_g149Stat)
+        {
+            static uint64_t s_frame = 0;
+            static uint64_t s_lastHit = 0, s_lastBuild = 0, s_lastInel = 0, s_lastGpu = 0, s_lastGpuFb = 0;
+            if ((++s_frame % 30ull) == 0ull)
+            {
+                const uint64_t hit = g_g149Hits.load(std::memory_order_relaxed);
+                const uint64_t build = g_g149Builds.load(std::memory_order_relaxed);
+                const uint64_t inel = g_g149Ineligible.load(std::memory_order_relaxed);
+                const uint64_t gpu = g_g162GpuHits.load(std::memory_order_relaxed);
+                const uint64_t gpuFb = g_g162GpuFallback.load(std::memory_order_relaxed);
+                std::fprintf(stderr,
+                    "[G149:texcache] frame=%llu win=30 | hits/f=%llu builds/f=%llu ineligible/f=%llu gen=%llu | g162gpu/f=%llu g162fallback/f=%llu\n",
+                    (unsigned long long)s_frame,
+                    (unsigned long long)((hit - s_lastHit) / 30ull),
+                    (unsigned long long)((build - s_lastBuild) / 30ull),
+                    (unsigned long long)((inel - s_lastInel) / 30ull),
+                    (unsigned long long)g_g149VramGen.load(std::memory_order_relaxed),
+                    (unsigned long long)((gpu - s_lastGpu) / 30ull),
+                    (unsigned long long)((gpuFb - s_lastGpuFb) / 30ull));
+                s_lastHit = hit; s_lastBuild = build; s_lastInel = inel; s_lastGpu = gpu; s_lastGpuFb = gpuFb;
+            }
+        }
+    }
+    g178CensusScan();
+    // Sequential (no pool) — safe to call from the mgEndFrame override to drain the trailing tail.
+    if (g_g144FlushSeqFn && !g_g144List.empty())
+    {
+        G146PerfScope g146FlushScope(g_g146G144FlushFrameNs, g_g146G144FlushFrameCount);
+        g_g144FlushSeqFn();
+    }
+}
+
+// G178 census (DEFAULT OFF, DC2_G178_CENSUS=1): distinct GS render-state keys in the deferred
+// list, scanned at EVERY drain point (frame-end AND mid-frame upload flushes — whichever path
+// actually drains the list on the live config), printed every ~5s. MEASURE-first (the G161
+// lesson): decides exactly which blend equations / texture PSMs / test modes the G178 GPU
+// backend's shader+GL-state mapping must implement for the live workload. Diagnostic only.
+// Called only from the threads that own g_g144List at a drain point, so no locking needed.
+static void g178CensusScan()
+{
+    static const bool s_g178Census = (std::getenv("DC2_G178_CENSUS") != nullptr);
+    if (s_g178Census && !g_g144List.empty())
+    {
+        static std::map<std::string, uint64_t> s_combo;
+        static std::mutex s_comboMx; // frame-end (EE) and upload flush (worker) can interleave
+        {
+            std::lock_guard<std::mutex> lk(s_comboMx);
+            for (const auto &e : g_g144List)
+            {
+                const uint64_t al = e.ctx.alpha, ts = e.ctx.test, zb = e.ctx.zbuf,
+                               t1 = e.ctx.tex1, cl = e.ctx.clamp;
+                char buf[320];
+                std::snprintf(buf, sizeof(buf),
+                    "prim=%d iip=%u tme=%u fge=%u abe=%u fst=%u pabe=%u | fbp=0x%x fpsm=%u fbmsk=0x%x | "
+                    "tex psm=%u cpsm=%u tfx=%u tcc=%u tw=%u th=%u | alpha A=%llu B=%llu C=%llu D=%llu FIX=%llu | "
+                    "test ATE=%llu ATST=%llu AREF=%llu AFAIL=%llu DATE=%llu ZTE=%llu ZTST=%llu | zpsm=%llu zmsk=%llu | "
+                    "wms=%llu wmt=%llu mmag=%llu mmin=%llu fba=%llu",
+                    (int)e.prim.type, e.prim.iip ? 1u : 0u, e.prim.tme ? 1u : 0u, e.prim.fge ? 1u : 0u,
+                    e.prim.abe ? 1u : 0u, e.prim.fst ? 1u : 0u, e.pabe ? 1u : 0u,
+                    e.ctx.frame.fbp, (unsigned)e.ctx.frame.psm, e.ctx.frame.fbmsk,
+                    (unsigned)e.ctx.tex0.psm, (unsigned)e.ctx.tex0.cpsm, (unsigned)e.ctx.tex0.tfx,
+                    (unsigned)e.ctx.tex0.tcc, (unsigned)e.ctx.tex0.tw, (unsigned)e.ctx.tex0.th,
+                    (unsigned long long)(al & 3u), (unsigned long long)((al >> 2) & 3u),
+                    (unsigned long long)((al >> 4) & 3u), (unsigned long long)((al >> 6) & 3u),
+                    (unsigned long long)((al >> 32) & 0xffu),
+                    (unsigned long long)(ts & 1u), (unsigned long long)((ts >> 1) & 7u),
+                    (unsigned long long)((ts >> 4) & 0xffu),
+                    (unsigned long long)((ts >> 12) & 3u), (unsigned long long)((ts >> 14) & 1u),
+                    (unsigned long long)((ts >> 16) & 1u), (unsigned long long)((ts >> 17) & 3u),
+                    (unsigned long long)((zb >> 24) & 0xfu), (unsigned long long)((zb >> 32) & 1u),
+                    (unsigned long long)(cl & 3u), (unsigned long long)((cl >> 2) & 3u),
+                    (unsigned long long)((t1 >> 5) & 1u), (unsigned long long)((t1 >> 6) & 7u),
+                    (unsigned long long)(e.ctx.fba & 1u));
+                s_combo[buf]++;
+            }
+            static auto s_lastPrint = std::chrono::steady_clock::now();
+            const auto now = std::chrono::steady_clock::now();
+            if (now - s_lastPrint > std::chrono::seconds(5))
+            {
+                s_lastPrint = now;
+                std::fprintf(stderr, "[G178:census] distinct=%zu\n", s_combo.size());
+                for (const auto &kv : s_combo)
+                    std::fprintf(stderr, "[G178:census] %8llu | %s\n",
+                                 (unsigned long long)kv.second, kv.first.c_str());
+            }
+        }
+    }
+}
+
+// PARALLEL flush for the texture-upload path (called during active guest rendering, not from the
+// mgEndFrame context that races the present thread). Keeps the batch parallelism instead of forcing
+// a slow single-threaded drain on every mid-frame texture upload. DC2_G144_SEQUPLOAD forces the
+// sequential path (A/B / fallback if the parallel upload flush proves unsafe).
+void g144FlushPendingUpload()
+{
+    if (g_g144List.empty())
+        return;
+    g178CensusScan();
+    G146PerfScope g146FlushScope(g_g146G144FlushUploadNs, g_g146G144FlushUploadCount);
+    static const bool s_seqUpload = (std::getenv("DC2_G144_SEQUPLOAD") != nullptr);
+    if (s_seqUpload)
+    {
+        if (g_g144FlushSeqFn)
+            g_g144FlushSeqFn();
+    }
+    else if (g_g144FlushFn)
+    {
+        g_g144FlushFn();
+    }
+}
+
+// G145 (experimental, opt-in DC2_G145_DIRTY_UPLOAD=1): dirty-region upload flush gate. G144 flushed
+// before every upload/local-copy because any VRAM write can invalidate deferred texture sampling.
+// This keeps that behavior on uncertainty, but skips flushes whose destination does not overlap any
+// pending texture/CLUT/target range. For local-to-local copies, a source overlap with the pending
+// render target also flushes so the copy reads already-rasterized pixels.
+void g144FlushPendingUploadRange(uint32_t dbp,
+                                 uint8_t dbw,
+                                 uint8_t dpsm,
+                                 uint32_t dsax,
+                                 uint32_t dsay,
+                                 uint32_t rrw,
+                                 uint32_t rrh)
+{
+    if (g_g144List.empty())
+        return;
+
+    static const bool s_noDirty = (std::getenv("DC2_G145_NO_DIRTY_UPLOAD") != nullptr);
+    const G144BlockRange dst = g144RangeForRect(dbp, dpsm, dbw, dsax, dsay, rrw, rrh);
+    if (!s_noDirty && !g144PendingNeedsFlushForRanges({}, dst))
+    {
+        g144DirtyStat("upload", false);
+        return;
+    }
+
+    g144DirtyStat("upload", true);
+    g144FlushPendingUpload();
+}
+
+void g144FlushPendingLocalTransferRange(uint32_t sbp,
+                                        uint8_t sbw,
+                                        uint8_t spsm,
+                                        uint32_t ssax,
+                                        uint32_t ssay,
+                                        uint32_t dbp,
+                                        uint8_t dbw,
+                                        uint8_t dpsm,
+                                        uint32_t dsax,
+                                        uint32_t dsay,
+                                        uint32_t rrw,
+                                        uint32_t rrh)
+{
+    if (g_g144List.empty())
+        return;
+
+    static const bool s_noDirty = (std::getenv("DC2_G145_NO_DIRTY_UPLOAD") != nullptr);
+    const G144BlockRange src = g144RangeForRect(sbp, spsm, sbw, ssax, ssay, rrw, rrh);
+    const G144BlockRange dst = g144RangeForRect(dbp, dpsm, dbw, dsax, dsay, rrw, rrh);
+    if (!s_noDirty && !g144PendingNeedsFlushForRanges(src, dst))
+    {
+        g144DirtyStat("local", false);
+        return;
+    }
+
+    g144DirtyStat("local", true);
+    g144FlushPendingUpload();
 }
 
 void GSRasterizer::drawTriangle(GS *gs)
@@ -3246,7 +5437,7 @@ void GSRasterizer::drawTriangle(GS *gs)
         // Re-enable with DC2_G89_FORCE_GUARD_CULL=1 (DC2_G89_GUARD still tunes the width).
         static const bool s_g89off = (std::getenv("DC2_G89_FORCE_GUARD_CULL") == nullptr) ||
                                      (std::getenv("DC2_G89_NO_GUARD_CULL") != nullptr);
-        if (!g_g104TriClipReentry && !s_g89off && g_dc2TitleRockScope.load(std::memory_order_relaxed) &&
+        if (!g_g104TriClipReentry && !s_g89off && g144EffectiveTitleRockScope() &&
             gs->m_prim.tme && ctx.frame.fbp != 0x139u &&
             ctx.tex0.tbp0 >= 0x2720u && ctx.tex0.tbp0 <= 0x3960u)
         {
@@ -3420,6 +5611,15 @@ void GSRasterizer::drawTriangle(GS *gs)
     int maxX = clampInt(rawMaxX, ctx.scissor.x0, ctx.scissor.x1);
     int minY = clampInt(rawMinY, ctx.scissor.y0, ctx.scissor.y1);
     int maxY = clampInt(rawMaxY, ctx.scissor.y0, ctx.scissor.y1);
+    // G144: during a tile-binning flush, restrict this triangle to the calling lane's scanline band
+    // (intersect the bbox with [BandY0,BandY1]). Everything downstream (x-span, y-loop, Z, write)
+    // then operates only on in-band rows, so lanes touch disjoint pixels. If the intersection is
+    // empty this entry does not cover the band and the loops run zero iterations.
+    if (t_g144Banded)
+    {
+        if (minY < t_g144BandY0) minY = t_g144BandY0;
+        if (maxY > t_g144BandY1) maxY = t_g144BandY1;
+    }
 
     float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
 
@@ -3533,7 +5733,10 @@ void GSRasterizer::drawTriangle(GS *gs)
     static const bool s_zTestDisabled = (std::getenv("DC2_NO_ZTEST") != nullptr);
     const bool g106TitleZ =
         g106TitleZScope(gs->m_prim.tme, ctx.frame.fbp, ctx.tex0.tbp0);
-    if (g106TitleZ && g106TitleZPrivateEnabled())
+    // G144: skip the fbp-transition clear during a parallel replay (it uses a racy file-static
+    // last-fbp and would spuriously wipe the shared title-Z mid-band). The flush pre-runs it once,
+    // single-threaded, before dispatching the bands.
+    if (g106TitleZ && g106TitleZPrivateEnabled() && !t_g144InReplay)
         g106TitleZClearIfNeeded(ctx.frame.fbp);
     const uint32_t zte  = static_cast<uint32_t>((ctx.test >> 16) & 0x1u);
     const uint32_t ztst = static_cast<uint32_t>((ctx.test >> 17) & 0x3u);
@@ -3561,10 +5764,291 @@ void GSRasterizer::drawTriangle(GS *gs)
         maxX >= 344 && minX <= 412 &&
         maxY >= 40 && minY <= 144;
 
-    for (int y = minY; y <= maxY; ++y)
+    // G141 sub-profile: local coverage tally (flushed to the globals once after the loop, so no
+    // per-pixel atomic). bbox area vs inside-count exposes bounding-box scan waste.
+    long g141BboxPx = (maxX >= minX && maxY >= minY)
+                          ? static_cast<long>(maxX - minX + 1) * static_cast<long>(maxY - minY + 1)
+                          : 0L;
+    long g141InsidePx = 0;
+
+    // G141 (eliminate-work, behavior-identical): on each scanline the inside set is a contiguous
+    // interval (convex triangle + affine barycentric), so narrow the x scan to a conservative span
+    // derived from the SAME edge functions instead of edge-testing every bbox pixel (measured ~70%
+    // of per-pixel work was wasted on outside pixels). The per-pixel EXACT float test in the inner
+    // loop is UNCHANGED; the span is computed in double and padded by floor/ceil ±1px so no pixel
+    // the exact test would accept is ever skipped -> output is bit-identical (golden 211646 /
+    // frame_001500.ppm byte-equal). Per-x slope of each barycentric = its px coefficient. Kill
+    // with DC2_G141_NO_XSPAN=1 to restore the full-bbox scan for A/B.
+    static const bool s_g141NoXspan = (std::getenv("DC2_G141_NO_XSPAN") != nullptr);
+    // G141 cost-split PROBES (measurement levers, default off, render garbage when on — used only to
+    // apportion the ~170 ms GS raster between the per-pixel texture sample and the pixel write before
+    // refactoring either). DC2_G141_SKIP_SAMPLE bypasses sampleTexture; DC2_G141_SKIP_WRITE bypasses
+    // writePixel. Delta in [G141:perf] GSraster ms = that stage's cost. Never ship enabled.
+    static const bool s_g141SkipSample = (std::getenv("DC2_G141_SKIP_SAMPLE") != nullptr);
+    static const bool s_g141SkipWrite = (std::getenv("DC2_G141_SKIP_WRITE") != nullptr);
+    const double g141S0 = static_cast<double>(fy1 - fy2) * static_cast<double>(winding) * static_cast<double>(invAbsDenom);
+    const double g141S1 = static_cast<double>(fy2 - fy0) * static_cast<double>(winding) * static_cast<double>(invAbsDenom);
+    const double g141S2 = -g141S0 - g141S1;
+    // G141 (drawn-pixel lever, user-approved SAFE inline+hoist): the ~68 ms/frame texture sampler
+    // (skip-probe = 40% of GS raster) is a NON-inlined sampleTexture call per drawn pixel that
+    // re-derefs activeContext() and re-decodes texW/clamp/wrap/psm every pixel (all per-triangle
+    // invariant). For the dominant cavern case (textured, non-RTT, POINT sampling, traces off,
+    // common PSM) run an inlined fast-path that hoists those invariants and reuses the EXACT leaf
+    // reads (ReadP8/readTexel*/lookupCLUT/applyTexa/wrapTextureCoordinate) -> bit-identical by
+    // construction. Everything else (bilinear, costume RTT fbp=0x139, Z-as-texture, non-default T8
+    // config, any trace) FALLS BACK to sampleTexture. Kill DC2_G141_NO_FASTSAMPLE=1. Bit-exactness
+    // is PROVEN per-pixel with DC2_G141_SAMPLE_VERIFY=1 ([G141:vfy] tot/bad; bad must stay 0).
+    static const bool s_g141NoFastSample = (std::getenv("DC2_G141_NO_FASTSAMPLE") != nullptr);
+    static const bool s_g141SampleVerify = (std::getenv("DC2_G141_SAMPLE_VERIFY") != nullptr);
+    static const bool s_g141T8GsmemDefault =
+        !(std::getenv("DC2_T8_GSMEM") && std::getenv("DC2_T8_GSMEM")[0] == '0');
+    static const bool s_g141T8AliasSet = (std::getenv("DC2_T8_ALIAS_TBW") != nullptr);
+    const uint8_t g141Psm = ctx.tex0.psm;
+    const bool g141FastPsm =
+        g141Psm == GS_PSM_CT32 || g141Psm == GS_PSM_CT24 ||
+        g141Psm == GS_PSM_CT16 || g141Psm == GS_PSM_CT16S ||
+        g141Psm == GS_PSM_T4 || g141Psm == GS_PSM_T4HL || g141Psm == GS_PSM_T4HH ||
+        (g141Psm == GS_PSM_T8 && s_g141T8GsmemDefault && !s_g141T8AliasSet);
+    const int g141TexW = 1 << ctx.tex0.tw;
+    const int g141TexH = 1 << ctx.tex0.th;
+    const uint8_t g141WrapU = static_cast<uint8_t>(ctx.clamp & 0x3u);
+    const uint8_t g141WrapV = static_cast<uint8_t>((ctx.clamp >> 2u) & 0x3u);
+    const int g141MinU = static_cast<int>((ctx.clamp >> 4u) & 0x3FFu);
+    const int g141MaxU = static_cast<int>((ctx.clamp >> 14u) & 0x3FFu);
+    const int g141MinV = static_cast<int>((ctx.clamp >> 24u) & 0x3FFu);
+    const int g141MaxV = static_cast<int>((ctx.clamp >> 34u) & 0x3FFu);
+    const bool g141TraceOff =
+        !renderQualityTraceEnabled() && !phaseDiagnosticsEnabled() && !f50_12_trace_enabled();
+    // The cavern is BILINEAR (mmag=1) — sampleTexture's 4-tap path is the bulk of the 68 ms — so the
+    // fast path covers both POINT and BILINEAR (g141Linear), matching sampleTexture's own selection
+    // (for fbp!=0x139: point iff !tex1UsesLinearFilter, else bilinear; box-filter/g45ForceLinear are
+    // fbp==0x139-only and excluded here).
+    const bool g141Linear = tex1UsesLinearFilter(ctx.tex1);
+    const bool g141FastSampleTri =
+        !s_g141NoFastSample && gs->m_prim.tme && g141TraceOff &&
+        ctx.frame.fbp != 0x139u && g141FastPsm && ctx.tex0.tbw != 0u;
+    // G141 one-shot: report WHY textured non-RTT tris do/don't take the fast path (DC2_G141_FASTDIAG).
     {
-        float py = static_cast<float>(y) + 0.5f;
-        for (int x = minX; x <= maxX; ++x)
+        static const bool s_g141FastDiag = (std::getenv("DC2_G141_FASTDIAG") != nullptr);
+        if (s_g141FastDiag && gs->m_prim.tme && ctx.frame.fbp != 0x139u)
+        {
+            static std::atomic<uint32_t> s_fd{0};
+            const uint32_t k = s_fd.fetch_add(1u, std::memory_order_relaxed);
+            if (k < 24u)
+                std::fprintf(stderr,
+                    "[G141:fastdiag] k=%u fbp=0x%x psm=0x%x tbw=%u tex1=0x%llx mmag=%u mmin=%u "
+                    "fastPsm=%u linear=%u tbw0=%u traceOff=%u -> fast=%u\n",
+                    k, ctx.frame.fbp, (unsigned)g141Psm, (unsigned)ctx.tex0.tbw,
+                    (unsigned long long)ctx.tex1,
+                    (unsigned)((ctx.tex1 >> 5) & 0x1u), (unsigned)((ctx.tex1 >> 6) & 0x7u),
+                    (unsigned)g141FastPsm, (unsigned)tex1UsesLinearFilter(ctx.tex1),
+                    (unsigned)(ctx.tex0.tbw == 0u), (unsigned)g141TraceOff,
+                    (unsigned)g141FastSampleTri);
+        }
+    }
+    // G142 (drawn-pixel eliminate-work, SAFE/bit-exact): per-triangle CLUT decode cache. The
+    // bilinear cavern samples 4 CLUT-decoded taps/pixel (g141FastSample -> 4x g141SamplePoint ->
+    // lookupCLUT = resolveClutIndex + VRAM CLUT read + applyTexa). The CLUT decode is per-triangle
+    // INVARIANT (GS state + CLUT VRAM are constant within a primitive), so memoize each distinct
+    // texel index ONCE per triangle: g141ClutLookup(idx) == lookupCLUT(gs, idx, ...) by construction
+    // (proven per-pixel by DC2_G141_SAMPLE_VERIFY). Lazy decode-on-first-use => never issues more
+    // lookupCLUT than the uncached path (safe for point/small tris too); caps at <=256 (T8) / 16 (T4)
+    // decodes/tri vs 4*~230 today. Fresh per triangle => NO cross-draw staleness, no invalidation
+    // needed. Kill DC2_G141_NO_CLUTCACHE=1.
+    static const bool s_g141NoClutCache = (std::getenv("DC2_G141_NO_CLUTCACHE") != nullptr);
+    // G148 sampler-stat gate (measurement only; see the g_g148* globals). Captured once per triangle.
+    static const bool s_g148SampleStat = (std::getenv("DC2_G148_SAMPLESTAT") != nullptr);
+    const bool g148Stat = s_g148SampleStat;
+    const bool g141Paletted =
+        g141Psm == GS_PSM_T8 || g141Psm == GS_PSM_T4 ||
+        g141Psm == GS_PSM_T4HL || g141Psm == GS_PSM_T4HH;
+    const bool g141UseClutCache = g141FastSampleTri && g141Paletted && !s_g141NoClutCache;
+    // G143: thread_local so row-parallel lanes each get their own cache; reset per lane in g143RangeFn.
+    static thread_local uint32_t g141Clut[256];
+    static thread_local uint8_t g141ClutValid[256];
+    auto g141ClutLookup = [&](uint8_t idx) -> uint32_t {
+        if (!g141ClutValid[idx])
+        {
+            g141Clut[idx] = lookupCLUT(gs, idx, ctx.tex0.cbp, ctx.tex0.cpsm,
+                                       ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.psm);
+            g141ClutValid[idx] = 1u;
+        }
+        return g141Clut[idx];
+    };
+    // G149 (perf, DEFAULT OFF): the decoded, CLUT-pre-applied buffer for THIS triangle's texture is
+    // built ONCE at DEFER time on the single guest thread (see g149BuildForDefer at the tilebin defer
+    // site) and handed to every band lane via a thread_local, so the read below is LOCK-FREE — no
+    // mutex on the hot path. t_g149Decoded is non-null only inside a G144 tilebin replay of an
+    // eligible fast-sampler tri; nullptr for direct/non-tilebin draws → the normal sampler runs.
+    static const bool s_g149Verify = (std::getenv("DC2_G149_TCVERIFY") != nullptr);
+    const uint32_t *g149Px = t_g149Px; // eager-decoded read-only buffer (null unless texcache replay)
+    // Inner point sampler = sampleTexture's samplePoint lambda (wrap + format read), leaves reused.
+    auto g141SamplePoint = [&](int su0, int sv0) -> uint32_t {
+        if (g148Stat) g_g148LeafReads.fetch_add(1u, std::memory_order_relaxed);
+        const int su = wrapTextureCoordinate(su0, g141WrapU, g141TexW, g141MinU, g141MaxU);
+        const int sv = wrapTextureCoordinate(sv0, g141WrapV, g141TexH, g141MinV, g141MaxV);
+        // G149 fast path: single read-only linear lookup of the pre-decoded, CLUT-pre-applied buffer.
+        const size_t g149Idx = static_cast<size_t>(sv) * static_cast<size_t>(g141TexW) + static_cast<size_t>(su);
+        if (g149Px && !s_g149Verify)
+            return g149Px[g149Idx];
+        uint32_t leaf;
+        switch (g141Psm)
+        {
+        case GS_PSM_CT32:
+        case GS_PSM_CT24:
+            leaf = applyTexa(gs->m_texa, g141Psm, readTexelPSMCT32(gs, ctx.tex0.tbp0, ctx.tex0.tbw, su, sv));
+            break;
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+            leaf = applyTexa(gs->m_texa, g141Psm, readTexelPSMCT16(gs, ctx.tex0.tbp0, ctx.tex0.tbw, su, sv));
+            break;
+        case GS_PSM_T8:
+        {
+            const uint32_t pageBwT8 = ((ctx.tex0.tbw >> 1u) != 0u) ? (ctx.tex0.tbw >> 1u) : 1u;
+            const uint8_t idx = static_cast<uint8_t>(GSMem::ReadP8(gs->m_vram, ctx.tex0.tbp0, pageBwT8,
+                                    static_cast<uint32_t>(su), static_cast<uint32_t>(sv)));
+            leaf = g141UseClutCache ? g141ClutLookup(idx)
+                                    : lookupCLUT(gs, idx, ctx.tex0.cbp, ctx.tex0.cpsm, ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.psm);
+            break;
+        }
+        default: // T4 / T4HL / T4HH
+        {
+            const uint32_t idx = readTexelPSMT4(gs, ctx.tex0.tbp0, ctx.tex0.tbw, su, sv);
+            leaf = g141UseClutCache ? g141ClutLookup(static_cast<uint8_t>(idx))
+                                    : lookupCLUT(gs, static_cast<uint8_t>(idx), ctx.tex0.cbp, ctx.tex0.cpsm, ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.psm);
+            break;
+        }
+        }
+        // G149 verify (DC2_G149_TCVERIFY): A/B the pre-decoded buffer vs the live leaf — bad must be 0.
+        if (g149Px && s_g149Verify)
+        {
+            const uint32_t cached = g149Px[g149Idx];
+            static std::atomic<uint64_t> s_tcTot{0}, s_tcBad{0};
+            const uint64_t tt = s_tcTot.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (cached != leaf)
+            {
+                const uint64_t bb = s_tcBad.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (bb <= 16u)
+                    std::fprintf(stderr, "[G149:vfy] MISMATCH cached=%08x leaf=%08x psm=0x%x su=%d sv=%d\n",
+                                 cached, leaf, (unsigned)g141Psm, su, sv);
+            }
+            if ((tt & 0xFFFFFull) == 0ull)
+                std::fprintf(stderr, "[G149:vfy] tot=%llu bad=%llu\n",
+                             (unsigned long long)tt, (unsigned long long)s_tcBad.load(std::memory_order_relaxed));
+        }
+        return leaf;
+    };
+    // G142 texel-quad cache (bilinear MAGNIFIED textures, e.g. the cavern MMAG=1): consecutive
+    // pixels along a scanline map to the SAME 4 taps (u0,v0 unchanged), so cache the 4 corner
+    // colours keyed on (u0,v0) and skip the 4x wrap+ReadP8+CLUT when unchanged (the per-pixel
+    // fx/fy lerp still runs). Reuse ONLY on identical tap coords => bit-exact (proven by
+    // DC2_G141_SAMPLE_VERIFY). Fresh per triangle. Kill DC2_G141_NO_TEXQUAD=1.
+    static const bool s_g141NoTexQuad = (std::getenv("DC2_G141_NO_TEXQUAD") != nullptr);
+    // G143: thread_local (per row-parallel lane); g141QValid reset per row in g143RangeFn.
+    static thread_local bool g141QValid;
+    static thread_local int g141QU0, g141QV0;
+    static thread_local uint32_t g141QC00, g141QC10, g141QC01, g141QC11;
+    auto g141FastSample = [&](float s, float t, float q, uint16_t u, uint16_t v) -> uint32_t {
+        if (g148Stat) g_g148TexSamples.fetch_add(1u, std::memory_order_relaxed);
+        float texUf, texVf;
+        if (gs->m_prim.fst)
+        {
+            texUf = static_cast<float>(u) / 16.0f;
+            texVf = static_cast<float>(v) / 16.0f;
+        }
+        else
+        {
+            const float invQ = 1.0f / fabsQ(q);
+            texUf = s * invQ * static_cast<float>(g141TexW);
+            texVf = t * invQ * static_cast<float>(g141TexH);
+        }
+        if (!g141Linear)
+        {
+            if (g148Stat) g_g148PointSamp.fetch_add(1u, std::memory_order_relaxed);
+            return g141SamplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
+        }
+        // Bilinear = sampleTexture's 4-tap path (identical float ops + lerpChannel).
+        const float sampleU = texUf - 0.5f;
+        const float sampleV = texVf - 0.5f;
+        const int u0 = static_cast<int>(std::floor(sampleU));
+        const int v0 = static_cast<int>(std::floor(sampleV));
+        const int u1 = u0 + 1;
+        const int v1 = v0 + 1;
+        const float fx = sampleU - static_cast<float>(u0);
+        const float fy = sampleV - static_cast<float>(v0);
+        uint32_t c00, c10, c01, c11;
+        if (!s_g141NoTexQuad && g141QValid && u0 == g141QU0 && v0 == g141QV0)
+        {
+            if (g148Stat) g_g148QuadHit.fetch_add(1u, std::memory_order_relaxed);
+            c00 = g141QC00; c10 = g141QC10; c01 = g141QC01; c11 = g141QC11;
+        }
+        else
+        {
+            if (g148Stat) g_g148QuadMiss.fetch_add(1u, std::memory_order_relaxed);
+            c00 = g141SamplePoint(u0, v0);
+            c10 = g141SamplePoint(u1, v0);
+            c01 = g141SamplePoint(u0, v1);
+            c11 = g141SamplePoint(u1, v1);
+            g141QValid = true; g141QU0 = u0; g141QV0 = v0;
+            g141QC00 = c00; g141QC10 = c10; g141QC01 = c01; g141QC11 = c11;
+        }
+        const uint8_t rr = lerpChannel(static_cast<uint8_t>(c00 & 0xFFu), static_cast<uint8_t>(c10 & 0xFFu),
+                                       static_cast<uint8_t>(c01 & 0xFFu), static_cast<uint8_t>(c11 & 0xFFu), fx, fy);
+        const uint8_t gg = lerpChannel(static_cast<uint8_t>((c00 >> 8) & 0xFFu), static_cast<uint8_t>((c10 >> 8) & 0xFFu),
+                                       static_cast<uint8_t>((c01 >> 8) & 0xFFu), static_cast<uint8_t>((c11 >> 8) & 0xFFu), fx, fy);
+        const uint8_t bb = lerpChannel(static_cast<uint8_t>((c00 >> 16) & 0xFFu), static_cast<uint8_t>((c10 >> 16) & 0xFFu),
+                                       static_cast<uint8_t>((c01 >> 16) & 0xFFu), static_cast<uint8_t>((c11 >> 16) & 0xFFu), fx, fy);
+        const uint8_t aa = lerpChannel(static_cast<uint8_t>((c00 >> 24) & 0xFFu), static_cast<uint8_t>((c10 >> 24) & 0xFFu),
+                                       static_cast<uint8_t>((c01 >> 24) & 0xFFu), static_cast<uint8_t>((c11 >> 24) & 0xFFu), fx, fy);
+        return static_cast<uint32_t>(rr) | (static_cast<uint32_t>(gg) << 8) |
+               (static_cast<uint32_t>(bb) << 16) | (static_cast<uint32_t>(aa) << 24);
+    };
+    // G143 (perf, DEFAULT OFF): the per-row body as a lane function so a worker pool can rasterize
+    // disjoint scanline ranges concurrently. Bit-exact: disjoint rows => disjoint FB/Z pixel writes;
+    // the CLUT/texel-quad caches are thread_local (reset per lane / per row here); the pixel counters
+    // are per-lane; cross-triangle submission order is preserved (drawTriangle still finishes before
+    // the next). insideAcc/drawnAcc replace the g141InsidePx/f516cov increments so lanes don't race.
+    auto g143RangeFn = [&](int y0, int y1, long &insideAcc, int &drawnAcc)
+    {
+        if (g141UseClutCache)
+            std::memset(g141ClutValid, 0, sizeof(g141ClutValid));
+        for (int y = y0; y <= y1; ++y)
+        {
+            g141QValid = false;
+            float py = static_cast<float>(y) + 0.5f;
+        int xStart = minX, xEnd = maxX;
+        if (!s_g141NoXspan)
+        {
+            const double eps = static_cast<double>(kEdgeEpsilon);
+            const double basePx = static_cast<double>(minX) + 0.5;
+            const double pyd = static_cast<double>(py);
+            const double w0b = ((static_cast<double>(fy1 - fy2)) * (basePx - static_cast<double>(fx2)) +
+                                (static_cast<double>(fx2 - fx1)) * (pyd - static_cast<double>(fy2))) *
+                               static_cast<double>(winding) * static_cast<double>(invAbsDenom);
+            const double w1b = ((static_cast<double>(fy2 - fy0)) * (basePx - static_cast<double>(fx2)) +
+                                (static_cast<double>(fx0 - fx2)) * (pyd - static_cast<double>(fy2))) *
+                               static_cast<double>(winding) * static_cast<double>(invAbsDenom);
+            const double w2b = 1.0 - w0b - w1b;
+            // Solve wi(t) = wib + t*Si >= -eps for t = (x - minX). Lower/upper bounds per edge.
+            double tLo = 0.0;
+            double tHi = static_cast<double>(maxX - minX);
+            const double tiny = 1e-9;
+            const double lo0 = -eps - w0b, lo1 = -eps - w1b, lo2 = -eps - w2b;
+            if (g141S0 > tiny)       { const double c = lo0 / g141S0; if (c > tLo) tLo = c; }
+            else if (g141S0 < -tiny) { const double c = lo0 / g141S0; if (c < tHi) tHi = c; }
+            if (g141S1 > tiny)       { const double c = lo1 / g141S1; if (c > tLo) tLo = c; }
+            else if (g141S1 < -tiny) { const double c = lo1 / g141S1; if (c < tHi) tHi = c; }
+            if (g141S2 > tiny)       { const double c = lo2 / g141S2; if (c > tLo) tLo = c; }
+            else if (g141S2 < -tiny) { const double c = lo2 / g141S2; if (c < tHi) tHi = c; }
+            double tLoC = std::floor(tLo) - 1.0;
+            if (tLoC < 0.0) tLoC = 0.0;
+            double tHiC = std::ceil(tHi) + 1.0;
+            const double span = static_cast<double>(maxX - minX);
+            if (tHiC > span) tHiC = span;
+            xStart = minX + static_cast<int>(tLoC);
+            xEnd = minX + static_cast<int>(tHiC);
+        }
+        for (int x = xStart; x <= xEnd; ++x)
         {
             float px = static_cast<float>(x) + 0.5f;
 
@@ -3574,6 +6058,7 @@ void GSRasterizer::drawTriangle(GS *gs)
 
             if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
                 continue;
+            ++insideAcc;
 
             // G41: depth test (Z is interpolated linearly in screen space by the GS).
             uint32_t zi = 0u;
@@ -3692,7 +6177,36 @@ void GSRasterizer::drawTriangle(GS *gs)
                     iv = 0;
                 }
 
-                uint32_t texel = sampleTexture(gs, is, it, iq, iu, iv);
+                uint32_t texel;
+                if (s_g141SkipSample)
+                {
+                    texel = 0xFFFFFFFFu;
+                }
+                else if (g141FastSampleTri)
+                {
+                    texel = g141FastSample(is, it, iq, iu, iv);
+                    if (s_g141SampleVerify)
+                    {
+                        const uint32_t ref = sampleTexture(gs, is, it, iq, iu, iv);
+                        static std::atomic<uint64_t> s_vTot{0}, s_vBad{0};
+                        const uint64_t tt = s_vTot.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                        if (ref != texel)
+                        {
+                            const uint64_t bb = s_vBad.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                            if (bb <= 16u)
+                                std::fprintf(stderr, "[G141:vfy] MISMATCH ref=%08x fast=%08x psm=0x%x fst=%u\n",
+                                             ref, texel, (unsigned)g141Psm, (unsigned)gs->m_prim.fst);
+                        }
+                        if ((tt & 0xFFFFFull) == 0ull)
+                            std::fprintf(stderr, "[G141:vfy] tot=%llu bad=%llu\n",
+                                         (unsigned long long)tt,
+                                         (unsigned long long)s_vBad.load(std::memory_order_relaxed));
+                    }
+                }
+                else
+                {
+                    texel = sampleTexture(gs, is, it, iq, iu, iv);
+                }
 
                 uint8_t tr = static_cast<uint8_t>(texel & 0xFF);
                 uint8_t tg = static_cast<uint8_t>((texel >> 8) & 0xFF);
@@ -3879,7 +6393,8 @@ void GSRasterizer::drawTriangle(GS *gs)
                 continue;
             }
 
-            writePixel(gs, x, y, r, g, b, a);
+            if (!s_g141SkipWrite)
+                writePixel(gs, x, y, r, g, b, a);
             if (zWrite)
             {
                 // G45: costume model (fbp=0x139) writes its private, non-aliasing Z buffer so it
@@ -3895,7 +6410,63 @@ void GSRasterizer::drawTriangle(GS *gs)
                 else
                     GSMem::WriteZ32(gs->m_vram, zbp, zbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y), zi);
             }
-            ++f516cov;
+            ++drawnAcc;
+        }
+        }
+    };
+    // G143 dispatch: sequential unless DC2_G143_THREADS>1 AND the triangle is big enough AND no
+    // per-pixel diagnostic is active (those use shared static/atomic state that would race). The
+    // costume RTT (fbp=0x139) is excluded. Bit-exact by construction; DEFAULT OFF pending a
+    // full-frame golden diff before it is ever promoted to default-on.
+    {
+        static const int s_g143Threads = []() {
+            const char *e = std::getenv("DC2_G143_THREADS");
+            int n = e ? std::atoi(e) : 0;
+            return n < 0 ? 0 : (n > 16 ? 16 : n);
+        }();
+        // NOTE: DC2_PERF is intentionally NOT a gate — under threading each lane increments its own
+        // local counters (no race; the per-triangle coverage stat just reads 0), while the frame /
+        // GSraster wall-clock scopes are measured on the guest thread and stay valid, so the speedup
+        // is measurable with DC2_PERF=1. DC2_G82_ROCK genuinely mutates shared state per pixel → gate.
+        static const bool s_g143G82 = (std::getenv("DC2_G82_ROCK") != nullptr);
+        const bool g143DiagActive =
+            s_g143G82 || g43FaceUv || g44FaceZ ||
+            (g106TitleZ && g106TitleZTraceEnabled());
+        // Thresholds env-tunable for sweeps (row-within-tri threading only pays when a lane's pixel
+        // work >> the per-dispatch barrier cost; default high so only genuinely big tris thread).
+        // Defaults are the measured sweet spot: threading pays down to fairly small tris here (the
+        // cavern is many medium tris, not a few huge ones), and GSraster plateaus ~129 ms (from
+        // ~154) at threads=8. Below this the per-dispatch barrier starts to dominate.
+        static const int s_g143MinRows = []() { const char *e = std::getenv("DC2_G143_MINROWS"); return e ? std::atoi(e) : 8; }();
+        static const long s_g143MinArea = []() { const char *e = std::getenv("DC2_G143_MINAREA"); return e ? std::atol(e) : 512L; }();
+        const int g143Rows = maxY - minY + 1;
+        const bool g143DoThread =
+            s_g143Threads > 1 && !g143DiagActive && g141FastSampleTri &&
+            ctx.frame.fbp != 0x139u && g143Rows >= s_g143MinRows &&
+            !t_g144InReplay && // never nest G143 row-threads inside a G144 band replay (same pool)
+            (static_cast<long>(g143Rows) * static_cast<long>(maxX - minX + 1)) >= s_g143MinArea;
+        if (g143DoThread)
+        {
+            GSRowPool::instance().run(minY, maxY, s_g143Threads, [&](int a, int b) {
+                long ia = 0;
+                int da = 0;
+                g143RangeFn(a, b, ia, da);
+            });
+        }
+        else
+        {
+            g143RangeFn(minY, maxY, g141InsidePx, f516cov);
+        }
+    }
+
+    // G141 sub-profile flush (one atomic add per triangle, gated).
+    {
+        static const bool s_g141GsPerfOn = (std::getenv("DC2_PERF") != nullptr);
+        if (s_g141GsPerfOn)
+        {
+            g_g141BboxPx.fetch_add(static_cast<uint64_t>(g141BboxPx), std::memory_order_relaxed);
+            g_g141InsidePx.fetch_add(static_cast<uint64_t>(g141InsidePx), std::memory_order_relaxed);
+            g_g141DrawnPx.fetch_add(static_cast<uint64_t>(f516cov), std::memory_order_relaxed);
         }
     }
 
