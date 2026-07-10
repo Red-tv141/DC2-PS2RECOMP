@@ -13,10 +13,149 @@
 #include <chrono>
 #include <vector>
 #include <atomic>
+#include <functional>
+#include <string>
+#include <algorithm>
+#include <thread>
+#include <mutex>
+#include <unordered_map>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+// G182: EE thread CPU-time (user+kernel), same technique as G151/G156's worker-side
+// GetThreadTimes probe -- called from f29_mgendframe_probe, which runs ON the EE thread, so
+// GetCurrentThread() here is the EE thread itself. Lets us tell whether the measured VIF1(EE)
+// wall-time (G146:perf) is real CPU work or scheduler/cache stall, before chasing a dispatch-
+// overhead lever inside the interpreter.
+static uint64_t g182ThreadCpuNs()
+{
+    FILETIME cr, ex, kt, ut;
+    if (!GetThreadTimes(GetCurrentThread(), &cr, &ex, &kt, &ut))
+        return 0ull;
+    const uint64_t k = ((uint64_t)kt.dwHighDateTime << 32) | kt.dwLowDateTime;
+    const uint64_t u = ((uint64_t)ut.dwHighDateTime << 32) | ut.dwLowDateTime;
+    return (k + u) * 100ull; // FILETIME is 100 ns units -> ns
+}
+#else
+static uint64_t g182ThreadCpuNs() { return 0ull; }
+#endif
+
+// G183: statistical PC-sampling profiler. G182 found EE is 90-99% on-CPU with 92-93% of
+// that time inside the single mgEndFrame call -- but mgEndFrame is translated GUEST code
+// (a deep inlined C++ call tree with no returns to instrument), so there are no free
+// per-region timers the way there are for runtime code. Instead, sample the LIVE
+// per-instruction ctx->pc (same technique F50.2's hang-watch used, and the same cross-
+// thread unsynchronised-scalar-read precedent as F50.2/F66/G151/G156) from a dedicated
+// host thread at high frequency WHILE mgEndFrame executes on the EE thread, and histogram
+// hot addresses. Symbolize offline against ref/functions + ref/index -- this profiler
+// only needs to name the addresses, not embed a symbolizer. Default-off (DC2_G183_PCSAMPLE=1),
+// zero cost when unset (thread never spawned).
+static std::atomic<bool> g_g183Sampling{false};
+static std::atomic<R5900Context *> g_g183Ctx{nullptr};
+static std::mutex g_g183HistMutex;
+static std::unordered_map<uint32_t, uint64_t> g_g183Hist;
+
+static void g183DumpAndReset(uint64_t total)
+{
+    std::vector<std::pair<uint32_t, uint64_t>> sorted;
+    {
+        std::lock_guard<std::mutex> lock(g_g183HistMutex);
+        sorted.assign(g_g183Hist.begin(), g_g183Hist.end());
+        g_g183Hist.clear();
+    }
+    std::sort(sorted.begin(), sorted.end(),
+              [](const auto &a, const auto &b) { return a.second > b.second; });
+    std::fprintf(stderr, "[G183:pcsample] total=%llu distinctPc=%zu (top 20)\n",
+                 (unsigned long long)total, sorted.size());
+    for (size_t i = 0; i < sorted.size() && i < 20; ++i)
+    {
+        std::fprintf(stderr, "[G183:pcsample]   pc=0x%08x count=%llu (%.1f%%)\n",
+                     sorted[i].first, (unsigned long long)sorted[i].second,
+                     100.0 * (double)sorted[i].second / (double)std::max<uint64_t>(1, total));
+    }
+    // Full histogram, overwritten each flush (never appended) so it always reflects the
+    // most recent window -- consumed offline against ref/functions/ref/index.
+    if (FILE *f = std::fopen("captures/g183_pcsample.csv", "w"))
+    {
+        std::fprintf(f, "pc,count\n");
+        for (const auto &kv : sorted)
+            std::fprintf(f, "0x%08x,%llu\n", kv.first, (unsigned long long)kv.second);
+        std::fclose(f);
+    }
+}
+
+static void g183SamplerThreadMain()
+{
+    std::unordered_map<uint32_t, uint64_t> local;
+    uint64_t localCount = 0;
+    uint64_t windowTotal = 0;
+    auto lastFlush = std::chrono::steady_clock::now();
+    for (;;)
+    {
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+        if (g_g183Sampling.load(std::memory_order_relaxed))
+        {
+            R5900Context *ctx = g_g183Ctx.load(std::memory_order_relaxed);
+            if (ctx != nullptr)
+            {
+                ++local[ctx->pc];
+                ++localCount;
+            }
+        }
+        if (localCount >= 64)
+        {
+            std::lock_guard<std::mutex> lock(g_g183HistMutex);
+            for (auto &kv : local)
+                g_g183Hist[kv.first] += kv.second;
+            windowTotal += localCount;
+            local.clear();
+            localCount = 0;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        if (windowTotal > 0 &&
+            std::chrono::duration<double>(now - lastFlush).count() >= 5.0)
+        {
+            g183DumpAndReset(windowTotal);
+            windowTotal = 0;
+            lastFlush = now;
+        }
+    }
+}
 
 extern void (*g_g7_poll_live_pad_hook)();
 extern void (*g_g55_title_draw_probe_hook)(uint8_t *rdram);
 extern bool (*g_f66_drive_dungeon_pad_hook)(uint32_t);
+
+// G141: perf ns accumulators, defined in ps2_gs_rasterizer.cpp / ps2_vu1.cpp (external linkage).
+extern std::atomic<uint64_t> g_g141GsRasterNs;
+extern std::atomic<uint64_t> g_g141Vu1RunNs;
+extern std::atomic<uint64_t> g_g146Vif1Ns;
+extern std::atomic<uint64_t> g_g146GifSubmitNs;
+extern std::atomic<uint64_t> g_g146GsImageNs;
+extern std::atomic<uint64_t> g_g146GsLocalNs;
+extern std::atomic<uint64_t> g_g146G144FlushMidNs;
+extern std::atomic<uint64_t> g_g146G144FlushUploadNs;
+extern std::atomic<uint64_t> g_g146G144FlushFrameNs;
+extern std::atomic<uint64_t> g_g146G144FlushMidCount;
+extern std::atomic<uint64_t> g_g146G144FlushUploadCount;
+extern std::atomic<uint64_t> g_g146G144FlushFrameCount;
+extern std::atomic<uint64_t> g_g147GsGifPacketNs;
+extern std::atomic<uint64_t> g_g147GsGifPacketCount;
+extern std::atomic<uint64_t> g_g147DrawPrimitiveNs;
+extern std::atomic<uint64_t> g_g147DrawPrimitiveCount;
+extern std::atomic<uint64_t> g_g147GifTags;
+extern std::atomic<uint64_t> g_g147PackedRegs;
+extern std::atomic<uint64_t> g_g147ReglistRegs;
+extern std::atomic<uint64_t> g_g147ImageBytes;
+extern std::atomic<uint64_t> g_g171RegNs[16];
+extern std::atomic<uint64_t> g_g171RegCount[16];
+extern std::atomic<uint64_t> g_g171AdNs[256];
+extern std::atomic<uint64_t> g_g171AdCount[256];
 
 void g7_poll_live_pad();
 void g55_title_draw_probe(uint8_t *rdram);
@@ -25,6 +164,9 @@ bool f66_drive_dungeon_pad(uint32_t);
 // PHASE F25: forward-decl for delegation when path is not the empty-stem map pattern.
 // Defined in recomp/LoadFile2__FPcPvPii_0x149370.cpp.
 extern void LoadFile2__FPcPvPii_0x149370(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void EditDraw__Fv_0x1ae3d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void EditLoop__Fv_0x1abcf0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern bool g_g186SpBalArmed; // ps2_runtime.cpp — G186 sp-balance logging armed while inside EditDraw
 extern void TitleLoop__Fv_0x29ffa0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void TitleModeInit__Fv_0x2a1020(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void MenuInit__F13INIT_LOOP_ARG_0x191970(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -195,6 +337,21 @@ static std::atomic<int> g_g37_in_outline{0};
 extern std::atomic<bool> g_dc2TitleRockScope;
 // G90: current logical title block flushing through mgEndDraw (rasterizer-side, [G88:geo] tag).
 extern std::atomic<int> g_dc2TitleCurBlock;
+// G144: defined in ps2_gs_rasterizer.cpp; drains trailing deferred tile-binning triangles at frame
+// end. Declared at global scope (external linkage) — a local extern inside the anon namespace below
+// would bind to an anon-namespace symbol (internal linkage) and fail to link.
+extern void g144FlushPending();
+// G150 MTGS (multi-threaded GS): defined in ps2_gif_arbiter.cpp. When DC2_G150_MTGS=1 the GS drain
+// runs on a dedicated worker thread. g150_frame_barrier runs this closure (G144 flush + present
+// latch) correctly either way: with DC2_G157_PIPELINE=1 it hands the closure to the worker as a
+// frame-boundary marker and the EE returns immediately (bounded ≤1-frame pipeline overlap,
+// register-write races against the worker's deferred latch closed by ps2_memory.cpp's
+// g150_pipeline_wait_register_slot() gate); otherwise it blocks the EE until the worker has
+// finished this frame's draws and then runs the closure here, on the EE thread (G150-v2). When
+// MTGS is off, g150_frame_barrier runs the closure inline (byte-identical to the pre-G150 path).
+extern bool g150_mtgs_enabled();
+extern void g150_frame_barrier(std::function<void()> latch);
+extern void g150_wait_idle();
 
 namespace
 {
@@ -263,6 +420,269 @@ static bool dc2_phase_trace_enabled()
 {
     static const bool enabled = dc2_env_flag_enabled("DC2_PHASE_TRACE");
     return enabled;
+}
+
+static uint32_t g154_env_u32(const char *name, uint32_t defValue, uint32_t minValue, uint32_t maxValue)
+{
+    const char *value = std::getenv(name);
+    if (!value || value[0] == '\0')
+        return defValue;
+
+    char *end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 0);
+    if (end == value)
+        return defValue;
+
+    uint32_t out = static_cast<uint32_t>(parsed);
+    if (out < minValue)
+        out = minValue;
+    if (out > maxValue)
+        out = maxValue;
+    return out;
+}
+
+static std::string g154_trim(std::string value)
+{
+    while (!value.empty() && (value.front() == ' ' || value.front() == '\t'))
+        value.erase(value.begin());
+    while (!value.empty() && (value.back() == ' ' || value.back() == '\t'))
+        value.pop_back();
+    return value;
+}
+
+struct G154Watch
+{
+    uint32_t addr = 0u;
+    uint32_t size = 4u;
+    std::string label;
+    uint64_t last = 0ull;
+    uint64_t changes = 0ull;
+    bool haveLast = false;
+};
+
+static uint32_t g154_watch_size(uint32_t raw)
+{
+    if (raw == 1u || raw == 2u || raw == 4u || raw == 8u)
+        return raw;
+    return 4u;
+}
+
+static std::vector<G154Watch> g154_parse_watches()
+{
+    std::vector<G154Watch> watches;
+    const char *env = std::getenv("DC2_G154_WATCH");
+    if (!env || env[0] == '\0')
+        return watches;
+
+    const std::string spec(env);
+    size_t pos = 0u;
+    while (pos < spec.size() && watches.size() < 16u)
+    {
+        const size_t comma = spec.find(',', pos);
+        const size_t end = (comma == std::string::npos) ? spec.size() : comma;
+        std::string item = g154_trim(spec.substr(pos, end - pos));
+        pos = (comma == std::string::npos) ? spec.size() : comma + 1u;
+        if (item.empty())
+            continue;
+
+        size_t colon0 = item.find(':');
+        size_t colon1 = (colon0 == std::string::npos) ? std::string::npos : item.find(':', colon0 + 1u);
+        std::string addrText = g154_trim(item.substr(0u, colon0));
+        if (addrText.empty())
+            continue;
+
+        char *addrEnd = nullptr;
+        const unsigned long addr = std::strtoul(addrText.c_str(), &addrEnd, 0);
+        if (addrEnd == addrText.c_str())
+            continue;
+
+        G154Watch watch;
+        watch.addr = static_cast<uint32_t>(addr);
+        if (colon0 != std::string::npos)
+        {
+            const size_t sizeEnd = (colon1 == std::string::npos) ? item.size() : colon1;
+            std::string sizeText = g154_trim(item.substr(colon0 + 1u, sizeEnd - colon0 - 1u));
+            if (!sizeText.empty())
+            {
+                char *sizeParseEnd = nullptr;
+                const unsigned long parsedSize = std::strtoul(sizeText.c_str(), &sizeParseEnd, 0);
+                if (sizeParseEnd != sizeText.c_str())
+                    watch.size = g154_watch_size(static_cast<uint32_t>(parsedSize));
+            }
+        }
+        if (colon1 != std::string::npos)
+            watch.label = g154_trim(item.substr(colon1 + 1u));
+        watches.push_back(watch);
+    }
+    return watches;
+}
+
+static uint64_t g154_read_le(uint8_t *rdram, uint32_t addr, uint32_t size)
+{
+    uint64_t value = 0ull;
+    for (uint32_t i = 0u; i < size; ++i)
+    {
+        const uint8_t *src = getConstMemPtr(rdram, addr + i);
+        if (src)
+            value |= static_cast<uint64_t>(*src) << (i * 8u);
+    }
+    return value;
+}
+
+static bool g154_should_log_watch(uint64_t changes)
+{
+    if (dc2_env_flag_enabled("DC2_G154_WATCH_VERBOSE"))
+        return true;
+    return changes <= 64ull || (changes & (changes - 1ull)) == 0ull;
+}
+
+static void g154_observe_frame(uint8_t *rdram,
+                               uint32_t n,
+                               uint32_t scriptFrame,
+                               uint32_t loopNo,
+                               uint32_t nextLoopNo)
+{
+    static const bool s_obs = dc2_env_flag_enabled("DC2_G154_OBS");
+    static const uint32_t s_every = g154_env_u32("DC2_G154_EVERY", 60u, 1u, 3600u);
+    static std::vector<G154Watch> s_watches = g154_parse_watches();
+    static bool s_reportedInit = false;
+
+    if (!s_obs && s_watches.empty())
+        return;
+
+    if (!s_reportedInit)
+    {
+        const char *tilebin = std::getenv("DC2_G144_TILEBIN");
+        const bool tilebinDisabled =
+            dc2_env_flag_enabled("DC2_G144_NO_TILEBIN") ||
+            (tilebin && (tilebin[0] == '\0' ||
+                         std::strcmp(tilebin, "0") == 0 ||
+                         std::strcmp(tilebin, "false") == 0 ||
+                         std::strcmp(tilebin, "FALSE") == 0 ||
+                         std::strcmp(tilebin, "off") == 0 ||
+                         std::strcmp(tilebin, "OFF") == 0));
+        std::fprintf(stderr,
+                     "[G154:init] obs=%u every=%u watches=%u mtgs=%u tilebin=%s\n",
+                     s_obs ? 1u : 0u,
+                     s_every,
+                     static_cast<unsigned>(s_watches.size()),
+                     g150_mtgs_enabled() ? 1u : 0u,
+                     tilebinDisabled ? "off" : ((tilebin && tilebin[0] != '\0') ? tilebin : "8(default)"));
+        s_reportedInit = true;
+    }
+
+    static bool s_havePerfBase = false;
+    static std::chrono::steady_clock::time_point s_windowStart{};
+    static uint32_t s_windowFrames = 0u;
+    static uint64_t s_lastG144MidNs = 0ull;
+    static uint64_t s_lastG144UploadNs = 0ull;
+    static uint64_t s_lastG144FrameNs = 0ull;
+    static uint64_t s_lastG144MidCount = 0ull;
+    static uint64_t s_lastG144UploadCount = 0ull;
+    static uint64_t s_lastG144FrameCount = 0ull;
+
+    const auto now = std::chrono::steady_clock::now();
+    if (!s_havePerfBase)
+    {
+        s_windowStart = now;
+        s_lastG144MidNs = g_g146G144FlushMidNs.load(std::memory_order_relaxed);
+        s_lastG144UploadNs = g_g146G144FlushUploadNs.load(std::memory_order_relaxed);
+        s_lastG144FrameNs = g_g146G144FlushFrameNs.load(std::memory_order_relaxed);
+        s_lastG144MidCount = g_g146G144FlushMidCount.load(std::memory_order_relaxed);
+        s_lastG144UploadCount = g_g146G144FlushUploadCount.load(std::memory_order_relaxed);
+        s_lastG144FrameCount = g_g146G144FlushFrameCount.load(std::memory_order_relaxed);
+        s_havePerfBase = true;
+    }
+    else if (s_obs)
+    {
+        ++s_windowFrames;
+        if (s_windowFrames >= s_every)
+        {
+            const double elapsedMs = std::chrono::duration<double, std::milli>(now - s_windowStart).count();
+            const double avgFrameMs = elapsedMs / static_cast<double>(s_windowFrames);
+            const double fps = 1000.0 / std::max(0.001, avgFrameMs);
+            const int32_t dngStatus = static_cast<int32_t>(dc2_read_u32(rdram, 0x01E9F6E0u));
+            const uint64_t midNs = g_g146G144FlushMidNs.load(std::memory_order_relaxed);
+            const uint64_t uploadNs = g_g146G144FlushUploadNs.load(std::memory_order_relaxed);
+            const uint64_t frameNs = g_g146G144FlushFrameNs.load(std::memory_order_relaxed);
+            const uint64_t midCount = g_g146G144FlushMidCount.load(std::memory_order_relaxed);
+            const uint64_t uploadCount = g_g146G144FlushUploadCount.load(std::memory_order_relaxed);
+            const uint64_t frameCount = g_g146G144FlushFrameCount.load(std::memory_order_relaxed);
+            const double midMs = static_cast<double>(midNs - s_lastG144MidNs) / 1.0e6;
+            const double uploadMs = static_cast<double>(uploadNs - s_lastG144UploadNs) / 1.0e6;
+            const double frameMs = static_cast<double>(frameNs - s_lastG144FrameNs) / 1.0e6;
+            const double w = static_cast<double>(s_windowFrames);
+
+            std::fprintf(stderr,
+                         "[G154:perf] n=%u frame=%u window=%u avgFrameMs=%.2f fps=%.2f loop=%u->%u DngStatus=%d mtgs=%u g144(mid=%.2fms/%.2fx upload=%.2fms/%.2fx frame=%.2fms/%.2fx) watches=%u\n",
+                         n,
+                         scriptFrame,
+                         s_windowFrames,
+                         avgFrameMs,
+                         fps,
+                         loopNo,
+                         nextLoopNo,
+                         dngStatus,
+                         g150_mtgs_enabled() ? 1u : 0u,
+                         midMs / w,
+                         static_cast<double>(midCount - s_lastG144MidCount) / w,
+                         uploadMs / w,
+                         static_cast<double>(uploadCount - s_lastG144UploadCount) / w,
+                         frameMs / w,
+                         static_cast<double>(frameCount - s_lastG144FrameCount) / w,
+                         static_cast<unsigned>(s_watches.size()));
+
+            s_windowStart = now;
+            s_windowFrames = 0u;
+            s_lastG144MidNs = midNs;
+            s_lastG144UploadNs = uploadNs;
+            s_lastG144FrameNs = frameNs;
+            s_lastG144MidCount = midCount;
+            s_lastG144UploadCount = uploadCount;
+            s_lastG144FrameCount = frameCount;
+        }
+    }
+
+    for (G154Watch &watch : s_watches)
+    {
+        const uint64_t value = g154_read_le(rdram, watch.addr, watch.size);
+        const char *label = watch.label.empty() ? "-" : watch.label.c_str();
+        if (!watch.haveLast)
+        {
+            std::fprintf(stderr,
+                         "[G154:watch] n=%u frame=%u loop=%u->%u addr=0x%08x size=%u label=%s init=0x%llx\n",
+                         n,
+                         scriptFrame,
+                         loopNo,
+                         nextLoopNo,
+                         watch.addr,
+                         watch.size,
+                         label,
+                         static_cast<unsigned long long>(value));
+            watch.haveLast = true;
+            watch.last = value;
+        }
+        else if (value != watch.last)
+        {
+            ++watch.changes;
+            if (g154_should_log_watch(watch.changes))
+            {
+                std::fprintf(stderr,
+                             "[G154:watch] n=%u frame=%u loop=%u->%u addr=0x%08x size=%u label=%s old=0x%llx new=0x%llx changes=%llu\n",
+                             n,
+                             scriptFrame,
+                             loopNo,
+                             nextLoopNo,
+                             watch.addr,
+                             watch.size,
+                             label,
+                             static_cast<unsigned long long>(watch.last),
+                             static_cast<unsigned long long>(value),
+                             static_cast<unsigned long long>(watch.changes));
+            }
+            watch.last = value;
+        }
+    }
 }
 
 static bool f39_trace_map_entry_enabled()
@@ -2635,7 +3055,23 @@ static void f50_7_map_draw_tailfix_probe(uint8_t *rdram, R5900Context *ctx, PS2R
     f50_set_reg(ctx, 4, self);
     f50_set_reg(ctx, 5, directFlag);
     f50_set_reg(ctx, 31, 0u);
+    // G186 FIX (root cause of Known Issue #3, the 0xe3dc70/0x1dd8260 "Function not
+    // found" level-load crashes): the ra=0 sentinel contract below is only safe if the
+    // emulated call runs to completion in ONE invocation. If the draw chain back-edge
+    // yields (shouldPreemptGuestExecution) mid-call, this probe's C++ frame unwinds and
+    // prematurely restores ra; the resumed chain later reloads the fake ra=0 saved in
+    // DrawSub's own guest frame, the naked pc=0 reaches the dispatcher, and pc-zero
+    // recovery re-enters a mid-function pc WITHOUT restoring $sp — the resumed code then
+    // runs ~0x500 deep into live frames, corrupting saved-$ra slots (the garbage values
+    // 0xe3dc70 / 0x1dd8260 / stack addresses seen as "missing functions"). Same hazard
+    // class G57 fixed for the title draw, same fix: suppress back-edge preemption for
+    // the duration of the emulated call. Kill-switch: DC2_G186_NO_PREEMPTFIX=1.
+    static const bool s_g186NoPreemptFix = (std::getenv("DC2_G186_NO_PREEMPTFIX") != nullptr);
+    if (!s_g186NoPreemptFix)
+        g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
     runtime->lookupFunction(slot)(rdram, ctx, runtime);
+    if (!s_g186NoPreemptFix)
+        g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
 
     const uint32_t postPc = ctx->pc;
     ctx->r[31] = savedRa;
@@ -5953,13 +6389,377 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
     }();
     static uint32_t calls = 0u;
     const uint32_t n = ++calls;
+
+    // G141: measure-first perf instrumentation (skill 17-performance-optimization.md).
+    // This probe fires once per guest frame (wraps mgEndFrame), so the wall-clock delta
+    // between successive entries is the whole guest frame time (game logic + VU1 draw-list
+    // build + previous frame's GS submit, all of which run BEFORE the next mgEndFrame call);
+    // the time spent inside mgEndFrame itself is the packet-flush/present-adjacent tail.
+    // Env-gated, aggregate-only print (DC2_PERF=1), per the lever/instrumentation doctrine.
+    static const bool s_g141PerfOn = dc2_env_flag_enabled("DC2_PERF");
+    static const bool s_g147PerfOn = dc2_env_flag_enabled("DC2_G147_PERF");
+    static const bool s_g171PerfOn = dc2_env_flag_enabled("DC2_G171_STAT");
+    // G182: EE thread onCPU%/frame -- is the measured VIF1(EE) wall time real compute or stall?
+    static const bool s_g182PerfOn = dc2_env_flag_enabled("DC2_G182_EE_STAT");
+    static const bool s_perfOn = s_g141PerfOn || dc2_env_flag_enabled("DC2_G146_PERF") || s_g147PerfOn || s_g171PerfOn || s_g182PerfOn;
+    static std::chrono::steady_clock::time_point s_lastEntry{};
+    static bool s_haveLast = false;
+    static double s_sumFrameMs = 0.0;
+    static double s_sumEndFrameMs = 0.0;
+    static uint64_t s_lastEeCpuNs = 0ull;
+    static double s_sumEeCpuMs = 0.0;
+    static uint32_t s_perfWindow = 0u;
+    // G141: read the global GS-raster + VU1-run ns accumulators (defined in
+    // ps2_gs_rasterizer.cpp / ps2_vu1.cpp, declared at file scope below) to build a
+    // NON-overlapping per-frame split. GS raster runs synchronously inside VU1 XGKICK, so
+    // VU1-proper = vu1RunNs - gsRasterNs, and "other" (uploads/DMA/present/2D not nested in
+    // VU1) = frame - vu1RunNs - (GS outside VU1).
+    static uint64_t s_lastGsNs = 0ull, s_lastVu1Ns = 0ull;
+    static uint64_t s_lastVif1Ns = 0ull, s_lastGifNs = 0ull, s_lastImageNs = 0ull, s_lastLocalNs = 0ull;
+    static uint64_t s_lastG144MidNs = 0ull, s_lastG144UploadNs = 0ull, s_lastG144FrameNs = 0ull;
+    static uint64_t s_lastG144MidCount = 0ull, s_lastG144UploadCount = 0ull, s_lastG144FrameCount = 0ull;
+    static uint64_t s_lastG147PacketNs = 0ull, s_lastG147PacketCount = 0ull;
+    static uint64_t s_lastG147DrawNs = 0ull, s_lastG147DrawCount = 0ull;
+    static uint64_t s_lastG147Tags = 0ull, s_lastG147PackedRegs = 0ull, s_lastG147ReglistRegs = 0ull, s_lastG147ImageBytes = 0ull;
+    static uint64_t s_lastG171RegNs[16] = {0};
+    static uint64_t s_lastG171RegCount[16] = {0};
+    static uint64_t s_lastG171AdNs[256] = {0};
+    static uint64_t s_lastG171AdCount[256] = {0};
+    static double s_sumGsMs = 0.0, s_sumVu1Ms = 0.0;
+    static double s_sumVif1Ms = 0.0, s_sumGifMs = 0.0, s_sumImageMs = 0.0, s_sumLocalMs = 0.0;
+    static double s_sumG144MidMs = 0.0, s_sumG144UploadMs = 0.0, s_sumG144FrameMs = 0.0;
+    static uint64_t s_sumG144MidCount = 0ull, s_sumG144UploadCount = 0ull, s_sumG144FrameCount = 0ull;
+    static double s_sumG147PacketMs = 0.0, s_sumG147DrawMs = 0.0;
+    static uint64_t s_sumG147PacketCount = 0ull, s_sumG147DrawCount = 0ull;
+    static uint64_t s_sumG147Tags = 0ull, s_sumG147PackedRegs = 0ull, s_sumG147ReglistRegs = 0ull, s_sumG147ImageBytes = 0ull;
+    static uint64_t s_sumG171RegNs[16] = {0};
+    static uint64_t s_sumG171RegCount[16] = {0};
+    static uint64_t s_sumG171AdNs[256] = {0};
+    static uint64_t s_sumG171AdCount[256] = {0};
+    const auto perfEntryTs = std::chrono::steady_clock::now();
+    if (s_perfOn)
+    {
+        if (s_haveLast)
+        {
+            s_sumFrameMs += std::chrono::duration<double, std::milli>(perfEntryTs - s_lastEntry).count();
+            if (s_g182PerfOn)
+            {
+                const uint64_t eeCpuNow = g182ThreadCpuNs();
+                s_sumEeCpuMs += (eeCpuNow - s_lastEeCpuNs) / 1.0e6;
+                s_lastEeCpuNs = eeCpuNow;
+            }
+            const uint64_t gsNow = g_g141GsRasterNs.load(std::memory_order_relaxed);
+            const uint64_t vuNow = g_g141Vu1RunNs.load(std::memory_order_relaxed);
+            const uint64_t vifNow = g_g146Vif1Ns.load(std::memory_order_relaxed);
+            const uint64_t gifNow = g_g146GifSubmitNs.load(std::memory_order_relaxed);
+            const uint64_t imageNow = g_g146GsImageNs.load(std::memory_order_relaxed);
+            const uint64_t localNow = g_g146GsLocalNs.load(std::memory_order_relaxed);
+            const uint64_t g144MidNow = g_g146G144FlushMidNs.load(std::memory_order_relaxed);
+            const uint64_t g144UploadNow = g_g146G144FlushUploadNs.load(std::memory_order_relaxed);
+            const uint64_t g144FrameNow = g_g146G144FlushFrameNs.load(std::memory_order_relaxed);
+            const uint64_t g144MidCountNow = g_g146G144FlushMidCount.load(std::memory_order_relaxed);
+            const uint64_t g144UploadCountNow = g_g146G144FlushUploadCount.load(std::memory_order_relaxed);
+            const uint64_t g144FrameCountNow = g_g146G144FlushFrameCount.load(std::memory_order_relaxed);
+            const uint64_t g147PacketNow = g_g147GsGifPacketNs.load(std::memory_order_relaxed);
+            const uint64_t g147PacketCountNow = g_g147GsGifPacketCount.load(std::memory_order_relaxed);
+            const uint64_t g147DrawNow = g_g147DrawPrimitiveNs.load(std::memory_order_relaxed);
+            const uint64_t g147DrawCountNow = g_g147DrawPrimitiveCount.load(std::memory_order_relaxed);
+            const uint64_t g147TagsNow = g_g147GifTags.load(std::memory_order_relaxed);
+            const uint64_t g147PackedRegsNow = g_g147PackedRegs.load(std::memory_order_relaxed);
+            const uint64_t g147ReglistRegsNow = g_g147ReglistRegs.load(std::memory_order_relaxed);
+            const uint64_t g147ImageBytesNow = g_g147ImageBytes.load(std::memory_order_relaxed);
+            s_sumGsMs += (gsNow - s_lastGsNs) / 1.0e6;
+            s_sumVu1Ms += (vuNow - s_lastVu1Ns) / 1.0e6;
+            s_sumVif1Ms += (vifNow - s_lastVif1Ns) / 1.0e6;
+            s_sumGifMs += (gifNow - s_lastGifNs) / 1.0e6;
+            s_sumImageMs += (imageNow - s_lastImageNs) / 1.0e6;
+            s_sumLocalMs += (localNow - s_lastLocalNs) / 1.0e6;
+            s_sumG144MidMs += (g144MidNow - s_lastG144MidNs) / 1.0e6;
+            s_sumG144UploadMs += (g144UploadNow - s_lastG144UploadNs) / 1.0e6;
+            s_sumG144FrameMs += (g144FrameNow - s_lastG144FrameNs) / 1.0e6;
+            s_sumG144MidCount += g144MidCountNow - s_lastG144MidCount;
+            s_sumG144UploadCount += g144UploadCountNow - s_lastG144UploadCount;
+            s_sumG144FrameCount += g144FrameCountNow - s_lastG144FrameCount;
+            s_sumG147PacketMs += (g147PacketNow - s_lastG147PacketNs) / 1.0e6;
+            s_sumG147DrawMs += (g147DrawNow - s_lastG147DrawNs) / 1.0e6;
+            s_sumG147PacketCount += g147PacketCountNow - s_lastG147PacketCount;
+            s_sumG147DrawCount += g147DrawCountNow - s_lastG147DrawCount;
+            s_sumG147Tags += g147TagsNow - s_lastG147Tags;
+            s_sumG147PackedRegs += g147PackedRegsNow - s_lastG147PackedRegs;
+            s_sumG147ReglistRegs += g147ReglistRegsNow - s_lastG147ReglistRegs;
+            s_sumG147ImageBytes += g147ImageBytesNow - s_lastG147ImageBytes;
+            if (s_g171PerfOn)
+            {
+                for (int i = 0; i < 16; ++i)
+                {
+                    const uint64_t nsNow = g_g171RegNs[i].load(std::memory_order_relaxed);
+                    const uint64_t cNow = g_g171RegCount[i].load(std::memory_order_relaxed);
+                    s_sumG171RegNs[i] += nsNow - s_lastG171RegNs[i];
+                    s_sumG171RegCount[i] += cNow - s_lastG171RegCount[i];
+                    s_lastG171RegNs[i] = nsNow;
+                    s_lastG171RegCount[i] = cNow;
+                }
+                for (int i = 0; i < 256; ++i)
+                {
+                    const uint64_t nsNow = g_g171AdNs[i].load(std::memory_order_relaxed);
+                    const uint64_t cNow = g_g171AdCount[i].load(std::memory_order_relaxed);
+                    s_sumG171AdNs[i] += nsNow - s_lastG171AdNs[i];
+                    s_sumG171AdCount[i] += cNow - s_lastG171AdCount[i];
+                    s_lastG171AdNs[i] = nsNow;
+                    s_lastG171AdCount[i] = cNow;
+                }
+            }
+            s_lastGsNs = gsNow;
+            s_lastVu1Ns = vuNow;
+            s_lastVif1Ns = vifNow;
+            s_lastGifNs = gifNow;
+            s_lastImageNs = imageNow;
+            s_lastLocalNs = localNow;
+            s_lastG144MidNs = g144MidNow;
+            s_lastG144UploadNs = g144UploadNow;
+            s_lastG144FrameNs = g144FrameNow;
+            s_lastG144MidCount = g144MidCountNow;
+            s_lastG144UploadCount = g144UploadCountNow;
+            s_lastG144FrameCount = g144FrameCountNow;
+            s_lastG147PacketNs = g147PacketNow;
+            s_lastG147PacketCount = g147PacketCountNow;
+            s_lastG147DrawNs = g147DrawNow;
+            s_lastG147DrawCount = g147DrawCountNow;
+            s_lastG147Tags = g147TagsNow;
+            s_lastG147PackedRegs = g147PackedRegsNow;
+            s_lastG147ReglistRegs = g147ReglistRegsNow;
+            s_lastG147ImageBytes = g147ImageBytesNow;
+            ++s_perfWindow;
+        }
+        else
+        {
+            if (s_g182PerfOn)
+                s_lastEeCpuNs = g182ThreadCpuNs();
+            s_lastGsNs = g_g141GsRasterNs.load(std::memory_order_relaxed);
+            s_lastVu1Ns = g_g141Vu1RunNs.load(std::memory_order_relaxed);
+            s_lastVif1Ns = g_g146Vif1Ns.load(std::memory_order_relaxed);
+            s_lastGifNs = g_g146GifSubmitNs.load(std::memory_order_relaxed);
+            s_lastImageNs = g_g146GsImageNs.load(std::memory_order_relaxed);
+            s_lastLocalNs = g_g146GsLocalNs.load(std::memory_order_relaxed);
+            s_lastG144MidNs = g_g146G144FlushMidNs.load(std::memory_order_relaxed);
+            s_lastG144UploadNs = g_g146G144FlushUploadNs.load(std::memory_order_relaxed);
+            s_lastG144FrameNs = g_g146G144FlushFrameNs.load(std::memory_order_relaxed);
+            s_lastG144MidCount = g_g146G144FlushMidCount.load(std::memory_order_relaxed);
+            s_lastG144UploadCount = g_g146G144FlushUploadCount.load(std::memory_order_relaxed);
+            s_lastG144FrameCount = g_g146G144FlushFrameCount.load(std::memory_order_relaxed);
+            s_lastG147PacketNs = g_g147GsGifPacketNs.load(std::memory_order_relaxed);
+            s_lastG147PacketCount = g_g147GsGifPacketCount.load(std::memory_order_relaxed);
+            s_lastG147DrawNs = g_g147DrawPrimitiveNs.load(std::memory_order_relaxed);
+            s_lastG147DrawCount = g_g147DrawPrimitiveCount.load(std::memory_order_relaxed);
+            s_lastG147Tags = g_g147GifTags.load(std::memory_order_relaxed);
+            s_lastG147PackedRegs = g_g147PackedRegs.load(std::memory_order_relaxed);
+            s_lastG147ReglistRegs = g_g147ReglistRegs.load(std::memory_order_relaxed);
+            s_lastG147ImageBytes = g_g147ImageBytes.load(std::memory_order_relaxed);
+            if (s_g171PerfOn)
+            {
+                for (int i = 0; i < 16; ++i)
+                {
+                    s_lastG171RegNs[i] = g_g171RegNs[i].load(std::memory_order_relaxed);
+                    s_lastG171RegCount[i] = g_g171RegCount[i].load(std::memory_order_relaxed);
+                }
+                for (int i = 0; i < 256; ++i)
+                {
+                    s_lastG171AdNs[i] = g_g171AdNs[i].load(std::memory_order_relaxed);
+                    s_lastG171AdCount[i] = g_g171AdCount[i].load(std::memory_order_relaxed);
+                }
+            }
+        }
+        s_lastEntry = perfEntryTs;
+        s_haveLast = true;
+    }
+
     // PHASE F30: probe mgDBuffID at $gp-0x77E8 before / after mgEndFrame call.
     const uint32_t gpReg = getRegU32(ctx, 28);
     const uint32_t mgDBuffIDAddr = gpReg + 0xFFFF8818u;
     const uint32_t beforeDB = dc2_read_u32(rdram, mgDBuffIDAddr);
     f29_log_counters("mgEndFrame.enter", n, runtime, ctx);
     f29_log_packet_state("mgEndFrame.packet.enter", n, rdram, ctx, runtime);
+    const auto perfEndFrameT0 = s_perfOn ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // G183: bracket the PC sampler around exactly the call G182 found dominant (92-93% of
+    // EE on-CPU time) so the histogram localizes hot addresses INSIDE mgEndFrame, not the
+    // ~7-8% of EE time between calls.
+    static const bool s_g183On = dc2_env_flag_enabled("DC2_G183_PCSAMPLE");
+    if (s_g183On)
+    {
+        static std::thread s_g183Thread(g183SamplerThreadMain);
+        static const bool s_g183Detached = [](){ s_g183Thread.detach(); return true; }();
+        (void)s_g183Detached;
+        g_g183Ctx.store(ctx, std::memory_order_relaxed);
+        g_g183Sampling.store(true, std::memory_order_relaxed);
+    }
     mgEndFrame__FP14mgCDrawManager_0x1425b0(rdram, ctx, runtime);
+    if (s_g183On)
+        g_g183Sampling.store(false, std::memory_order_relaxed);
+    // G144: drain any trailing deferred triangles (frame-level tile-binning) now that this frame's
+    // whole draw stream is complete, before the runtime presents/latches VRAM. Same (guest) thread
+    // as capture, so no race on the deferred list. Sequential (no pool) — safe from this context.
+    // Cheap no-op unless DC2_G144_TILEBIN>1 (list empty). (g144FlushPending declared at global scope.)
+    // G150 MTGS: when the GS drain runs on the worker thread, g_g144List is populated ON that worker,
+    // so the trailing flush must ALSO run there (folded into the frame-barrier callback below) — never
+    // on this EE thread. Skip it here when MTGS is on.
+    if (!g150_mtgs_enabled())
+        g144FlushPending();
+    if (s_perfOn)
+    {
+        s_sumEndFrameMs += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - perfEndFrameT0).count();
+        if (s_perfWindow >= 30u)
+        {
+            const double w = static_cast<double>(s_perfWindow);
+            const double avgFrameMs = s_sumFrameMs / w;
+            const double avgEndFrameMs = s_sumEndFrameMs / w;
+            const double avgGsMs = s_sumGsMs / w;
+            const double avgVu1Ms = s_sumVu1Ms / w;
+            const double avgVu1ProperMs = avgVu1Ms - avgGsMs; // VU1 minus its nested XGKICK raster
+            const double avgOtherMs = avgFrameMs - avgVu1Ms;  // everything not in vu1.run (2D/upload/present)
+            if (s_g141PerfOn)
+            {
+                std::fprintf(stderr,
+                             "[G141:perf] n=%u window=%u avgFrameMs=%.2f fps=%.2f | GSraster=%.1f (%.0f%%) VU1proper=%.1f (%.0f%%) other=%.1f (%.0f%%) | mgEndFrame=%.1f\n",
+                             n, s_perfWindow, avgFrameMs, 1000.0 / std::max(0.001, avgFrameMs),
+                             avgGsMs, 100.0 * avgGsMs / std::max(0.001, avgFrameMs),
+                             avgVu1ProperMs, 100.0 * avgVu1ProperMs / std::max(0.001, avgFrameMs),
+                             avgOtherMs, 100.0 * avgOtherMs / std::max(0.001, avgFrameMs),
+                             avgEndFrameMs);
+            }
+            else
+            {
+                std::fprintf(stderr,
+                             "[G146:frame] n=%u window=%u avgFrameMs=%.2f fps=%.2f | mgEndFrame=%.1f\n",
+                             n, s_perfWindow, avgFrameMs,
+                             1000.0 / std::max(0.001, avgFrameMs),
+                             avgEndFrameMs);
+            }
+            std::fprintf(stderr,
+                         "[G146:perf] n=%u window=%u incl: VIF1=%.1f GIFsubmit=%.1f GSimage=%.1f GSlocal=%.1f\n",
+                         n, s_perfWindow,
+                         s_sumVif1Ms / w,
+                         s_sumGifMs / w,
+                         s_sumImageMs / w,
+                         s_sumLocalMs / w);
+            if (s_g182PerfOn)
+            {
+                const double eeCpuMs = s_sumEeCpuMs / w;
+                std::fprintf(stderr,
+                             "[G182:ee] n=%u window=%u busyMs/f=%.2f cpuMs/f=%.2f onCPU=%.0f%%\n",
+                             n, s_perfWindow, avgFrameMs, eeCpuMs,
+                             100.0 * eeCpuMs / std::max(0.001, avgFrameMs));
+            }
+            std::fprintf(stderr,
+                         "[G146:g144] n=%u window=%u flush: mid=%.1fms/%.2fx upload=%.1fms/%.2fx frame=%.1fms/%.2fx\n",
+                         n, s_perfWindow,
+                         s_sumG144MidMs / w,
+                         static_cast<double>(s_sumG144MidCount) / w,
+                         s_sumG144UploadMs / w,
+                         static_cast<double>(s_sumG144UploadCount) / w,
+                         s_sumG144FrameMs / w,
+                         static_cast<double>(s_sumG144FrameCount) / w);
+            if (s_g147PerfOn)
+            {
+                const double packetMs = s_sumG147PacketMs / w;
+                const double drawMs = s_sumG147DrawMs / w;
+                const double imageMs = s_sumImageMs / w;
+                const double parserOtherMs = packetMs - drawMs - imageMs;
+                std::fprintf(stderr,
+                             "[G147:gif] n=%u window=%u packet=%.1fms/%.2fx draw=%.1fms/%.2fx parserOther=%.1fms tags=%.1f packedRegs=%.1f reglistRegs=%.1f imageKB=%.1f\n",
+                             n, s_perfWindow,
+                             packetMs,
+                             static_cast<double>(s_sumG147PacketCount) / w,
+                             drawMs,
+                             static_cast<double>(s_sumG147DrawCount) / w,
+                             parserOtherMs,
+                             static_cast<double>(s_sumG147Tags) / w,
+                             static_cast<double>(s_sumG147PackedRegs) / w,
+                             static_cast<double>(s_sumG147ReglistRegs) / w,
+                             static_cast<double>(s_sumG147ImageBytes) / (w * 1024.0));
+            }
+            if (s_g171PerfOn)
+            {
+                // Packed-register descriptor names (GS PACKED format table).
+                static const char *kRegNames[16] = {
+                    "PRIM", "RGBAQ", "ST", "UV", "XYZF2", "XYZ2", "TEX0_1", "TEX0_2",
+                    "CLAMP_1", "CLAMP_2", "FOG", "resv0x0B", "XYZ3", "XYZF3", "A+D", "NOP"};
+                double totalMs = 0.0;
+                for (int i = 0; i < 16; ++i)
+                    totalMs += s_sumG171RegNs[i] / 1.0e6;
+                std::fprintf(stderr, "[G171:regstat] n=%u window=%u totalMs=%.2f/f\n", n, s_perfWindow, totalMs / w);
+                for (int i = 0; i < 16; ++i)
+                {
+                    const double ms = s_sumG171RegNs[i] / 1.0e6;
+                    const double cnt = static_cast<double>(s_sumG171RegCount[i]);
+                    if (cnt <= 0.0)
+                        continue;
+                    std::fprintf(stderr,
+                                 "[G171:regstat]   desc=0x%02X %-9s ms/f=%.3f (%.0f%%) count/f=%.1f ns/call=%.1f\n",
+                                 i, kRegNames[i], ms / w,
+                                 100.0 * ms / std::max(0.001, totalMs),
+                                 cnt / w,
+                                 (s_sumG171RegNs[i]) / std::max(1.0, cnt));
+                }
+                // Top A+D (desc 0x0E) register addresses by total time this window.
+                int adIdx[256];
+                int adN = 0;
+                for (int i = 0; i < 256; ++i)
+                    if (s_sumG171AdCount[i] > 0)
+                        adIdx[adN++] = i;
+                std::sort(adIdx, adIdx + adN, [&](int a, int b) {
+                    return s_sumG171AdNs[a] > s_sumG171AdNs[b];
+                });
+                const int adShow = std::min(adN, 8);
+                for (int k = 0; k < adShow; ++k)
+                {
+                    const int i = adIdx[k];
+                    const double ms = s_sumG171AdNs[i] / 1.0e6;
+                    const double cnt = static_cast<double>(s_sumG171AdCount[i]);
+                    std::fprintf(stderr,
+                                 "[G171:regstat]     A+D addr=0x%02X ms/f=%.3f count/f=%.1f ns/call=%.1f\n",
+                                 i, ms / w, cnt / w, (s_sumG171AdNs[i]) / std::max(1.0, cnt));
+                }
+            }
+            s_sumFrameMs = 0.0;
+            s_sumEndFrameMs = 0.0;
+            s_sumEeCpuMs = 0.0;
+            s_sumGsMs = 0.0;
+            s_sumVu1Ms = 0.0;
+            s_sumVif1Ms = 0.0;
+            s_sumGifMs = 0.0;
+            s_sumImageMs = 0.0;
+            s_sumLocalMs = 0.0;
+            s_sumG144MidMs = 0.0;
+            s_sumG144UploadMs = 0.0;
+            s_sumG144FrameMs = 0.0;
+            s_sumG144MidCount = 0ull;
+            s_sumG144UploadCount = 0ull;
+            s_sumG144FrameCount = 0ull;
+            s_sumG147PacketMs = 0.0;
+            s_sumG147DrawMs = 0.0;
+            s_sumG147PacketCount = 0ull;
+            s_sumG147DrawCount = 0ull;
+            s_sumG147Tags = 0ull;
+            s_sumG147PackedRegs = 0ull;
+            s_sumG147ReglistRegs = 0ull;
+            s_sumG147ImageBytes = 0ull;
+            if (s_g171PerfOn)
+            {
+                for (int i = 0; i < 16; ++i)
+                {
+                    s_sumG171RegNs[i] = 0ull;
+                    s_sumG171RegCount[i] = 0ull;
+                }
+                for (int i = 0; i < 256; ++i)
+                {
+                    s_sumG171AdNs[i] = 0ull;
+                    s_sumG171AdCount[i] = 0ull;
+                }
+            }
+            s_perfWindow = 0u;
+        }
+    }
     const uint32_t afterDB = dc2_read_u32(rdram, mgDBuffIDAddr);
     if (f29_should_log(n))
     {
@@ -6029,7 +6829,27 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                              chosen.fbp, chosen.fbw, chosen.psm, afterDB);
             }
         }
-        runtime->gs().latchHostPresentationFrame();
+        // G150 MTGS: g150_frame_barrier first blocks until the GS worker has finished this frame's
+        // draws (frameDrain), then runs this closure on THIS (EE) thread: drain the trailing tile-bin
+        // tris (safe — worker idle, sole toucher of g_g144List) and latch the present frame, reading
+        // live display registers + vsync tick over complete VRAM exactly as the synchronous baseline.
+        // When MTGS is off, the barrier runs the closure inline and the flush is skipped here (already
+        // done on the EE thread above) → byte-identical to the pre-G150 path.
+        g150_frame_barrier([runtime, n] {
+            // G189 (diagnostic watchdog, DEFAULT OFF, DC2_G189_WATCHDOG=1): cheap atomic-only
+            // breadcrumbs (no I/O in the hot path -- an earlier fprintf-based version of this
+            // trace perturbed thread timing enough to hide the bug it was meant to catch) so a
+            // hang under DC2_G157_PIPELINE=1 can be isolated to g144FlushPending() vs
+            // latchHostPresentationFrame() (both run on the GS worker thread under pipelining,
+            // per g150_frame_barrier). See plans/phase-G189-fix-log.md.
+            extern void g189_set_closure_stage(int stage, uint32_t n);
+            g189_set_closure_stage(1, n);
+            if (g150_mtgs_enabled())
+                g144FlushPending();
+            g189_set_closure_stage(2, n);
+            runtime->gs().latchHostPresentationFrame();
+            g189_set_closure_stage(3, n);
+        });
         if (f29_should_log(n))
         {
             std::fprintf(stderr,
@@ -6051,6 +6871,7 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
     f47_log_menu_state(rdram, ctx, n, scriptFrame, loopNo, nextLoopNo);
     f57_log_frame_loop(rdram, n, loopNo, nextLoopNo);
     f59_log_frame(rdram, n, loopNo);
+    g154_observe_frame(rdram, n, scriptFrame, loopNo, nextLoopNo);
     g_f40_frame_counter = scriptFrame;
     f40_drive_pad(scriptFrame, loopNo);
 }
@@ -10929,6 +11750,44 @@ static void g34_divsprite_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *r
 
 
 // PHASE9: DC2 ג€” Apply all Phase 9.3 stub address bindings for Dark Cloud 2.
+// PHASE G186: guest-sp desync probe for the 0xe3dc70 / level-load crash class.
+// EditDraw's saved-ra stack slot is overwritten by ordinary mg-library callees
+// (G186 watch-ring evidence), and the same route crashes with DIFFERENT sp values
+// across runs — hypothesis: some callee leaves ctx->sp shifted, so subsequent
+// callee frames overlap EditDraw's save area. Log sp/ra at EditLoop/EditDraw
+// entry+exit each frame. Opt-in DC2_G186_SPTRACE=1.
+static bool g186_sptrace_enabled()
+{
+    static const bool e = (std::getenv("DC2_G186_SPTRACE") != nullptr);
+    return e;
+}
+static void g186_editdraw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    static uint32_t s_n = 0u;
+    const uint32_t spIn = getRegU32(ctx, 29), raIn = getRegU32(ctx, 31);
+    ++s_n;
+    if (s_n <= 512u)
+        std::fprintf(stderr, "[G186:editdraw-enter] n=%u spIn=0x%x raIn=0x%x\n", s_n, spIn, raIn);
+    g_g186SpBalArmed = true;
+    EditDraw__Fv_0x1ae3d0(rdram, ctx, runtime);
+    g_g186SpBalArmed = false;
+    const uint32_t spOut = getRegU32(ctx, 29);
+    if (s_n <= 512u || spIn != spOut)
+        std::fprintf(stderr, "[G186:editdraw] n=%u spIn=0x%x raIn=0x%x spOut=0x%x%s\n",
+                     s_n, spIn, raIn, spOut, (spIn != spOut) ? " SP-DESYNC" : "");
+}
+static void g186_editloop_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    static uint32_t s_n = 0u;
+    const uint32_t spIn = getRegU32(ctx, 29), raIn = getRegU32(ctx, 31);
+    EditLoop__Fv_0x1abcf0(rdram, ctx, runtime);
+    const uint32_t spOut = getRegU32(ctx, 29);
+    ++s_n;
+    if (s_n <= 512u || spIn != spOut)
+        std::fprintf(stderr, "[G186:editloop] n=%u spIn=0x%x raIn=0x%x spOut=0x%x%s\n",
+                     s_n, spIn, raIn, spOut, (spIn != spOut) ? " SP-DESYNC" : "");
+}
+
 void applyDC2Phase9Stubs(PS2Runtime &runtime)
 {
     using namespace ps2_game_overrides;
@@ -11463,6 +12322,13 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     // Exit_0x118FB0 uses a tail-j to _Exit (0x10FD00) so 0x10FD00 is a direct C++ call
     // in the runner, not a dispatch-table lookup. Bind the Exit wrapper itself instead.
     runtime.registerFunction(0x00118FB0u, exit_halt_stub);
+
+    // PHASE G186 (opt-in DC2_G186_SPTRACE=1): sp-desync probe on the edit loop/draw.
+    if (g186_sptrace_enabled())
+    {
+        runtime.registerFunction(0x001AE3D0u, g186_editdraw_probe); // EditDraw__Fv
+        runtime.registerFunction(0x001ABCF0u, g186_editloop_probe); // EditLoop__Fv
+    }
 }
 
 // PHASE F9: DC2 ג€” Apply ezMidi audio-compat layer (sister-fork port).
