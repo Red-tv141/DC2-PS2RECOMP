@@ -1,0 +1,51 @@
+[general]
+# Mandatory path to the original PS2 ELF file
+input = "path/to/your/ps2_game.elf"
+
+# Mandatory path to where the generated C++ files will go
+output = "output/"
+
+# The memory address where the ELF is loaded. Almost always 0x00100000.
+code_base = "0x00100000" 
+
+# Header to include at the top of all generated C++ files
+runtime_header = "Runtime.h"
+
+# Setting to true generates one massive C++ file. Speeds up compilation drastically for testing.
+single_file_output = true 
+
+# ==============================================================================
+# STUBS
+# Functions you don't want recompiled to C++, but handled by native runtime code.
+# The string must match a C++ function implemented in the runtime or game overrides.
+# You can bind stripped functions by address using "handler@0xADDRESS".
+# ==============================================================================
+stubs = [
+  "printf",
+  "sceCdRead@0x00115000",
+  "ret1@0x00115500", # Temporary triage binding: return 1 (success)
+  "ret0@0x00116200"  # Temporary triage binding: return 0 
+]
+
+# ==============================================================================
+# SKIPS
+# Functions the recompiler treats as intentionally unsupported. It emits an
+# explicit placeholder (ps2_stubs::TODO_NAMED("name") returning an error-like
+# value) instead of translating the body. If execution actually REACHES a
+# skipped function, expect wrong behavior — skip only code that never needs to
+# run (crt0 bootstrapper, dead init loops). See 03-ps2recomp-pipeline.md §2.
+# ==============================================================================
+skip = [
+  "sub_00100008", # Skip early hardware initialization loops
+]
+
+# ==============================================================================
+# PATCHES
+# Replacing MIPS bytecode BEFORE recompilation happens.
+# Easiest way to break an infinite spinlock waiting on unsupported hardware.
+# ==============================================================================
+[patches]
+instructions = [
+  # Replace a branch or jump with 'nop' (0x00000000)
+  { address = "0x140228", value = "0x00000000" },
+]
