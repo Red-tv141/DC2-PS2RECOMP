@@ -200,6 +200,65 @@ namespace
         return n <= 32u || (n % 60u) == 0u;
     }
 
+    enum class G195PresentMode : int
+    {
+        Default = 0,
+        Crt1Only = 1,
+        Crt2Only = 2,
+        FieldPairCrt2Even = 3,
+        FieldPairCrt1Even = 4,
+    };
+
+    G195PresentMode g195PresentationMode()
+    {
+        static const G195PresentMode mode = []() {
+            const char *value = std::getenv("DC2_G195_PRESENT_MODE");
+            if (!value || value[0] == '\0')
+            {
+                return G195PresentMode::Default;
+            }
+
+            if (std::strcmp(value, "crt1") == 0 || std::strcmp(value, "1") == 0)
+            {
+                return G195PresentMode::Crt1Only;
+            }
+            if (std::strcmp(value, "crt2") == 0 || std::strcmp(value, "2") == 0)
+            {
+                return G195PresentMode::Crt2Only;
+            }
+            if (std::strcmp(value, "fieldpair") == 0 || std::strcmp(value, "pair") == 0 ||
+                std::strcmp(value, "3") == 0)
+            {
+                return G195PresentMode::FieldPairCrt2Even;
+            }
+            if (std::strcmp(value, "fieldpair-swap") == 0 || std::strcmp(value, "pair-swap") == 0 ||
+                std::strcmp(value, "4") == 0)
+            {
+                return G195PresentMode::FieldPairCrt1Even;
+            }
+            return G195PresentMode::Default;
+        }();
+        return mode;
+    }
+
+    const char *g195PresentationModeName(G195PresentMode mode)
+    {
+        switch (mode)
+        {
+        case G195PresentMode::Crt1Only:
+            return "crt1";
+        case G195PresentMode::Crt2Only:
+            return "crt2";
+        case G195PresentMode::FieldPairCrt2Even:
+            return "fieldpair";
+        case G195PresentMode::FieldPairCrt1Even:
+            return "fieldpair-swap";
+        case G195PresentMode::Default:
+        default:
+            return "default";
+        }
+    }
+
     bool f33AdTraceEnabled()
     {
         static const bool enabled = envFlagEnabled("DC2_TRACE_AD");
@@ -667,6 +726,19 @@ namespace
                         std::memcpy(&existing, vram + off, sizeof(existing));
                         pixel = (pixel & ~ctx.frame.fbmsk) | (existing & ctx.frame.fbmsk);
                     }
+                    // G219 (default-off, DC2_G219_SKYPX=1): rect-clear watch, zoom work-page window.
+                    {
+                        static const bool s_g219cw = (std::getenv("DC2_G219_SKYPX") != nullptr);
+                        if (s_g219cw && off >= 0x278400u && off < 0x278440u)
+                        {
+                            static std::atomic<uint32_t> s_g219cwn{0};
+                            const uint32_t n = s_g219cwn.fetch_add(1u, std::memory_order_relaxed);
+                            if (n < 200u || (n % 512u) == 0u)
+                                std::fprintf(stderr,
+                                    "[G219:rcx] n=%u off=0x%x xy=(%d,%d) fbp=0x%x val=%08x\n",
+                                    n, off, x, y, ctx.frame.fbp, pixel);
+                        }
+                    }
                     std::memcpy(vram + off, &pixel, sizeof(pixel));
                 }
             }
@@ -885,6 +957,20 @@ namespace
             const uint32_t off = GSPSMCT32::addrPSMCT32(basePtr, width, x, y);
             if (off + 4u > vramSize)
                 return;
+            // G219 (default-off, DC2_G219_SKYPX=1): transfer-write watch for the zoom work-page
+            // clobber window (see [G219:wpx] in the rasterizer).
+            {
+                static const bool s_g219tw = (std::getenv("DC2_G219_SKYPX") != nullptr);
+                if (s_g219tw && off >= 0x278400u && off < 0x278440u)
+                {
+                    static std::atomic<uint32_t> s_g219twn{0};
+                    const uint32_t n = s_g219twn.fetch_add(1u, std::memory_order_relaxed);
+                    if (n < 200u || (n % 512u) == 0u)
+                        std::fprintf(stderr,
+                            "[G219:twx] n=%u off=0x%x xy=(%u,%u) dbp=0x%x dbw=%u psm=0x%x val=%08x\n",
+                            n, off, x, y, basePtr, width, psm, value);
+                }
+            }
             std::memcpy(vram + off, &value, sizeof(value));
             return;
         }
@@ -1628,6 +1714,129 @@ void GS::latchHostPresentationFrame()
 
         if (copiedCrt1 && copiedCrt2)
         {
+            const G195PresentMode g195Mode = g195PresentationMode();
+            if (g195Mode == G195PresentMode::Crt1Only || g195Mode == G195PresentMode::Crt2Only)
+            {
+                const bool useCrt1 = (g195Mode == G195PresentMode::Crt1Only);
+                std::vector<uint8_t> selected = useCrt1 ? rc1 : rc2;
+                const uint32_t width = useCrt1 ? width1 : width2;
+                const uint32_t height = useCrt1 ? height1 : height2;
+                if (applyFieldMode)
+                {
+                    applyFieldPresentation(selected, width, height, oddField);
+                }
+                normalizePresentationAlpha(selected, width, height);
+
+                m_hostPresentationFrame.swap(selected);
+                m_hostPresentationWidth = width;
+                m_hostPresentationHeight = height;
+                m_hostPresentationDisplayFbp = useCrt1 ? displayFrame1.fbp : displayFrame2.fbp;
+                m_hostPresentationSourceFbp = useCrt1 ? selectedFrame1.fbp : selectedFrame2.fbp;
+                m_hostPresentationUsedPreferred = false;
+                m_hasHostPresentationFrame = true;
+                static std::atomic<uint32_t> s_g195PresentLog{0};
+                const uint32_t pn = s_g195PresentLog.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (pn <= 16u || (pn % 60u) == 0u)
+                {
+                    std::fprintf(stderr,
+                                 "[G195:present] n=%u mode=%s applyField=%u odd=%u "
+                                 "dispFbp=0x%x sourceFbp=0x%x size=%ux%u nonblack=%u\n",
+                                 pn,
+                                 g195PresentationModeName(g195Mode),
+                                 applyFieldMode ? 1u : 0u,
+                                 oddField ? 1u : 0u,
+                                 m_hostPresentationDisplayFbp,
+                                 m_hostPresentationSourceFbp,
+                                 m_hostPresentationWidth,
+                                 m_hostPresentationHeight,
+                                 countNonBlackPixels(m_hostPresentationFrame,
+                                                     m_hostPresentationWidth,
+                                                     m_hostPresentationHeight));
+                }
+                return;
+            }
+
+            if (g195Mode == G195PresentMode::FieldPairCrt2Even ||
+                g195Mode == G195PresentMode::FieldPairCrt1Even)
+            {
+                const uint32_t width = std::max(width1, width2);
+                const uint32_t height = std::max(height1, height2);
+                const uint8_t bgR = static_cast<uint8_t>(m_privRegs->bgcolor & 0xFFu);
+                const uint8_t bgG = static_cast<uint8_t>((m_privRegs->bgcolor >> 8) & 0xFFu);
+                const uint8_t bgB = static_cast<uint8_t>((m_privRegs->bgcolor >> 16) & 0xFFu);
+
+                std::vector<uint8_t> merged(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
+                for (uint32_t y = 0; y < height; ++y)
+                {
+                    const bool evenLine = (y & 1u) == 0u;
+                    const bool useCrt1 = (g195Mode == G195PresentMode::FieldPairCrt1Even)
+                                             ? evenLine
+                                             : !evenLine;
+                    const std::vector<uint8_t> &src = useCrt1 ? rc1 : rc2;
+                    const uint32_t srcWidth = useCrt1 ? width1 : width2;
+                    const uint32_t srcHeight = useCrt1 ? height1 : height2;
+                    uint8_t *dstRow = merged.data() + (y * kHostFrameWidth * 4u);
+                    for (uint32_t x = 0; x < width; ++x)
+                    {
+                        dstRow[x * 4u + 0u] = bgR;
+                        dstRow[x * 4u + 1u] = bgG;
+                        dstRow[x * 4u + 2u] = bgB;
+                        dstRow[x * 4u + 3u] = 255u;
+                    }
+
+                    if (srcWidth == 0u || srcHeight == 0u || src.empty())
+                    {
+                        continue;
+                    }
+
+                    uint32_t sourceY = (y >> 1u) << 1u;
+                    if (sourceY >= srcHeight)
+                    {
+                        sourceY = srcHeight - 1u;
+                    }
+
+                    const uint8_t *srcRow = src.data() + (sourceY * kHostFrameWidth * 4u);
+                    const uint32_t copyWidth = std::min(width, srcWidth);
+                    for (uint32_t x = 0; x < copyWidth; ++x)
+                    {
+                        dstRow[x * 4u + 0u] = srcRow[x * 4u + 0u];
+                        dstRow[x * 4u + 1u] = srcRow[x * 4u + 1u];
+                        dstRow[x * 4u + 2u] = srcRow[x * 4u + 2u];
+                        dstRow[x * 4u + 3u] = 255u;
+                    }
+                }
+
+                m_hostPresentationFrame.swap(merged);
+                m_hostPresentationWidth = width;
+                m_hostPresentationHeight = height;
+                m_hostPresentationDisplayFbp = displayFrame1.fbp;
+                m_hostPresentationSourceFbp = selectedFrame1.fbp;
+                m_hostPresentationUsedPreferred = false;
+                m_hasHostPresentationFrame = true;
+                static std::atomic<uint32_t> s_g195PresentLog{0};
+                const uint32_t pn = s_g195PresentLog.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (pn <= 16u || (pn % 60u) == 0u)
+                {
+                    std::fprintf(stderr,
+                                 "[G195:present] n=%u mode=%s applyField=%u odd=%u "
+                                 "disp1Org=%u,%u disp2Org=%u,%u size=%ux%u nonblack=%u\n",
+                                 pn,
+                                 g195PresentationModeName(g195Mode),
+                                 applyFieldMode ? 1u : 0u,
+                                 oddField ? 1u : 0u,
+                                 displayOrigin1.x,
+                                 displayOrigin1.y,
+                                 displayOrigin2.x,
+                                 displayOrigin2.y,
+                                 m_hostPresentationWidth,
+                                 m_hostPresentationHeight,
+                                 countNonBlackPixels(m_hostPresentationFrame,
+                                                     m_hostPresentationWidth,
+                                                     m_hostPresentationHeight));
+                }
+                return;
+            }
+
             const uint32_t width = std::max(width1, width2);
             const uint32_t height = std::max(height1, height2);
             const uint8_t bgR = static_cast<uint8_t>(m_privRegs->bgcolor & 0xFFu);
@@ -3277,6 +3486,18 @@ extern void g144FlushPendingLocalTransferRange(uint32_t sbp,
 void GS::performLocalToLocalTransfer()
 {
     G146PerfScope g146Scope(g_g146GsLocalNs);
+    // G219 transition sentinel (inert unless DC2_G219_SKYPX=1).
+    {
+        extern void g219Sentinel(const uint8_t *, uint32_t, const char *);
+        static const bool s_g219on = (std::getenv("DC2_G219_SKYPX") != nullptr);
+        if (s_g219on)
+        {
+            static thread_local char s_g219tag[80];
+            std::snprintf(s_g219tag, sizeof(s_g219tag), "l2l(sbp=0x%x dbp=0x%x rr=%ux%u)",
+                          m_bitbltbuf.sbp, m_bitbltbuf.dbp, m_trxreg.rrw, m_trxreg.rrh);
+            g219Sentinel(m_vram, m_vramSize, s_g219tag);
+        }
+    }
 
     const bool g145DirtyUpload = envFlagEnabled("DC2_G145_DIRTY_UPLOAD") &&
                                  !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD");
@@ -3405,6 +3626,32 @@ void GS::performLocalToLocalTransfer()
 
 void GS::vertexKick(bool drawing)
 {
+    // G196: raw per-kick ADC/drawing trace for tbp=0x2a20 (the G195 foreground-sheet suspect),
+    // scoped identically to the existing G195:fgtri draw-time trace, so the two can be diffed
+    // directly against the real map_0.gs freeze-dump's vertex/ADC stream. Default-off.
+    if (envFlagEnabled("DC2_G196_ADC_TRACE"))
+    {
+        const GSContext &ctx196 = m_ctx[m_prim.ctxt & 1u];
+        if (m_prim.tme && ctx196.tex0.tbp0 == 0x2a20u &&
+            (ctx196.frame.fbp == 0u || ctx196.frame.fbp == 0x68u))
+        {
+            static std::atomic<uint32_t> s_g196{0};
+            const uint32_t n = s_g196.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 512u)
+            {
+                // G200: also log the freshly-written vertex position so the runner's output
+                // coords can be compared against the real map_0.gs freeze's XYZ2 stream for the
+                // same tbp (positions-diverge vs pure-gate-diverge discriminator).
+                const GSVertex &v196 = m_vtxQueue[m_vtxCount % kMaxVerts];
+                std::fprintf(stderr,
+                    "[G196:kick] n=%u prim=%u drawing=%u vtxCount=%u fbp=0x%x x=%.3f y=%.3f z=%.1f q=%g\n",
+                    n, static_cast<uint32_t>(m_prim.type),
+                    static_cast<uint32_t>(drawing ? 1u : 0u), m_vtxCount, ctx196.frame.fbp,
+                    v196.x, v196.y, v196.z, v196.q);
+            }
+        }
+    }
+
     // G107 A/B: ADC is "drawing kick disabled". For title-rock strips, test the stricter
     // interpretation that an ADC vertex must not advance the primitive queue either.
     if (!drawing)
@@ -3629,6 +3876,18 @@ void GS::vertexKick(bool drawing)
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
     G146PerfScope g146Scope(g_g146GsImageNs);
+    // G219 transition sentinel (inert unless DC2_G219_SKYPX=1).
+    {
+        extern void g219Sentinel(const uint8_t *, uint32_t, const char *);
+        static const bool s_g219on = (std::getenv("DC2_G219_SKYPX") != nullptr);
+        if (s_g219on)
+        {
+            static thread_local char s_g219tag[64];
+            std::snprintf(s_g219tag, sizeof(s_g219tag), "upload(dbp=0x%x dpsm=0x%x)",
+                          m_bitbltbuf.dbp, (unsigned)m_bitbltbuf.dpsm);
+            g219Sentinel(m_vram, m_vramSize, s_g219tag);
+        }
+    }
 
     const bool g145DirtyUpload = envFlagEnabled("DC2_G145_DIRTY_UPLOAD") &&
                                  !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD");

@@ -205,14 +205,27 @@ struct G141PerfScope
 // cull in drawTriangle so it never fires outside the title-map scene. Defined here (external
 // linkage) and referenced via `extern` from the override.
 std::atomic<bool> g_dc2TitleRockScope{false};
+// G202: set by dc2_game_override.cpp once the edit/town loop has a live scene, map, and camera.
+// The GS state alone (fbp 0/0x68, Z24, zbp 0xd0) also appears during transitions/loading, so the
+// town Z promotion must be game-state scoped to avoid clearing those frames.
+std::atomic<bool> g_dc2TownDepthScope{false};
 static thread_local bool t_g144TitleRockScopeOverride = false;
 static thread_local bool t_g144TitleRockScope = false;
+static thread_local bool t_g144TownDepthScopeOverride = false;
+static thread_local bool t_g144TownDepthScope = false;
 
 static bool g144EffectiveTitleRockScope()
 {
     return t_g144TitleRockScopeOverride
                ? t_g144TitleRockScope
                : g_dc2TitleRockScope.load(std::memory_order_relaxed);
+}
+
+static bool g144EffectiveTownDepthScope()
+{
+    return t_g144TownDepthScopeOverride
+               ? t_g144TownDepthScope
+               : g_dc2TownDepthScope.load(std::memory_order_relaxed);
 }
 // G90: the logical title block currently being flushed by mgEndDraw (set by the override). Lets
 // the G88:geo probe tag each drawn rock triangle with its source block. -1 = none.
@@ -256,6 +269,26 @@ namespace
     {
         static const bool enabled = envFlagEnabled("DC2_TRACE_RENDER_QUALITY");
         return enabled;
+    }
+
+    bool g195DofTraceEnabled()
+    {
+        static const bool enabled = envFlagEnabled("DC2_G195_DOF_TRACE");
+        return enabled;
+    }
+
+    bool g195ForegroundTraceTarget(const GSContext &ctx, int x, int y)
+    {
+        static const bool enabled = envFlagEnabled("DC2_G195_FG_TRACE");
+        if (!enabled)
+            return false;
+        if (ctx.frame.fbp != 0u && ctx.frame.fbp != 0x68u)
+            return false;
+        return (x == 256 && y == 260) ||
+               (x == 256 && y == 300) ||
+               (x == 256 && y == 350) ||
+               (x == 120 && y == 300) ||
+               (x == 400 && y == 300);
     }
 
     bool g43FaceUvTraceEnabled()
@@ -313,6 +346,36 @@ namespace
     };
     std::mutex g_g50Mutex;
     std::map<uint32_t, G50PartStat> g_g50Parts;
+
+    // PHASE G214 (default-off, DC2_G214_CAPTRACE=1): per-present-tick triangle counts for the
+    // individual head sub-mesh texture pages, so the "head present but cap missing" window the
+    // user observed and the flicker's temporal shape (rapid per-frame vs contiguous stretch) are
+    // directly visible. Each page is an independent VU1 batch; G213 showed cap(0x35a0)+face(0x3420)
+    // drop as whole batches (0 tris) upstream of the GS. Prints one line per tick that touches the
+    // fbp=0x139 character RTT.
+    bool g214CapTraceEnabled()
+    {
+        static const bool e = envFlagEnabled("DC2_G214_CAPTRACE");
+        return e;
+    }
+    std::mutex g_g214Mutex;
+    uint64_t g_g214Tick = 0;
+    // pages: cap 0x35a0, face 0x3420, hair 0x34c0, head-base 0x3480, body 0x3460, neck-decal 0x34a0
+    uint64_t g_g214Cap = 0, g_g214Face = 0, g_g214Hair = 0, g_g214Head = 0, g_g214Body = 0, g_g214Neck = 0;
+    void g214CapFlushLocked(uint64_t newTick)
+    {
+        if (g_g214Tick != 0 && (g_g214Cap | g_g214Face | g_g214Hair | g_g214Head | g_g214Body | g_g214Neck))
+        {
+            std::fprintf(stderr,
+                "[G214:cap] tick=%llu cap35a0=%llu face3420=%llu hair34c0=%llu head3480=%llu body3460=%llu neck34a0=%llu\n",
+                (unsigned long long)g_g214Tick,
+                (unsigned long long)g_g214Cap, (unsigned long long)g_g214Face,
+                (unsigned long long)g_g214Hair, (unsigned long long)g_g214Head,
+                (unsigned long long)g_g214Body, (unsigned long long)g_g214Neck);
+        }
+        g_g214Tick = newTick;
+        g_g214Cap = g_g214Face = g_g214Hair = g_g214Head = g_g214Body = g_g214Neck = 0;
+    }
 
     void g50Record(uint32_t tbp, bool degen,
                    float x0, float y0, float x1, float y1, float x2, float y2)
@@ -390,6 +453,51 @@ namespace
                (static_cast<uint64_t>(tex.csm & 0x1u) << 55) |
                (static_cast<uint64_t>(tex.csa & 0x1Fu) << 56) |
                (static_cast<uint64_t>(tex.cld & 0x7u) << 61);
+    }
+
+    void g195LogForegroundPixel(const GSContext &ctx,
+                                int x,
+                                int y,
+                                uint32_t off,
+                                uint32_t bytesPerPixel,
+                                uint32_t primType,
+                                bool primTme,
+                                bool primAbe,
+                                bool primFst,
+                                bool primCtxt,
+                                bool pabe,
+                                uint32_t dstBefore,
+                                uint8_t srcR,
+                                uint8_t srcG,
+                                uint8_t srcB,
+                                uint8_t srcA,
+                                uint32_t finalRgba)
+    {
+        static std::atomic<uint32_t> s_count{0};
+        const uint32_t n = s_count.fetch_add(1u, std::memory_order_relaxed);
+        if (n >= 1024u)
+            return;
+        std::fprintf(stderr,
+            "[G195:fgpx] n=%u blk=%d xy=(%d,%d) fbp=0x%x fbw=%u fpsm=0x%x off=0x%x bpp=%u "
+            "prim=%u tme=%u abe=%u fst=%u ctxt=%u tbp=0x%x tbw=%u tpsm=0x%x tw=%u th=%u "
+            "cbp=0x%x csa=%u tex0=0x%016llx alpha=0x%llx test=0x%llx zbuf=0x%llx fba=0x%llx pabe=%u "
+            "src=%02x,%02x,%02x,%02x dst=%08x final=%08x scissor=(%d,%d)-(%d,%d)\n",
+            n, g_dc2TitleCurBlock.load(std::memory_order_relaxed),
+            x, y, ctx.frame.fbp, static_cast<uint32_t>(ctx.frame.fbw),
+            static_cast<uint32_t>(ctx.frame.psm), off, bytesPerPixel, primType,
+            primTme ? 1u : 0u, primAbe ? 1u : 0u, primFst ? 1u : 0u,
+            primCtxt ? 1u : 0u, ctx.tex0.tbp0,
+            static_cast<uint32_t>(ctx.tex0.tbw), static_cast<uint32_t>(ctx.tex0.psm),
+            static_cast<uint32_t>(ctx.tex0.tw), static_cast<uint32_t>(ctx.tex0.th),
+            ctx.tex0.cbp, static_cast<uint32_t>(ctx.tex0.csa),
+            static_cast<unsigned long long>(f50_12_tex0_raw(ctx.tex0)),
+            static_cast<unsigned long long>(ctx.alpha),
+            static_cast<unsigned long long>(ctx.test),
+            static_cast<unsigned long long>(ctx.zbuf),
+            static_cast<unsigned long long>(ctx.fba),
+            pabe ? 1u : 0u,
+            srcR, srcG, srcB, srcA, dstBefore, finalRgba,
+            ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1);
     }
 
     struct F50_12FramebufferBucket
@@ -584,6 +692,86 @@ namespace
     {
         static const bool enabled = envFlagEnabled("DC2_G106_TITLE_Z_STAT");
         return enabled;
+    }
+
+    bool g202TownZEnabled()
+    {
+        // G202 (default-ON): normal town/field display targets use the guest's real ZBUF/TEST
+        // state instead of painter's order. DC2_G202_NO_TOWN_Z kills the promoted behavior; the
+        // older G195 opt-in still forces it for A/B against the original diagnostic.
+        static const bool enabled =
+            !envFlagEnabled("DC2_G202_NO_TOWN_Z") || envFlagEnabled("DC2_G195_TOWN_Z");
+        return enabled;
+    }
+
+    bool g202TownZTraceEnabled()
+    {
+        static const bool enabled = envFlagEnabled("DC2_G202_TOWN_Z_STAT");
+        return enabled;
+    }
+
+    bool g202TownZForced()
+    {
+        static const bool enabled = envFlagEnabled("DC2_G195_TOWN_Z");
+        return enabled;
+    }
+
+    bool g203UniversalZEnabled()
+    {
+        // G203 (default-ON): honor the guest's real ZBUF/TEST for EVERY draw + primitive against the
+        // real VRAM Z buffer, and let the game's own full-screen ztst=ALWAYS,zmsk=0 clear-sprite
+        // populate it (drawSprite now writes Z). Replaces the per-screen Z whitelist — title
+        // private-Z (g106), costume private-Z (fbp 0x139), and the town game-state scope + artificial
+        // Z-page clear (g202) — which was not HW-faithful and leaked: g202's blind clear of zbp 0xd0
+        // (= VRAM block 0x1a00, the debug/menu font staging per G5) corrupted inventory/loading
+        // textures whenever the town scope stayed active into a menu. Kill DC2_G203_LEGACY_Z=1 to
+        // restore the old scoped/private paths for A/B. DC2_NO_ZTEST=1 still disables Z globally.
+        static const bool enabled = !envFlagEnabled("DC2_G203_LEGACY_Z");
+        return enabled;
+    }
+
+    bool g202TownZScope(uint32_t fbp, uint32_t zbpPage, uint32_t zpsm)
+    {
+        return g202TownZEnabled() &&
+               (g202TownZForced() || g144EffectiveTownDepthScope()) &&
+               !g144EffectiveTitleRockScope() &&
+               (fbp == 0u || fbp == 0x68u) &&
+               zbpPage == 0xd0u &&
+               zpsm == 0x1u; // Z24, matching the MAP-0 HW dump's town scene.
+    }
+
+    void g202TownZClear(uint8_t *vram, uint32_t fbp, uint32_t zbpBlock, uint32_t zbw)
+    {
+        if (vram == nullptr)
+            return;
+        const uint32_t width = std::max(1u, std::min(1024u, zbw * 64u));
+        constexpr uint32_t kHeight = 512u;
+        for (uint32_t y = 0; y < kHeight; ++y)
+            for (uint32_t x = 0; x < width; ++x)
+                GSMem::WriteZ24(vram, zbpBlock, zbw, x, y, 0u);
+        if (g202TownZTraceEnabled())
+        {
+            static std::atomic<uint32_t> s_clearTrace{0};
+            const uint32_t n = s_clearTrace.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 16u || (n % 120u) == 0u)
+                std::fprintf(stderr, "[G202:zclear] n=%u fbp=0x%x zbp=0x%x zbw=%u size=%ux%u\n",
+                             n, fbp, zbpBlock, zbw, width, kHeight);
+        }
+    }
+
+    void g202TownZClearIfNeeded(uint8_t *vram, uint32_t fbp, uint32_t zbuf, uint32_t fbw)
+    {
+        const uint32_t zbpPage = static_cast<uint32_t>(zbuf & 0x1FFu);
+        const uint32_t zpsm = static_cast<uint32_t>((zbuf >> 24) & 0xFu);
+        if (!g202TownZScope(fbp, zbpPage, zpsm))
+            return;
+        const uint32_t zbw = (fbw != 0u) ? fbw : 8u;
+        const uint32_t key = (fbp & 0x1FFu) | (zbpPage << 9) | ((zbw & 0x3Fu) << 18) | (zpsm << 24);
+        static std::atomic<uint32_t> s_lastKey{0xFFFFFFFFu};
+        const uint32_t prev = s_lastKey.exchange(key, std::memory_order_relaxed);
+        if (prev == key)
+            return;
+        g202TownZClear(vram, fbp, zbpPage << 5, zbw);
     }
 
     bool g106TitleZScope(bool primTme, uint32_t fbp, uint32_t tbp)
@@ -1215,11 +1403,133 @@ struct G144Entry
     GSTexClutReg texclut;
     bool pabe;
     bool titleRockScope;
+    bool townDepthScope;
     GSVertex v[3];
     int minY, maxY; // screen-space bbox rows (post-scissor) for band-overlap prefilter
     G149Buf decoded; // G149: pre-decoded texture buffer (null unless texcache eligible); kept alive here
 };
 static std::vector<G144Entry> g_g144List;       // reused across frames (clear keeps capacity)
+// G219 diagnostic snapshot buffer (see the [G219:cap]/[G219:dif] probes; inert unless
+// DC2_G219_SKYPX=1).
+uint8_t g_g219Snap[0x8000];
+// G219 transition sentinel: called at raster/transfer choke points with a location tag; logs
+// whenever the watched work-page qword (0x278420, blue after the zoom screen-copy) changes value,
+// bracketing WHICH processing step the change happened inside. Inert unless DC2_G219_SKYPX=1.
+static std::atomic<uint64_t> g_g219SentinelVal{0xDEADBEEFDEADBEEFull};
+
+#if defined(_WIN32)
+// G219 write-watchpoint (default-off, DC2_G219_GUARD=1 in addition to DC2_G219_SKYPX=1): make the
+// host page holding VRAM offset 0x278400 read-only once the sentinel sees the post-copy content;
+// the first write then faults, the vectored handler logs the writer's instruction address + thread
+// and restores write access. Identifies the zeroing writer definitively (every prior software
+// choke-point instrumentation missed it).
+#define WIN32_LEAN_AND_MEAN
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+namespace
+{
+    uint8_t *g_g219GuardBase = nullptr;   // host address of the guarded page
+    std::atomic<bool> g_g219GuardArmed{false};
+
+    LONG CALLBACK g219VectoredHandler(PEXCEPTION_POINTERS info)
+    {
+        if (!info || !info->ExceptionRecord ||
+            info->ExceptionRecord->ExceptionCode != EXCEPTION_ACCESS_VIOLATION)
+            return EXCEPTION_CONTINUE_SEARCH;
+        const ULONG_PTR isWrite = info->ExceptionRecord->ExceptionInformation[0];
+        const ULONG_PTR addr = info->ExceptionRecord->ExceptionInformation[1];
+        uint8_t *base = g_g219GuardBase;
+        if (!base || addr < reinterpret_cast<ULONG_PTR>(base) ||
+            addr >= reinterpret_cast<ULONG_PTR>(base) + 0x1000u)
+            return EXCEPTION_CONTINUE_SEARCH;
+        DWORD oldProt = 0;
+        VirtualProtect(base, 0x1000u, PAGE_READWRITE, &oldProt);
+        g_g219GuardArmed.store(false, std::memory_order_relaxed);
+        static std::atomic<uint32_t> s_hits{0};
+        const uint32_t n = s_hits.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 64u)
+        {
+            HMODULE mod = nullptr;
+            const void *rip = info->ExceptionRecord->ExceptionAddress;
+            GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                   GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               reinterpret_cast<LPCSTR>(rip), &mod);
+            char name[260] = {0};
+            if (mod)
+                GetModuleFileNameA(mod, name, sizeof(name) - 1);
+            std::fprintf(stderr,
+                "[G219:guard] n=%u tid=%lu write=%llu vramOff=0x%llx rip=%p module=%s base=%p delta=0x%llx\n",
+                n, (unsigned long)GetCurrentThreadId(),
+                (unsigned long long)isWrite,
+                (unsigned long long)(addr - reinterpret_cast<ULONG_PTR>(base) + 0x278000u),
+                rip, name[0] ? name : "?", (void *)mod,
+                mod ? (unsigned long long)(reinterpret_cast<ULONG_PTR>(rip) -
+                                           reinterpret_cast<ULONG_PTR>(mod))
+                    : 0ull);
+            std::fflush(stderr);
+        }
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
+
+    void g219GuardArm(uint8_t *vramBase)
+    {
+        static const bool s_on = (std::getenv("DC2_G219_GUARD") != nullptr);
+        if (!s_on || !vramBase)
+            return;
+        static bool s_handler = []() {
+            AddVectoredExceptionHandler(1, g219VectoredHandler);
+            return true;
+        }();
+        (void)s_handler;
+        bool expected = false;
+        if (!g_g219GuardArmed.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+            return;
+        g_g219GuardBase = vramBase + 0x278000u;
+        DWORD oldProt = 0;
+        VirtualProtect(g_g219GuardBase, 0x1000u, PAGE_READONLY, &oldProt);
+    }
+}
+#else
+namespace
+{
+    void g219GuardArm(uint8_t *) {}
+}
+#endif
+void g219Sentinel(const uint8_t *vram, uint32_t vramSize, const char *where)
+{
+    static const bool s_on = (std::getenv("DC2_G219_SKYPX") != nullptr);
+    if (!s_on || !vram || 0x278420u + 8u > vramSize)
+        return;
+    // Ring of the last 8 sentinel visits (single GS worker thread proven by the tid trace), so a
+    // detected transition can name its exact predecessor event, not just the detector.
+    static char s_ring[8][96];
+    static uint32_t s_ringPos = 0;
+    uint64_t v = 0;
+    std::memcpy(&v, vram + 0x278420u, 8);
+    const uint64_t prev = g_g219SentinelVal.exchange(v, std::memory_order_relaxed);
+    if (prev != v && prev != 0xDEADBEEFDEADBEEFull)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 600u)
+        {
+            const std::size_t tid = std::hash<std::thread::id>{}(std::this_thread::get_id());
+            std::fprintf(stderr, "[G219:trans] n=%u tid=%04x at=%s old=%016llx new=%016llx\n",
+                         n, (unsigned)(tid & 0xFFFFu), where,
+                         (unsigned long long)prev, (unsigned long long)v);
+            if (n < 40u)
+                for (uint32_t k = 0; k < 8u; ++k)
+                    std::fprintf(stderr, "[G219:ring] -%u %s\n", 8u - k,
+                                 s_ring[(s_ringPos + k) & 7u]);
+        }
+    }
+    std::snprintf(s_ring[s_ringPos & 7u], sizeof(s_ring[0]), "%s v=%016llx",
+                  where, (unsigned long long)v);
+    s_ringPos = (s_ringPos + 1u) & 7u;
+    g219GuardArm(const_cast<uint8_t *>(vram));
+}
 static int g_g144Threads = -1;                  // -1 = env not read yet; 0/1 = off; >1 = lanes
 static uint32_t g_g144BlockFbp = 0xFFFFFFFFu;   // fbp of the current deferred block (flush on change)
 static GS *g_g144LastGs = nullptr;              // live GS for VRAM at flush (set each capture)
@@ -2033,15 +2343,38 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
     // (private per-fbp Z, g106TitleZScope); sprites never touch Z (drawSprite has no Z code).
     st.depthFunc = 0;
     st.depthWrite = false;
+    static const bool s_zTestDisabled = (std::getenv("DC2_NO_ZTEST") != nullptr);
+    const uint32_t zte = static_cast<uint32_t>((ts >> 16) & 1u);
+    const uint32_t ztst = static_cast<uint32_t>((ts >> 17) & 3u);
+    const bool zmsk = ((ctx.zbuf >> 32) & 1ull) != 0ull;
+    if (g203UniversalZEnabled())
+    {
+        // G203 correctness-first: under universal-Z the CPU VRAM Z buffer is authoritative for ALL
+        // targets and prims (incl. the game's clear-sprite). The G178 GPU path reads back color
+        // only, not the live VRAM Z page, so any entry that reads OR writes real Z must run on the
+        // CPU replay to stay coherent. Trivial ztst=ALWAYS + zmsk (no test, no write) draws remain
+        // GPU-eligible (e.g. UI/HUD sprites). GPU depth parity for universal-Z is a G204 follow-up.
+        const bool zWrites = (zte != 0u) && !zmsk && (ztst != 0u);
+        const bool zTests  = (zte != 0u) && (ztst != 1u); // NEVER/GEQUAL/GREATER all need CPU
+        if (!s_zTestDisabled && (zWrites || zTests))
+        {
+            g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+            return false;
+        }
+        return true;
+    }
+    // Legacy (DC2_G203_LEGACY_Z=1): the old per-scope GPU-depth model.
     if (e.prim.type != GS_PRIM_SPRITE)
     {
-        static const bool s_zTestDisabled = (std::getenv("DC2_NO_ZTEST") != nullptr);
         const bool rockScope = e.titleRockScope && e.prim.tme && ctx.frame.fbp != 0x139u &&
                                ctx.tex0.tbp0 >= 0x2720u && ctx.tex0.tbp0 <= 0x3960u;
-        const uint32_t zte = static_cast<uint32_t>((ts >> 16) & 1u);
-        const uint32_t ztst = static_cast<uint32_t>((ts >> 17) & 3u);
-        const bool zmsk = ((ctx.zbuf >> 32) & 1ull) != 0ull;
+        const uint32_t zbpPage = static_cast<uint32_t>(ctx.zbuf & 0x1FFu);
         const uint32_t zpsm = static_cast<uint32_t>((ctx.zbuf >> 24) & 0xFu);
+        if (zte != 0u && g202TownZScope(ctx.frame.fbp, zbpPage, zpsm))
+        {
+            g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+            return false; // G202 town Z needs real VRAM Z read/write; GPU path readbacks color only.
+        }
         const bool zEnabled = !s_zTestDisabled && g106TitleZEnabled() && rockScope && zte != 0u;
         if (zEnabled)
         {
@@ -2486,6 +2819,21 @@ void GSRasterizer::drawPrimitive(GS *gs)
     static uint32_t s_g141Win = 0u;
     G141PerfScope g141Scope(s_g141PerfOn, &s_g141Sum, &s_g141Win, "gs.drawPrimitive", 4000u);
     g141Scope.accumNs = &g_g141GsRasterNs;
+    // G219 transition sentinel (inert unless DC2_G219_SKYPX=1).
+    {
+        static const bool s_g219on = (std::getenv("DC2_G219_SKYPX") != nullptr);
+        if (s_g219on && !t_g144InReplay)
+        {
+            extern void g219Sentinel(const uint8_t *, uint32_t, const char *);
+            static thread_local char s_g219tag[96];
+            const auto &g219ctx = gs->activeContext();
+            std::snprintf(s_g219tag, sizeof(s_g219tag), "drawprim(prim=%u tme=%u fbp=0x%x tbp=0x%x)",
+                          static_cast<uint32_t>(gs->m_prim.type),
+                          static_cast<uint32_t>(gs->m_prim.tme),
+                          g219ctx.frame.fbp, g219ctx.tex0.tbp0);
+            g219Sentinel(gs->m_vram, gs->m_vramSize, s_g219tag);
+        }
+    }
     const std::chrono::steady_clock::time_point g156FnT0 =
         g_g156Stat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
@@ -3171,12 +3519,15 @@ void GSRasterizer::drawPrimitive(GS *gs)
         {
             GSRasterizer *self = this;
             g_g144FlushFn = [self]() {
+                if (g_g144LastGs)
+                    g219Sentinel(g_g144LastGs->m_vram, g_g144LastGs->m_vramSize, "flush-preg162");
                 // G166: resolve any batched T8 GPU-decode requests FIRST, unconditionally -- every
                 // e.decoded the replay below reads must already be pixel-filled (see
                 // g162ResolvePendingT8Batch's comment for why this ordering is safe by construction).
                 g162ResolvePendingT8Batch();
                 if (g_g144List.empty() || !g_g144LastGs)
                     return;
+                g219Sentinel(g_g144LastGs->m_vram, g_g144LastGs->m_vramSize, "flush-start");
                 // G178: whole-flush GPU attempt (default OFF, DC2_G178_GPU=1). On success the
                 // batch is already rendered AND read back into VRAM — skip the CPU replay
                 // entirely. On ANY unsupported entry it returns false having changed nothing,
@@ -3187,8 +3538,19 @@ void GSRasterizer::drawPrimitive(GS *gs)
                     return;
                 }
                 // Pre-run the title-Z fbp-transition clear ONCE, single-threaded (replay skips it).
-                if (g106TitleZPrivateEnabled())
-                    g106TitleZClearIfNeeded(g_g144BlockFbp);
+                // G203: universal-Z uses no artificial clears — the game's own clear-sprite populates
+                // VRAM Z during the replay below (the g202 clear here is what stomped block 0x1a00 /
+                // the menu font staging into inventory/loading; skip it entirely under universal-Z).
+                if (!g203UniversalZEnabled())
+                {
+                    if (g106TitleZPrivateEnabled())
+                        g106TitleZClearIfNeeded(g_g144BlockFbp);
+                    const GSContext &c = g_g144List[0].ctx;
+                    t_g144TownDepthScopeOverride = true;
+                    t_g144TownDepthScope = g_g144List[0].townDepthScope;
+                    g202TownZClearIfNeeded(g_g144LastGs->m_vram, c.frame.fbp, c.zbuf, c.frame.fbw);
+                    t_g144TownDepthScopeOverride = false;
+                }
                 int y0 = 0x7fffffff, y1 = -0x7fffffff;
                 for (const auto &e : g_g144List)
                 {
@@ -3219,6 +3581,8 @@ void GSRasterizer::drawPrimitive(GS *gs)
                             s_rg.m_pabe = e.pabe;
                             t_g144TitleRockScopeOverride = true;
                             t_g144TitleRockScope = e.titleRockScope;
+                            t_g144TownDepthScopeOverride = true;
+                            t_g144TownDepthScope = e.townDepthScope;
                             s_rg.m_vtxQueue[0] = e.v[0];
                             s_rg.m_vtxQueue[1] = e.v[1];
                             s_rg.m_vtxQueue[2] = e.v[2];
@@ -3233,6 +3597,7 @@ void GSRasterizer::drawPrimitive(GS *gs)
                         }
                         t_g149Px = nullptr; t_g149Valid = nullptr;
                         t_g144TitleRockScopeOverride = false;
+                        t_g144TownDepthScopeOverride = false;
                         t_g144InReplay = false;
                         t_g144Banded = false;
                     });
@@ -3253,8 +3618,17 @@ void GSRasterizer::drawPrimitive(GS *gs)
                     g_g144List.clear();
                     return;
                 }
-                if (g106TitleZPrivateEnabled())
-                    g106TitleZClearIfNeeded(g_g144BlockFbp);
+                // G203: skip all artificial Z pre-clears under universal-Z (see the parallel closure).
+                if (!g203UniversalZEnabled())
+                {
+                    if (g106TitleZPrivateEnabled())
+                        g106TitleZClearIfNeeded(g_g144BlockFbp);
+                    const GSContext &c = g_g144List[0].ctx;
+                    t_g144TownDepthScopeOverride = true;
+                    t_g144TownDepthScope = g_g144List[0].townDepthScope;
+                    g202TownZClearIfNeeded(g_g144LastGs->m_vram, c.frame.fbp, c.zbuf, c.frame.fbw);
+                    t_g144TownDepthScopeOverride = false;
+                }
                 static thread_local GS s_seq;
                 GS *rgs = g_g144LastGs;
                 s_seq.m_vram = rgs->m_vram;
@@ -3272,6 +3646,8 @@ void GSRasterizer::drawPrimitive(GS *gs)
                     s_seq.m_pabe = e.pabe;
                     t_g144TitleRockScopeOverride = true;
                     t_g144TitleRockScope = e.titleRockScope;
+                    t_g144TownDepthScopeOverride = true;
+                    t_g144TownDepthScope = e.townDepthScope;
                     s_seq.m_vtxQueue[0] = e.v[0];
                     s_seq.m_vtxQueue[1] = e.v[1];
                     s_seq.m_vtxQueue[2] = e.v[2];
@@ -3285,6 +3661,7 @@ void GSRasterizer::drawPrimitive(GS *gs)
                 }
                 t_g149Px = nullptr; t_g149Valid = nullptr;
                 t_g144TitleRockScopeOverride = false;
+                t_g144TownDepthScopeOverride = false;
                 t_g144InReplay = false;
                 g_g144List.clear();
             };
@@ -3427,6 +3804,7 @@ void GSRasterizer::drawPrimitive(GS *gs)
             e.texclut = gs->m_texclut;
             e.pabe = gs->m_pabe;
             e.titleRockScope = g_dc2TitleRockScope.load(std::memory_order_relaxed);
+            e.townDepthScope = g_dc2TownDepthScope.load(std::memory_order_relaxed);
             e.minY = clampInt(crawMinY, ctx.scissor.y0, ctx.scissor.y1);
             e.maxY = clampInt(crawMaxY, ctx.scissor.y0, ctx.scissor.y1);
             // G149: decode this tri's texture ONCE now (guest thread), so all band lanes read it
@@ -3435,6 +3813,30 @@ void GSRasterizer::drawPrimitive(GS *gs)
             e.decoded = isSprite144 ? G149Buf{} : g149BuildDecoded(this, gs, ctx, gs->m_texa, gs->m_vram);
             if (isTri144)
                 g161CensusEligibility(ctx, gs->m_prim.abe);
+            // G219 (default-off, DC2_G219_SKYPX=1): fingerprint the 0x2720 work-page range at
+            // CAPTURE time for the display composite that samples it — paired with the identical
+            // fingerprint at raster time in drawTriangle, this discriminates "VRAM clobbered
+            // between capture and flush" from "sampler reads a different address in replay".
+            {
+                static const bool s_g219f = (std::getenv("DC2_G219_SKYPX") != nullptr);
+                if (s_g219f && isTri144 && gs->m_prim.tme && ctx.tex0.tbp0 == 0x2720u &&
+                    gs->m_vram && 0x272000u + 0x8000u <= gs->m_vramSize)
+                {
+                    static std::atomic<uint32_t> s_g219fn{0};
+                    const uint32_t n = s_g219fn.fetch_add(1u, std::memory_order_relaxed);
+                    if (n < 400u)
+                    {
+                        uint64_t sum = 0;
+                        const uint64_t *p = reinterpret_cast<const uint64_t *>(gs->m_vram + 0x272000u);
+                        for (uint32_t i = 0; i < 0x1000u; ++i)
+                            sum += p[i];
+                        std::fprintf(stderr, "[G219:cap] n=%u fbp=0x%x sum=%016llx\n",
+                                     n, ctx.frame.fbp, (unsigned long long)sum);
+                        extern uint8_t g_g219Snap[0x8000];
+                        std::memcpy(g_g219Snap, gs->m_vram + 0x272000u, 0x8000u);
+                    }
+                }
+            }
             g_g144List.push_back(e);
             if (g_g156Stat)
                 g_g156CaptureNs.fetch_add(
@@ -3448,6 +3850,22 @@ void GSRasterizer::drawPrimitive(GS *gs)
         // didn't satisfy deferrable144 above, e.g. a sprite/tri to a non-display fbp like 0x139):
         // drain the pending list FIRST so global submission order (3D under the 2D menu) is
         // preserved, then draw this prim normally.
+        // G219 (default-off, DC2_G219_SKYPX=1): log the non-deferrable drains around the 0x139
+        // work-page cycle so the copy/composite/clear interleave is visible in the trace.
+        {
+            static const bool s_g219d = (std::getenv("DC2_G219_SKYPX") != nullptr);
+            if (s_g219d && ctx.frame.fbp == 0x139u)
+            {
+                static std::atomic<uint32_t> s_g219dn{0};
+                const uint32_t n = s_g219dn.fetch_add(1u, std::memory_order_relaxed);
+                if (n < 2000u)
+                    std::fprintf(stderr,
+                        "[G219:nondef] n=%u prim=%u tme=%u fbp=0x%x tbp=0x%x list=%zu\n",
+                        n, static_cast<uint32_t>(gs->m_prim.type),
+                        static_cast<uint32_t>(gs->m_prim.tme), ctx.frame.fbp, ctx.tex0.tbp0,
+                        g_g144List.size());
+            }
+        }
         if (!g_g144List.empty())
             g144TimedMidFlush();
     }
@@ -3617,6 +4035,26 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
     if (off + bytesPerPixel > gs->m_vramSize)
         return;
 
+    // G219 (default-off, DC2_G219_SKYPX=1): watch writes landing in the qwords the [G219:dif]
+    // capture-vs-replay diff showed being zeroed (0x278400..) — identifies the clobbering draw.
+    // (The F51.2 watch below can't serve: renderQualityTraceEnabled() disables deferral itself.)
+    {
+        static const bool s_g219w2 = (std::getenv("DC2_G219_SKYPX") != nullptr);
+        if (s_g219w2 && off >= 0x278400u && off < 0x278440u)
+        {
+            static std::atomic<uint32_t> s_g219wpn{0};
+            const uint32_t n = s_g219wpn.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 400u || (n % 512u) == 0u)
+                std::fprintf(stderr,
+                    "[G219:wpx] n=%u off=0x%x xy=(%d,%d) fbp=0x%x fbw=%u fpsm=0x%x prim=%u tme=%u "
+                    "tbp=0x%x rgba=%02x,%02x,%02x,%02x replay=%u\n",
+                    n, off, x, y, ctx.frame.fbp, static_cast<uint32_t>(ctx.frame.fbw),
+                    static_cast<uint32_t>(ctx.frame.psm), static_cast<uint32_t>(gs->m_prim.type),
+                    static_cast<uint32_t>(gs->m_prim.tme), ctx.tex0.tbp0, r, g, b, a,
+                    t_g144InReplay ? 1u : 0u);
+        }
+    }
+
     // [F51.2] Watch writes that land in the manager texture page (0x272000..0x282000).
     // Identify which draw zeroes the uploaded T8 data (pageNz drops 62381 -> ~8192).
     if (renderQualityTraceEnabled() && off >= 0x272000u && off < 0x282000u)
@@ -3675,6 +4113,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
     const uint8_t srcR = r;
     const uint8_t srcG = g;
     const uint8_t srcB = b;
+    const uint8_t srcA = a;
 
     if (gs->m_prim.abe)
     {
@@ -3760,6 +4199,17 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
             std::memcpy(&existing, gs->m_vram + off, 2);
             pixel = static_cast<uint16_t>((pixel & ~mask) | (existing & mask));
         }
+        if (g195ForegroundTraceTarget(ctx, x, y))
+        {
+            uint16_t before = 0u;
+            std::memcpy(&before, gs->m_vram + off, 2);
+            g195LogForegroundPixel(ctx, x, y, off, bytesPerPixel,
+                                   static_cast<uint32_t>(gs->m_prim.type),
+                                   gs->m_prim.tme, gs->m_prim.abe,
+                                   gs->m_prim.fst, gs->m_prim.ctxt, gs->m_pabe,
+                                   decodePSMCT16(before), srcR, srcG, srcB, srcA,
+                                   decodePSMCT16(pixel));
+        }
         f50_12_log_framebuffer_commit(ctx, x, y, off, bytesPerPixel, decodePSMCT16(pixel),
                                       gs->m_prim.type, gs->m_prim.tme, gs->m_prim.abe,
                                       gs->m_prim.fst, gs->m_prim.ctxt);
@@ -3781,6 +4231,17 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
         uint32_t existing = 0u;
         std::memcpy(&existing, gs->m_vram + off, 4);
         pixel = (pixel & 0x00FFFFFFu) | (existing & 0xFF000000u);
+    }
+
+    if (g195ForegroundTraceTarget(ctx, x, y))
+    {
+        uint32_t before = 0u;
+        std::memcpy(&before, gs->m_vram + off, 4);
+        g195LogForegroundPixel(ctx, x, y, off, bytesPerPixel,
+                               static_cast<uint32_t>(gs->m_prim.type),
+                               gs->m_prim.tme, gs->m_prim.abe,
+                               gs->m_prim.fst, gs->m_prim.ctxt, gs->m_pabe,
+                               before, srcR, srcG, srcB, srcA, pixel);
     }
 
     if (g43FacePixelTraceEnabled() &&
@@ -4545,6 +5006,97 @@ void GSRasterizer::drawSprite(GS *gs)
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const auto &ctx = gs->activeContext();
 
+    // G219 (default-off, DC2_G219_SKYPX=1): sprite writer log at the two probe pixels inside the
+    // zoom black rectangle (mirrors the drawTriangle skycol probe, so the full writer sequence at
+    // one pixel can be reconstructed across both primitive paths).
+    auto g219SpritePixelProbe = [&](const auto &pctx, GS *pgs, int px, int py,
+                                    uint8_t pr, uint8_t pg, uint8_t pb, uint8_t pa, int texd) {
+        static const bool s_g219sp = (std::getenv("DC2_G219_SKYPX") != nullptr);
+        if (!s_g219sp)
+            return;
+        if (!((px == 470 && py == 30) || (px == 500 && py == 100)))
+            return;
+        if (pctx.frame.fbp != 0x0u && pctx.frame.fbp != 0x68u)
+            return;
+        static std::atomic<uint32_t> s_g219spn{0};
+        const uint32_t n = s_g219spn.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 2000u)
+            std::fprintf(stderr,
+                "[G219:sprcol] n=%u xy=(%d,%d) fbp=0x%x tme=%u tbp=0x%x abe=%u texd=%d "
+                "rgba=(%u,%u,%u,%u) replay=%u\n",
+                n, px, py, pctx.frame.fbp, static_cast<uint32_t>(pgs->m_prim.tme),
+                pctx.tex0.tbp0, static_cast<uint32_t>(pgs->m_prim.abe), texd,
+                pr, pg, pb, pa, t_g144InReplay ? 1u : 0u);
+    };
+
+    // G203: honor the guest's real ZBUF/TEST on SPRITES too. DC2 CLEARS its Z buffer every frame
+    // via a full-screen ztst=ALWAYS,zmsk=0 sprite (seen in ttle/map_0/Inventory .gs freezes);
+    // drawSprite previously ignored Z entirely, so that clear never reached VRAM and the triangle
+    // path read stale Z — which is why prior phases used private title/costume Z buffers and the
+    // town artificial clear. Reproducing the clear here lets universal-Z retire all of those.
+    // Pure ztst=ALWAYS + zmsk (no-op: always passes, never writes) sprites skip the Z work.
+    static const bool s_spriteZDisabled = (std::getenv("DC2_NO_ZTEST") != nullptr);
+    const bool sZuni = g203UniversalZEnabled();
+    const uint32_t sZte  = static_cast<uint32_t>((ctx.test >> 16) & 0x1u);
+    const uint32_t sZtst = static_cast<uint32_t>((ctx.test >> 17) & 0x3u);
+    const uint32_t sZbp  = static_cast<uint32_t>(ctx.zbuf & 0x1FFu) << 5;
+    const uint32_t sZpsm = static_cast<uint32_t>((ctx.zbuf >> 24) & 0xFu);
+    const bool sZmsk     = ((ctx.zbuf >> 32) & 0x1u) != 0u;
+    const uint32_t sZbw  = ctx.frame.fbw;
+    const bool sZ16 = (sZpsm == 0x2u || sZpsm == 0xAu || sZpsm == 0xBu);
+    const bool sZ24 = (sZpsm == 0x1u);
+    const bool sZActive = sZuni && !s_spriteZDisabled && sZte != 0u && gs->m_vram != nullptr &&
+                          !(sZtst == 1u && sZmsk); // ALWAYS + no-write == no-op, fast-skip
+    uint32_t sZi = 0u;
+    if (sZActive)
+    {
+        float zf = v1.z; // sprite Z is flat: the kick (2nd) vertex's z
+        if (zf < 0.0f) zf = 0.0f;
+        const float zmax = sZ16 ? 65535.0f : (sZ24 ? 16777215.0f : 4294967295.0f);
+        if (zf > zmax) zf = zmax;
+        sZi = static_cast<uint32_t>(zf);
+    }
+    const bool sZWrite = sZActive && !sZmsk && sZtst != 0u; // ZTST=NEVER never writes
+    // G219 (default-off, DC2_G219_SKYPX=1): flag any sprite whose Z BUFFER lands in the
+    // 0x139-0x140 work-page range — a deferred display sprite with such a zbp would zero the
+    // work page during replay (the [G219:dif] clobber signature).
+    {
+        static const bool s_g219z = (std::getenv("DC2_G219_SKYPX") != nullptr);
+        const uint32_t sZbpPage = static_cast<uint32_t>(ctx.zbuf & 0x1FFu);
+        if (s_g219z && sZWrite && sZbpPage >= 0x139u && sZbpPage <= 0x148u)
+        {
+            static std::atomic<uint32_t> s_g219zn{0};
+            const uint32_t n = s_g219zn.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 400u)
+                std::fprintf(stderr,
+                    "[G219:spzbp] n=%u fbp=0x%x zbpPage=0x%x zpsm=0x%x ztst=%u zi=%u tme=%u "
+                    "tbp=0x%x v=(%.0f,%.0f)-(%.0f,%.0f) replay=%u\n",
+                    n, ctx.frame.fbp, sZbpPage, sZpsm, sZtst, sZi,
+                    static_cast<uint32_t>(gs->m_prim.tme), ctx.tex0.tbp0,
+                    v0.x, v0.y, v1.x, v1.y, t_g144InReplay ? 1u : 0u);
+        }
+    }
+    auto spriteZPass = [&](int px, int py) -> bool {
+        if (!sZActive) return true;
+        const uint32_t zdst =
+            sZ16 ? GSMem::ReadZ16(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py))
+                 : (sZ24 ? GSMem::ReadZ24(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py))
+                         : GSMem::ReadZ32(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py)));
+        switch (sZtst)
+        {
+        case 0:  return false;          // NEVER
+        case 1:  return true;           // ALWAYS
+        case 2:  return sZi >= zdst;    // GEQUAL
+        default: return sZi >  zdst;    // GREATER
+        }
+    };
+    auto spriteZStore = [&](int px, int py) {
+        if (!sZWrite) return;
+        if (sZ16)      GSMem::WriteZ16(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py), sZi);
+        else if (sZ24) GSMem::WriteZ24(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py), sZi);
+        else           GSMem::WriteZ32(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py), sZi);
+    };
+
     int ofx = ctx.xyoffset.ofx >> 4;
     int ofy = ctx.xyoffset.ofy >> 4;
 
@@ -4587,6 +5139,28 @@ void GSRasterizer::drawSprite(GS *gs)
     {
         if (drawY0 < t_g144BandY0) drawY0 = t_g144BandY0;
         if (drawY1 > t_g144BandY1) drawY1 = t_g144BandY1;
+    }
+
+    // G219 (default-off, DC2_G219_SKYPX=1): log any SPRITE touching Z inside the zoom black
+    // rectangle (per-sprite, not per-pixel) — verifies the game's Z-clear sprite reaches
+    // cols 417-511 / rows 0-140 and with what Z value.
+    {
+        static const bool s_g219s = (std::getenv("DC2_G219_SKYPX") != nullptr);
+        if (s_g219s && (sZActive || sZWrite) &&
+            (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u) &&
+            drawX1 >= 417 && drawY0 <= 140)
+        {
+            static std::atomic<uint32_t> s_g219sn{0};
+            const uint32_t n = s_g219sn.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 400u || (n % 1024u) == 0u)
+                std::fprintf(stderr,
+                    "[G219:spz] n=%u fbp=0x%x rect=(%d,%d)-(%d,%d) ztst=%u zmsk=%u zwr=%u "
+                    "zi=%u tme=%u tbp=0x%x replay=%u banded=%u\n",
+                    n, ctx.frame.fbp, drawX0, drawY0, drawX1, drawY1, sZtst,
+                    static_cast<uint32_t>(sZmsk), static_cast<uint32_t>(sZWrite), sZi,
+                    static_cast<uint32_t>(gs->m_prim.tme), ctx.tex0.tbp0,
+                    t_g144InReplay ? 1u : 0u, t_g144Banded ? 1u : 0u);
+        }
     }
 
     const uint64_t alphaReg = ctx.alpha;
@@ -4878,7 +5452,11 @@ void GSRasterizer::drawSprite(GS *gs)
                         }
                     }
                 }
+                if (!spriteZPass(x, y)) // G203: guest Z test
+                    continue;
+                g219SpritePixelProbe(ctx, gs, x, y, color.r, color.g, color.b, color.a, 1);
                 writePixel(gs, x, y, color.r, color.g, color.b, color.a);
+                spriteZStore(x, y); // G203: guest Z write (e.g. the game's clear-sprite)
             }
         }
     }
@@ -4886,7 +5464,13 @@ void GSRasterizer::drawSprite(GS *gs)
     {
         for (int y = drawY0; y <= drawY1; ++y)
             for (int x = drawX0; x <= drawX1; ++x)
+            {
+                if (!spriteZPass(x, y)) // G203: guest Z test
+                    continue;
+                g219SpritePixelProbe(ctx, gs, x, y, r, g, b, a, 0);
                 writePixel(gs, x, y, r, g, b, a);
+                spriteZStore(x, y); // G203: guest Z write (e.g. the game's clear-sprite)
+            }
     }
 }
 
@@ -4898,6 +5482,18 @@ static void g178CensusScan();
 
 void g144FlushPending()
 {
+    // G219 (default-off, DC2_G219_SKYPX=1): log the frame-end drain cadence + pending size so
+    // "how long do deferred entries live before the trailing flush" is directly visible.
+    {
+        static const bool s_g219fl = (std::getenv("DC2_G219_SKYPX") != nullptr);
+        if (s_g219fl)
+        {
+            static std::atomic<uint32_t> s_g219fln{0};
+            const uint32_t n = s_g219fln.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 200u || (n % 64u) == 0u || !g_g144List.empty())
+                std::fprintf(stderr, "[G219:framefl] n=%u list=%zu\n", n, g_g144List.size());
+        }
+    }
     // G148 sampler-stat dump (DC2_G148_SAMPLESTAT=1). Fires once per guest frame (this runs from the
     // mgEndFrame override). Prints cumulative + 30-frame-window deltas so we can read the steady-state
     // quad hit/miss ratio and leaf-read volume that decide whether a de-swizzle cache is worthwhile.
@@ -5623,12 +6219,365 @@ void GSRasterizer::drawTriangle(GS *gs)
 
     float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
 
+    // G219 (default-off, DC2_G219_SKYPX=1): triangle-level probe for the sky dome (tbp=0x2820)
+    // on the display targets — logs every such triangle that reaches the raster stage with its
+    // clamped bbox, so a zero-pixel result in the black region can be split into "triangle never
+    // got here" vs "bbox/span clipped it".
+    {
+        static const bool s_g219t = (std::getenv("DC2_G219_SKYPX") != nullptr);
+        // G219: raster-time fingerprint pair for the [G219:cap] capture-time one above.
+        if (s_g219t && gs->m_prim.tme && ctx.tex0.tbp0 == 0x2720u &&
+            (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u) &&
+            gs->m_vram && 0x272000u + 0x8000u <= gs->m_vramSize)
+        {
+            static std::atomic<uint32_t> s_g219rn{0};
+            const uint32_t n = s_g219rn.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 400u)
+            {
+                uint64_t sum = 0;
+                const uint64_t *p = reinterpret_cast<const uint64_t *>(gs->m_vram + 0x272000u);
+                for (uint32_t i = 0; i < 0x1000u; ++i)
+                    sum += p[i];
+                std::fprintf(stderr, "[G219:ras] n=%u fbp=0x%x sum=%016llx replay=%u banded=%u\n",
+                             n, ctx.frame.fbp, (unsigned long long)sum,
+                             t_g144InReplay ? 1u : 0u, t_g144Banded ? 1u : 0u);
+                // Diff vs the capture-time snapshot: the changed offsets identify the clobbering
+                // writer (color-page vs Z-page vs copy stride patterns).
+                extern uint8_t g_g219Snap[0x8000];
+                const uint64_t *q = reinterpret_cast<const uint64_t *>(g_g219Snap);
+                uint32_t shown = 0, diffs = 0;
+                for (uint32_t i = 0; i < 0x1000u; ++i)
+                {
+                    if (p[i] != q[i])
+                    {
+                        ++diffs;
+                        if (shown < 6u)
+                        {
+                            std::fprintf(stderr,
+                                "[G219:dif] off=0x%05x old=%016llx new=%016llx\n",
+                                0x272000u + i * 8u, (unsigned long long)q[i], (unsigned long long)p[i]);
+                            ++shown;
+                        }
+                    }
+                }
+                if (diffs)
+                    std::fprintf(stderr, "[G219:dif] totalDiffQwords=%u of 4096\n", diffs);
+            }
+        }
+        if (s_g219t &&
+            (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u) &&
+            rawMaxX >= 440 && rawMinY <= 100 && (rawMaxX - rawMinX) > 60)
+        {
+            static std::atomic<uint32_t> s_g219tn{0};
+            const uint32_t n = s_g219tn.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 300u || (n % 256u) == 0u)
+                std::fprintf(stderr,
+                    "[G219:skytri] n=%u fbp=0x%x prim=%u tme=%u tbp=0x%x bbox=(%d,%d)-(%d,%d) "
+                    "raw=(%d,%d)-(%d,%d) denom=%g replay=%u banded=%u band=(%d,%d) "
+                    "px=(%.1f,%.1f)(%.1f,%.1f)(%.1f,%.1f) q=(%.4g,%.4g,%.4g)\n",
+                    n, ctx.frame.fbp, static_cast<uint32_t>(gs->m_prim.type),
+                    static_cast<uint32_t>(gs->m_prim.tme), ctx.tex0.tbp0,
+                    minX, minY, maxX, maxY, rawMinX, rawMinY, rawMaxX, rawMaxY,
+                    denom, t_g144InReplay ? 1u : 0u, t_g144Banded ? 1u : 0u,
+                    t_g144BandY0, t_g144BandY1,
+                    fx0, fy0, fx1, fy1, fx2, fy2, v0.q, v1.q, v2.q);
+        }
+    }
+
+    if (envFlagEnabled("DC2_G195_FG_TRACE") &&
+        gs->m_vram &&
+        gs->m_prim.tme &&
+        ctx.tex0.tbp0 == 0x2a20u &&
+        (ctx.frame.fbp == 0u || ctx.frame.fbp == 0x68u))
+    {
+        static std::atomic<uint32_t> s_g195FgTri{0};
+        const uint32_t n = s_g195FgTri.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 256u || (n % 512u) == 0u)
+        {
+            std::fprintf(stderr,
+                "[G195:fgtri] n=%u blk=%d fbp=0x%x fbw=%u fpsm=0x%x prim=%u fst=%u iip=%u abe=%u "
+                "tex0=0x%016llx tbw=%u psm=0x%x tw=%u th=%u tfx=%u tcc=%u cbp=0x%x cpsm=0x%x csa=%u "
+                "alpha=0x%llx test=0x%llx zbuf=0x%llx tex1=0x%llx clamp=0x%llx "
+                "bbox=(%d,%d)-(%d,%d) rawbbox=(%d,%d)-(%d,%d) denom=%g of=(%d,%d) "
+                "v0=(%.1f,%.1f,%.0f rgba=%u,%u,%u,%u stq=%.6g,%.6g,%.6g uv=%u,%u) "
+                "v1=(%.1f,%.1f,%.0f rgba=%u,%u,%u,%u stq=%.6g,%.6g,%.6g uv=%u,%u) "
+                "v2=(%.1f,%.1f,%.0f rgba=%u,%u,%u,%u stq=%.6g,%.6g,%.6g uv=%u,%u)\n",
+                n, g_dc2TitleCurBlock.load(std::memory_order_relaxed),
+                ctx.frame.fbp, static_cast<uint32_t>(ctx.frame.fbw),
+                static_cast<uint32_t>(ctx.frame.psm), static_cast<uint32_t>(gs->m_prim.type),
+                static_cast<uint32_t>(gs->m_prim.fst), static_cast<uint32_t>(gs->m_prim.iip),
+                static_cast<uint32_t>(gs->m_prim.abe),
+                static_cast<unsigned long long>(f50_12_tex0_raw(ctx.tex0)),
+                static_cast<uint32_t>(ctx.tex0.tbw), static_cast<uint32_t>(ctx.tex0.psm),
+                static_cast<uint32_t>(ctx.tex0.tw), static_cast<uint32_t>(ctx.tex0.th),
+                static_cast<uint32_t>(ctx.tex0.tfx), static_cast<uint32_t>(ctx.tex0.tcc),
+                ctx.tex0.cbp, static_cast<uint32_t>(ctx.tex0.cpsm),
+                static_cast<uint32_t>(ctx.tex0.csa),
+                static_cast<unsigned long long>(ctx.alpha),
+                static_cast<unsigned long long>(ctx.test),
+                static_cast<unsigned long long>(ctx.zbuf),
+                static_cast<unsigned long long>(ctx.tex1),
+                static_cast<unsigned long long>(ctx.clamp),
+                minX, minY, maxX, maxY, rawMinX, rawMinY, rawMaxX, rawMaxY, denom, ofx, ofy,
+                fx0, fy0, v0.z, static_cast<uint32_t>(v0.r), static_cast<uint32_t>(v0.g),
+                static_cast<uint32_t>(v0.b), static_cast<uint32_t>(v0.a),
+                v0.s, v0.t, v0.q, static_cast<uint32_t>(v0.u), static_cast<uint32_t>(v0.v),
+                fx1, fy1, v1.z, static_cast<uint32_t>(v1.r), static_cast<uint32_t>(v1.g),
+                static_cast<uint32_t>(v1.b), static_cast<uint32_t>(v1.a),
+                v1.s, v1.t, v1.q, static_cast<uint32_t>(v1.u), static_cast<uint32_t>(v1.v),
+                fx2, fy2, v2.z, static_cast<uint32_t>(v2.r), static_cast<uint32_t>(v2.g),
+                static_cast<uint32_t>(v2.b), static_cast<uint32_t>(v2.a),
+                v2.s, v2.t, v2.q, static_cast<uint32_t>(v2.u), static_cast<uint32_t>(v2.v));
+        }
+    }
+
+    if (g195DofTraceEnabled() &&
+        gs->m_vram &&
+        gs->m_prim.tme &&
+        ctx.tex0.tbp0 >= 0x2720u &&
+        ctx.tex0.tbp0 <= 0x3a00u &&
+        ctx.frame.fbp != 0x139u)
+    {
+        struct G195State
+        {
+            uint32_t fbp, fbw, tbp, tbw, cbp;
+            uint8_t fpsm, psm, tfx, tcc, tw, th, cpsm, csm, csa;
+            uint8_t prim, fst, iip, abe;
+            uint64_t alpha, test, tex1, clamp;
+            uint32_t hits;
+        };
+        static std::mutex s_stateMutex;
+        static G195State s_seen[256]{};
+        static uint32_t s_seenN = 0;
+        const G195State key{
+            ctx.frame.fbp, static_cast<uint32_t>(ctx.frame.fbw), ctx.tex0.tbp0,
+            static_cast<uint32_t>(ctx.tex0.tbw), ctx.tex0.cbp,
+            static_cast<uint8_t>(ctx.frame.psm), static_cast<uint8_t>(ctx.tex0.psm),
+            static_cast<uint8_t>(ctx.tex0.tfx), static_cast<uint8_t>(ctx.tex0.tcc),
+            static_cast<uint8_t>(ctx.tex0.tw), static_cast<uint8_t>(ctx.tex0.th),
+            static_cast<uint8_t>(ctx.tex0.cpsm), static_cast<uint8_t>(ctx.tex0.csm),
+            static_cast<uint8_t>(ctx.tex0.csa), static_cast<uint8_t>(gs->m_prim.type),
+            static_cast<uint8_t>(gs->m_prim.fst), static_cast<uint8_t>(gs->m_prim.iip),
+            static_cast<uint8_t>(gs->m_prim.abe), ctx.alpha, ctx.test, ctx.tex1, ctx.clamp, 0u
+        };
+        uint32_t idx = 0xFFFFFFFFu;
+        bool firstHit = false;
+        uint32_t hits = 0;
+        {
+            std::lock_guard<std::mutex> lk(s_stateMutex);
+            for (uint32_t i = 0; i < s_seenN; ++i)
+            {
+                const G195State &s = s_seen[i];
+                if (s.fbp == key.fbp && s.fbw == key.fbw && s.tbp == key.tbp &&
+                    s.tbw == key.tbw && s.cbp == key.cbp && s.fpsm == key.fpsm &&
+                    s.psm == key.psm && s.tfx == key.tfx && s.tcc == key.tcc &&
+                    s.tw == key.tw && s.th == key.th && s.cpsm == key.cpsm &&
+                    s.csm == key.csm && s.csa == key.csa && s.prim == key.prim &&
+                    s.fst == key.fst && s.iip == key.iip && s.abe == key.abe &&
+                    s.alpha == key.alpha && s.test == key.test && s.tex1 == key.tex1 &&
+                    s.clamp == key.clamp)
+                {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx == 0xFFFFFFFFu && s_seenN < 256u)
+            {
+                idx = s_seenN++;
+                s_seen[idx] = key;
+                firstHit = true;
+            }
+            if (idx != 0xFFFFFFFFu)
+                hits = ++s_seen[idx].hits;
+        }
+        if (idx != 0xFFFFFFFFu && (firstHit || hits == 2u || hits == 4u || hits == 16u || hits == 256u))
+        {
+            std::fprintf(stderr,
+                "[G195:state] k=%u hits=%u fbp=0x%x fbw=%u fpsm=0x%x prim=%u fst=%u iip=%u abe=%u "
+                "tbp=0x%x tbw=%u psm=0x%x tfx=%u tcc=%u tw=%u th=%u cbp=0x%x cpsm=0x%x csm=%u csa=%u "
+                "alpha=0x%llx test=0x%llx tex1=0x%llx clamp=0x%llx bbox=(%d,%d)-(%d,%d) "
+                "rawbbox=(%d,%d)-(%d,%d) rgba2=(%u,%u,%u,%u)\n",
+                idx, hits, key.fbp, key.fbw, static_cast<uint32_t>(key.fpsm),
+                static_cast<uint32_t>(key.prim), static_cast<uint32_t>(key.fst),
+                static_cast<uint32_t>(key.iip), static_cast<uint32_t>(key.abe),
+                key.tbp, key.tbw, static_cast<uint32_t>(key.psm),
+                static_cast<uint32_t>(key.tfx), static_cast<uint32_t>(key.tcc),
+                static_cast<uint32_t>(key.tw), static_cast<uint32_t>(key.th), key.cbp,
+                static_cast<uint32_t>(key.cpsm), static_cast<uint32_t>(key.csm),
+                static_cast<uint32_t>(key.csa), static_cast<unsigned long long>(key.alpha),
+                static_cast<unsigned long long>(key.test), static_cast<unsigned long long>(key.tex1),
+                static_cast<unsigned long long>(key.clamp),
+                minX, minY, maxX, maxY, rawMinX, rawMinY, rawMaxX, rawMaxY,
+                static_cast<uint32_t>(v2.r), static_cast<uint32_t>(v2.g),
+                static_cast<uint32_t>(v2.b), static_cast<uint32_t>(v2.a));
+        }
+    }
+
+    const bool g195DofTri =
+        g195DofTraceEnabled() &&
+        gs->m_vram &&
+        gs->m_prim.tme &&
+        gs->m_prim.abe &&
+        ctx.tex0.tbp0 >= 0x2720u &&
+        ctx.tex0.tbp0 <= 0x2a80u &&
+        ctx.tex0.psm == GS_PSM_T8 &&
+        ctx.tex0.tcc == 1u &&
+        ctx.tex0.cbp >= 0x3fb0u &&
+        ctx.tex0.cbp <= 0x3fbcu &&
+        (ctx.alpha == 0x44u || ctx.alpha == 0x48u || ctx.alpha == 0x800000002au) &&
+        (ctx.frame.fbp == 0u || ctx.frame.fbp == 0x68u);
+    if (g195DofTri)
+    {
+        static std::atomic<uint32_t> s_tri{0};
+        const uint32_t n = s_tri.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 96u || (n % 256u) == 0u)
+        {
+            std::fprintf(stderr,
+                "[G195:doftri] n=%u fbp=0x%x fbw=%u fpsm=0x%x prim=%u fst=%u iip=%u "
+                "tex0=0x%016llx tbw=%u tw=%u th=%u tex1=0x%llx clamp=0x%llx alpha=0x%llx test=0x%llx "
+                "bbox=(%d,%d)-(%d,%d) rawbbox=(%d,%d)-(%d,%d) denom=%g "
+                "v0=(%.1f,%.1f,%.0f rgba=%u,%u,%u,%u stq=%.5g,%.5g,%.5g uv=%u,%u) "
+                "v1=(%.1f,%.1f,%.0f rgba=%u,%u,%u,%u stq=%.5g,%.5g,%.5g uv=%u,%u) "
+                "v2=(%.1f,%.1f,%.0f rgba=%u,%u,%u,%u stq=%.5g,%.5g,%.5g uv=%u,%u)\n",
+                n, ctx.frame.fbp, static_cast<uint32_t>(ctx.frame.fbw),
+                static_cast<uint32_t>(ctx.frame.psm), static_cast<uint32_t>(gs->m_prim.type),
+                static_cast<uint32_t>(gs->m_prim.fst), static_cast<uint32_t>(gs->m_prim.iip),
+                static_cast<unsigned long long>(f50_12_tex0_raw(ctx.tex0)),
+                static_cast<uint32_t>(ctx.tex0.tbw), static_cast<uint32_t>(ctx.tex0.tw),
+                static_cast<uint32_t>(ctx.tex0.th),
+                static_cast<unsigned long long>(ctx.tex1),
+                static_cast<unsigned long long>(ctx.clamp),
+                static_cast<unsigned long long>(ctx.alpha),
+                static_cast<unsigned long long>(ctx.test),
+                minX, minY, maxX, maxY, rawMinX, rawMinY, rawMaxX, rawMaxY, denom,
+                fx0, fy0, v0.z, static_cast<uint32_t>(v0.r), static_cast<uint32_t>(v0.g),
+                static_cast<uint32_t>(v0.b), static_cast<uint32_t>(v0.a),
+                v0.s, v0.t, v0.q, static_cast<uint32_t>(v0.u), static_cast<uint32_t>(v0.v),
+                fx1, fy1, v1.z, static_cast<uint32_t>(v1.r), static_cast<uint32_t>(v1.g),
+                static_cast<uint32_t>(v1.b), static_cast<uint32_t>(v1.a),
+                v1.s, v1.t, v1.q, static_cast<uint32_t>(v1.u), static_cast<uint32_t>(v1.v),
+                fx2, fy2, v2.z, static_cast<uint32_t>(v2.r), static_cast<uint32_t>(v2.g),
+                static_cast<uint32_t>(v2.b), static_cast<uint32_t>(v2.a),
+                v2.s, v2.t, v2.q, static_cast<uint32_t>(v2.u), static_cast<uint32_t>(v2.v));
+        }
+
+        bool doDump = false;
+        {
+            static std::mutex s_dumpMutex;
+            static uint64_t s_dumpedKeys[32]{};
+            static uint32_t s_dumpedN = 0;
+            const uint64_t dumpKey =
+                (static_cast<uint64_t>(ctx.tex0.tbp0) << 40) |
+                (static_cast<uint64_t>(ctx.tex0.tbw & 0x3fu) << 32) |
+                (static_cast<uint64_t>(ctx.tex0.cbp & 0x3fffu) << 16) |
+                (static_cast<uint64_t>(ctx.tex0.tw & 0xfu) << 8) |
+                static_cast<uint64_t>(ctx.tex0.th & 0xfu);
+            std::lock_guard<std::mutex> lk(s_dumpMutex);
+            bool seen = false;
+            for (uint32_t i = 0; i < s_dumpedN; ++i)
+            {
+                if (s_dumpedKeys[i] == dumpKey)
+                {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen && s_dumpedN < 32u)
+            {
+                s_dumpedKeys[s_dumpedN++] = dumpKey;
+                doDump = true;
+            }
+        }
+        if (doDump)
+        {
+            const int dw = 1 << ctx.tex0.tw;
+            const int dh = 1 << ctx.tex0.th;
+            const uint32_t pageBwT8 = ((ctx.tex0.tbw >> 1u) != 0u) ? (ctx.tex0.tbw >> 1u) : 1u;
+            char rgbPath[128];
+            char alphaPath[128];
+            std::snprintf(rgbPath, sizeof(rgbPath), "D:/ps2r/dc2/captures/g195_dof_%04x_rgb.ppm", ctx.tex0.tbp0);
+            std::snprintf(alphaPath, sizeof(alphaPath), "D:/ps2r/dc2/captures/g195_dof_%04x_alpha.ppm", ctx.tex0.tbp0);
+            FILE *rgb = std::fopen(rgbPath, "wb");
+            FILE *alpha = std::fopen(alphaPath, "wb");
+            if (rgb) std::fprintf(rgb, "P6\n%d %d\n255\n", dw, dh);
+            if (alpha) std::fprintf(alpha, "P6\n%d %d\n255\n", dw, dh);
+            uint64_t sumR = 0, sumG = 0, sumB = 0, sumA = 0;
+            uint32_t nzRgb = 0, nzA = 0, idx0 = 0, idxNon0 = 0, a80 = 0, a7fPlus = 0;
+            for (int yy = 0; yy < dh; ++yy)
+            {
+                for (int xx = 0; xx < dw; ++xx)
+                {
+                    const uint8_t ix = static_cast<uint8_t>(
+                        GSMem::ReadP8(gs->m_vram, ctx.tex0.tbp0, pageBwT8,
+                                      static_cast<uint32_t>(xx), static_cast<uint32_t>(yy)));
+                    const uint32_t c = lookupCLUT(gs, ix, ctx.tex0.cbp, ctx.tex0.cpsm,
+                                                  ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.psm);
+                    const uint8_t rr = static_cast<uint8_t>(c & 0xFFu);
+                    const uint8_t gg = static_cast<uint8_t>((c >> 8) & 0xFFu);
+                    const uint8_t bb = static_cast<uint8_t>((c >> 16) & 0xFFu);
+                    const uint8_t aa = static_cast<uint8_t>((c >> 24) & 0xFFu);
+                    sumR += rr; sumG += gg; sumB += bb; sumA += aa;
+                    if ((rr | gg | bb) != 0u) ++nzRgb;
+                    if (aa != 0u) ++nzA;
+                    if (ix == 0u) ++idx0; else ++idxNon0;
+                    if (aa == 0x80u) ++a80;
+                    if (aa >= 0x7fu) ++a7fPlus;
+                    if (rgb)
+                    {
+                        std::fputc(rr, rgb); std::fputc(gg, rgb); std::fputc(bb, rgb);
+                    }
+                    if (alpha)
+                    {
+                        std::fputc(aa, alpha); std::fputc(aa, alpha); std::fputc(aa, alpha);
+                    }
+                }
+            }
+            if (rgb) std::fclose(rgb);
+            if (alpha) std::fclose(alpha);
+            const uint32_t pixels = static_cast<uint32_t>(dw * dh);
+            std::fprintf(stderr,
+                "[G195:dofdump] tex=0x%x size=%dx%d tbw=%u pageBw=%u cbp=0x%x cpsm=0x%x csm=%u csa=%u "
+                "avg=(%llu,%llu,%llu,%llu) nzRgb=%u/%u nzA=%u/%u idx0=%u idxNon0=%u a80=%u a7fPlus=%u "
+                "files=%s,%s\n",
+                ctx.tex0.tbp0, dw, dh, static_cast<uint32_t>(ctx.tex0.tbw), pageBwT8, ctx.tex0.cbp,
+                static_cast<uint32_t>(ctx.tex0.cpsm), static_cast<uint32_t>(ctx.tex0.csm),
+                static_cast<uint32_t>(ctx.tex0.csa),
+                pixels ? static_cast<unsigned long long>(sumR / pixels) : 0ull,
+                pixels ? static_cast<unsigned long long>(sumG / pixels) : 0ull,
+                pixels ? static_cast<unsigned long long>(sumB / pixels) : 0ull,
+                pixels ? static_cast<unsigned long long>(sumA / pixels) : 0ull,
+                nzRgb, pixels, nzA, pixels, idx0, idxNon0, a80, a7fPlus,
+                rgbPath, alphaPath);
+        }
+    }
+
     // G50: tally costume-model triangles per texture page (drawn vs degenerate/dropped + bbox).
     if (g50PartsEnabled() && ctx.frame.fbp == 0x139u && gs->m_prim.tme)
     {
         g50Record(ctx.tex0.tbp0, std::fabs(denom) < 0.001f,
                   fx0, fy0, fx1, fy1, fx2, fy2);
         g50DumpMaybe();
+    }
+
+    // G214: per-tick head-page triangle counter (see g214CapFlushLocked).
+    if (g214CapTraceEnabled() && ctx.frame.fbp == 0x139u && gs->m_prim.tme)
+    {
+        extern std::atomic<uint64_t> g_dc2PresentTick; // defined in ps2_runtime.cpp
+        const uint64_t tk = g_dc2PresentTick.load(std::memory_order_relaxed);
+        const uint32_t tbp = ctx.tex0.tbp0;
+        std::lock_guard<std::mutex> lk(g_g214Mutex);
+        if (tk != g_g214Tick)
+            g214CapFlushLocked(tk);
+        switch (tbp)
+        {
+        case 0x35a0u: g_g214Cap++;  break;
+        case 0x3420u: g_g214Face++; break;
+        case 0x34c0u: g_g214Hair++; break;
+        case 0x3480u: g_g214Head++; break;
+        case 0x3460u: g_g214Body++; break;
+        case 0x34a0u: g_g214Neck++; break;
+        default: break;
+        }
     }
 
     // [F51.7] Global textured-triangle classifier: where does textured 3D geometry go, and does it
@@ -5731,30 +6680,50 @@ void GSRasterizer::drawTriangle(GS *gs)
     // Max "hollow face" — back of cap/hair showed through the front). Honor it now.
     // Decode once: TEST.ZTE=bit16, ZTST=bits17-18; ZBUF.ZBP=bits0-8, ZPSM=bits24-27, ZMSK=bit32.
     static const bool s_zTestDisabled = (std::getenv("DC2_NO_ZTEST") != nullptr);
+    const bool g203Uni = g203UniversalZEnabled();
     const bool g106TitleZ =
         g106TitleZScope(gs->m_prim.tme, ctx.frame.fbp, ctx.tex0.tbp0);
     // G144: skip the fbp-transition clear during a parallel replay (it uses a racy file-static
     // last-fbp and would spuriously wipe the shared title-Z mid-band). The flush pre-runs it once,
     // single-threaded, before dispatching the bands.
-    if (g106TitleZ && g106TitleZPrivateEnabled() && !t_g144InReplay)
+    // G203: in universal-Z mode the game's own clear-sprite populates VRAM Z — no artificial clear.
+    if (!g203Uni && g106TitleZ && g106TitleZPrivateEnabled() && !t_g144InReplay)
         g106TitleZClearIfNeeded(ctx.frame.fbp);
     const uint32_t zte  = static_cast<uint32_t>((ctx.test >> 16) & 0x1u);
     const uint32_t ztst = static_cast<uint32_t>((ctx.test >> 17) & 0x3u);
     // ZBUF.ZBP is a page base; GSMem Z addressing wants a block base (page<<5), matching
     // writePixel's framePageBaseToBlock(fbp) convention.
-    const uint32_t zbp  = static_cast<uint32_t>(ctx.zbuf & 0x1FFu) << 5;
+    const uint32_t zbpPage = static_cast<uint32_t>(ctx.zbuf & 0x1FFu);
+    const uint32_t zbp  = zbpPage << 5;
     const uint32_t zpsm = static_cast<uint32_t>((ctx.zbuf >> 24) & 0xFu);
     const bool zmsk     = ((ctx.zbuf >> 32) & 0x1u) != 0u;
     const uint32_t zbw  = ctx.frame.fbw;
-    // Scope to the costume model RTT (fbp=0x139) for now: that is the only 3D draw target
-    // validated this phase. Enabling Z globally risks the dungeon 3D map (which currently
-    // renders correctly via painter order and whose per-frame Z clear the runner does not yet
-    // honor on sprite clears). Generalizing needs the dungeon free-roam route validated.
-    const bool zScope = (ctx.frame.fbp == 0x139u) || g106TitleZ;
+    const bool g202TownZ = g202TownZScope(ctx.frame.fbp, zbpPage, zpsm);
+    if (!g203Uni && g202TownZ && !t_g144InReplay)
+        g202TownZClearIfNeeded(gs->m_vram, ctx.frame.fbp, ctx.zbuf, ctx.frame.fbw);
+    // G203: universal-Z honors guest ZBUF/TEST for ALL targets against real VRAM Z; the legacy path
+    // kept the per-screen whitelist (costume 0x139, title-rock, town state-scope).
+    const bool zScope = g203Uni || (ctx.frame.fbp == 0x139u) || g106TitleZ || g202TownZ;
     const bool zEnabled = !s_zTestDisabled && zScope && zte != 0u && gs->m_vram != nullptr;
     const bool z16 = (zpsm == 0x2u || zpsm == 0xAu || zpsm == 0xBu); // PSMZ16 / PSMZ16S
     const bool z24 = (zpsm == 0x1u); // PSMZ24
     const bool zWrite = zEnabled && !zmsk && ztst != 0u; // ZTST=NEVER never writes
+    // G219 (default-off, DC2_G219_SKYPX=1): triangle twin of the [G219:spzbp] sprite watch.
+    {
+        static const bool s_g219z = (std::getenv("DC2_G219_SKYPX") != nullptr);
+        if (s_g219z && zWrite && zbpPage >= 0x139u && zbpPage <= 0x148u)
+        {
+            static std::atomic<uint32_t> s_g219tzn{0};
+            const uint32_t n = s_g219tzn.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 400u)
+                std::fprintf(stderr,
+                    "[G219:trzbp] n=%u fbp=0x%x zbpPage=0x%x zpsm=0x%x ztst=%u tme=%u tbp=0x%x "
+                    "bbox=(%d,%d)-(%d,%d) replay=%u\n",
+                    n, ctx.frame.fbp, zbpPage, zpsm, ztst,
+                    static_cast<uint32_t>(gs->m_prim.tme), ctx.tex0.tbp0,
+                    minX, minY, maxX, maxY, t_g144InReplay ? 1u : 0u);
+        }
+    }
     const bool g44FaceZ =
         g44FaceZTraceEnabled() &&
         ctx.frame.fbp == 0x139u &&
@@ -6072,9 +7041,10 @@ void GSRasterizer::drawTriangle(GS *gs)
                 if (zf > zmax) zf = zmax;
                 zi = static_cast<uint32_t>(zf);
                 // G45: costume model (fbp=0x139) uses the private, non-aliasing Z buffer.
-                if (ctx.frame.fbp == 0x139u)
+                // G203: universal-Z reads the real VRAM Z for every target (private buffers retired).
+                if (!g203Uni && ctx.frame.fbp == 0x139u)
                     zdst = costumeZRead(x, y);
-                else if (g106TitleZ && g106TitleZPrivateEnabled())
+                else if (!g203Uni && g106TitleZ && g106TitleZPrivateEnabled())
                     zdst = g106TitleZRead(x, y, ctx.frame.fbp);
                 else
                     zdst = z16
@@ -6088,6 +7058,28 @@ void GSRasterizer::drawTriangle(GS *gs)
                 case 1:  zPass = true;  break;            // ALWAYS
                 case 2:  zPass = (zi >= zdst); break;     // GEQUAL
                 default: zPass = (zi >  zdst); break;     // GREATER
+                }
+            }
+            // G219 (default-off, DC2_G219_SKYPX=1): MAP-4 zoom top-right black region. Trace the
+            // sky-dome pixels (display fbp, tbp=0x2820) inside the black rectangle (x>=417,
+            // y<=140) — zi vs zdst discriminates "sky fails Z" from "sky never rasterized here".
+            {
+                static const bool s_g219 = (std::getenv("DC2_G219_SKYPX") != nullptr);
+                if (s_g219 &&
+                    (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u) &&
+                    gs->m_prim.tme && ctx.tex0.tbp0 == 0x2820u &&
+                    x >= 417 && y <= 140 && ((x & 7) == 1) && ((y & 7) == 1))
+                {
+                    static std::atomic<uint32_t> s_g219n{0};
+                    const uint32_t n = s_g219n.fetch_add(1u, std::memory_order_relaxed);
+                    if (n < 400u || (n % 4096u) == 0u)
+                        std::fprintf(stderr,
+                            "[G219:skypx] n=%u xy=(%d,%d) fbp=0x%x prim=%u zen=%u ztst=%u "
+                            "zi=%u zdst=%u pass=%u replay=%u vz=(%.0f,%.0f,%.0f)\n",
+                            n, x, y, ctx.frame.fbp, static_cast<uint32_t>(gs->m_prim.type),
+                            static_cast<uint32_t>(zEnabled), ztst, zi, zdst,
+                            static_cast<uint32_t>(zPass), t_g144InReplay ? 1u : 0u,
+                            v0.z, v1.z, v2.z);
                 }
             }
             if (g106TitleZ && g106TitleZTraceEnabled())
@@ -6109,6 +7101,25 @@ void GSRasterizer::drawTriangle(GS *gs)
                         g106TitleZPrivateEnabled() ? 1u : 0u,
                         zi, zdst, static_cast<uint32_t>(zPass),
                         static_cast<unsigned long long>(s_g106Reject.load(std::memory_order_relaxed)));
+            }
+            if (g195ForegroundTraceTarget(ctx, x, y) && ctx.tex0.tbp0 == 0x2a20u)
+            {
+                static std::atomic<uint32_t> s_g195Zpx{0};
+                const uint32_t zn = s_g195Zpx.fetch_add(1u, std::memory_order_relaxed);
+                if (zn < 512u)
+                {
+                    std::fprintf(stderr,
+                        "[G195:zpx] n=%u xy=(%d,%d) fbp=0x%x tbp=0x%x prim=%u "
+                        "zen=%u scopeTown=%u ztst=%u zbp=0x%x zbw=%u zpsm=0x%x zmsk=%u "
+                        "zi=%u zdst=%u pass=%u z=(%.0f,%.0f,%.0f)\n",
+                        zn, x, y, ctx.frame.fbp, ctx.tex0.tbp0,
+                        static_cast<uint32_t>(gs->m_prim.type),
+                        static_cast<uint32_t>(zEnabled), static_cast<uint32_t>(g202TownZ),
+                        ztst, zbp, zbw, zpsm, static_cast<uint32_t>(zmsk),
+                        zi, zdst, static_cast<uint32_t>(zPass),
+                        v0.z, v1.z, v2.z);
+                    std::fflush(stderr);
+                }
             }
             if (g44FaceZ &&
                 x >= 344 && x <= 412 && y >= 40 && y <= 144 &&
@@ -6312,6 +7323,171 @@ void GSRasterizer::drawTriangle(GS *gs)
                     }
                 }
 
+                if (g195DofTri)
+                {
+                    static std::atomic<uint32_t> s_g195Px{0};
+                    const uint32_t pn = s_g195Px.fetch_add(1u, std::memory_order_relaxed);
+                    const bool targetPx =
+                        (x == 170 && y == 160) ||
+                        (x == 250 && y == 180) ||
+                        (x == 380 && y == 160) ||
+                        (x == 230 && y == 300) ||
+                        (x == 400 && y == 300);
+                    if (targetPx || pn < 160u || (pn % 4096u) == 0u)
+                    {
+                        const bool linear = tex1UsesLinearFilter(ctx.tex1);
+                        float texUf = 0.0f, texVf = 0.0f;
+                        if (gs->m_prim.fst)
+                        {
+                            texUf = static_cast<float>(iu) / 16.0f;
+                            texVf = static_cast<float>(iv) / 16.0f;
+                        }
+                        else
+                        {
+                            const float invQ = 1.0f / fabsQ(iq);
+                            texUf = is * invQ * static_cast<float>(g141TexW);
+                            texVf = it * invQ * static_cast<float>(g141TexH);
+                        }
+
+                        const uint32_t pageBwT8 = ((ctx.tex0.tbw >> 1u) != 0u) ? (ctx.tex0.tbw >> 1u) : 1u;
+                        auto readIdx = [&](int su0, int sv0, uint8_t &ix, uint32_t &col, int &su, int &sv) {
+                            su = wrapTextureCoordinate(su0, g141WrapU, g141TexW, g141MinU, g141MaxU);
+                            sv = wrapTextureCoordinate(sv0, g141WrapV, g141TexH, g141MinV, g141MaxV);
+                            ix = static_cast<uint8_t>(GSMem::ReadP8(gs->m_vram, ctx.tex0.tbp0, pageBwT8,
+                                                                     static_cast<uint32_t>(su),
+                                                                     static_cast<uint32_t>(sv)));
+                            col = lookupCLUT(gs, ix, ctx.tex0.cbp, ctx.tex0.cpsm,
+                                             ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.psm);
+                        };
+
+                        int su0 = 0, sv0 = 0, su1 = 0, sv1 = 0, su2 = 0, sv2 = 0, su3 = 0, sv3 = 0;
+                        uint8_t ix0 = 0, ix1 = 0, ix2 = 0, ix3 = 0;
+                        uint32_t c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+                        float fx = 0.0f, fy = 0.0f;
+                        if (linear)
+                        {
+                            const float sampleU = texUf - 0.5f;
+                            const float sampleV = texVf - 0.5f;
+                            const int u0 = static_cast<int>(std::floor(sampleU));
+                            const int v0s = static_cast<int>(std::floor(sampleV));
+                            fx = sampleU - static_cast<float>(u0);
+                            fy = sampleV - static_cast<float>(v0s);
+                            readIdx(u0,     v0s,     ix0, c0, su0, sv0);
+                            readIdx(u0 + 1, v0s,     ix1, c1, su1, sv1);
+                            readIdx(u0,     v0s + 1, ix2, c2, su2, sv2);
+                            readIdx(u0 + 1, v0s + 1, ix3, c3, su3, sv3);
+                        }
+                        else
+                        {
+                            readIdx(static_cast<int>(texUf), static_cast<int>(texVf), ix0, c0, su0, sv0);
+                        }
+
+                        const uint32_t widthBlocks = (ctx.frame.fbw != 0u) ? ctx.frame.fbw : 1u;
+                        const uint32_t bytesPerPixel =
+                            (ctx.frame.psm == GS_PSM_CT16 || ctx.frame.psm == GS_PSM_CT16S) ? 2u : 4u;
+                        uint32_t off = 0u;
+                        if (ctx.frame.psm == GS_PSM_CT32 || ctx.frame.psm == GS_PSM_CT24)
+                        {
+                            off = GSPSMCT32::addrPSMCT32(GSInternal::framePageBaseToBlock(ctx.frame.fbp),
+                                                         widthBlocks,
+                                                         static_cast<uint32_t>(x),
+                                                         static_cast<uint32_t>(y));
+                        }
+                        else
+                        {
+                            off = addrPSMCT16Family(GSInternal::framePageBaseToBlock(ctx.frame.fbp),
+                                                    widthBlocks,
+                                                    ctx.frame.psm,
+                                                    static_cast<uint32_t>(x),
+                                                    static_cast<uint32_t>(y));
+                        }
+
+                        uint32_t dst = 0u;
+                        if (off + bytesPerPixel <= gs->m_vramSize)
+                        {
+                            if (bytesPerPixel == 2u)
+                            {
+                                uint16_t packed = 0u;
+                                std::memcpy(&packed, gs->m_vram + off, 2);
+                                dst = decodePSMCT16(packed);
+                            }
+                            else
+                            {
+                                std::memcpy(&dst, gs->m_vram + off, 4);
+                            }
+                        }
+
+                        const AlphaTestResult at = classifyAlphaTest(ctx.test, color.a);
+                        uint8_t finalR = color.r, finalG = color.g, finalB = color.b, finalA = color.a;
+                        const uint8_t dr = static_cast<uint8_t>(dst & 0xFFu);
+                        const uint8_t dg = static_cast<uint8_t>((dst >> 8) & 0xFFu);
+                        const uint8_t db = static_cast<uint8_t>((dst >> 16) & 0xFFu);
+                        const uint8_t da = static_cast<uint8_t>((dst >> 24) & 0xFFu);
+                        if (at.writeFramebuffer && gs->m_prim.abe &&
+                            !(gs->m_pabe && (color.a & 0x80u) == 0u))
+                        {
+                            const uint64_t alphaReg = ctx.alpha;
+                            const uint8_t asel = alphaReg & 3u;
+                            const uint8_t bsel = (alphaReg >> 2) & 3u;
+                            const uint8_t csel = (alphaReg >> 4) & 3u;
+                            const uint8_t dsel = (alphaReg >> 6) & 3u;
+                            const uint8_t fix = static_cast<uint8_t>((alphaReg >> 32) & 0xFFu);
+                            auto pickRGB = [&](uint8_t sel, int cs, int cd) -> int {
+                                if (sel == 0u) return cs;
+                                if (sel == 1u) return cd;
+                                return 0;
+                            };
+                            const int cAlpha = (csel == 0u) ? color.a : (csel == 1u) ? da : fix;
+                            finalR = clampU8(((pickRGB(asel, color.r, dr) - pickRGB(bsel, color.r, dr)) * cAlpha >> 7) +
+                                             pickRGB(dsel, color.r, dr));
+                            finalG = clampU8(((pickRGB(asel, color.g, dg) - pickRGB(bsel, color.g, dg)) * cAlpha >> 7) +
+                                             pickRGB(dsel, color.g, dg));
+                            finalB = clampU8(((pickRGB(asel, color.b, db) - pickRGB(bsel, color.b, db)) * cAlpha >> 7) +
+                                             pickRGB(dsel, color.b, db));
+                        }
+                        if (!at.preserveDestinationAlpha &&
+                            (ctx.fba & 0x1ull) != 0ull &&
+                            ctx.frame.psm != GS_PSM_CT24)
+                        {
+                            finalA = static_cast<uint8_t>(finalA | 0x80u);
+                        }
+                        uint32_t finalPixel = static_cast<uint32_t>(finalR) |
+                            (static_cast<uint32_t>(finalG) << 8) |
+                            (static_cast<uint32_t>(finalB) << 16) |
+                            (static_cast<uint32_t>(finalA) << 24);
+                        if (ctx.frame.fbmsk != 0u && off + bytesPerPixel <= gs->m_vramSize)
+                            finalPixel = (finalPixel & ~ctx.frame.fbmsk) | (dst & ctx.frame.fbmsk);
+                        if (at.preserveDestinationAlpha)
+                            finalPixel = (finalPixel & 0x00FFFFFFu) | (dst & 0xFF000000u);
+
+                        std::fprintf(stderr,
+                            "[G195:dofpx] n=%u target=%u xy=(%d,%d) fbp=0x%x off=0x%x prim=%u tbp=0x%x cbp=0x%x "
+                            "bbox=(%d,%d)-(%d,%d) lin=%u texuv=(%.3f,%.3f) fx=%.3f fy=%.3f "
+                            "tap0=(%d,%d ix=%u col=%08x) tap1=(%d,%d ix=%u col=%08x) "
+                            "tap2=(%d,%d ix=%u col=%08x) tap3=(%d,%d ix=%u col=%08x) "
+                            "texel=%02x,%02x,%02x,%02x shade=%02x,%02x,%02x,%02x src=%02x,%02x,%02x,%02x "
+                            "dst=%08x drgba=%02x,%02x,%02x,%02x alpha=0x%llx test=0x%llx atWrite=%u atKeepA=%u "
+                            "final=%08x w=(%.4f,%.4f,%.4f) st=(%.5g,%.5g,%.5g) uv=(%u,%u)\n",
+                            pn, targetPx ? 1u : 0u, x, y, ctx.frame.fbp, off,
+                            static_cast<uint32_t>(gs->m_prim.type), ctx.tex0.tbp0, ctx.tex0.cbp,
+                            minX, minY, maxX, maxY, linear ? 1u : 0u, texUf, texVf, fx, fy,
+                            su0, sv0, static_cast<uint32_t>(ix0), c0,
+                            su1, sv1, static_cast<uint32_t>(ix1), c1,
+                            su2, sv2, static_cast<uint32_t>(ix2), c2,
+                            su3, sv3, static_cast<uint32_t>(ix3), c3,
+                            tr, tg, tb, ta,
+                            shadeR, shadeG, shadeB, shadeA,
+                            color.r, color.g, color.b, color.a,
+                            dst, dr, dg, db, da,
+                            static_cast<unsigned long long>(ctx.alpha),
+                            static_cast<unsigned long long>(ctx.test),
+                            at.writeFramebuffer ? 1u : 0u,
+                            at.preserveDestinationAlpha ? 1u : 0u,
+                            finalPixel,
+                            w0, w1, w2, is, it, iq, static_cast<uint32_t>(iu), static_cast<uint32_t>(iv));
+                    }
+                }
+
                 r = color.r;
                 g = color.g;
                 b = color.b;
@@ -6393,15 +7569,59 @@ void GSRasterizer::drawTriangle(GS *gs)
                 continue;
             }
 
+            // G219 (default-off, DC2_G219_SKYPX=1): color-level probe for the sky-dome trifan
+            // pixels inside the black rectangle — logs the post-interpolation fragment color
+            // heading into writePixel, discriminating flat-black fragments from blend loss.
+            {
+                static const bool s_g219c = (std::getenv("DC2_G219_SKYPX") != nullptr);
+                if (s_g219c &&
+                    (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u) &&
+                    ((x == 470 && y == 30) || (x == 500 && y == 100)))
+                {
+                    static std::atomic<uint32_t> s_g219cn{0};
+                    const uint32_t n = s_g219cn.fetch_add(1u, std::memory_order_relaxed);
+                    if (n < 2000u)
+                        std::fprintf(stderr,
+                            "[G219:skycol] n=%u xy=(%d,%d) fbp=0x%x tme=%u tbp=0x%x abe=%u iip=%u "
+                            "rgba=(%u,%u,%u,%u) vrgba0=(%u,%u,%u,%u) vrgba2=(%u,%u,%u,%u) replay=%u\n",
+                            n, x, y, ctx.frame.fbp, static_cast<uint32_t>(gs->m_prim.tme),
+                            ctx.tex0.tbp0, static_cast<uint32_t>(gs->m_prim.abe),
+                            static_cast<uint32_t>(gs->m_prim.iip),
+                            r, g, b, a,
+                            (unsigned)v0.r, (unsigned)v0.g, (unsigned)v0.b, (unsigned)v0.a,
+                            (unsigned)v2.r, (unsigned)v2.g, (unsigned)v2.b, (unsigned)v2.a,
+                            t_g144InReplay ? 1u : 0u);
+                }
+            }
             if (!s_g141SkipWrite)
                 writePixel(gs, x, y, r, g, b, a);
+            // G219 (default-off, DC2_G219_SKYPX=1): identify every draw WRITING Z inside the
+            // black rectangle — finds what poisons zdst so the sky's GEQUAL fails there.
+            {
+                static const bool s_g219w = (std::getenv("DC2_G219_SKYPX") != nullptr);
+                if (s_g219w && zWrite &&
+                    (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u) &&
+                    x >= 417 && y <= 140 && ((x & 15) == 1) && ((y & 15) == 1))
+                {
+                    static std::atomic<uint32_t> s_g219wn{0};
+                    const uint32_t n = s_g219wn.fetch_add(1u, std::memory_order_relaxed);
+                    if (n < 400u || (n % 4096u) == 0u)
+                        std::fprintf(stderr,
+                            "[G219:zwr] n=%u xy=(%d,%d) fbp=0x%x tme=%u tbp=0x%x prim=%u "
+                            "zi=%u replay=%u\n",
+                            n, x, y, ctx.frame.fbp, static_cast<uint32_t>(gs->m_prim.tme),
+                            ctx.tex0.tbp0, static_cast<uint32_t>(gs->m_prim.type), zi,
+                            t_g144InReplay ? 1u : 0u);
+                }
+            }
             if (zWrite)
             {
                 // G45: costume model (fbp=0x139) writes its private, non-aliasing Z buffer so it
                 // neither corrupts nor is corrupted by the menu text VRAM it would otherwise alias.
-                if (ctx.frame.fbp == 0x139u)
+                // G203: universal-Z writes the real VRAM Z for every target (private buffers retired).
+                if (!g203Uni && ctx.frame.fbp == 0x139u)
                     costumeZWrite(x, y, zi);
-                else if (g106TitleZ && g106TitleZPrivateEnabled())
+                else if (!g203Uni && g106TitleZ && g106TitleZPrivateEnabled())
                     g106TitleZWrite(x, y, ctx.frame.fbp, zi);
                 else if (z16)
                     GSMem::WriteZ16(gs->m_vram, zbp, zbw, static_cast<uint32_t>(x), static_cast<uint32_t>(y), zi);

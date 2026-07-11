@@ -2454,6 +2454,11 @@ void PS2Runtime::reacquireGuestExecution(uint32_t depth)
 // the title draw only), so other guest threads are unaffected outside that window.
 std::atomic<int> g_dc2PreemptSuppressDepth{0};
 
+// PHASE G214: extern-visible mirror of the host present-loop tick (g_g189PresentTick lives
+// in an anonymous namespace and cannot be externed). Lets a game-override diagnostic probe
+// correlate an event (e.g. a collapsed skin matrix) with the dumped frame_NNNNNN.ppm number.
+std::atomic<uint64_t> g_dc2PresentTick{0};
+
 bool PS2Runtime::shouldPreemptGuestExecution()
 {
     // G57 experiment: allow disabling back-edge preemption entirely to confirm
@@ -2693,6 +2698,7 @@ void PS2Runtime::run()
     {
         tick++;
         g_g189PresentTick.store(tick, std::memory_order_relaxed);
+        g_dc2PresentTick.store(tick, std::memory_order_relaxed);
         g_g189PresentStage.store(0, std::memory_order_relaxed);
         PS2_IF_AGRESSIVE_LOGS({
             if ((tick % 120) == 0)

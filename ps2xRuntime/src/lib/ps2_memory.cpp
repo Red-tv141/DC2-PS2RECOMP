@@ -11,6 +11,14 @@
 #include <string>
 #include <vector>
 
+// G217: armed by the default-off exact head-object wrapper in dc2_game_override.cpp and
+// consumed by the matching scratchpad -> RAM DMA below.  Kept out of a shared header because
+// this is a temporary cross-layer diagnostic, not runtime API.
+extern std::atomic<uint32_t> g_dc2G217HeadDmaPacket;
+extern std::atomic<uint32_t> g_dc2G217HeadDmaSelf;
+extern std::atomic<uint32_t> g_dc2G217HeadDmaKind;
+extern std::atomic<uint32_t> g_dc2G217DirectPackets[128];
+
 std::atomic<uint32_t> g_dc2G136TraceActive{0};
 std::atomic<uint32_t> g_dc2G136TraceSeq{0};
 // G138: last VU1 XGKICK program counter (packer entry), published by ps2_vu1.cpp just
@@ -23,6 +31,10 @@ extern std::atomic<bool> g_dc2TitleRockScope;
 
 namespace
 {
+    constexpr uint32_t G217_RECENT_DMA_COUNT = 256u;
+    std::atomic<uint32_t> s_g217RecentDma[G217_RECENT_DMA_COUNT]{};
+    std::atomic<uint32_t> s_g217RecentDmaWrite{0u};
+
     struct G146PerfScope
     {
         bool on = false;
@@ -1109,6 +1121,56 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                         copied = n;
                     }
                 }
+
+                // G217: exact visual -> scratch packet -> RAM-chain proof.  The object wrapper
+                // arms its a1 destination immediately before entering the real packet builder;
+                // SendDMA consumes the token only when channel 8 targets that exact address.
+                // This remains silent and inert unless DC2_G217_EEOBJ registered the wrapper.
+                uint32_t armedG217 = g_dc2G217HeadDmaPacket.load(std::memory_order_acquire);
+                if (fromSpr && armedG217 != 0u &&
+                    (madr & 0x0fffffffu) == armedG217 &&
+                    g_dc2G217HeadDmaPacket.compare_exchange_strong(
+                        armedG217, 0u,
+                        std::memory_order_acq_rel, std::memory_order_relaxed))
+                {
+                    const uint32_t headKind =
+                        g_dc2G217HeadDmaKind.load(std::memory_order_relaxed);
+                    const uint32_t r = madr & PS2_RAM_MASK;
+                    const uint32_t recentSlot = s_g217RecentDmaWrite.fetch_add(
+                        1u, std::memory_order_relaxed) % G217_RECENT_DMA_COUNT;
+                    s_g217RecentDma[recentSlot].store(
+                        madr & 0x0fffffffu, std::memory_order_release);
+                    uint32_t taggedSelectors = 0u;
+                    if (envFlagEnabled("DC2_G217_TAG_VU") && copied >= 20u)
+                    {
+                        const uint32_t tagBit = (headKind & 1u) ? 0x40000000u :
+                                                (headKind & 2u) ? 0x20000000u : 0u;
+                        uint32_t *words = reinterpret_cast<uint32_t *>(m_rdram + r);
+                        const uint32_t wordCount = copied / 4u;
+                        for (uint32_t i = 0u; tagBit != 0u && i + 1u < wordCount; ++i)
+                        {
+                            if (words[i] == 0x6c010026u)
+                            {
+                                words[i + 1u] |= tagBit;
+                                ++taggedSelectors;
+                            }
+                        }
+                    }
+                    uint32_t first[4]{};
+                    uint32_t last[4]{};
+                    if (copied >= 16u && r + copied <= PS2_RAM_SIZE)
+                    {
+                        std::memcpy(first, m_rdram + r, sizeof(first));
+                        std::memcpy(last, m_rdram + r + copied - sizeof(last), sizeof(last));
+                    }
+                    std::fprintf(stderr,
+                        "[G217:headdma] self=0x%08x kind=%u madr=0x%08x sadr=0x%08x qwc=%u copied=%u tagged=%u first=%08x,%08x,%08x,%08x last=%08x,%08x,%08x,%08x\n",
+                        g_dc2G217HeadDmaSelf.load(std::memory_order_relaxed),
+                        headKind, madr, sadr, qwc, copied, taggedSelectors,
+                        first[0], first[1], first[2], first[3],
+                        last[0], last[1], last[2], last[3]);
+                    std::fflush(stderr);
+                }
                 // Mark the channel transfer complete: clear STR, drain QWC.
                 m_ioRegisters[channelBase] = value & ~0x100u;
                 m_ioRegisters[channelBase + 0x20u] = 0u;
@@ -1191,7 +1253,13 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     uint32_t asr1 = m_ioRegisters[channelBase + 0x50];
                     uint32_t asp = (chcr >> 4) & 0x3u;
                     const bool tieEnabled = (chcr & (1u << 7)) != 0u;
-                    const int kMaxChainTags = 4096;
+                    // G217: MAP-4's character RTT legitimately exceeds 4096 nested/local
+                    // DMAtags.  The old guard truncated the chain at exactly the point where
+                    // the static-view head/cap packets were linked; rotating the model moved
+                    // them a few tags earlier and made them appear.  Keep a generous runaway
+                    // guard, but do not discard valid packets solely because the scene is
+                    // complex.
+                    const int kMaxChainTags = 16384;
                     std::vector<uint8_t> chainBuf;
                     const bool g136Enabled = g136_trace_enabled() && channelBase == 0x10009000u;
                     const uint32_t g136Packet = g136_target_packet();
@@ -1282,6 +1350,84 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             }
                         }
                         return true;
+                    };
+
+                    // G217: the exact head/cap render-info DMA can optionally stamp an
+                    // otherwise-unused selector bit immediately after its V4_32 UNPACK.
+                    // Look for that stamp in each source payload while assembling the
+                    // VIF1 chain.  This distinguishes "the packet was never linked" from
+                    // a later VIF/VU unpacking failure without changing default behavior.
+                    auto g217TraceTaggedPayload = [&](uint32_t srcAddr, uint32_t qwCount,
+                                                      uint32_t dmaTagAddr, uint32_t dmaId)
+                    {
+                        if (channelBase != 0x10009000u ||
+                            !envFlagEnabled("DC2_G217_TAG_VU") || qwCount == 0u)
+                            return;
+
+                        try
+                        {
+                            const bool scratch = isScratchpad(srcAddr);
+                            const uint32_t phys = translateAddress(srcAddr);
+                            const uint8_t *base = scratch ? m_scratchpad : m_rdram;
+                            const uint32_t maxSize = scratch ? PS2_SCRATCHPAD_SIZE : PS2_RAM_SIZE;
+                            const uint64_t requested64 = static_cast<uint64_t>(qwCount) * 16ull;
+                            if (phys >= maxSize || requested64 < 8ull)
+                                return;
+                            const uint32_t bytes = std::min<uint32_t>(
+                                static_cast<uint32_t>(std::min<uint64_t>(requested64, 0xffffffffull)),
+                                maxSize - phys);
+                            const uint32_t wordCount = bytes / 4u;
+                            const uint32_t *words = reinterpret_cast<const uint32_t *>(base + phys);
+                            for (uint32_t i = 0u; i + 1u < wordCount; ++i)
+                            {
+                                if (words[i] != 0x6c010026u)
+                                    continue;
+                                const uint32_t selector = words[i + 1u];
+                                const uint32_t exactBits = selector & 0x60000000u;
+                                if (exactBits == 0u)
+                                    continue;
+                                static std::atomic<uint32_t> s_g217VifConsume{0u};
+                                const uint32_t n = s_g217VifConsume.fetch_add(
+                                    1u, std::memory_order_relaxed) + 1u;
+                                if (n <= 192u || (n % 512u) == 0u)
+                                {
+                                    std::fprintf(stderr,
+                                        "[G217:vifconsume] n=%u tagAddr=0x%08x id=%u src=0x%08x qwc=%u word=%u selector=0x%08x exact=0x%08x spr=%u\n",
+                                        n, dmaTagAddr, dmaId, srcAddr, qwCount, i,
+                                        selector, exactBits, scratch ? 1u : 0u);
+                                    std::fflush(stderr);
+                                }
+                            }
+                        }
+                        catch (...)
+                        {
+                        }
+                    };
+
+                    auto g217RecentExactDma = [&](uint32_t candidate) -> bool
+                    {
+                        if (!envFlagEnabled("DC2_G217_TAG_VU"))
+                            return false;
+                        const uint32_t phys = candidate & 0x0fffffffu;
+                        if (phys == 0u)
+                            return false;
+                        for (uint32_t i = 0u; i < G217_RECENT_DMA_COUNT; ++i)
+                            if (s_g217RecentDma[i].load(std::memory_order_acquire) == phys)
+                                return true;
+                        return false;
+                    };
+
+                    auto g217RecentDirectPacket = [&](uint32_t candidate) -> bool
+                    {
+                        if (!envFlagEnabled("DC2_G217_TAG_VU"))
+                            return false;
+                        const uint32_t phys = candidate & 0x0fffffffu;
+                        if (phys == 0u)
+                            return false;
+                        for (uint32_t i = 0u; i < 128u; ++i)
+                            if (g_dc2G217DirectPackets[i].load(std::memory_order_acquire) == phys)
+                                return true;
+                        return false;
                     };
 
                     int tagsProcessed = 0;
@@ -1407,6 +1553,47 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             }
                         }
 
+                        if (channelBase == 0x10009000u)
+                        {
+                            const bool hitTag = g217RecentExactDma(currentTagAddr);
+                            const bool hitAddr = g217RecentExactDma(addr);
+                            const bool hitData = g217RecentExactDma(dataAddr);
+                            if (hitTag || hitAddr || hitData)
+                            {
+                                static std::atomic<uint32_t> s_g217VifLink{0u};
+                                const uint32_t n = s_g217VifLink.fetch_add(
+                                    1u, std::memory_order_relaxed) + 1u;
+                                if (n <= 256u || (n % 512u) == 0u)
+                                {
+                                    std::fprintf(stderr,
+                                        "[G217:viflink] n=%u tagIndex=%d tagAddr=0x%08x id=%u qwc=%u addr=0x%08x dataAddr=0x%08x next=0x%08x hitTag=%u hitAddr=%u hitData=%u\n",
+                                        n, tagsProcessed, currentTagAddr, id, tagQwc, addr,
+                                        dataAddr, tagAddr, hitTag ? 1u : 0u,
+                                        hitAddr ? 1u : 0u, hitData ? 1u : 0u);
+                                    std::fflush(stderr);
+                                }
+                            }
+
+                            const bool directTag = g217RecentDirectPacket(currentTagAddr);
+                            const bool directAddr = g217RecentDirectPacket(addr);
+                            const bool directData = g217RecentDirectPacket(dataAddr);
+                            if (directTag || directAddr || directData)
+                            {
+                                static std::atomic<uint32_t> s_g217VifDirect{0u};
+                                const uint32_t n = s_g217VifDirect.fetch_add(
+                                    1u, std::memory_order_relaxed) + 1u;
+                                if (n <= 256u || (n % 512u) == 0u)
+                                {
+                                    std::fprintf(stderr,
+                                        "[G217:vifdirect] n=%u tagIndex=%d tagAddr=0x%08x id=%u qwc=%u addr=0x%08x dataAddr=0x%08x next=0x%08x hitTag=%u hitAddr=%u hitData=%u\n",
+                                        n, tagsProcessed, currentTagAddr, id, tagQwc, addr,
+                                        dataAddr, tagAddr, directTag ? 1u : 0u,
+                                        directAddr ? 1u : 0u, directData ? 1u : 0u);
+                                    std::fflush(stderr);
+                                }
+                            }
+                        }
+
                         if (g136Enabled)
                         {
                             const bool packetHit =
@@ -1462,6 +1649,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                 vif1Chain && (id == 1u || id == 2u || id == 5u || id == 6u || id == 7u);
                             if (vif1Chain)
                             {
+                                g217TraceTaggedPayload(dataAddr, tagQwc, currentTagAddr, id);
                                 appendVif1TagHi(currentTagAddr, id, tagQwc, compactVif1LocalPayload);
                                 appendData(dataAddr, tagQwc);
                             }
@@ -1852,7 +2040,14 @@ namespace
     {
         if (!g138DumpPath())
             return;
-        if (!g_dc2TitleRockScope.load(std::memory_order_relaxed))
+        // G194: DC2_G138_GSDUMP_ALL=1 lifts the title-scope gate so non-title routes
+        // (town/edit map, dungeon) can be packet-dumped too. Default keeps the old
+        // title-scoped behavior.
+        static const bool dumpAllScopes = []() {
+            const char *e = std::getenv("DC2_G138_GSDUMP_ALL");
+            return e && e[0] && !(e[0] == '0' && !e[1]);
+        }();
+        if (!dumpAllScopes && !g_dc2TitleRockScope.load(std::memory_order_relaxed))
             return;
         // PCSX2 dump path byte convention: 0=P1(old) 1=P2 2=P3 3=P1(new).
         uint8_t path = 2u;

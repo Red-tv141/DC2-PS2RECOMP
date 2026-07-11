@@ -143,6 +143,22 @@ namespace
     }
     thread_local float s_vuQPending = 0.0f;
     thread_local int   s_vuQDelay   = 0;
+    // G200: real VU1's FDIV unit stalls a second DIV/SQRT/RSQRT issued while a result is still
+    // in flight -- the machine waits until the FIRST result latches into Q, then starts the new
+    // op (PCSX2 VUops.cpp: _vuTestFDIVStalls advances VU->cycle to the in-flight op's completion,
+    // letting _vuFDIVflush latch VU->VI[REG_Q] BEFORE _vuFDIVAdd replaces the pipe entry). The
+    // old single-slot pending model silently DROPPED the in-flight result on re-arm, leaving Q
+    // stale-from-before-the-first-DIV for the whole next window. The town/map transform prologue
+    // (back-to-back DIV @0x2020/0x2028, then ADDq.w @0x2058/0x2060 building the cull guard-box W
+    // bounds at qw21/qw22) hit exactly this: stale Q -> corrupt W bracket -> behind-camera
+    // vertices pass the ADC draw gate that real HW's map_0.gs freeze shows 100%-skipped (the
+    // G195/G196 foreground water-sheet). Fix: commit the in-flight pending Q before arming the
+    // new producer. Kill switch DC2_VU1_NO_QSTALL restores the drop-pending model.
+    bool g200_qstall_enabled()
+    {
+        static const bool v = (std::getenv("DC2_VU1_NO_QSTALL") == nullptr);
+        return v;
+    }
     // G138: VU1 MAC/STATUS flag pipeline (default ON, kill DC2_VU1_NO_MACPIPE). Real VU1 FMAC
     // results — and therefore the MAC flags FMEQ/FMAND/FMOR and the STATUS bits FSAND/FSEQ/FSOR
     // read — become visible ~4 instruction pairs AFTER the FMAC issues, not immediately. The
@@ -909,12 +925,26 @@ namespace
 
     // Dump PRIM, TEX0.tbp and the first few decoded XYZ verts an XGKICK packet
     // emits, decoded EXACTLY as GS::writeRegisterPacked does (case 0x05/0x04/0x0D).
+    // G214: watch a single texture page (e.g. the always-culled cap 0x35a0). When set, bypass the
+    // 64-kick boot cap and print ONLY XGKICK packets whose TEX0.tbp matches -- so we can answer
+    // whether the cap sub-mesh is ever XGKICK'd (=> GS-side cull) or never reaches the kick
+    // (=> rejected inside the VU1 model program's guard/cull gate). 0xFFFFFFFF = disabled.
+    static uint32_t g214_kick_watch_tbp()
+    {
+        static const uint32_t w = []() -> uint32_t {
+            const char *e = std::getenv("DC2_G214_KICKWATCH");
+            return e ? (uint32_t)std::strtoul(e, nullptr, 16) : 0xFFFFFFFFu;
+        }();
+        return w;
+    }
     void vu1_dump_xgkick(uint32_t addr, uint32_t totalBytes, const uint8_t *data)
     {
-        if (!vu1_trace_enabled() || !data || totalBytes < 16u)
+        const uint32_t watch = g214_kick_watch_tbp();
+        const bool watching = watch != 0xFFFFFFFFu;
+        if ((!vu1_trace_enabled() && !watching) || !data || totalBytes < 16u)
             return;
         const uint32_t kick = s_vu1KickDumpCount.fetch_add(1u, std::memory_order_relaxed);
-        if (kick >= 64u)
+        if (!watching && kick >= 64u)
             return;
 
         uint32_t offset = 0u;
@@ -970,7 +1000,7 @@ namespace
                         else if (rd == 0x05u || rd == 0x0Du) // XYZ2 / XYZ3 packed
                         {
                             ++vertTotal;
-                            if (xyzPrinted < 6)
+                            if (xyzPrinted < 6 && (!watching || curTbp == watch))
                             {
                                 const uint32_t x = static_cast<uint32_t>(lo & 0xFFFFu);
                                 const uint32_t y = static_cast<uint32_t>((lo >> 32u) & 0xFFFFu);
@@ -1018,9 +1048,10 @@ namespace
             ++tagIndex;
         }
     done:
-        std::fprintf(stderr,
-                     "[F51.7:kick] kick=%u addr=0x%x bytes=0x%x prim=0x%x tbp=0x%x psm=0x%x verts=%u\n",
-                     kick, addr, totalBytes, prim, curTbp, curPsm, vertTotal);
+        if (!watching || curTbp == watch)
+            std::fprintf(stderr,
+                         "[F51.7:kick] kick=%u addr=0x%x bytes=0x%x prim=0x%x tbp=0x%x psm=0x%x verts=%u\n",
+                         kick, addr, totalBytes, prim, curTbp, curPsm, vertTotal);
     }
 }
 
@@ -1189,6 +1220,67 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
 // DC2_G65_KICKAGG to find which VU1 program emits the rock tristrips.
 static uint32_t s_g65CurStartPC = 0u;
 
+// G215: MAP-4 head/cap batch-cull discriminator. Per model-program execute (startPC=0x10)
+// inside the character COutLineDraw window, count how much geometry the batch KICKS out vs how
+// much vertex data was uploaded (XTOP window). Reset at execute() entry, bumped at each XGKICK,
+// logged after run(). Single-threaded guest exec, same idiom as s_g65CurStartPC. Answers the
+// G214 open question: does the head batch reach VU1 but get culled (kicks small/none while input
+// present) or is it never submitted by the EE (no execute for it at all)? Default-off.
+extern std::atomic<uint64_t> g_dc2PresentTick;        // ps2_runtime.cpp (host present tick mirror)
+static const bool s_g215batch = (std::getenv("DC2_G215_BATCH") != nullptr);
+static uint32_t s_g215KickCount = 0u;
+static uint64_t s_g215KickBytes = 0ull;
+static uint32_t s_g215EntryFbp0 = 0u;   // GS ctx0/ctx1 FRAME.fbp at execute entry — character RTT
+static uint32_t s_g215EntryFbp1 = 0u;   // renders to fbp=0x139, so scope the batch trace on it
+
+// G216: capture the projected vertex at the model program's final trifan clip gate.
+static const bool s_g216clip = (std::getenv("DC2_G216_CLIP") != nullptr);
+static const bool s_g216ForceGate = (std::getenv("DC2_G216_FORCE_GATE") != nullptr);
+struct G216ClipSample
+{
+    float p[4];
+    uint16_t vi1;
+    uint16_t vi10;
+};
+struct G216ClipStats
+{
+    uint32_t count;
+    uint32_t gateTaken;
+    uint32_t gate1d48;
+    uint32_t taken1d48;
+    uint32_t gate1f68;
+    uint32_t taken1f68;
+    uint32_t nonFinite;
+    uint32_t qNonPositive;
+    uint32_t outsideGuard;
+    float minv[4];
+    float maxv[4];
+    G216ClipSample samples[4];
+    uint32_t sampleCount;
+};
+static bool s_g216CharExec = false;
+static G216ClipStats s_g216Stats{};
+static uint32_t s_g216Header[8]{};
+
+// G217: join the character model's separate TEX0-state and geometry XGKICKs.  G214 proved
+// that looking for TEX0 inside the geometry packet is insufficient: DC2 emits the bind and
+// vertices in adjacent PATH1 packets.  This observer keeps the last PATH1 TEX0, then reports
+// the exact page, packer PC, selector header, primitive, ADC distribution, and screen bounds
+// for every kick in the fbp=0x139 model execute.  It never changes VU/GS state or packet bytes.
+// Default off; DC2_G217_TICK_MIN/MAX bound the present-tick window and DC2_G217_LIMIT bounds log.
+static const bool s_g217Join = (std::getenv("DC2_G217_JOIN") != nullptr);
+static const uint64_t s_g217TickMin = g136_env_u32("DC2_G217_TICK_MIN", 0u);
+static const uint64_t s_g217TickMax = g136_env_u32("DC2_G217_TICK_MAX", 0xFFFFFFFFu);
+static const uint32_t s_g217Limit = g136_env_u32("DC2_G217_LIMIT", 4096u);
+static bool s_g217CharExec = false;
+static uint32_t s_g217ExecSeq = 0u;
+static uint32_t s_g217KickSeq = 0u;
+static uint64_t s_g217LastTex0 = 0u;
+static uint32_t s_g217Header[8]{};
+static const bool s_g217TagVu = (std::getenv("DC2_G217_TAG_VU") != nullptr);
+static uint32_t s_g217ExactKind = 0u;
+static std::atomic<uint32_t> s_g217Logged{0};
+
 void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint8_t *vuData, uint32_t dataSize,
                              GS &gs, PS2Memory *memory,
@@ -1196,6 +1288,63 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint32_t maxCycles)
 {
     s_g65CurStartPC = startPC;
+    if (s_g215batch || s_g216clip || s_g216ForceGate || s_g217TagVu)
+    {
+        s_g215KickCount = 0u; s_g215KickBytes = 0ull;
+        s_g215EntryFbp0 = gs.getContextFrame(0).fbp;
+        s_g215EntryFbp1 = gs.getContextFrame(1).fbp;
+    }
+    if (s_g216clip || s_g216ForceGate)
+    {
+        const uint32_t fbp0 = gs.getContextFrame(0).fbp;
+        const uint32_t fbp1 = gs.getContextFrame(1).fbp;
+        s_g216CharExec = startPC == 0x10u && (fbp0 == 0x139u || fbp1 == 0x139u);
+        s_g216Stats = {};
+        std::memset(s_g216Header, 0, sizeof(s_g216Header));
+        if (s_g216CharExec && memory)
+        {
+            const uint32_t top = memory->vif1_regs.top & 0x3FFu;
+            for (uint32_t word = 0; word < 8u; ++word)
+            {
+                const uint32_t off = ((top * 16u) + word * 4u) & (PS2_VU1_DATA_SIZE - 1u);
+                if (off + 4u <= dataSize)
+                    std::memcpy(&s_g216Header[word], vuData + off, 4u);
+            }
+        }
+    }
+    if (s_g217Join)
+    {
+        const uint64_t tick = g_dc2PresentTick.load(std::memory_order_relaxed);
+        const uint32_t fbp0 = gs.getContextFrame(0).fbp;
+        const uint32_t fbp1 = gs.getContextFrame(1).fbp;
+        s_g217CharExec = startPC == 0x10u &&
+                         (fbp0 == 0x139u || fbp1 == 0x139u) &&
+                         tick >= s_g217TickMin && tick <= s_g217TickMax;
+        s_g217KickSeq = 0u;
+        std::memset(s_g217Header, 0, sizeof(s_g217Header));
+        if (s_g217CharExec)
+        {
+            ++s_g217ExecSeq;
+            if (memory)
+            {
+                const uint32_t top = memory->vif1_regs.top & 0x3FFu;
+                for (uint32_t word = 0; word < 8u; ++word)
+                {
+                    const uint32_t off = ((top * 16u) + word * 4u) & (PS2_VU1_DATA_SIZE - 1u);
+                    if (off + 4u <= dataSize)
+                        std::memcpy(&s_g217Header[word], vuData + off, 4u);
+                }
+            }
+        }
+    }
+    s_g217ExactKind = 0u;
+    if (s_g217TagVu && vuData && 38u * 16u + 4u <= dataSize)
+    {
+        uint32_t selector = 0u;
+        std::memcpy(&selector, vuData + 38u * 16u, sizeof(selector));
+        if ((selector & 0x40000000u) != 0u) s_g217ExactKind = 1u;
+        else if ((selector & 0x20000000u) != 0u) s_g217ExactKind = 2u;
+    }
     m_state.pc = startPC;
     m_state.ebit = false;
     m_state.itop = itop;
@@ -1286,6 +1435,61 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                 std::memcpy(&lo, vuCode + a, 4);
                 std::memcpy(&up, vuCode + a + 4, 4);
                 std::fprintf(stderr, "[G39:code] pc=0x%x lo=0x%08x up=0x%08x\n", a, lo, up);
+            }
+        }
+    }
+    // G197: generic one-shot-per-distinct-startPC full microcode dump, unscoped (unlike G38's
+    // startPC==0x10 title-model-only gate) -- needed to capture the map-piece/mgCVisualMDT
+    // "VU program 0" microcode (G195/G196 block-trace) which uses a different startPC than the
+    // title programs. Default-off (DC2_G197_VUDUMP); caps at 16 distinct startPC values so it
+    // can't runaway across a long session.
+    static const bool s_g197vudump = (std::getenv("DC2_G197_VUDUMP") != nullptr);
+    if (s_g197vudump)
+    {
+        static std::atomic<uint32_t> s_g197Seen[16];
+        bool doDump = false;
+        for (uint32_t i = 0; i < 16u; ++i)
+        {
+            uint32_t expected = 0u;
+            const uint32_t tag = startPC + 1u;
+            if (s_g197Seen[i].load(std::memory_order_relaxed) == tag) break;
+            if (s_g197Seen[i].compare_exchange_strong(expected, tag, std::memory_order_relaxed))
+            {
+                doDump = true;
+                break;
+            }
+            if (expected == tag) break;
+        }
+        if (doDump)
+        {
+            std::fprintf(stderr, "[G197:vudump] startPC=0x%x codeSize=0x%x\n", startPC, codeSize);
+            for (uint32_t a = 0x0u; a + 8u <= codeSize; a += 8u)
+            {
+                uint32_t lo = 0u, up = 0u;
+                std::memcpy(&lo, vuCode + a, 4);
+                std::memcpy(&up, vuCode + a + 4, 4);
+                std::fprintf(stderr, "[G39:code] pc=0x%x lo=0x%08x up=0x%08x\n", a, lo, up);
+            }
+            std::fflush(stderr);
+        }
+    }
+    // G198: the gate chain's ILW.x VI8,30(VI0) @0x2058 reads a fixed data-memory slot (qw 30,
+    // byte 0x1E0) whose x-component IORs into VI10 (with the 0xD0 constant) before the FMAND
+    // cascade. Dump it once per kick (capped) to check whether it's a resident constant (same
+    // every kick, same title vs map) or something per-object/per-draw upload seeds differently --
+    // a plain wrong-constant bug would need no VU1 interpreter change at all. Default-off
+    // (DC2_G198_GATE_TRACE, shares the gate-trace env with the VI dump above).
+    {
+        static const bool s_g198qw30 = (std::getenv("DC2_G198_GATE_TRACE") != nullptr);
+        if (s_g198qw30 && startPC == 0x10u && vuData && dataSize > 30u * 16u + 4u)
+        {
+            static std::atomic<uint32_t> s_g198KickN{0};
+            const uint32_t kn = s_g198KickN.fetch_add(1u, std::memory_order_relaxed);
+            if (kn < 200u)
+            {
+                uint32_t qw30x = 0u;
+                std::memcpy(&qw30x, vuData + 30u * 16u, 4);
+                std::fprintf(stderr, "[G198:qw30] kick=%u qw30.x=0x%08x\n", kn, qw30x);
             }
         }
     }
@@ -1399,6 +1603,67 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
         }
     }
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
+    if (s_g217ExactKind != 0u)
+    {
+        uint32_t selector = 0u;
+        if (vuData && 38u * 16u + 4u <= dataSize)
+            std::memcpy(&selector, vuData + 38u * 16u, sizeof(selector));
+        std::fprintf(stderr,
+            "[G217:exactvu] tick=%llu kind=%u startPC=0x%x top=0x%x itop=0x%x selector=0x%08x kicks=%u bytes=%llu\n",
+            static_cast<unsigned long long>(g_dc2PresentTick.load(std::memory_order_relaxed)),
+            s_g217ExactKind, startPC, memory ? (memory->vif1_regs.top & 0x3ffu) : 0u,
+            itop, selector, s_g215KickCount,
+            static_cast<unsigned long long>(s_g215KickBytes));
+        std::fflush(stderr);
+    }
+    if (s_g216CharExec)
+    {
+        const G216ClipStats &st = s_g216Stats;
+        const G216ClipSample &a = st.samples[0];
+        const G216ClipSample &b = st.samples[st.sampleCount > 1u ? 1u : 0u];
+        static std::atomic<uint32_t> s_g216seq{0};
+        const uint32_t seq = s_g216seq.fetch_add(1u, std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "[G216:clip] seq=%u tick=%llu hdr=%08x,%08x,%08x,%08x/%08x,%08x,%08x,%08x "
+                     "g1d48=%u/%u g1f68=%u/%u g2128=%u/%u nonfin=%u qle0=%u outside=%u kicks=%u bytes=%llu "
+                     "x=[%.3f,%.3f] y=[%.3f,%.3f] z=[%.3f,%.3f] q=[%.6g,%.6g] "
+                     "s0=(%.3f,%.3f,%.3f,%.6g;%04x/%04x) s1=(%.3f,%.3f,%.3f,%.6g;%04x/%04x)\n",
+                     seq, (unsigned long long)g_dc2PresentTick.load(std::memory_order_relaxed),
+                     s_g216Header[0], s_g216Header[1], s_g216Header[2], s_g216Header[3],
+                     s_g216Header[4], s_g216Header[5], s_g216Header[6], s_g216Header[7],
+                     st.taken1d48, st.gate1d48, st.taken1f68, st.gate1f68,
+                     st.gateTaken, st.count, st.nonFinite, st.qNonPositive, st.outsideGuard,
+                     s_g215KickCount, (unsigned long long)s_g215KickBytes,
+                     st.minv[0], st.maxv[0], st.minv[1], st.maxv[1],
+                     st.minv[2], st.maxv[2], st.minv[3], st.maxv[3],
+                     a.p[0], a.p[1], a.p[2], a.p[3], a.vi1, a.vi10,
+                     b.p[0], b.p[1], b.p[2], b.p[3], b.vi1, b.vi10);
+        std::fflush(stderr);
+    }
+    // G215: per-model-batch input-vs-kick tally for the character RTT (fbp=0x139). Distinguishes
+    // an EE-skipped sub-mesh (no execute for it) from a VU1-culled one (input present, 0 kicks).
+    if (s_g215batch && startPC == 0x10u &&
+        (s_g215EntryFbp0 == 0x139u || s_g215EntryFbp1 == 0x139u))
+    {
+        const uint32_t top = memory ? (memory->vif1_regs.top & 0x3FFu) : 0u;
+        uint32_t nzqw = 0u;
+        for (uint32_t qw = top; qw < top + 0x200u; ++qw)
+        {
+            const uint32_t off = (qw * 16u) & (PS2_VU1_DATA_SIZE - 1u);
+            if (off + 16u > dataSize) break;
+            bool nz = false;
+            for (uint32_t b = 0; b < 16u; ++b) if (vuData[off + b]) { nz = true; break; }
+            if (nz) ++nzqw;
+        }
+        static std::atomic<uint32_t> s_g215seq{0};
+        const uint32_t seq = s_g215seq.fetch_add(1u, std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "[G215:batch] seq=%u tick=%llu fbp0=0x%x fbp1=0x%x top=0x%x itop=0x%x inNZqw=%u kicks=%u kickBytes=%llu\n",
+                     seq, (unsigned long long)g_dc2PresentTick.load(std::memory_order_relaxed),
+                     s_g215EntryFbp0, s_g215EntryFbp1, top, itop, nzqw,
+                     s_g215KickCount, (unsigned long long)s_g215KickBytes);
+        std::fflush(stderr);
+    }
     if (g29SetupDump)
     {
         for (uint32_t qw = 4u; qw <= 6u; ++qw)
@@ -1531,6 +1796,55 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     {
         const uint32_t currentPc = m_state.pc;
         const int16_t g72_vi1_before = (int16_t)m_state.vi[1];
+        if (s_g216CharExec && currentPc == 0x1d48u)
+        {
+            ++s_g216Stats.gate1d48;
+            if ((uint16_t)m_state.vi[1] == (uint16_t)m_state.vi[10]) ++s_g216Stats.taken1d48;
+        }
+        if (s_g216CharExec && currentPc == 0x1f68u)
+        {
+            ++s_g216Stats.gate1f68;
+            if ((uint16_t)m_state.vi[7] == (uint16_t)m_state.vi[10]) ++s_g216Stats.taken1f68;
+        }
+        if (s_g216CharExec && currentPc == 0x2128u)
+        {
+            G216ClipStats &st = s_g216Stats;
+            const float *p = m_state.vf[16];
+            if (st.count == 0u)
+            {
+                for (int lane = 0; lane < 4; ++lane)
+                    st.minv[lane] = st.maxv[lane] = p[lane];
+            }
+            else
+            {
+                for (int lane = 0; lane < 4; ++lane)
+                {
+                    st.minv[lane] = std::min(st.minv[lane], p[lane]);
+                    st.maxv[lane] = std::max(st.maxv[lane], p[lane]);
+                }
+            }
+            bool finite = true;
+            for (int lane = 0; lane < 4; ++lane)
+                finite = finite && std::isfinite(p[lane]);
+            if (!finite) ++st.nonFinite;
+            if (p[3] <= 0.0f) ++st.qNonPositive;
+            // G215 byte-matched these character-RTT guard limits against PCSX2.
+            if (p[0] < 1766.4f || p[0] > 2329.6f ||
+                p[1] < 1819.2f || p[1] > 2276.8f)
+                ++st.outsideGuard;
+            if ((uint16_t)m_state.vi[1] == (uint16_t)m_state.vi[10]) ++st.gateTaken;
+            if (st.sampleCount < 4u)
+            {
+                G216ClipSample &sample = st.samples[st.sampleCount++];
+                std::memcpy(sample.p, p, sizeof(sample.p));
+                sample.vi1 = (uint16_t)m_state.vi[1];
+                sample.vi10 = (uint16_t)m_state.vi[10];
+            }
+            ++st.count;
+        }
+        if (s_g216ForceGate && s_g216CharExec &&
+            (currentPc == 0x1d48u || currentPc == 0x2128u))
+            m_state.vi[1] = m_state.vi[10];
         // G72 force-draw experiment: the tristrip(0x1d48)/trifan(0x2128) packer cull gates
         // (IBEQ VI10,VI1) are never taken (VI10=208, VI1 in {0,1,3,23,...}) -> +2048 ADC=1 on
         // 100% of verts -> title flat blue. Force VI1:=VI10 just before the gate so the branch
@@ -2223,6 +2537,62 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 s_g106LowerMacRead = g106MacBeforeUpper;
                 s_g106LowerStatusRead = g106StatusBeforeUpper;
                 s_g106UseLowerFlagRead = true;
+            }
+            // G198: refuted G197's IALU-latency hypothesis by reading PCSX2's real _vuIALUflush/
+            // _vuTestALUStalls (VUops.cpp) -- IALU-pipe bookkeeping only advances VU->cycle (a
+            // timing counter used elsewhere for XGKICK pacing), it never delays or forwards a
+            // stale VALUE: _vuILW/_vuIADD* write VU->VI[] eagerly every time regardless of the
+            // ialu[] pipe state, so modeling that latency in DC2 (an interpreter with no true
+            // out-of-order execution) would be a no-op for this bug. Also confirmed the PCSX2
+            // DebugServer cannot do a live VU1-internal register A/B (g135's tool note: EE RAM/
+            // scratchpad only). Redirect: trace the shared FMAND/IAND/IBEQ chain's actual inputs
+            // (VI1/VI7/VI8/VI9/VI10 at pc=0x2128, the same gate G138 already fixed for the title)
+            // for the map-piece startPC=0x10 program, so a title-vs-map comparison can be done
+            // from log data instead. Default-off (DC2_G198_GATE_TRACE), capped at 4000 hits.
+            static const bool s_g198GateOn = (std::getenv("DC2_G198_GATE_TRACE") != nullptr);
+            if (s_g198GateOn && startPc == 0x10u && currentPc == 0x2128u)
+            {
+                static std::atomic<uint32_t> s_g198Hits{0};
+                const uint32_t h = s_g198Hits.fetch_add(1u, std::memory_order_relaxed);
+                if (h < 4000u)
+                {
+                    std::fprintf(stderr,
+                        "[G198:gate] hit=%u vi1=0x%x vi7=0x%x vi8=0x%x vi9=0x%x vi10=0x%x taken=%d\n",
+                        h, (unsigned)(uint16_t)m_state.vi[1], (unsigned)(uint16_t)m_state.vi[7],
+                        (unsigned)(uint16_t)m_state.vi[8], (unsigned)(uint16_t)m_state.vi[9],
+                        (unsigned)(uint16_t)m_state.vi[10],
+                        (int)((int16_t)m_state.vi[1] == (int16_t)m_state.vi[10]));
+                }
+            }
+            // G200: qw30's REAL producer is this same program's setup block (statically confirmed
+            // from the G197 full dump: 0x170 OPMULA/OPMSUB cross of VF15xVF16, 0x180 MUL by VF17,
+            // 0x198/0x1a0 ADD.x sum -> det in VF24.x, 0x1c0 FMAND VI9,0x80 on the det's S.x flag,
+            // 0x1e0/0x200 VI7=0x0/0x20, 0x210 ISW.x VI7,30(VI0)) -- NOT an EE-side upload (G199's
+            // info+0x270 refutation + this close G198's "EE-side producer" framing). Trace the det
+            // inputs/outputs at the ISW so a host-side recompute can check sign consistency, and a
+            // matrix-level A/B vs PCSX2 EE RAM becomes possible. Default-off (DC2_G200_DET_TRACE).
+            // NOTE: startPC=0x10 enters at byte 0x10 -> JR to 0x320, SKIPPING the setup block;
+            // the det/qw30 setup only runs under a different start (0x0 path). No startPc filter.
+            static const bool s_g200DetOn = (std::getenv("DC2_G200_DET_TRACE") != nullptr);
+            if (s_g200DetOn && currentPc == 0x210u)
+            {
+                static std::atomic<uint32_t> s_g200Hits{0};
+                const uint32_t h = s_g200Hits.fetch_add(1u, std::memory_order_relaxed);
+                if (h < 400u)
+                {
+                    uint32_t r15[4], r16[4], r17[4], d24;
+                    std::memcpy(r15, m_state.vf[15], 16);
+                    std::memcpy(r16, m_state.vf[16], 16);
+                    std::memcpy(r17, m_state.vf[17], 16);
+                    std::memcpy(&d24, &m_state.vf[24][0], 4);
+                    std::fprintf(stderr,
+                        "[G200:det] hit=%u start=0x%x vi7=0x%x det=%.9g d24=0x%08x"
+                        " vf15=%08x,%08x,%08x,%08x vf16=%08x,%08x,%08x,%08x vf17=%08x,%08x,%08x,%08x\n",
+                        h, startPc, (unsigned)(uint16_t)m_state.vi[7], m_state.vf[24][0], d24,
+                        r15[0], r15[1], r15[2], r15[3],
+                        r16[0], r16[1], r16[2], r16[3],
+                        r17[0], r17[1], r17[2], r17[3]);
+                }
             }
             execLower(lower, vuData, dataSize, gs, memory, upper);
             s_g106UseLowerFlagRead = false;
@@ -4013,7 +4383,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 float qv = (den != 0.0f)
                     ? (num / den)
                     : ((num >= 0.0f) ? std::numeric_limits<float>::max() : -std::numeric_limits<float>::max());
-                if (g87_q_latency_enabled()) { s_vuQPending = qv; s_vuQDelay = 7; }
+                if (g87_q_latency_enabled()) { if (g200_qstall_enabled() && s_vuQDelay > 0) m_state.q = s_vuQPending; s_vuQPending = qv; s_vuQDelay = 7; } // G200 FDIV busy-stall
                 else m_state.q = qv;
                 if (s_g29DivTrace.load(std::memory_order_relaxed) > 0)
                 {
@@ -4041,7 +4411,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 int ftf = (instr >> 23) & 0x3;
                 float val = m_state.vf[it][ftf];
                 float qv = std::sqrt(std::fabs(val));
-                if (g87_q_latency_enabled()) { s_vuQPending = qv; s_vuQDelay = 7; }
+                if (g87_q_latency_enabled()) { if (g200_qstall_enabled() && s_vuQDelay > 0) m_state.q = s_vuQPending; s_vuQPending = qv; s_vuQDelay = 7; } // G200 FDIV busy-stall
                 else m_state.q = qv;
                 return;
             }
@@ -4052,7 +4422,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 float num = m_state.vf[is][fsf];
                 float den = std::sqrt(std::fabs(m_state.vf[it][ftf]));
                 float qv = (den != 0.0f) ? (num / den) : std::numeric_limits<float>::max();
-                if (g87_q_latency_enabled()) { s_vuQPending = qv; s_vuQDelay = 13; }
+                if (g87_q_latency_enabled()) { if (g200_qstall_enabled() && s_vuQDelay > 0) m_state.q = s_vuQPending; s_vuQPending = qv; s_vuQDelay = 13; } // G200 FDIV busy-stall
                 else m_state.q = qv;
                 return;
             }
@@ -4372,7 +4742,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 float qv = (den != 0.0f)
                     ? (num / den)
                     : ((num >= 0.0f) ? std::numeric_limits<float>::max() : -std::numeric_limits<float>::max());
-                if (g87_q_latency_enabled()) { s_vuQPending = qv; s_vuQDelay = 7; }
+                if (g87_q_latency_enabled()) { if (g200_qstall_enabled() && s_vuQDelay > 0) m_state.q = s_vuQPending; s_vuQPending = qv; s_vuQDelay = 7; } // G200 FDIV busy-stall
                 else m_state.q = qv;
                 if (s_g29DivTrace.load(std::memory_order_relaxed) > 0)
                 {
@@ -4387,7 +4757,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 int ftf = (instr >> 23) & 0x3;
                 float val = m_state.vf[it][ftf];
                 float qv = std::sqrt(std::fabs(val));
-                if (g87_q_latency_enabled()) { s_vuQPending = qv; s_vuQDelay = 7; }
+                if (g87_q_latency_enabled()) { if (g200_qstall_enabled() && s_vuQDelay > 0) m_state.q = s_vuQPending; s_vuQPending = qv; s_vuQDelay = 7; } // G200 FDIV busy-stall
                 else m_state.q = qv;
                 return;
             }
@@ -4398,7 +4768,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 float num = m_state.vf[is][fsf];
                 float den = std::sqrt(std::fabs(m_state.vf[it][ftf]));
                 float qv = (den != 0.0f) ? (num / den) : std::numeric_limits<float>::max();
-                if (g87_q_latency_enabled()) { s_vuQPending = qv; s_vuQDelay = 13; }
+                if (g87_q_latency_enabled()) { if (g200_qstall_enabled() && s_vuQDelay > 0) m_state.q = s_vuQPending; s_vuQPending = qv; s_vuQDelay = 13; } // G200 FDIV busy-stall
                 else m_state.q = qv;
                 return;
             }
@@ -5046,6 +5416,152 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 }
             };
 
+            auto g217JoinXgkick = [&](const uint8_t *pkt, uint32_t bytes)
+            {
+                if (!s_g217Join || !pkt || bytes < 16u)
+                    return;
+
+                const uint64_t tex0Before = s_g217LastTex0;
+                uint64_t curTex0 = tex0Before;
+                uint64_t geomTex0 = 0u;
+                uint32_t texWrites = 0u;
+                uint32_t tags = 0u;
+                uint32_t invalid = 0u;
+                uint32_t curPrim = 0u;
+                uint32_t verts[8] = {};
+                uint32_t adcDraw[8] = {};
+                uint32_t adcNoDraw[8] = {};
+                uint32_t minX = 0xFFFFFFFFu, minY = 0xFFFFFFFFu;
+                uint32_t maxX = 0u, maxY = 0u;
+                uint32_t off = 0u;
+
+                auto bindTex0 = [&](uint64_t value)
+                {
+                    curTex0 = value;
+                    ++texWrites;
+                };
+                auto visitVertex = [&](uint64_t lo, uint64_t hi)
+                {
+                    const uint32_t prim = curPrim & 7u;
+                    if (prim < 8u)
+                    {
+                        ++verts[prim];
+                        if (((hi >> 47u) & 1ull) != 0ull)
+                            ++adcNoDraw[prim];
+                        else
+                            ++adcDraw[prim];
+                    }
+                    if (geomTex0 == 0u)
+                        geomTex0 = curTex0;
+                    const uint32_t x = static_cast<uint32_t>(lo & 0xFFFFu);
+                    const uint32_t y = static_cast<uint32_t>((lo >> 32u) & 0xFFFFu);
+                    minX = std::min(minX, x); maxX = std::max(maxX, x);
+                    minY = std::min(minY, y); maxY = std::max(maxY, y);
+                };
+
+                for (uint32_t safety = 0u; safety < 256u && off + 16u <= bytes; ++safety)
+                {
+                    uint64_t tagLo = 0u, tagHi = 0u;
+                    std::memcpy(&tagLo, pkt + off, 8u);
+                    std::memcpy(&tagHi, pkt + off + 8u, 8u);
+                    const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7FFFu);
+                    const uint32_t flg = static_cast<uint32_t>((tagLo >> 58u) & 0x3u);
+                    uint32_t nreg = static_cast<uint32_t>((tagLo >> 60u) & 0xFu);
+                    if (nreg == 0u) nreg = 16u;
+                    if (((tagLo >> 46u) & 1ull) != 0ull)
+                        curPrim = static_cast<uint32_t>((tagLo >> 47u) & 0x7u);
+                    ++tags;
+                    uint32_t dataOff = off + 16u;
+
+                    if (flg == 0u)
+                    {
+                        for (uint32_t lp = 0u; lp < nloop; ++lp)
+                        {
+                            for (uint32_t r = 0u; r < nreg; ++r)
+                            {
+                                if (dataOff + 16u > bytes) { ++invalid; goto g217_done; }
+                                const uint8_t rr = static_cast<uint8_t>((tagHi >> ((r & 0xFu) * 4u)) & 0xFu);
+                                uint64_t lo = 0u, hi = 0u;
+                                std::memcpy(&lo, pkt + dataOff, 8u);
+                                std::memcpy(&hi, pkt + dataOff + 8u, 8u);
+                                if (rr == 0x0Eu)
+                                {
+                                    const uint32_t adReg = static_cast<uint32_t>(hi & 0xFFu);
+                                    if (adReg == 0x00u) curPrim = static_cast<uint32_t>(lo & 7u);
+                                    else if (adReg == 0x06u || adReg == 0x07u) bindTex0(lo);
+                                }
+                                else if (rr == 0x00u) curPrim = static_cast<uint32_t>(lo & 7u);
+                                else if (rr == 0x06u || rr == 0x07u) bindTex0(lo);
+                                else if (rr == 0x04u || rr == 0x05u || rr == 0x0Du) visitVertex(lo, hi);
+                                dataOff += 16u;
+                            }
+                        }
+                    }
+                    else if (flg == 1u)
+                    {
+                        const uint32_t count = nloop * nreg;
+                        for (uint32_t k = 0u; k < count; ++k)
+                        {
+                            if (dataOff + 8u > bytes) { ++invalid; goto g217_done; }
+                            const uint8_t rr = static_cast<uint8_t>((tagHi >> (((k % nreg) & 0xFu) * 4u)) & 0xFu);
+                            uint64_t value = 0u;
+                            std::memcpy(&value, pkt + dataOff, 8u);
+                            if (rr == 0x00u) curPrim = static_cast<uint32_t>(value & 7u);
+                            else if (rr == 0x06u || rr == 0x07u) bindTex0(value);
+                            dataOff += 8u;
+                        }
+                        if ((count & 1u) != 0u) dataOff += 8u;
+                    }
+                    else if (flg == 2u)
+                    {
+                        const uint64_t imageBytes = static_cast<uint64_t>(nloop) * 16ull;
+                        if (imageBytes > static_cast<uint64_t>(bytes - dataOff)) { ++invalid; goto g217_done; }
+                        dataOff += static_cast<uint32_t>(imageBytes);
+                    }
+                    else
+                    {
+                        ++invalid;
+                        goto g217_done;
+                    }
+
+                    if (dataOff <= off || dataOff > bytes) { ++invalid; break; }
+                    off = dataOff;
+                    if (((tagLo >> 15u) & 1ull) != 0ull)
+                        break;
+                }
+
+            g217_done:
+                s_g217LastTex0 = curTex0;
+                if (s_g217TagVu && s_g217ExactKind == 0u)
+                    return;
+                if (!s_g217CharExec)
+                    return;
+                const uint32_t logIndex = s_g217Logged.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (s_g217Limit != 0u && logIndex > s_g217Limit)
+                    return;
+                const uint64_t tick = g_dc2PresentTick.load(std::memory_order_relaxed);
+                const uint64_t effectiveTex0 = geomTex0 != 0u ? geomTex0 : curTex0;
+                const uint32_t totalVerts = verts[3] + verts[4] + verts[5];
+                const uint32_t bboxMinX = minX == 0xFFFFFFFFu ? 0u : minX;
+                const uint32_t bboxMinY = minY == 0xFFFFFFFFu ? 0u : minY;
+                std::fprintf(stderr,
+                    "[G217:join] n=%u tick=%llu exec=%u kick=%u exact=%u pc=0x%x bytes=0x%x tags=%u invalid=%u "
+                    "texWrites=%u texBefore=0x%llx texAfter=0x%llx geomTex=0x%llx tbp=0x%x psm=0x%x "
+                    "verts=%u tri=%u/%u tstrip=%u/%u tfan=%u/%u bbox=%u,%u..%u,%u "
+                    "hdr=%08x,%08x,%08x,%08x/%08x,%08x,%08x,%08x\n",
+                    logIndex, static_cast<unsigned long long>(tick), s_g217ExecSeq, ++s_g217KickSeq,
+                    s_g217ExactKind, m_state.pc, bytes, tags, invalid, texWrites,
+                    static_cast<unsigned long long>(tex0Before),
+                    static_cast<unsigned long long>(curTex0),
+                    static_cast<unsigned long long>(effectiveTex0),
+                    static_cast<uint32_t>(effectiveTex0 & 0x3FFFu),
+                    static_cast<uint32_t>((effectiveTex0 >> 20u) & 0x3Fu), totalVerts,
+                    adcDraw[3], adcNoDraw[3], adcDraw[4], adcNoDraw[4], adcDraw[5], adcNoDraw[5],
+                    bboxMinX, bboxMinY, maxX, maxY,
+                    s_g217Header[0], s_g217Header[1], s_g217Header[2], s_g217Header[3],
+                    s_g217Header[4], s_g217Header[5], s_g217Header[6], s_g217Header[7]);
+            };
+
             auto g136DumpXgkick = [&](const uint8_t *pkt, uint32_t bytes)
             {
                 if (!pkt || bytes < 16u || !g136_trace_enabled())
@@ -5059,7 +5575,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                     ? (m_state.pc == pcFilter)
                     : (m_state.pc == 0x1c30u || m_state.pc == 0x1fd0u ||
                        m_state.pc == 0x1da0u || m_state.pc == 0x2180u);
-                if (!titleScope || !interestingPc)
+                // G216: the same decoder is useful for the character RTT even though the
+                // historical G136 scope was title-only. Both paths remain diagnostic-only.
+                if ((!titleScope && !s_g216CharExec) || !interestingPc)
                     return;
 
                 const uint32_t limit = g136_xg_limit();
@@ -5654,6 +6172,88 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 }
                 else
                 {
+                    // G217 A/B: the missing MAP-4 FixMDT head/cap use the copy packer.  If a
+                    // character-RTT packed tag marks every vertex ADC/no-draw, preserve the two
+                    // strip-restart vertices and clear ADC on the remaining vertices.  This is
+                    // diagnostic-only and deliberately broad within fbp=0x139; it determines
+                    // whether the residual is output ADC versus projected position/submission.
+                    static const bool s_g217ForceCopyDraw =
+                        (std::getenv("DC2_G217_FORCE_COPY_DRAW") != nullptr);
+                    std::vector<uint8_t> g217Patched;
+                    if (s_g217ForceCopyDraw && s_g217CharExec && m_state.pc == 0x1c30u)
+                    {
+                        g217Patched.assign(pkt, pkt + bytes);
+                        uint32_t off = 0u;
+                        uint32_t changed = 0u;
+                        for (uint32_t safety = 0u; safety < 256u && off + 16u <= bytes; ++safety)
+                        {
+                            uint64_t tagLo = 0u, tagHi = 0u;
+                            std::memcpy(&tagLo, g217Patched.data() + off, 8u);
+                            std::memcpy(&tagHi, g217Patched.data() + off + 8u, 8u);
+                            const uint32_t nloop = static_cast<uint32_t>(tagLo & 0x7fffu);
+                            const uint32_t flg = static_cast<uint32_t>((tagLo >> 58u) & 3u);
+                            uint32_t nreg = static_cast<uint32_t>((tagLo >> 60u) & 0xfu);
+                            if (nreg == 0u) nreg = 16u;
+                            uint32_t pktSize = 16u;
+                            if (flg == 0u) pktSize += nloop * nreg * 16u;
+                            else if (flg == 1u)
+                            {
+                                const uint32_t regs = nloop * nreg;
+                                pktSize += regs * 8u + ((regs & 1u) ? 8u : 0u);
+                            }
+                            else if (flg == 2u) pktSize += nloop * 16u;
+                            if (pktSize == 0u || off + pktSize > bytes) break;
+
+                            if (flg == 0u)
+                            {
+                                uint32_t vertexCount = 0u;
+                                uint32_t adcCount = 0u;
+                                uint32_t dataOff = off + 16u;
+                                for (uint32_t lp = 0u; lp < nloop; ++lp)
+                                {
+                                    for (uint32_t r = 0u; r < nreg; ++r, dataOff += 16u)
+                                    {
+                                        const uint8_t reg = static_cast<uint8_t>((tagHi >> (r * 4u)) & 0xfu);
+                                        if (reg != 0x04u && reg != 0x05u && reg != 0x0du) continue;
+                                        uint64_t hi = 0u;
+                                        std::memcpy(&hi, g217Patched.data() + dataOff + 8u, 8u);
+                                        ++vertexCount;
+                                        if (((hi >> 47u) & 1ull) != 0ull) ++adcCount;
+                                    }
+                                }
+                                if (vertexCount >= 3u && adcCount == vertexCount)
+                                {
+                                    dataOff = off + 16u;
+                                    uint32_t vertexIndex = 0u;
+                                    for (uint32_t lp = 0u; lp < nloop; ++lp)
+                                    {
+                                        for (uint32_t r = 0u; r < nreg; ++r, dataOff += 16u)
+                                        {
+                                            const uint8_t reg = static_cast<uint8_t>((tagHi >> (r * 4u)) & 0xfu);
+                                            if (reg != 0x04u && reg != 0x05u && reg != 0x0du) continue;
+                                            if (vertexIndex++ < 2u) continue;
+                                            uint64_t hi = 0u;
+                                            std::memcpy(&hi, g217Patched.data() + dataOff + 8u, 8u);
+                                            hi &= ~(1ull << 47u);
+                                            std::memcpy(g217Patched.data() + dataOff + 8u, &hi, 8u);
+                                            ++changed;
+                                        }
+                                    }
+                                }
+                            }
+                            if (((tagLo >> 15u) & 1ull) != 0ull) break;
+                            off += pktSize;
+                        }
+                        if (changed != 0u)
+                        {
+                            static std::atomic<uint32_t> s_g217ForceLogs{0};
+                            const uint32_t n = s_g217ForceLogs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                            if (n <= 128u)
+                                std::fprintf(stderr, "[G217:forcecopy] n=%u pc=0x%x changed=%u bytes=0x%x\n",
+                                             n, m_state.pc, changed, bytes);
+                            pkt = g217Patched.data();
+                        }
+                    }
                     if (memory)
                         memory->submitGifPacket(GifPathId::Path1, pkt, bytes, !g95_defer_gif_enabled());
                     else
@@ -5661,8 +6261,14 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 }
             };
 
+            if (s_g215batch || s_g216clip || s_g216ForceGate || s_g217TagVu)
+            {
+                ++s_g215KickCount;
+                s_g215KickBytes += totalBytes;
+            }
             if (addr + totalBytes <= dataSize)
             {
+                g217JoinXgkick(vuData + addr, totalBytes);
                 g136DumpXgkick(vuData + addr, totalBytes);
                 f50_12_vu_scan_xgkick_packet(addr, totalBytes, vuData + addr);
                 g67_vu_scan_xgkick_packet(addr, totalBytes, vuData + addr, m_state.pc, s_g65CurStartPC, m_state.itop);
@@ -5677,6 +6283,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                     wrappedPacket[i] = vuData[wrapOffset(addr + i)];
                 }
 
+                g217JoinXgkick(wrappedPacket.data(), totalBytes);
                 g136DumpXgkick(wrappedPacket.data(), totalBytes);
                 f50_12_vu_scan_xgkick_packet(addr, totalBytes, wrappedPacket.data());
                 g67_vu_scan_xgkick_packet(addr, totalBytes, wrappedPacket.data(), m_state.pc, s_g65CurStartPC, m_state.itop);
