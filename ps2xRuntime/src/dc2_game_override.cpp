@@ -205,6 +205,9 @@ extern void TitleMapDraw__Fv_0x2a2280(uint8_t* rdram, R5900Context* ctx, PS2Runt
 // title override invokes as direct C++ calls, run to completion instead of leaking a
 // mid-loop preemption resume PC (which left BeginDraw's mgr[4]/mgr[6] null ג†’ flush crash).
 extern std::atomic<int> g_dc2PreemptSuppressDepth;
+// G214: extern-visible host present-loop tick (defined in ps2_runtime.cpp) so the skin-matrix
+// collapse scanner can print the frame_NNNNNN.ppm number an event lands on.
+extern std::atomic<uint64_t> g_dc2PresentTick;
 // G56: main-title map geometry-submission chain (delegated by the G56 chain taps).
 extern void Draw__9CMapPartsFv_0x15e3d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void PreDraw__9CMapPartsFv_0x166a00(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -212,6 +215,13 @@ extern void Draw__9CMapPieceFv_0x166e40(uint8_t* rdram, R5900Context* ctx, PS2Ru
 extern void BeginDraw__14mgCDrawManagerFP9mgCMemoryPi_0x135230(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 // G57: DrawWater (last call in TitleMapDraw) ג€” wrapped by g57_drawwater_skip bisection tool.
 extern void DrawWater__4CMapFP9mgCCameraP10mgCTextureP10mgCTexture_0x15e800(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G194: town-scene effect-pass bisection targets (giant dark overlay tris sampling 0x28c0/T8).
+extern void DrawEffect__6CSceneFi_0x2c8820(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DepthOfField__FiPfP10mgCTexturef_0x17e320(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void TexAnime__15mgCTextureAnimeFiP13sceVif1Packet_0x13bd90(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void mgSetPkMoveImage__FP10mgCTexture9mgRect_i_P10mgCTextureiii_0x144560(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DrawEffect__8CEditMapFv_0x29c1c0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DrawEffect__4CMapFv_0x15e3f0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 // G129: SPI map-config WATER_VERTEX command handler ג€” creates a CWaterFrame (CreateWaterFrame@0x185D40)
 // and stores it into the global `cfgWater`. The title water arrays (CMap+0xcec/+0xcf0) are empty on
 // the runner; this probe tells whether the title map's config script dispatches WATER_VERTEX at all.
@@ -229,6 +239,9 @@ extern void AddHeight__15mgCCameraFollowFf_0x131a50(uint8_t* rdram, R5900Context
 extern void AssignCamera__6CSceneFiP9mgCCameraPc_0x283740(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 // G58: GetCamera__6CScene ג€” wrapped to assign the title camera on demand (ordering fix).
 extern void GetCamera__6CSceneFi_0x2838c0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G193: town/edit-map camera diagnosis (scene->Initialize ordering vs EditInit's AssignCamera).
+extern void Initialize__6CSceneFv_0x282ea0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void EditInit__F13INIT_LOOP_ARG_0x1a9f40(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 // G59: title MDS texture-block return probe.
 extern void GetTextureBlockNo__11CMdsListSetFiPii_0x168fd0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void mgDraw__FP8mgCFrame_0x142f90(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -266,10 +279,14 @@ extern void mgEndFrame__FP14mgCDrawManager_0x1425b0(uint8_t* rdram, R5900Context
 // PHASE G15: costume/character deform-mesh build path (split VU1-dormant vs packet-not-built).
 extern void mgDrawDirect__FP8mgCFrame_0x142fd0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void DrawDirect__12CActionCharaFv_0x16b940(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// PHASE G205: field-character (non-"Direct") draw entry, town Max candidate.
+extern void Draw__12CActionCharaFv_0x16b850(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void DrawDirect__11CCharacter2Fv_0x1731f0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void mgGetDrawRect__FP8mgCFrameP9mgVu0FBOX_0x143160(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void Draw__8mgCFrameFPUi_0x137e10(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void SetDeformMesh__11CCharacter2Fv_0x1730b0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// PHASE G209: per-frame world (skin) matrix builder, test of G207/G208's skin-matrix hypothesis.
+extern void GetLWMatrix__8mgCFrameFPA4_f_0x137030(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 // PHASE G34: costume model RTT->display composite (the outline/preview pass).
 extern void Draw__12COutLineDrawFff_0x17c2d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void DrawDivSprite4__FP11mgCDrawPrim9mgRect_i_P10mgCTexturePiii_0x17cb20(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -280,7 +297,10 @@ extern void mgSendVuProg__FPUii_0x145e80(uint8_t* rdram, R5900Context* ctx, PS2R
 extern void Draw__12mgCVisualMDTFPUiPA4_fP14mgCDrawManager_0x13f4e0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void AddPacket__14mgCDrawManagerFiP1P1i_0x1359d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void CreateFacePacket__12mgCVisualMDTFPUiP7mgCFace_0x13ff60(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CreatePacket__12mgCVisualMDTFP14mgCDrawManager_0x13f6a0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CreatePacket__15mgCVisualFixMDTFP14mgCDrawManager_0x13f920(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void CreateRenderInfoPacket__12mgCVisualMDTFPUiPA4_fP13mgRENDER_INFO_0x1404d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CreateRenderInfoPacket__18mgCVisualMotionMDTFPUiPA4_fP13mgRENDER_INFO_0x28a660(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void CalcGlidPutPos__11CDngFreeMapFP9GLID_INFORfRfi_0x1ea890(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void InitEnd__12CMenuTreeMapFv_0x1ef9f0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void SetTextureInfo__11CDngFreeMapFv_0x1eabe0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -331,10 +351,17 @@ extern std::atomic<int> g_g34_in_divsprite;
 // not for any other COutLineDraw user.
 static std::atomic<int> g_g37_in_outline{0};
 
+// G215: expose the COutLineDraw character-draw window to the VU1 interpreter so its
+// per-model-batch cull discriminator (DC2_G215_BATCH) can scope model executes to the
+// character pass. Only meaningful when the outline wrapper is registered (DC2_G205_FVAR13_TRACE
+// or DC2_G9_COSTUME); otherwise g_g37_in_outline stays 0 and the probe emits nothing.
+bool dc2_g215_in_char_outline() { return g_g37_in_outline.load(std::memory_order_relaxed) > 0; }
+
 // G89: defined in ps2_gs_rasterizer.cpp; set by g67_title_scope each frame so the rasterizer's
 // title-rock guard-band cull only fires in the title-map scene. Declared at global scope (external
 // linkage) -- declaring it inside the anonymous namespace below would give it internal linkage.
 extern std::atomic<bool> g_dc2TitleRockScope;
+extern std::atomic<bool> g_dc2TownDepthScope;
 // G90: current logical title block flushing through mgEndDraw (rasterizer-side, [G88:geo] tag).
 extern std::atomic<int> g_dc2TitleCurBlock;
 // G144: defined in ps2_gs_rasterizer.cpp; drains trailing deferred tile-binning triangles at frame
@@ -352,6 +379,13 @@ extern void g144FlushPending();
 extern bool g150_mtgs_enabled();
 extern void g150_frame_barrier(std::function<void()> latch);
 extern void g150_wait_idle();
+
+// G217: one-shot exact head-object packet correlation consumed by ps2_memory.cpp.
+std::atomic<uint32_t> g_dc2G217HeadDmaPacket{0u};
+std::atomic<uint32_t> g_dc2G217HeadDmaSelf{0u};
+std::atomic<uint32_t> g_dc2G217HeadDmaKind{0u};
+std::atomic<uint32_t> g_dc2G217DirectPackets[128]{};
+std::atomic<uint32_t> g_dc2G217DirectPacketWrite{0u};
 
 namespace
 {
@@ -2969,7 +3003,16 @@ static void f50_7_funcpoint_setter_probe(uint8_t *rdram, R5900Context *ctx, PS2R
     PS2Runtime::RecompiledFunction targetFn = fallbackFn;
     if (slot != 0u && runtime->hasFunction(slot))
         targetFn = runtime->lookupFunction(slot);
+    // G212 (audit, G186 bug class): the vtable slot target is arbitrary guest code; if it
+    // contains a back-edge preemption checkpoint, the unconditional ctx->pc = ra below
+    // would swallow the yield (the mgCObject fallbacks are checkpoint-free, but a subclass
+    // override need not be). Suppress preemption for the emulated call, like G186.
+    static const bool s_g212NoPreemptFix = dc2_env_flag_enabled("DC2_G212_NO_PREEMPTFIX");
+    if (!s_g212NoPreemptFix)
+        g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
     targetFn(rdram, ctx, runtime);
+    if (!s_g212NoPreemptFix)
+        g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
 
     ctx->r[31] = savedRa;
     ctx->pc = ra;
@@ -3022,7 +3065,16 @@ static void f50_7_mg_active_lighting_probe(uint8_t *rdram, R5900Context *ctx, PS
     f50_set_reg(ctx, 5, lightNo);
     f50_set_reg(ctx, 6, active);
     f50_set_reg(ctx, 31, 0u);
+    // G212 (audit hit, G186 bug class): ActiveLighting@0x139120 has back-edge preemption
+    // checkpoints; a yield here would be swallowed by the unconditional ctx->pc = ra below
+    // (half-executed lighting call, resume lost). Suppress preemption for the emulated
+    // call, exactly like the G186 fix for the Draw__4CMap override. Kill: DC2_G212_NO_PREEMPTFIX=1.
+    static const bool s_g212NoPreemptFix = dc2_env_flag_enabled("DC2_G212_NO_PREEMPTFIX");
+    if (!s_g212NoPreemptFix)
+        g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
     ActiveLighting__13mgRENDER_INFOFii_0x139120(rdram, ctx, runtime);
+    if (!s_g212NoPreemptFix)
+        g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
 
     ctx->r[31] = savedRa;
     ctx->pc = ra;
@@ -3112,6 +3164,80 @@ static bool g56_trace_enabled()
     return enabled;
 }
 
+static bool g195_block_trace_enabled()
+{
+    static const bool enabled = dc2_env_flag_enabled("DC2_G195_BLOCK_TRACE");
+    return enabled;
+}
+
+static std::atomic<uint32_t> g_g195_current_map_part{0u};
+static std::atomic<uint32_t> g_g195_current_map_piece{0u};
+static constexpr uint32_t kG195ForegroundVisual = 0x0121C940u;
+
+static uint32_t g195_find_piece_index(uint8_t *rdram, uint32_t part, uint32_t piece)
+{
+    if (part == 0u || piece == 0u)
+        return 0xFFFFFFFFu;
+
+    uint32_t node = part + 0xB0u;
+    for (uint32_t i = 0u; i < 64u && node != 0u; ++i)
+    {
+        if (node + 0x10u == piece)
+            return i;
+        node = dc2_read_u32(rdram, node + 0x00u);
+    }
+    return 0xFFFFFFFFu;
+}
+
+static uint32_t g195_find_frame_for_visual(uint8_t *rdram, uint32_t rootFrame, uint32_t visual,
+                                           uint32_t *depthOut, uint32_t *ordinalOut)
+{
+    if (depthOut) *depthOut = 0xFFFFFFFFu;
+    if (ordinalOut) *ordinalOut = 0xFFFFFFFFu;
+    if (rootFrame == 0u || visual == 0u)
+        return 0u;
+
+    uint32_t stack[64]{};
+    uint32_t depth[64]{};
+    uint32_t sp = 0u;
+    stack[sp] = rootFrame;
+    depth[sp] = 0u;
+    ++sp;
+
+    uint32_t ordinal = 0u;
+    while (sp != 0u && ordinal < 256u)
+    {
+        --sp;
+        const uint32_t frame = stack[sp];
+        const uint32_t d = depth[sp];
+        if (frame == 0u)
+            continue;
+        if (dc2_read_u32(rdram, frame + 0xF8u) == visual)
+        {
+            if (depthOut) *depthOut = d;
+            if (ordinalOut) *ordinalOut = ordinal;
+            return frame;
+        }
+        ++ordinal;
+
+        const uint32_t sibling = dc2_read_u32(rdram, frame + 0x5Cu);
+        const uint32_t child = dc2_read_u32(rdram, frame + 0x58u);
+        if (sibling != 0u && sp < 64u)
+        {
+            stack[sp] = sibling;
+            depth[sp] = d;
+            ++sp;
+        }
+        if (child != 0u && sp < 64u)
+        {
+            stack[sp] = child;
+            depth[sp] = d + 1u;
+            ++sp;
+        }
+    }
+    return 0u;
+}
+
 static void g56_chain_tap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
                           const char *tag,
                           void (*real)(uint8_t *, R5900Context *, PS2Runtime *),
@@ -3133,7 +3259,12 @@ static void g56_chain_tap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime
 static void g56_mapparts_draw_tap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     static unsigned c = 0u, nz = 0u;
+    const bool g195 = g195_block_trace_enabled();
+    const uint32_t part = g195 ? getRegU32(ctx, 4) : 0u;
+    const uint32_t prevPart = g195 ? g_g195_current_map_part.exchange(part, std::memory_order_relaxed) : 0u;
     g56_chain_tap(rdram, ctx, runtime, "parts.draw", Draw__9CMapPartsFv_0x15e3d0, c, nz);
+    if (g195)
+        g_g195_current_map_part.store(prevPart, std::memory_order_relaxed);
 }
 
 static void g56_mapparts_predraw_tap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -3145,7 +3276,89 @@ static void g56_mapparts_predraw_tap(uint8_t *rdram, R5900Context *ctx, PS2Runti
 static void g56_mappiece_draw_tap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     static unsigned c = 0u, nz = 0u;
+    const bool g195 = g195_block_trace_enabled();
+    const uint32_t piece = g195 ? getRegU32(ctx, 4) : 0u;
+    const uint32_t frame = piece ? dc2_read_u32(rdram, piece + 0x70u) : 0u;
+    const uint32_t visual = frame ? dc2_read_u32(rdram, frame + 0xF8u) : 0u;
+    const bool g195Target = g195 && (visual == kG195ForegroundVisual);
+    const uint32_t prevPiece = g195 ? g_g195_current_map_piece.exchange(piece, std::memory_order_relaxed) : 0u;
     g56_chain_tap(rdram, ctx, runtime, "piece.draw", Draw__9CMapPieceFv_0x166e40, c, nz);
+    if (g195Target)
+    {
+        static std::atomic<uint32_t> s_g195OwnerLog{0u};
+        const uint32_t n = s_g195OwnerLog.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 96u || (n % 720u) == 0u)
+        {
+            const uint32_t part = g_g195_current_map_part.load(std::memory_order_relaxed);
+            const uint32_t pieceIndex = g195_find_piece_index(rdram, part, piece);
+            const uint32_t partFlags = part ? dc2_read_u32(rdram, part + 0x2B0u) : 0u;
+            const uint32_t partPieces = part ? dc2_read_u32(rdram, part + 0xB0u) : 0u;
+            const uint32_t partVisual = part ? dc2_read_u32(rdram, part + 0x2F8u) : 0u;
+            const uint32_t frameObj = frame ? dc2_read_u32(rdram, frame + 0xF4u) : 0u;
+            const uint32_t frameMtx = frame ? dc2_read_u32(rdram, frame + 0xF0u) : 0u;
+            const uint32_t pieceFlags = piece ? dc2_read_u32(rdram, piece + 0x84u) : 0u;
+            const uint32_t pieceGate = piece ? dc2_read_u32(rdram, piece + 0x88u) : 0u;
+            const uint32_t animeCount = piece ? dc2_read_u32(rdram, piece + 0x8Cu) : 0u;
+            const uint32_t animeBase = piece ? dc2_read_u32(rdram, piece + 0x90u) : 0u;
+            std::fprintf(stderr,
+                         "[G195:owner] n=%u part=0x%x partFlags=0x%x partVis=0x%x partPieces=0x%x "
+                         "piece=0x%x pieceIdx=%u pieceFlags=0x%x gate=0x%x anime=%u@0x%x "
+                         "frame=0x%x frameMtx=0x%x frameObj=0x%x visual=0x%x ret=0x%x\n",
+                         n, part, partFlags, partVisual, partPieces,
+                         piece, pieceIndex, pieceFlags, pieceGate, animeCount, animeBase,
+                         frame, frameMtx, frameObj, visual, getRegU32(ctx, 2));
+            std::fflush(stderr);
+        }
+    }
+    if (g195)
+        g_g195_current_map_piece.store(prevPiece, std::memory_order_relaxed);
+}
+
+static void g195_mdt_owner_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t self = getRegU32(ctx, 4);
+    const bool target = g195_block_trace_enabled() && (self == kG195ForegroundVisual);
+    const uint32_t argPacket = target ? getRegU32(ctx, 5) : 0u;
+    const uint32_t argMtx = target ? getRegU32(ctx, 6) : 0u;
+    const uint32_t argMgr = target ? getRegU32(ctx, 7) : 0u;
+    const uint32_t part = target ? g_g195_current_map_part.load(std::memory_order_relaxed) : 0u;
+    const uint32_t piece = target ? g_g195_current_map_piece.load(std::memory_order_relaxed) : 0u;
+    const uint32_t rootFrame = piece ? dc2_read_u32(rdram, piece + 0x70u) : 0u;
+    uint32_t frameDepth = 0xFFFFFFFFu;
+    uint32_t frameOrdinal = 0xFFFFFFFFu;
+    const uint32_t visualFrame = target ?
+        g195_find_frame_for_visual(rdram, rootFrame, self, &frameDepth, &frameOrdinal) : 0u;
+
+    Draw__12mgCVisualMDTFPUiPA4_fP14mgCDrawManager_0x13f4e0(rdram, ctx, runtime);
+
+    if (target)
+    {
+        static std::atomic<uint32_t> s_g195MdtOwnerLog{0u};
+        const uint32_t n = s_g195MdtOwnerLog.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 96u || (n % 720u) == 0u)
+        {
+            const uint32_t pieceIndex = g195_find_piece_index(rdram, part, piece);
+            const uint32_t partFlags = part ? dc2_read_u32(rdram, part + 0x2B0u) : 0u;
+            const uint32_t partPieces = part ? dc2_read_u32(rdram, part + 0xB0u) : 0u;
+            const uint32_t partVisual = part ? dc2_read_u32(rdram, part + 0x2F8u) : 0u;
+            const uint32_t pieceFlags = piece ? dc2_read_u32(rdram, piece + 0x84u) : 0u;
+            const uint32_t pieceGate = piece ? dc2_read_u32(rdram, piece + 0x88u) : 0u;
+            const uint32_t frameObj = visualFrame ? dc2_read_u32(rdram, visualFrame + 0xF4u) : 0u;
+            const uint32_t frameMtx = visualFrame ? dc2_read_u32(rdram, visualFrame + 0xF0u) : 0u;
+            const uint32_t matBase = dc2_read_u32(rdram, self + 0x44u);
+            const uint32_t nodeHead = dc2_read_u32(rdram, self + 0x48u);
+            std::fprintf(stderr,
+                         "[G195:owner] n=%u src=mdt part=0x%x partFlags=0x%x partVis=0x%x partPieces=0x%x "
+                         "piece=0x%x pieceIdx=%u pieceFlags=0x%x gate=0x%x rootFrame=0x%x "
+                         "visFrame=0x%x frameDepth=%u frameOrd=%u frameMtx=0x%x frameObj=0x%x "
+                         "self=0x%x matBase=0x%x nodeHead=0x%x argPacket=0x%x argMtx=0x%x mgr=0x%x ret=0x%x\n",
+                         n, part, partFlags, partVisual, partPieces,
+                         piece, pieceIndex, pieceFlags, pieceGate, rootFrame,
+                         visualFrame, frameDepth, frameOrdinal, frameMtx, frameObj,
+                         self, matBase, nodeHead, argPacket, argMtx, argMgr, getRegU32(ctx, 2));
+            std::fflush(stderr);
+        }
+    }
 }
 
 // G56: tap BeginDraw__14mgCDrawManager (reached via mgBeginDraw's indirect tail-call).
@@ -3219,6 +3432,209 @@ static void g57_drawwater_skip(uint8_t *rdram, R5900Context *ctx, PS2Runtime *ru
     }
     if (skip) return; // empty body => dispatch handler returns to caller (DrawWater skipped)
     DrawWater__4CMapFP9mgCCameraP10mgCTextureP10mgCTexture_0x15e800(rdram, ctx, runtime);
+}
+
+// G194 bisection tools (town dark-wedge overlay + water-region mismatch vs ref/dumps/map_0.png).
+// Opt-in skip levers, default OFF (run the real body). Each prints a bounded hit marker when its
+// env is set, so a silent log also tells us the hook was bypassed by a direct jal.
+static void g194_skip_draweffect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    static const bool skip = dc2_env_flag_enabled("DC2_G194_SKIP_DRAWEFFECT");
+    if (skip)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 8u || (n % 128u) == 0u)
+            std::fprintf(stderr, "[G194:skip] DrawEffect__6CScene hit n=%u (skipped)\n", n);
+        return;
+    }
+    DrawEffect__6CSceneFi_0x2c8820(rdram, ctx, runtime);
+}
+
+static void g194_skip_dof(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    static const bool skip = dc2_env_flag_enabled("DC2_G194_SKIP_DOF");
+    // G194: input probe for the DOF wedge bug — log the call args + the float
+    // param block so they can be A/B'd against the paused PCSX2 session.
+    static const bool probe = dc2_env_flag_enabled("DC2_G194_DOF_PROBE");
+    if (probe)
+    {
+        static std::atomic<uint32_t> s_p{0};
+        const uint32_t n = s_p.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 12u)
+        {
+            const uint32_t a0 = getRegU32(ctx, 4);
+            const uint32_t a1 = getRegU32(ctx, 5);
+            const uint32_t a2 = getRegU32(ctx, 6);
+            const float f12 = ctx->f[12];
+            float p[8] = {};
+            if (a1 && a1 < 0x02000000u - 32u)
+                std::memcpy(p, rdram + (a1 & 0x01FFFFFFu), sizeof(p));
+            uint32_t texw = 0, texh = 0, texTbp = 0;
+            if (a2 && a2 < 0x02000000u - 0x40u)
+            {
+                texw = dc2_read_u32(rdram, a2 + 0x28u);
+                texh = dc2_read_u32(rdram, a2 + 0x2cu);
+                texTbp = dc2_read_u32(rdram, a2 + 0x20u);
+            }
+            std::fprintf(stderr,
+                "[G194:dof] n=%u mode=%u params=0x%x tex=0x%x f12=%.4f p={%.4f %.4f %.4f %.4f %.4f %.4f %.4f %.4f} tex+0x20=0x%x +0x28=%u +0x2c=%u\n",
+                n, a0, a1, a2, f12, p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], texTbp, texw, texh);
+            uint8_t blk[0x60] = {};
+            std::memcpy(blk, rdram + 0x382490u, sizeof(blk));
+            std::fprintf(stderr, "[G194:dof] fbdesc@0x382490:");
+            for (size_t i = 0; i < sizeof(blk); ++i)
+                std::fprintf(stderr, "%s%02x", (i % 16 == 0) ? " | " : (i % 4 == 0 ? " " : ""), blk[i]);
+            std::fprintf(stderr, "\n");
+            // G194: raw VRAM region dump (linear bytes as 256x256 gray PPM — swizzle
+            // scrambles layout but keeps brightness truth). Pages: DOF blur pyramid.
+            static const bool vramDump = dc2_env_flag_enabled("DC2_G194_VRAM_DUMP");
+            if (vramDump && n == 5)
+            {
+                const uint8_t *vram = runtime ? runtime->memory().getGSVRAM() : nullptr;
+                if (vram)
+                {
+                    static const uint32_t blocks[] = {0x2760u, 0x27a0u, 0x2860u, 0x28c0u};
+                    for (uint32_t b : blocks)
+                    {
+                        const uint32_t off = b * 256u;
+                        char fn[128];
+                        std::snprintf(fn, sizeof(fn), "D:/ps2r/dc2/captures/g194_vram_%04x.ppm", b);
+                        FILE *fp = std::fopen(fn, "wb");
+                        if (!fp)
+                            continue;
+                        std::fprintf(fp, "P6\n256 256\n255\n");
+                        for (uint32_t i = 0; i < 65536u && off + i < 4u * 1024u * 1024u; ++i)
+                        {
+                            const uint8_t v = vram[off + i];
+                            std::fputc(v, fp); std::fputc(v, fp); std::fputc(v, fp);
+                        }
+                        std::fclose(fp);
+                    }
+                    std::fprintf(stderr, "[G194:dof] vram pyramid pages dumped\n");
+                }
+            }
+        }
+    }
+    if (skip)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 8u || (n % 128u) == 0u)
+            std::fprintf(stderr, "[G194:skip] DepthOfField hit n=%u (skipped)\n", n);
+        return;
+    }
+    DepthOfField__FiPfP10mgCTexturef_0x17e320(rdram, ctx, runtime);
+}
+
+static void g194_skip_texanime(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    static const bool skip = dc2_env_flag_enabled("DC2_G194_SKIP_TEXANIME");
+    if (skip)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 8u || (n % 128u) == 0u)
+            std::fprintf(stderr, "[G194:skip] TexAnime hit n=%u (skipped)\n", n);
+        return;
+    }
+    TexAnime__15mgCTextureAnimeFiP13sceVif1Packet_0x13bd90(rdram, ctx, runtime);
+}
+
+static void g195_skip_editmap_draweffect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    static const bool skip = dc2_env_flag_enabled("DC2_G195_SKIP_EDITMAP_DRAWEFFECT");
+    if (skip)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 8u || (n % 128u) == 0u)
+            std::fprintf(stderr, "[G195:skip] DrawEffect__8CEditMap hit n=%u (skipped)\n", n);
+        return;
+    }
+    DrawEffect__8CEditMapFv_0x29c1c0(rdram, ctx, runtime);
+}
+
+static void g195_skip_cmap_draweffect(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    static const bool skip = dc2_env_flag_enabled("DC2_G195_SKIP_CMAP_DRAWEFFECT");
+    if (skip)
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 8u || (n % 128u) == 0u)
+            std::fprintf(stderr, "[G195:skip] DrawEffect__4CMap hit n=%u (skipped)\n", n);
+        return;
+    }
+    DrawEffect__4CMapFv_0x15e3f0(rdram, ctx, runtime);
+}
+
+static bool g195_moveimage_trace_enabled()
+{
+    static const bool enabled = dc2_env_flag_enabled("DC2_G195_MOVEIMAGE_TRACE");
+    return enabled;
+}
+
+struct G195Tex0Info
+{
+    uint64_t raw = 0;
+    uint32_t tbp = 0;
+    uint32_t tbw = 0;
+    uint32_t psm = 0;
+    uint32_t tw = 0;
+    uint32_t th = 0;
+    uint32_t cbp = 0;
+    uint32_t cpsm = 0;
+};
+
+static G195Tex0Info g195_read_tex0_info(uint8_t *rdram, uint32_t mgTex)
+{
+    G195Tex0Info t{};
+    if (mgTex == 0u || mgTex >= 0x02000000u - 0x40u)
+        return t;
+    t.raw = dc2_read_u64(rdram, mgTex + 0x38u);
+    t.tbp = static_cast<uint32_t>(t.raw & 0x3FFFu);
+    t.tbw = static_cast<uint32_t>((t.raw >> 14) & 0x3Fu);
+    t.psm = static_cast<uint32_t>((t.raw >> 20) & 0x3Fu);
+    t.tw = static_cast<uint32_t>((t.raw >> 26) & 0xFu);
+    t.th = static_cast<uint32_t>((t.raw >> 30) & 0xFu);
+    t.cbp = static_cast<uint32_t>((t.raw >> 37) & 0x3FFFu);
+    t.cpsm = static_cast<uint32_t>((t.raw >> 51) & 0xFu);
+    return t;
+}
+
+static void g195_moveimage_trace(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    if (g195_moveimage_trace_enabled())
+    {
+        static std::atomic<uint32_t> s_n{0};
+        const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 240u)
+        {
+            const uint32_t srcTex = getRegU32(ctx, 4);
+            const uint32_t rect = getRegU32(ctx, 5);
+            const uint32_t dstTex = getRegU32(ctx, 6);
+            const uint32_t dstX = getRegU32(ctx, 7);
+            const uint32_t dstY = getRegU32(ctx, 8);
+            const uint32_t dir = getRegU32(ctx, 9);
+            const G195Tex0Info src = g195_read_tex0_info(rdram, srcTex);
+            const G195Tex0Info dst = g195_read_tex0_info(rdram, dstTex);
+            const uint32_t r0 = rect ? dc2_read_u32(rdram, rect + 0u) : 0u;
+            const uint32_t r1 = rect ? dc2_read_u32(rdram, rect + 4u) : 0u;
+            const uint32_t r2 = rect ? dc2_read_u32(rdram, rect + 8u) : 0u;
+            const uint32_t r3 = rect ? dc2_read_u32(rdram, rect + 12u) : 0u;
+            std::fprintf(stderr,
+                "[G195:moveimg] n=%u ra=0x%x srcTex=0x%x src={tbp=0x%x tbw=%u psm=0x%x tw=%u th=%u cbp=0x%x cpsm=0x%x raw=0x%llx} "
+                "dstTex=0x%x dst={tbp=0x%x tbw=%u psm=0x%x tw=%u th=%u cbp=0x%x cpsm=0x%x raw=0x%llx} "
+                "rect={0x%x,0x%x,0x%x,0x%x} dstXY=(%u,%u) dir=%u\n",
+                n, getRegU32(ctx, 31), srcTex, src.tbp, src.tbw, src.psm, src.tw, src.th,
+                src.cbp, src.cpsm, static_cast<unsigned long long>(src.raw),
+                dstTex, dst.tbp, dst.tbw, dst.psm, dst.tw, dst.th,
+                dst.cbp, dst.cpsm, static_cast<unsigned long long>(dst.raw),
+                r0, r1, r2, r3, dstX, dstY, dir);
+        }
+    }
+    mgSetPkMoveImage__FP10mgCTexture9mgRect_i_P10mgCTextureiii_0x144560(rdram, ctx, runtime);
 }
 
 // G129: probe the SPI map-config WATER_VERTEX handler. If this fires during the title map load,
@@ -3381,6 +3797,93 @@ static void g58_assign_camera_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtim
         ++n;
         std::fprintf(stderr, "[G58:assigncam] scene=0x%x id=%u cam=0x%x name=0x%x ra=0x%x -> ret=%d slot%u.obj=0x%x\n",
                      scene, id, cam, name, ra, (int)ret, id, slotObj);
+        std::fflush(stderr);
+    }
+}
+
+// G193: town/edit-map flat-blue camera diagnosis. Orders, within the EditInit frame,
+// (a) the scene->Initialize() virtual dispatch (sets count=8, active=-1, clears slots),
+// (b) EditInit's 5 AssignCamera calls, and (c) any later writer that re-resets the state —
+// to pin why the runner ends the MAP-0 route at count=8/active=-1/slot0.obj=0 (flat blue
+// via the G127 zero-view-matrix mechanism) while real HW ends count=8/active=0/slots
+// populated (PCSX2 A/B, phase G192/G193). Quiet unless DC2_TRACE_G193.
+static bool g193_trace_enabled()
+{
+    static const bool enabled = dc2_env_flag_enabled("DC2_TRACE_G193");
+    return enabled;
+}
+
+static void g193_scene_snapshot(uint8_t *rdram, const char *tag, uint32_t scene, uint32_t ra)
+{
+    if (!g193_trace_enabled() || scene == 0u)
+        return;
+    static unsigned s_lines = 0u;
+    if (s_lines >= 64u)
+        return;
+    ++s_lines;
+    std::fprintf(stderr,
+                 "[G193:%s] scene=0x%x ra=0x%x vptr=0x%x count=%d active=%d slot0(w0=0x%x,obj=0x%x)\n",
+                 tag, scene, ra,
+                 dc2_read_u32(rdram, scene + 0x10548u),
+                 (int)dc2_read_u32(rdram, scene + 0x2044u),
+                 (int)dc2_read_u32(rdram, scene + 0x2E54u),
+                 dc2_read_u32(rdram, scene + 0x2048u + 0x00u),
+                 dc2_read_u32(rdram, scene + 0x2048u + 0x34u));
+    std::fflush(stderr);
+}
+
+static void g193_scene_initialize_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t scene = getRegU32(ctx, 4);
+    const uint32_t ra = getRegU32(ctx, 31);
+    g193_scene_snapshot(rdram, "SceneInit.enter", scene, ra);
+    Initialize__6CSceneFv_0x282ea0(rdram, ctx, runtime);
+    g193_scene_snapshot(rdram, "SceneInit.exit", scene, ra);
+}
+
+// forward decl (defined with the F50.4 dungeon-route repair below)
+static void f50_4_repair_main_scene_vtable(uint8_t *rdram);
+
+// G193 FIX (default-ON, kill DC2_G193_NO_SCENEVT_FIX=1): the F50.4 MainScene-vtable
+// repair, applied at EditInit entry. Root: __sinit_mainloop@0x373580 does not take
+// effect headless, so MainScene+0x10548 (__vt__6CScene) is 0. F50.4 repaired this at
+// InitDungeonMain entry only; the town/edit route (LoopInit[1] = EditInit@0x1A9F40) has
+// the IDENTICAL scene-entry dispatch (0x1AA930: lw t9,0x548(scene+0x10000); lw t9,0x8(t9);
+// jalr) which silently no-ops on the null vtable -> Initialize__6CScene never runs ->
+// camera count stays 0 -> EditInit's 5 AssignCamera calls all fail -> no active camera ->
+// zero view matrix -> every map part frustum-culled -> flat blue (G127 mechanism, G192/G193
+// diagnosis). Same idempotent restore-the-boot-invariant pattern as the dungeon fix.
+static void g193_edit_init_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    g_dc2TownDepthScope.store(false, std::memory_order_relaxed);
+    static const bool s_noFix = dc2_env_flag_enabled("DC2_G193_NO_SCENEVT_FIX");
+    if (!s_noFix)
+        f50_4_repair_main_scene_vtable(rdram);
+    const uint32_t ra = getRegU32(ctx, 31);
+    g193_scene_snapshot(rdram, "EditInit.enter", 0x01DD8260u, ra);
+    EditInit__F13INIT_LOOP_ARG_0x1a9f40(rdram, ctx, runtime);
+    g193_scene_snapshot(rdram, "EditInit.exit", 0x01DD8260u, ra);
+}
+
+static void g193_assign_camera_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t scene = getRegU32(ctx, 4);
+    const uint32_t id = getRegU32(ctx, 5);
+    const uint32_t cam = getRegU32(ctx, 6);
+    const uint32_t name = getRegU32(ctx, 7);
+    const uint32_t ra = getRegU32(ctx, 31);
+    const uint32_t countBefore = scene ? dc2_read_u32(rdram, scene + 0x2044u) : 0u;
+    AssignCamera__6CSceneFiP9mgCCameraPc_0x283740(rdram, ctx, runtime);
+    const uint32_t ret = getRegU32(ctx, 2);
+    const uint32_t slotObj = (scene && id < 8u) ? dc2_read_u32(rdram, scene + 0x2048u + 56u * id + 0x34u) : 0xFFFFFFFFu;
+    static unsigned n = 0u;
+    if (g193_trace_enabled() && n < 40u)
+    {
+        ++n;
+        std::fprintf(stderr,
+                     "[G193:assigncam] scene=0x%x id=%u cam=0x%x name=0x%x ra=0x%x countBefore=%d -> ret=%d slot%u.obj=0x%x active=%d\n",
+                     scene, id, cam, name, ra, (int)countBefore, (int)ret, id, slotObj,
+                     scene ? (int)dc2_read_u32(rdram, scene + 0x2E54u) : -999);
         std::fflush(stderr);
     }
 }
@@ -5104,6 +5607,124 @@ static void f59_log_frame(uint8_t *rdram, uint32_t n, uint32_t loopNo)
     std::fprintf(stderr,
                  "[F59:frame] n=%u frame=%u loopNo=%u DngStatus=%d DngMainMap=0x%x scale=%.3f flags=0x%x mapIdx=%d\n",
                  n, g_f40_frame_counter, loopNo, status, dngMap, scale, flags, (int32_t)mapIdx);
+}
+
+static bool g195_camera_trace_enabled()
+{
+    static const bool enabled = dc2_env_flag_enabled("DC2_G195_CAMERA_TRACE");
+    return enabled;
+}
+
+static float dc2_read_f32(uint8_t *rdram, uint32_t addr)
+{
+    const uint32_t bits = dc2_read_u32(rdram, addr);
+    float value = 0.0f;
+    std::memcpy(&value, &bits, sizeof(value));
+    return value;
+}
+
+static void g195_log_camera_state(uint8_t *rdram, uint32_t n, uint32_t loopNo)
+{
+    if (!g195_camera_trace_enabled())
+        return;
+
+    static uint32_t s_lines = 0u;
+    if ((n % 30u) != 0u || s_lines >= 220u)
+        return;
+    ++s_lines;
+
+    const uint32_t mainScene = dc2_read_u32(rdram, 0x003771A0u);
+    const uint32_t sceneCamId = mainScene ? dc2_read_u32(rdram, mainScene + 0x2E54u) : 0xFFFFFFFFu;
+    const uint32_t sceneMapId = mainScene ? dc2_read_u32(rdram, mainScene + 0x2E5Cu) : 0xFFFFFFFFu;
+    const uint32_t camera = dc2_read_u32(rdram, 0x0037714Cu);
+    const uint32_t eventCamera = dc2_read_u32(rdram, 0x00377150u);
+    const uint32_t fixCamera = dc2_read_u32(rdram, 0x00377154u);
+    const uint32_t editCamera = dc2_read_u32(rdram, 0x00377158u);
+    const uint32_t active = camera ? dc2_read_u32(rdram, camera + 0xF0u) : 0xFFFFFFFFu;
+    const uint32_t param = (camera && active < 4u) ? (camera + 0xF4u + active * 0x2Cu) : 0u;
+    const uint32_t backup = camera ? (camera + 0x1A4u) : 0u;
+
+    float p[10]{};
+    float b[10]{};
+    for (uint32_t i = 0; i < 10u; ++i)
+    {
+        p[i] = param ? dc2_read_f32(rdram, param + i * 4u) : 0.0f;
+        b[i] = backup ? dc2_read_f32(rdram, backup + i * 4u) : 0.0f;
+    }
+    const uint32_t pFlags = param ? dc2_read_u32(rdram, param + 0x28u) : 0u;
+    const uint32_t bFlags = backup ? dc2_read_u32(rdram, backup + 0x28u) : 0u;
+
+    std::fprintf(stderr,
+                 "[G195:camera] n=%u frame=%u loop=%u scene=0x%x sceneCam=%u sceneMap=%u "
+                 "cam=0x%x evt=0x%x fix=0x%x edit=0x%x active=%u "
+                 "pos={%.2f,%.2f,%.2f} ref={%.2f,%.2f,%.2f} "
+                 "param=0x%x p={%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f} pflags=0x%x "
+                 "backup={%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f} bflags=0x%x\n",
+                 n,
+                 g_f40_frame_counter,
+                 loopNo,
+                 mainScene,
+                 sceneCamId,
+                 sceneMapId,
+                 camera,
+                 eventCamera,
+                 fixCamera,
+                 editCamera,
+                 active,
+                 camera ? dc2_read_f32(rdram, camera + 0x00u) : 0.0f,
+                 camera ? dc2_read_f32(rdram, camera + 0x04u) : 0.0f,
+                 camera ? dc2_read_f32(rdram, camera + 0x08u) : 0.0f,
+                 camera ? dc2_read_f32(rdram, camera + 0x10u) : 0.0f,
+                 camera ? dc2_read_f32(rdram, camera + 0x14u) : 0.0f,
+                 camera ? dc2_read_f32(rdram, camera + 0x18u) : 0.0f,
+                 param,
+                 p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7], p[8], p[9],
+                 pFlags,
+                 b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7], b[8], b[9],
+                 bFlags);
+}
+
+static bool g202_town_depth_trace_enabled()
+{
+    static const bool enabled = dc2_env_flag_enabled("DC2_G202_TOWN_Z_STAT");
+    return enabled;
+}
+
+static bool g202_town_depth_ready(uint8_t *rdram, uint32_t loopNo)
+{
+    if (loopNo != 1u) // edit/town loop; excludes debug menu, title/loading, and dungeon
+        return false;
+    const uint32_t mainScene = dc2_read_u32(rdram, 0x003771A0u);
+    const uint32_t camera = dc2_read_u32(rdram, 0x0037714Cu);
+    if (mainScene == 0u || camera == 0u)
+        return false;
+    const uint32_t sceneCamId = dc2_read_u32(rdram, mainScene + 0x2E54u);
+    const uint32_t sceneMapId = dc2_read_u32(rdram, mainScene + 0x2E5Cu);
+    const uint32_t activeCam = dc2_read_u32(rdram, camera + 0xF0u);
+    return sceneCamId < 0x80u && sceneMapId < 0x80u && activeCam < 4u;
+}
+
+static void g202_update_town_depth_scope(uint8_t *rdram, uint32_t n, uint32_t scriptFrame, uint32_t loopNo)
+{
+    const bool ready = g202_town_depth_ready(rdram, loopNo);
+    const bool prev = g_dc2TownDepthScope.exchange(ready, std::memory_order_relaxed);
+    if (!g202_town_depth_trace_enabled())
+        return;
+
+    static uint32_t s_lines = 0u;
+    if (s_lines >= 80u || (prev == ready && (n % 120u) != 0u))
+        return;
+    ++s_lines;
+
+    const uint32_t mainScene = dc2_read_u32(rdram, 0x003771A0u);
+    const uint32_t camera = dc2_read_u32(rdram, 0x0037714Cu);
+    const uint32_t sceneCamId = mainScene ? dc2_read_u32(rdram, mainScene + 0x2E54u) : 0xFFFFFFFFu;
+    const uint32_t sceneMapId = mainScene ? dc2_read_u32(rdram, mainScene + 0x2E5Cu) : 0xFFFFFFFFu;
+    const uint32_t activeCam = camera ? dc2_read_u32(rdram, camera + 0xF0u) : 0xFFFFFFFFu;
+    std::fprintf(stderr,
+                 "[G202:scope] n=%u frame=%u loop=%u ready=%u prev=%u scene=0x%x sceneCam=%u sceneMap=%u camera=0x%x active=%u\n",
+                 n, scriptFrame, loopNo, ready ? 1u : 0u, prev ? 1u : 0u, mainScene,
+                 sceneCamId, sceneMapId, camera, activeCam);
 }
 
 // F57: per-PRESENTED-FRAME logger (called from f29_mgendframe_probe, which fires
@@ -6871,7 +7492,9 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
     f47_log_menu_state(rdram, ctx, n, scriptFrame, loopNo, nextLoopNo);
     f57_log_frame_loop(rdram, n, loopNo, nextLoopNo);
     f59_log_frame(rdram, n, loopNo);
+    g195_log_camera_state(rdram, n, loopNo);
     g154_observe_frame(rdram, n, scriptFrame, loopNo, nextLoopNo);
+    g202_update_town_depth_scope(rdram, n, scriptFrame, loopNo);
     g_f40_frame_counter = scriptFrame;
     f40_drive_pad(scriptFrame, loopNo);
 }
@@ -8245,6 +8868,27 @@ static void g15_actor_draw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                      f50, f54, f58, f60, f64, f68, f70);
 }
 
+// PHASE G205: is Draw__12CActionCharaFv (0x16b850, the non-Direct field-character group
+// draw, walks the +0x678 linked list calling Draw__11CCharacter2Fv) even reached on the
+// town route? DrawDirect__11CCharacter2Fv (costume path, G204's assumption) and
+// Draw__11CCharacter2Fv both traced 0 hits at their raw-body entry on MAP-4 -- this probe
+// checks the level above. Gated on DC2_G205_FVAR13_TRACE (shared with the recomp-file
+// raw-body traces added this phase; see phase-G205-fix-log.md).
+static bool g205_trace_enabled()
+{
+    static const bool enabled = dc2_env_flag_enabled("DC2_G205_FVAR13_TRACE");
+    return enabled;
+}
+static std::atomic<uint32_t> g_g205_actionchara{0};
+static void g205_actionchara_draw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t self = getRegU32(ctx, 4);
+    const uint32_t n = g_g205_actionchara.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (n <= 40u || (n % 240u) == 0u)
+        std::fprintf(stderr, "[G205:actionCharaDraw] n=%u this=0x%x\n", n, self);
+    Draw__12CActionCharaFv_0x16b850(rdram, ctx, runtime);
+}
+
 static void g15_char_draw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     const uint32_t gp = getRegU32(ctx, 28);
@@ -8408,6 +9052,215 @@ static bool g67_trace_enabled()
 
 static std::atomic<uint32_t> g_g16_crip{0};
 static std::atomic<uint32_t> g_g30_crip{0};
+static std::atomic<uint32_t> g_g217HeadStatePacket{0u};
+static std::atomic<uint32_t> g_g217CapStatePacket{0u};
+
+// G217: runner-side counterpart to tools/g217_pcsx2_head_objects.ps1.  Observe both
+// CreateRenderInfoPacket entry points, identify visuals by their material TEX0 pages, then
+// tail-call the real body without any post-call fixup.  The non-static atomics arm a one-shot
+// correlation in ps2_memory.cpp: SendDMA must copy this visual's scratch packet to a1 before
+// another visual can reuse the packet slot.  Default off; registration itself is conditional
+// on DC2_G217_EEOBJ.
+static uint32_t g217_head_kind(uint8_t *rdram, uint32_t self)
+{
+    uint32_t matCount = self ? dc2_read_u32(rdram, self + 0x40u) : 0u;
+    const uint32_t matBase = self ? dc2_read_u32(rdram, self + 0x44u) : 0u;
+    if (matCount > 64u) matCount = 64u;
+    uint32_t kind = 0u;
+    for (uint32_t m = 0u; matBase != 0u && m < matCount; ++m)
+    {
+        const uint32_t texture = dc2_read_u32(rdram, matBase + m * 0x30u + 0x20u);
+        if (texture == 0u) continue;
+        const uint32_t tbp = dc2_read_u32(rdram, texture + 0x38u) & 0x3fffu;
+        if (tbp == 0x3420u) kind |= 1u;
+        if (tbp == 0x35a0u) kind |= 2u;
+    }
+    return kind;
+}
+
+static void g217_trace_eeobj(uint8_t *rdram, R5900Context *ctx)
+{
+    const uint32_t self = getRegU32(ctx, 4);
+    const uint32_t packet = getRegU32(ctx, 5) & 0x0fffffffu;
+    const uint32_t matrix = getRegU32(ctx, 6);
+    const uint32_t info = getRegU32(ctx, 7);
+    const uint32_t desc = info ? dc2_read_u32(rdram, info + 0xfccu) : 0u;
+    const uint32_t d2c = desc ? dc2_read_u32(rdram, desc + 0x2cu) : 0xffffffffu;
+    uint32_t matCount = self ? dc2_read_u32(rdram, self + 0x40u) : 0u;
+    const uint32_t matBase = self ? dc2_read_u32(rdram, self + 0x44u) : 0u;
+    if (matCount > 64u) matCount = 64u;
+
+    uint32_t pages[16]{};
+    uint32_t pageCount = 0u;
+    bool headPage = false;
+    if (matBase != 0u)
+    {
+        for (uint32_t m = 0u; m < matCount; ++m)
+        {
+            const uint32_t material = matBase + m * 0x30u;
+            const uint32_t texture = dc2_read_u32(rdram, material + 0x20u);
+            if (texture == 0u) continue;
+            const uint32_t tbp = dc2_read_u32(rdram, texture + 0x38u) & 0x3fffu;
+            if (tbp == 0u) continue;
+            bool duplicate = false;
+            for (uint32_t i = 0u; i < pageCount; ++i)
+                if (pages[i] == tbp) { duplicate = true; break; }
+            if (!duplicate && pageCount < 16u) pages[pageCount++] = tbp;
+            if (tbp == 0x3420u || tbp == 0x35a0u) headPage = true;
+        }
+    }
+
+    if (headPage)
+    {
+        uint32_t headKind = 0u;
+        for (uint32_t i = 0u; i < pageCount; ++i)
+        {
+            if (pages[i] == 0x3420u) headKind |= 1u;
+            if (pages[i] == 0x35a0u) headKind |= 2u;
+        }
+        g_dc2G217HeadDmaSelf.store(self, std::memory_order_relaxed);
+        g_dc2G217HeadDmaKind.store(headKind, std::memory_order_relaxed);
+        g_dc2G217HeadDmaPacket.store(packet, std::memory_order_release);
+        if ((headKind & 1u) != 0u)
+            g_g217HeadStatePacket.store(packet, std::memory_order_release);
+        if ((headKind & 2u) != 0u)
+            g_g217CapStatePacket.store(packet, std::memory_order_release);
+
+        static std::atomic<uint32_t> s_g217EeCount{0};
+        const uint32_t n = s_g217EeCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 2048u)
+        {
+            char pageText[192]{};
+            int pos = 0;
+            for (uint32_t i = 0u; i < pageCount && pos < static_cast<int>(sizeof(pageText)); ++i)
+                pos += std::snprintf(pageText + pos, sizeof(pageText) - static_cast<size_t>(pos),
+                                     "%s0x%x", i ? "," : "", pages[i]);
+            std::fprintf(stderr,
+                "[G217:eeobj] n=%u tick=%llu self=0x%08x packet=0x%08x matrix=0x%08x info=0x%08x desc=0x%08x d2c=0x%x mats=%u pages=%s\n",
+                n, static_cast<unsigned long long>(g_dc2PresentTick.load(std::memory_order_relaxed)),
+                self, packet, matrix, info, desc, d2c, matCount, pageText);
+        }
+    }
+
+}
+
+static void g217_base_createpacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    g217_trace_eeobj(rdram, ctx);
+    // Deliberately no post-call code: if the recompiled body yields, its resume PC must pass
+    // straight back to the dispatcher without a wrapper-side PC/SP fixup (G57/G186 rule).
+    CreateRenderInfoPacket__12mgCVisualMDTFPUiPA4_fP13mgRENDER_INFO_0x1404d0(rdram, ctx, runtime);
+}
+
+static void g217_motion_createpacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    g217_trace_eeobj(rdram, ctx);
+    CreateRenderInfoPacket__18mgCVisualMotionMDTFPUiPA4_fP13mgRENDER_INFO_0x28a660(rdram, ctx, runtime);
+}
+
+static void g217_facepacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t self = getRegU32(ctx, 4);
+    const uint32_t packet = getRegU32(ctx, 5) & 0x0fffffffu;
+    const uint32_t face = getRegU32(ctx, 6);
+    const uint32_t kind = g217_head_kind(rdram, self);
+    if (kind != 0u)
+    {
+        g_dc2G217HeadDmaSelf.store(self, std::memory_order_relaxed);
+        g_dc2G217HeadDmaKind.store(kind | 0x100u, std::memory_order_relaxed);
+        g_dc2G217HeadDmaPacket.store(packet, std::memory_order_release);
+        static std::atomic<uint32_t> s_g217FaceCount{0};
+        const uint32_t n = s_g217FaceCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 4096u)
+        {
+            std::fprintf(stderr,
+                "[G217:eeface] n=%u tick=%llu self=0x%08x kind=%u packet=0x%08x face=0x%08x count=%d data=0x%08x\n",
+                n, static_cast<unsigned long long>(g_dc2PresentTick.load(std::memory_order_relaxed)),
+                self, kind, packet, face,
+                face ? static_cast<int16_t>(dc2_read_u32(rdram, face + 8u) & 0xffffu) : 0,
+                face ? dc2_read_u32(rdram, face + 0xcu) : 0u);
+        }
+    }
+    CreateFacePacket__12mgCVisualMDTFPUiP7mgCFace_0x13ff60(rdram, ctx, runtime);
+}
+
+static void g217_trace_createpacket(uint8_t *rdram, R5900Context *ctx)
+{
+    const uint32_t self = getRegU32(ctx, 4);
+    const uint32_t manager = getRegU32(ctx, 5);
+    const uint32_t kind = g217_head_kind(rdram, self);
+    if (kind != 0u)
+    {
+        uint32_t groups = 0u;
+        uint32_t faces = 0u;
+        uint32_t vertices = 0u;
+        uint32_t materialSig = 2166136261u;
+        uint32_t group = dc2_read_u32(rdram, self + 0x48u);
+        while (group != 0u && groups < 64u)
+        {
+            const uint32_t material = dc2_read_u32(rdram, group + 0x00u);
+            materialSig = (materialSig ^ material) * 16777619u;
+            uint32_t face = dc2_read_u32(rdram, group + 0x04u);
+            uint32_t groupFaces = 0u;
+            while (face != 0u && groupFaces < 256u)
+            {
+                vertices += static_cast<uint16_t>(dc2_read_u32(rdram, face + 0x08u) & 0xffffu);
+                face = dc2_read_u32(rdram, face + 0x10u);
+                ++groupFaces;
+            }
+            faces += groupFaces;
+            group = dc2_read_u32(rdram, group + 0x08u);
+            ++groups;
+        }
+        static std::atomic<uint32_t> s_g217PacketCount{0};
+        const uint32_t n = s_g217PacketCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 4096u)
+        {
+            std::fprintf(stderr,
+                "[G217:eepacket] n=%u tick=%llu self=0x%08x kind=%u manager=0x%08x head=0x%08x groups=%u faces=%u vertices=%u materialSig=%08x\n",
+                n, static_cast<unsigned long long>(g_dc2PresentTick.load(std::memory_order_relaxed)),
+                self, kind, manager, dc2_read_u32(rdram, self + 0x48u),
+                groups, faces, vertices, materialSig);
+        }
+    }
+}
+
+static void g217_createpacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    g217_trace_createpacket(rdram, ctx);
+    CreatePacket__12mgCVisualMDTFP14mgCDrawManager_0x13f6a0(rdram, ctx, runtime);
+}
+
+static void g217_fix_createpacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    g217_trace_createpacket(rdram, ctx);
+    CreatePacket__15mgCVisualFixMDTFP14mgCDrawManager_0x13f920(rdram, ctx, runtime);
+}
+
+static void g217_mdt_draw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t self = getRegU32(ctx, 4);
+    const uint32_t kind = g217_head_kind(rdram, self);
+    if (kind != 0u)
+    {
+        const uint32_t direct = getRegU32(ctx, 5) & 0x0fffffffu;
+        const uint32_t slot = g_dc2G217DirectPacketWrite.fetch_add(
+            1u, std::memory_order_relaxed) % 128u;
+        g_dc2G217DirectPackets[slot].store(direct, std::memory_order_release);
+        static std::atomic<uint32_t> s_g217DrawCount{0u};
+        const uint32_t n = s_g217DrawCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 512u || (n % 720u) == 0u)
+        {
+            std::fprintf(stderr,
+                "[G217:eedraw] n=%u tick=%llu self=0x%08x kind=%u direct=0x%08x matrix=0x%08x manager=0x%08x ra=0x%08x\n",
+                n, static_cast<unsigned long long>(g_dc2PresentTick.load(std::memory_order_relaxed)),
+                self, kind, direct, getRegU32(ctx, 6),
+                getRegU32(ctx, 7), getRegU32(ctx, 31));
+            std::fflush(stderr);
+        }
+    }
+    Draw__12mgCVisualMDTFPUiPA4_fP14mgCDrawManager_0x13f4e0(rdram, ctx, runtime);
+}
 
 static void g16_createpacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
@@ -8522,6 +9375,33 @@ static void g16_createpacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime
             }
             if (matrix)
                 dumpMat(matrix, 0x0u, "world");
+            std::fflush(stderr);
+        }
+    }
+    // G199: EE-side producer trace for VU1 data-memory quadword 30 (G198's map-only 0x0/0x20
+    // divergence). Hypothesis from static analysis: CreateRenderInfoPacket's optional block
+    // gated by info+0xfc4 uploads 8 quadwords at VU1 ADDR 25..32 (VIFcode 0x6c080019 at
+    // asm 0x1409d8); the 6th quadword of that block (VU1 ADDR 30) is copied VERBATIM from
+    // info+0x270..info+0x27c. Dump the gate flag + that raw quadword BEFORE the real call runs
+    // (captures exactly what this call will upload, or would skip uploading if fc4==0 -- in
+    // which case VU1 addr 30 keeps whatever a PRIOR object's kick left there). Default-off
+    // (DC2_G199_QW30), unscoped (need both title and map data), first 300 + every 500th call.
+    if (std::getenv("DC2_G199_QW30") != nullptr && info)
+    {
+        static std::atomic<uint32_t> s_g199n{0};
+        const uint32_t n = s_g199n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 300u || (n % 500u) == 0u)
+        {
+            const uint32_t fc4 = dc2_read_u32(rdram, info + 0xfc4u);
+            const uint32_t desc = dc2_read_u32(rdram, info + 0xfccu);
+            const uint32_t q30x = dc2_read_u32(rdram, info + 0x270u);
+            const uint32_t q30y = dc2_read_u32(rdram, info + 0x274u);
+            const uint32_t q30z = dc2_read_u32(rdram, info + 0x278u);
+            const uint32_t q30w = dc2_read_u32(rdram, info + 0x27cu);
+            std::fprintf(stderr,
+                "[G199:qw30src] n=%u self=0x%x info=0x%x desc=0x%x fc4=%u blockEmitted=%d "
+                "q30=0x%08x,0x%08x,0x%08x,0x%08x\n",
+                n, self, info, desc, fc4, fc4 != 0u ? 1 : 0, q30x, q30y, q30z, q30w);
             std::fflush(stderr);
         }
     }
@@ -9862,6 +10742,48 @@ static void g78_frame_clipinbox_fix(uint8_t *rdram, R5900Context *ctx, PS2Runtim
     }
 }
 
+// G215: EE-side per-frame cull discriminator for the MAP-4 head/cap drop. The character model
+// VIF packets are BUILT synchronously on the EE thread inside the COutLineDraw window
+// (g_g37_in_outline>0) but VU1-EXECUTED later at the deferred frame flush, so a VU1-side probe
+// scoped to that window sees nothing (proven G215). This probe instead observes the EE-side
+// traversal Draw__8mgCFrame@0x137e10 does, whose own-mesh emit is gated by mgClipBoxW/test1 — a
+// camera-angle-dependent per-frame bbox cull. ret==0 with a non-null visual (f4) at a frame that
+// returns >0 from another camera angle => the EE frustum/guard cull dropped it upstream of VU1.
+static bool g215_frame_enabled()
+{
+    static const bool e = dc2_env_flag_enabled("DC2_G215_FRAME");
+    return e;
+}
+
+// G215: dump the runner's live guard/clip data and compare to the real-HW reference read from
+// PCSX2 at MAP-4 (mgRenderInfo idx 0x3a8..: max(2329.6,2276.8) min(1766.4,1819.2) guard(4095,1);
+// EE mgClipBoxW: DAT_381da0=(256,208,0,30000) DAT_381db0=(-256,-208,0,3)). A divergence here is a
+// guard-data root: the VU1 per-vertex guard would cull on-screen head verts the EE frame test (which
+// passes, all frames ret>0) admits. Throttled, default-off (DC2_G215_GUARD).
+static void g215_dump_guard(uint8_t *rdram)
+{
+    static const bool en = dc2_env_flag_enabled("DC2_G215_GUARD");
+    if (!en) return;
+    static std::atomic<uint32_t> s_n{0};
+    const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed);
+    if (n != 0u && (n % 200u) != 0u) return;
+    auto rf = [&](uint32_t a) { uint32_t u = dc2_read_u32(rdram, a); float f; std::memcpy(&f, &u, sizeof(f)); return static_cast<double>(f); };
+    const uint32_t ri = dc2_read_u32(rdram, 0x00382144u);
+    std::fprintf(stderr, "[G215:guard] n=%u ri=0x%x d381d48=%g\n", n, ri, rf(0x00381d48u));
+    std::fprintf(stderr, "[G215:guard]   EEclip max=(%g,%g,%g,%g) min=(%g,%g,%g,%g) band=(%g,%g)/(%g,%g)\n",
+                 rf(0x00381da0u), rf(0x00381da4u), rf(0x00381da8u), rf(0x00381dacu),
+                 rf(0x00381db0u), rf(0x00381db4u), rf(0x00381db8u), rf(0x00381dbcu),
+                 rf(0x00381dc0u), rf(0x00381dc4u), rf(0x00381dd0u), rf(0x00381dd4u));
+    if (ri > 0x100000u && ri < 0x2000000u)
+    {
+        std::fprintf(stderr, "[G215:guard]   VUguard max=(%g,%g,%g,%g) min=(%g,%g,%g,%g) band max=(%g,%g) min=(%g,%g)\n",
+                     rf(ri + 0x3a8u * 4u), rf(ri + 0x3a9u * 4u), rf(ri + 0x3aau * 4u), rf(ri + 0x3abu * 4u),
+                     rf(ri + 0x3acu * 4u), rf(ri + 0x3adu * 4u), rf(ri + 0x3aeu * 4u), rf(ri + 0x3afu * 4u),
+                     rf(ri + 0x3b0u * 4u), rf(ri + 0x3b1u * 4u), rf(ri + 0x3b4u * 4u), rf(ri + 0x3b5u * 4u));
+    }
+    std::fflush(stderr);
+}
+
 static void g67_frame_draw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     const bool trace = g67_trace_enabled();
@@ -9910,6 +10832,19 @@ static void g67_frame_draw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
     Draw__8mgCFrameFPUi_0x137e10(rdram, ctx, runtime);
 
     const uint32_t ret = getRegU32(ctx, 2);
+    g215_dump_guard(rdram);
+    // G215: character-window per-frame emit trace (default-off; needs DC2_G205_FVAR13_TRACE for
+    // the outline wrapper that sets g_g37_in_outline). Read-only post-call (safe per G212 audit).
+    if (g215_frame_enabled() && g_g37_in_outline.load(std::memory_order_relaxed) > 0)
+    {
+        static std::atomic<uint32_t> s_g215fseq{0};
+        const uint32_t fs = s_g215fseq.fetch_add(1u, std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "[G215:frame] seq=%u tick=%llu frame=0x%x f0=0x%x f4=0x%x f8=0x%x child=0x%x ret=0x%x\n",
+                     fs, (unsigned long long)g_dc2PresentTick.load(std::memory_order_relaxed),
+                     frame, f0, f4, f8, child, ret);
+        std::fflush(stderr);
+    }
     if (!track)
         return;
 
@@ -10142,6 +11077,9 @@ static void g67_mgenddraw_reload_probe(uint8_t *rdram, R5900Context *ctx, PS2Run
 static void g67_mgenddraw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     const bool trace = g67_trace_enabled() && g67_title_scope(rdram, ctx);
+    static const bool g195BlockTrace = dc2_env_flag_enabled("DC2_G195_FG_TRACE") ||
+                                       dc2_env_flag_enabled("DC2_G195_BLOCK_TRACE") ||
+                                       (std::getenv("DC2_G88_GEO") != nullptr);
     const int32_t reqBlock = static_cast<int32_t>(getRegU32(ctx, 4));
     const uint32_t mgrArg = getRegU32(ctx, 5);
     const uint32_t mgr = mgrArg ? mgrArg : 0x003820E0u;
@@ -10164,10 +11102,10 @@ static void g67_mgenddraw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *r
     // G90: tag the rasterizer with the block currently flushing so [G88:geo] can attribute
     // each drawn rock triangle to its source block.
     const bool inTitle = g67_title_scope(rdram, ctx);
-    if (inTitle)
+    if (inTitle || g195BlockTrace)
         g_dc2TitleCurBlock.store(reqBlock, std::memory_order_relaxed);
     mgEndDraw__FiP14mgCDrawManager_0x142580(rdram, ctx, runtime);
-    if (inTitle)
+    if (inTitle || g195BlockTrace)
         g_dc2TitleCurBlock.store(-1, std::memory_order_relaxed);
 }
 
@@ -10500,8 +11438,9 @@ static void g91_drawmgr_flush_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtim
     const uint32_t ra = getRegU32(ctx, 31);
     const bool inTitle = g67_title_scope(rdram, ctx);
     const bool g91 = (std::getenv("DC2_G91_FLUSH") != nullptr) && inTitle;
+    const bool g195Block = dc2_env_flag_enabled("DC2_G195_BLOCK_TRACE");
 
-    if (g91)
+    if (g91 || g195Block)
     {
         // Replicate the read-only batch-array resolution from Draw__14mgCDrawManager@0x135720.
         const uint32_t texInfo = dc2_read_u32(rdram, mgr + 0x58u);
@@ -10516,7 +11455,7 @@ static void g91_drawmgr_flush_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtim
             const uint32_t cnt = (block >= 0) ? dc2_read_u32(rdram, dc2_read_u32(rdram, mgr + 0x18u) + (uint32_t)block * 4u) : 0u;
             static std::atomic<uint32_t> s_n{0};
             const uint32_t call = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
-            if (head != 0u && call <= 12u)
+            if (head != 0u && (g195Block || call <= 12u))
             {
                 for (uint32_t i = 0u; i < cnt && i < 256u; ++i)
                 {
@@ -10530,6 +11469,26 @@ static void g91_drawmgr_flush_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtim
                     G67TexHit hits[6]{};
                     uint32_t hc = 0u;
                     g67_scan_tex0_range_limited(rdram, statePkt, 0x400u, 0x400u, hits, &hc);
+                    bool hit2a20 = false;
+                    for (uint32_t h = 0u; h < hc; ++h)
+                        hit2a20 |= (hits[h].tbp == 0x2a20u);
+                    if (g195Block && hit2a20)
+                    {
+                        static std::atomic<uint32_t> s_g195DrawMgr{0};
+                        const uint32_t n = s_g195DrawMgr.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                        if (n <= 256u || (n % 720u) == 0u)
+                        {
+                            char line[640];
+                            int p = std::snprintf(line, sizeof(line),
+                                "[G195:drawmgr] n=%u call=%u ra=0x%x mgr=0x%x blockArg=%d block=%d "
+                                "i=%u/%u batch=0x%x blkIdx=%d vuProg=0x%x state=0x%x geom=0x%x stateTbp=",
+                                n, call, ra, mgr, blockArg, block, i, cnt, batch, blkIdx, vuProg, statePkt, geomPkt);
+                            g67_append_tex_hits(line, sizeof(line), &p, hits, hc);
+                            std::fprintf(stderr, "%s\n", line);
+                        }
+                    }
+                    if (!g91 || call > 12u)
+                        continue;
                     char line[640];
                     int p = std::snprintf(line, sizeof(line),
                         "[G91:flush] call=%u blockArg=%d block=%d i=%u/%u batch=0x%x blkIdx=%d vuProg=0x%x state=0x%x geom=0x%x stateTbp=",
@@ -10742,9 +11701,21 @@ static void g67_addpacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *r
     const uint32_t texNode = getRegU32(ctx, 2);
     const uint32_t self = getRegU32(ctx, 16);
     const uint32_t node = getRegU32(ctx, 17);
+    uint32_t g217Kind = 0u;
+    if (dc2_env_flag_enabled("DC2_G217_EEOBJ"))
+    {
+        const uint32_t statePhys = state & 0x0fffffffu;
+        if (statePhys == g_g217HeadStatePacket.load(std::memory_order_acquire)) g217Kind |= 1u;
+        if (statePhys == g_g217CapStatePacket.load(std::memory_order_acquire)) g217Kind |= 2u;
+    }
+    const uint32_t g217HeadPtr = (g217Kind != 0u && g43_guest_ram_addr(mgr))
+        ? dc2_read_u32(rdram, mgr + 0x50u) : 0u;
+    const uint32_t g217PreHead = g43_guest_ram_addr(g217HeadPtr)
+        ? dc2_read_u32(rdram, g217HeadPtr) : 0u;
     const bool addScope = g67_addpacket_scope(rdram, ctx, self, state);
     const bool g135Src = g135_src_trace_enabled() && addScope;
     const bool g95AddMini = g95_add_mini_tex0_enabled() && g67_title_scope(rdram, ctx);
+    const bool g195Block = dc2_env_flag_enabled("DC2_G195_BLOCK_TRACE");
 
     G67TexHit stateHits[6]{};
     G67TexHit packetHits[6]{};
@@ -10768,7 +11739,7 @@ static void g67_addpacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *r
         g95PreHead = g43_guest_ram_addr(g95ListHeadPtr) ? dc2_read_u32(rdram, g95ListHeadPtr) : 0u;
     }
 
-    if ((trace || g135Src) && addScope)
+    if (((trace || g135Src) && addScope) || g195Block)
     {
         const uint64_t tex0 = g43_guest_ram_addr(texNode) ? dc2_read_u64(rdram, texNode + 0x38u) : 0u;
         if (tex0 != 0u)
@@ -10781,6 +11752,67 @@ static void g67_addpacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *r
     }
 
     AddPacket__14mgCDrawManagerFiP1P1i_0x1359d0(rdram, ctx, runtime);
+
+    if (g217Kind != 0u)
+    {
+        const uint32_t batch = g43_guest_ram_addr(g217HeadPtr)
+            ? dc2_read_u32(rdram, g217HeadPtr) : 0u;
+        const bool linked = g43_guest_ram_addr(batch) && batch != g217PreHead &&
+            dc2_read_u32(rdram, batch + 0x00u) == state &&
+            dc2_read_u32(rdram, batch + 0x04u) == packet;
+        static std::atomic<uint32_t> s_g217AddPacket{0u};
+        const uint32_t n = s_g217AddPacket.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 512u || (n % 720u) == 0u)
+        {
+            std::fprintf(stderr,
+                "[G217:addpacket] n=%u tick=%llu kind=%u mgr=0x%08x req=%d state=0x%08x geom=0x%08x vprog=0x%08x headPtr=0x%08x pre=0x%08x post=0x%08x linked=%u block=%d batchVu=0x%x next=0x%08x\n",
+                n, static_cast<unsigned long long>(g_dc2PresentTick.load(std::memory_order_relaxed)),
+                g217Kind, mgr, reqArg, state, packet, vprog, g217HeadPtr,
+                g217PreHead, batch, linked ? 1u : 0u,
+                g43_guest_ram_addr(batch) ? static_cast<int32_t>(static_cast<int16_t>(g67_read_u16(rdram, batch + 0x0cu))) : -1,
+                g43_guest_ram_addr(batch) ? static_cast<uint32_t>(g67_read_u16(rdram, batch + 0x0eu)) : 0u,
+                g43_guest_ram_addr(batch) ? dc2_read_u32(rdram, batch + 0x08u) : 0u);
+            std::fflush(stderr);
+        }
+    }
+
+    if (g195Block)
+    {
+        bool hit2a20 = (tbp == 0x2a20u);
+        for (uint32_t h = 0u; h < stateHitCount; ++h)
+            hit2a20 |= (stateHits[h].tbp == 0x2a20u);
+        for (uint32_t h = 0u; h < packetHitCount; ++h)
+            hit2a20 |= (packetHits[h].tbp == 0x2a20u);
+
+        if (hit2a20)
+        {
+            static std::atomic<uint32_t> s_g195Add{0};
+            const uint32_t n = s_g195Add.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 256u || (n % 720u) == 0u)
+            {
+                const uint32_t listHeadPtr = g43_guest_ram_addr(mgr) ? dc2_read_u32(rdram, mgr + 0x50u) : 0u;
+                const uint32_t batch = g43_guest_ram_addr(listHeadPtr) ? dc2_read_u32(rdram, listHeadPtr) : 0u;
+                const bool batchOk = g43_guest_ram_addr(batch) &&
+                    dc2_read_u32(rdram, batch + 0x00u) == state &&
+                    dc2_read_u32(rdram, batch + 0x04u) == packet;
+                char line[1024];
+                int p = std::snprintf(line, sizeof(line),
+                    "[G195:addpacket] n=%u ra=0x%x mgr=0x%x reqArg=%d state=0x%x packet=0x%x vprog=0x%x "
+                    "self=0x%x node=0x%x texNode=0x%x reqNode=%d tex0(tbp=0x%x psm=0x%x cbp=0x%x) "
+                    "batch=0x%x batchOk=%u batchBlk=%d batchVu=0x%x",
+                    n, getRegU32(ctx, 31), mgr, reqArg, state, packet, vprog, self, node, texNode,
+                    reqNode, tbp, psm, cbp, batch, batchOk ? 1u : 0u,
+                    batchOk ? static_cast<int32_t>(static_cast<int16_t>(g67_read_u16(rdram, batch + 0x0Cu))) : -1,
+                    batchOk ? static_cast<uint32_t>(g67_read_u16(rdram, batch + 0x0Eu)) : 0u);
+                if (stateHitCount != 0u)
+                    g135_append_hit_text(line, sizeof(line), &p, "state", stateHits, stateHitCount);
+                if (packetHitCount != 0u)
+                    g135_append_hit_text(line, sizeof(line), &p, "packet", packetHits, packetHitCount);
+                std::fprintf(stderr, "%s\n", line);
+                std::fflush(stderr);
+            }
+        }
+    }
 
     if (g95AddMini && g95HaveTex0 && g43_guest_ram_addr(g95ListHeadPtr))
     {
@@ -11276,6 +12308,51 @@ static void g34_char_draw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *r
     }
 }
 
+// =====================================================================
+// PHASE G204: character LOD / part-count trace. DrawDirect__11CCharacter2
+// (0x1731f0) picks an LOD index from camera distance (threshold array at
+// this+0x350, count this+0x34c), calls ChangeLOD which stores the chosen
+// index at this+0x354 and the selected LOD data at this+0x358, then walks
+// the mesh frame list drawing each part. On MAP-4 the costume-menu Max (LOD 0,
+// close camera) renders the cap correctly but the town Max (farther camera)
+// drops the cap. This probe logs LOD count + chosen index (before AND after
+// the draw) + the dynamic-anime sub count (this+0x12c) so we can tell whether
+// town selects a higher, cap-less LOD than the costume route. Gated behind
+// DC2_G204_LOD_TRACE=1; registered on ANY route so town is observable.
+// =====================================================================
+static bool g204_lod_trace_enabled()
+{
+    static const bool e = dc2_env_flag_enabled("DC2_G204_LOD_TRACE");
+    return e;
+}
+static std::atomic<uint32_t> g_g204_char{0};
+static void g204_lod_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t self = getRegU32(ctx, 4);
+    const bool valid = (self > 0x80000u && self < 0x2000000u);
+    const uint32_t lodCount = valid ? dc2_read_u32(rdram, self + 0x34cu) : 0u;
+    const uint32_t lodBefore = valid ? dc2_read_u32(rdram, self + 0x354u) : 0u;
+    const uint32_t dynCount = valid ? dc2_read_u32(rdram, self + 0x12cu) : 0u;
+    const uint32_t outBits = valid ? dc2_read_u32(rdram, self + 0x100u) : 0u;
+    float outline; std::memcpy(&outline, &outBits, sizeof(outline));
+    // Object frame translation proxy (row2 of the this+0x10 transform block).
+    auto rf = [&](uint32_t off) { uint32_t b = valid ? dc2_read_u32(rdram, self + off) : 0u; float f; std::memcpy(&f, &b, sizeof(f)); return f; };
+    const float px = rf(0x30u), py = rf(0x34u), pz = rf(0x38u);
+    DrawDirect__11CCharacter2Fv_0x1731f0(rdram, ctx, runtime);
+    const uint32_t retCount = getRegU32(ctx, 2); // v0 = accumulated draw count
+    const uint32_t lodAfter = valid ? dc2_read_u32(rdram, self + 0x354u) : 0u;
+    const uint32_t lodData = valid ? dc2_read_u32(rdram, self + 0x358u) : 0u;
+    const uint32_t n = g_g204_char.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (n <= 24u || (n % 240u) == 0u)
+    {
+        std::fprintf(stderr,
+            "[G204:lod] n=%u this=0x%x ret=%u out(+0x100)=%g pos=(%.1f,%.1f,%.1f) lodCount=%d lodIdx %d->%d dynSub=%d\n",
+            n, self, retCount, (double)outline, (double)px, (double)py, (double)pz,
+            (int)lodCount, (int)lodBefore, (int)lodAfter, (int)dynCount);
+        std::fflush(stderr);
+    }
+}
+
 // Wrap Draw__12COutLineDraw::Draw@0x17c2d0. a0 = COutLineDraw this; param_1=f12,
 // param_2=f13 (== fVar13, the composite gate value). +0x64 must be 0, +0x38 is
 // outlineW (>0 selects the RTT-outline branch), +0x30/+0x34 are the frames.
@@ -11291,7 +12368,7 @@ static void g34_outline_draw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime
     const uint32_t v60 = valid ? dc2_read_u32(rdram, self + 0x60u) : 0u;
     const uint32_t v64 = valid ? dc2_read_u32(rdram, self + 0x64u) : 0u;
     const uint32_t n = g_g34_outline.fetch_add(1u, std::memory_order_relaxed) + 1u;
-    if (n <= 24u || (n % 240u) == 0u)
+    if (n <= 56u || (n % 240u) == 0u)
     {
         std::fprintf(stderr, "[G34:outline] n=%u this=0x%x p1=%g p2(fVar13)=%g p2ge1=%d +0x30=0x%x +0x34=0x%x +0x38(outlineW)=%g +0x60=0x%x +0x64=0x%x\n",
                      n, self, static_cast<double>(p1), static_cast<double>(p2),
@@ -11313,13 +12390,47 @@ static void g34_outline_draw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime
 // PCSX2-verified preview extents fixes the clear and the composite together; the G36
 // composite-rect patch then becomes a no-op backstop. mgVu0FBOX layout: +0x00 max.xyzw,
 // +0x10 min.xyzw (GetDrawRect writes sceVu0CopyVector(box,max) + (box+4,min)).
+static bool g206_bbox_trace_enabled();
+static bool g212_lwguard_disabled(); // G212: preempt-suppress guard kill switch (defined below)
 static std::atomic<uint32_t> g_g37_boxfix{0};
+static std::atomic<uint32_t> g_g206_bbox_costume{0};
 static void g37_getdrawrect_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
+    const uint32_t frame = getRegU32(ctx, 4); // a0 = mgCFrame* (G206 identity trace)
     const uint32_t box = getRegU32(ctx, 5); // a1 = mgVu0FBOX* output
+    // G212: this probe replaces the default g212_getdrawrect_guard in the function table,
+    // so it must reproduce the guard's preempt suppression (a yield escaping through this
+    // probe's direct C++ call is the exact G211 swallow; the probe would also read/REWRITE
+    // the box before the body logically finished).
+    if (!g212_lwguard_disabled())
+        g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
     mgGetDrawRect__FP8mgCFrameP9mgVu0FBOX_0x143160(rdram, ctx, runtime);
+    if (!g212_lwguard_disabled())
+        g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
+    const uint32_t retVal = getRegU32(ctx, 2);
+    // G206: read-only bbox trace on the COSTUME route too (same window/identity scheme
+    // as g206_getdrawrect_probe, but this route already has the box-fix wrapper on
+    // 0x143160 so we log inline here instead of double-registering).
+    if (g206_bbox_trace_enabled() && g_g37_in_outline.load(std::memory_order_relaxed) > 0)
+    {
+        float mx = 0, my = 0, nx = 0, ny = 0;
+        if (box > 0x80000u && box < 0x2000000u)
+        {
+            auto rf = [&](uint32_t off) { uint32_t u = dc2_read_u32(rdram, box + off); float f; std::memcpy(&f, &u, sizeof(f)); return f; };
+            mx = rf(0x00u); my = rf(0x04u); nx = rf(0x10u); ny = rf(0x14u);
+        }
+        const uint32_t n = g_g206_bbox_costume.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 56u || (n % 240u) == 0u)
+        {
+            std::fprintf(stderr,
+                         "[G206:bboxCostume] n=%u frame=0x%x ret=%u box=(x:%.1f..%.1f y:%.1f..%.1f)\n",
+                         n, frame, retVal, static_cast<double>(nx), static_cast<double>(mx),
+                         static_cast<double>(ny), static_cast<double>(my));
+            std::fflush(stderr);
+        }
+    }
     if (g_g37_in_outline.load(std::memory_order_relaxed) <= 0 ||
-        getRegU32(ctx, 2) == 0u ||                 // ret==0: not visible, COutLineDraw bails anyway
+        retVal == 0u ||                            // ret==0: not visible, COutLineDraw bails anyway
         box <= 0x80000u || box >= 0x2000000u)
         return;
 
@@ -11345,6 +12456,383 @@ static void g37_getdrawrect_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime 
                      "[G37:boxfix] n=%u box=0x%x oldmax=(%.2f,%.2f) oldmin=(%.2f,%.2f) -> max=(512,380.875) min=(223.9375,0)\n",
                      n, box, static_cast<double>(maxX), static_cast<double>(maxY),
                      static_cast<double>(minX), static_cast<double>(minY));
+        std::fflush(stderr);
+    }
+}
+
+// PHASE G206: read-only screen-bbox probe for mgGetDrawRect, scoped to the same
+// Draw__12COutLineDraw call window as g34/g37 (g_g37_in_outline) but WITHOUT the G37
+// costume-preview box rewrite -- town/field parts must not be stomped with the costume
+// RTT's hardcoded extents. Logs a0 (mgCFrame*, expected == a part's self+0x34 captured
+// by g34_outline_draw_probe) + the projected screen rect, to identify which of the 7
+// outline parts is the cap by screen position (see phase-G205-fix-log.md "Next").
+static bool g206_bbox_trace_enabled()
+{
+    static const bool enabled = dc2_env_flag_enabled("DC2_G206_BBOX_TRACE");
+    return enabled;
+}
+static std::atomic<uint32_t> g_g206_bbox{0};
+// PHASE G207: dense per-part visibility tabulation, layered on the G206 probe. A first
+// attempt keyed the tally by POSITIONAL index ((n-1)%8) assuming a fixed 8-call/frame
+// cycle starting at n=1 -- WRONG: the very first sampled call (n=1) is a one-off warm-up
+// outlier (different frame identity than the steady-state cycle), which phase-shifts every
+// later positional bucket by one and silently corrupts the whole tally (see fix-log
+// "Finding 0"). Key by the mgCFrame* IDENTITY itself instead (small fixed-size linear-probe
+// table; ~8 distinct parts expected) so the tally is immune to any positional drift.
+struct G207Slot {
+    std::atomic<uint32_t> addr{0}; std::atomic<uint32_t> total{0}; std::atomic<uint32_t> visible{0};
+    // PHASE G209: latest GetLWMatrix world-matrix snapshot for this identity (translation
+    // row + basis-X magnitude as a cheap degenerate-scale check), for skin-matrix hypothesis testing.
+    std::atomic<uint32_t> lwCalls{0};
+    std::atomic<uint32_t> tx{0}, ty{0}, tz{0}, scale0{0}; // float bits
+};
+static G207Slot g_g207_slots[16];
+// Find (or create) this identity's slot in the shared G207 table. Used by both the
+// GetDrawRect visibility probe and the G209 GetLWMatrix probe so results correlate.
+static uint32_t g207_slot_for(uint32_t frame)
+{
+    uint32_t slotIdx = 16;
+    for (uint32_t i = 0; i < 16; ++i)
+    {
+        uint32_t cur = g_g207_slots[i].addr.load(std::memory_order_relaxed);
+        if (cur == frame) { slotIdx = i; break; }
+        if (cur == 0u)
+        {
+            uint32_t expected = 0u;
+            if (g_g207_slots[i].addr.compare_exchange_strong(expected, frame, std::memory_order_relaxed) ||
+                expected == frame)
+            {
+                slotIdx = i;
+                break;
+            }
+        }
+    }
+    return slotIdx;
+}
+static void g206_getdrawrect_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t frame = getRegU32(ctx, 4); // a0 = mgCFrame*
+    const uint32_t box = getRegU32(ctx, 5);   // a1 = mgVu0FBOX* output
+    // G212: reproduce the default guard's preempt suppression (see g37_getdrawrect_probe).
+    if (!g212_lwguard_disabled())
+        g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
+    mgGetDrawRect__FP8mgCFrameP9mgVu0FBOX_0x143160(rdram, ctx, runtime);
+    if (!g212_lwguard_disabled())
+        g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
+    const uint32_t ret = getRegU32(ctx, 2);
+    if (g_g37_in_outline.load(std::memory_order_relaxed) <= 0 || box <= 0x80000u || box >= 0x2000000u)
+        return;
+    auto readF = [&](uint32_t off) { uint32_t u = dc2_read_u32(rdram, box + off); float f; std::memcpy(&f, &u, sizeof(f)); return f; };
+    const float maxX = readF(0x00u), maxY = readF(0x04u);
+    const float minX = readF(0x10u), minY = readF(0x14u);
+    const uint32_t n = g_g206_bbox.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    uint32_t slotIdx = g207_slot_for(frame);
+    if (slotIdx < 16)
+    {
+        g_g207_slots[slotIdx].total.fetch_add(1u, std::memory_order_relaxed);
+        if (ret != 0u)
+            g_g207_slots[slotIdx].visible.fetch_add(1u, std::memory_order_relaxed);
+    }
+    if (n <= 56u || (n % 240u) == 0u)
+    {
+        float tx = 0, ty = 0, tz = 0, s0 = 0; uint32_t lw = 0;
+        if (slotIdx < 16)
+        {
+            uint32_t b;
+            b = g_g207_slots[slotIdx].tx.load(std::memory_order_relaxed); std::memcpy(&tx, &b, sizeof(tx));
+            b = g_g207_slots[slotIdx].ty.load(std::memory_order_relaxed); std::memcpy(&ty, &b, sizeof(ty));
+            b = g_g207_slots[slotIdx].tz.load(std::memory_order_relaxed); std::memcpy(&tz, &b, sizeof(tz));
+            b = g_g207_slots[slotIdx].scale0.load(std::memory_order_relaxed); std::memcpy(&s0, &b, sizeof(s0));
+            lw = g_g207_slots[slotIdx].lwCalls.load(std::memory_order_relaxed);
+        }
+        std::fprintf(stderr,
+                     "[G206:bbox] n=%u frame=0x%x ret=%u box=(x:%.1f..%.1f y:%.1f..%.1f) lwPos=(%.2f,%.2f,%.2f) lwScale0=%.3f lwCalls=%u\n",
+                     n, frame, ret, static_cast<double>(minX), static_cast<double>(maxX),
+                     static_cast<double>(minY), static_cast<double>(maxY),
+                     static_cast<double>(tx), static_cast<double>(ty), static_cast<double>(tz),
+                     static_cast<double>(s0), lw);
+        std::fflush(stderr);
+    }
+    if ((n % 800u) == 0u)
+    {
+        std::fprintf(stderr, "[G207:stat] n=%u", n);
+        for (uint32_t i = 0; i < 16; ++i)
+        {
+            const uint32_t a = g_g207_slots[i].addr.load(std::memory_order_relaxed);
+            if (a == 0u)
+                continue;
+            const uint32_t tot = g_g207_slots[i].total.load(std::memory_order_relaxed);
+            const uint32_t vis = g_g207_slots[i].visible.load(std::memory_order_relaxed);
+            std::fprintf(stderr, " f=0x%x:%u/%u", a, vis, tot);
+        }
+        std::fprintf(stderr, "\n");
+        std::fflush(stderr);
+    }
+}
+
+// PHASE G209: test G207/G208's skin-matrix hypothesis for the MAP-4 cap-mesh flicker
+// (identity 0x8638b0 this session) directly. Wraps GetLWMatrix__8mgCFrame -- the world
+// (local-to-world joint chain) matrix builder GetDrawRect's AABB projection consumes --
+// and, scoped to the same outline-draw window as G206/G207, stashes the latest translation
+// (row3 xyz) + basis-X magnitude (cheap degenerate-scale check) into the SAME identity-keyed
+// g_g207_slots table, so g206_getdrawrect_probe's [G206:bbox] line can print the matrix that
+// produced each ret=0/ret=1 sample for direct correlation (no separate log to cross-reference).
+// A wildly different/garbage lwPos or lwScale0 on a ret=0 sample vs a neighboring ret=1 sample
+// for the SAME identity confirms the hypothesis; a near-identical matrix refutes it.
+static std::atomic<uint32_t> g_g209_lw{0};
+// PHASE G210: extend G209's probe to capture PRE-call producer state -- G209 proved
+// GetLWMatrix returns an exact-zero world matrix on bad frames but left open WHICH branch
+// produced it (decompiled 0x137030: cache branch = plain sceVu0CopyMatrix of this+0x70 when
+// this+0x40==0 AND the whole this+0x54 parent-dirty chain is clean; recompute branch =
+// ClearChildFlag + GetLocalMatrix + optional parent recurse + multiply, always ends with
+// this+0x40=0). Reading this+0x40 (dirty)/this+0x54 (parent)/this+0x70 (cached matrix, same
+// 4x4 layout as the output) and the parent's own +0x40 BEFORE the call distinguishes: (a)
+// dirtyPre==0 + cache already zero => something zeroed the this+0x70 cache slot directly
+// without marking dirty (the field-level producer bug G209 named); (b) dirtyPre==1 (recompute
+// ran) but output still zero => GetLocalMatrix or the parent's own GetLWMatrix fed it zero
+// upstream instead.
+static void g209_lwmatrix_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t self = getRegU32(ctx, 4); // a0 = mgCFrame*
+    const uint32_t outp = getRegU32(ctx, 5); // a1 = undefined1 (*)[16][4] world matrix out
+
+    const bool inWindowPre = g_g37_in_outline.load(std::memory_order_relaxed) > 0;
+    uint32_t fcFlagPre = 0, dirtyPre = 0, parentPre = 0, parentDirtyPre = 0, parentFcPre = 0;
+    float cacheR0xPre = 0.0f, cacheTxPre = 0.0f, cacheTyPre = 0.0f, cacheTzPre = 0.0f;
+    float parentCacheR0xPre = 0.0f, parentCacheTxPre = 0.0f, parentCacheTyPre = 0.0f, parentCacheTzPre = 0.0f;
+    // G210: local's own scale vector (self+0x30) -- GetLocalMatrix scales the bind matrix
+    // rows 0-2 by this vector; an all-zero scale collapses local's basis to zero even with
+    // a perfectly healthy parent, which would also present as a fully-zero world matrix.
+    float scaleVecXPre = 0.0f, scaleVecYPre = 0.0f, scaleVecZPre = 0.0f;
+    // G211: the rest of GetLocalMatrix's inputs G210 left unread -- translate (self+0x10),
+    // Euler angles (self+0x20/0x24/0x28), and the two mode/branch-select flags (self+0x44
+    // local-dirty, self+0x100 rotation/translate-mode bitmask) that gate which of
+    // GetLocalMatrix's optional blocks execute.
+    uint32_t localFlag44Pre = 0, modeFlag100Pre = 0;
+    float txInPre = 0.0f, tyInPre = 0.0f, tzInPre = 0.0f;
+    float rotXPre = 0.0f, rotYPre = 0.0f, rotZPre = 0.0f;
+    float bindR0xPre = 0.0f, bindR0yPre = 0.0f, bindR0zPre = 0.0f;
+    float bindTxPre = 0.0f, bindTyPre = 0.0f, bindTzPre = 0.0f;
+    const bool selfInRange = self > 0x80000u && self < 0x2000000u;
+    if (inWindowPre && selfInRange)
+    {
+        fcFlagPre = dc2_read_u32(rdram, self + 0xfcu);
+        dirtyPre = dc2_read_u32(rdram, self + 0x40u);
+        parentPre = dc2_read_u32(rdram, self + 0x54u);
+        if (parentPre > 0x80000u && parentPre < 0x2000000u)
+        {
+            parentDirtyPre = dc2_read_u32(rdram, parentPre + 0x40u);
+            parentFcPre = dc2_read_u32(rdram, parentPre + 0xfcu);
+            auto rfp = [&](uint32_t off) { uint32_t u = dc2_read_u32(rdram, parentPre + 0x70u + off); float f; std::memcpy(&f, &u, sizeof(f)); return f; };
+            parentCacheR0xPre = rfp(0x00u);
+            parentCacheTxPre = rfp(0x30u); parentCacheTyPre = rfp(0x34u); parentCacheTzPre = rfp(0x38u);
+        }
+        auto rfc = [&](uint32_t off) { uint32_t u = dc2_read_u32(rdram, self + 0x70u + off); float f; std::memcpy(&f, &u, sizeof(f)); return f; };
+        cacheR0xPre = rfc(0x00u);
+        cacheTxPre = rfc(0x30u); cacheTyPre = rfc(0x34u); cacheTzPre = rfc(0x38u);
+        auto rfs = [&](uint32_t off) { uint32_t u = dc2_read_u32(rdram, self + 0x30u + off); float f; std::memcpy(&f, &u, sizeof(f)); return f; };
+        scaleVecXPre = rfs(0x00u); scaleVecYPre = rfs(0x04u); scaleVecZPre = rfs(0x08u);
+        localFlag44Pre = dc2_read_u32(rdram, self + 0x44u);
+        modeFlag100Pre = dc2_read_u32(rdram, self + 0x100u);
+        auto rft = [&](uint32_t off) { uint32_t u = dc2_read_u32(rdram, self + 0x10u + off); float f; std::memcpy(&f, &u, sizeof(f)); return f; };
+        txInPre = rft(0x00u); tyInPre = rft(0x04u); tzInPre = rft(0x08u);
+        auto rfr = [&](uint32_t off) { uint32_t u = dc2_read_u32(rdram, self + off); float f; std::memcpy(&f, &u, sizeof(f)); return f; };
+        rotXPre = rfr(0x20u); rotYPre = rfr(0x24u); rotZPre = rfr(0x28u);
+        // G212: flag44==0 takes GetLocalMatrix's TRIVIAL branch (sceVu0CopyMatrix straight
+        // from self+0xb0) -- scale/translate/rot above are dead code on that path. self+0xb0
+        // (the bind local matrix) is the actual local input in play; read it directly.
+        auto rfb = [&](uint32_t off) { uint32_t u = dc2_read_u32(rdram, self + 0xb0u + off); float f; std::memcpy(&f, &u, sizeof(f)); return f; };
+        bindR0xPre = rfb(0x00u); bindR0yPre = rfb(0x04u); bindR0zPre = rfb(0x08u);
+        bindTxPre = rfb(0x30u); bindTyPre = rfb(0x34u); bindTzPre = rfb(0x38u);
+    }
+
+    // G212: reproduce the default guard's preempt suppression (this probe replaces
+    // g212_lwmatrix_guard in the function table when the trace is enabled).
+    if (!g212_lwguard_disabled())
+        g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
+    GetLWMatrix__8mgCFrameFPA4_f_0x137030(rdram, ctx, runtime);
+    if (!g212_lwguard_disabled())
+        g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
+    if (!inWindowPre || outp <= 0x80000u || outp >= 0x2000000u)
+        return;
+    auto rf = [&](uint32_t off) { uint32_t u = dc2_read_u32(rdram, outp + off); float f; std::memcpy(&f, &u, sizeof(f)); return f; };
+    // row0 = basis-X (world scale/orientation proxy), row3 = translation.
+    const float r0x = rf(0x00u), r0y = rf(0x04u), r0z = rf(0x08u);
+    const float tx = rf(0x30u), ty = rf(0x34u), tz = rf(0x38u);
+    const float scale0 = std::sqrt(r0x * r0x + r0y * r0y + r0z * r0z);
+    const bool bad = !std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(tz) || !std::isfinite(scale0);
+    const bool zeroMat = scale0 == 0.0f && tx == 0.0f && ty == 0.0f && tz == 0.0f;
+    const uint32_t slotIdx = g207_slot_for(self);
+    if (slotIdx < 16)
+    {
+        g_g207_slots[slotIdx].lwCalls.fetch_add(1u, std::memory_order_relaxed);
+        uint32_t txb, tyb, tzb, s0b;
+        std::memcpy(&txb, &tx, sizeof(txb)); std::memcpy(&tyb, &ty, sizeof(tyb));
+        std::memcpy(&tzb, &tz, sizeof(tzb)); std::memcpy(&s0b, &scale0, sizeof(s0b));
+        g_g207_slots[slotIdx].tx.store(txb, std::memory_order_relaxed);
+        g_g207_slots[slotIdx].ty.store(tyb, std::memory_order_relaxed);
+        g_g207_slots[slotIdx].tz.store(tzb, std::memory_order_relaxed);
+        g_g207_slots[slotIdx].scale0.store(s0b, std::memory_order_relaxed);
+    }
+    const uint32_t n = g_g209_lw.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (bad || zeroMat || n <= 40u || (n % 800u) == 0u)
+    {
+        std::fprintf(stderr,
+                     "[G209:lwmat] n=%u self=0x%x pos=(%.2f,%.2f,%.2f) scale0=%.3f%s"
+                     " pre[fc=%u dirty=%u flag44=%u mode100=0x%x scaleVec=(%.3f,%.3f,%.3f)"
+                     " translateIn=(%.3f,%.3f,%.3f) rotIn=(%.4f,%.4f,%.4f)"
+                     " bindR0=(%.3f,%.3f,%.3f) bindPos=(%.2f,%.2f,%.2f)"
+                     " parent=0x%x parentDirty=%u parentFc=%u"
+                     " parentCacheR0x=%.3f parentCachePos=(%.2f,%.2f,%.2f) cacheR0x=%.3f cachePos=(%.2f,%.2f,%.2f)]\n",
+                     n, self, static_cast<double>(tx), static_cast<double>(ty), static_cast<double>(tz),
+                     static_cast<double>(scale0), bad ? " BAD" : (zeroMat ? " ZERO" : ""),
+                     fcFlagPre, dirtyPre, localFlag44Pre, modeFlag100Pre,
+                     static_cast<double>(scaleVecXPre), static_cast<double>(scaleVecYPre), static_cast<double>(scaleVecZPre),
+                     static_cast<double>(txInPre), static_cast<double>(tyInPre), static_cast<double>(tzInPre),
+                     static_cast<double>(rotXPre), static_cast<double>(rotYPre), static_cast<double>(rotZPre),
+                     static_cast<double>(bindR0xPre), static_cast<double>(bindR0yPre), static_cast<double>(bindR0zPre),
+                     static_cast<double>(bindTxPre), static_cast<double>(bindTyPre), static_cast<double>(bindTzPre),
+                     parentPre, parentDirtyPre, parentFcPre,
+                     static_cast<double>(parentCacheR0xPre), static_cast<double>(parentCacheTxPre),
+                     static_cast<double>(parentCacheTyPre), static_cast<double>(parentCacheTzPre),
+                     static_cast<double>(cacheR0xPre), static_cast<double>(cacheTxPre),
+                     static_cast<double>(cacheTyPre), static_cast<double>(cacheTzPre));
+        std::fflush(stderr);
+    }
+}
+
+// PHASE G212 FIX (default-ON, kill DC2_G212_NO_LWGUARD=1): scoped back-edge preemption
+// suppression for the joint-matrix / draw-rect computation window. G211 proved the MAP-4
+// cap/head-mesh flicker root: shouldPreemptGuestExecution() can fire on a backward branch
+// inside GetLWMatrix@0x137030 (its ancestor-dirty-chain walk), ClearChildFlag@0x136C80
+// (sibling walk, called from GetLWMatrix's recompute), or GetDrawRect@0x1381C0 (under
+// mgGetDrawRect@0x143160) -- the yield unwinds the whole recompiled call chain, and if any
+// interposed override swallows the resume (calls another body before the dispatcher can
+// re-drive the yielded one -- the G57/G186 bug class), the world matrix / screen rect is
+// never written and the consumer reads zeros => the part is culled for that frame
+// (GetDrawRect ret=0, screen box collapsed). Decisive A/B in phase-G211-fix-log.md:
+// DC2_G57_NO_PREEMPT=1 eliminated 100% of the zero-matrix samples; these guards reproduce
+// that atomicity ONLY for the two proven windows (a few bone-chain recursions + VU0 math,
+// microseconds) instead of globally (global no-preempt has its own regressions, G211).
+// Same fix pattern as G57 (title draw) and G186 (Draw__4CMap): depth ++/-- around the call.
+static bool g212_lwguard_disabled()
+{
+    static const bool disabled = dc2_env_flag_enabled("DC2_G212_NO_LWGUARD");
+    return disabled;
+}
+static void g212_lwmatrix_guard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    if (!g212_lwguard_disabled())
+    {
+        g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
+        GetLWMatrix__8mgCFrameFPA4_f_0x137030(rdram, ctx, runtime);
+        g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
+        return;
+    }
+    GetLWMatrix__8mgCFrameFPA4_f_0x137030(rdram, ctx, runtime);
+}
+static void g212_getdrawrect_guard(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    if (!g212_lwguard_disabled())
+    {
+        g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
+        mgGetDrawRect__FP8mgCFrameP9mgVu0FBOX_0x143160(rdram, ctx, runtime);
+        g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
+        return;
+    }
+    mgGetDrawRect__FP8mgCFrameP9mgVu0FBOX_0x143160(rdram, ctx, runtime);
+}
+
+// PHASE G214 (default-off, DC2_G214_LWSCAN=1): skin-matrix collapse scanner. G213 localized the
+// MAP-4 head/cap whole-batch drop to the cap sub-mesh (tbp=0x35a0) + face (tbp=0x3420) emitting
+// ZERO triangles on back-view frames (upstream of the GS) -- the signature of those verts being
+// collapsed/off-screen by a bad per-bone skin matrix so VU1 clips the entire batch. G209/G212's
+// probe only samples GetLWMatrix calls INSIDE the outline-draw window (g_g37_in_outline > 0), i.e.
+// the mgGetDrawRect AABB phase -- it tracked the outline frame 0x8638b0, which G213 proved is a RED
+// HERRING (valid matrix, ret=1, head still gone). The SKIN matrices are built EARLIER, during
+// SetDeformMesh->DeformMesh->MotionProc2->GetLWMatrix, OUTSIDE that window. This scanner inspects
+// EVERY GetLWMatrix output (a1) and reports any collapsed (row0 magnitude ~0 & zero translation, or
+// non-finite) world matrix with the identity + present tick, so a missing frame (e.g. 900/1200) can
+// be checked for a collapsing bone the old probe never sampled. Replaces g212_lwmatrix_guard in the
+// table when enabled and reproduces its preempt suppression, so default behavior is unchanged.
+static bool g214_lwscan_enabled()
+{
+    static const bool on = dc2_env_flag_enabled("DC2_G214_LWSCAN");
+    return on;
+}
+static std::atomic<uint64_t> g_g214_calls{0};
+static std::atomic<uint64_t> g_g214_collapses{0};
+static std::atomic<uint64_t> g_g214_logged{0};
+static void g214_lwscan_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t self = getRegU32(ctx, 4); // a0 = mgCFrame*
+    const uint32_t outp = getRegU32(ctx, 5); // a1 = float[4][4] world matrix out
+    const bool inOutline = g_g37_in_outline.load(std::memory_order_relaxed) > 0;
+
+    // Reproduce g212_lwmatrix_guard's scoped preempt suppression (this probe owns the table slot).
+    if (!g212_lwguard_disabled())
+        g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
+    GetLWMatrix__8mgCFrameFPA4_f_0x137030(rdram, ctx, runtime);
+    if (!g212_lwguard_disabled())
+        g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
+
+    const uint64_t nCalls = g_g214_calls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (outp <= 0x80000u || outp >= 0x2000000u)
+        return;
+    auto rf = [&](uint32_t off) { uint32_t u = dc2_read_u32(rdram, outp + off); float f; std::memcpy(&f, &u, sizeof(f)); return f; };
+    const float r0x = rf(0x00u), r0y = rf(0x04u), r0z = rf(0x08u);
+    const float tx = rf(0x30u), ty = rf(0x34u), tz = rf(0x38u);
+    const float scale0 = std::sqrt(r0x * r0x + r0y * r0y + r0z * r0z);
+    const bool nonFinite = !std::isfinite(scale0) || !std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(tz);
+    const bool zeroMat = scale0 == 0.0f && tx == 0.0f && ty == 0.0f && tz == 0.0f;
+    if (nonFinite || zeroMat)
+    {
+        const uint64_t nc = g_g214_collapses.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        const uint64_t nl = g_g214_logged.load(std::memory_order_relaxed);
+        // Log the first 200 collapses in full, then 1-in-64, to keep the identity/tick set
+        // visible without flooding (collapses should be rare -- one bone per bad frame).
+        if (nl < 200u || (nc % 64u) == 0u)
+        {
+            g_g214_logged.fetch_add(1u, std::memory_order_relaxed);
+            std::fprintf(stderr,
+                         "[G214:collapse] tick=%llu self=0x%08x inOutline=%d %s scale0=%g t=(%g,%g,%g)\n",
+                         (unsigned long long)g_dc2PresentTick.load(std::memory_order_relaxed),
+                         self, inOutline ? 1 : 0, nonFinite ? "NONFIN" : "ZERO",
+                         (double)scale0, (double)tx, (double)ty, (double)tz);
+        }
+    }
+    if ((nCalls % 20000ull) == 0ull)
+    {
+        std::fprintf(stderr, "[G214:scan] tick=%llu calls=%llu collapses=%llu\n",
+                     (unsigned long long)g_dc2PresentTick.load(std::memory_order_relaxed),
+                     (unsigned long long)nCalls,
+                     (unsigned long long)g_g214_collapses.load(std::memory_order_relaxed));
+    }
+}
+
+// PHASE G206b: does the mesh-emit (Draw__12mgCVisualMDT) actually grow the mgVif1Packet
+// for a part whose mgGetDrawRect bbox/ret says "visible"? Bbox-visible-but-zero-pktDelta
+// would mean the geometry collapses INSIDE the mesh emit (skin matrix / cull), not at the
+// GetDrawRect gate. Scoped to the same g_g37_in_outline window as G206's bbox probe so
+// call order lines up 1:1 with the 8 [G34:outline]/[G206:bbox] part entries per frame.
+static std::atomic<uint32_t> g_g206_mdt{0};
+static void g206_mdt_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t gp = getRegU32(ctx, 28);
+    const uint32_t pkt = dc2_read_u32(rdram, gp - 0x788Cu);
+    const uint32_t before = pkt ? dc2_read_u32(rdram, pkt) : 0u;
+    const uint32_t mesh = getRegU32(ctx, 4);
+    const bool inOutline = g_g37_in_outline.load(std::memory_order_relaxed) > 0;
+    Draw__12mgCVisualMDTFPUiPA4_fP14mgCDrawManager_0x13f4e0(rdram, ctx, runtime);
+    if (!inOutline)
+        return;
+    const uint32_t after = pkt ? dc2_read_u32(rdram, pkt) : 0u;
+    const uint32_t ret = getRegU32(ctx, 2);
+    const uint32_t n = g_g206_mdt.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (n <= 56u || (n % 240u) == 0u)
+    {
+        std::fprintf(stderr, "[G206:mdt] n=%u mesh=0x%x ret=0x%x pktDelta=0x%x\n",
+                     n, mesh, ret, after - before);
         std::fflush(stderr);
     }
 }
@@ -12148,6 +13636,12 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     // title model geometry submits) and DrawWater returns clean. The DrawWater skip below
     // ruled the water draw OUT as the $ra-corruption source (see g57_drawwater_skip).
     runtime.registerFunction(0x0015E800u, g57_drawwater_skip);      // G57 DrawWater skip bisection (DC2_G57_SKIP_WATER)
+    runtime.registerFunction(0x002C8820u, g194_skip_draweffect);    // G194 DrawEffect skip bisection (DC2_G194_SKIP_DRAWEFFECT)
+    runtime.registerFunction(0x0017E320u, g194_skip_dof);           // G194 DepthOfField skip bisection (DC2_G194_SKIP_DOF)
+    runtime.registerFunction(0x0013BD90u, g194_skip_texanime);      // G194 TexAnime skip bisection (DC2_G194_SKIP_TEXANIME)
+    runtime.registerFunction(0x0029C1C0u, g195_skip_editmap_draweffect); // G195 CEditMap effect skip (DC2_G195_SKIP_EDITMAP_DRAWEFFECT)
+    runtime.registerFunction(0x0015E3F0u, g195_skip_cmap_draweffect);    // G195 CMap effect skip probe (DC2_G195_SKIP_CMAP_DRAWEFFECT)
+    runtime.registerFunction(0x00144560u, g195_moveimage_trace);     // G195 move-image copy probe (DC2_G195_MOVEIMAGE_TRACE)
     // G58: $ra-corruption canary over the title geometry-queue chain. Registered LAST so it
     // wins the function table over the G56/F50.7 taps it wraps. Only installed under
     // DC2_TRACE_G58 so the default dispatch table (and golden title smoke) is untouched.
@@ -12166,6 +13660,16 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
         runtime.registerFunction(0x00131A10u, g58_cam_getdistance);       // GetDistance (r31/a0 probe)
         runtime.registerFunction(0x00131A50u, g58_cam_addheight);         // AddHeight (r31/a0 probe)
         runtime.registerFunction(0x00283740u, g58_assign_camera_probe);   // AssignCamera args/result probe
+    }
+    // G193 FIX (always registered): EditInit wrapper repairs the MainScene CScene vtable
+    // (F50.4 pattern) before the scene-entry Initialize dispatch, so the town/edit route
+    // gets cameras like the dungeon route does. Trace output stays gated by DC2_TRACE_G193;
+    // the repair itself is default-ON (kill DC2_G193_NO_SCENEVT_FIX=1).
+    runtime.registerFunction(0x001A9F40u, g193_edit_init_probe);            // EditInit (LoopInit[1] dispatch)
+    if (dc2_env_flag_enabled("DC2_TRACE_G193"))
+    {
+        runtime.registerFunction(0x00282EA0u, g193_scene_initialize_probe); // Initialize__6CScene (virtual dispatch)
+        runtime.registerFunction(0x00283740u, g193_assign_camera_probe);    // AssignCamera w/ count-at-entry
     }
     runtime.registerFunction(0x0028BE40u, f50_7_random_circle_step_probe); // F50.7: repair CRandomCircle global vtable and resume tailcall
     runtime.registerFunction(0x001EA890u, f55_calc_glid_put_pos_probe); // F55: CDngFreeMap::CalcGlidPutPos A/B input/output probe (DC2_TRACE_F55)
@@ -12220,6 +13724,46 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
         runtime.registerFunction(0x0013F4E0u, g15_mdt_probe);        // Draw__12mgCVisualMDT (mesh emit)
         runtime.registerFunction(0x00145E80u, g15_sendvuprog_probe); // mgSendVuProg (VU prog upload)
     }
+    // PHASE G212 FIX (default-ON, kill DC2_G212_NO_LWGUARD=1): preempt-suppression guards
+    // for the joint-matrix / draw-rect windows (the G211 cap-mesh root cause). Registered
+    // UNCONDITIONALLY and BEFORE the gated diagnostic blocks below, so when a trace is
+    // enabled its probe overwrites the table slot -- each such probe reproduces the same
+    // suppression internally (g209_lwmatrix_probe / g206_getdrawrect_probe /
+    // g37_getdrawrect_probe).
+    runtime.registerFunction(0x00137030u, g212_lwmatrix_guard);    // GetLWMatrix__8mgCFrame
+    runtime.registerFunction(0x00143160u, g212_getdrawrect_guard); // mgGetDrawRect (covers GetDrawRect@0x1381C0's checkpoint)
+    // G214: skin-matrix collapse scanner overrides the GetLWMatrix guard slot (reproduces its
+    // preempt suppression) -- samples EVERY call, not just the outline window g209 sampled.
+    if (g214_lwscan_enabled())
+        runtime.registerFunction(0x00137030u, g214_lwscan_probe);  // GetLWMatrix (G214 collapse scan)
+    if (g205_trace_enabled())
+    {
+        runtime.registerFunction(0x0016B850u, g205_actionchara_draw_probe); // Draw__12CActionChara (field, non-Direct)
+        // G205: reuse G34's existing fVar13 capture on ANY route (not just g9_costume_enabled()),
+        // since raw-body edits to recomp/DrawDirect__11CCharacter2Fv_0x1731f0.cpp were found to be
+        // linker-shadowed by the duplicate definition ps2_runtime's runner/*.cpp glob force-links
+        // (see phase-G205-fix-log.md) -- registerFunction wrappers are the only reliable probe point
+        // for this symbol. g34_outline_draw_probe is read-only (fprintf); does not mutate state.
+        runtime.registerFunction(0x0017C2D0u, g34_outline_draw_probe);  // Draw__12COutLineDraw::Draw
+        runtime.registerFunction(0x001731F0u, g15_char_draw_probe);     // DrawDirect__11CCharacter2 (packet-delta)
+        // G206: per-part screen bbox (read-only, no box rewrite) -- only when the costume
+        // g9 block below hasn't already claimed 0x143160 for the G37 box-fix wrapper.
+        if (g206_bbox_trace_enabled() && !g9_costume_enabled())
+            runtime.registerFunction(0x00143160u, g206_getdrawrect_probe); // mgGetDrawRect (G206 bbox trace)
+        if (g206_bbox_trace_enabled() && !g15_trace_enabled())
+            runtime.registerFunction(0x0013F4E0u, g206_mdt_probe); // Draw__12mgCVisualMDT (G206 pktDelta trace)
+        if (g206_bbox_trace_enabled())
+            runtime.registerFunction(0x00137030u, g209_lwmatrix_probe); // GetLWMatrix (G209 skin-matrix hypothesis test)
+    }
+    if (dc2_env_flag_enabled("DC2_G217_EEOBJ"))
+    {
+        runtime.registerFunction(0x0013F4E0u, g217_mdt_draw_probe);            // direct/deferred packet route
+        runtime.registerFunction(0x001404D0u, g217_base_createpacket_probe);   // plain MDT head/cap visuals
+        runtime.registerFunction(0x0028A660u, g217_motion_createpacket_probe); // MotionMDT outer; base call is direct jal
+        runtime.registerFunction(0x0013FF60u, g217_facepacket_probe);          // per-face geometry DMA
+        runtime.registerFunction(0x0013F6A0u, g217_createpacket_probe);        // per-visual face-list chain build
+        runtime.registerFunction(0x0013F920u, g217_fix_createpacket_probe);    // FixMDT prebuilt-face chain build
+    }
     // PHASE G16/G30/G99: CreateRenderInfoPacket probes (quiet unless explicitly requested).
     if (g16_trace_enabled() || g30_trace_enabled() || g99_ri_trace_enabled())
     {
@@ -12237,7 +13781,9 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     // G95: title copy-path TEX0 rebinding proof wrapper. Default behavior delegates
     // to the original draw loop; DC2_G95_COPY_TEX0/DC2_G95_REPLAY_DRAW enable A/B.
     runtime.registerFunction(0x00135720u, g91_drawmgr_flush_probe);
-    if (g67_trace_enabled() || g95_add_mini_tex0_enabled() || g135_src_trace_enabled())
+    if (g67_trace_enabled() || g95_add_mini_tex0_enabled() || g135_src_trace_enabled() ||
+        dc2_env_flag_enabled("DC2_G195_BLOCK_TRACE") ||
+        dc2_env_flag_enabled("DC2_G217_EEOBJ"))
         runtime.registerFunction(0x001359D0u, g67_addpacket_probe);     // G67 trace / G95 mini-packet proof / G135 source-chain trace
     if (g67_trace_enabled())
     {
@@ -12251,6 +13797,14 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
         runtime.registerFunction(0x00142560u, g67_mgenddraw_reload_probe); // G67 title block reload trace
         runtime.registerFunction(0x00142580u, g67_mgenddraw_probe);     // G67 title block draw trace
     }
+    else if (dc2_env_flag_enabled("DC2_G195_FG_TRACE") ||
+             dc2_env_flag_enabled("DC2_G195_BLOCK_TRACE") ||
+             (std::getenv("DC2_G88_GEO") != nullptr))
+    {
+        runtime.registerFunction(0x00142580u, g67_mgenddraw_probe);     // G195 map block tag for raster traces
+    }
+    if (dc2_env_flag_enabled("DC2_G195_BLOCK_TRACE"))
+        runtime.registerFunction(0x0013F4E0u, g195_mdt_owner_probe);     // G195 foreground MDT owner trace
     // PHASE G34: costume model RTT->display composite gap. On the costume route,
     // wrap the character draw (reads/optionally restores the +0x100 outline level)
     // and the COutLineDraw composite gate (captures fVar13). Registered last so the
@@ -12261,11 +13815,19 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
         runtime.registerFunction(0x0017C2D0u, g34_outline_draw_probe);  // Draw__12COutLineDraw::Draw
         runtime.registerFunction(0x00143160u, g37_getdrawrect_probe);   // mgGetDrawRect (G37 bbox repair)
         runtime.registerFunction(0x0017CB20u, g34_divsprite_probe);     // DrawDivSprite4 (RTT composite)
+        if (g206_bbox_trace_enabled() && !g16_trace_enabled() && !g43_face_trace_enabled())
+            runtime.registerFunction(0x0013F4E0u, g206_mdt_probe);      // Draw__12mgCVisualMDT (G206 pktDelta trace)
         if (g36_packet_trace_enabled())
         {
             runtime.registerFunction(0x00134B00u, g36_directdata_probe); // DirectData cursor trace
             runtime.registerFunction(0x00134940u, g36_endprim2_probe);   // EndPrim2 packet-finalize trace
         }
+    }
+    // PHASE G204: character LOD/part trace on ANY route (town + costume). Registered
+    // after the g9 block so it wins 0x1731f0 when DC2_G204_LOD_TRACE=1.
+    if (g204_lod_trace_enabled())
+    {
+        runtime.registerFunction(0x001731F0u, g204_lod_probe);          // DrawDirect__11CCharacter2 LOD trace
     }
     // PHASE F38: FinishForMC nop_stub removed ג€” real recomp
     // FinishForMC__18CMemoryCardManagerFv_0x2f19a0 registered by
