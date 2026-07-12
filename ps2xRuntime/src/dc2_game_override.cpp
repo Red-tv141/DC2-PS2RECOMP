@@ -198,6 +198,10 @@ extern void Update__11CPadControlFP8CGamePad_0x2ed550(uint8_t* rdram, R5900Conte
 extern void sndStep__Ff_0x18d650(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void StepSnd__6CSceneFv_0x2a7940(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void TitleDraw__Fv_0x2a0ab0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void GetPoly__8CEditMapFiP6CCPolyR9mgVu0FBOXi_0x1b0780(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void Step__14CCameraControlFi_0x2ec110(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void SetFollow__15mgCCameraFollowFfff_0x131990(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void DngMainDraw__Fv_0x1cf090(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void TitleModeDraw__Fv_0x2a1b60(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void TitleMapDraw__Fv_0x2a2280(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 // G57: scoped back-edge preemption suppression (defined in ps2_runtime.cpp). Held > 0
@@ -5398,6 +5402,59 @@ static void f55_start_read_bg_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtim
     StartReadBG__Fv_0x148cc0(rdram, ctx, runtime);
 }
 
+// G224 FIX (root: un-run __sinit class, same family as F50.4/F50.7/G12/G193):
+// __sinit_dng_main.cpp@0x373CA0 constructs the two static dungeon CCameraControl
+// objects (__ct__14CCameraControlFv@0x2EBE80 on 0x1EA5830 and 0x1EA5A20, asm
+// 0x373F60-0x373F84). That initializer does not take effect on this route, so the
+// free-roam camera object's +0x60 vtable pointer (0x376330, written by the ctor)
+// stays 0. Every camera vtable dispatch then silently no-ops (the generated jalr
+// treats target 0 as skip-call): DngMainDraw's per-frame Step__14CCameraControlFi
+// (slot +0x08, the nextPos->pos commit) and DngMainKey's SetFollow (slot +0x20,
+// the player-follow target) never run, leaving the free-roam camera frozen at its
+// boot pose -- the G223 dungeon-0 "static gradient instead of 3D world" symptom.
+// Fix: run the game's OWN recompiled ctor on each object (f50_run_guest_call
+// resume-loop, G212 gold standard) before InitDungeonMain, exactly reproducing
+// the static initializer's effect. Idempotent: only when +0x60 is still 0.
+// Kill switch: DC2_G224_NO_CAMFIX=1.
+static void g224_repair_dungeon_camera_controls(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    static const bool disabled = dc2_env_flag_enabled("DC2_G224_NO_CAMFIX");
+    if (disabled)
+        return;
+    constexpr uint32_t kCamCtl[2] = {0x01EA5830u, 0x01EA5A20u};
+    constexpr uint32_t kCamCtlVt60 = 0x00376330u;
+    constexpr uint32_t kCamCtlCtor = 0x002EBE80u; // __ct__14CCameraControlFv
+    for (uint32_t i = 0; i < 2u; ++i)
+    {
+        if (dc2_read_u32(rdram, kCamCtl[i] + 0x60u) != 0u)
+            continue;
+        // Preserve the wrapped function's incoming state around the guest call
+        // (f50_callg clobbers a0-a3/ra and the callee clobbers v0/v1 + temps).
+        const auto savedA0 = ctx->r[4];
+        const auto savedA1 = ctx->r[5];
+        const auto savedA2 = ctx->r[6];
+        const auto savedA3 = ctx->r[7];
+        const auto savedV0 = ctx->r[2];
+        const auto savedV1 = ctx->r[3];
+        const auto savedRa = ctx->r[31];
+        const uint32_t savedPc = ctx->pc;
+        f50_callg(rdram, ctx, runtime, kCamCtlCtor, kCamCtl[i], 0u, 0u, 0u);
+        ctx->r[4] = savedA0;
+        ctx->r[5] = savedA1;
+        ctx->r[6] = savedA2;
+        ctx->r[7] = savedA3;
+        ctx->r[2] = savedV0;
+        ctx->r[3] = savedV1;
+        ctx->r[31] = savedRa;
+        ctx->pc = savedPc;
+        if (f48_4_trace_postcostume_enabled() || dc2_env_flag_enabled("DC2_TRACE_F59"))
+        {
+            std::fprintf(stderr, "[G224:camfix] constructed CCameraControl@0x%x vt60=0x%x (expect 0x%x)\n",
+                         kCamCtl[i], dc2_read_u32(rdram, kCamCtl[i] + 0x60u), kCamCtlVt60);
+        }
+    }
+}
+
 static void f48_4_init_dungeon_main_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     const uint32_t n = ++g_f48_4_init_log;
@@ -5433,6 +5490,7 @@ static void f48_4_init_dungeon_main_probe(uint8_t *rdram, R5900Context *ctx, PS2
     // pointer before InitDungeonMain's scene-entry Initialize dispatch runs.
     f50_4_repair_main_scene_vtable(rdram);
     f50_7_repair_dng_main_static_objects(rdram);
+    g224_repair_dungeon_camera_controls(rdram, ctx, runtime);
     f50_7_repair_debug_dungeon_equipment(rdram, ctx, runtime);
     InitDungeonMain__F13INIT_LOOP_ARG_0x1cc040(rdram, ctx, runtime);
     if (f48_4_trace_postcostume_enabled() && n <= 8u)
@@ -5577,10 +5635,215 @@ static void f59_log_freeroam_state(uint8_t *rdram, uint32_t n)
     if ((sig != s_prevSig || (n % 60u == 0u)) && s_lines < 240u)
     {
         ++s_lines;
+        // G223: DAT_01e9f6e8 = InitEyeCamera's unconditional "eye-camera init done"
+        // sentinel (also read as the DngMainKey movement gate elsewhere) — a
+        // cheap proxy for "has InitEyeCamera__FP12CActionChara run yet" without
+        // instrumenting that direct-jal-only function (which has a runner/
+        // shadow duplicate and can't be registerFunction-hooked).
+        const uint32_t eyeCamSentinel = dc2_read_u32(rdram, 0x01E9F6E8u);
+        // G224: DngMainKey's normal (third-person) camera path gates:
+        //   *(BAS+0x54)  = camera mode (0 => ControlOn + GetCameraPoly + MoveCamera;
+        //                  1/2 => direct SetPos blocks) -- 0x1d241c.
+        //   DAT_003D8070 = manual right-stick camera state (nonzero skips MoveCamera).
+        const uint32_t camMode = bas ? dc2_read_u32(rdram, bas + 0x54u) : 0xDEADu;
+        const uint32_t manualCam = dc2_read_u32(rdram, 0x003D8070u);
+        // G223: MainChara ptr @ gp-0x7228 = 0x003772C8; world pos @ +0xe0.
+        const uint32_t mainChara = dc2_read_u32(rdram, 0x003772C8u);
+        float mcx = 0, mcy = 0, mcz = 0;
+        // G224: MainChara's virtual GetPos (vtbl+0x18) is GetPosition__9mgCObjectFPf,
+        // which returns the mgCObject row at +0x10 -- NOT the +0xE0 field. The camera
+        // follow target is fed from +0x10, so log both to catch a +0x10/+0xE0 desync.
+        float ocx = 0, ocy = 0, ocz = 0;
+        if (mainChara)
+        {
+            uint32_t xu = dc2_read_u32(rdram, mainChara + 0xe0u);
+            uint32_t yu = dc2_read_u32(rdram, mainChara + 0xe4u);
+            uint32_t zu = dc2_read_u32(rdram, mainChara + 0xe8u);
+            std::memcpy(&mcx, &xu, 4);
+            std::memcpy(&mcy, &yu, 4);
+            std::memcpy(&mcz, &zu, 4);
+            xu = dc2_read_u32(rdram, mainChara + 0x10u);
+            yu = dc2_read_u32(rdram, mainChara + 0x14u);
+            zu = dc2_read_u32(rdram, mainChara + 0x18u);
+            std::memcpy(&ocx, &xu, 4);
+            std::memcpy(&ocy, &yu, 4);
+            std::memcpy(&ocz, &zu, 4);
+        }
         std::fprintf(stderr,
-                     "[F59:freeroam] n=%u frame=%u DngStatus=%d DngMainMap=0x%x BAS=0x%x lightScale=%.4f flags=0x%x camIdx=%u mapIdx=%u\n",
-                     n, g_f40_frame_counter, status, dngMap, bas, scale, flags, camIdx, mapIdx);
+                     "[F59:freeroam] n=%u frame=%u DngStatus=%d DngMainMap=0x%x BAS=0x%x lightScale=%.4f flags=0x%x camIdx=%u mapIdx=%u eyeCamSentinel=0x%x camMode=0x%x manualCam=0x%x mainChara=0x%x pos=(%.2f,%.2f,%.2f) objPos=(%.2f,%.2f,%.2f)\n",
+                     n, g_f40_frame_counter, status, dngMap, bas, scale, flags, camIdx, mapIdx, eyeCamSentinel, camMode, manualCam, mainChara, mcx, mcy, mcz, ocx, ocy, ocz);
+        // G223: dump both CSceneCamera slots' assignment state + camera world pos.
+        // Layout (AssignCamera/GetSceneCamera/AssignData): CSceneCamera[id] at
+        // scene+0x2048+id*0x38; +0x0 flags (bit 0x4 = assigned), +0x34 = mgCCamera*.
+        // mgCCamera position is at object offset 0x0 (GetPos passes 'this' straight
+        // into sceVu0CopyVector with no offset).
+        if (scene)
+        {
+            for (uint32_t id = 0; id < 3u; ++id)
+            {
+                const uint32_t elem = scene + 0x2048u + id * 0x38u;
+                const uint32_t camFlags = dc2_read_u32(rdram, elem + 0x0u);
+                const uint32_t camPtr = dc2_read_u32(rdram, elem + 0x34u);
+                float px = 0, py = 0, pz = 0;
+                if (camPtr)
+                {
+                    uint32_t pxu = dc2_read_u32(rdram, camPtr + 0x0u);
+                    uint32_t pyu = dc2_read_u32(rdram, camPtr + 0x4u);
+                    uint32_t pzu = dc2_read_u32(rdram, camPtr + 0x8u);
+                    std::memcpy(&px, &pxu, 4);
+                    std::memcpy(&py, &pyu, 4);
+                    std::memcpy(&pz, &pzu, 4);
+                }
+                std::fprintf(stderr,
+                             "[G223:cam] n=%u id=%u camFlags=0x%x camPtr=0x%x pos=(%.2f,%.2f,%.2f)\n",
+                             n, id, camFlags, camPtr, px, py, pz);
+                // G224: CCameraControl internals for slot 0 (the free-roam camera).
+                // +0x20 row = MoveCamera's working/next camera pos, +0x30 row = next
+                // look-at ref, +0xC0 = ControlOn active flag. If +0x20 tracks the
+                // player while +0x0 stays frozen, the commit/interp step is the gap;
+                // if +0x20 is frozen too, MoveCamera itself is no-op'ing.
+                if (id == 0u && camPtr)
+                {
+                    float rows[9] = {};
+                    for (uint32_t w = 0; w < 3u; ++w)
+                    {
+                        uint32_t r0 = dc2_read_u32(rdram, camPtr + 0x20u + w * 4u);
+                        uint32_t r1 = dc2_read_u32(rdram, camPtr + 0x30u + w * 4u);
+                        uint32_t r2 = dc2_read_u32(rdram, camPtr + 0x10u + w * 4u);
+                        std::memcpy(&rows[w], &r0, 4);
+                        std::memcpy(&rows[3u + w], &r1, 4);
+                        std::memcpy(&rows[6u + w], &r2, 4);
+                    }
+                    const uint32_t ctlOn = dc2_read_u32(rdram, camPtr + 0xC0u);
+                    const uint32_t actIdx = dc2_read_u32(rdram, camPtr + 0xF0u);
+                    float fol[3] = {};
+                    for (uint32_t w = 0; w < 3u; ++w)
+                    {
+                        uint32_t fu = dc2_read_u32(rdram, camPtr + 0x70u + w * 4u);
+                        std::memcpy(&fol[w], &fu, 4);
+                    }
+                    // G224: the camera's +0x60 vtable drives BOTH the per-frame
+                    // Step (slot +0x08, from DngMainDraw) and SetFollow (slot +0x20,
+                    // from DngMainKey). On real HW it is 0x376330. If it (or its
+                    // slots) read differently here, every camera vtable dispatch is
+                    // routing to the wrong function.
+                    const uint32_t vt60 = dc2_read_u32(rdram, camPtr + 0x60u);
+                    const uint32_t slotStep = vt60 ? dc2_read_u32(rdram, vt60 + 0x8u) : 0u;
+                    const uint32_t slotSetF = vt60 ? dc2_read_u32(rdram, vt60 + 0x20u) : 0u;
+                    std::fprintf(stderr,
+                                 "[G224:cam0] n=%u ref=(%.2f,%.2f,%.2f) nextPos=(%.2f,%.2f,%.2f) nextRef=(%.2f,%.2f,%.2f) follow=(%.2f,%.2f,%.2f) ctlOn=%u actIdx=%u vt60=0x%x step=0x%x setf=0x%x\n",
+                                 n, rows[6], rows[7], rows[8], rows[0], rows[1], rows[2], rows[3], rows[4], rows[5], fol[0], fol[1], fol[2], ctlOn, actIdx, vt60, slotStep, slotSetF);
+                }
+            }
+        }
         s_prevSig = sig;
+    }
+}
+
+// G224: probe on GetPoly__8CEditMap@0x1B0780 (DISPATCH_TABLE_TARGET, jalr-dispatched,
+// so registerFunction fires -- unlike the DIRECT_JAL_ONLY camera-path functions).
+// DngMainKey's normal camera block calls it (via the GetCameraPoly@0x15F290 thunk,
+// polyType a1=3) right before MoveCamera; a NEGATIVE return takes the
+// "camera ply not found" printf + early-return path at 0x1d25f4, which would leave the
+// free-roam camera frozen. Logging camera-type queries answers BOTH open questions:
+// (a) does DngMainKey reach its camera block each free-roam frame, (b) does the poly
+// query fail. Gated by DC2_TRACE_F59 (same gate as the rest of the G223/G224 traces).
+// Preempt-suppressed around the direct body call (G212 pattern) so the logged v0 is a
+// real completed-call result, never a mid-resume artifact.
+static void g224_getpoly_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t polyType = getRegU32(ctx, 5);
+    const uint32_t self = getRegU32(ctx, 4);
+    const uint32_t ra = getRegU32(ctx, 31);
+    const bool trace = f59_trace_enabled() && polyType == 3u;
+    // Preempt-suppress only while tracing (so the logged v0 is a completed-call
+    // result); on the default path leave preemption semantics untouched.
+    if (trace)
+        g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
+    GetPoly__8CEditMapFiP6CCPolyR9mgVu0FBOXi_0x1b0780(rdram, ctx, runtime);
+    if (trace)
+        g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
+    if (trace)
+    {
+        static uint32_t s_lines = 0;
+        const int32_t ret = (int32_t)getRegU32(ctx, 2);
+        if (s_lines < 200u || (ret < 0 && s_lines < 400u))
+        {
+            ++s_lines;
+            std::fprintf(stderr,
+                         "[G224:campoly] n=%u self=0x%x type=%u ra=0x%x ret=%d\n",
+                         s_lines, self, polyType, ra, ret);
+        }
+    }
+}
+
+// G224: probe on Step__14CCameraControlFi@0x2EC110 (vtable slot +0x08 of the scene
+// camera's control vtable @0x376330 -- jalr-dispatched, hookable). This is the step
+// that ultimately commits mgCCamera nextPos(+0x20)->pos(+0x0) via Step__9mgCCamera.
+// If it never fires for cam 0x1EA5830 during free-roam, the camera-step iteration is
+// the gap; if it fires but pos stays frozen, the Step__9mgCCamera guards
+// (this+0x5C suspend / StopCamera@0x376C00) are the gap.
+static void g224_camctl_step_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t self = getRegU32(ctx, 4);
+    const uint32_t arg = getRegU32(ctx, 5);
+    const uint32_t ra = getRegU32(ctx, 31);
+    Step__14CCameraControlFi_0x2ec110(rdram, ctx, runtime);
+    if (f59_trace_enabled())
+    {
+        static uint32_t s_lines = 0;
+        if (s_lines < 240u)
+        {
+            ++s_lines;
+            const uint32_t susp = dc2_read_u32(rdram, self + 0x5Cu);
+            const uint32_t stop = dc2_read_u32(rdram, 0x00376C00u);
+            std::fprintf(stderr,
+                         "[G224:camstep] n=%u self=0x%x arg=%d ra=0x%x susp=0x%x stopCam=0x%x\n",
+                         s_lines, self, (int32_t)arg, ra, susp, stop);
+        }
+    }
+}
+
+// G224: entry probe on DngMainDraw@0x1CF090 (called from LoopDungeonMain@0x1CEB70
+// through a hasFunction() guard). Zero hits while DngMainKey runs every frame would
+// mean LoopDungeonMain's own flow never reaches its draw dispatch on this route.
+static void g224_dngmaindraw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    if (f59_trace_enabled())
+    {
+        static uint32_t s_lines = 0;
+        if (s_lines < 120u)
+        {
+            ++s_lines;
+            const uint32_t ra = getRegU32(ctx, 31);
+            const int32_t status = (int32_t)dc2_read_u32(rdram, 0x01E9F6E0u);
+            std::fprintf(stderr, "[G224:dmd] n=%u ra=0x%x DngStatus=%d pc=0x%x\n",
+                         s_lines, ra, status, ctx->pc);
+        }
+    }
+    DngMainDraw__Fv_0x1cf090(rdram, ctx, runtime);
+}
+
+// G224: probe on SetFollow__15mgCCameraFollowFfff@0x131990 (vtable slot +0x20 of the
+// camera control vtable @0x376330, jalr-dispatched from DngMainKey@0x1d2120 with the
+// player-derived follow point in f12/f13/f14). Logs the exact follow target the game
+// hands the free-roam camera each frame.
+static void g224_setfollow_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t self = getRegU32(ctx, 4);
+    const uint32_t ra = getRegU32(ctx, 31);
+    const float x = ctx->f[12], y = ctx->f[13], z = ctx->f[14];
+    SetFollow__15mgCCameraFollowFfff_0x131990(rdram, ctx, runtime);
+    if (f59_trace_enabled())
+    {
+        static uint32_t s_lines = 0;
+        if (s_lines < 240u)
+        {
+            ++s_lines;
+            std::fprintf(stderr,
+                         "[G224:setfollow] n=%u self=0x%x ra=0x%x follow=(%.2f,%.2f,%.2f)\n",
+                         s_lines, self, ra, x, y, z);
+        }
     }
 }
 
@@ -8866,6 +9129,502 @@ static void g15_actor_draw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                      " f50=0x%x f54=0x%x f58=0x%x f60=0x%x f64=0x%x f68=0x%x f70=0x%x\n",
                      n, self, pkt, before, after, after - before,
                      f50, f54, f58, f60, f64, f68, f70);
+}
+
+// =====================================================================================
+// PHASE G226 -- CDynamicAnime (physics-driven accessory, e.g. Max's chest pendant) probe.
+// Dumps the CCharacter2-chain DA fields (+0x120 flags, +0x12c count, +0x130 array) for the
+// CActionChara head and every +0x678 linked part, before the raw DrawDirect body runs, to
+// localize whether the pendant's dyn-anime data is loaded/populated in the runner at all.
+// Ground truth (live PCSX2, empty-room repro): CCharacter2 flags120=0x0 daCount=1
+// daArray!=0, DA[0] vertexCount=6 drawFrameCount=0. Read-only, no state mutation.
+// Env: DC2_TRACE_G226 (quiet/off by default).
+// =====================================================================================
+static bool g226_trace_enabled()
+{
+    static const bool enabled = dc2_env_flag_enabled("DC2_TRACE_G226");
+    return enabled;
+}
+static std::atomic<uint32_t> g_g226_actor{0};
+// PHASE G228 (default-off, DC2_G228_DASCAN=1): dynamic-anime output-frame world-matrix
+// degeneracy scanner. G227 refuted every node-level visibility layer for Max's pendant; the
+// gem is skinned to a DA-driven bone (DrawSub self-draw is empty -- drawFrameCount=0 both HW
+// and runner -- so the gem is body geometry attached to the 3 DA output frames FramePose
+// poses each tick). G214 only flags an ALL-ZERO / non-finite world matrix; a FramePose basis
+// that collapses to near-ZERO DETERMINANT (physics verts too close -> degenerate orthonormal
+// basis) would zero-area the gem's tris while leaving translation intact -- invisible to G214.
+// This captures the DA output-frame ptrs (from g226_dump_chain) and, in the g214 GetLWMatrix
+// slot, dumps each DA frame's full world matrix + 3x3 basis determinant so a degenerate basis
+// can be seen and A/B'd against live PCSX2.
+static bool g228_dascan_enabled()
+{
+    static const bool on = dc2_env_flag_enabled("DC2_G228_DASCAN");
+    return on;
+}
+static std::atomic<uint32_t> g_g228_daFrames[24];
+static std::atomic<int> g_g228_daFrameCount{0};
+static std::atomic<uint64_t> g_g228_logged{0};
+static void g228_register_da_frame(uint32_t frm)
+{
+    if (frm < 0x80000u || frm >= 0x2000000u)
+        return;
+    int cnt = g_g228_daFrameCount.load(std::memory_order_relaxed);
+    for (int i = 0; i < cnt; ++i)
+        if (g_g228_daFrames[i].load(std::memory_order_relaxed) == frm)
+            return;
+    if (cnt < 24)
+    {
+        g_g228_daFrames[cnt].store(frm, std::memory_order_relaxed);
+        g_g228_daFrameCount.store(cnt + 1, std::memory_order_relaxed);
+    }
+}
+static bool g228_is_da_frame(uint32_t frm)
+{
+    int cnt = g_g228_daFrameCount.load(std::memory_order_relaxed);
+    for (int i = 0; i < cnt; ++i)
+        if (g_g228_daFrames[i].load(std::memory_order_relaxed) == frm)
+            return true;
+    return false;
+}
+
+// PHASE G229 (default-off, DC2_G229_DATREE=1): map every DA output frame's mgCFrame
+// subtree and correlate visual-owning descendants with GetLWMatrix.  The authoritative
+// mgCFrame layout is: +0x50 name, +0x54 parent, +0x58 first child, +0x5c next sibling,
+// +0xf8 visual.  This closes G228's load-bearing unknown: which actual mesh is attached
+// to the physics bones, and whether that mesh's own world matrix is ever fetched.
+static bool g229_datree_enabled()
+{
+    static const bool on = dc2_env_flag_enabled("DC2_G229_DATREE");
+    return on;
+}
+struct G229FrameSlot
+{
+    std::atomic<uint32_t> frame{0};
+    std::atomic<uint32_t> root{0};
+    std::atomic<uint32_t> depth{0};
+    std::atomic<uint32_t> visual{0};
+    std::atomic<uint64_t> lwCalls{0};
+};
+static G229FrameSlot g_g229_frames[256];
+static std::atomic<uint64_t> g_g229_logged{0};
+// G230: the visual pointer for the "atoramiria--m1-"/"miria" pendant mesh, latched once its
+// name is resolved by the DA-tree walk below. Lets a later per-frame Draw__12mgCVisualMDT probe
+// scope its logging to exactly this visual without re-walking the frame hierarchy every call.
+static std::atomic<uint32_t> g_g230_pendant_visual{0};
+
+static bool g229_valid_guest_ptr(uint32_t p)
+{
+    return p >= 0x80000u && p < 0x2000000u;
+}
+
+static void g229_frame_name(uint8_t *rdram, uint32_t frame, char (&out)[64])
+{
+    out[0] = '\0';
+    const uint32_t name = g229_valid_guest_ptr(frame)
+        ? dc2_read_u32(rdram, frame + 0x50u) : 0u;
+    if (!g229_valid_guest_ptr(name))
+        return;
+    for (size_t i = 0; i + 1u < sizeof(out); ++i)
+    {
+        const char c = static_cast<char>(rdram[(name + static_cast<uint32_t>(i)) & 0x01FFFFFFu]);
+        out[i] = c;
+        out[i + 1u] = '\0';
+        if (c == '\0')
+            break;
+    }
+}
+
+// PHASE G230 (default-off, DC2_G229_DATREE=1 shares the gate): dump the mgCVisualMDT material
+// table for a newly-registered DA-tree frame -- count @+0x40, array @+0x44, stride 0x30 (two
+// vec4 colors @+0x00/+0x10, resolved mgCTexture* @+0x20). Correlates each material with its
+// TEX0 (tbp/tbw/psm/cbp/cpsm, mgCTexture+0x38) so the pendant's exact material/page identity can
+// be matched byte-for-byte against a live-PCSX2 read of the same struct (see
+// tools/run_g230_pendant_material.ps1), instead of comparing whole-dump GS totals.
+static void g230_dump_materials(uint8_t *rdram, uint32_t frame, uint32_t visual)
+{
+    if (!g229_valid_guest_ptr(visual))
+        return;
+    const uint32_t matCount = dc2_read_u32(rdram, visual + 0x40u);
+    const uint32_t matArray = dc2_read_u32(rdram, visual + 0x44u);
+    if (!g229_valid_guest_ptr(matArray) || matCount == 0u || matCount >= 32u)
+        return;
+    for (uint32_t m = 0; m < matCount; ++m)
+    {
+        const uint32_t matOff = matArray + m * 0x30u;
+        const float c0x = dc2_read_f32(rdram, matOff + 0x00u);
+        const float c0y = dc2_read_f32(rdram, matOff + 0x04u);
+        const float c0z = dc2_read_f32(rdram, matOff + 0x08u);
+        const float c0w = dc2_read_f32(rdram, matOff + 0x0Cu);
+        const float c1x = dc2_read_f32(rdram, matOff + 0x10u);
+        const float c1y = dc2_read_f32(rdram, matOff + 0x14u);
+        const float c1z = dc2_read_f32(rdram, matOff + 0x18u);
+        const float c1w = dc2_read_f32(rdram, matOff + 0x1Cu);
+        const uint32_t texPtr = dc2_read_u32(rdram, matOff + 0x20u);
+        uint32_t tbp = 0, tbw = 0, psm = 0, cbp = 0, cpsm = 0;
+        uint64_t tex0 = 0;
+        if (g229_valid_guest_ptr(texPtr))
+        {
+            tex0 = dc2_read_u64(rdram, texPtr + 0x38u);
+            f51_decode_tex0(tex0, &tbp, &tbw, &psm, &cbp, &cpsm);
+        }
+        std::fprintf(stderr,
+                     "[G230:mat] frame=0x%08x visual=0x%08x mat=%u@0x%08x c0=(%g,%g,%g,%g) "
+                     "c1=(%g,%g,%g,%g) texPtr=0x%08x tex0=0x%016llx tbp=0x%x tbw=%u psm=0x%x "
+                     "cbp=0x%x cpsm=0x%x\n",
+                     frame, visual, m, matOff,
+                     (double)c0x, (double)c0y, (double)c0z, (double)c0w,
+                     (double)c1x, (double)c1y, (double)c1z, (double)c1w,
+                     texPtr, (unsigned long long)tex0, tbp, tbw, psm, cbp, cpsm);
+    }
+}
+
+// PHASE G230b (same DC2_G229_DATREE gate): walk the mgCVisualMDT per-material face-group
+// bucket list (visual+0x48 -> linked list of {materialIndex, mgCFace* head, next} 0x20-byte
+// buckets; each mgCFace is {flags16, vertsPerFace16, materialIndex16, totalIndexCount16,
+// faceCount16, pad16, indexArray32, nextFace32} per CreateFace__12mgCVisualMDTFP8FACES_ID
+// (0x0013F010) decompilation). This is the load-time-built per-material geometry the draw
+// path walks -- if the pendant's gem material (index 0, tbp=0x34e0) has an empty/absent
+// bucket while the frame material (index 4, same page) does not, that pins the defect to
+// geometry assignment rather than texture/material binding (already proven identical to
+// live PCSX2 by g230_dump_materials).
+static uint16_t g230_read_u16(uint8_t *rdram, uint32_t addr)
+{
+    return static_cast<uint16_t>(dc2_read_u32(rdram, addr) & 0xFFFFu);
+}
+static void g230_dump_face_buckets(uint8_t *rdram, uint32_t frame, uint32_t visual)
+{
+    if (!g229_valid_guest_ptr(visual))
+        return;
+    uint32_t bucket = dc2_read_u32(rdram, visual + 0x48u);
+    for (uint32_t guard = 0; guard < 32u && g229_valid_guest_ptr(bucket); ++guard)
+    {
+        const uint32_t matIdx = dc2_read_u32(rdram, bucket + 0x00u);
+        const uint32_t faceHead = dc2_read_u32(rdram, bucket + 0x04u);
+        const uint32_t nextBucket = dc2_read_u32(rdram, bucket + 0x08u);
+        uint32_t face = faceHead;
+        uint32_t faceGuard = 0;
+        uint32_t totalFaces = 0, totalIdx = 0;
+        for (; faceGuard < 64u && g229_valid_guest_ptr(face); ++faceGuard)
+        {
+            const uint16_t flags = g230_read_u16(rdram, face + 0x00u);
+            const uint16_t vertsPerFace = g230_read_u16(rdram, face + 0x02u);
+            const uint16_t faceMatIdx = g230_read_u16(rdram, face + 0x04u);
+            const uint16_t totalIdxCount = g230_read_u16(rdram, face + 0x06u);
+            const uint16_t faceCount = g230_read_u16(rdram, face + 0x08u);
+            const uint32_t idxArray = dc2_read_u32(rdram, face + 0x0Cu);
+            const uint32_t nextFace = dc2_read_u32(rdram, face + 0x10u);
+            std::fprintf(stderr,
+                         "[G230:face] frame=0x%08x visual=0x%08x bucket=0x%08x matIdx=%u "
+                         "face=0x%08x flags=0x%x vertsPerFace=%d faceMatIdx=%d totalIdxCount=%d "
+                         "faceCount=%d idxArray=0x%08x next=0x%08x\n",
+                         frame, visual, bucket, matIdx, face, flags,
+                         (int16_t)vertsPerFace, (int16_t)faceMatIdx, (int16_t)totalIdxCount,
+                         (int16_t)faceCount, idxArray, nextFace);
+            totalFaces += (uint32_t)(int16_t)faceCount;
+            totalIdx += (uint32_t)(int16_t)totalIdxCount;
+            face = nextFace;
+        }
+        std::fprintf(stderr,
+                     "[G230:bucket] frame=0x%08x visual=0x%08x bucket=0x%08x matIdx=%u "
+                     "faceHead=0x%08x next=0x%08x faceLinks=%u totalFaces=%u totalIdx=%u\n",
+                     frame, visual, bucket, matIdx, faceHead, nextBucket, faceGuard,
+                     totalFaces, totalIdx);
+        bucket = nextBucket;
+    }
+}
+
+// PHASE G230c (same DC2_G229_DATREE gate): sample the per-material bucket's PACKET fields
+// (+0x10 packet-start ptr, +0x14 quadword count -- written by
+// CreatePacket__12mgCVisualMDTFP14mgCDrawManager@0x13F6A0, read back by
+// Draw__12mgCVisualMDTFPUiPA4_fP14mgCDrawManager@0x13F4E0's own AddPacket loop) AFTER a real
+// draw call for the latched pendant visual. g230_dump_face_buckets already proved the load-time
+// FACE DATA for material 0 (the gem, tbp=0x34e0) is present and non-trivial (72 faces); this
+// checks whether the SOLID-FILL packet-build step (CreatePacket, invoked once per draw from
+// COutLineDraw's per-node chain) actually produced a nonzero-quadword GS packet for that same
+// bucket, or silently emits qwc=0 for it while other materials get real packets.
+static std::atomic<uint32_t> g_g230_mdt_calls{0};
+static void g230_visualmdt_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t self = getRegU32(ctx, 4);
+    Draw__12mgCVisualMDTFPUiPA4_fP14mgCDrawManager_0x13f4e0(rdram, ctx, runtime);
+    const uint32_t target = g_g230_pendant_visual.load(std::memory_order_relaxed);
+    if (!g229_valid_guest_ptr(target) || self != target)
+        return;
+    const uint32_t n = g_g230_mdt_calls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (n > 6u) // static geometry -- a few post-warm-up samples are enough
+        return;
+    uint32_t bucket = dc2_read_u32(rdram, self + 0x48u);
+    for (uint32_t guard = 0; guard < 32u && g229_valid_guest_ptr(bucket); ++guard)
+    {
+        const uint32_t matIdx = dc2_read_u32(rdram, bucket + 0x00u);
+        const uint32_t nextBucket = dc2_read_u32(rdram, bucket + 0x08u);
+        const uint32_t packetPtr = dc2_read_u32(rdram, bucket + 0x10u);
+        const uint32_t qwc = dc2_read_u32(rdram, bucket + 0x14u);
+        std::fprintf(stderr,
+                     "[G230:pkt] n=%u self=0x%08x bucket=0x%08x matIdx=%u packetPtr=0x%08x qwc=%u\n",
+                     n, self, bucket, matIdx, packetPtr, qwc);
+        bucket = nextBucket;
+    }
+}
+
+static int g229_register_frame(uint8_t *rdram, uint32_t frame, uint32_t root, uint32_t depth)
+{
+    if (!g229_valid_guest_ptr(frame))
+        return -1;
+    for (int i = 0; i < 256; ++i)
+    {
+        uint32_t cur = g_g229_frames[i].frame.load(std::memory_order_relaxed);
+        if (cur == frame)
+        {
+            // Output frames can nest (atora is below himo_hone).  The later walk is the
+            // more-specific DA root, so refresh the classification without duplicating it.
+            g_g229_frames[i].root.store(root, std::memory_order_relaxed);
+            g_g229_frames[i].depth.store(depth, std::memory_order_relaxed);
+            return i;
+        }
+        if (cur == 0u && g_g229_frames[i].frame.compare_exchange_strong(
+                cur, frame, std::memory_order_relaxed))
+        {
+            const uint32_t visual = dc2_read_u32(rdram, frame + 0xF8u);
+            g_g229_frames[i].root.store(root, std::memory_order_relaxed);
+            g_g229_frames[i].depth.store(depth, std::memory_order_relaxed);
+            g_g229_frames[i].visual.store(visual, std::memory_order_relaxed);
+            char name[64];
+            g229_frame_name(rdram, frame, name);
+            std::fprintf(stderr,
+                         "[G229:tree] frame=0x%08x root=0x%08x depth=%u name=%s "
+                         "parent=0x%08x child=0x%08x sibling=0x%08x visual=0x%08x\n",
+                         frame, root, depth, name[0] ? name : "<none>",
+                         dc2_read_u32(rdram, frame + 0x54u),
+                         dc2_read_u32(rdram, frame + 0x58u),
+                         dc2_read_u32(rdram, frame + 0x5Cu), visual);
+            g230_dump_materials(rdram, frame, visual);
+            g230_dump_face_buckets(rdram, frame, visual);
+            if (g229_valid_guest_ptr(visual) && std::strstr(name, "miria") != nullptr)
+                g_g230_pendant_visual.store(visual, std::memory_order_relaxed);
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void g229_register_tree(uint8_t *rdram, uint32_t frame, uint32_t root,
+                               uint32_t depth, uint32_t &budget)
+{
+    if (!g229_valid_guest_ptr(frame) || depth > 32u || budget >= 256u)
+        return;
+    ++budget;
+    g229_register_frame(rdram, frame, root, depth);
+    uint32_t child = dc2_read_u32(rdram, frame + 0x58u);
+    for (uint32_t siblings = 0; g229_valid_guest_ptr(child) && siblings < 64u; ++siblings)
+    {
+        g229_register_tree(rdram, child, root, depth + 1u, budget);
+        child = dc2_read_u32(rdram, child + 0x5Cu);
+    }
+}
+
+static int g229_frame_slot(uint32_t frame)
+{
+    for (int i = 0; i < 256; ++i)
+        if (g_g229_frames[i].frame.load(std::memory_order_relaxed) == frame)
+            return i;
+    return -1;
+}
+
+static void g226_dump_chain(uint8_t *rdram, uint32_t self, uint32_t n)
+{
+    int part = 0;
+    while (self != 0 && part < 8)
+    {
+        const uint32_t flags120 = dc2_read_u32(rdram, self + 0x120u);
+        const uint32_t daCount  = dc2_read_u32(rdram, self + 0x12Cu);
+        const uint32_t daArray  = dc2_read_u32(rdram, self + 0x130u);
+        // G227: +0x124 is the COutLineDraw-group head ptr DrawDirect__11CCharacter2Fv branches
+        // on -- if null, the whole per-part COutLineDraw loop is skipped and the character is
+        // drawn via a single direct mgDrawDirect(mainFrame) call instead (no per-node census).
+        const uint32_t outlineGroup = dc2_read_u32(rdram, self + 0x124u);
+        std::fprintf(stderr, "[G226:chain] n=%u part=%d this=0x%x flags120=0x%x daCount=%u daArray=0x%x outlineGroup(+0x124)=0x%x\n",
+                     n, part, self, flags120, daCount, daArray, outlineGroup);
+        if (daArray != 0 && daCount > 0 && daCount < 64)
+        {
+            for (uint32_t i = 0; i < daCount; ++i)
+            {
+                const uint32_t obj = daArray + i * 0x90u;
+                const uint32_t vcount = dc2_read_u32(rdram, obj + 0x10u);
+                const uint32_t drawCount = dc2_read_u32(rdram, obj + 0x30u);
+                std::fprintf(stderr, "[G226:chain]   DA[%u]@0x%x vertexCount=%u drawFrameCount=%u\n",
+                             i, obj, vcount, drawCount);
+                // Full 0x90-byte struct dump (hex) so it can be diffed against a live-PCSX2
+                // snapshot taken a few frames apart, to see which fields actually evolve
+                // (proof of physics stepping) vs stay frozen in the runner.
+                char hexbuf[0x90 * 2 + 1];
+                for (uint32_t b = 0; b < 0x90u; ++b)
+                    std::snprintf(hexbuf + b * 2, 3, "%02x", rdram[(obj + b) & 0x01FFFFFFu]);
+                std::fprintf(stderr, "[G226:chain]   DA[%u]hex=%s\n", i, hexbuf);
+                // +0x18 = "now position" vertex array ptr (vec4 per vertex, stride 0x10).
+                // Dump vertex 0 and the last vertex (likely the pendant tip) to see whether
+                // the physics chain is actually moving each tick.
+                const uint32_t nowPosPtr = dc2_read_u32(rdram, obj + 0x18u);
+                if (nowPosPtr != 0 && vcount > 0)
+                {
+                    const uint32_t v0 = 0u;
+                    const uint32_t vN = vcount - 1u;
+                    std::fprintf(stderr,
+                        "[G226:chain]   DA[%u] nowPosPtr=0x%x v0=(%.3f,%.3f,%.3f,%.3f) v%u=(%.3f,%.3f,%.3f,%.3f)\n",
+                        i, nowPosPtr,
+                        dc2_read_f32(rdram, nowPosPtr + v0 * 0x10u + 0u),
+                        dc2_read_f32(rdram, nowPosPtr + v0 * 0x10u + 4u),
+                        dc2_read_f32(rdram, nowPosPtr + v0 * 0x10u + 8u),
+                        dc2_read_f32(rdram, nowPosPtr + v0 * 0x10u + 12u),
+                        vN,
+                        dc2_read_f32(rdram, nowPosPtr + vN * 0x10u + 0u),
+                        dc2_read_f32(rdram, nowPosPtr + vN * 0x10u + 4u),
+                        dc2_read_f32(rdram, nowPosPtr + vN * 0x10u + 8u),
+                        dc2_read_f32(rdram, nowPosPtr + vN * 0x10u + 12u));
+                }
+                // +0x04 = output frame count, +0x08 = resolved mgCFrame* table (one per
+                // output frame FramePose() writes SetTransMatrix into). A null entry here
+                // means the physics runs fine but its output frame was never resolved at
+                // load time -- the bone FramePose should drive stays at bind pose/identity.
+                const uint32_t frameCount = dc2_read_u32(rdram, obj + 0x04u);
+                const uint32_t frameTbl = dc2_read_u32(rdram, obj + 0x08u);
+                if (frameTbl != 0 && frameCount > 0 && frameCount < 16)
+                {
+                    for (uint32_t f = 0; f < frameCount; ++f)
+                    {
+                        const uint32_t frm = dc2_read_u32(rdram, frameTbl + f * 4u);
+                        std::fprintf(stderr, "[G226:chain]   DA[%u] outFrame[%u]=0x%x\n", i, f, frm);
+                        g228_register_da_frame(frm); // G228: track for the GetLWMatrix degeneracy scan
+                        if (g229_datree_enabled())
+                        {
+                            uint32_t budget = 0;
+                            g229_register_tree(rdram, frm, frm, 0u, budget);
+                        }
+                    }
+                }
+            }
+        }
+        self = dc2_read_u32(rdram, self + 0x678u);
+        ++part;
+    }
+}
+// G227: scope flag -- set while inside Max's DrawDirect__12CActionCharaFv call, so the
+// per-outline-node census below (g227_node_probe/g227_getdrawrect_probe) can filter out
+// every OTHER object's draws (geo-stones, npcs) without needing a self-pointer allowlist.
+static std::atomic<int> g_g227_in_max_draw{0};
+static void g226_actor_da_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t self = getRegU32(ctx, 4);
+    const uint32_t n = g_g226_actor.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (n <= 40u || (n % 240u) == 0u)
+    {
+        std::fprintf(stderr, "[G226:actorDraw] n=%u this=0x%x (before)\n", n, self);
+        g226_dump_chain(rdram, self, n);
+    }
+    g_g227_in_max_draw.fetch_add(1, std::memory_order_relaxed);
+    DrawDirect__12CActionCharaFv_0x16b940(rdram, ctx, runtime);
+    g_g227_in_max_draw.fetch_sub(1, std::memory_order_relaxed);
+}
+
+// PHASE G227: per-outline-node census (read-only). G226 verified the DA physics data +
+// stepping + frame-resolution are correct; G227 refuted the LOD-fade cull gate (f20 always
+// 1.0), the GetLWMatrix collapse class (0 collapses/20000+ calls, DC2_G214_LWSCAN), and the
+// VIF1 chain-tag truncation class (max tagsProcessed=1748 vs the 16384 cutoff) for this
+// scene. What remains: does the pendant's outline-group node ever get built at all, and if
+// so does ITS specific mgGetDrawRect call return ret=0 (a per-node AABB-collapse cull that
+// is a DIFFERENT check than the world-matrix collapse G214 already scans)? This walks every
+// node in CCharacter2+0x124's outline-group linked list each time DrawDirect__11CCharacter2Fv
+// runs for Max (scoped via g_g227_in_max_draw), logging each node's identity fields and its
+// GetDrawRect ret/box. Env: DC2_TRACE_G227 (shared with the LOD-fade/VIF1-tag probes above).
+static bool g212_lwguard_disabled(); // forward decl (defined later; DC2_G212_NO_LWGUARD kill switch)
+static std::atomic<uint32_t> g_g227_curNode{0};
+static std::atomic<uint32_t> g_g227_nodeCalls{0};
+static std::atomic<uint32_t> g_g229_outlineCalls{0};
+static void g229_outline_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t node = getRegU32(ctx, 4);
+    const uint32_t frame = dc2_read_u32(rdram, node + 0x34u);
+    const int slot = g229_frame_slot(frame);
+    const uint32_t gp = getRegU32(ctx, 28);
+    const uint32_t pkt = dc2_read_u32(rdram, gp - 0x788Cu);
+    const uint32_t before = g229_valid_guest_ptr(pkt) ? dc2_read_u32(rdram, pkt) : 0u;
+    Draw__12COutLineDrawFff_0x17c2d0(rdram, ctx, runtime);
+    if (slot < 0)
+        return;
+    const uint32_t after = g229_valid_guest_ptr(pkt) ? dc2_read_u32(rdram, pkt) : before;
+    const uint32_t visual = dc2_read_u32(rdram, frame + 0xF8u);
+    // The cached world matrix at +0x70 is exactly what GetLWMatrixTopBottom refreshes for
+    // rigid visuals before their vtable Draw call.  Read it after the outline body returns.
+    auto rf = [&](uint32_t off) {
+        const uint32_t u = dc2_read_u32(rdram, frame + 0x70u + off);
+        float f; std::memcpy(&f, &u, sizeof(f)); return f;
+    };
+    const float r0x = rf(0x00u), r0y = rf(0x04u), r0z = rf(0x08u);
+    const float r1x = rf(0x10u), r1y = rf(0x14u), r1z = rf(0x18u);
+    const float r2x = rf(0x20u), r2y = rf(0x24u), r2z = rf(0x28u);
+    const float tx = rf(0x30u), ty = rf(0x34u), tz = rf(0x38u);
+    const float det = r0x * (r1y * r2z - r1z * r2y)
+                    - r0y * (r1x * r2z - r1z * r2x)
+                    + r0z * (r1x * r2y - r1y * r2x);
+    const uint32_t n = g_g229_outlineCalls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (n <= 400u || (n % 120u) == 0u)
+    {
+        char name[64];
+        g229_frame_name(rdram, frame, name);
+        std::fprintf(stderr,
+                     "[G229:outline] n=%u tick=%llu node=0x%08x frame=0x%08x name=%s "
+                     "visual=0x%08x dirty=%u pkt=0x%08x before=0x%08x after=0x%08x "
+                     "delta=0x%x ret=0x%x det=%g t=(%g,%g,%g)\n",
+                     n, (unsigned long long)g_dc2PresentTick.load(std::memory_order_relaxed),
+                     node, frame, name[0] ? name : "<none>", visual,
+                     dc2_read_u32(rdram, frame + 0x40u), pkt, before, after, after - before,
+                     getRegU32(ctx, 2), (double)det, (double)tx, (double)ty, (double)tz);
+    }
+}
+static void g227_node_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t node = getRegU32(ctx, 4); // a0 = param_3 (the COutLineDraw node ptr)
+    const uint32_t v30 = dc2_read_u32(rdram, node + 0x30u);
+    const uint32_t v34 = dc2_read_u32(rdram, node + 0x34u);
+    uint32_t v38b = dc2_read_u32(rdram, node + 0x38u);
+    float v38; std::memcpy(&v38, &v38b, sizeof(v38));
+    const uint32_t v3c = dc2_read_u32(rdram, node + 0x3Cu);
+    const uint32_t v60 = dc2_read_u32(rdram, node + 0x60u);
+    const uint32_t v64 = dc2_read_u32(rdram, node + 0x64u);
+    g_g227_curNode.store(node, std::memory_order_relaxed);
+    Draw__12COutLineDrawFff_0x17c2d0(rdram, ctx, runtime);
+    g_g227_curNode.store(0, std::memory_order_relaxed);
+    const uint32_t ret = getRegU32(ctx, 2);
+    const uint32_t n = g_g227_nodeCalls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (n <= 400u || (n % 60u) == 0u)
+        std::fprintf(stderr,
+                     "[G227:node] n=%u node=0x%x +0x30=0x%x +0x34(frame)=0x%x +0x38(outlineW)=%.4f +0x3c=0x%x +0x60=0x%x +0x64=0x%x ret=%u\n",
+                     n, node, v30, v34, static_cast<double>(v38), v3c, v60, v64, ret);
+}
+static void g227_getdrawrect_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t frame = getRegU32(ctx, 4); // capture BEFORE the call -- a0/a1 are not
+    const uint32_t box = getRegU32(ctx, 5);   // preserved by the callee's own body.
+    if (!g212_lwguard_disabled())
+        g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
+    mgGetDrawRect__FP8mgCFrameP9mgVu0FBOX_0x143160(rdram, ctx, runtime);
+    if (!g212_lwguard_disabled())
+        g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
+    const uint32_t retVal = getRegU32(ctx, 2);
+    const uint32_t node = g_g227_curNode.load(std::memory_order_relaxed);
+    float mx = 0, my = 0, nx = 0, ny = 0;
+    if (box > 0x80000u && box < 0x2000000u)
+    {
+        auto rf = [&](uint32_t off) { uint32_t u = dc2_read_u32(rdram, box + off); float f; std::memcpy(&f, &u, sizeof(f)); return f; };
+        mx = rf(0x00u); my = rf(0x04u); nx = rf(0x10u); ny = rf(0x14u);
+    }
+    static std::atomic<uint32_t> s_n{0};
+    const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (n <= 400u || (n % 60u) == 0u)
+        std::fprintf(stderr,
+                     "[G227:drawrect] n=%u node=0x%x frame=0x%x ret=%u box=(x:%.1f..%.1f y:%.1f..%.1f)\n",
+                     n, node, frame, retVal, static_cast<double>(nx), static_cast<double>(mx),
+                     static_cast<double>(ny), static_cast<double>(my));
 }
 
 // PHASE G205: is Draw__12CActionCharaFv (0x16b850, the non-Direct field-character group
@@ -12785,6 +13544,67 @@ static void g214_lwscan_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *run
     const float scale0 = std::sqrt(r0x * r0x + r0y * r0y + r0z * r0z);
     const bool nonFinite = !std::isfinite(scale0) || !std::isfinite(tx) || !std::isfinite(ty) || !std::isfinite(tz);
     const bool zeroMat = scale0 == 0.0f && tx == 0.0f && ty == 0.0f && tz == 0.0f;
+    // G228: for the DA physics output frames (the gem's bone), dump the full basis + 3x3
+    // determinant regardless of zero/degenerate -- a near-zero-det (collapsed) basis vanishes
+    // the gem without tripping the all-zero check above.
+    if (g228_dascan_enabled() && g228_is_da_frame(self))
+    {
+        const float r1x = rf(0x10u), r1y = rf(0x14u), r1z = rf(0x18u);
+        const float r2x = rf(0x20u), r2y = rf(0x24u), r2z = rf(0x28u);
+        const float det = r0x * (r1y * r2z - r1z * r2y)
+                        - r0y * (r1x * r2z - r1z * r2x)
+                        + r0z * (r1x * r2y - r1y * r2x);
+        const uint64_t nl = g_g228_logged.fetch_add(1u, std::memory_order_relaxed);
+        if (nl < 400u)
+            std::fprintf(stderr,
+                         "[G228:daMat] tick=%llu frame=0x%08x det=%g scale0=%g t=(%g,%g,%g) "
+                         "r0=(%g,%g,%g) r1=(%g,%g,%g) r2=(%g,%g,%g)\n",
+                         (unsigned long long)g_dc2PresentTick.load(std::memory_order_relaxed),
+                         self, (double)det, (double)scale0, (double)tx, (double)ty, (double)tz,
+                         (double)r0x, (double)r0y, (double)r0z,
+                         (double)r1x, (double)r1y, (double)r1z,
+                         (double)r2x, (double)r2y, (double)r2z);
+    }
+    // G229: the actual pendant visual can be below (rather than equal to) a DA output
+    // frame.  Count every registered descendant, but log only DA roots and frames that
+    // own a visual so the whole character skeleton cannot saturate the useful window.
+    if (g229_datree_enabled())
+    {
+        const int slot = g229_frame_slot(self);
+        if (slot >= 0)
+        {
+            const uint64_t slotCalls = g_g229_frames[slot].lwCalls.fetch_add(
+                1u, std::memory_order_relaxed) + 1u;
+            const uint32_t root = g_g229_frames[slot].root.load(std::memory_order_relaxed);
+            const uint32_t visual = g_g229_frames[slot].visual.load(std::memory_order_relaxed);
+            // Roots are extremely hot (hundreds of identical reads per second).  Sample
+            // them sparsely so they cannot consume the global cap before a visual owner
+            // such as atoramiria--m1- is reached.
+            const bool sampledRoot = self == root && (slotCalls <= 8u || (slotCalls % 200u) == 0u);
+            if (visual != 0u || sampledRoot)
+            {
+                const float r1x = rf(0x10u), r1y = rf(0x14u), r1z = rf(0x18u);
+                const float r2x = rf(0x20u), r2y = rf(0x24u), r2z = rf(0x28u);
+                const float det = r0x * (r1y * r2z - r1z * r2y)
+                                - r0y * (r1x * r2z - r1z * r2x)
+                                + r0z * (r1x * r2y - r1y * r2x);
+                const uint64_t nl = g_g229_logged.fetch_add(1u, std::memory_order_relaxed);
+                if (nl < 800u)
+                {
+                    char name[64];
+                    g229_frame_name(rdram, self, name);
+                    std::fprintf(stderr,
+                                 "[G229:lw] tick=%llu self=0x%08x root=0x%08x name=%s "
+                                 "visual=0x%08x calls=%llu det=%g scale0=%g t=(%g,%g,%g)\n",
+                                 (unsigned long long)g_dc2PresentTick.load(std::memory_order_relaxed),
+                                 self, root, name[0] ? name : "<none>", visual,
+                                 (unsigned long long)slotCalls,
+                                 (double)det, (double)scale0,
+                                 (double)tx, (double)ty, (double)tz);
+                }
+            }
+        }
+    }
     if (nonFinite || zeroMat)
     {
         const uint64_t nc = g_g214_collapses.fetch_add(1u, std::memory_order_relaxed) + 1u;
@@ -13555,6 +14375,10 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     runtime.registerFunction(0x00117D58u, sif_module_return_zero_stub); // sceSifLoadStartModule
     // PHASE F41: title_mode_key_stub retired. Real TitleModeKey__Fv at 0x002A1220
     // now runs via register_functions.cpp. F40 pad injection drives confirm via R1.
+    runtime.registerFunction(0x001B0780u, g224_getpoly_probe);       // G224: camera-poly query result (DngMainKey camera block reach + fail signal)
+    runtime.registerFunction(0x002EC110u, g224_camctl_step_probe);   // G224: scene camera Step (nextPos->pos commit) reach probe
+    runtime.registerFunction(0x00131990u, g224_setfollow_probe);     // G224: follow-target value probe
+    runtime.registerFunction(0x001CF090u, g224_dngmaindraw_probe);   // G224: DngMainDraw entry reach probe
     runtime.registerFunction(0x001648F0u, g129_cfg_water_vertex_probe); // G129: SPI WATER_VERTEX map-config handler
     runtime.registerFunction(0x0029FFA0u, f29_title_loop_probe);     // TitleLoop
     runtime.registerFunction(0x002A1020u, g94_title_mode_init_probe); // G94: state-1 init postcondition (projection/camera)
@@ -13724,6 +14548,11 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
         runtime.registerFunction(0x0013F4E0u, g15_mdt_probe);        // Draw__12mgCVisualMDT (mesh emit)
         runtime.registerFunction(0x00145E80u, g15_sendvuprog_probe); // mgSendVuProg (VU prog upload)
     }
+    if (g226_trace_enabled() || dc2_env_flag_enabled("DC2_TRACE_G227") ||
+        g228_dascan_enabled() || g229_datree_enabled())
+    {
+        runtime.registerFunction(0x0016B940u, g226_actor_da_probe); // DrawDirect__12CActionChara (G226 DA/pendant probe; G228 captures DA frames)
+    }
     // PHASE G212 FIX (default-ON, kill DC2_G212_NO_LWGUARD=1): preempt-suppression guards
     // for the joint-matrix / draw-rect windows (the G211 cap-mesh root cause). Registered
     // UNCONDITIONALLY and BEFORE the gated diagnostic blocks below, so when a trace is
@@ -13732,10 +14561,22 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     // g37_getdrawrect_probe).
     runtime.registerFunction(0x00137030u, g212_lwmatrix_guard);    // GetLWMatrix__8mgCFrame
     runtime.registerFunction(0x00143160u, g212_getdrawrect_guard); // mgGetDrawRect (covers GetDrawRect@0x1381C0's checkpoint)
+    if (dc2_env_flag_enabled("DC2_TRACE_G227"))
+    {
+        // G227: per-outline-node census, registered AFTER the unconditional G212 guards above
+        // so it wins the 0x143160 table slot (matches g206/g214/g37's established pattern).
+        runtime.registerFunction(0x0017C2D0u, g227_node_probe);        // Draw__12COutLineDraw::Draw (per-node identity)
+        runtime.registerFunction(0x00143160u, g227_getdrawrect_probe); // mgGetDrawRect (per-node ret/box)
+    }
+    if (g229_datree_enabled())
+    {
+        runtime.registerFunction(0x0017C2D0u, g229_outline_probe); // per-visual matrix + packet growth
+        runtime.registerFunction(0x0013F4E0u, g230_visualmdt_probe); // G230: per-bucket packet/qwc sample
+    }
     // G214: skin-matrix collapse scanner overrides the GetLWMatrix guard slot (reproduces its
     // preempt suppression) -- samples EVERY call, not just the outline window g209 sampled.
-    if (g214_lwscan_enabled())
-        runtime.registerFunction(0x00137030u, g214_lwscan_probe);  // GetLWMatrix (G214 collapse scan)
+    if (g214_lwscan_enabled() || g228_dascan_enabled() || g229_datree_enabled())
+        runtime.registerFunction(0x00137030u, g214_lwscan_probe);  // GetLWMatrix (G214 collapse scan + G228 DA-frame det scan)
     if (g205_trace_enabled())
     {
         runtime.registerFunction(0x0016B850u, g205_actionchara_draw_probe); // Draw__12CActionChara (field, non-Direct)
