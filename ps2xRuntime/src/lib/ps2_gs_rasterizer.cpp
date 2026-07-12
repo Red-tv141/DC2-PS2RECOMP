@@ -2424,15 +2424,24 @@ void g178PushVertex(std::vector<G178Vtx> &out, const GSVertex &v, int ofx, int o
     }
     else
     {
-        // CPU parity (drawTriangle STQ path): the rasterizer samples at texUf =
-        // interp_screen(s * 1/|q|) * texW — an AFFINE interpolation of the pre-divided
-        // coordinate (v.s is the GS's Q-premultiplied S). Emit s/|q| per vertex and interpolate
-        // it linearly (iq=1), NOT a perspective reconstruction — matching the shipped CPU
-        // sampler exactly is the phase-1 gate.
-        const float invQ = 1.0f / fabsQ(v.q);
-        o.sq = v.s * invQ;
-        o.tq = v.t * invQ;
-        o.iq = 1.0f;
+        // G222 CPU parity (drawTriangle STQ path): raw S/T/Q per vertex; the FS divides the
+        // noperspective-lerped .xy by the lerped .z — the GS's own hyperbolic interpolation,
+        // matching the G222 CPU sampler (u = lerp(S)/lerp(Q)). DC2_G222_AFFINE_TEX=1 restores
+        // the pre-G222 affine s/|q| feed (parity with the old CPU sampler).
+        static const bool s_g222Affine = envFlagEnabled("DC2_G222_AFFINE_TEX");
+        if (s_g222Affine)
+        {
+            const float invQ = 1.0f / fabsQ(v.q);
+            o.sq = v.s * invQ;
+            o.tq = v.t * invQ;
+            o.iq = 1.0f;
+        }
+        else
+        {
+            o.sq = v.s;
+            o.tq = v.t;
+            o.iq = fabsQ(v.q); // zero-guard only (returns q signed); FS max() guards the divide
+        }
     }
     out.push_back(o);
 }
@@ -2812,6 +2821,16 @@ static void g161CensusEligibility(const GSContext &ctx, bool abe)
         g161Report();
 }
 
+// [G232] gem-draw pixel accounting (DC2_G232_RTTDUMP=1, default-off). drawPrimitive arms
+// this for a gem-red 0x34e0 draw; the immediately following drawTriangle consumes it and
+// tallies where the pixels die (bbox -> inside -> ztest -> writePixel). Serial-path only.
+static std::atomic<int> g_g232TriArm{0};
+static std::atomic<uint32_t> g_g232PxBbox{0}, g_g232PxInside{0}, g_g232PxZfail{0};
+static std::atomic<uint32_t> g_g232PxWrite{0}, g_g232PxRedWrite{0}, g_g232PxZlog{0};
+// [G232] watched pixel = latest gem-draw centroid; drawTriangle logs EVERY fbp=0x139 draw
+// touching it (tbp, zi vs zdst, pass) -> full per-frame Z history at the gem's screen pixel.
+static std::atomic<int> g_g232GemX{-1}, g_g232GemY{-1};
+
 void GSRasterizer::drawPrimitive(GS *gs)
 {
     static const bool s_g141PerfOn = (std::getenv("DC2_PERF") != nullptr);
@@ -3126,6 +3145,279 @@ void GSRasterizer::drawPrimitive(GS *gs)
             std::fflush(stderr);
         }
     }
+    // [G231] Max's chest gem (empty-room repro). The gem's GS draw reaches the runner
+    // byte-identically to the HW .gs (fbp=0x139, tbp=0x2720 CT24, TEXA As=128 opaque,
+    // ALPHA=0x44, TEST=0x5000b, red vertex modulate) yet produces 0 red pixels. Gate on a
+    // RED-vertex textured fbp=0x139 draw (title has no red verts here, so this only fires on
+    // the room gem). One-shot: sample the CT24 texel the gem reads through the runtime's own
+    // addressing, and dump the raw source pages so we can compare content to the ref freeze.
+    {
+        static const bool s_g231 = (std::getenv("DC2_G231_GEMDUMP") != nullptr);
+        static std::atomic<uint32_t> s_g231n139{0};
+        if (s_g231 && gs->m_vram && gs->m_prim.tme && ctx.frame.fbp == 0x139u)
+        {
+            const uint32_t n = s_g231n139.fetch_add(1, std::memory_order_relaxed) + 1u;
+            // Log the distinct texture pages the character samples at fbp=0x139 (first sighting),
+            // so we can see whether the gem source pages 0x34e0/0x3460 are ever bound here.
+            {
+                static std::atomic<uint64_t> s_seen[64];
+                static std::atomic<int> s_seenN{0};
+                const uint32_t tp = ctx.tex0.tbp0;
+                bool known = false;
+                const int cnt = s_seenN.load(std::memory_order_relaxed);
+                for (int j = 0; j < cnt && j < 64; ++j)
+                    if ((s_seen[j].load(std::memory_order_relaxed) & 0x3FFFu) == tp) { known = true; break; }
+                if (!known && cnt < 64)
+                {
+                    int slot = s_seenN.fetch_add(1, std::memory_order_relaxed);
+                    if (slot < 64)
+                    {
+                        s_seen[slot].store(tp, std::memory_order_relaxed);
+                        std::fprintf(stderr, "[G231:tbp] fbp=0x139 samples tbp=0x%x psm=0x%x tbw=%u (drawN=%u)\n",
+                                     tp, (unsigned)ctx.tex0.psm, (unsigned)ctx.tex0.tbw, n);
+                        std::fflush(stderr);
+                    }
+                }
+            }
+            // The gem's source texture 0x34e0 (128x128 T8) holds jeans (upper-left) + the red
+            // Atlamillia gem in the LOWER-RIGHT corner. Character draws are STQ (fst=0), so read
+            // s/t/q and compute the normalized UV. Decode the sampled T8 texel through the CLUT
+            // and count how many 0x34e0 draws sample a RED texel -> proves whether the gem
+            // sub-mesh actually rasterizes the red gem region.
+            if (ctx.tex0.tbp0 == 0x34e0u)
+            {
+                const uint32_t bwv = (ctx.tex0.tbw > 1u) ? (ctx.tex0.tbw >> 1) : 1u;
+                const int tw = 1 << ctx.tex0.tw, th = 1 << ctx.tex0.th;
+                bool sawRed = false; float unRed = 0, vnRed = 0; uint32_t cRed = 0;
+                float unMax = 0, vnMax = 0;
+                for (int t = 0; t < 3; ++t)
+                {
+                    const float q = gs->m_vtxQueue[t].q;
+                    if (q == 0.0f) continue;
+                    float un = gs->m_vtxQueue[t].s / q;   // normalized U
+                    float vn = gs->m_vtxQueue[t].t / q;   // normalized V
+                    unMax = std::max(unMax, un); vnMax = std::max(vnMax, vn);
+                    int tu = (int)(un * tw); int tv = (int)(vn * th);
+                    if (tu < 0) tu = 0; if (tu >= tw) tu = tw - 1;
+                    if (tv < 0) tv = 0; if (tv >= th) tv = th - 1;
+                    const uint8_t ix = (uint8_t)GSMem::ReadP8(gs->m_vram, ctx.tex0.tbp0, bwv,
+                                          (uint32_t)tu, (uint32_t)tv);
+                    const uint32_t c = lookupCLUT(gs, ix, ctx.tex0.cbp, ctx.tex0.cpsm,
+                                          ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.psm) & 0xFFFFFF;
+                    const uint32_t r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
+                    if (r > 90 && r > g + 40 && r > b + 40) { sawRed = true; unRed = un; vnRed = vn; cRed = c; }
+                }
+                // Bright GEM red only (r>190,g<80,b<80) — excludes brown skin/leather.
+                bool sawGem = false; uint32_t cGem = 0; float ug = 0, vg = 0;
+                for (int t = 0; t < 3; ++t)
+                {
+                    const float q = gs->m_vtxQueue[t].q;
+                    if (q == 0.0f) continue;
+                    float un = gs->m_vtxQueue[t].s / q, vn = gs->m_vtxQueue[t].t / q;
+                    int tu = (int)(un * tw), tv = (int)(vn * th);
+                    if (tu < 0) tu = 0; if (tu >= tw) tu = tw - 1;
+                    if (tv < 0) tv = 0; if (tv >= th) tv = th - 1;
+                    const uint8_t ix = (uint8_t)GSMem::ReadP8(gs->m_vram, ctx.tex0.tbp0, bwv, (uint32_t)tu, (uint32_t)tv);
+                    const uint32_t c = lookupCLUT(gs, ix, ctx.tex0.cbp, ctx.tex0.cpsm, ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.psm) & 0xFFFFFF;
+                    const uint32_t r = c & 0xFF, g = (c >> 8) & 0xFF, b = (c >> 16) & 0xFF;
+                    if (r > 190 && g < 80 && b < 80) { sawGem = true; cGem = c; ug = un; vg = vn; }
+                }
+                static std::atomic<uint32_t> s_34e0n{0}, s_34e0red{0}, s_gemN{0};
+                const uint32_t k34 = s_34e0n.fetch_add(1, std::memory_order_relaxed) + 1u;
+                if (sawRed) s_34e0red.fetch_add(1, std::memory_order_relaxed);
+                if (sawGem)
+                {
+                    const uint32_t gn = s_gemN.fetch_add(1, std::memory_order_relaxed) + 1u;
+                    if (gn <= 30u)
+                    {
+                        // modulate: pixel = texel * vcol / 128 (PS2 modulate, TFX=MODULATE)
+                        const uint32_t tr = cGem & 0xFF, tg = (cGem >> 8) & 0xFF, tb = (cGem >> 16) & 0xFF;
+                        const uint32_t mr = (tr * gs->m_vtxQueue[0].r) >> 7;
+                        const uint32_t mg = (tg * gs->m_vtxQueue[0].g) >> 7;
+                        const uint32_t mb = (tb * gs->m_vtxQueue[0].b) >> 7;
+                        std::fprintf(stderr,
+                            "[G231:GEM] gemDraw#%u (of %u 0x34e0 draws) prim=%u texel=0x%06x UVn=(%.3f,%.3f) "
+                            "vcol0=(%u,%u,%u,%u) tfx=%u => modulated=(%u,%u,%u) abe=%u alpha=0x%llx test=0x%llx\n",
+                            gn, k34, (unsigned)gs->m_prim.type, cGem, ug, vg,
+                            gs->m_vtxQueue[0].r, gs->m_vtxQueue[0].g, gs->m_vtxQueue[0].b, gs->m_vtxQueue[0].a,
+                            (unsigned)ctx.tex0.tfx, mr, mg, mb, (unsigned)gs->m_prim.abe,
+                            (unsigned long long)(ctx.alpha & 0xFFFFFFFFFFull),
+                            (unsigned long long)(ctx.test & 0xFFFFFFFFFFull));
+                        std::fflush(stderr);
+                    }
+                }
+                if ((k34 % 5000u) == 0u)
+                    std::fprintf(stderr, "[G231:red34e0] CUM 0x34e0draws=%u brownRed=%u GEMbrightRed=%u\n",
+                                 k34, s_34e0red.load(std::memory_order_relaxed), s_gemN.load(std::memory_order_relaxed));
+            }
+        }
+    }
+    // [G232] Localize the G231 gem pixel-write / composite loss. G231 proved the gem
+    // rasterizes bright opaque red at fbp=0x139 yet no red reaches any framebuffer. Split
+    // "written then lost" vs "never written" in one run: (a) log each gem-red draw's screen
+    // XY / scissor / FBMSK / Z (G231 never logged XY), (b) scan the RTT page (0x272000) for
+    // gem red at the NEXT drawPrimitive entry after a gem draw (= post-raster under serial
+    // levers), (c) scan + dump the page at composite time (tme && tbp0=0x2720 && fbp!=0x139).
+    // DC2_G232_RTTDUMP=1, default-off; run serial (G144/G178/G157/MTGS off) so the CPU path
+    // rasters synchronously.
+    {
+        static const bool s_g232 = (std::getenv("DC2_G232_RTTDUMP") != nullptr);
+        // Full 512x416 CT32 RTT extent = fbw 8 pages/row * 13 page-rows * 8KB = 0xD0000 bytes
+        // (the first run scanned only 0x80000 = rows 0..255 and missed the character band).
+        if (s_g232 && gs->m_vram && 0x272000u + 0xD0000u <= gs->m_vramSize)
+        {
+            static std::atomic<int> s_g232pending{0};
+            static std::atomic<uint32_t> s_g232gemN{0}, s_g232postN{0}, s_g232compN{0}, s_g232dumpN{0};
+            const auto scan2720 = [gs](uint32_t &nz, uint32_t &red, uint32_t &firstRedOff, uint32_t &lastNzOff) {
+                nz = red = 0; firstRedOff = 0xFFFFFFFFu; lastNzOff = 0;
+                const uint32_t *w = reinterpret_cast<const uint32_t *>(gs->m_vram + 0x272000u);
+                for (uint32_t i = 0; i < 0xD0000u / 4u; ++i)
+                {
+                    const uint32_t c = w[i];
+                    if (c & 0xFFFFFFu) { ++nz; lastNzOff = i * 4u; }
+                    const uint32_t r = c & 0xFFu, g = (c >> 8) & 0xFFu, b = (c >> 16) & 0xFFu;
+                    if (r > 150u && g < 90u && b < 110u)
+                    {
+                        ++red;
+                        if (firstRedOff == 0xFFFFFFFFu) firstRedOff = i * 4u;
+                    }
+                }
+            };
+            // (b) post-raster scan armed by the previous (gem) draw.
+            if (s_g232pending.exchange(0, std::memory_order_relaxed) == 1)
+            {
+                const uint32_t pn = s_g232postN.fetch_add(1, std::memory_order_relaxed) + 1u;
+                if (pn <= 30u || (pn % 50u) == 0u)
+                {
+                    uint32_t nz, red, fro, lnz;
+                    scan2720(nz, red, fro, lnz);
+                    // pageRow: CT32 fbw=8 -> 8KB page = 64x32 px; row ~ (off/8192)/8*32
+                    std::fprintf(stderr,
+                        "[G232:postGem] n=%u rtt2720 nz=%u gemRed=%u firstRedOff=0x%x (~row %u) lastNzOff=0x%x (~row %u) "
+                        "CUMpx bbox=%u inside=%u zfail=%u write=%u redWrite=%u\n",
+                        pn, nz, red, fro, (fro == 0xFFFFFFFFu) ? 0u : (fro / 8192u) / 8u * 32u,
+                        lnz, (lnz / 8192u) / 8u * 32u,
+                        g_g232PxBbox.load(std::memory_order_relaxed),
+                        g_g232PxInside.load(std::memory_order_relaxed),
+                        g_g232PxZfail.load(std::memory_order_relaxed),
+                        g_g232PxWrite.load(std::memory_order_relaxed),
+                        g_g232PxRedWrite.load(std::memory_order_relaxed));
+                    std::fflush(stderr);
+                }
+            }
+            // (c) composite-time scan + one-shot dumps (only once a gem draw was seen this run).
+            if (gs->m_prim.tme && ctx.tex0.tbp0 == 0x2720u && ctx.frame.fbp != 0x139u)
+            {
+                const uint32_t cn = s_g232compN.fetch_add(1, std::memory_order_relaxed) + 1u;
+                if (cn <= 40u || (cn % 100u) == 0u)
+                {
+                    uint32_t nz, red, fro, lnz;
+                    scan2720(nz, red, fro, lnz);
+                    std::fprintf(stderr,
+                        "[G232:comp] n=%u destFbp=0x%x nz=%u gemRed=%u firstRedOff=0x%x (~row %u) "
+                        "lastNzOff=0x%x (~row %u) gemDrawsSoFar=%u\n",
+                        cn, ctx.frame.fbp, nz, red, fro,
+                        (fro == 0xFFFFFFFFu) ? 0u : (fro / 8192u) / 8u * 32u,
+                        lnz, (lnz / 8192u) / 8u * 32u,
+                        s_g232gemN.load(std::memory_order_relaxed));
+                    std::fflush(stderr);
+                    // One-shot after the room's gem draws exist: dump the FULL RTT extent + a
+                    // whole-VRAM red census (0x20000 regions) to see where red DID land, if
+                    // anywhere.
+                    if (s_g232gemN.load(std::memory_order_relaxed) > 100u &&
+                        s_g232dumpN.load(std::memory_order_relaxed) < 3u)
+                    {
+                        const uint32_t dn = s_g232dumpN.fetch_add(1, std::memory_order_relaxed);
+                        if (dn < 3u)
+                        {
+                            char path[128];
+                            std::snprintf(path, sizeof(path), "captures/g232_rtt_comp_%u.bin", dn);
+                            FILE *fp = std::fopen(path, "wb");
+                            if (fp)
+                            {
+                                std::fwrite(gs->m_vram + 0x272000u, 1, 0xD0000u, fp);
+                                std::fclose(fp);
+                                std::fprintf(stderr, "[G232:dump] %s full 0xD0000 (comp n=%u)\n", path, cn);
+                            }
+                            char line[1024]; int lp = 0;
+                            lp += std::snprintf(line + lp, sizeof(line) - lp,
+                                                "[G232:vramred] regions(0x20000) red:");
+                            for (uint32_t rg = 0; rg < gs->m_vramSize / 0x20000u &&
+                                                  lp + 24 < (int)sizeof(line); ++rg)
+                            {
+                                uint32_t rc = 0;
+                                const uint32_t *w = reinterpret_cast<const uint32_t *>(
+                                    gs->m_vram + rg * 0x20000u);
+                                for (uint32_t i = 0; i < 0x20000u / 4u; ++i)
+                                {
+                                    const uint32_t c = w[i];
+                                    const uint32_t r = c & 0xFFu, g = (c >> 8) & 0xFFu,
+                                                   b = (c >> 16) & 0xFFu;
+                                    if (r > 150u && g < 90u && b < 110u) ++rc;
+                                }
+                                if (rc)
+                                    lp += std::snprintf(line + lp, sizeof(line) - lp, " 0x%x=%u",
+                                                        rg * 0x20000u, rc);
+                            }
+                            std::fprintf(stderr, "%s\n", line);
+                            std::fflush(stderr);
+                        }
+                    }
+                }
+            }
+            // (a) gem-red draw detect (same texel test as G231's sawGem) + XY/state log + arm (b).
+            if (gs->m_prim.tme && ctx.frame.fbp == 0x139u && ctx.tex0.tbp0 == 0x34e0u)
+            {
+                const uint32_t bwv = (ctx.tex0.tbw > 1u) ? (ctx.tex0.tbw >> 1) : 1u;
+                const int tw = 1 << ctx.tex0.tw, th = 1 << ctx.tex0.th;
+                bool sawGem = false;
+                for (int t = 0; t < 3 && !sawGem; ++t)
+                {
+                    const float q = gs->m_vtxQueue[t].q;
+                    if (q == 0.0f) continue;
+                    const float un = gs->m_vtxQueue[t].s / q, vn = gs->m_vtxQueue[t].t / q;
+                    int tu = (int)(un * tw), tv = (int)(vn * th);
+                    if (tu < 0) tu = 0; if (tu >= tw) tu = tw - 1;
+                    if (tv < 0) tv = 0; if (tv >= th) tv = th - 1;
+                    const uint8_t ix = (uint8_t)GSMem::ReadP8(gs->m_vram, ctx.tex0.tbp0, bwv,
+                                          (uint32_t)tu, (uint32_t)tv);
+                    const uint32_t c = lookupCLUT(gs, ix, ctx.tex0.cbp, ctx.tex0.cpsm,
+                                          ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.psm) & 0xFFFFFF;
+                    const uint32_t r = c & 0xFFu, g = (c >> 8) & 0xFFu, b = (c >> 16) & 0xFFu;
+                    if (r > 190u && g < 80u && b < 80u) sawGem = true;
+                }
+                if (sawGem)
+                {
+                    const uint32_t gn = s_g232gemN.fetch_add(1, std::memory_order_relaxed) + 1u;
+                    s_g232pending.store(1, std::memory_order_relaxed);
+                    g_g232TriArm.store(1, std::memory_order_relaxed);
+                    g_g232GemX.store((int)gs->m_vtxQueue[0].x - (int)(ctx.xyoffset.ofx >> 4),
+                                     std::memory_order_relaxed);
+                    g_g232GemY.store((int)gs->m_vtxQueue[0].y - (int)(ctx.xyoffset.ofy >> 4),
+                                     std::memory_order_relaxed);
+                    if (gn <= 40u || (gn % 200u) == 0u)
+                    {
+                        const int ofx = static_cast<int>(ctx.xyoffset.ofx >> 4);
+                        const int ofy = static_cast<int>(ctx.xyoffset.ofy >> 4);
+                        std::fprintf(stderr,
+                            "[G232:gemXY] #%u prim=%u v0=(%.1f,%.1f,z=%.0f) v1=(%.1f,%.1f) v2=(%.1f,%.1f) "
+                            "ofxy=(%d,%d) scissor=(%u,%u)-(%u,%u) fbw=%u fpsm=0x%x fbmsk=0x%x "
+                            "zbp=0x%x zmsk=%u test=0x%llx\n",
+                            gn, (unsigned)gs->m_prim.type,
+                            gs->m_vtxQueue[0].x, gs->m_vtxQueue[0].y, gs->m_vtxQueue[0].z,
+                            gs->m_vtxQueue[1].x, gs->m_vtxQueue[1].y,
+                            gs->m_vtxQueue[2].x, gs->m_vtxQueue[2].y,
+                            ofx, ofy,
+                            ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1,
+                            (unsigned)ctx.frame.fbw, (unsigned)ctx.frame.psm, ctx.frame.fbmsk,
+                            (unsigned)(ctx.zbuf & 0x1FFu), (unsigned)((ctx.zbuf >> 32) & 1u),
+                            (unsigned long long)(ctx.test & 0xFFFFFFFFFFull));
+                        std::fflush(stderr);
+                    }
+                }
+            }
+        }
+    }
     // [F51.2] Classify the render-to-texture draws that target the manager texture page
     // (fbp=0x139 -> VRAM byte 0x272000, aliasing tbp=0x2720). Is this textured compositing
     // (producing content) or a flat fill that clears the uploaded T8 data to black?
@@ -3165,16 +3457,13 @@ void GSRasterizer::drawPrimitive(GS *gs)
                 gs->m_vtxQueue[1].r, gs->m_vtxQueue[1].g, gs->m_vtxQueue[1].b, gs->m_vtxQueue[1].a);
         }
     }
-    // [G37] The costume preview's RTT black-fill clear (untextured black sprite to the
-    // 0x139/0x2720 work page) is collapsed to an 18px center point because the model's VU0
-    // AABB->screen projection in GetDrawRect degenerates. The composite then samples the
-    // uncleared remainder of the 0x2720 page, which still holds the time-shared font/menu
-    // atlas -> garbage in the preview. Reproduce what the game's clear INTENDS: zero the
-    // CT32 composite region of block 0x2720 the moment that black-fill draws. GS-order is
-    // clear -> model render -> composite, so the model overwrites its pixels and the rest
-    // stays transparent black. G44 tightened the signature to the first full-RTT black sprite:
-    // the costume path emits later smaller black sprites between face/head pages, and treating
-    // those as full clears wipes Z between skin/detail/cap draws. Escape: DC2_G37_NOCLEAR.
+    // [G37/G220] Historical costume-RTT workaround. G37 bulk-zeroed the shared 0x2720 page
+    // because the costume clear rect used to collapse with its GetDrawRect bbox. The G37 bbox
+    // repair now gives the game's own clear sprite its intended extent, and G220 proved this
+    // synthetic clear redundant on the costume route. Worse, MAP-4 zoom legitimately reuses
+    // fbp=0x139/tbp=0x2720 as a screen-effect work page and satisfies the old broad signature:
+    // this loop then destroys the captured sky before G144 replays the display composite.
+    // Keep the old behavior only as an opt-in historical A/B; never enable it by default.
     const float rttClearX0 = std::min(gs->m_vtxQueue[0].x, gs->m_vtxQueue[1].x) -
         static_cast<float>(ctx.xyoffset.ofx >> 4);
     const float rttClearY0 = std::min(gs->m_vtxQueue[0].y, gs->m_vtxQueue[1].y) -
@@ -3191,8 +3480,9 @@ void GSRasterizer::drawPrimitive(GS *gs)
         gs->m_vtxQueue[0].b == 0 && gs->m_vtxQueue[0].a == 0 &&
         g37FullRttClear)
     {
-        static const bool noClear = (std::getenv("DC2_G37_NOCLEAR") != nullptr);
-        if (!noClear)
+        static const bool forceLegacyClear =
+            envFlagEnabled("DC2_G37_FORCE_CLEAR") && !envFlagEnabled("DC2_G37_NOCLEAR");
+        if (forceLegacyClear)
         {
             // Composite samples RTT x:[~224,512] y:[0,381]; clear a small margin wider.
             for (uint32_t y = 0u; y < 400u; ++y)
@@ -6740,6 +7030,17 @@ void GSRasterizer::drawTriangle(GS *gs)
                           : 0L;
     long g141InsidePx = 0;
 
+    // [G232] consume the gem-draw arm set by drawPrimitive for this same primitive.
+    const bool g232tri = g_g232TriArm.exchange(0, std::memory_order_relaxed) != 0;
+    if (g232tri && g141BboxPx > 0)
+        g_g232PxBbox.fetch_add(static_cast<uint32_t>(g141BboxPx), std::memory_order_relaxed);
+    static const bool s_g232w = (std::getenv("DC2_G232_RTTDUMP") != nullptr);
+    const int g232wx = g_g232GemX.load(std::memory_order_relaxed);
+    const int g232wy = g_g232GemY.load(std::memory_order_relaxed);
+    // Watch every triangle touching the gem pixel on ANY target sharing the game's single Z
+    // page (0xd0) — room draws (fbp 0/0x68) and character RTT draws (0x139) alike.
+    const bool g232watch = s_g232w && g232wx >= 0 && zbpPage == 0xd0u;
+
     // G141 (eliminate-work, behavior-identical): on each scanline the inside set is a contiguous
     // interval (convex triangle + affine barycentric), so narrow the x scan to a conservative span
     // derived from the SAME edge functions instead of edge-testing every bbox pixel (measured ~70%
@@ -7028,6 +7329,8 @@ void GSRasterizer::drawTriangle(GS *gs)
             if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
                 continue;
             ++insideAcc;
+            if (g232tri)
+                g_g232PxInside.fetch_add(1u, std::memory_order_relaxed);
 
             // G41: depth test (Z is interpolated linearly in screen space by the GS).
             uint32_t zi = 0u;
@@ -7142,6 +7445,30 @@ void GSRasterizer::drawTriangle(GS *gs)
                         w0, w1, w2, v0.z, v1.z, v2.z, minX, minY, maxX, maxY);
                 }
             }
+            if (g232tri)
+            {
+                const uint32_t zl = g_g232PxZlog.fetch_add(1u, std::memory_order_relaxed);
+                if (zl < 16u)
+                    std::fprintf(stderr,
+                        "[G232:gempx] xy=(%d,%d) zen=%u ztst=%u zi=%u zdst=%u pass=%u zbp=0x%x zbw=%u zpsm=0x%x\n",
+                        x, y, static_cast<uint32_t>(zEnabled), ztst, zi, zdst,
+                        static_cast<uint32_t>(zPass), zbp, zbw, zpsm);
+                if (!zPass)
+                    g_g232PxZfail.fetch_add(1u, std::memory_order_relaxed);
+            }
+            if (g232watch && x == g232wx && y == g232wy)
+            {
+                static std::atomic<uint32_t> s_g232zh{0};
+                const uint32_t n = s_g232zh.fetch_add(1u, std::memory_order_relaxed);
+                if (n < 500u)
+                    std::fprintf(stderr,
+                        "[G232:zhist] xy=(%d,%d) fbp=0x%x tbp=0x%x prim=%u tme=%u abe=%u zen=%u ztst=%u "
+                        "zi=%u zdst=%u pass=%u zwr=%u gem=%u\n",
+                        x, y, ctx.frame.fbp, ctx.tex0.tbp0, (unsigned)gs->m_prim.type,
+                        (unsigned)gs->m_prim.tme, (unsigned)gs->m_prim.abe,
+                        (unsigned)zEnabled, ztst, zi, zdst, (unsigned)zPass,
+                        (unsigned)zWrite, g232tri ? 1u : 0u);
+            }
             if (!zPass)
                 continue;
 
@@ -7175,15 +7502,31 @@ void GSRasterizer::drawTriangle(GS *gs)
                 }
                 else
                 {
-                    const float invQ0 = 1.0f / fabsQ(v0.q);
-                    const float invQ1 = 1.0f / fabsQ(v1.q);
-                    const float invQ2 = 1.0f / fabsQ(v2.q);
-                    const float sOverQ = (v0.s * invQ0) * w0 + (v1.s * invQ1) * w1 + (v2.s * invQ2) * w2;
-                    const float tOverQ = (v0.t * invQ0) * w0 + (v1.t * invQ1) * w1 + (v2.t * invQ2) * w2;
-                    const float invQ = invQ0 * w0 + invQ1 * w1 + invQ2 * w2;
-                    iq = (std::fabs(invQ) > 1.0e-8f) ? (1.0f / invQ) : 1.0f;
-                    is = sOverQ * iq;
-                    it = tOverQ * iq;
+                    // G222: real GS STQ semantics — S/T/Q interpolate LINEARLY in screen space and
+                    // the single divide happens per pixel in the sampler (u = lerp(S)/lerp(Q)*texW).
+                    // The old path divided per VERTEX then re-multiplied; the iq factors cancel to a
+                    // pure AFFINE interpolation of s/q, visible as bent texture seams at a quad's
+                    // shared diagonal on large deep triangles (MAP-2 dock floor, G222).
+                    // DC2_G222_AFFINE_TEX=1 restores the old affine behavior.
+                    static const bool s_g222Affine = envFlagEnabled("DC2_G222_AFFINE_TEX");
+                    if (s_g222Affine)
+                    {
+                        const float invQ0 = 1.0f / fabsQ(v0.q);
+                        const float invQ1 = 1.0f / fabsQ(v1.q);
+                        const float invQ2 = 1.0f / fabsQ(v2.q);
+                        const float sOverQ = (v0.s * invQ0) * w0 + (v1.s * invQ1) * w1 + (v2.s * invQ2) * w2;
+                        const float tOverQ = (v0.t * invQ0) * w0 + (v1.t * invQ1) * w1 + (v2.t * invQ2) * w2;
+                        const float invQ = invQ0 * w0 + invQ1 * w1 + invQ2 * w2;
+                        iq = (std::fabs(invQ) > 1.0e-8f) ? (1.0f / invQ) : 1.0f;
+                        is = sOverQ * iq;
+                        it = tOverQ * iq;
+                    }
+                    else
+                    {
+                        is = v0.s * w0 + v1.s * w1 + v2.s * w2;
+                        it = v0.t * w0 + v1.t * w1 + v2.t * w2;
+                        iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
+                    }
                     iu = 0;
                     iv = 0;
                 }
@@ -7592,6 +7935,12 @@ void GSRasterizer::drawTriangle(GS *gs)
                             (unsigned)v2.r, (unsigned)v2.g, (unsigned)v2.b, (unsigned)v2.a,
                             t_g144InReplay ? 1u : 0u);
                 }
+            }
+            if (g232tri)
+            {
+                g_g232PxWrite.fetch_add(1u, std::memory_order_relaxed);
+                if (r > 150u && g < 90u && b < 110u)
+                    g_g232PxRedWrite.fetch_add(1u, std::memory_order_relaxed);
             }
             if (!s_g141SkipWrite)
                 writePixel(gs, x, y, r, g, b, a);

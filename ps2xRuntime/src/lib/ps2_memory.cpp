@@ -1666,6 +1666,25 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                             break;
                     }
 
+                    // G227: read-only high-water-mark tracker for the VIF1 chain-tag walker
+                    // (kMaxChainTags=16384 since G217). Confirms whether a given scene's chain
+                    // ever approaches the cutoff, without needing to re-derive G217's evidence
+                    // trail from scratch. Env: DC2_TRACE_G227.
+                    if (channelBase == 0x10009000u && envFlagEnabled("DC2_TRACE_G227"))
+                    {
+                        static std::atomic<int> s_g227MaxTags{0};
+                        int prevMax = s_g227MaxTags.load(std::memory_order_relaxed);
+                        while (tagsProcessed > prevMax &&
+                               !s_g227MaxTags.compare_exchange_weak(prevMax, tagsProcessed, std::memory_order_relaxed))
+                        {
+                        }
+                        if (tagsProcessed > prevMax)
+                        {
+                            std::fprintf(stderr, "[G227:viftags] new max tagsProcessed=%d (limit=%d)\n",
+                                         tagsProcessed, kMaxChainTags);
+                        }
+                    }
+
                     m_ioRegisters[channelBase + 0x30] = tagAddr;
                     m_ioRegisters[channelBase + 0x40] = asr0;
                     m_ioRegisters[channelBase + 0x50] = asr1;

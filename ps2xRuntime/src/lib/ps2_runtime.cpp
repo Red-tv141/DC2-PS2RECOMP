@@ -2952,28 +2952,28 @@ void PS2Runtime::run()
         }
 
         // F64 FIX: the dungeon-entrance EVENT (DngStatus==2) never completes headless,
-        // so the floor never reaches free-roam (DngStatus==0). The entrance cutscene is
-        // an audio/choreography-driven sequence: its CRunScript (@0x1ece3d0) waits in a
-        // generic "wait until the event director advances me" loop (an op-0x10 back-jump
-        // gated on the script skip flag +0x40; the loop never exits on its own), and once
-        // it yields, EventLoop@0x2555E0 stops resuming the script and waits on its own
-        // fade/stream sub-states (DAT_01ece500/504). On real HW the director (sound/fade)
-        // advances it; headless (audio absent — see the standing "Audio is absent" issue)
-        // nothing does, so it hangs forever at DngStatus==2.
+        // G225 (2026-07-12) CORRECTION of the F64 story: the entrance script's generic
+        // wait sub-function (strBase+0x378) is NOT an infinite "wait until the director
+        // skips me" loop — it is a plain per-frame COUNTDOWN (op-0x7 SUB: var0 -= 1,
+        // exit when var0 < 0; decoded live from PCSX2 guest memory). The whole entrance
+        // cutscene runs to its final dialogue box naturally with no audio at all
+        // (verified: forge-off runner frame matches ref/dumps/dungeon_0_cutscene_end.png
+        // pixel-for-pixel in composition). F64's 120-iteration (~2s) done==0 detector
+        // fired long before any multi-thousand-tick countdown could finish, which is what
+        // truncated the cutscene and dropped the player at the staging position (G224
+        // post-fix symptom). The only genuinely indefinite park is a message-window /
+        // end-of-script wait (real PCSX2 parks at the same vmcode offset +0x40E0 with
+        // done==0 until player input).
         //
-        // The completion path is documented: RunMainEvent@0x1D1360 sets DngStatus=0 when
-        // EventLoop returns 1, and EventLoop returns 1 from its default branch precisely
-        // when the script DONE flag DAT_01ece40c (= CRunScript+0x3c) != 0 (and the return
-        // latch DAT_01ece4fc has no pending special code) — it calls EdEventEnd() to tear
-        // the cutscene down and hands control back to free-roam. EventLoop reads the done
-        // flag EVERY frame, so (unlike the +0x40 skip flag, which is only read by exe and
-        // exe stops being called once the script yields) forcing done from the host
-        // present loop is reliably observed. We let the entrance run normally, then once
-        // it is confirmed STUCK (DngStatus==2, floor map loaded, done==0 for >=2s of
-        // present iterations) assert the done flag (and clear the d4fc latch so EventLoop
-        // takes the "return 1" branch, not a pending fade/transition code). This is the
-        // event's own natural end state; it does not corrupt the loaded map/player.
-        // Default ON; set DC2_DISABLE_EVENT_SKIP=1 to A/B the raw stall.
+        // So the stall detector is now PROGRESS-AWARE: it only counts consecutive present
+        // iterations where the script's current vmcode_t* (+0x38) has NOT moved. Any
+        // advance resets the counter. Threshold default 10800 iterations (longest
+        // legitimate frozen-vmcode park measured on this route is ~3600, the countdown);
+        // override via DC2_F64_STALL_TICKS (e.g. =120 for the old fast-skip behavior in
+        // headless harnesses that only need free-roam). The forge action itself is
+        // unchanged (halt VM + done=1 + RunMainEvent completion block — see F64 fix-log
+        // for why the subtler alternatives failed).
+        // Default ON; set DC2_DISABLE_EVENT_SKIP=1 to A/B the raw behavior.
         {
             static const bool s_f64disabled = (std::getenv("DC2_DISABLE_EVENT_SKIP") != nullptr);
             static const bool s_f64log = (std::getenv("DC2_TRACE_F64") != nullptr);
@@ -2990,10 +2990,18 @@ void PS2Runtime::run()
                 const bool stuckEvent = (status == 2 && dngMap != 0u && done == 0u);
                 static uint32_t s_f64stuck = 0u;
                 static bool s_f64forced = false;
-                if (stuckEvent) ++s_f64stuck; else { s_f64stuck = 0u; s_f64forced = false; }
-                // ~120 present iterations (~2s) of an in-dungeon event with the done flag
-                // clear == the stall (a normal entrance reaches done within ~1s).
-                if (stuckEvent && s_f64stuck >= 120u && !s_f64forced) {
+                static uint32_t s_g225LastVm = 0u;
+                static const uint32_t s_g225Threshold = [](){
+                    const char *e = std::getenv("DC2_F64_STALL_TICKS");
+                    if (e) { long v = std::strtol(e, nullptr, 10); if (v > 0) return (uint32_t)v; }
+                    return 10800u; }();
+                const uint32_t vm = rr(script + 0x38u);
+                if (stuckEvent) {
+                    // G225: count only while the script makes NO progress (vmcode frozen).
+                    if (vm == s_g225LastVm) ++s_f64stuck; else s_f64stuck = 0u;
+                    s_g225LastVm = vm;
+                } else { s_f64stuck = 0u; s_g225LastVm = 0u; s_f64forced = false; }
+                if (stuckEvent && s_f64stuck >= s_g225Threshold && !s_f64forced) {
                     s_f64forced = true;
                     // Halt the event script VM the way its own op-0xf end opcode does
                     // (current vmcode_t* +0x38 = 0, done +0x3c = 1, return latch = 0)...
@@ -3014,8 +3022,8 @@ void PS2Runtime::run()
                     const uint32_t dms = rr(0x0037729Cu); // DngMainScene
                     if (dms) wr(dms + 0x2e54u, 0u);       // cam idx = 0
                     if (s_f64log)
-                        std::fprintf(stderr, "[F64:done] forcing event end (stuck=%u) bas=0x%x dms=0x%x -> DngStatus=0\n",
-                                     s_f64stuck, bas, dms);
+                        std::fprintf(stderr, "[F64:done][G225] forcing event end (frozen=%u thr=%u vm=0x%x) bas=0x%x dms=0x%x -> DngStatus=0\n",
+                                     s_f64stuck, s_g225Threshold, vm, bas, dms);
                 }
             }
         }

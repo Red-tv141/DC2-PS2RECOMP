@@ -309,6 +309,46 @@ namespace ps2_stubs
             runtime->gs().writeRegister(static_cast<uint8_t>(clear.testb.reg & 0xFFu), clear.testb.value);
         }
 
+        // G219: sceGsSwapDBuffDc's swap-time framebuffer clear used to be applied IMMEDIATELY on
+        // the EE thread — clearFramebufferContext() rect-filled VRAM through the LIVE GS context,
+        // then applyGsClearPacket() drove the clear sprite via direct writeRegister calls. Both are
+        // the exact G177 FIFO-bypass class (one site G177's audit missed): under the default
+        // MTGS+G144 pipeline the worker still holds this frame's DEFERRED draw list unflushed, and
+        // m_ctx still holds whatever FRAME the last WORKER-processed packet bound (e.g. the
+        // fbp=0x139 character-RTT pages = tbp 0x2720 as a texture), so the EE-side clear stomped
+        // texture pages that deferred triangles (the town sky/feedback pass) sample at flush time —
+        // the G218 MAP-4 zoom top-right black region (pixel-proven: the same feedback triangle
+        // samples sky-blue inline but black under deferral, [G219:skycol]). Fix: submit the seeded
+        // 6-register clear packet (TEST/PRIM/RGBAQ/XYZ2/XYZ2/TEST — GsClearMem is 6 contiguous
+        // GsRegPairMem, already in A+D qword layout) through the GifArbiter FIFO exactly like the
+        // G177 drawenv pairs, so the worker executes it in program order and the XYZ2 kicks travel
+        // the normal drawPrimitive/deferral path. Kill switch DC2_G219_DIRECT_SWAPCLEAR=1 restores
+        // the old immediate clear.
+        void g219ApplyGsClearPacketQueued(PS2Runtime *runtime,
+                                          const GsClearMem &clear,
+                                          uint32_t clearContext)
+        {
+            if (!runtime || !runtime->syncCoreSubsystems() || !hasSeededGsClearPacket(clear))
+            {
+                return;
+            }
+            static const bool s_direct = envFlagEnabled("DC2_G219_DIRECT_SWAPCLEAR");
+            if (s_direct)
+            {
+                runtime->gs().clearFramebufferContext(clearContext,
+                                                      static_cast<uint32_t>(clear.rgbaq.value));
+                applyGsClearPacket(runtime, clear);
+                return;
+            }
+            uint8_t buf[16u + 6u * 16u];
+            const uint64_t tagLo = makeGiftagAplusD(6u);
+            const uint64_t tagHi = 0xEull; // REGS[0] = A+D
+            std::memcpy(buf, &tagLo, sizeof(tagLo));
+            std::memcpy(buf + 8, &tagHi, sizeof(tagHi));
+            std::memcpy(buf + 16, &clear, 6u * sizeof(GsRegPairMem));
+            runtime->memory().submitGifPacket(GifPathId::Path3, buf, sizeof(buf), true);
+        }
+
         // G177: sceGsSwapDBuff / sceGsPutDrawEnv / sceGsPutDispEnv are STUBBED (DC2 calls
         // sceGsSwapDBuff from mgEndFrame EVERY frame, alternating buffers), and their register
         // writes used to be applied DIRECTLY from the EE thread (Support.h applyGsDispEnv /
@@ -1392,9 +1432,17 @@ namespace ps2_stubs
         uint32_t psm = getRegU32(ctx, 5);
         uint32_t w = getRegU32(ctx, 6);
         uint32_t h = getRegU32(ctx, 7);
-        const uint32_t ztest = readStackU32(rdram, ctx, 16);
-        const uint32_t zpsm = readStackU32(rdram, ctx, 20);
-        const uint32_t clear = readStackU32(rdram, ctx, 24);
+        // G194: DC2 is EABI — args 5..7 arrive in $t0/$t1/$t2, not the o32 stack
+        // slots. The old readStackU32(16/20/24) reads picked up caller stack junk,
+        // seeding zpsm=0 (Z32) into the dbuff struct where the game asked for
+        // 0x31 (Z24) — the game re-reads this struct for every per-material ZBUF
+        // write, so the whole town/field Z buffer ran in the wrong format.
+        // decodeGsTrailingArgs3 is regs-first with a stack fallback (same as the
+        // Dc variant above).
+        const GsTrailingArgs3 trailing = decodeGsTrailingArgs3(rdram, ctx);
+        const uint32_t ztest = trailing.arg0;
+        const uint32_t zpsm = trailing.arg1;
+        const uint32_t clear = trailing.arg2;
         (void)clear;
 
         if (w == 0u)
@@ -1632,10 +1680,11 @@ namespace ps2_stubs
             if (hasSeededGsClearPacket(db.clear0))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear0.prim.value >> 9) & 0x1u);
-                runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear0.rgbaq.value));
+                // G219: queued through the arbiter FIFO (was: immediate EE-thread clear — see
+                // g219ApplyGsClearPacketQueued).
+                g219ApplyGsClearPacketQueued(runtime, db.clear0, clearContext);
                 logSwapProbeStage(runtime, "swap-post-clear", which, db.draw01.frame1.value, db.disp[which].dispfb, true);
             }
-            applyGsClearPacket(runtime, db.clear0);
             logSwapProbeStage(runtime, "swap-post", which, db.draw01.frame1.value, db.disp[which].dispfb, hasClearPacket);
         }
         else
@@ -1645,10 +1694,11 @@ namespace ps2_stubs
             if (hasSeededGsClearPacket(db.clear1))
             {
                 const uint32_t clearContext = static_cast<uint32_t>((db.clear1.prim.value >> 9) & 0x1u);
-                runtime->gs().clearFramebufferContext(clearContext, static_cast<uint32_t>(db.clear1.rgbaq.value));
+                // G219: queued through the arbiter FIFO (was: immediate EE-thread clear — see
+                // g219ApplyGsClearPacketQueued).
+                g219ApplyGsClearPacketQueued(runtime, db.clear1, clearContext);
                 logSwapProbeStage(runtime, "swap-post-clear", which, db.draw11.frame1.value, db.disp[which].dispfb, true);
             }
-            applyGsClearPacket(runtime, db.clear1);
             logSwapProbeStage(runtime, "swap-post", which, db.draw11.frame1.value, db.disp[which].dispfb, hasClearPacket);
         }
 
