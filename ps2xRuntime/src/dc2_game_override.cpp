@@ -397,6 +397,7 @@ namespace
 
 static uint32_t dc2_read_u32(uint8_t *rdram, uint32_t addr);
 static uint64_t dc2_read_u64(uint8_t *rdram, uint32_t addr);
+static float dc2_read_f32(uint8_t *rdram, uint32_t addr);
 static void dc2_write_u32(uint8_t *rdram, uint32_t addr, uint32_t value);
 static void dc2_write_u16(uint8_t *rdram, uint32_t addr, uint16_t value);
 static inline void f50_set_reg(R5900Context *ctx, int reg, uint32_t value);
@@ -3261,12 +3262,54 @@ static void g56_chain_tap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime
     }
 }
 
+// G240: dungeon-1 flat cream/white untextured-quad artifact. CMapParts blend-colour
+// slots (part+0x1f0, stride 0x10, count part+0x1e8) are only refreshed from the
+// resolved CMapPiece material by UpdateColor when a slot's weight (+0xc) > 0; a slot
+// SetColor never touched keeps whatever value it had at allocation time. Dump slot
+// state for every drawn CMapParts so a zero/negative-weight slot (or a garbage colour
+// in an otherwise-valid slot) can be correlated with the visible artifact.
+static bool g240_trace_enabled()
+{
+    static const bool enabled = dc2_env_flag_enabled("DC2_TRACE_G240");
+    return enabled;
+}
+
+static void g240_scan_mapparts_colors(uint8_t *rdram, uint32_t part)
+{
+    if (!part) return;
+    static std::atomic<uint32_t> s_calls{0u};
+    const uint32_t n = s_calls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    const uint32_t slotCount = dc2_read_u32(rdram, part + 0x1E8u);
+    if (slotCount == 0u || slotCount > 32u) return; // sanity guard vs a garbage part ptr
+    bool anyBad = false;
+    char buf[640];
+    int off = std::snprintf(buf, sizeof(buf), "part=0x%x slots=%u", part, slotCount);
+    for (uint32_t i = 0; i < slotCount && off > 0 && off < (int)sizeof(buf) - 64; ++i)
+    {
+        const uint32_t slot = part + 0x1F0u + i * 0x10u;
+        const float x = dc2_read_f32(rdram, slot + 0x00u);
+        const float y = dc2_read_f32(rdram, slot + 0x04u);
+        const float z = dc2_read_f32(rdram, slot + 0x08u);
+        const float w = dc2_read_f32(rdram, slot + 0x0Cu);
+        if (w <= 0.0f) anyBad = true;
+        off += std::snprintf(buf + off, sizeof(buf) - off, " [%u](%.2f,%.2f,%.2f,w=%.2f)", i, x, y, z, w);
+    }
+    if (anyBad && (n <= 300u || (n % 400u) == 0u))
+    {
+        std::fprintf(stderr, "[G240:slots] n=%u %s\n", n, buf);
+        std::fflush(stderr);
+    }
+}
+
 static void g56_mapparts_draw_tap(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     static unsigned c = 0u, nz = 0u;
     const bool g195 = g195_block_trace_enabled();
-    const uint32_t part = g195 ? getRegU32(ctx, 4) : 0u;
+    const bool g240 = g240_trace_enabled();
+    const uint32_t part = (g195 || g240) ? getRegU32(ctx, 4) : 0u;
     const uint32_t prevPart = g195 ? g_g195_current_map_part.exchange(part, std::memory_order_relaxed) : 0u;
+    if (g240)
+        g240_scan_mapparts_colors(rdram, part);
     g56_chain_tap(rdram, ctx, runtime, "parts.draw", Draw__9CMapPartsFv_0x15e3d0, c, nz);
     if (g195)
         g_g195_current_map_part.store(prevPart, std::memory_order_relaxed);
