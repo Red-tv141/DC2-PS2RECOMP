@@ -293,6 +293,7 @@ extern void SetDeformMesh__11CCharacter2Fv_0x1730b0(uint8_t* rdram, R5900Context
 extern void GetLWMatrix__8mgCFrameFPA4_f_0x137030(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 // PHASE G34: costume model RTT->display composite (the outline/preview pass).
 extern void Draw__12COutLineDrawFff_0x17c2d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CheckHit__10CDAColPipeFPf_0x17c090(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void DrawDivSprite4__FP11mgCDrawPrim9mgRect_i_P10mgCTexturePiii_0x17cb20(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void mgClipBoxW__FPfPfPfPf_0x12f2e0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void mgClipInBoxW__FPfPfPfPf_0x12f380(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -9581,6 +9582,37 @@ static void g229_outline_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *ru
                      getRegU32(ctx, 2), (double)det, (double)tx, (double)ty, (double)tz);
     }
 }
+// PHASE G233 (default-off, DC2_G233_COLPROBE=1): sample CDAColPipe::CheckHit@0x17C090 — the
+// torso collider push-out the DA pendant chain relies on to stay in FRONT of the body (G232
+// proved the chain settles BEHIND). Indirectly dispatched from Step__13CDynamicAnime's
+// collision loop (vtable+0x8 at obj+0xC0), so registerFunction hooks it. Splits: never
+// called / called-but-never-hits / hits-but-pushes-the-wrong-way. Direct body call is
+// preempt-suppressed (G212 rule). Extern decl at file top (global scope).
+static std::atomic<uint32_t> g_g233_calls{0}, g_g233_hits{0};
+static void g233_colpipe_checkhit_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t obj = getRegU32(ctx, 4);
+    const uint32_t vertPtr = getRegU32(ctx, 5);
+    auto rdf = [&](uint32_t addr) {
+        const uint32_t u = dc2_read_u32(rdram, addr);
+        float f; std::memcpy(&f, &u, sizeof(f)); return f;
+    };
+    const float ix = rdf(vertPtr), iy = rdf(vertPtr + 4), iz = rdf(vertPtr + 8);
+    g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
+    CheckHit__10CDAColPipeFPf_0x17c090(rdram, ctx, runtime);
+    g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
+    const uint32_t ret = getRegU32(ctx, 2);
+    const float ox = rdf(vertPtr), oy = rdf(vertPtr + 4), oz = rdf(vertPtr + 8);
+    const uint32_t n = g_g233_calls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (ret != 0u) g_g233_hits.fetch_add(1u, std::memory_order_relaxed);
+    if (n <= 40u || (n % 500u) == 0u)
+        std::fprintf(stderr,
+                     "[G233:checkhit] n=%u hits=%u obj=0x%08x ret=%u in=(%.3f,%.3f,%.3f) "
+                     "out=(%.3f,%.3f,%.3f) d=(%.3f,%.3f,%.3f) r=%.3f\n",
+                     n, g_g233_hits.load(std::memory_order_relaxed), obj, ret,
+                     ix, iy, iz, ox, oy, oz, ox - ix, oy - iy, oz - iz,
+                     rdf(obj + 4));
+}
 static void g227_node_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     const uint32_t node = getRegU32(ctx, 4); // a0 = param_3 (the COutLineDraw node ptr)
@@ -9915,6 +9947,40 @@ static void g217_motion_createpacket_probe(uint8_t *rdram, R5900Context *ctx, PS
 {
     g217_trace_eeobj(rdram, ctx);
     CreateRenderInfoPacket__18mgCVisualMotionMDTFPUiPA4_fP13mgRENDER_INFO_0x28a660(rdram, ctx, runtime);
+}
+
+// G234: dump each mgCVisualMDT's per-material color multipliers (+0x00 and +0x10, two vec4
+// colors per G230) + texture page, at CreateRenderInfoPacket time. For the DngStatus=5 map
+// pieces this reveals whether the material TINT is present (HW: bluish/tinted) or lost
+// (runner suspected white/gray). Default off (DC2_G234_MAT). Tail-calls the real body.
+static void g234_mat_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    // Only dump in the DngStatus=5 map state (character draws in title/menu are all white
+    // and would exhaust the window before the map renders).
+    const int32_t dngStatus = (int32_t)dc2_read_u32(rdram, 0x01E9F6E0u);
+    static std::atomic<uint32_t> s_n{0};
+    const uint32_t n = (dngStatus == 5) ? s_n.fetch_add(1u, std::memory_order_relaxed) : 0xFFFFFFFFu;
+    if (dngStatus == 5 && n < 120u)
+    {
+        const uint32_t self = getRegU32(ctx, 4);
+        uint32_t matCount = self ? dc2_read_u32(rdram, self + 0x40u) : 0u;
+        const uint32_t matBase = self ? dc2_read_u32(rdram, self + 0x44u) : 0u;
+        if (matCount > 32u) matCount = 32u;
+        auto rf = [&](uint32_t a) { uint32_t u = dc2_read_u32(rdram, a); float f; std::memcpy(&f, &u, 4); return f; };
+        for (uint32_t m = 0u; matBase != 0u && m < matCount; ++m)
+        {
+            const uint32_t mat = matBase + m * 0x30u;
+            const uint32_t tex = dc2_read_u32(rdram, mat + 0x20u);
+            const uint32_t tbp = tex ? (dc2_read_u32(rdram, tex + 0x38u) & 0x3fffu) : 0u;
+            std::fprintf(stderr,
+                "[G234:mat] n=%u self=0x%x m=%u tbp=0x%x c0=(%.3f,%.3f,%.3f,%.3f) c1=(%.3f,%.3f,%.3f,%.3f)\n",
+                n, self, m, tbp,
+                rf(mat), rf(mat + 4u), rf(mat + 8u), rf(mat + 0xcu),
+                rf(mat + 0x10u), rf(mat + 0x14u), rf(mat + 0x18u), rf(mat + 0x1cu));
+        }
+        std::fflush(stderr);
+    }
+    CreateRenderInfoPacket__12mgCVisualMDTFPUiPA4_fP13mgRENDER_INFO_0x1404d0(rdram, ctx, runtime);
 }
 
 static void g217_facepacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -14573,6 +14639,8 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
         runtime.registerFunction(0x0017C2D0u, g229_outline_probe); // per-visual matrix + packet growth
         runtime.registerFunction(0x0013F4E0u, g230_visualmdt_probe); // G230: per-bucket packet/qwc sample
     }
+    if (dc2_env_flag_enabled("DC2_G233_COLPROBE"))
+        runtime.registerFunction(0x0017C090u, g233_colpipe_checkhit_probe); // CDAColPipe::CheckHit (DA torso push-out)
     // G214: skin-matrix collapse scanner overrides the GetLWMatrix guard slot (reproduces its
     // preempt suppression) -- samples EVERY call, not just the outline window g209 sampled.
     if (g214_lwscan_enabled() || g228_dascan_enabled() || g229_datree_enabled())
@@ -14604,6 +14672,11 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
         runtime.registerFunction(0x0013FF60u, g217_facepacket_probe);          // per-face geometry DMA
         runtime.registerFunction(0x0013F6A0u, g217_createpacket_probe);        // per-visual face-list chain build
         runtime.registerFunction(0x0013F920u, g217_fix_createpacket_probe);    // FixMDT prebuilt-face chain build
+    }
+    // G234: map material-color dump (independent of G217/G16; only one may claim 0x1404D0).
+    if (dc2_env_flag_enabled("DC2_G234_MAT"))
+    {
+        runtime.registerFunction(0x001404D0u, g234_mat_probe);  // CreateRenderInfoPacket material colors
     }
     // PHASE G16/G30/G99: CreateRenderInfoPacket probes (quiet unless explicitly requested).
     if (g16_trace_enabled() || g30_trace_enabled() || g99_ri_trace_enabled())
