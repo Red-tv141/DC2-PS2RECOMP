@@ -1105,6 +1105,7 @@ namespace
     struct AlphaTestResult
     {
         bool writeFramebuffer;
+        bool writeDepth;
         bool preserveDestinationAlpha;
     };
 
@@ -1112,19 +1113,20 @@ namespace
     {
         const bool pass = passesAlphaTest(testReg, alpha);
         if (pass)
-            return {true, false};
+            return {true, true, false};
 
         // TEST.AFAIL controls what happens when the alpha comparison fails.
         switch (static_cast<uint8_t>((testReg >> 12) & 0x3u))
         {
         case 1: // FB_ONLY
-            return {true, false};
-        case 3: // RGB_ONLY
-            return {true, true};
-        case 0: // KEEP
+            return {true, false, false};
         case 2: // ZB_ONLY
+            return {false, true, false};
+        case 3: // RGB_ONLY
+            return {true, false, true};
+        case 0: // KEEP
         default:
-            return {false, false};
+            return {false, false, false};
         }
     }
 
@@ -5744,9 +5746,12 @@ void GSRasterizer::drawSprite(GS *gs)
                 }
                 if (!spriteZPass(x, y)) // G203: guest Z test
                     continue;
+                const AlphaTestResult alphaTest = classifyAlphaTest(ctx.test, color.a);
                 g219SpritePixelProbe(ctx, gs, x, y, color.r, color.g, color.b, color.a, 1);
-                writePixel(gs, x, y, color.r, color.g, color.b, color.a);
-                spriteZStore(x, y); // G203: guest Z write (e.g. the game's clear-sprite)
+                if (alphaTest.writeFramebuffer)
+                    writePixel(gs, x, y, color.r, color.g, color.b, color.a);
+                if (alphaTest.writeDepth)
+                    spriteZStore(x, y); // G203: guest Z write (e.g. the game's clear-sprite)
             }
         }
     }
@@ -5757,9 +5762,12 @@ void GSRasterizer::drawSprite(GS *gs)
             {
                 if (!spriteZPass(x, y)) // G203: guest Z test
                     continue;
+                const AlphaTestResult alphaTest = classifyAlphaTest(ctx.test, a);
                 g219SpritePixelProbe(ctx, gs, x, y, r, g, b, a, 0);
-                writePixel(gs, x, y, r, g, b, a);
-                spriteZStore(x, y); // G203: guest Z write (e.g. the game's clear-sprite)
+                if (alphaTest.writeFramebuffer)
+                    writePixel(gs, x, y, r, g, b, a);
+                if (alphaTest.writeDepth)
+                    spriteZStore(x, y); // G203: guest Z write (e.g. the game's clear-sprite)
             }
     }
 }
@@ -6221,6 +6229,102 @@ void GSRasterizer::drawTriangle(GS *gs)
                     tex.tbp0, dw, dh, (unsigned)tex.tbw, (unsigned)tex.psm, tex.cbp,
                     (unsigned long long)(sr/np), (unsigned long long)(sg/np),
                     (unsigned long long)(sb/np), nz, np);
+                std::fflush(stderr);
+            }
+        }
+    }
+
+    // G240: compare the foliage cutout's effective T8 indices and CT32 CLUT alpha against
+    // the supplied hardware dump. The source IMAGE packets are byte-identical; this probe
+    // observes the final values at the exact GEQUAL/AREF=64 draw boundary. Default-off.
+    {
+        static const bool s_g240TexAlpha = (std::getenv("DC2_G240_TEXALPHA") != nullptr);
+        const auto &tex = ctx.tex0;
+        const bool foliage2920 = tex.tbp0 == 0x2920u && tex.cbp == 0x3fb4u;
+        const bool foliage2a20 = tex.tbp0 == 0x2a20u && tex.cbp == 0x3fb0u;
+        if (s_g240TexAlpha && gs->m_vram && gs->m_prim.tme && tex.psm == GS_PSM_T8 &&
+            tex.tcc != 0u && (foliage2920 || foliage2a20) &&
+            (ctx.frame.fbp == 0u || ctx.frame.fbp == 0x68u) && ctx.test == 0x5040bu)
+        {
+            static std::mutex s_g240Mtx;
+            static uint32_t s_g240Seen = 0u;
+            std::lock_guard<std::mutex> lock(s_g240Mtx);
+            const uint32_t bit = foliage2920 ? 1u : 2u;
+            if ((s_g240Seen & bit) == 0u)
+            {
+                s_g240Seen |= bit;
+                const int width = 1 << tex.tw;
+                const int height = 1 << tex.th;
+                const uint32_t pageBwT8 = (tex.tbw > 1u) ? (tex.tbw >> 1u) : 1u;
+                char indexPath[128], alphaPath[128], clutPath[128];
+                std::snprintf(indexPath, sizeof(indexPath), "captures/g240_tex_%x_index.pgm", tex.tbp0);
+                std::snprintf(alphaPath, sizeof(alphaPath), "captures/g240_tex_%x_alpha.pgm", tex.tbp0);
+                std::snprintf(clutPath, sizeof(clutPath), "captures/g240_clut_%x.rgba", tex.cbp);
+                FILE *indexFile = std::fopen(indexPath, "wb");
+                FILE *alphaFile = std::fopen(alphaPath, "wb");
+                FILE *clutFile = std::fopen(clutPath, "wb");
+                if (indexFile) std::fprintf(indexFile, "P5\n%d %d\n255\n", width, height);
+                if (alphaFile) std::fprintf(alphaFile, "P5\n%d %d\n255\n", width, height);
+
+                uint64_t alphaHist[256]{};
+                uint64_t indexHist[256]{};
+                for (int y = 0; y < height; ++y)
+                {
+                    for (int x = 0; x < width; ++x)
+                    {
+                        const uint8_t index = static_cast<uint8_t>(GSMem::ReadP8(
+                            gs->m_vram, tex.tbp0, pageBwT8,
+                            static_cast<uint32_t>(x), static_cast<uint32_t>(y)));
+                        const uint32_t color = lookupCLUT(gs, index, tex.cbp, tex.cpsm,
+                                                          tex.csm, tex.csa, tex.psm);
+                        const uint8_t alpha = static_cast<uint8_t>(color >> 24u);
+                        ++indexHist[index];
+                        ++alphaHist[alpha];
+                        if (indexFile) std::fwrite(&index, 1, 1, indexFile);
+                        if (alphaFile) std::fwrite(&alpha, 1, 1, alphaFile);
+                    }
+                }
+                if (indexFile) std::fclose(indexFile);
+                if (alphaFile) std::fclose(alphaFile);
+
+                if (clutFile)
+                {
+                    for (uint32_t index = 0; index < 256u; ++index)
+                    {
+                        const uint32_t color = lookupCLUT(gs, static_cast<uint8_t>(index),
+                                                          tex.cbp, tex.cpsm, tex.csm,
+                                                          tex.csa, tex.psm);
+                        std::fwrite(&color, 1, sizeof(color), clutFile);
+                    }
+                    std::fclose(clutFile);
+                }
+
+                uint64_t below64 = 0u, atLeast64 = 0u;
+                for (uint32_t alpha = 0; alpha < 256u; ++alpha)
+                {
+                    if (alpha < 64u) below64 += alphaHist[alpha];
+                    else atLeast64 += alphaHist[alpha];
+                }
+                std::fprintf(stderr,
+                    "[G240:texalpha] tbp=0x%x cbp=0x%x size=%dx%d tbw=%u cpsm=0x%x csm=%u csa=%u "
+                    "cld=%u tex1=0x%llx texclut=(%u,%u,%u) test=0x%llx texa=(%u,%u,%u) "
+                    "alpha_lt64=%llu alpha_ge64=%llu idx0=%llu idx173=%llu vtxa=(%u,%u,%u)\n",
+                    tex.tbp0, tex.cbp, width, height, static_cast<unsigned>(tex.tbw),
+                    static_cast<unsigned>(tex.cpsm), static_cast<unsigned>(tex.csm),
+                    static_cast<unsigned>(tex.csa), static_cast<unsigned>(tex.cld),
+                    static_cast<unsigned long long>(ctx.tex1),
+                    static_cast<unsigned>(gs->m_texclut.cbw),
+                    static_cast<unsigned>(gs->m_texclut.cou),
+                    static_cast<unsigned>(gs->m_texclut.cov),
+                    static_cast<unsigned long long>(ctx.test),
+                    static_cast<unsigned>(gs->m_texa.ta0), static_cast<unsigned>(gs->m_texa.aem),
+                    static_cast<unsigned>(gs->m_texa.ta1),
+                    static_cast<unsigned long long>(below64),
+                    static_cast<unsigned long long>(atLeast64),
+                    static_cast<unsigned long long>(indexHist[0]),
+                    static_cast<unsigned long long>(indexHist[173]),
+                    static_cast<unsigned>(v0.a), static_cast<unsigned>(v1.a),
+                    static_cast<unsigned>(v2.a));
                 std::fflush(stderr);
             }
         }
@@ -7838,6 +7942,13 @@ void GSRasterizer::drawTriangle(GS *gs)
                 a = color.a;
             }
 
+            // G240: alpha-test failure controls framebuffer and depth writes independently.
+            // The old path let writePixel suppress AFAIL=KEEP framebuffer writes, then wrote Z
+            // unconditionally below. Transparent cutout texels consequently occluded later
+            // primitives. Keep ZB_ONLY depth-only behavior while suppressing depth for KEEP,
+            // FB_ONLY, and RGB_ONLY, matching TEST.AFAIL.
+            const AlphaTestResult fragmentAlpha = classifyAlphaTest(ctx.test, a);
+
             // G48: the costume head sub-meshes (skin / hair / hat / dark face-shadow decals)
             // interleave, and the RTT is cleared to BLACK, so a DARK alpha-blended decal that hits
             // a still-uncovered pixel BEFORE the opaque skin reaches it locks in a dark
@@ -7943,13 +8054,13 @@ void GSRasterizer::drawTriangle(GS *gs)
                 if (r > 150u && g < 90u && b < 110u)
                     g_g232PxRedWrite.fetch_add(1u, std::memory_order_relaxed);
             }
-            if (!s_g141SkipWrite)
+            if (!s_g141SkipWrite && fragmentAlpha.writeFramebuffer)
                 writePixel(gs, x, y, r, g, b, a);
             // G219 (default-off, DC2_G219_SKYPX=1): identify every draw WRITING Z inside the
             // black rectangle — finds what poisons zdst so the sky's GEQUAL fails there.
             {
                 static const bool s_g219w = (std::getenv("DC2_G219_SKYPX") != nullptr);
-                if (s_g219w && zWrite &&
+                if (s_g219w && zWrite && fragmentAlpha.writeDepth &&
                     (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u) &&
                     x >= 417 && y <= 140 && ((x & 15) == 1) && ((y & 15) == 1))
                 {
@@ -7964,7 +8075,7 @@ void GSRasterizer::drawTriangle(GS *gs)
                             t_g144InReplay ? 1u : 0u);
                 }
             }
-            if (zWrite)
+            if (zWrite && fragmentAlpha.writeDepth)
             {
                 // G45: costume model (fbp=0x139) writes its private, non-aliasing Z buffer so it
                 // neither corrupts nor is corrupted by the menu text VRAM it would otherwise alias.
