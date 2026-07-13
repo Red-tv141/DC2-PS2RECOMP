@@ -4,6 +4,7 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "runtime/ps2_gs_gpu.h"
+#include "runtime/ps2_gs_memory.h"
 #include "runtime/ps2_gs_psmct32.h"
 #include "runtime/ps2_gs_psmt4.h"
 #include "runtime/ps2_gs_psmt8.h"
@@ -2956,6 +2957,155 @@ void register_ps2_gs_tests()
             std::memcpy(&pixel, vram.data(), sizeof(pixel));
             t.Equals(pixel, 0xAB563412u,
                      "AFAIL=RGB_ONLY should update RGB while preserving destination alpha");
+        });
+
+        tc.Run("GS alpha test AFAIL gates sprite depth writes", [](TestCase &t)
+        {
+            constexpr uint32_t kZbpPage = 0x20u;
+            constexpr uint32_t kZbpBlock = kZbpPage << 5u;
+            constexpr uint32_t kOldDepth = 0x00123456u;
+            constexpr uint32_t kNewDepth = 0x00654321u;
+            constexpr uint32_t kOldFrame = 0xAB030201u;
+            constexpr uint64_t kFrame =
+                (0ull << 0) |
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kZbuf =
+                (static_cast<uint64_t>(kZbpPage) << 0) |
+                (1ull << 24); // PSMZ24
+            constexpr uint64_t kPrim = static_cast<uint64_t>(GS_PRIM_SPRITE);
+            constexpr uint64_t kRgbaq =
+                (0x12ull << 0) |
+                (0x34ull << 8) |
+                (0x56ull << 16) |
+                (0x00ull << 24) |
+                (0x3F800000ull << 32); // q = 1.0f
+            constexpr uint64_t kXyz0 = static_cast<uint64_t>(kNewDepth) << 32;
+            constexpr uint64_t kXyz1 =
+                (16ull << 0) |
+                (16ull << 16) |
+                (static_cast<uint64_t>(kNewDepth) << 32);
+
+            auto renderFail = [&](uint32_t afail, uint32_t &frame, uint32_t &depth)
+            {
+                std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+                GS gs;
+                gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+                std::memcpy(vram.data(), &kOldFrame, sizeof(kOldFrame));
+                GSMem::WriteZ24(vram.data(), kZbpBlock, 1u, 0u, 0u, kOldDepth);
+
+                const uint64_t test =
+                    1ull |                  // ATE
+                    (5ull << 1) |          // ATST = GEQUAL
+                    (0x80ull << 4) |       // AREF; source alpha 0 fails
+                    (static_cast<uint64_t>(afail) << 12) |
+                    (1ull << 16) |         // ZTE
+                    (1ull << 17);          // ZTST = ALWAYS
+
+                gs.writeRegister(GS_REG_FRAME_1, kFrame);
+                gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
+                gs.writeRegister(GS_REG_SCISSOR_1, 0ull);
+                gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+                gs.writeRegister(GS_REG_TEST_1, test);
+                gs.writeRegister(GS_REG_PRIM, kPrim);
+                gs.writeRegister(GS_REG_RGBAQ, kRgbaq);
+                gs.writeRegister(GS_REG_XYZ2, kXyz0);
+                gs.writeRegister(GS_REG_XYZ2, kXyz1);
+
+                std::memcpy(&frame, vram.data(), sizeof(frame));
+                depth = GSMem::ReadZ24(vram.data(), kZbpBlock, 1u, 0u, 0u);
+            };
+
+            uint32_t frame = 0u;
+            uint32_t depth = 0u;
+            renderFail(0u, frame, depth); // KEEP
+            t.Equals(frame, kOldFrame, "AFAIL=KEEP should preserve the framebuffer");
+            t.Equals(depth, kOldDepth, "AFAIL=KEEP should preserve depth");
+
+            renderFail(1u, frame, depth); // FB_ONLY
+            t.Equals(frame, 0x00563412u, "AFAIL=FB_ONLY should write the framebuffer");
+            t.Equals(depth, kOldDepth, "AFAIL=FB_ONLY should preserve depth");
+
+            renderFail(2u, frame, depth); // ZB_ONLY
+            t.Equals(frame, kOldFrame, "AFAIL=ZB_ONLY should preserve the framebuffer");
+            t.Equals(depth, kNewDepth, "AFAIL=ZB_ONLY should write depth");
+
+            renderFail(3u, frame, depth); // RGB_ONLY
+            t.Equals(frame, 0xAB563412u, "AFAIL=RGB_ONLY should preserve destination alpha");
+            t.Equals(depth, kOldDepth, "AFAIL=RGB_ONLY should preserve depth");
+        });
+
+        tc.Run("GS alpha test AFAIL KEEP suppresses triangle depth writes", [](TestCase &t)
+        {
+            std::vector<uint8_t> vram(PS2_GS_VRAM_SIZE, 0u);
+            GS gs;
+            gs.init(vram.data(), static_cast<uint32_t>(vram.size()), nullptr);
+
+            constexpr uint32_t kTargetX = 1u;
+            constexpr uint32_t kTargetY = 1u;
+            constexpr uint32_t kZbpPage = 0x20u;
+            constexpr uint32_t kZbpBlock = kZbpPage << 5u;
+            constexpr uint32_t kOldDepth = 0x00123456u;
+            constexpr uint32_t kNewDepth = 0x00654321u;
+            constexpr uint32_t kOldFrame = 0xAB030201u;
+            constexpr uint64_t kFrame =
+                (0ull << 0) |
+                (1ull << 16) |
+                (static_cast<uint64_t>(GS_PSM_CT32) << 24);
+            constexpr uint64_t kZbuf =
+                (static_cast<uint64_t>(kZbpPage) << 0) |
+                (1ull << 24); // PSMZ24
+            constexpr uint64_t kScissor =
+                (0ull << 0) |
+                (4ull << 16) |
+                (0ull << 32) |
+                (4ull << 48);
+            constexpr uint64_t kTest =
+                1ull |                  // ATE
+                (5ull << 1) |          // ATST = GEQUAL
+                (0x80ull << 4) |       // AREF; source alpha 0 fails
+                (0ull << 12) |         // AFAIL = KEEP
+                (1ull << 16) |         // ZTE
+                (1ull << 17);          // ZTST = ALWAYS
+            constexpr uint64_t kPrim = static_cast<uint64_t>(GS_PRIM_TRIANGLE);
+            constexpr uint64_t kRgbaq =
+                (0x12ull << 0) |
+                (0x34ull << 8) |
+                (0x56ull << 16) |
+                (0x00ull << 24) |
+                (0x3F800000ull << 32); // q = 1.0f
+            auto makeXyz = [](uint16_t x, uint16_t y, uint32_t z) -> uint64_t
+            {
+                return static_cast<uint64_t>(x) |
+                       (static_cast<uint64_t>(y) << 16) |
+                       (static_cast<uint64_t>(z) << 32);
+            };
+
+            const uint32_t frameOff =
+                GSPSMCT32::addrPSMCT32(0u, 1u, kTargetX, kTargetY);
+            std::memcpy(vram.data() + frameOff, &kOldFrame, sizeof(kOldFrame));
+            GSMem::WriteZ24(vram.data(), kZbpBlock, 1u,
+                            kTargetX, kTargetY, kOldDepth);
+
+            gs.writeRegister(GS_REG_FRAME_1, kFrame);
+            gs.writeRegister(GS_REG_ZBUF_1, kZbuf);
+            gs.writeRegister(GS_REG_SCISSOR_1, kScissor);
+            gs.writeRegister(GS_REG_XYOFFSET_1, 0ull);
+            gs.writeRegister(GS_REG_TEST_1, kTest);
+            gs.writeRegister(GS_REG_PRIM, kPrim);
+            gs.writeRegister(GS_REG_RGBAQ, kRgbaq);
+            gs.writeRegister(GS_REG_XYZ2, makeXyz(0u, 0u, kNewDepth));
+            gs.writeRegister(GS_REG_XYZ2, makeXyz(64u, 0u, kNewDepth));
+            gs.writeRegister(GS_REG_XYZ2, makeXyz(0u, 64u, kNewDepth));
+
+            uint32_t frame = 0u;
+            std::memcpy(&frame, vram.data() + frameOff, sizeof(frame));
+            const uint32_t depth = GSMem::ReadZ24(vram.data(), kZbpBlock, 1u,
+                                                  kTargetX, kTargetY);
+            t.Equals(frame, kOldFrame,
+                     "AFAIL=KEEP should preserve the triangle framebuffer sample");
+            t.Equals(depth, kOldDepth,
+                     "AFAIL=KEEP should preserve the triangle depth sample");
         });
 
         tc.Run("GS triangle fan subpixel quad fills rows without interior holes", [](TestCase &t)
