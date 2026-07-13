@@ -7031,12 +7031,13 @@ void GSRasterizer::drawTriangle(GS *gs)
     long g141InsidePx = 0;
 
     // [G232] consume the gem-draw arm set by drawPrimitive for this same primitive.
-    const bool g232tri = g_g232TriArm.exchange(0, std::memory_order_relaxed) != 0;
+    // s_g232w short-circuits first so the default path pays no atomics here.
+    static const bool s_g232w = (std::getenv("DC2_G232_RTTDUMP") != nullptr);
+    const bool g232tri = s_g232w && g_g232TriArm.exchange(0, std::memory_order_relaxed) != 0;
     if (g232tri && g141BboxPx > 0)
         g_g232PxBbox.fetch_add(static_cast<uint32_t>(g141BboxPx), std::memory_order_relaxed);
-    static const bool s_g232w = (std::getenv("DC2_G232_RTTDUMP") != nullptr);
-    const int g232wx = g_g232GemX.load(std::memory_order_relaxed);
-    const int g232wy = g_g232GemY.load(std::memory_order_relaxed);
+    const int g232wx = s_g232w ? g_g232GemX.load(std::memory_order_relaxed) : -1;
+    const int g232wy = s_g232w ? g_g232GemY.load(std::memory_order_relaxed) : -1;
     // Watch every triangle touching the gem pixel on ANY target sharing the game's single Z
     // page (0xd0) — room draws (fbp 0/0x68) and character RTT draws (0x139) alike.
     const bool g232watch = s_g232w && g232wx >= 0 && zbpPage == 0xd0u;

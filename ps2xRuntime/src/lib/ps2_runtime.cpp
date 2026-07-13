@@ -2876,6 +2876,52 @@ void PS2Runtime::run()
                     "[F59:dump] tick=%llu DngStatus=%d DngMainMap=0x%x scale=%.3f flags=0x%x mapIdx=%d\n",
                     (unsigned long long)tick, status, dngMap, scale, flags, mapIdx);
             }
+            // G234: deferred GS-dump start — close the g138 dump gate at boot when
+            // DC2_G138_GSDUMP_AT_TICK is set, open it once the present tick reaches
+            // the requested value (dump then runs until DC2_G138_GSDUMP_MAX records).
+            {
+                extern std::atomic<bool> g_dc2G138DumpGateOpen;
+                static const long s_gsdumpAtTick = []() -> long {
+                    const char *e = std::getenv("DC2_G138_GSDUMP_AT_TICK");
+                    const long v = e ? std::strtol(e, nullptr, 10) : -1;
+                    if (v >= 0)
+                        g_dc2G138DumpGateOpen.store(false, std::memory_order_relaxed);
+                    return v;
+                }();
+                if (s_gsdumpAtTick >= 0 && (long)tick >= s_gsdumpAtTick &&
+                    !g_dc2G138DumpGateOpen.load(std::memory_order_relaxed)) {
+                    g_dc2G138DumpGateOpen.store(true, std::memory_order_relaxed);
+                    std::fprintf(stderr, "[G234:gsdump] gate OPEN at tick=%llu\n",
+                                 (unsigned long long)tick);
+                }
+            }
+            // G234: dump the mgRenderInfo active light set (dir/color matrices, ambient,
+            // point lights) on each frame-dump tick for A/B vs a paused PCSX2 at the same
+            // scene. Gated on DC2_G234_LIGHT.
+            static const bool s_g234 = (std::getenv("DC2_G234_LIGHT") != nullptr);
+            if (s_g234) {
+                uint8_t *rd = m_memory.getRDRAM();
+                auto rd32 = [&](uint32_t a){ uint32_t v; std::memcpy(&v, rd + (a & 0x01FFFFFFu), 4); return v; };
+                auto rdf = [&](uint32_t a){ uint32_t u = rd32(a); float f; std::memcpy(&f, &u, 4); return f; };
+                const uint32_t ri = rd32(0x00382144u);
+                if (ri != 0) {
+                    const uint32_t idx = rd32(ri + 0x3F4u);
+                    std::fprintf(stderr, "[G234:light] tick=%llu ri=0x%x activeSet=%u\n",
+                                 (unsigned long long)tick, ri, idx);
+                    for (uint32_t s = 0; s < 8u; ++s) {
+                        const uint32_t b = ri + 0x400u + s * 0x150u;
+                        std::fprintf(stderr,
+                            "[G234:light]   set %u dir0=(%.2f,%.2f,%.2f,%.2f) col0=(%.2f,%.2f,%.2f,%.2f) amb=(%.2f,%.2f,%.2f,%.2f) pl0col=(%.2f,%.2f,%.2f,%.2f) pl0pos=(%.2f,%.2f,%.2f,%.2f)\n",
+                            s,
+                            rdf(b), rdf(b+4u), rdf(b+8u), rdf(b+12u),
+                            rdf(b+0x40u), rdf(b+0x44u), rdf(b+0x48u), rdf(b+0x4Cu),
+                            rdf(b+0x80u), rdf(b+0x84u), rdf(b+0x88u), rdf(b+0x8Cu),
+                            rdf(b+0x90u), rdf(b+0x94u), rdf(b+0x98u), rdf(b+0x9Cu),
+                            rdf(b+0xA0u), rdf(b+0xA4u), rdf(b+0xA8u), rdf(b+0xACu));
+                    }
+                    std::fflush(stderr);
+                }
+            }
         }
 
         // F60: sample the poll/wait-primitive counters from the host present

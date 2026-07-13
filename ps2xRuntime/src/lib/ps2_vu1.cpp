@@ -143,6 +143,57 @@ namespace
     }
     thread_local float s_vuQPending = 0.0f;
     thread_local int   s_vuQDelay   = 0;
+    // G239: VU1 P-register/EFU pipeline. EFU results are not architecturally visible until
+    // their instruction-specific latency expires. A second EFU instruction (or WAITP) stalls
+    // the unit and publishes the older pending result before continuing; MFP itself does not
+    // stall and therefore reads the previous P while a newer result is in flight. DC2's dungeon
+    // lighting loop deliberately issues ERSQRT at the unit's throughput boundary, then executes
+    // MFP one pair later. This pipeline is required for the architectural P value to match VU1;
+    // DC2_VU1_NO_PPIPE restores the old immediate-result model for focused A/B verification.
+    bool g239_p_pipeline_enabled()
+    {
+        static const bool v = (std::getenv("DC2_VU1_NO_PPIPE") == nullptr);
+        return v;
+    }
+    thread_local float s_vuPPending = 0.0f;
+    thread_local int   s_vuPDelay   = 0;
+
+    void g239_stage_p(float &architecturalP, float result, int latency)
+    {
+        if (!g239_p_pipeline_enabled())
+        {
+            architecturalP = result;
+            s_vuPDelay = 0;
+            return;
+        }
+
+        // PCSX2's _vuTestEFUStalls releases the busy stall one cycle before the nominal
+        // latency, then flushes the old pipe entry before _vuEFUAdd replaces it. For value
+        // semantics in this single-pair interpreter, that is exactly an old-P commit here.
+        if (s_vuPDelay > 0)
+            architecturalP = s_vuPPending;
+        s_vuPPending = result;
+        s_vuPDelay = latency;
+    }
+
+    void g239_wait_p(float &architecturalP)
+    {
+        if (g239_p_pipeline_enabled() && s_vuPDelay > 0)
+        {
+            architecturalP = s_vuPPending;
+            s_vuPDelay = 0;
+        }
+    }
+    // G239: lower FDIV/EFU waits and busy producers are tested before the parallel upper slot
+    // executes on VU1. This matters for pairs such as `MULq ... | WAITQ`: WAITQ publishes the
+    // pending Q first, then MULq consumes it. The old sequential upper-then-lower interpreter
+    // multiplied by the stale Q and could turn a normalized lighting basis into ~FLT_MAX.
+    // Kill switch retained solely for the matched route A/B.
+    bool g239_scalar_prestall_enabled()
+    {
+        static const bool v = (std::getenv("DC2_VU1_NO_SCALAR_PRESTALL") == nullptr);
+        return v;
+    }
     // G200: real VU1's FDIV unit stalls a second DIV/SQRT/RSQRT issued while a result is still
     // in flight -- the machine waits until the FIRST result latches into Q, then starts the new
     // op (PCSX2 VUops.cpp: _vuTestFDIVStalls advances VU->cycle to the in-flight op's completion,
@@ -1086,6 +1137,8 @@ void VU1Interpreter::reset()
     std::memset(&m_state, 0, sizeof(m_state));
     m_state.vf[0][3] = 1.0f; // VF0.w = 1.0
     m_state.q = 1.0f;
+    s_vuPPending = 0.0f;
+    s_vuPDelay = 0;
 }
 
 float VU1Interpreter::broadcast(const float *vf, uint8_t bc)
@@ -1438,6 +1491,102 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
             }
         }
     }
+    // G234: dump the map program's INPUT vertex qwords (XTOP batch) at kick time, to
+    // discriminate EE-side (VIF stream already carries the wrong constant color) from
+    // VU-side (input varies, output collapses). Layout per the dungeon map program
+    // (startPC=0x10, XGKICK@0x648): batch header at TOP+0/+1, vertices at TOP+2,
+    // stride 5 qw (pos, st, color->FTOI0, x2 aux->FTOI4). Gated DC2_G234_VUIN +
+    // the G138 deferred-start gate (DC2_G138_GSDUMP_AT_TICK) so it samples the
+    // scene of interest, capped at 6 kicks.
+    {
+        static const bool s_g234vuin = (std::getenv("DC2_G234_VUIN") != nullptr);
+        extern std::atomic<bool> g_dc2G138DumpGateOpen;
+        if (s_g234vuin && startPC == 0x10u && vuData &&
+            g_dc2G138DumpGateOpen.load(std::memory_order_relaxed))
+        {
+            static std::atomic<uint32_t> s_g234Kicks{0};
+            const uint32_t kn = s_g234Kicks.fetch_add(1u, std::memory_order_relaxed);
+            if (kn < 24u)
+            {
+                const uint32_t top = memory ? (memory->vif1_regs.top & 0x3FFu) : 0u;
+                uint32_t code648 = 0u;
+                if (0x648u + 4u <= codeSize)
+                    std::memcpy(&code648, vuCode + 0x648u, 4);
+                std::fprintf(stderr, "[G234:vuin] kick=%u top=0x%x itop=0x%x lo@648=0x%08x\n",
+                             kn, top, itop, code648);
+                // Constant region at VI0 base (qw 0x0..0x14): matrix rows, light/material
+                // color constants. The map program stores VF6 (loaded from ~qw0x10) as the
+                // per-vertex GS color, so the material tint lives here.
+                // G235: extended to qw 0x3c to capture the light-colour matrix / ambient /
+                // point-light constants (the map program reads these for its per-vertex tint,
+                // not just the object matrix at 0x08-0x0b). Skip all-zero rows above 0x14.
+                for (uint32_t q = 0x0u; q <= 0x3cu; ++q)
+                {
+                    const uint32_t base = q * 16u;
+                    if (base + 16u > dataSize) break;
+                    float f[4];
+                    std::memcpy(f, vuData + base, 16);
+                    if (q > 0x14u && f[0] == 0.f && f[1] == 0.f && f[2] == 0.f && f[3] == 0.f)
+                        continue;
+                    std::fprintf(stderr, "[G234:vuin]   K qw0x%02x %12.4f %12.4f %12.4f %12.4f\n",
+                                 q, f[0], f[1], f[2], f[3]);
+                }
+                // G235: dump the per-vertex INPUT batch to discriminate EE-side (the vertex
+                // stream already carries the wrong per-vertex colour) from VU-side (input
+                // colour correct, VU over-brightens it). Layout per this program: header at
+                // TOP+0/+1, vertices at TOP+2 stride 5 qw (pos, st, colour, aux, aux). The
+                // colour qw is the 3rd of each vertex (TOP + 2 + v*5 + 2). Dump 8 verts.
+                // G235: the map program uses THREE SEQUENTIAL input arrays (VI2 positions,
+                // VI4=VI2+count colours, VI5=VI4+count st), NOT interleaved. Dump a raw window
+                // of consecutive qw from TOP so the colour array (values in ~0..255 range,
+                // FTOI0-passthrough to the GS RGBA) is visible after the position block.
+                // G236: dump the VIF1 row/col/mask registers — if the map colour array is
+                // VIF-UNPACKed in row-ADD (m-bit) mode, the per-frame STROW value is ADDED to
+                // the baked base colour, which matches the additive-on-lit over-brightness.
+                if (memory)
+                {
+                    std::fprintf(stderr,
+                        "[G236:vif] mask=0x%08x row=[%d %d %d %d] col=[%d %d %d %d]\n",
+                        memory->vif1_regs.mask,
+                        (int)memory->vif1_regs.row[0], (int)memory->vif1_regs.row[1],
+                        (int)memory->vif1_regs.row[2], (int)memory->vif1_regs.row[3],
+                        (int)memory->vif1_regs.col[0], (int)memory->vif1_regs.col[1],
+                        (int)memory->vif1_regs.col[2], (int)memory->vif1_regs.col[3]);
+                }
+                // G236: widen the window to 0x140 qw so the parallel colour array
+                // (VI4 = positions + count, values in ~0..255 range -> FTOI0 -> GS RGBA) and
+                // the st array are captured past the position block (which alone fills 0x60).
+                // G236: SCAN THE ENTIRE VU data memory for colour-range float qwords. If the
+                // per-vertex colour is a baked FTOI0-ready array (G235's passthrough claim), it
+                // must appear somewhere as floats in ~[40,260]. If NO such qword exists anywhere,
+                // the colour is VU-COMPUTED (G235 refuted / G234's VU-lighting math right).
+                {
+                    uint32_t nColourQw = 0u;
+                    for (uint32_t qw = 0u; (qw + 1u) * 16u <= dataSize; ++qw)
+                    {
+                        float f[4];
+                        std::memcpy(f, vuData + qw * 16u, 16);
+                        int lanesInRange = 0;
+                        for (int k = 0; k < 3; ++k)
+                            if (f[k] >= 40.0f && f[k] <= 260.0f) ++lanesInRange;
+                        if (lanesInRange >= 2)
+                        {
+                            uint32_t u[4];
+                            std::memcpy(u, vuData + qw * 16u, 16);
+                            if (nColourQw < 48u)
+                                std::fprintf(stderr,
+                                    "[G236:col] qw0x%03x %8.2f %8.2f %8.2f %8.2f | %08x %08x %08x %08x\n",
+                                    qw, f[0], f[1], f[2], f[3], u[0], u[1], u[2], u[3]);
+                            ++nColourQw;
+                        }
+                    }
+                    std::fprintf(stderr, "[G236:col] kick=%u colourRangeQw=%u top=0x%x\n",
+                                 kn, nColourQw, top);
+                }
+                std::fflush(stderr);
+            }
+        }
+    }
     // G197: generic one-shot-per-distinct-startPC full microcode dump, unscoped (unlike G38's
     // startPC==0x10 title-model-only gate) -- needed to capture the map-piece/mgCVisualMDT
     // "VU program 0" microcode (G195/G196 block-trace) which uses a different startPC than the
@@ -1446,12 +1595,21 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     static const bool s_g197vudump = (std::getenv("DC2_G197_VUDUMP") != nullptr);
     if (s_g197vudump)
     {
+        // G234: dedupe by (startPC, code checksum), not startPC alone — the game RELOADS
+        // different microcode at the same startPC across scenes (title vs dungeon map),
+        // and the old startPC-only key silently skipped every later program.
+        uint32_t crc = 0x811C9DC5u;
+        for (uint32_t a = 0; a + 4u <= codeSize; a += 64u)
+        {
+            uint32_t w = 0u; std::memcpy(&w, vuCode + a, 4);
+            crc = (crc ^ w) * 0x01000193u;
+        }
         static std::atomic<uint32_t> s_g197Seen[16];
         bool doDump = false;
         for (uint32_t i = 0; i < 16u; ++i)
         {
             uint32_t expected = 0u;
-            const uint32_t tag = startPC + 1u;
+            const uint32_t tag = (startPC + 1u) ^ (crc | 1u);
             if (s_g197Seen[i].load(std::memory_order_relaxed) == tag) break;
             if (s_g197Seen[i].compare_exchange_strong(expected, tag, std::memory_order_relaxed))
             {
@@ -1782,6 +1940,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     // title smoke must stay 211646. TLS addresses are stable for the thread's lifetime, and run()
     // is re-entered per MSCAL so each call re-caches its own thread's base.
     const bool s_qlatOn        = g87_q_latency_enabled();
+    const bool s_ppipeOn       = g239_p_pipeline_enabled();
+    const bool s_scalarPrestallOn = g239_scalar_prestall_enabled();
     const bool s_macpipeOn     = g138_macpipe_enabled();
     const int  s_macpipeDepth  = s_macpipeOn ? g138_macpipe_depth() : 4;
     const bool s_pairhazOn     = g139_pairhaz_enabled();
@@ -1791,6 +1951,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     uint32_t *const s_macVisP      = &s_vuMacVisible;
     uint32_t *const s_statusVisP   = &s_vuStatusVisible;
     int      *const s_qDelayP      = &s_vuQDelay;
+    int      *const s_pDelayP      = &s_vuPDelay;
 
     for (; cycle < maxCycles; ++cycle)
     {
@@ -2393,6 +2554,63 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             }
         }
 
+        // G237: dungeon-MAP per-vertex colour+alpha trace. The map-env emit loop (0x550-0x648,
+        // XGKICK@0x648) stores VF22 as the GS colour (FTOI0 @0x5b0) and VF26.w as alpha
+        // (built via MADDw/MINIy/MAXz vs the VF29=qw59 fog consts, DIV @0x5e0). G236 showed the
+        // runner collapses this to over-bright (220,252,254,255) vs HW teal (57,105,122,128).
+        // Dump the pre-conversion colour VF22 + its inputs (VF30 qw22, VF27=VF25-VF19, VF25
+        // transformed, VF19, VF16/VF17 tex-scale, VF20 pos, VF21 in) and the alpha state, for
+        // the first N vertices, to localize which contributor diverges. Env DC2_G237_TRACE.
+        if (startPc == 0x10u)
+        {
+            static const bool s_g237 = (std::getenv("DC2_G237_TRACE") != nullptr);
+            // Discriminate the MAP program from the other startPC=0x10 programs (title/model):
+            // only this uploaded map emit loop has XGKICK (lo=0x80006efc) at code 0x648. Also defer to the
+            // map scene via the G138 dump gate so we don't capture the boot/title program.
+            extern std::atomic<bool> g_dc2G138DumpGateOpen;
+            bool mapProg = false;
+            if (s_g237 && vuCode && codeSize >= 0x64Cu)
+            {
+                uint32_t c648 = 0u; std::memcpy(&c648, vuCode + 0x648u, 4);
+                mapProg = (c648 == 0x80006efcu);
+            }
+            // Fire on the FTOI0 xyzw COLOUR op (reliable across map-part microcode variants,
+            // unlike a fixed PC). FTOI0 = Special upper (op 0x3C/0x3D) with S2_FUNC==0x14; the
+            // colour store has dest==0xF (all lanes) vs the ADC .w-only path (dest==0x1/0x9).
+            if (s_g237 && mapProg && g_dc2G138DumpGateOpen.load(std::memory_order_relaxed))
+            {
+                const uint8_t upOp237 = static_cast<uint8_t>(upper & 0x3Fu);
+                const uint8_t s2_237  = S2_FUNC(upper);
+                if (upOp237 >= 0x3Cu && (s2_237 == 0x14u || s2_237 == 0x15u)) // FTOI0 or FTOI4
+                {
+                    const uint8_t fs = static_cast<uint8_t>((upper >> 11u) & 0x1Fu);
+                    const float scale237 = (s2_237 == 0x14u) ? 1.0f : 16.0f;
+                    // Target the census-dominant (220,252,254) family: green lane result ~252.
+                    const float rx = m_state.vf[fs][0]*scale237, ry = m_state.vf[fs][1]*scale237;
+                    const bool washed = (ry >= 240.0f && ry <= 256.0f) && (rx >= 180.0f && rx <= 256.0f);
+                    static std::atomic<uint32_t> s_g237n{0};
+                    const uint32_t nn = washed ? s_g237n.fetch_add(1u, std::memory_order_relaxed) : 0xFFFFFFFFu;
+                    if (washed && nn < 32u)
+                    {
+                        auto V = [&](int r){ return m_state.vf[r]; };
+                        const float *src = m_state.vf[fs];   // pre-FTOI0 colour float
+                        std::fprintf(stderr,
+                            "[G237:col] n=%u pc=0x%x src=VF%u COL(pre-FTOI0)=(% .3f % .3f % .3f % .3f) | "
+                            "Lmtx VF10=(% .4f % .4f % .4f % .4f) VF11=(% .4f % .4f % .4f % .4f) "
+                            "VF12=(% .4f % .4f % .4f % .4f) VF13=(% .4f % .4f % .4f % .4f) | "
+                            "in VF20=(% .4f % .4f % .4f % .4f) VF25=(% .3f % .3f % .3f % .3f) "
+                            "VF19=(% .3f % .3f % .3f % .3f) VF29=(% .3f % .3f % .3f % .3f)\n",
+                            nn, currentPc, fs, src[0],src[1],src[2],src[3],
+                            V(10)[0],V(10)[1],V(10)[2],V(10)[3], V(11)[0],V(11)[1],V(11)[2],V(11)[3],
+                            V(12)[0],V(12)[1],V(12)[2],V(12)[3], V(13)[0],V(13)[1],V(13)[2],V(13)[3],
+                            V(20)[0],V(20)[1],V(20)[2],V(20)[3], V(25)[0],V(25)[1],V(25)[2],V(25)[3],
+                            V(19)[0],V(19)[1],V(19)[2],V(19)[3], V(29)[0],V(29)[1],V(29)[2],V(29)[3]);
+                        std::fflush(stderr);
+                    }
+                }
+            }
+        }
+
         // G70: confirm VU1 data qword 59 (VF29 = per-vertex W/ADC cull consts) is zero on the
         // title and dump the const region. The title flat-blue mechanism (decoded from the
         // executing transform 0x1e78-0x1fc0): sp06 = SUBAz.w ACC,VF0,VF29 -> ACC.w = 1 - VF29.z;
@@ -2479,6 +2697,45 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         // word (re)arms the delay afterwards (in execLower) so it counts from the next word.
         if (*s_qDelayP > 0 && --(*s_qDelayP) == 0)
             m_state.q = s_vuQPending;
+
+        // G239: advance the EFU pipeline before this instruction pair. An MFP in the pair
+        // where the latency expires sees the newly published architectural P, matching the
+        // interpreter ordering in PCSX2 (_vuTestPipes before lower execution).
+        if (s_ppipeOn && *s_pDelayP > 0 && --(*s_pDelayP) == 0)
+            m_state.p = s_vuPPending;
+
+        // G239: PCSX2's interpreter performs _vuTestLowerStalls + _vuTestPipes before
+        // executing either half of the instruction pair. Publish an older scalar result here
+        // when this lower op would stall FDIV/EFU; execLower then arms the new producer (or
+        // observes an already-completed WAIT) after the parallel upper has consumed the value.
+        if (!iBit && s_scalarPrestallOn)
+        {
+            const uint8_t lowerOpHi239 = static_cast<uint8_t>((lower >> 25u) & 0x7fu);
+            if (lowerOpHi239 == 0x40u)
+            {
+                const uint8_t lowerS2239 = S2_FUNC(lower);
+                const bool waitQ239 = lowerS2239 == 0x3bu;
+                const bool fdivProducer239 = lowerS2239 >= 0x38u && lowerS2239 <= 0x3au;
+                if (s_qlatOn && *s_qDelayP > 0 &&
+                    (waitQ239 || (fdivProducer239 && g200_qstall_enabled())))
+                {
+                    m_state.q = s_vuQPending;
+                    *s_qDelayP = 0;
+                }
+
+                const bool waitP239 = lowerS2239 == 0x7bu;
+                const bool efuProducer239 =
+                    lowerS2239 == 0x70u || lowerS2239 == 0x71u ||
+                    lowerS2239 == 0x72u || lowerS2239 == 0x73u ||
+                    lowerS2239 == 0x76u || lowerS2239 == 0x78u ||
+                    lowerS2239 == 0x79u || lowerS2239 == 0x7au;
+                if (s_ppipeOn && *s_pDelayP > 0 && (waitP239 || efuProducer239))
+                {
+                    m_state.p = s_vuPPending;
+                    *s_pDelayP = 0;
+                }
+            }
+        }
 
         // G138: advance the MAC/STATUS flag pipeline one instruction pair. Flag-consuming
         // lower ops executed THIS pair (FMEQ/FMAND/FMOR/FSAND/FSEQ/FSOR) read the snapshot
@@ -2965,6 +3222,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
         if (eBit)
             m_state.ebit = true;
+    }
+
+    // The hardware drains EFU (and FDIV/FMAC) when an E-bit program ends. Preserve an in-flight
+    // P only across max-cycle suspension/resume; a normal microprogram completion publishes it.
+    if (s_ppipeOn && m_state.ebit && *s_pDelayP > 0)
+    {
+        m_state.p = s_vuPPending;
+        *s_pDelayP = 0;
     }
 
     if (vu1_trace_enabled())
@@ -4513,16 +4778,18 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             case 0x6C: // XGKICK
                 goto legacy_xgkick;
             case 0x70: // ESADD
-                m_state.p = m_state.vf[is][0] * m_state.vf[is][0] +
-                            m_state.vf[is][1] * m_state.vf[is][1] +
-                            m_state.vf[is][2] * m_state.vf[is][2];
+                g239_stage_p(m_state.p,
+                             m_state.vf[is][0] * m_state.vf[is][0] +
+                             m_state.vf[is][1] * m_state.vf[is][1] +
+                             m_state.vf[is][2] * m_state.vf[is][2],
+                             11);
                 return;
             case 0x71: // ERSADD
             {
                 float s = m_state.vf[is][0] * m_state.vf[is][0] +
                           m_state.vf[is][1] * m_state.vf[is][1] +
                           m_state.vf[is][2] * m_state.vf[is][2];
-                m_state.p = (s != 0.0f) ? (1.0f / s) : 0.0f;
+                g239_stage_p(m_state.p, (s != 0.0f) ? (1.0f / s) : 0.0f, 18);
                 return;
             }
             case 0x72: // ELENG
@@ -4530,7 +4797,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 float s = m_state.vf[is][0] * m_state.vf[is][0] +
                           m_state.vf[is][1] * m_state.vf[is][1] +
                           m_state.vf[is][2] * m_state.vf[is][2];
-                m_state.p = std::sqrt(std::fabs(s));
+                g239_stage_p(m_state.p, std::sqrt(std::fabs(s)), 18);
                 return;
             }
             case 0x73: // ERLENG
@@ -4539,33 +4806,38 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                           m_state.vf[is][1] * m_state.vf[is][1] +
                           m_state.vf[is][2] * m_state.vf[is][2];
                 float len = std::sqrt(std::fabs(s));
-                m_state.p = (len != 0.0f) ? (1.0f / len) : 0.0f;
+                g239_stage_p(m_state.p, (len != 0.0f) ? (1.0f / len) : 0.0f, 24);
                 return;
             }
             case 0x76: // ESUM
-                m_state.p = m_state.vf[is][0] + m_state.vf[is][1] + m_state.vf[is][2] + m_state.vf[is][3];
+                g239_stage_p(m_state.p,
+                             m_state.vf[is][0] + m_state.vf[is][1] +
+                             m_state.vf[is][2] + m_state.vf[is][3],
+                             12);
                 return;
             case 0x78: // ESQRT
             {
                 int fsf = (instr >> 21) & 0x3;
-                m_state.p = std::sqrt(std::fabs(m_state.vf[is][fsf]));
+                g239_stage_p(m_state.p, std::sqrt(std::fabs(m_state.vf[is][fsf])), 12);
                 return;
             }
             case 0x79: // ERSQRT
             {
                 int fsf = (instr >> 21) & 0x3;
                 float root = std::sqrt(std::fabs(m_state.vf[is][fsf]));
-                m_state.p = (root != 0.0f) ? (1.0f / root) : 0.0f;
+                g239_stage_p(m_state.p, (root != 0.0f) ? (1.0f / root) : 0.0f, 18);
                 return;
             }
             case 0x7A: // ERCPR
             {
                 int fsf = (instr >> 21) & 0x3;
                 float val = m_state.vf[is][fsf];
-                m_state.p = (val != 0.0f) ? (1.0f / val) : 0.0f;
+                g239_stage_p(m_state.p, (val != 0.0f) ? (1.0f / val) : 0.0f, 12);
                 return;
             }
             case 0x7B: // WAITP
+                g239_wait_p(m_state.p);
+                return;
             case 0x74: // EATANxy
             case 0x75: // EATANxz
             case 0x77: // reserved

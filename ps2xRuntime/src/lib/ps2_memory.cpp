@@ -1973,6 +1973,9 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
 // a synthetic 32-byte A+D NOP record carrying the VU packer PC (reg addr 0x0f is
 // a GS NOP, ignored by the old parsers, decoded by tools/g138_hw_slice.py).
 // Bounded by DC2_G138_GSDUMP_MAX records (default 200000).
+// G234: cross-TU gate for deferred-start dumping (see g138DumpSubmit); the present
+// loop in ps2_runtime.cpp flips it once DC2_G138_GSDUMP_AT_TICK is reached.
+std::atomic<bool> g_dc2G138DumpGateOpen{true};
 namespace
 {
     struct Dc2G138GsDump
@@ -2058,6 +2061,12 @@ namespace
     void g138DumpSubmit(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes)
     {
         if (!g138DumpPath())
+            return;
+        // G234: optional deferred-start gate (DC2_G138_GSDUMP_AT_TICK=<present tick>).
+        // The present loop opens the gate once the requested host tick is reached, so a
+        // long scripted route can dump ONLY the scene of interest instead of the whole
+        // session. Gate defaults open (old behavior) when the env is absent.
+        if (!g_dc2G138DumpGateOpen.load(std::memory_order_relaxed))
             return;
         // G194: DC2_G138_GSDUMP_ALL=1 lifts the title-scope gate so non-title routes
         // (town/edit map, dungeon) can be packet-dumped too. Default keeps the old

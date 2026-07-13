@@ -4197,7 +4197,9 @@ void sceVu0Normalize(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     float src[4]{}, out[4]{};
     if (readVuVec4f(rdram, srcAddr, src))
     {
-        const float len = std::sqrt((src[0] * src[0]) + (src[1] * src[1]) + (src[2] * src[2]) + (src[3] * src[3]));
+        // G233: real sceVu0Normalize sums x,y,z only (VU0 ESADD); including w broke the
+        // CDAColPipe push-out (pendant chain collapsed behind the torso).
+        const float len = std::sqrt((src[0] * src[0]) + (src[1] * src[1]) + (src[2] * src[2]));
         if (len > 1.0e-6f)
         {
             const float invLen = 1.0f / len;

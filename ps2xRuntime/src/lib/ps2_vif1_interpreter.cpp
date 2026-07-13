@@ -1324,6 +1324,37 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             if ((imm & 0x8000u) != 0u)
                 vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
             g39_seq("UNPK", vuAddr, writeVectorCount, (imm & 0x8000u) ? 1u : 0u);
+            // G238: capture the map per-vertex COLOUR array's SOURCE bytes. Colour is unpacked as
+            // V4-8 (vn=3, vl=2 => 4 bytes/vec, opcode 0x6E). Gated DC2_G238_COLSRC + the G138 map
+            // scene gate; dump the first few source vectors so we can see whether the EE data is
+            // already white (255,255,255,128 => EE build bug) or teal (unpack-scale bug).
+            {
+                static const bool s_g238col = (std::getenv("DC2_G238_COLSRC") != nullptr);
+                extern std::atomic<bool> g_dc2G138DumpGateOpen;
+                // Only V4 unpacks (vn==3) are candidate colour/pos/st streams; log all vl formats
+                // with the first vector decoded both as bytes and as f32 so the colour stream
+                // (values 0/128/255) is identifiable regardless of pack width.
+                if (s_g238col && writeVectorCount >= 16u &&
+                    g_dc2G138DumpGateOpen.load(std::memory_order_relaxed))
+                {
+                    static std::atomic<uint32_t> s_g238u{0};
+                    const uint32_t un = s_g238u.fetch_add(1u, std::memory_order_relaxed);
+                    if (un < 12u && pos + bytesPerVector * 3u <= sizeBytes)
+                    {
+                        const uint32_t nv = (writeVectorCount < 12u) ? writeVectorCount : 12u;
+                        std::fprintf(stderr, "[G238:colsrc] u=%u vn=%u vl=%u bpv=%u dest=0x%x num=%u v:",
+                                     un, (uint32_t)vn, (uint32_t)vl, bytesPerVector, vuAddr, writeVectorCount);
+                        for (uint32_t v = 0; v < nv; ++v)
+                        {
+                            const uint32_t o = pos + v * bytesPerVector;
+                            if (vl == 0u) { float f[4]; std::memcpy(f, data+o, 16); std::fprintf(stderr, " (%.0f,%.0f,%.0f,%.0f)", f[0],f[1],f[2],f[3]); }
+                            else if (vl == 1u) { int16_t s[4]; std::memcpy(s, data+o, 8); std::fprintf(stderr, " (%d,%d,%d,%d)", s[0],s[1],s[2],s[3]); }
+                            else { std::fprintf(stderr, " (%u,%u,%u,%u)", data[o],data[o+1],data[o+2],data[o+3]); }
+                        }
+                        std::fprintf(stderr, "\n"); std::fflush(stderr);
+                    }
+                }
+            }
             if (g136Active && g136LoggedPayloads < g136_command_limit())
             {
                 ++g136LoggedPayloads;

@@ -528,6 +528,14 @@ namespace ps2_stubs
 
     void sceVu0LightColorMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        static const bool s_g238 = (std::getenv("DC2_G238_LIGHTMTX") != nullptr);
+        if (s_g238) {
+            static std::atomic<uint32_t> s_n{0};
+            const uint32_t nn = s_n.fetch_add(1u, std::memory_order_relaxed);
+            if (nn < 8u)
+                std::fprintf(stderr, "[G238:LightColorMatrix] call n=%u a0=0x%x a1=0x%x a2=0x%x a3=0x%x t0=0x%x\n",
+                             nn, getRegU32(ctx,4), getRegU32(ctx,5), getRegU32(ctx,6), getRegU32(ctx,7), getRegU32(ctx,8));
+        }
         TODO_NAMED("sceVu0LightColorMatrix", rdram, ctx, runtime);
     }
 
@@ -571,7 +579,11 @@ namespace ps2_stubs
         float src[4]{}, out[4]{};
         if (readVuVec4f(rdram, srcAddr, src))
         {
-            const float len = std::sqrt((src[0] * src[0]) + (src[1] * src[1]) + (src[2] * src[2]) + (src[3] * src[3]));
+            // Real sceVu0Normalize sums x,y,z ONLY (VU0 ESADD P,vf12), then VMULq scales all
+            // four lanes by 1/sqrt(P). Including w in the length (G233 bug) under-scaled every
+            // direction whose w!=0 — CDAColPipe::CheckHit's push-out became a pull-IN and the
+            // pendant chain collapsed behind the torso (the missing chest gem).
+            const float len = std::sqrt((src[0] * src[0]) + (src[1] * src[1]) + (src[2] * src[2]));
             if (len > 1.0e-6f)
             {
                 const float invLen = 1.0f / len;
@@ -587,6 +599,14 @@ namespace ps2_stubs
 
     void sceVu0NormalLightMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        static const bool s_g238 = (std::getenv("DC2_G238_LIGHTMTX") != nullptr);
+        if (s_g238) {
+            static std::atomic<uint32_t> s_n{0};
+            const uint32_t nn = s_n.fetch_add(1u, std::memory_order_relaxed);
+            if (nn < 8u)
+                std::fprintf(stderr, "[G238:NormalLightMatrix] call n=%u a0=0x%x a1=0x%x a2=0x%x a3=0x%x t0=0x%x\n",
+                             nn, getRegU32(ctx,4), getRegU32(ctx,5), getRegU32(ctx,6), getRegU32(ctx,7), getRegU32(ctx,8));
+        }
         TODO_NAMED("sceVu0NormalLightMatrix", rdram, ctx, runtime);
     }
 
