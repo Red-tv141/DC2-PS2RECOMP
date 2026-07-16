@@ -1566,6 +1566,38 @@ void register_ps2_gs_tests()
                      "PSMT4 x=128 should advance to the next page of nibble addresses");
         });
 
+        tc.Run("compact CT32 address map matches the canonical GSMem writer", [](TestCase &t)
+        {
+            GSMem::InitLookupTables();
+            std::vector<uint8_t> canonical(PS2_GS_VRAM_SIZE, 0u);
+            std::vector<uint8_t> compact(PS2_GS_VRAM_SIZE, 0u);
+            constexpr uint32_t kBases[] = {0u, 1u, 31u, 32u, 0x2720u, 0x3FE0u};
+            constexpr uint32_t kWidths[] = {1u, 2u, 8u};
+            uint32_t serial = 1u;
+
+            for (const uint32_t bp : kBases)
+            {
+                for (const uint32_t bw : kWidths)
+                {
+                    for (uint32_t y = 0u; y < 96u; ++y)
+                    {
+                        for (uint32_t x = 0u; x < 192u; ++x)
+                        {
+                            const uint32_t value = 0x9E3779B9u * serial++;
+                            GSMem::WriteCT32(canonical.data(), bp, bw, x, y, value);
+                            const uint32_t off =
+                                GSPSMCT32::addrPSMCT32(bp, bw, x, y) &
+                                (PS2_GS_VRAM_SIZE - static_cast<uint32_t>(sizeof(uint32_t)));
+                            std::memcpy(compact.data() + off, &value, sizeof(value));
+                        }
+                    }
+                }
+            }
+
+            t.IsTrue(std::memcmp(canonical.data(), compact.data(), canonical.size()) == 0,
+                     "small-table CT32 addressing must be byte-identical to GSMem across bases, widths, blocks, pages, and VRAM wrap");
+        });
+
         tc.Run("PSMT4 large atlases keep manual page layout across 512x512 textures", [](TestCase &t)
         {
             constexpr uint32_t kBaseBlock = 64u;
