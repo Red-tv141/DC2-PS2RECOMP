@@ -80,6 +80,27 @@ namespace
         return enabled;
     }
 
+    // G268: env vars are process-constant in every DC2 harness; the VIF1 chain-tag walker
+    // called getenv() per tag/candidate check (G217/G227 sites, up to 16384 tags per chain).
+    // Read once by default; DC2_G268_LIVE_ENVREAD=1 restores the per-call read (A/B control).
+    bool g268LiveEnvRead()
+    {
+        static const bool live = envFlagEnabled("DC2_G268_LIVE_ENVREAD");
+        return live;
+    }
+
+    bool g217TagVuEnabled()
+    {
+        static const bool cached = envFlagEnabled("DC2_G217_TAG_VU");
+        return g268LiveEnvRead() ? envFlagEnabled("DC2_G217_TAG_VU") : cached;
+    }
+
+    bool g227TraceEnabled()
+    {
+        static const bool cached = envFlagEnabled("DC2_TRACE_G227");
+        return g268LiveEnvRead() ? envFlagEnabled("DC2_TRACE_G227") : cached;
+    }
+
     bool f50_12_trace_enabled()
     {
         static const bool enabled = envFlagEnabled("DC2_TRACE_F50_12");
@@ -1141,7 +1162,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     s_g217RecentDma[recentSlot].store(
                         madr & 0x0fffffffu, std::memory_order_release);
                     uint32_t taggedSelectors = 0u;
-                    if (envFlagEnabled("DC2_G217_TAG_VU") && copied >= 20u)
+                    if (g217TagVuEnabled() && copied >= 20u)
                     {
                         const uint32_t tagBit = (headKind & 1u) ? 0x40000000u :
                                                 (headKind & 2u) ? 0x20000000u : 0u;
@@ -1361,7 +1382,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                                                       uint32_t dmaTagAddr, uint32_t dmaId)
                     {
                         if (channelBase != 0x10009000u ||
-                            !envFlagEnabled("DC2_G217_TAG_VU") || qwCount == 0u)
+                            !g217TagVuEnabled() || qwCount == 0u)
                             return;
 
                         try
@@ -1406,7 +1427,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                     auto g217RecentExactDma = [&](uint32_t candidate) -> bool
                     {
-                        if (!envFlagEnabled("DC2_G217_TAG_VU"))
+                        if (!g217TagVuEnabled())
                             return false;
                         const uint32_t phys = candidate & 0x0fffffffu;
                         if (phys == 0u)
@@ -1419,7 +1440,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 
                     auto g217RecentDirectPacket = [&](uint32_t candidate) -> bool
                     {
-                        if (!envFlagEnabled("DC2_G217_TAG_VU"))
+                        if (!g217TagVuEnabled())
                             return false;
                         const uint32_t phys = candidate & 0x0fffffffu;
                         if (phys == 0u)
@@ -1670,7 +1691,7 @@ bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
                     // (kMaxChainTags=16384 since G217). Confirms whether a given scene's chain
                     // ever approaches the cutoff, without needing to re-derive G217's evidence
                     // trail from scratch. Env: DC2_TRACE_G227.
-                    if (channelBase == 0x10009000u && envFlagEnabled("DC2_TRACE_G227"))
+                    if (channelBase == 0x10009000u && g227TraceEnabled())
                     {
                         static std::atomic<int> s_g227MaxTags{0};
                         int prevMax = s_g227MaxTags.load(std::memory_order_relaxed);

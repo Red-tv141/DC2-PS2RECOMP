@@ -33,6 +33,11 @@ struct G178Draw
     int firstVtx = 0;
     int vtxCount = 0;
     uint64_t texKey = 0; // 0 = untextured (vertex color only)
+    // G261: when nonzero, sample the persistent FBO color texture of this TARGET fbp instead of a
+    // texKey upload (GPU-resident RTT wave: the producer's pixels never round-tripped through
+    // VRAM). texKey must be 0; the front-end has already remapped UVs into the FBO's fbW x fbH
+    // bottom-first space. Must never equal the batch's own fbp (no feedback loops).
+    uint32_t srcFbp = 0;
     uint8_t blend = 0;   // 0=off (Cv=Cs), 1=standard (Cs-Cd)*As+Cd, 2=additive Cs*As+Cd
     uint8_t tfx = 0;     // GS TFX (0 modulate / 1 decal / 2 highlight / 3 highlight2)
     uint8_t tcc = 0;
@@ -60,11 +65,14 @@ struct G178Batch
     int fbW = 0, fbH = 0;
     bool clearDepth = false;
     bool uploadFb = false;              // VRAM framebuffer copy is newer than the FBO
+    // G261 GPU-resident RTT wave flags:
+    bool skipReadback = false;          // leave the result in the FBO; `readback` stays empty
+    bool rttRawAlpha = false;           // apply the G255 raw-source-alpha RTT store without the env
     std::vector<uint32_t> fbPixels;     // fbW*fbH RGBA when uploadFb (GL row order)
     std::vector<G178TexUpload> texUploads;
     std::vector<G178Vtx> verts;
     std::vector<G178Draw> draws;
-    std::vector<uint32_t> readback;     // out (resized by the backend)
+    std::vector<uint32_t> readback;     // out (resized by the backend; empty under skipReadback)
 };
 
 // Backend (ps2_gs_gpu_raster.cpp). submit() blocks the calling thread until rendering+readback
@@ -72,3 +80,14 @@ struct G178Batch
 bool g178_backend_ready();
 bool g178_backend_submit(G178Batch &batch);
 bool g178_backend_has_tex(uint64_t key); // still resident (not evicted)?
+// G261: synchronous row-window color readback from a target's persistent FBO (the deferred
+// materialization of a GPU-resident RTT wave at a real CPU-consumer edge). glY/rows are GL
+// (bottom-first) window coordinates; `out` is resized to width*rows, GL row order.
+bool g178_backend_read_color(uint32_t fbp, int width, int height, int glY, int rows,
+                             std::vector<uint32_t> &out);
+// G264: synchronous row-window color WRITE into a target's persistent FBO texture (upload-into-
+// FBO routing: the guest re-uploaded scratch content into resident rows, mirror it instead of
+// materializing). Same coordinate conventions as read_color; `in` must be width*rows RGBA8 in
+// GL (bottom-first) row order. The FBO must already exist with matching dimensions.
+bool g178_backend_write_color(uint32_t fbp, int width, int height, int glY, int rows,
+                              const std::vector<uint32_t> &in);

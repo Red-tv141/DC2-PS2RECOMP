@@ -183,6 +183,18 @@ namespace
         return enabled;
     }
 
+    // G268: diagnostic/lever env vars are process-constant in every DC2 harness, but several
+    // per-vertex/per-packet hot paths still called getenv() on EVERY invocation (Windows CRT
+    // getenv = env lock + linear scan, microseconds). The G268 MAP-0 census measured packed
+    // XYZF2 at 5.0us/call vs 25ns for RGBAQ (whose handler has no getenv) — ~2.4us/vertex of
+    // pure environment lookup in vertexKick, ~66ms/frame. Hot sites now read once;
+    // DC2_G268_LIVE_ENVREAD=1 restores the historical per-call read (same-binary A/B control).
+    bool g268LiveEnvRead()
+    {
+        static const bool live = envFlagEnabled("DC2_G268_LIVE_ENVREAD");
+        return live;
+    }
+
     bool phaseDiagnosticsEnabled()
     {
         static const bool enabled = envFlagEnabled("DC2_PHASE_TRACE");
@@ -3461,6 +3473,9 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
 // G144/G145: defined in ps2_gs_rasterizer.cpp; drains pending tile-binning deferred triangles
 // before transfers that overlap VRAM they depend on. Unknown ranges fall back to flushing.
 // G149: bump the de-swizzle texture-cache VRAM generation so stale decoded buffers are invalidated.
+// G260: native-renderer command graph (opt-in DC2_G260_NR=1) — when active, transfers must take
+// the RANGE-tested barrier path (the graph executes only on real dependency edges).
+extern bool g260NrEnabled();
 extern void g149BumpVramGen();
 extern void g144FlushPendingUpload();
 extern void g144FlushPendingUploadRange(uint32_t dbp,
@@ -3482,6 +3497,17 @@ extern void g144FlushPendingLocalTransferRange(uint32_t sbp,
                                                uint32_t dsay,
                                                uint32_t rrw,
                                                uint32_t rrh);
+// G242: when opt-in GPU guest-depth ownership is active, materialize an overlapping
+// GPU-resident depth surface before a transfer reads its guest-VRAM source. No-op otherwise.
+extern void g242PrepareVramReadRect(uint8_t *vram,
+                                    uint32_t bpBlocks,
+                                    uint32_t bw64,
+                                    uint32_t psm,
+                                    uint32_t x,
+                                    uint32_t y,
+                                    uint32_t w,
+                                    uint32_t h);
+extern bool g242GuestDepthEnabled();
 
 void GS::performLocalToLocalTransfer()
 {
@@ -3499,21 +3525,18 @@ void GS::performLocalToLocalTransfer()
         }
     }
 
-    const bool g145DirtyUpload = envFlagEnabled("DC2_G145_DIRTY_UPLOAD") &&
-                                 !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD");
+    static const bool s_g145EnvDirtyUpload = envFlagEnabled("DC2_G145_DIRTY_UPLOAD") &&
+                                             !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD");
+    const bool g145DirtyUpload = (g268LiveEnvRead()
+                                      ? (envFlagEnabled("DC2_G145_DIRTY_UPLOAD") &&
+                                         !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD"))
+                                      : s_g145EnvDirtyUpload) ||
+                                 g260NrEnabled();
     if (!g145DirtyUpload)
         g144FlushPendingUpload();
 
     if (!m_vram)
         return;
-
-    g149BumpVramGen(); // VRAM about to change: invalidate the de-swizzle texture cache
-    // G178: per-page write generations for the GPU-resident texture cache (no-op when off).
-    {
-        extern void g178NoteVramWriteRect(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
-        g178NoteVramWriteRect(m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
-                              m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh);
-    }
 
     uint32_t sbp = m_bitbltbuf.sbp;
     uint8_t sbw = m_bitbltbuf.sbw;
@@ -3545,6 +3568,19 @@ void GS::performLocalToLocalTransfer()
     {
         g144FlushPendingLocalTransferRange(sbp, sbw, spsm, ssax, ssay,
                                            dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+    }
+
+    // G242: the range/full G144 barrier above must run first so every deferred draw
+    // that can feed this copy has reached its GPU depth surface before we read VRAM.
+    g242PrepareVramReadRect(m_vram, sbp, sbw, spsm, ssax, ssay, rrw, rrh);
+
+    g149BumpVramGen(); // VRAM about to change: invalidate the de-swizzle texture cache
+    // G178/G242: notify only after pending draws and source depth have been resolved.
+    // The hook materializes an overlapping GPU-owned destination before the CPU copy writes it.
+    {
+        extern void g178NoteVramWriteRect(uint8_t *, uint32_t, uint32_t, uint32_t,
+                                          uint32_t, uint32_t, uint32_t, uint32_t);
+        g178NoteVramWriteRect(m_vram, dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
     }
 
     PS2_IF_AGRESSIVE_LOGS({
@@ -3629,7 +3665,9 @@ void GS::vertexKick(bool drawing)
     // G196: raw per-kick ADC/drawing trace for tbp=0x2a20 (the G195 foreground-sheet suspect),
     // scoped identically to the existing G195:fgtri draw-time trace, so the two can be diffed
     // directly against the real map_0.gs freeze-dump's vertex/ADC stream. Default-off.
-    if (envFlagEnabled("DC2_G196_ADC_TRACE"))
+    // G268: this ran getenv() on EVERY vertex kick (~2.4us/vertex, ~66ms/frame on MAP-0).
+    static const bool s_g196AdcTrace = envFlagEnabled("DC2_G196_ADC_TRACE");
+    if (g268LiveEnvRead() ? envFlagEnabled("DC2_G196_ADC_TRACE") : s_g196AdcTrace)
     {
         const GSContext &ctx196 = m_ctx[m_prim.ctxt & 1u];
         if (m_prim.tme && ctx196.tex0.tbp0 == 0x2a20u &&
@@ -3889,8 +3927,13 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         }
     }
 
-    const bool g145DirtyUpload = envFlagEnabled("DC2_G145_DIRTY_UPLOAD") &&
-                                 !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD");
+    static const bool s_g145EnvDirtyUpload = envFlagEnabled("DC2_G145_DIRTY_UPLOAD") &&
+                                             !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD");
+    const bool g145DirtyUpload = (g268LiveEnvRead()
+                                      ? (envFlagEnabled("DC2_G145_DIRTY_UPLOAD") &&
+                                         !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD"))
+                                      : s_g145EnvDirtyUpload) ||
+                                 g260NrEnabled();
     if (!g145DirtyUpload)
         g144FlushPendingUpload();
 
@@ -3921,14 +3964,6 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
     if (m_trxdir != 0 || !m_vram)
         return;
 
-    g149BumpVramGen(); // host-to-local upload about to write VRAM: invalidate the texture cache
-    // G178: per-page write generations for the GPU-resident texture cache (no-op when off).
-    {
-        extern void g178NoteVramWriteRect(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
-        g178NoteVramWriteRect(m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
-                              m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh);
-    }
-
     // G145: flush only if this upload overlaps a pending deferred draw's texture/CLUT/target.
     if (g145DirtyUpload)
     {
@@ -3939,6 +3974,15 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
                                     m_trxpos.dsay,
                                     m_trxreg.rrw,
                                     m_trxreg.rrh);
+    }
+
+    g149BumpVramGen(); // host-to-local upload about to write VRAM: invalidate the texture cache
+    // G178/G242: notify only after the pending-draw barrier above has established GS order.
+    {
+        extern void g178NoteVramWriteRect(uint8_t *, uint32_t, uint32_t, uint32_t,
+                                          uint32_t, uint32_t, uint32_t, uint32_t);
+        g178NoteVramWriteRect(m_vram, m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
+                              m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh);
     }
 
     // [G37:seq] GS-order trace of writes to the 0x2720 work page (uploads), shared with the
@@ -4564,6 +4608,12 @@ void GS::performLocalToHostToBuffer()
     uint32_t rrh = m_trxreg.rrh;
     uint32_t ssax = m_trxpos.ssax;
     uint32_t ssay = m_trxpos.ssay;
+
+    // G242: establish GS submission order first, then publish any persistent depth aliased by the
+    // source.  Keep the historical default-off path byte-for-byte unchanged.
+    if (g242GuestDepthEnabled())
+        g144FlushPendingUpload();
+    g242PrepareVramReadRect(m_vram, sbp, sbw, spsm, ssax, ssay, rrw, rrh);
 
     if (bpp == 4)
     {

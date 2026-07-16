@@ -1432,43 +1432,93 @@ bool g178EnvEnabled()
     return on;
 }
 
+// G256/G258 diagnostic only: exact PS2 fragment arithmetic for the dependency-preserving G255
+// RTT path.  G258 found this backend performance-neutral after parity, so do not expose it as a
+// standalone behavior arm: require the CPU shadow oracle whenever it is requested.
+bool g256ExactRttOn()
+{
+    static const bool on = g158EnvFlag("DC2_G256_EXACT_RTT") &&
+                           g158EnvFlag("DC2_G255_VERIFY");
+    return on;
+}
+
+// G257 (default OFF): prove image-store, barrier, coverage, and direct texture readback on the
+// actual persistent G178 worker context without touching a guest batch.
+bool g257ImageStoreTestOn()
+{
+    static const bool on = g158EnvFlag("DC2_G257_IMAGESTORE_TEST");
+    return on;
+}
+
+// G258 (default OFF): synchronously read one fbp=0x146 destination pixel after selected
+// exact-shader draws.  This is a localization probe only; never enable it for timing.
+bool g258TraceOn()
+{
+    static const bool on = g158EnvFlag("DC2_G258_TRACE");
+    return on;
+}
+
 // GL entry points needed beyond GLFns (loaded once on the G178 thread).
 typedef void(APIENTRY *PFN178BLENDFUNCSEPARATE)(GLenum, GLenum, GLenum, GLenum);
+typedef void(APIENTRY *PFN178BLENDEQUATIONSEPARATE)(GLenum, GLenum);
 typedef void(APIENTRY *PFN178GENRENDERBUFFERS)(GLsizei, GLuint *);
 typedef void(APIENTRY *PFN178BINDRENDERBUFFER)(GLenum, GLuint);
 typedef void(APIENTRY *PFN178RENDERBUFFERSTORAGE)(GLenum, GLenum, GLsizei, GLsizei);
 typedef void(APIENTRY *PFN178FRAMEBUFFERRENDERBUFFER)(GLenum, GLenum, GLenum, GLuint);
 typedef void(APIENTRY *PFN178DELETERENDERBUFFERS)(GLsizei, const GLuint *);
 typedef void(APIENTRY *PFN178UNIFORM2F)(GLint, GLfloat, GLfloat);
+typedef void(APIENTRY *PFN178BINDIMAGETEXTURE)(GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum);
+typedef void(APIENTRY *PFN178MEMORYBARRIER)(GLbitfield);
+typedef void(APIENTRY *PFN178GETINTERNALFORMATIV)(GLenum, GLenum, GLenum, GLsizei, GLint *);
 
 struct G178GLExt
 {
     PFN178BLENDFUNCSEPARATE glBlendFuncSeparate_ = nullptr;
+    PFN178BLENDEQUATIONSEPARATE glBlendEquationSeparate_ = nullptr;
     PFN178GENRENDERBUFFERS glGenRenderbuffers_ = nullptr;
     PFN178BINDRENDERBUFFER glBindRenderbuffer_ = nullptr;
     PFN178RENDERBUFFERSTORAGE glRenderbufferStorage_ = nullptr;
     PFN178FRAMEBUFFERRENDERBUFFER glFramebufferRenderbuffer_ = nullptr;
     PFN178DELETERENDERBUFFERS glDeleteRenderbuffers_ = nullptr;
     PFN178UNIFORM2F glUniform2f_ = nullptr;
+    PFN178BINDIMAGETEXTURE glBindImageTexture_ = nullptr;
+    PFN178MEMORYBARRIER glMemoryBarrier_ = nullptr;
+    PFN178GETINTERNALFORMATIV glGetInternalformativ_ = nullptr;
 };
 
 bool g178LoadGLExt(G178GLExt &e)
 {
     bool ok = true;
     ok &= loadProc(e.glBlendFuncSeparate_, "glBlendFuncSeparate");
+    ok &= loadProc(e.glBlendEquationSeparate_, "glBlendEquationSeparate");
     ok &= loadProc(e.glGenRenderbuffers_, "glGenRenderbuffers");
     ok &= loadProc(e.glBindRenderbuffer_, "glBindRenderbuffer");
     ok &= loadProc(e.glRenderbufferStorage_, "glRenderbufferStorage");
     ok &= loadProc(e.glFramebufferRenderbuffer_, "glFramebufferRenderbuffer");
     ok &= loadProc(e.glDeleteRenderbuffers_, "glDeleteRenderbuffers");
     ok &= loadProc(e.glUniform2f_, "glUniform2f");
+    if (g256ExactRttOn() || g257ImageStoreTestOn())
+    {
+        ok &= loadProc(e.glBindImageTexture_, "glBindImageTexture");
+        ok &= loadProc(e.glMemoryBarrier_, "glMemoryBarrier");
+        ok &= loadProc(e.glGetInternalformativ_, "glGetInternalformativ");
+    }
     return ok;
 }
 
+constexpr GLenum GL178_FUNC_ADD = 0x8006;
+constexpr GLenum GL178_FUNC_REVERSE_SUBTRACT = 0x800B;
 constexpr GLenum GL178_RENDERBUFFER = 0x8D41;
 constexpr GLenum GL178_DEPTH_ATTACHMENT = 0x8D00;
 constexpr GLenum GL178_DEPTH_COMPONENT32F = 0x8CAC;
 constexpr GLenum GL178_STREAM_DRAW = 0x88E0;
+constexpr GLenum GL178_READ_WRITE = 0x88BA;
+constexpr GLbitfield GL178_SHADER_IMAGE_ACCESS_BARRIER_BIT = 0x00000020;
+constexpr GLbitfield GL178_TEXTURE_FETCH_BARRIER_BIT = 0x00000008;
+constexpr GLbitfield GL178_TEXTURE_UPDATE_BARRIER_BIT = 0x00000100;
+constexpr GLbitfield GL178_FRAMEBUFFER_BARRIER_BIT = 0x00000400;
+constexpr GLenum GL257_SHADER_IMAGE_LOAD = 0x82A4;
+constexpr GLenum GL257_SHADER_IMAGE_STORE = 0x82A5;
 // GPU texture-cache residency cap (bytes of decoded RGBA8). Title uses a handful of ≤512²
 // textures (~1-4MB); the cap only matters on texture-heavy routes. LRU by last-used batch.
 constexpr size_t kG178TexCacheCapBytes = 256ull * 1024 * 1024;
@@ -1537,22 +1587,155 @@ public:
     // read back. The batch is used in place (no copy); the caller owns its lifetime.
     bool submit(G178Batch &batch)
     {
-        if (!m_ready.load(std::memory_order_acquire))
+        return submitImpl(&batch, 0u, nullptr, 0, 0, nullptr);
+    }
+
+    // G242: universal-Z batches carry the authoritative guest PSMZ24 rows beside the existing
+    // color-only G178 interface. Keep this private side channel out of ps2_gs_gpu_lle.h: that
+    // header is deliberately frozen for the project's no-header-rebuild rule. Submission is
+    // synchronous, so the caller-owned vectors remain alive until the worker finishes.
+    bool submitDepth(G178Batch &batch, uint64_t depthKey,
+                     const std::vector<float> *depthUpload, int depthY, int depthRows)
+    {
+        return submitImpl(&batch, depthKey, depthUpload, depthY, depthRows, nullptr);
+    }
+
+    bool readDepth(uint64_t depthKey, int width, int height,
+                   int depthY, int depthRows, std::vector<float> &depthReadback)
+    {
+        if (depthKey == 0u || width <= 0 || height <= 0 || depthY < 0 || depthRows <= 0 ||
+            depthY > height || depthRows > height - depthY)
+            return false;
+        G178Batch readBatch;
+        readBatch.fbW = width;
+        readBatch.fbH = height;
+        return submitImpl(&readBatch, depthKey, nullptr, depthY, depthRows, &depthReadback);
+    }
+
+    // G261: synchronous FBO color row-window readback (deferred RTT-wave materialization).
+    bool readColor(uint32_t fbp, int width, int height, int glY, int rows,
+                   std::vector<uint32_t> &out)
+    {
+        if (width <= 0 || height <= 0 || glY < 0 || rows <= 0 ||
+            glY > height || rows > height - glY || !m_ready.load(std::memory_order_acquire))
             return false;
         auto promise = std::make_shared<std::promise<bool>>();
         std::future<bool> fut = promise->get_future();
         {
             std::unique_lock<std::mutex> lk(m_mtx);
-            m_queue.push_back({&batch, promise});
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.colorFbp = fbp;
+            item.colorReadback = &out;
+            item.colorTexW = width;
+            item.colorTexH = height;
+            item.colorW = width;
+            item.colorY = glY;
+            item.colorRows = rows;
+            item.promise = promise;
+            m_queue.push_back(std::move(item));
         }
         m_cvWork.notify_one();
-        return fut.get();
+        try
+        {
+            return fut.get();
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    bool writeColor(uint32_t fbp, int texWidth, int texHeight,
+                    int glX, int glY, int width, int rows,
+                    const std::vector<uint32_t> &in)
+    {
+        if (texWidth <= 0 || texHeight <= 0 || glX < 0 || glY < 0 ||
+            width <= 0 || rows <= 0 || glX > texWidth || width > texWidth - glX ||
+            glY > texHeight || rows > texHeight - glY ||
+            in.size() != static_cast<size_t>(width) * rows ||
+            !m_ready.load(std::memory_order_acquire))
+            return false;
+        auto promise = std::make_shared<std::promise<bool>>();
+        std::future<bool> fut = promise->get_future();
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.colorFbp = fbp;
+            item.colorWrite = &in;
+            item.colorTexW = texWidth;
+            item.colorTexH = texHeight;
+            item.colorX = glX;
+            item.colorW = width;
+            item.colorY = glY;
+            item.colorRows = rows;
+            item.promise = promise;
+            m_queue.push_back(std::move(item));
+        }
+        m_cvWork.notify_one();
+        try
+        {
+            return fut.get();
+        }
+        catch (...)
+        {
+            return false;
+        }
     }
 
 private:
+    bool submitImpl(G178Batch *batch, uint64_t depthKey,
+                    const std::vector<float> *depthUpload, int depthY, int depthRows,
+                    std::vector<float> *depthReadback)
+    {
+        if (batch == nullptr || !m_ready.load(std::memory_order_acquire))
+            return false;
+        auto promise = std::make_shared<std::promise<bool>>();
+        std::future<bool> fut = promise->get_future();
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.batch = batch;
+            item.depthKey = depthKey;
+            item.depthUpload = depthUpload;
+            item.depthY = depthY;
+            item.depthRows = depthRows;
+            item.depthReadback = depthReadback;
+            item.promise = promise;
+            m_queue.push_back(std::move(item));
+        }
+        m_cvWork.notify_one();
+        try
+        {
+            return fut.get();
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
     struct QueueItem
     {
         G178Batch *batch = nullptr;
+        uint64_t depthKey = 0u;
+        const std::vector<float> *depthUpload = nullptr;
+        int depthY = 0;
+        int depthRows = 0;
+        std::vector<float> *depthReadback = nullptr;
+        // G261 color-readback job (batch == nullptr, colorReadback != nullptr)
+        uint32_t colorFbp = 0u;
+        std::vector<uint32_t> *colorReadback = nullptr;
+        // G264 color-write job (batch == nullptr, colorWrite != nullptr): mirror guest upload
+        // bytes into the resident FBO texture instead of materializing around them.
+        const std::vector<uint32_t> *colorWrite = nullptr;
+        int colorTexW = 0, colorTexH = 0;
+        int colorX = 0, colorY = 0, colorW = 0, colorRows = 0;
         std::shared_ptr<std::promise<bool>> promise;
     };
     struct TexEntry
@@ -1565,6 +1748,12 @@ private:
     {
         GLuint fbo = 0, colorTex = 0, depthRb = 0;
         int w = 0, h = 0;
+    };
+    struct DepthEntry
+    {
+        GLuint tex = 0;
+        int w = 0, h = 0;
+        bool initialized = false;
     };
 
     void worker()
@@ -1589,7 +1778,8 @@ private:
             m_cvReady.notify_all();
             return;
         }
-        if (!setupProgram() || !setupBuffers())
+        if (!setupProgram() || (g256ExactRttOn() && !setupExactProgram()) || !setupBuffers() ||
+            (g257ImageStoreTestOn() && !runG257ImageStoreDiagnostic()))
         {
             wglMakeCurrent(nullptr, nullptr);
             wglDeleteContext(rc);
@@ -1617,7 +1807,19 @@ private:
             bool ok = false;
             try
             {
-                ok = renderBatch(*item.batch);
+                if (item.colorReadback != nullptr)
+                    ok = readColorOnWorker(item.colorFbp, item.colorTexW, item.colorTexH,
+                                           item.colorY, item.colorRows, *item.colorReadback);
+                else if (item.colorWrite != nullptr)
+                    ok = writeColorOnWorker(item.colorFbp, item.colorTexW, item.colorTexH,
+                                            item.colorX, item.colorY, item.colorW,
+                                            item.colorRows, *item.colorWrite);
+                else if (item.depthReadback != nullptr)
+                    ok = readDepthOnWorker(item.depthKey, item.batch->fbW, item.batch->fbH,
+                                           item.depthY, item.depthRows, *item.depthReadback);
+                else
+                    ok = renderBatch(*item.batch, item.depthKey, item.depthUpload,
+                                     item.depthY, item.depthRows);
             }
             catch (...)
             {
@@ -1625,6 +1827,32 @@ private:
             }
             item.promise->set_value(ok);
         }
+
+        m_ready.store(false, std::memory_order_release);
+        for (auto &kv : m_fbos)
+            destroyFbo(kv.second);
+        m_fbos.clear();
+        for (auto &kv : m_depths)
+            if (kv.second.tex != 0)
+                glDeleteTextures(1, &kv.second.tex);
+        m_depths.clear();
+        for (auto &kv : m_texCache)
+            if (kv.second.id != 0)
+                glDeleteTextures(1, &kv.second.id);
+        m_texCache.clear();
+        m_texBytes = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_residentMtx);
+            m_resident.clear();
+        }
+        if (m_vbo != 0)
+            m_f.glDeleteBuffers_(1, &m_vbo);
+        if (m_vao != 0)
+            m_f.glDeleteVertexArrays_(1, &m_vao);
+        if (m_prog != 0)
+            m_f.glDeleteProgram_(m_prog);
+        if (m_progExact != 0)
+            m_f.glDeleteProgram_(m_progExact);
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(rc);
     }
@@ -1653,7 +1881,9 @@ private:
             "    float ndcY = 1.0 - aPos.y / uFbSize.y * 2.0;\n"
             "    gl_Position = vec4(ndcX, ndcY, 0.0, 1.0);\n"
             "}\n";
-        // uMode bits: 0 = textured, 1..2 = TFX, 3 = TCC.
+        // uMode bits: 0 = textured, 1..2 = TFX, 3 = TCC, 4 = clamp Z to PSMZ24,
+        // 5 = store raw source alpha (G255 RTT second pass), 6 = G265 GEQUAL alpha test,
+        // 7..8 = G265 AREF code (0=1, 1=64, 2=127).
         // PS2 color/alpha scale: 0x80 == 1.0, so MODULATE is (t*c)>>7 -> t*c*255/128 in [0,1]
         // space (1.9921875), clamped — identical to combineTexture(). The written alpha is the
         // BLEND FACTOR encoding (As/128 clamped to 1): glBlendFunc consumes it as SRC_ALPHA. The
@@ -1670,6 +1900,9 @@ private:
             "uniform int uMode;\n"
             "void main(){\n"
             "    vec4 c = vColor;\n"
+            "    bool alphaTest = (uMode & 64) != 0;\n"
+            "    int alphaByte = 0;\n"
+            "    if (alphaTest) alphaByte = int(floor(vColor.a * 255.0 + 0.5));\n"
             "    if ((uMode & 1) != 0) {\n"
             "        vec2 uv = vSTQ.xy / max(vSTQ.z, 1e-8);\n"
             "        vec4 t = texture(uTex, uv);\n"
@@ -1687,10 +1920,29 @@ private:
             "            a = (tfx == 2) ? (tcc ? min(t.a + c.a, 1.0) : c.a)\n"
             "                           : (tcc ? t.a : c.a);\n"
             "        }\n"
+            "        if (alphaTest) {\n"
+            "            int texA = int(floor(t.a * 255.0 + 0.5));\n"
+            "            int vertA = alphaByte;\n"
+            "            if (tfx == 0)\n"
+            "                alphaByte = tcc ? min((texA * vertA) / 128, 255) : vertA;\n"
+            "            else if (tfx == 1)\n"
+            "                alphaByte = tcc ? texA : vertA;\n"
+            "            else\n"
+            "                alphaByte = (tfx == 2) ? (tcc ? min(texA + vertA, 255) : vertA)\n"
+            "                                       : (tcc ? texA : vertA);\n"
+            "        }\n"
             "        c = vec4(rgb, a);\n"
             "    }\n"
-            "    o = vec4(c.rgb, min(c.a * 1.9921875, 1.0));\n"
-            "    gl_FragDepth = vZ * (1.0 / 4294967296.0);\n"
+            "    if (alphaTest) {\n"
+            "        int refCode = (uMode >> 7) & 3;\n"
+            "        int refA = (refCode == 0) ? 1 : ((refCode == 1) ? 64 : 127);\n"
+            "        if (alphaByte < refA) discard;\n"
+            "    }\n"
+            "    float outA = ((uMode & 32) != 0) ? c.a : min(c.a * 1.9921875, 1.0);\n"
+            "    o = vec4(c.rgb, outA);\n"
+            "    float z = max(vZ, 0.0);\n"
+            "    if ((uMode & 16) != 0) z = floor(min(z, 16777215.0));\n"
+            "    gl_FragDepth = z * (1.0 / 4294967296.0);\n"
             "}\n";
         GLuint vs = 0, fs = 0;
         std::string log;
@@ -1726,6 +1978,143 @@ private:
         return true;
     }
 
+    bool setupExactProgram()
+    {
+        // G256 is sprite-only and color-only by contract.  The vertex path intentionally keeps
+        // the already-proven G255 integer rectangle coverage; the fragment path below replaces
+        // normalized sampling/combine/fixed-function blending with the CPU oracle's arithmetic.
+        static const char *kVS =
+            "#version 430 core\n"
+            "layout(location=0) in vec3 aPos;\n"
+            "layout(location=1) in vec3 aSTQ;\n"
+            "layout(location=2) in vec4 aColor;\n"
+            "uniform vec2 uFbSize;\n"
+            "noperspective out vec3 vSTQ;\n"
+            "noperspective out vec4 vColor;\n"
+            "void main(){\n"
+            "    vSTQ = aSTQ; vColor = aColor;\n"
+            "    float ndcX = aPos.x / uFbSize.x * 2.0 - 1.0;\n"
+            "    float ndcY = 1.0 - aPos.y / uFbSize.y * 2.0;\n"
+            "    gl_Position = vec4(ndcX, ndcY, 0.0, 1.0);\n"
+            "}\n";
+        static const char *kFS =
+            "#version 430 core\n"
+            "noperspective in vec3 vSTQ;\n"
+            "noperspective in vec4 vColor;\n"
+            "layout(location=0) out vec4 oCoverage;\n"
+            "layout(rgba8, binding=1) uniform coherent image2D uFb;\n"
+            "uniform sampler2D uTex;\n"
+            "uniform int uMode;\n"
+            "uniform int uLinear;\n"
+            "uniform int uWrapU;\n"
+            "uniform int uWrapV;\n"
+            "int wrapCoord(int p, int n, int mode){\n"
+            "    if (mode != 0) return clamp(p, 0, n - 1);\n"
+            "    int r = p % n; return r < 0 ? r + n : r;\n"
+            "}\n"
+            "int floorDiv16(int v){ return v >= 0 ? v / 16 : -((-v + 15) / 16); }\n"
+            "int floorDiv128(int v){ return v >= 0 ? v / 128 : -((-v + 127) / 128); }\n"
+            "ivec4 texel8(ivec2 p){\n"
+            "    ivec2 n = textureSize(uTex, 0);\n"
+            "    p.x = wrapCoord(p.x, n.x, uWrapU);\n"
+            "    p.y = wrapCoord(p.y, n.y, uWrapV);\n"
+            "    return clamp(ivec4(floor(texelFetch(uTex, p, 0) * 255.0 + 0.5)), 0, 255);\n"
+            "}\n"
+            "ivec4 sampleExact(vec2 uvTex){\n"
+            // CPU drawSprite reaches exact 12.4 half-steps and std::lround resolves them upward.
+            // GPU noperspective interpolation can land a few ulps below the same mathematical
+            // tie (G258: 409.5 -> 409), so stabilize only that quantization boundary.
+            "    ivec2 f16 = clamp(ivec2(floor(uvTex * 16.0 + 0.5001)), ivec2(0), ivec2(65535));\n"
+            "    if (uLinear == 0) return texel8(f16 / 16);\n"
+            "    ivec2 shifted = f16 - ivec2(8);\n"
+            "    ivec2 p0 = ivec2(floorDiv16(shifted.x), floorDiv16(shifted.y));\n"
+            "    ivec2 fr = shifted - p0 * 16;\n"
+            "    ivec4 c00 = texel8(p0);\n"
+            "    ivec4 c10 = texel8(p0 + ivec2(1,0));\n"
+            "    ivec4 c01 = texel8(p0 + ivec2(0,1));\n"
+            "    ivec4 c11 = texel8(p0 + ivec2(1,1));\n"
+            "    int wx0 = 16 - fr.x, wy0 = 16 - fr.y;\n"
+            "    ivec4 sum = c00 * (wx0 * wy0) + c10 * (fr.x * wy0) +\n"
+            "                c01 * (wx0 * fr.y) + c11 * (fr.x * fr.y);\n"
+            "    return clamp((sum + ivec4(128)) / 256, 0, 255);\n"
+            "}\n"
+            "ivec4 combineExact(ivec4 vc, ivec4 tc){\n"
+            "    int tfx = (uMode >> 1) & 3; bool tcc = (uMode & 8) != 0;\n"
+            "    ivec4 c = tc;\n"
+            "    if (tfx == 0) {\n"
+            "        c.rgb = (tc.rgb * vc.rgb) >> 7; c.a = tcc ? ((tc.a * vc.a) >> 7) : vc.a;\n"
+            "    } else if (tfx == 1) { c.a = tcc ? tc.a : vc.a;\n"
+            "    } else {\n"
+            "        c.rgb = ((tc.rgb * vc.rgb) >> 7) + ivec3(vc.a);\n"
+            "        c.a = (tfx == 2) ? (tcc ? tc.a + vc.a : vc.a) : (tcc ? tc.a : vc.a);\n"
+            "    }\n"
+            "    return clamp(c, 0, 255);\n"
+            "}\n"
+            "int blendStd(int s, int d, int a){ return clamp(floorDiv128((s-d)*a) + d, 0, 255); }\n"
+            "int blendAdd(int s, int d, int a){ return clamp((s*a)/128 + d, 0, 255); }\n"
+            "void main(){\n"
+            "    ivec4 src = clamp(ivec4(floor(vColor * 255.0 + 0.5)), 0, 255);\n"
+            "    if ((uMode & 1) != 0) {\n"
+            "        vec2 uv = vSTQ.xy / max(vSTQ.z, 1e-8);\n"
+            "        src = combineExact(src, sampleExact(uv * vec2(textureSize(uTex, 0))));\n"
+            "    }\n"
+            "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+            "    ivec4 dst = clamp(ivec4(floor(imageLoad(uFb, p) * 255.0 + 0.5)), 0, 255);\n"
+            "    int blend = (uMode >> 8) & 3; ivec4 outc = src;\n"
+            "    bool opaque139 = (uMode & 1024) != 0 && (dst.r | dst.g | dst.b) == 0;\n"
+            "    if (!opaque139 && blend == 1) {\n"
+            "        outc.r = blendStd(src.r,dst.r,src.a); outc.g = blendStd(src.g,dst.g,src.a);\n"
+            "        outc.b = blendStd(src.b,dst.b,src.a);\n"
+            "    } else if (!opaque139 && blend == 2) {\n"
+            "        outc.r = blendAdd(src.r,dst.r,src.a); outc.g = blendAdd(src.g,dst.g,src.a);\n"
+            "        outc.b = blendAdd(src.b,dst.b,src.a);\n"
+            "    }\n"
+            "    outc.a = src.a;\n"
+            "    imageStore(uFb, p, vec4(outc) * (1.0 / 255.0));\n"
+            "    oCoverage = vec4(1.0);\n"
+            "}\n";
+
+        GLuint vs = 0, fs = 0;
+        std::string log;
+        if (!g158CompileShader(m_f, GL158_VERTEX_SHADER, kVS, vs, log))
+        {
+            std::fprintf(stderr, "[G256:backend] FAIL: VS compile: %s\n", log.c_str());
+            return false;
+        }
+        if (!g158CompileShader(m_f, GL158_FRAGMENT_SHADER, kFS, fs, log))
+        {
+            std::fprintf(stderr, "[G256:backend] FAIL: FS compile: %s\n", log.c_str());
+            m_f.glDeleteShader_(vs);
+            return false;
+        }
+        m_progExact = m_f.glCreateProgram_();
+        m_f.glAttachShader_(m_progExact, vs);
+        m_f.glAttachShader_(m_progExact, fs);
+        m_f.glLinkProgram_(m_progExact);
+        GLint linked = 0;
+        m_f.glGetProgramiv_(m_progExact, GL158_LINK_STATUS, &linked);
+        m_f.glDeleteShader_(vs);
+        m_f.glDeleteShader_(fs);
+        if (!linked)
+        {
+            GLint len = 0;
+            m_f.glGetProgramiv_(m_progExact, GL158_INFO_LOG_LENGTH, &len);
+            std::vector<char> buf(len > 0 ? static_cast<size_t>(len) : 1u);
+            m_f.glGetProgramInfoLog_(m_progExact, static_cast<GLsizei>(buf.size()), nullptr, buf.data());
+            std::fprintf(stderr, "[G256:backend] FAIL: program link: %s\n", buf.data());
+            return false;
+        }
+        m_f.glUseProgram_(m_progExact);
+        m_locExactFbSize = m_f.glGetUniformLocation_(m_progExact, "uFbSize");
+        m_locExactMode = m_f.glGetUniformLocation_(m_progExact, "uMode");
+        m_locExactLinear = m_f.glGetUniformLocation_(m_progExact, "uLinear");
+        m_locExactWrapU = m_f.glGetUniformLocation_(m_progExact, "uWrapU");
+        m_locExactWrapV = m_f.glGetUniformLocation_(m_progExact, "uWrapV");
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_progExact, "uTex"), 0);
+        std::fprintf(stderr, "[G256:backend] PASS: exact RTT fragment program ready\n");
+        return true;
+    }
+
     bool setupBuffers()
     {
         m_f.glGenVertexArrays_(1, &m_vao);
@@ -1745,18 +2134,238 @@ private:
         return true;
     }
 
+    bool runG257ImageStoreDiagnostic()
+    {
+        constexpr int kW = 4;
+        constexpr int kH = 4;
+        static const char *kVS =
+            "#version 430 core\n"
+            "layout(location=0) in vec3 aPos;\n"
+            "void main(){ gl_Position = vec4(aPos.xy, 0.0, 1.0); }\n";
+        static const char *kFS =
+            "#version 430 core\n"
+            "layout(location=0) out vec4 oCoverage;\n"
+            "layout(rgba8, binding=0) uniform writeonly image2D uImage;\n"
+            "void main(){\n"
+            "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+            "    imageStore(uImage, p, vec4(float(p.x + 1), float(p.y + 17), 90.0, 195.0) / 255.0);\n"
+            "    oCoverage = vec4(1.0, 0.0, 1.0, 1.0);\n"
+            "}\n";
+
+        auto drainErrors = []() {
+            unsigned count = 0;
+            GLenum first = GL_NO_ERROR;
+            for (GLenum e = glGetError(); e != GL_NO_ERROR && count < 32; e = glGetError())
+            {
+                if (count == 0)
+                    first = e;
+                ++count;
+            }
+            return std::pair<GLenum, unsigned>{first, count};
+        };
+        const auto staleErrors = drainErrors();
+        const char *glVersion = reinterpret_cast<const char *>(glGetString(GL_VERSION));
+        const char *glslVersion = reinterpret_cast<const char *>(glGetString(0x8B8C));
+        GLint imageLoad = 0;
+        GLint imageStore = 0;
+        m_e.glGetInternalformativ_(GL_TEXTURE_2D, GL158_RGBA8, GL257_SHADER_IMAGE_LOAD, 1,
+                                   &imageLoad);
+        m_e.glGetInternalformativ_(GL_TEXTURE_2D, GL158_RGBA8, GL257_SHADER_IMAGE_STORE, 1,
+                                   &imageStore);
+        const auto capabilityErrors = drainErrors();
+        std::fprintf(stderr,
+                     "[G257:image] caps gl=%s glsl=%s rgba8Load=%d rgba8Store=%d staleErr=0x%x/%u capErr=0x%x/%u\n",
+                     glVersion ? glVersion : "?", glslVersion ? glslVersion : "?",
+                     imageLoad, imageStore, staleErrors.first, staleErrors.second,
+                     capabilityErrors.first, capabilityErrors.second);
+
+        GLuint vs = 0;
+        GLuint fs = 0;
+        GLuint prog = 0;
+        GLuint imageTex = 0;
+        GLuint coverageTex = 0;
+        GLuint coverageFbo = 0;
+        auto cleanup = [&]() {
+            m_e.glBindImageTexture_(0, 0, 0, GL_FALSE, 0, GL178_READ_WRITE, GL158_RGBA8);
+            m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, 0);
+            m_f.glUseProgram_(m_prog);
+            m_f.glBindVertexArray_(m_vao);
+            m_f.glBindBuffer_(GL158_ARRAY_BUFFER, m_vbo);
+            m_f.glActiveTexture_(GL158_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, 0);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glDepthMask(GL_TRUE);
+            glDisable(GL_BLEND);
+            glDisable(GL_DEPTH_TEST);
+            glDisable(GL_SCISSOR_TEST);
+            if (coverageFbo != 0)
+                m_f.glDeleteFramebuffers_(1, &coverageFbo);
+            if (coverageTex != 0)
+                glDeleteTextures(1, &coverageTex);
+            if (imageTex != 0)
+                glDeleteTextures(1, &imageTex);
+            if (prog != 0)
+                m_f.glDeleteProgram_(prog);
+            if (vs != 0)
+                m_f.glDeleteShader_(vs);
+            if (fs != 0)
+                m_f.glDeleteShader_(fs);
+        };
+
+        std::string log;
+        if (!g158CompileShader(m_f, GL158_VERTEX_SHADER, kVS, vs, log) ||
+            !g158CompileShader(m_f, GL158_FRAGMENT_SHADER, kFS, fs, log))
+        {
+            std::fprintf(stderr, "[G257:image] FAIL: shader compile: %s\n", log.c_str());
+            cleanup();
+            return false;
+        }
+        prog = m_f.glCreateProgram_();
+        m_f.glAttachShader_(prog, vs);
+        m_f.glAttachShader_(prog, fs);
+        m_f.glLinkProgram_(prog);
+        GLint linked = 0;
+        m_f.glGetProgramiv_(prog, GL158_LINK_STATUS, &linked);
+        if (!linked)
+        {
+            GLint len = 0;
+            m_f.glGetProgramiv_(prog, GL158_INFO_LOG_LENGTH, &len);
+            std::vector<char> linkLog(len > 0 ? static_cast<size_t>(len) : 1u);
+            m_f.glGetProgramInfoLog_(prog, static_cast<GLsizei>(linkLog.size()), nullptr,
+                                     linkLog.data());
+            std::fprintf(stderr, "[G257:image] FAIL: program link: %s\n", linkLog.data());
+            cleanup();
+            return false;
+        }
+
+        std::vector<uint8_t> sentinel(static_cast<size_t>(kW * kH * 4));
+        for (size_t i = 0; i < sentinel.size(); i += 4)
+        {
+            sentinel[i + 0] = 7;
+            sentinel[i + 1] = 11;
+            sentinel[i + 2] = 13;
+            sentinel[i + 3] = 17;
+        }
+        glGenTextures(1, &imageTex);
+        glBindTexture(GL_TEXTURE_2D, imageTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, kW, kH, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                     sentinel.data());
+
+        glGenTextures(1, &coverageTex);
+        glBindTexture(GL_TEXTURE_2D, coverageTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, kW, kH, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                     nullptr);
+        m_f.glGenFramebuffers_(1, &coverageFbo);
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, coverageFbo);
+        m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                    coverageTex, 0);
+        const GLenum fboStatus = m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER);
+        if (fboStatus != GL158_FRAMEBUFFER_COMPLETE)
+        {
+            std::fprintf(stderr, "[G257:image] FAIL: scratch FBO incomplete 0x%x\n", fboStatus);
+            cleanup();
+            return false;
+        }
+
+        std::vector<uint8_t> before(sentinel.size());
+        glBindTexture(GL_TEXTURE_2D, imageTex);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, before.data());
+        const bool sentinelOk = before == sentinel;
+        const auto setupErrors = drainErrors();
+
+        const G178Vtx tri[3] = {
+            {-1.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 255, 255, 255, 255},
+            { 3.0f, -1.0f, 0.0f, 0.0f, 0.0f, 1.0f, 255, 255, 255, 255},
+            {-1.0f,  3.0f, 0.0f, 0.0f, 0.0f, 1.0f, 255, 255, 255, 255},
+        };
+        m_f.glUseProgram_(prog);
+        m_f.glBindVertexArray_(m_vao);
+        m_f.glBindBuffer_(GL158_ARRAY_BUFFER, m_vbo);
+        m_f.glBufferData_(GL158_ARRAY_BUFFER, sizeof(tri), tri, GL178_STREAM_DRAW);
+        m_e.glBindImageTexture_(0, imageTex, 0, GL_FALSE, 0, GL178_READ_WRITE, GL158_RGBA8);
+        glViewport(0, 0, kW, kH);
+        glDisable(GL_BLEND);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_SCISSOR_TEST);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        const auto drawErrors = drainErrors();
+
+        std::vector<uint8_t> beforeBarrier(sentinel.size());
+        glBindTexture(GL_TEXTURE_2D, imageTex);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, beforeBarrier.data());
+        const bool preBarrierChanged = beforeBarrier != sentinel;
+        const auto preBarrierErrors = drainErrors();
+
+        m_e.glMemoryBarrier_(GL178_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                             GL178_TEXTURE_FETCH_BARRIER_BIT |
+                             GL178_TEXTURE_UPDATE_BARRIER_BIT |
+                             GL178_FRAMEBUFFER_BARRIER_BIT);
+        const auto barrierErrors = drainErrors();
+        std::vector<uint8_t> afterBarrier(sentinel.size());
+        glBindTexture(GL_TEXTURE_2D, imageTex);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, afterBarrier.data());
+        std::vector<uint8_t> coverage(sentinel.size());
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, coverageFbo);
+        glReadPixels(0, 0, kW, kH, GL_RGBA, GL_UNSIGNED_BYTE, coverage.data());
+        const auto readErrors = drainErrors();
+
+        size_t patternPixels = 0;
+        size_t coveragePixels = 0;
+        for (int y = 0; y < kH; ++y)
+        {
+            for (int x = 0; x < kW; ++x)
+            {
+                const size_t i = static_cast<size_t>((y * kW + x) * 4);
+                if (afterBarrier[i + 0] == static_cast<uint8_t>(x + 1) &&
+                    afterBarrier[i + 1] == static_cast<uint8_t>(y + 17) &&
+                    afterBarrier[i + 2] == 90 && afterBarrier[i + 3] == 195)
+                    ++patternPixels;
+                if (coverage[i + 0] == 255 && coverage[i + 1] == 0 &&
+                    coverage[i + 2] == 255 && coverage[i + 3] == 255)
+                    ++coveragePixels;
+            }
+        }
+        const bool pass = imageLoad != 0 && imageStore != 0 && sentinelOk &&
+                          setupErrors.second == 0 && drawErrors.second == 0 &&
+                          preBarrierErrors.second == 0 && barrierErrors.second == 0 &&
+                          readErrors.second == 0 && patternPixels == kW * kH &&
+                          coveragePixels == kW * kH;
+        std::fprintf(stderr,
+                     "[G257:image] %s sentinel=%d preBarrierChanged=%d pattern=%zu/%d coverage=%zu/%d "
+                     "errSetup=0x%x/%u errDraw=0x%x/%u errPre=0x%x/%u errBarrier=0x%x/%u errRead=0x%x/%u\n",
+                     pass ? "PASS" : "FAIL", sentinelOk ? 1 : 0, preBarrierChanged ? 1 : 0,
+                     patternPixels, kW * kH, coveragePixels, kW * kH,
+                     setupErrors.first, setupErrors.second, drawErrors.first, drawErrors.second,
+                     preBarrierErrors.first, preBarrierErrors.second,
+                     barrierErrors.first, barrierErrors.second, readErrors.first, readErrors.second);
+        cleanup();
+        return pass;
+    }
+
+    void destroyFbo(FboEntry &e)
+    {
+        if (e.fbo != 0)
+            m_f.glDeleteFramebuffers_(1, &e.fbo);
+        if (e.colorTex != 0)
+            glDeleteTextures(1, &e.colorTex);
+        if (e.depthRb != 0)
+            m_e.glDeleteRenderbuffers_(1, &e.depthRb);
+        e = FboEntry{};
+    }
+
     FboEntry &ensureFbo(uint32_t fbp, int w, int h)
     {
         FboEntry &e = m_fbos[fbp];
         if (e.fbo != 0 && e.w == w && e.h == h)
             return e;
-        if (e.fbo != 0)
-        {
-            m_f.glDeleteFramebuffers_(1, &e.fbo);
-            glDeleteTextures(1, &e.colorTex);
-            m_e.glDeleteRenderbuffers_(1, &e.depthRb);
-            e = FboEntry{};
-        }
+        destroyFbo(e);
         glGenTextures(1, &e.colorTex);
         glBindTexture(GL_TEXTURE_2D, e.colorTex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -1776,18 +2385,111 @@ private:
         {
             std::fprintf(stderr, "[G178:backend] FAIL: FBO incomplete 0x%x (fbp=0x%x %dx%d)\n",
                          status, fbp, w, h);
-            m_f.glDeleteFramebuffers_(1, &e.fbo);
-            e.fbo = 0;
+            destroyFbo(e);
             return e;
         }
         e.w = w;
         e.h = h;
         // New FBO contents are undefined — force a depth clear; color comes from uploadFb (the
         // front-end always uploads on its first batch for an fbp, via the gen-snapshot mismatch).
+        glDisable(GL_SCISSOR_TEST);
         glDepthMask(GL_TRUE);
         glClearDepth(0.0);
         glClear(GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT);
         return e;
+    }
+
+    DepthEntry &ensureDepth(uint64_t key, int w, int h)
+    {
+        DepthEntry &e = m_depths[key];
+        if (e.tex != 0 && e.w == w && e.h == h)
+            return e;
+        GLuint newTex = 0;
+        glGenTextures(1, &newTex);
+        if (newTex == 0)
+            return e;
+        glBindTexture(GL_TEXTURE_2D, newTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL158_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL158_CLAMP_TO_EDGE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL178_DEPTH_COMPONENT32F,
+                     w, h, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+        if (e.tex != 0)
+            glDeleteTextures(1, &e.tex);
+        e.tex = newTex;
+        e.w = w;
+        e.h = h;
+        e.initialized = false;
+        return e;
+    }
+
+    // G261: read a row window of a target's persistent FBO color attachment. The FBO must already
+    // exist with matching dimensions (a wave rendered into it); anything else is a caller bug and
+    // fails loudly so the front-end can drop residency instead of consuming stale VRAM silently.
+    bool readColorOnWorker(uint32_t fbp, int w, int h, int glY, int rows,
+                           std::vector<uint32_t> &out)
+    {
+        if (w <= 0 || h <= 0 || rows <= 0 || glY < 0 || glY > h || rows > h - glY)
+            return false;
+        auto it = m_fbos.find(fbp);
+        if (it == m_fbos.end() || it->second.fbo == 0 || it->second.w != w || it->second.h != h)
+            return false;
+        out.resize(static_cast<size_t>(w) * rows);
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, it->second.fbo);
+        glDisable(GL_SCISSOR_TEST);
+        glReadPixels(0, glY, w, rows, GL_RGBA, GL_UNSIGNED_BYTE, out.data());
+        return true;
+    }
+
+    // G264: write a row window of RGBA8 pixels into a target's persistent FBO color texture
+    // (glTexSubImage2D — no draw, no readback). Same existence/dimension contract as
+    // readColorOnWorker; the front-end owns row flipping and byte layout (VRAM CT32 == RGBA8).
+    bool writeColorOnWorker(uint32_t fbp, int texW, int texH,
+                            int glX, int glY, int w, int rows,
+                            const std::vector<uint32_t> &in)
+    {
+        if (texW <= 0 || texH <= 0 || glX < 0 || glY < 0 || w <= 0 || rows <= 0 ||
+            glX > texW || w > texW - glX || glY > texH || rows > texH - glY ||
+            in.size() != static_cast<size_t>(w) * rows)
+            return false;
+        auto it = m_fbos.find(fbp);
+        if (it == m_fbos.end() || it->second.colorTex == 0 || it->second.w != texW ||
+            it->second.h != texH)
+            return false;
+        glBindTexture(GL_TEXTURE_2D, it->second.colorTex);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, glX, glY, w, rows, GL_RGBA, GL_UNSIGNED_BYTE,
+                        in.data());
+        return glGetError() == GL_NO_ERROR;
+    }
+
+    bool readDepthOnWorker(uint64_t depthKey, int w, int h, int depthY, int depthRows,
+                           std::vector<float> &out)
+    {
+        if (depthKey == 0u || w <= 0 || h <= 0 || depthRows <= 0 || depthY < 0 ||
+            depthY > h || depthRows > h - depthY)
+            return false;
+        auto it = m_depths.find(depthKey);
+        if (it == m_depths.end() || it->second.tex == 0 ||
+            it->second.w != w || it->second.h != h || !it->second.initialized)
+            return false;
+        out.resize(static_cast<size_t>(w) * depthRows);
+        FboEntry &scratch = ensureFbo(0xFFFFFFFFu, w, h);
+        if (scratch.fbo == 0)
+            return false;
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, scratch.fbo);
+        m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
+                                    GL_TEXTURE_2D, it->second.tex, 0);
+        if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) != GL158_FRAMEBUFFER_COMPLETE)
+        {
+            m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
+                                           GL178_RENDERBUFFER, scratch.depthRb);
+            return false;
+        }
+        glReadPixels(0, depthY, w, depthRows, GL_DEPTH_COMPONENT, GL_FLOAT, out.data());
+        m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
+                                       GL178_RENDERBUFFER, scratch.depthRb);
+        return true;
     }
 
     void evictIfNeeded()
@@ -1817,21 +2519,106 @@ private:
         }
     }
 
-    bool renderBatch(G178Batch &b)
+    // Validate every condition that can make a submission fail before the first draw. In
+    // particular, a late missing-texture failure would be unsafe for G242: earlier draws may
+    // already have changed a persistent guest-depth texture even though the front-end is about
+    // to replay the whole batch on the CPU.
+    bool validateBatchInputs(const G178Batch &b, uint64_t depthKey,
+                             const std::vector<float> *depthUpload,
+                             int depthY, int depthRows)
     {
-        ++m_batchCounter;
-        FboEntry &fbo = ensureFbo(b.fbp, b.fbW, b.fbH);
-        if (fbo.fbo == 0)
+        if (b.fbW <= 0 || b.fbH <= 0)
             return false;
-        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, fbo.fbo);
-        glViewport(0, 0, b.fbW, b.fbH);
+        const uint64_t fbPixelCount = static_cast<uint64_t>(b.fbW) *
+                                      static_cast<uint64_t>(b.fbH);
+        if (b.uploadFb && static_cast<uint64_t>(b.fbPixels.size()) != fbPixelCount)
+            return false;
+
+        const bool guestDepth = depthKey != 0u;
+        if (guestDepth)
+        {
+            if (depthRows <= 0 || depthY < 0 || depthY > b.fbH ||
+                depthRows > b.fbH - depthY)
+                return false;
+            if (depthUpload != nullptr &&
+                static_cast<uint64_t>(depthUpload->size()) !=
+                    static_cast<uint64_t>(b.fbW) * static_cast<uint64_t>(depthRows))
+                return false;
+            const auto it = m_depths.find(depthKey);
+            const bool initialized = it != m_depths.end() && it->second.tex != 0 &&
+                                     it->second.w == b.fbW && it->second.h == b.fbH &&
+                                     it->second.initialized;
+            // A new/recreated depth texture has undefined rows. Its first upload must therefore
+            // cover the entire target; later submissions may omit it or update a row subset.
+            if (!initialized &&
+                (depthUpload == nullptr || depthY != 0 || depthRows != b.fbH))
+                return false;
+        }
+        else if (depthUpload != nullptr || depthY != 0 || depthRows != 0)
+        {
+            return false;
+        }
+
+        std::unordered_set<uint64_t> uploadedKeys;
+        uploadedKeys.reserve(b.texUploads.size());
+        for (const G178TexUpload &up : b.texUploads)
+        {
+            if (up.key == 0u || up.w <= 0 || up.h <= 0 ||
+                static_cast<uint64_t>(up.px.size()) !=
+                    static_cast<uint64_t>(up.w) * static_cast<uint64_t>(up.h))
+                return false;
+            uploadedKeys.insert(up.key);
+        }
+
+        for (const G178Draw &d : b.draws)
+        {
+            if (d.firstVtx < 0 || d.vtxCount <= 0 || (d.firstVtx % 3) != 0 ||
+                (d.vtxCount % 3) != 0 ||
+                static_cast<size_t>(d.firstVtx) > b.verts.size() ||
+                static_cast<size_t>(d.vtxCount) >
+                    b.verts.size() - static_cast<size_t>(d.firstVtx))
+                return false;
+            if (d.scX0 > d.scX1 || d.scY0 > d.scY1 || d.blend > 5u || d.tfx > 3u ||
+                d.wrapU > 1u || d.wrapV > 1u ||
+                (d.depthFunc & 0x0Fu) > 3u)
+                return false;
+            if (d.srcFbp != 0u)
+            {
+                // G261 FBO-texture source: no texKey, never the batch's own target (feedback),
+                // and the source FBO must already exist (a wave rendered into it).
+                if (d.texKey != 0u || d.srcFbp == b.fbp)
+                    return false;
+                const auto it = m_fbos.find(d.srcFbp);
+                if (it == m_fbos.end() || it->second.fbo == 0 || it->second.colorTex == 0)
+                    return false;
+            }
+            else if (d.texKey != 0u && uploadedKeys.count(d.texKey) == 0u)
+            {
+                const auto it = m_texCache.find(d.texKey);
+                if (it == m_texCache.end() || it->second.id == 0)
+                    return false;
+            }
+        }
+        return true;
+    }
+
+    bool renderBatch(G178Batch &b, uint64_t depthKey, const std::vector<float> *depthUpload,
+                     int depthY, int depthRows)
+    {
+        if (!validateBatchInputs(b, depthKey, depthUpload, depthY, depthRows))
+            return false;
+        ++m_batchCounter;
 
         // Texture (re)uploads: replace-in-place keyed by the front-end's descriptor hash.
         for (G178TexUpload &up : b.texUploads)
         {
             TexEntry &t = m_texCache[up.key];
             if (t.id == 0)
+            {
                 glGenTextures(1, &t.id);
+                if (t.id == 0)
+                    return false;
+            }
             else
                 m_texBytes -= static_cast<size_t>(t.w) * t.h * 4u;
             glBindTexture(GL_TEXTURE_2D, t.id);
@@ -1846,15 +2633,79 @@ private:
                 m_resident.insert(up.key);
             }
         }
-        evictIfNeeded();
 
-        if (b.uploadFb && b.fbPixels.size() == static_cast<size_t>(b.fbW) * b.fbH)
+        // Protect every texture used by this batch from LRU eviction, then resolve all handles.
+        // No texture-cache operation occurs after this point, so draw submission has no late
+        // lookup failure path and pointers into the unordered_map remain stable.
+        for (const G178Draw &d : b.draws)
+            if (d.texKey != 0u)
+                m_texCache.find(d.texKey)->second.lastUse = m_batchCounter;
+        evictIfNeeded();
+        std::vector<TexEntry *> drawTextures(b.draws.size(), nullptr);
+        for (size_t i = 0; i < b.draws.size(); ++i)
+        {
+            if (b.draws[i].texKey == 0u)
+                continue;
+            const auto it = m_texCache.find(b.draws[i].texKey);
+            if (it == m_texCache.end() || it->second.id == 0)
+                return false;
+            drawTextures[i] = &it->second;
+        }
+
+        // Allocate all caller-visible output storage before drawing. A bad_alloc is caught by the
+        // worker and reported as a clean failure while persistent color/depth are still untouched.
+        // G261 skipReadback waves leave the result GPU-resident: no output storage, no readback.
+        if (b.skipReadback)
+            b.readback.clear();
+        else
+            b.readback.resize(static_cast<size_t>(b.fbW) * b.fbH);
+
+        FboEntry &fbo = ensureFbo(b.fbp, b.fbW, b.fbH);
+        if (fbo.fbo == 0)
+            return false;
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, fbo.fbo);
+        glViewport(0, 0, b.fbW, b.fbH);
+
+        if (b.uploadFb)
         {
             glBindTexture(GL_TEXTURE_2D, fbo.colorTex);
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, b.fbW, b.fbH, GL_RGBA, GL_UNSIGNED_BYTE,
                             b.fbPixels.data());
         }
-        if (b.clearDepth)
+
+        // G242: the real guest Z target owns one persistent texture keyed by ZBP/ZBW/ZPSM, not by
+        // the alternating color FBP. The front-end uploads only when guest VRAM changed and reads
+        // back only at a CPU/transfer/frame boundary.
+        const bool guestDepth = depthKey != 0u;
+        if (guestDepth)
+        {
+            DepthEntry &depth = ensureDepth(depthKey, b.fbW, b.fbH);
+            if (depth.tex == 0 || depth.w != b.fbW || depth.h != b.fbH)
+                return false;
+            if (depthUpload != nullptr)
+            {
+                glBindTexture(GL_TEXTURE_2D, depth.tex);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, depthY, b.fbW, depthRows,
+                                GL_DEPTH_COMPONENT, GL_FLOAT, depthUpload->data());
+                depth.initialized = true;
+            }
+            m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
+                                        GL_TEXTURE_2D, depth.tex, 0);
+            if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) != GL158_FRAMEBUFFER_COMPLETE)
+            {
+                m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
+                                               GL178_RENDERBUFFER, fbo.depthRb);
+                return false;
+            }
+        }
+        else
+        {
+            m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
+                                           GL178_RENDERBUFFER, fbo.depthRb);
+            if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) != GL158_FRAMEBUFFER_COMPLETE)
+                return false;
+        }
+        if (b.clearDepth && !guestDepth)
         {
             glDisable(GL_SCISSOR_TEST);
             glDepthMask(GL_TRUE);
@@ -1872,12 +2723,83 @@ private:
         m_f.glActiveTexture_(GL158_TEXTURE0);
         glEnable(GL_SCISSOR_TEST);
 
-        for (const G178Draw &d : b.draws)
+        // G268: was a raw getenv() per submitted batch; env is process-constant
+        // (DC2_G268_LIVE_ENVREAD=1 restores the per-call read for A/B).
+        static const bool s_g255GpuRttEnvLive = g158EnvFlag("DC2_G268_LIVE_ENVREAD");
+        static const bool s_g255GpuRttEnv = (std::getenv("DC2_G255_GPU_RTT") != nullptr);
+        const bool g255RttAlpha =
+            (b.rttRawAlpha || (s_g255GpuRttEnvLive
+                                   ? (std::getenv("DC2_G255_GPU_RTT") != nullptr)
+                                   : s_g255GpuRttEnv)) &&
+            (b.fbp == 0x139u || b.fbp == 0x13cu || b.fbp == 0x143u ||
+             b.fbp == 0x146u || b.fbp == 0x155u);
+        const bool g256Exact = g256ExactRttOn() && m_progExact != 0u &&
+            (b.fbp == 0x139u || b.fbp == 0x13cu || b.fbp == 0x143u ||
+             b.fbp == 0x146u || b.fbp == 0x155u) && !guestDepth;
+        const bool g257RealDiagnostic = g256Exact && g257ImageStoreTestOn() &&
+                                        m_g257RealBatches < 32u;
+        const bool g258Trace = g256Exact && g258TraceOn() && b.fbp == 0x146u &&
+                               m_g258TraceBatches < 4u;
+        const uint64_t g258TraceBatch = g258Trace ? ++m_g258TraceBatches : 0u;
+        std::vector<uint32_t> g257ImageBefore;
+        GLuint g257CoverageFbo = 0;
+        GLenum g257PreError = GL_NO_ERROR;
+        unsigned g257PreErrorCount = 0;
+        auto g257DrainErrors = [](GLenum &first, unsigned &count) {
+            first = GL_NO_ERROR;
+            count = 0;
+            for (GLenum e = glGetError(); e != GL_NO_ERROR && count < 32; e = glGetError())
+            {
+                if (count == 0)
+                    first = e;
+                ++count;
+            }
+        };
+        if (g256Exact)
         {
+            // Do not rasterize with the image-load/store target attached to the active FBO.
+            // That is undefined feedback even with color writes masked off.  A persistent
+            // same-sized scratch FBO supplies fragment coverage; the guest color texture is
+            // updated exclusively through uFb and remains attached to its own inactive FBO.
+            FboEntry &coverage = ensureFbo(0xFFFFFFFEu, b.fbW, b.fbH);
+            if (coverage.fbo == 0)
+                return false;
+            m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, coverage.fbo);
+            g257CoverageFbo = coverage.fbo;
+            glViewport(0, 0, b.fbW, b.fbH);
+            if (g257RealDiagnostic)
+            {
+                glDisable(GL_SCISSOR_TEST);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                g257ImageBefore.resize(static_cast<size_t>(b.fbW) * b.fbH);
+                glBindTexture(GL_TEXTURE_2D, fbo.colorTex);
+                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                              g257ImageBefore.data());
+                g257DrainErrors(g257PreError, g257PreErrorCount);
+            }
+            m_f.glUseProgram_(m_progExact);
+            m_e.glUniform2f_(m_locExactFbSize, static_cast<GLfloat>(b.fbW),
+                             static_cast<GLfloat>(b.fbH));
+            m_e.glBindImageTexture_(1u, fbo.colorTex, 0, GL_FALSE, 0, GL178_READ_WRITE,
+                                    GL158_RGBA8);
+            m_e.glMemoryBarrier_(GL178_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                                 GL178_FRAMEBUFFER_BARRIER_BIT);
+            // Keep a real framebuffer output live in the scratch attachment.  Some Windows GL
+            // drivers elide a fragment invocation whose only framebuffer output is fully masked,
+            // even though imageStore is a side effect.  The scratch result is deliberately ignored.
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glDisable(GL_BLEND);
+        }
+        for (size_t drawIndex = 0; drawIndex < b.draws.size(); ++drawIndex)
+        {
+            const G178Draw &d = b.draws[drawIndex];
             // GS scissor is inclusive, top-origin; GL is bottom-origin.
             const int scH = d.scY1 - d.scY0 + 1;
             glScissor(d.scX0, b.fbH - 1 - d.scY1, d.scX1 - d.scX0 + 1, scH);
-            if (d.depthFunc == 0)
+            const uint8_t depthFunc = d.depthFunc & 0x0Fu;
+            if (depthFunc == 0)
             {
                 glDisable(GL_DEPTH_TEST);
                 glDepthMask(GL_FALSE);
@@ -1885,8 +2807,49 @@ private:
             else
             {
                 glEnable(GL_DEPTH_TEST);
-                glDepthFunc(d.depthFunc == 1 ? GL_ALWAYS : (d.depthFunc == 2 ? GL_GEQUAL : GL_GREATER));
+                glDepthFunc(depthFunc == 1 ? GL_ALWAYS : (depthFunc == 2 ? GL_GEQUAL : GL_GREATER));
                 glDepthMask(d.depthWrite ? GL_TRUE : GL_FALSE);
+            }
+            if (g256Exact)
+            {
+                int mode = (static_cast<int>(d.blend & 3u) << 8);
+                if (b.fbp == 0x139u)
+                    mode |= 1024; // CPU writePixel's established opaque-over-black RTT rule.
+                if (d.texKey != 0u)
+                {
+                    TexEntry *const texture = drawTextures[drawIndex];
+                    glBindTexture(GL_TEXTURE_2D, texture->id);
+                    // A newly uploaded GL texture defaults to a mipmapped MIN filter, but the
+                    // cache intentionally provides level 0 only.  Even texelFetch returns the
+                    // incomplete-texture value (0,0,0,1) in that state.  G256 performs its own
+                    // point/bilinear taps, so NEAREST here only completes the sampler object.
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                    mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
+                }
+                m_f.glUniform1i_(m_locExactMode, mode);
+                m_f.glUniform1i_(m_locExactLinear, d.bilinear ? 1 : 0);
+                m_f.glUniform1i_(m_locExactWrapU, static_cast<GLint>(d.wrapU));
+                m_f.glUniform1i_(m_locExactWrapV, static_cast<GLint>(d.wrapV));
+                glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
+                // G256 keeps one captured sprite per draw.  Publish its image stores before the
+                // next sprite reads the same destination, preserving CPU submission/blend order.
+                m_e.glMemoryBarrier_(GL178_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                                     GL178_TEXTURE_FETCH_BARRIER_BIT |
+                                     GL178_FRAMEBUFFER_BARRIER_BIT);
+                if (g258Trace && (drawIndex == 0u || drawIndex == 6u))
+                {
+                    std::vector<uint32_t> afterDraw(static_cast<size_t>(b.fbW) * b.fbH);
+                    glFinish();
+                    glBindTexture(GL_TEXTURE_2D, fbo.colorTex);
+                    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, afterDraw.data());
+                    const size_t watch = static_cast<size_t>(b.fbH - 2) * b.fbW + 52u;
+                    std::fprintf(stderr,
+                                 "[G258:gpu.draw] batch=%llu draw=%zu rgba=%08x\n",
+                                 static_cast<unsigned long long>(g258TraceBatch),
+                                 drawIndex, watch < afterDraw.size() ? afterDraw[watch] : 0u);
+                }
+                continue;
             }
             if (d.blend == 0)
             {
@@ -1896,19 +2859,49 @@ private:
             {
                 glEnable(GL_BLEND);
                 // Alpha channel: keep dest alpha = written src value (CPU writePixel stores the
-                // source alpha unblended).
-                m_e.glBlendFuncSeparate_(GL_SRC_ALPHA,
-                                         d.blend == 1 ? GL_ONE_MINUS_SRC_ALPHA : GL_ONE,
+                // source alpha unblended). blend==3 (G262): (Cs-0)*(FIX=128)>>7 + Cd == Cs + Cd
+                // additive; blend==4 (G262): (0-Cs)*(FIX=128)>>7 + Cd == Cd - Cs subtractive
+                // (GL_FUNC_REVERSE_SUBTRACT = dst - src, both clamp at the [0,1] rail like GS
+                // COLCLAMP). RGB equation must be reset per draw — it is persistent GL state.
+                m_e.glBlendEquationSeparate_(d.blend == 4 ? GL178_FUNC_REVERSE_SUBTRACT
+                                                          : GL178_FUNC_ADD,
+                                             GL178_FUNC_ADD);
+                m_e.glBlendFuncSeparate_(d.blend == 5 ? GL_ZERO :
+                                             ((d.blend == 3 || d.blend == 4) ? GL_ONE : GL_SRC_ALPHA),
+                                         (d.blend == 1 || d.blend == 5) ?
+                                             GL_ONE_MINUS_SRC_ALPHA : GL_ONE,
                                          GL_ONE, GL_ZERO);
             }
             int mode = 0;
-            if (d.texKey != 0)
+            // Bit 4 asks the fragment shader to clamp interpolated GS Z to PSMZ24 before
+            // normalization, matching the CPU path's post-interpolation uint24 clamp.
+            if ((d.depthFunc & 0x10u) != 0u)
+                mode |= 16;
+            // G265: the admitted nontrivial alpha-test shapes are GEQUAL with AFAIL=KEEP.
+            // Fragment discard suppresses color and depth together, exactly matching KEEP.
+            if ((d.depthFunc & 0x20u) != 0u)
+                mode |= 64;
+            mode |= (static_cast<int>((d.depthFunc >> 6u) & 3u) << 7u);
+            if (d.srcFbp != 0u)
             {
-                auto it = m_texCache.find(d.texKey);
-                if (it == m_texCache.end() || it->second.id == 0)
-                    return false; // front-end must have uploaded it this batch or earlier
-                glBindTexture(GL_TEXTURE_2D, it->second.id);
-                it->second.lastUse = m_batchCounter;
+                // G261: sample the producer target's persistent FBO color texture directly. The
+                // front-end already remapped UVs into the FBO's full fbW x fbH bottom-first space,
+                // and only admits in-range UVs — CLAMP here is inert insurance, never wrap.
+                const FboEntry &src = m_fbos.find(d.srcFbp)->second;
+                glBindTexture(GL_TEXTURE_2D, src.colorTex);
+                const GLint filter = d.bilinear ? GL_LINEAR : GL_NEAREST;
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                                static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                                static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+                mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
+            }
+            else if (d.texKey != 0)
+            {
+                TexEntry *const texture = drawTextures[drawIndex];
+                glBindTexture(GL_TEXTURE_2D, texture->id);
                 const GLint filter = d.bilinear ? GL_LINEAR : GL_NEAREST;
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
@@ -1916,26 +2909,125 @@ private:
                                 d.wrapU == 0 ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE));
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
                                 d.wrapV == 0 ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE));
-                mode = 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
+                mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
             }
-            m_f.glUniform1i_(m_locMode, mode);
-            glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
+            if (g255RttAlpha && d.blend != 0u)
+            {
+                // Fixed-function blending needs As/128 in the shader alpha channel, while PS2
+                // framebuffer alpha stores the unblended source A byte. Preserve RGB blending in
+                // pass one with alpha masked, then overwrite alpha only with the raw source value.
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+                m_f.glUniform1i_(m_locMode, mode);
+                glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
+                glDisable(GL_BLEND);
+                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+                m_f.glUniform1i_(m_locMode, mode | 32);
+                glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
+                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            }
+            else
+            {
+                if (g255RttAlpha)
+                    mode |= 32;
+                m_f.glUniform1i_(m_locMode, mode);
+                glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
+            }
+        }
+
+        if (g256Exact)
+        {
+            m_e.glMemoryBarrier_(GL178_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                                 GL178_TEXTURE_FETCH_BARRIER_BIT |
+                                 GL178_FRAMEBUFFER_BARRIER_BIT);
+            std::vector<uint32_t> g257ImageAfter;
+            std::vector<uint32_t> g257Coverage;
+            GLenum g257PostError = GL_NO_ERROR;
+            unsigned g257PostErrorCount = 0;
+            if (g257RealDiagnostic)
+            {
+                g257ImageAfter.resize(static_cast<size_t>(b.fbW) * b.fbH);
+                glBindTexture(GL_TEXTURE_2D, fbo.colorTex);
+                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                              g257ImageAfter.data());
+                g257Coverage.resize(static_cast<size_t>(b.fbW) * b.fbH);
+                m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, g257CoverageFbo);
+                glReadPixels(0, 0, b.fbW, b.fbH, GL_RGBA, GL_UNSIGNED_BYTE,
+                             g257Coverage.data());
+                g257DrainErrors(g257PostError, g257PostErrorCount);
+            }
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            m_e.glBindImageTexture_(1u, 0u, 0, GL_FALSE, 0, GL178_READ_WRITE, GL158_RGBA8);
+            m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, fbo.fbo);
+            m_f.glUseProgram_(m_prog);
+
+            if (g257RealDiagnostic)
+            {
+                size_t changed = 0;
+                size_t covered = 0;
+                for (size_t i = 0; i < g257ImageAfter.size(); ++i)
+                {
+                    if (g257ImageAfter[i] != g257ImageBefore[i])
+                        ++changed;
+                    if (g257Coverage[i] != 0u)
+                        ++covered;
+                }
+                // Preserve the direct texture snapshot until after the normal FBO readback below.
+                m_g257ImageAfter.swap(g257ImageAfter);
+                m_g257Changed = changed;
+                m_g257Covered = covered;
+                m_g257PreError = g257PreError;
+                m_g257PreErrorCount = g257PreErrorCount;
+                m_g257PostError = g257PostError;
+                m_g257PostErrorCount = g257PostErrorCount;
+            }
         }
 
         glDisable(GL_SCISSOR_TEST);
-        b.readback.resize(static_cast<size_t>(b.fbW) * b.fbH);
-        glReadPixels(0, 0, b.fbW, b.fbH, GL_RGBA, GL_UNSIGNED_BYTE, b.readback.data());
+        if (!b.skipReadback)
+            glReadPixels(0, 0, b.fbW, b.fbH, GL_RGBA, GL_UNSIGNED_BYTE, b.readback.data());
+        if (g257RealDiagnostic)
+        {
+            GLenum fboReadError = GL_NO_ERROR;
+            unsigned fboReadErrorCount = 0;
+            g257DrainErrors(fboReadError, fboReadErrorCount);
+            size_t directFboBad = 0;
+            for (size_t i = 0; i < b.readback.size(); ++i)
+                if (b.readback[i] != m_g257ImageAfter[i])
+                    ++directFboBad;
+            ++m_g257RealBatches;
+            std::fprintf(stderr,
+                         "[G257:real] n=%llu fbp=0x%x draws=%zu changed=%zu/%zu coverage=%zu/%zu "
+                         "directFboBad=%zu preErr=0x%x/%u postErr=0x%x/%u fboErr=0x%x/%u\n",
+                         static_cast<unsigned long long>(m_g257RealBatches), b.fbp, b.draws.size(),
+                         m_g257Changed, b.readback.size(), m_g257Covered, b.readback.size(),
+                         directFboBad, m_g257PreError, m_g257PreErrorCount,
+                         m_g257PostError, m_g257PostErrorCount,
+                         fboReadError, fboReadErrorCount);
+            m_g257ImageAfter.clear();
+        }
+        if (guestDepth)
+            m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
+                                           GL178_RENDERBUFFER, fbo.depthRb);
         return true;
     }
 
     GLFns m_f;
     G178GLExt m_e;
-    GLuint m_prog = 0, m_vao = 0, m_vbo = 0;
+    GLuint m_prog = 0, m_progExact = 0, m_vao = 0, m_vbo = 0;
     GLint m_locFbSize = -1, m_locMode = -1;
+    GLint m_locExactFbSize = -1, m_locExactMode = -1, m_locExactLinear = -1;
+    GLint m_locExactWrapU = -1, m_locExactWrapV = -1;
     std::map<uint32_t, FboEntry> m_fbos;
+    std::unordered_map<uint64_t, DepthEntry> m_depths;
     std::unordered_map<uint64_t, TexEntry> m_texCache;
     size_t m_texBytes = 0;
     uint64_t m_batchCounter = 0;
+    uint64_t m_g257RealBatches = 0;
+    uint64_t m_g258TraceBatches = 0;
+    std::vector<uint32_t> m_g257ImageAfter;
+    size_t m_g257Changed = 0, m_g257Covered = 0;
+    GLenum m_g257PreError = GL_NO_ERROR, m_g257PostError = GL_NO_ERROR;
+    unsigned m_g257PreErrorCount = 0, m_g257PostErrorCount = 0;
 
     std::thread m_thread;
     std::mutex m_mtx;
@@ -1962,9 +3054,48 @@ bool g178_backend_submit(G178Batch &batch)
     return G178Backend::instance().submit(batch);
 }
 
+// G242 private .cpp-to-.cpp side channel; intentionally not added to a header.
+bool g242_backend_submit_depth(G178Batch &batch, uint64_t depthKey,
+                               const std::vector<float> *depthUpload,
+                               int depthY, int depthRows)
+{
+    return G178Backend::instance().submitDepth(batch, depthKey, depthUpload, depthY, depthRows);
+}
+
+bool g242_backend_read_depth(uint64_t depthKey, int width, int height,
+                             int depthY, int depthRows, std::vector<float> &depthReadback)
+{
+    return G178Backend::instance().readDepth(depthKey, width, height,
+                                             depthY, depthRows, depthReadback);
+}
+
 bool g178_backend_has_tex(uint64_t key)
 {
     return G178Backend::instance().hasTex(key);
+}
+
+// G261: deferred RTT-wave materialization (front-end writes the rows back into guest VRAM).
+bool g178_backend_read_color(uint32_t fbp, int width, int height, int glY, int rows,
+                             std::vector<uint32_t> &out)
+{
+    return G178Backend::instance().readColor(fbp, width, height, glY, rows, out);
+}
+
+// G264: upload-into-FBO mirror (front-end pushes guest upload bytes into the resident FBO).
+bool g178_backend_write_color(uint32_t fbp, int width, int height, int glY, int rows,
+                              const std::vector<uint32_t> &in)
+{
+    return G178Backend::instance().writeColor(fbp, width, height, 0, glY, width, rows, in);
+}
+
+// G264 alias-aware partial mirror. Kept as a private .cpp-to-.cpp bridge so the runtime's
+// generated-target headers remain untouched.
+bool g264_backend_write_color_rect(uint32_t fbp, int texWidth, int texHeight,
+                                   int glX, int glY, int width, int rows,
+                                   const std::vector<uint32_t> &in)
+{
+    return G178Backend::instance().writeColor(fbp, texWidth, texHeight,
+                                               glX, glY, width, rows, in);
 }
 
 // Called once from PS2Runtime::initialize() (after g158CaptureMainContext). No-op unless
@@ -1991,7 +3122,13 @@ bool g162DecodeT8Batch(int, const uint32_t *, const uint32_t *, const int *, con
                        const uint32_t *, const uint8_t *, size_t, uint32_t **) { return false; }
 bool g178_backend_ready() { return false; }
 bool g178_backend_submit(G178Batch &) { return false; }
+bool g242_backend_submit_depth(G178Batch &, uint64_t, const std::vector<float> *, int, int) { return false; }
+bool g242_backend_read_depth(uint64_t, int, int, int, int, std::vector<float> &) { return false; }
 bool g178_backend_has_tex(uint64_t) { return false; }
+bool g178_backend_read_color(uint32_t, int, int, int, int, std::vector<uint32_t> &) { return false; }
+bool g178_backend_write_color(uint32_t, int, int, int, int, const std::vector<uint32_t> &) { return false; }
+bool g264_backend_write_color_rect(uint32_t, int, int, int, int, int, int,
+                                   const std::vector<uint32_t> &) { return false; }
 void g178StartPersistentBackend() {}
 
 #endif

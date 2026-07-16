@@ -271,7 +271,16 @@ namespace
         AllStreams,
     };
 
-    G22Vu1KickMode g22_vu1_kick_mode()
+    // G268: env vars are process-constant in every DC2 harness; these two ran getenv() (plus
+    // strcmp chains) per VIF1 packet parse / per VU1 kick. Parsed once by default;
+    // DC2_G268_LIVE_ENVREAD=1 restores the historical per-call read (A/B control).
+    bool g268LiveEnvRead()
+    {
+        static const bool live = envFlagEnabled("DC2_G268_LIVE_ENVREAD");
+        return live;
+    }
+
+    G22Vu1KickMode g22_vu1_kick_mode_uncached()
     {
         const char *value = std::getenv("DC2_G22_VU1_KICK");
         if (value == nullptr || value[0] == '\0' ||
@@ -315,6 +324,14 @@ namespace
         }
 
         return G22Vu1KickMode::Stream;
+    }
+
+    G22Vu1KickMode g22_vu1_kick_mode()
+    {
+        if (g268LiveEnvRead())
+            return g22_vu1_kick_mode_uncached();
+        static const G22Vu1KickMode cached = g22_vu1_kick_mode_uncached();
+        return cached;
     }
 
     struct G22XgkickScan
@@ -374,7 +391,7 @@ namespace
         return false;
     }
 
-    uint32_t g22_vu1_start_pc_override(uint32_t fallback)
+    uint32_t g22_vu1_start_pc_override_uncached(uint32_t fallback)
     {
         const char *value = std::getenv("DC2_G22_VU1_START_PC");
         if (!value || value[0] == '\0')
@@ -385,6 +402,16 @@ namespace
         if (end == value)
             return fallback;
         return static_cast<uint32_t>(parsed) & ~7u;
+    }
+
+    uint32_t g22_vu1_start_pc_override(uint32_t fallback)
+    {
+        if (g268LiveEnvRead())
+            return g22_vu1_start_pc_override_uncached(fallback);
+        // Sentinel survives the uncached path verbatim only when the override is unset/invalid
+        // (a set value is masked with ~7u and cannot equal it).
+        static const uint32_t cachedRaw = g22_vu1_start_pc_override_uncached(0xFFFFFFFFu);
+        return (cachedRaw == 0xFFFFFFFFu) ? fallback : cachedRaw;
     }
 
     uint32_t gifImageQwcFromTag(const uint8_t *data, uint32_t sizeBytes)
