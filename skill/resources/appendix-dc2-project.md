@@ -100,31 +100,73 @@ powershell -ExecutionPolicy Bypass -File D:\ps2r\dc2\tools\run_30s_diagnose.ps1
 > headless test pattern here (the skill's "never redirect output" prohibition is about *build*
 > output, not these run logs).
 
-### Current DC2 operating snapshot (2026-07-10, post-G193)
+### Current DC2 operating snapshot (2026-07-16, post-G273 — see ROADMAP for live status)
+
+**G273 is default-on:** exact page enumeration for the sole measured aligned display tuple proves
+FBP 0x68 CT32 color pages 104..207 disjoint from ZBP 0xd0 Z24 pages 208+. This removes a false
+`colorzalias` whole-CPU fallback only for `(fbBlock=0xd00,zBlock=0x1a00,fbw=8)`; every unknown,
+unaligned, or different tuple retains the conservative guard. Interleaved MAP-0 medians
+`240.75→220.80 ms` (−8.29% frame / ~+9% FPS), fallback ~17–20%→~4–5%. Phase kills:
+`DC2_G273_NO_EXACT_COLORZ_ALIAS=1` or `DC2_G273_EXACT_COLORZ_ALIAS=0`; stack kill
+`DC2_G26X_NO_NATIVE=1`. Final default title and normal MAP-0/foliage/correct-light/costume/
+dungeon/corrected real-zoom MAP2+MAP4 presentation passed. `plans/phase-G273-fix-log.md`.
+
+**Do not re-chase the post-G268 profile:** G269 split the inclusive ~155 ms image timer into
+<=10 ms CT32 writing and ~145 ms pending graph execution; its compact writer regressed and was
+removed. G270 found zero steady MAP-0 line-wave coverage; the ~61.5 ms A+D number was deferred
+drain attribution. G271's conflict-prefix barrier retained only ~0.5 suffix batch and stayed
+noise-scale. G272 display-color residency measured ~6% but lost Max's body in normal composition,
+so it remains default-off (`DC2_G272_DISPLAY_COLOR_WAVE=1`) pending a separate temporal ownership
+mechanism. See `plans/phase-G269-fix-log.md` through `plans/phase-G272-fix-log.md`.
+
+G268's durable rule still applies: all env checks in per-vertex/per-draw/per-tag/per-flush paths
+must be `static const bool`; one uncached Windows CRT `getenv` cost 41% of the frame.
+
+### Prior snapshot (post-G266 — kept for context)
 
 Read `plans/ROADMAP.MD` first for live status — its Current Status + levers table supersede
-this snapshot when they disagree.
+this snapshot when they disagree. Pre-G222 narrative (town/MAP arcs, G191 perf arc) is
+archived in `plans/phase-history.md`; do not act on old snapshots of it.
 
-- Main-title 3D render is complete versus `ref/dumps/new_game_via_debug.png`; do not re-enable old
-  title band-aids unless explicitly reproducing history.
-- **Performance arc CLOSED for now (G191): G157 frame-pipelining, G172 sprite-defer and G178
-  LLE-GPU raster are DEFAULT-ON** (kills: `DC2_G157_NO_PIPELINE=1` / `DC2_G172_NO_SPRITE_DEFER=1`
-  / `DC2_G178_NO_GPU=1`). Default title ≈ **17 fps** (baseline was ~2.4). G189 fixed the
-  present-thread starvation the pipeline had on idle screens (dedicated host-presentation mutex).
-- **Active work is RENDERING again: town/field scenes.** G186 fixed the `0xe3dc70` level-load
-  crash class; G187 dungeon-3D soak CLEAN (first dungeon render). **G193 fixed the town/edit-map
-  flat blue** (first town render): `__sinit_mainloop` doesn't run headless → `MainScene+0x10548`
-  CScene-vtable null → `EditInit@0x1A9F40`'s `scene->Initialize()` dispatch no-ops → camera
-  count 0 → all `AssignCamera` fail → zero view matrix → 100% frustum cull. Fix = F50.4's
-  idempotent vtable repair also applied at EditInit entry (kill `DC2_G193_NO_SCENEVT_FIX=1`).
-  Open residuals: dark triangular overlay artifacts in town scenes; framing/water mismatch vs
-  `ref/dumps/map_0.png`; inventory circular-viewport noise (G189 symptom) unverified post-fix.
-- Baseline title gate is held-menu captures with nonzero count `211646 +/- 4`, `h=415`, plus
-  visual inspection — verified by FULL-FRAME DISTRIBUTION over many frames, never one sample.
-  Do not use byte hashes; the title animates. For anything touching threading/pipelining, soak
-  with `DC2_FRAME_DUMP_EVERY=1` (dense per-tick) — the 60-tick default cadence misses transient
-  races (G174 lesson).
-- Smoke: `tools/run_30s_diagnose.ps1` (sets a pinned `DC2_PAD_INPUT`); validate
+- **Arc state: CPU-raster perf arc CLOSED (G259); NATIVE-RENDERER STACK G260–G266 PROMOTED
+  DEFAULT-ON at G266 (2026-07-16).** Master rollback `DC2_G26X_NO_NATIVE=1`; per-slice kills
+  `DC2_G261_NO_WAVE`/`DC2_G262_NO_WIDE`/`DC2_G263_NO_BILIN_BIND`/`DC2_G264_NO_UP_FBO`/
+  `DC2_G265_NO_DISPLAY_ZWAVE`/`DC2_G266_NO_FBW_SPLIT`. Waves auto-disengage under
+  `DC2_G255_VERIFY`/`DC2_G248_VERIFY`/`DC2_G242_GPU_DEPTH`/`DC2_G256_EXACT_RTT`/
+  `DC2_G149_TEXCACHE`/`DC2_G38_VRAMDUMP` (oracles/dumps keep the per-flush readback contract).
+  Post-build matched MAP-0: default 408.90 ms/2.45 fps vs rollback 443.04 ms/2.26 fps.
+  First-read for any renderer/perf phase: `plans/arc-native-renderer.md`
+  (objective, MAP-0 profile, stepping-stones table, G266-revised consumer attack order).
+- **Default-on levers (kills):** G144 tile-bin (`DC2_G144_NO_TILEBIN=1`), G150 MTGS
+  (`DC2_G150_NO_MTGS=1`), G157 pipelining (`DC2_G157_NO_PIPELINE=1`), G172 sprite-defer
+  (`DC2_G172_NO_SPRITE_DEFER=1`), G178 LLE GPU raster (`DC2_G178_NO_GPU=1`), G203 universal
+  guest-Z (`DC2_G203_LEGACY_Z=1`), G222 hyperbolic STQ (`DC2_G222_AFFINE_TEX=1`), G240 AFAIL
+  FB/Z gating, G248/G250 RTT fast sampler (`DC2_G248_NO_FASTSPRITE=1`), G252 CPU RTT band
+  replay (`DC2_G252_NO_RTT_DEFER=1`).
+- **Validated default-OFF substrates (the native-renderer stepping stones — promote only with
+  a paying consumer):** G260 frame-scope command graph (`DC2_G260_NR=1`, +2.0% alone) and
+  G261 GPU-resident RTT waves (`DC2_G261_WAVE=1`, implies NR, +4.5% alone; zero
+  ownership-invariant failures). Verifier-only/opt-in experiments: G242 GPU depth
+  (`DC2_G242_GPU_DEPTH=1`), G255/G256 exact GPU RTT (requires `DC2_G255_VERIFY=1`).
+- **Current binding profile (G260 decomposition of the ~435-450 ms MAP-0 frame):** ~170 ms
+  banded CPU raster work + ~160 ms GIF parse/register dispatch (82k `writeRegisterPacked`/f)
+  + ~100 ms host→local deswizzle. Refuted as costs: drain count/fragmentation (G253+G260),
+  per-flush readback skip alone (G261, +4.5%).
+- **Next executable priority (G267 candidates, census-pinned in `plans/phase-G266-fix-log.md`):**
+  (a) extend G263's exact tap-footprint FBO-direct bind from sprites to display TRISTRIPs
+  (bounded); (b) l2l display→0x2760 dst mirrors (G264-style); (c) T8-alias consumer 0x143←0x13c
+  (decode-from-FBO); (d) fbp=0x68 color/Z-alias strip batch (display rows 416..447 alias
+  zbp=0xd0 — honest, UNBOUNDED, own phase); (e) pillar-1 compact GIF parse (~160 ms, largest
+  untouched bucket). Do NOT widen the classifier on drain evidence (G266 refuted) or re-chase
+  the fbw split as a ms win (proven neutral; it is GPU-coverage substrate).
+- Baseline title gate: held-menu `frame_001500 PixelNonZero=211646 ±4`, `h=415`, FULL-FRAME
+  DISTRIBUTION + visual review, never one sample, never byte hashes (title animates). For
+  threading/pipelining/deferral levers, dense soak `DC2_FRAME_DUMP_EVERY=1` (G174/G249: 60-tick
+  cadence misses transient races and temporal dropouts).
+- Perf A/B point: `tools/run_g194_map0.ps1` steady DngStatus=0 windows (`[G154:perf]`), ≥3
+  reps/arm, claim only non-overlapping arms. 60fps accelerant for 30fps routes:
+  `DC2_PATCH_60FPS=1` (opt-in, no-op on title).
+- Smoke: `tools/run_30s_diagnose.ps1` (pins `DC2_PAD_INPUT`); validate
   `captures/frame_001500.ppm` with `skill/scripts/ppm_nonzero.py`.
 - Use the build wrappers (`build_rt.bat`/`build_runner.bat`) and read `BUILD_EXIT` from
   `build_out.txt` / `runner_out.txt`; the wrapper process exit code is not reliable.
@@ -132,9 +174,9 @@ this snapshot when they disagree.
   EditLoop@0x1ABCF0 — the debug-menu "MAP N" route lands here via EditMapJump@0x1AF4C0)**,
   2=dungeon, 3=front-end. Real-HW reference pair for the MAP-0 town route:
   `ref/dumps/map_0.gs` / `map_0.png`.
-- Dungeon free-roam is EE-bound: 3.62 fps default → 4.37-4.40 under the full stack; menus
-  6.4 → 25-30. G178 rejects ~1/3 of dungeon flushes (GS-state combos → whole-flush CPU
-  fallback) — classifier widening is an open raster lever.
+- Parked by user (regression-route only, do NOT investigate during perf phases): Sindain
+  inventory circular-viewport noise. Other open residuals: Max foot shadow, G194 DOF wedge,
+  TexAnime L→L width, audio, memcard, FMV.
 
 ---
 
@@ -187,12 +229,18 @@ No real Ghidra, no hands on the pad — tests drive input via env vars parsed in
   `DC2_KEYBOARD=1` for keyboard). In-dungeon free-roam is the **LEFT analog stick**, not D-pad.
 - **The runner's menu rendering is too corrupted to ID screens visually** — distinguish screens
   by state (`LoopNo`, `titleInfo`, `DngStatus`, `DAT_01ecd62c`), not by frame captures.
+- **MAP zoom replay (recorded 2026-07-16):** `run_record.bat` established MAP4 navigation
+  Down@0, Right@15/30/43/59, Circle@77, raw R2@212. `replay_from_rec.py` converts raw R2 0x0200
+  to game-space `0x0002`; widen it into a hold for stable headless zoom. `run_g218_map4_zoom.ps1`
+  and `run_g221_map2_zoom.ps1` now do this by default. Real zoom appears near dump tick 1200 and
+  removes Max/HUD; if they remain, the route did not validate zoom. Input `scriptFrame` is not the
+  same clock as the `frame_NNNNNN` dump suffix.
 
 ---
 
 ## §6 DC2-Proven Graphics Facts (instances of `15-vu1-gs-debugging.md`)
 
-All FIXED + shipped behind kill-switches in `ps2_vu1.cpp` / `dc2_game_override.cpp`:
+Proven fixes and operating facts (some unconditional, some retired, others kill-switch gated):
 - **Scene-camera chain (G193, the town flat-blue root):** every loop-init (TitleInit /
   InitDungeonMain / EditInit / sgInitGyoRace) does `scene->Initialize()` via the CScene vtable
   (`*(scene+0x10548)`, `__vt__6CScene=0x375FE0`, slot +8 = `Initialize__6CSceneFv@0x282EA0`)
@@ -208,6 +256,26 @@ All FIXED + shipped behind kill-switches in `ps2_vu1.cpp` / `dc2_game_override.c
 - **VU1 MAC flags computed** per FMAC (G71); **STATUS** derived from MAC. Kill `DC2_NO_VU1_MAC`.
 - **VU1 Q pipeline latency modelled** (G87, DIV/SQRT 7, RSQRT 13; WAITQ commits). Kill
   `DC2_VU1_NO_QLATENCY`. Was the title-rock neon-green (point-light attenuation read stale Q).
+- **VU1 FDIV busy-stall / Q commit-before-rearm modelled** (G200). A second DIV/SQRT/RSQRT
+  issued while Q is pending must commit the in-flight result first; otherwise behind-camera
+  MAP-0 geometry that HW 100%-skips partly draws as a foreground sheet. Kill `DC2_VU1_NO_QSTALL=1`.
+- **VU1 lower scalar-stall ordering + P/EFU pipeline fixed** (G239). Repro:
+  `Debug menu -> Down x2 -> Circle -> Square -> Left -> Cross`; reference
+  `ref/dumps/correct_light.{png,gs}`. The decisive pair is `RSQRT` followed by
+  `MULq VF2.x,VF2,Q | WAITQ`: real VU1 tests the lower wait/busy pipe before the paired upper,
+  while the old upper-first interpreter let MULq consume stale Q, exploded the normalized
+  lighting basis toward `FLT_MAX`, and produced flat `(255,255,255,128)` strips. The runtime now
+  pre-publishes pending Q/P for `WAITQ`/`WAITP` and busy scalar producers; causal kill
+  `DC2_VU1_NO_SCALAR_PRESTALL=1`. A separate delayed-P model implements ESADD/ERSADD/ELENG/
+  ERLENG/ESUM/ESQRT/ERSQRT/ERCPR/WAITP (kill `DC2_VU1_NO_PPIPE=1`); disabling only P latency
+  leaves the route correct, so it is a sibling semantic fix, not the lighting cause. Exact packet
+  `302dc00000008039:0000000000000412` has 57 packed ST/RGBAQ/XYZF2 loops; scalar-prestall ON/OFF
+  yields 0/64 saturated lighting stores, and the fixed `tbp=0x2820` mean RGBA `(50.6,69.8,64.1,127.0)`
+  closely matches HW `(52.6,72.3,67.1,127.1)`. Harnesses `tools/run_g237_capture.ps1` and
+  `tools/run_g237_vugs_ab.ps1`; parsers `tools/g234_map_rgbaq.py` and
+  `tools/g239_dump_gs_records.py`; final artifacts `captures/g239_final_001800.png` and
+  `captures/g237_g239_fixed.gs`. Title golden remains exactly 211646 and MAP-4 stayed healthy.
+  See `plans/phase-G239-fix-log.md`.
 - **VU1 float clamp** (`vuDouble`) implemented opt-in `DC2_VU1_CLAMP` (kept OFF, validated no
   regression but unproven broadly).
 - **COP2 dest-mask lane reversal** (F51.8) — the 50-phase dungeon-black root. After ANY regen,
@@ -226,6 +294,27 @@ All FIXED + shipped behind kill-switches in `ps2_vu1.cpp` / `dc2_game_override.c
   packer-PC markers (`ps2_memory.cpp submitGifPacket`); census `tools/g138_hw_slice.py`
   (`--dedupe --strips out.csv --seq N`), geometry-join `tools/g138_join.py`. Reference dump
   `ref/dumps/new_game_via_debug.gs`+`.png`.
+- **VIF1 chain-walker cutoff fixed (G217):** MAP-4's character RTT legitimately exceeds 4096
+  nested/local DMA tags. The old `kMaxChainTags=4096` stopped before the static-view head/cap
+  packets; camera rotation moved them to indices ~3988-4071 and made the defect look like culling.
+  Runtime now uses 16384. If a whole batch is angle/order-dependent while arriving batches are
+  VU-byte-identical to HW, check chain-tag headroom before VU/skin theories. Diagnostics:
+  `DC2_G217_EEOBJ=1`, `DC2_G217_TAG_VU=1`, `tools/g217_pcsx2_head_objects.ps1`.
+- **MAP-4 zoom shared-page ordering fixed (G219/G220):** the zoom cycle copies the display into
+  work page `fbp=0x139/tbp=0x2720`, defers a display composite, then clears the work page. G219
+  routed `sceGsSwapDBuffDc` clear packets through the GIF arbiter FIFO (kill
+  `DC2_G219_DIRECT_SWAPCLEAR=1`) and proved capture-time blue became replay-time zero. G220 found
+  the remaining writer: G37's host-only costume clear directly bulk-zeroed the same aliased page.
+  That workaround is retired default-OFF; `DC2_G37_FORCE_CLEAR=1` reproduces the old boundary.
+  Repro/reference: `tools/run_g218_map4_zoom.ps1`, `tools/g219_black_region.py`,
+  `ref/dumps/map_4_zoom.gs` + `.png`. `DC2_G219_GUARD` is page-granular, so use its first-access
+  RIP only with a source audit and causal lever; it is not an exact-byte watchpoint.
+- **MAP-0 environment Z promoted with lifecycle guard** (G202): real HW z-tests town display
+  geometry with `ZBUF_1 zbp=0xd0`, `PSMZ24`, `ZTST=GEQUAL`. The runtime honors that only for
+  ready town/edit frames (`LoopNo==1`, live scene/camera/map) and clears Z24 page `0xd0` to
+  PS2-far (`0`) on display-target transitions. Kill `DC2_G202_NO_TOWN_Z=1`, trace
+  `DC2_G202_TOWN_Z_STAT=1`. Do not key this on GS state alone; loading/transition frames bind
+  the same fbp/zbuf shape.
 - **VU1 same-pair upper→lower VF hazard fixed** (G139): a lower op never sees its same-pair
   upper's result on real VU1; the immediate-commit model broke the tri packer's
   store-then-clobber idiom (`SUB VF24.xyz,VF17,VF16 | SQ VF24`) → every tri's middle vertex
@@ -321,6 +410,42 @@ All FIXED + shipped behind kill-switches in `ps2_vu1.cpp` / `dc2_game_override.c
   Verified TITLE ONLY. Diagnostics: `DC2_G178_STAT=1`, `DC2_G178_CENSUS=1` (state-combo
   census — run it before extending the shader to a new route). See
   `plans/phase-G178-fix-log.md` + `plans/gpu-raster-arc-plan.md`.
+- **Missing chest gem arc (G226-G233, CLOSED 2026-07-12) — the DC2 instance of 15-vu1-gs
+  §4.3b pixel accounting + 04-runtime §6.1 stub-semantics audit.** Final root:
+  `sceVu0Normalize` stub used 4-component length (real VU0 `ESADD` = xyz only) →
+  `CDAColPipe::CheckHit`'s push-out (radial vector with leftover w=1) became a pull-in → the
+  DA pendant chain settled behind the torso → gem Z-culled behind the chest. Reusable DC2
+  diagnostics (all env-gated, default-off): `DC2_G232_RTTDUMP=1` (RTT scans, per-draw
+  bbox/inside/zfail/write accounting, watched-pixel Z history in `ps2_gs_rasterizer.cpp`),
+  `DC2_G233_COLPROBE=1` (CheckHit in/out/delta), `DC2_G229_DATREE=1` (DA frame tree +
+  pendant matrix), `DC2_TRACE_G226` (DA now-positions). Tools: `tools/g232_gs_zorder.py`
+  (dual-context `.gs` z/order parser — handles PACKED TEX0 descriptors 0x06/0x07,
+  PRMODE/PRMODECONT, per-context FRAME/TEST/ZBUF), `tools/g232_pcsx2_pendant_mtx.ps1` (live
+  pendant-chain matrices + DA bind/now arrays over DebugServer). Two invalidated rule-outs to
+  never repeat: `DC2_NO_ZTEST=1` cannot exonerate Z for early-drawn elements (painter's-order
+  overpaint), and "physics byte-matches PCSX2" must compare the FREE chain vertices, not just
+  the pinned anchor. `plans/phase-G232-fix-log.md`, `plans/phase-G233-fix-log.md`.
+
+- **GPU render-target residency lessons (G260/G261, 2026-07-16, durable for any port):**
+  (1) Before building ANY skip-readback/GPU-residency mechanism for a render target, first
+  measure who CONSUMES its output per frame — if the consumers (later draws sampling it, CPU
+  fallback rasterization, guest re-uploads into the same pages) still execute on the CPU, the
+  round-trip merely relocates to the consumer edges and the win is small (G261: +4.5% despite a
+  flawless ownership model; 1836/frame-window classifier rejects + 2.2 uploads/frame were the
+  real cap). Instrument consumer-edge counters FIRST, build residency SECOND. (2) Residency
+  overlap footprints must be scoped to the actually-rendered row window, never the whole
+  512-row target — GS work blocks pack targets pages apart and texture-upload pages right
+  behind them. (3) Guest "transfer is cheaper than space" engines re-upload scratch-page
+  content every frame: cross-frame FBO residency for such targets requires routing the upload
+  INTO the FBO, not materializing around it. (4) When a gen-based ownership invariant guards a
+  resident surface, scope the gen sum to the same row window as the residency claim, or
+  unrelated same-page-range traffic trips it falsely. `plans/phase-G261-fix-log.md`.
+- **Native display admission/presentation lessons (G269–G273):** split inclusive upload/draw
+  timers before optimizing; deferred graph work is charged to the barrier that pays it. Relax a
+  conservative VRAM alias only with exact PSM page sets and only for the measured aligned tuple.
+  Internal batch/oracle success does not prove final composition: G272 was faster but produced a
+  head-only Max through the normal downstream path. G273 promoted only after dense title plus
+  normal foliage/light/costume/dungeon and recorded real-zoom MAP2/MAP4 presentation all passed.
 
 ---
 
@@ -345,6 +470,21 @@ All FIXED + shipped behind kill-switches in `ps2_vu1.cpp` / `dc2_game_override.c
   ring dumped at crash), `DC2_G186_SPBAL=1` (sp-balance trampoline), `DC2_G186_SPTRACE=1`
   (EditLoop/EditDraw sp probes — their per-frame "desync" lines are a benign yield artifact,
   only in-body shifts matter).
+- **G211/G212 (fixed, default-ON, 2026-07-11): third instance of the §8 preemption class +
+  full audit — the MAP-4 cap/head-mesh flicker.** A yield inside `GetLWMatrix@0x137030` /
+  `ClearChildFlag@0x136C80` left the joint world matrix unwritten → the draw consumed zeros →
+  part culled that frame ("identical inputs, intermittently zero output" signature, see
+  `16-runtime-concurrency-threading.md §8.1`). Fix = `g212_lwmatrix_guard` /
+  `g212_getdrawrect_guard` preempt-suppression wrappers on `0x137030`/`0x143160` (kill
+  `DC2_G212_NO_LWGUARD=1`); the G206/G209/G37 trace probes reproduce the suppression when they
+  claim those slots. Audit of all 133 wrappers × 1,977 checkpoint-bearing recomp bodies found
+  + fixed one more live instance (`f50_7_mg_active_lighting_probe`'s `ctx->pc = ra` stomp over
+  3-checkpoint `ActiveLighting@0x139120`; `f50_7_funcpoint_setter_probe` hardened; kill
+  `DC2_G212_NO_PREEMPTFIX=1`). **No unfixed instances remain — but ANY new override that
+  post-call-mutates pc/ra/output must apply the §8.1 rule.** `DC2_G57_NO_PREEMPT=1` remains a
+  DIAGNOSTIC only (own timing regressions, G211). Full audit table:
+  `plans/phase-G212-fix-log.md`. Open residual: MAP-4 boot-transient head-missing window
+  (~150 frames post-load, preemption-INDEPENDENT, separate root).
 
 - **Configs are inputs to a MANUAL `ps2_recomp` run**, not referenced by the runtime build.
   `ps2_recomp.exe`'s build cache hard-references the stale path `d:/ps2r/PS2Recomp` — fix +

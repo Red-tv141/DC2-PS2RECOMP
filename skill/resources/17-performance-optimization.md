@@ -37,6 +37,19 @@ write → build → run → **compare output metric AND time metric** → record
 - Counters/timers print AGGREGATES on an interval — never per-frame, never per-call `printf`.
 - Remove or env-gate every timer when done (`<PREFIX>_PERF=1`), per the lever doctrine
   (`15-vu1-gs-debugging.md` §5).
+- **The env gate itself must be CACHED** (`static const bool on = getenv(...)`), never a per-call
+  `getenv`: on Windows CRT that is an env-lock + linear scan (µs-class) and worker threads
+  serialize on the lock. One uncached gate in a per-vertex path cost 41% of the frame and
+  masqueraded as a "parse" bucket for four phases (hotspot class #2 in §3).
+- **Treat every timer as inclusive until proven otherwise.** A timer around an upload, draw, or
+  register handler may include a pending command-graph drain, worker wait, GPU readback, or
+  dependency barrier. Add child timers around the suspected body and each wait/flush before
+  optimizing the caller. A real 155 ms "image upload" bucket contained <=10 ms of CT32 writing
+  and ~145 ms of pending graph execution.
+- **Charge deferred work to its producer, not the call that happens to pay it.** The first later
+  inline draw/line/upload can inherit the cost of earlier queued primitives. Pair timing with a
+  steady-window coverage counter for the alleged payload. If the payload count is zero after the
+  scene transition, its callsite timing is attribution noise, not an optimization target.
 
 ---
 
@@ -47,14 +60,15 @@ Check these IN ORDER — the cheap wins come first. Confirm each with the profil
 | # | Hotspot | Symptom / check | Fix direction |
 |---|---------|-----------------|---------------|
 | 1 | **Leftover diagnostic logging** | `printf`/`fprintf`/`std::cout` in a per-frame, per-draw, per-call path; console I/O shows in profile | Delete or env-gate. Format+flush per call is brutally slow. An uncapped *counter* is fine; a per-hit *printf* is not. |
-| 2 | **Debug/unoptimized build** | You're not on `Release`; iterators/asserts in profile | Verify `CMAKE_BUILD_TYPE=Release` (Ninja: baked at configure; VS generator: `--config Release`). Never "fix" perf while accidentally profiling Debug. |
-| 3 | **Guest memory access macros** | `READ32`/`WRITE32`/`READ128` etc. dominate samples — every guest access masks + bounds-checks + MMIO-routes | Fast-path the common case (plain RDRAM range) before the MMIO check; keep the MMIO route for `0x10000000+`/`0x12000000` only. Behavior-identical by construction — still A/B it. |
-| 4 | **Function-pointer dispatch lookup** | The indirect-call resolver (address → handler map) hot in profile | Cache lookups; use a flat table indexed by (addr − code_base)/4 rather than a hash map, if the runtime doesn't already. |
-| 5 | **VU1 interpreter inner loop** | `ps2_vu1.cpp` dominates; heavy per-instruction decode | Decode-once/cache per microprogram; keep flag/Q-latency semantics EXACTLY (the correctness rows in `15-vu1-gs-debugging.md` §2 are non-negotiable — re-run distinct-lane tests after). |
-| 6 | **GS software rasterizer** | `ps2_gs_rasterizer.cpp` per-pixel loop dominates (usually the #1 cost) | FIRST hoist per-triangle invariants out of the per-pixel path (sampler setup, CLUT decode → memoize per-triangle, swizzle-address base, alpha/blend decode) + scanline-narrow the bbox scan; THEN parallelize across disjoint pixels — see **§3.1** (the biggest lever). Do NOT change rounding/blend/sample semantics (verify vs `.gs` capture + same-run per-pixel A/B). |
-| 7 | **Guest-execution lock contention / sleeps** | Cores idle, FPS low, threads ping-ponging | See `16-runtime-concurrency-threading.md` — wrong wait granularity (e.g. a 200 µs sleep in a hot yield) caps FPS. Tune wait sites, keep the release-on-wait rule intact. |
-| 8 | **Scalar loops in math-heavy stubs/overrides** | Your own handwritten override shows hot | Vectorize with SSE intrinsics (`04-runtime-syscalls-stubs.md` §6). Test with DISTINCT per-lane values after (`10-agent-guardrails.md` §2.1) — vectorizing is exactly where lane bugs are born. |
-| 9 | **Per-call allocations / copies in handlers** | `malloc`/`memcpy` hot inside a stub called per frame | Preallocate/reuse buffers. Respect allocator-family coherence (§3.6 of `10-agent-guardrails.md`) — never introduce a second allocator path. |
+| 2 | **Per-call `getenv()` in env-gated diagnostics** | An env-gated probe (`if (envFlagEnabled("X_TRACE")) …`) sits in a per-vertex/per-draw/per-tag path WITHOUT a `static const bool` cache. Does NOT show as I/O — the µs-class `getenv` (env lock + linear scan on Windows CRT) hides inside the caller's inclusive time, and worker/replay threads SERIALIZE on the CRT env lock. Check: grep hot files for `getenv`/`envFlagEnabled` calls not feeding a `static const` initializer; census per-callsite ns (a cheap handler at 25 ns vs a sibling at 5,000 ns whose only extra feature is an uncached env check = the tell). | Read once into `static const bool` (magic statics are thread-safe); keep an opt-in lever that restores per-call reads as the same-binary A/B control. Real-world cost: ONE uncached line in a per-vertex kick path cost **41% of the whole frame** and masqueraded for four phases as an architectural "parse/dispatch" bucket (DC2 G268) — profile-bucket names lie; census per-descriptor/per-callsite before designing an architectural fix for a bucket. |
+| 3 | **Debug/unoptimized build** | You're not on `Release`; iterators/asserts in profile | Verify `CMAKE_BUILD_TYPE=Release` (Ninja: baked at configure; VS generator: `--config Release`). Never "fix" perf while accidentally profiling Debug. |
+| 4 | **Guest memory access macros** | `READ32`/`WRITE32`/`READ128` etc. dominate samples — every guest access masks + bounds-checks + MMIO-routes | Fast-path the common case (plain RDRAM range) before the MMIO check; keep the MMIO route for `0x10000000+`/`0x12000000` only. Behavior-identical by construction — still A/B it. |
+| 5 | **Function-pointer dispatch lookup** | The indirect-call resolver (address → handler map) hot in profile | Cache lookups; use a flat table indexed by (addr − code_base)/4 rather than a hash map, if the runtime doesn't already. |
+| 6 | **VU1 interpreter inner loop** | `ps2_vu1.cpp` dominates; heavy per-instruction decode | Decode-once/cache per microprogram; keep flag/Q-latency semantics EXACTLY (the correctness rows in `15-vu1-gs-debugging.md` §2 are non-negotiable — re-run distinct-lane tests after). |
+| 7 | **GS software rasterizer** | `ps2_gs_rasterizer.cpp` per-pixel loop dominates (usually the #1 cost) | FIRST hoist per-triangle invariants out of the per-pixel path (sampler setup, CLUT decode → memoize per-triangle, swizzle-address base, alpha/blend decode) + scanline-narrow the bbox scan; THEN parallelize across disjoint pixels — see **§3.1** (the biggest lever). Do NOT change rounding/blend/sample semantics (verify vs `.gs` capture + same-run per-pixel A/B). |
+| 8 | **Guest-execution lock contention / sleeps** | Cores idle, FPS low, threads ping-ponging | See `16-runtime-concurrency-threading.md` — wrong wait granularity (e.g. a 200 µs sleep in a hot yield) caps FPS. Tune wait sites, keep the release-on-wait rule intact. |
+| 9 | **Scalar loops in math-heavy stubs/overrides** | Your own handwritten override shows hot | Vectorize with SSE intrinsics (`04-runtime-syscalls-stubs.md` §6). Test with DISTINCT per-lane values after (`10-agent-guardrails.md` §2.1) — vectorizing is exactly where lane bugs are born. |
+| 10 | **Per-call allocations / copies in handlers** | `malloc`/`memcpy` hot inside a stub called per frame | Preallocate/reuse buffers. Respect allocator-family coherence (§3.6 of `10-agent-guardrails.md`) — never introduce a second allocator path. |
 
 ---
 
@@ -95,7 +109,10 @@ in payoff order:
   render-to-texture. These usually bypass the draw path, so hook them explicitly and drain the list
   before them. Deceptive symptom: the primitives drawn *before* a mid-frame re-upload look perfect
   while the ones whose texture got overwritten corrupt — it reads like "some geometry is wrong,"
-  not like a texture bug.
+  not like a texture bug. Include GPU readback, runtime/stub clears, direct `GSMem`/VRAM helper
+  writes, legacy workarounds, and every path that bypasses the normal draw/GIF choke point in the
+  writer inventory. Drain before each mutation or queue it through the same ordered FIFO; never
+  apply it immediately from another thread against the worker's live GS context.
 - **Selective dirty flushes are a second-phase optimization, not the first fix.** First prove
   unconditional upload barriers are correct. Only then replace them with a conservative overlap
   test. The dirty range must cover upload destination, local-to-local source, pending texture base,
@@ -159,6 +176,46 @@ reaching the measured EE-bound ceiling. The contracts that made it work:
    on a same-length default-path control and compare PROFILES: isolated few-tick bursts in
    stable cells = a race; smooth broad deviation present in both arms = the scene. Window out
    boot/fade-in before taking medians.
+8. **Skipping the per-flush readback (GPU residency) pays ONLY when the CONSUMERS are on the
+   GPU too — count the consumer edges FIRST.** A DC2 instance built a flawless skip-readback
+   residency model for its render-to-texture targets (row-window dirty tracking, generation
+   invariant, materialize-on-CPU-consumer edges — zero invariant failures) and won only ~4.5%,
+   because ~90% of the family's draws still fell to the CPU replay (state-classifier rejects,
+   NOT the suspected depth issue — instrument the reject REASON, the obvious theory was wrong)
+   and the guest re-uploaded scratch content into the same rows every frame. The round-trip
+   just relocates to the consumer edges. Order of operations: (a) per-edge counters (who reads
+   the target: later GPU draws, CPU fallbacks, transfers, uploads-into-the-pages) BEFORE any
+   residency mechanism; (b) widen GPU coverage of the consumers first; (c) route the guest's
+   per-frame uploads INTO the resident surface, don't materialize around them. Also: scope
+   residency footprints and generation invariants to the actually-rendered ROW WINDOW — GS
+   layouts pack neighbor targets and streaming-texture pages a few pages away, and a
+   whole-target range false-triggers on them every frame.
+
+## §3.3 Native Renderer Admission, Aliasing, and Presentation
+
+Once a GPU path is correct for supported batches, the next large wins often come from eliminating
+whole-batch CPU fallback. Use this protocol:
+
+1. **Profile success and fallback separately.** Split successful GPU work into prepare / submit /
+   publication, then census fallback reasons and shapes. A cheap successful batch does not imply
+   GPU overhead is the bottleneck; a conservative reject may be replaying the whole batch on CPU.
+2. **Relax alias guards only with exact physical evidence.** Conservative range/page functions
+   often add slack for unaligned bases or unknown swizzles. Never delete that slack globally.
+   For a measured aligned tuple, enumerate the exact pages/blocks touched by both rectangles using
+   the real PSM geometry; admit only if the sets are disjoint. Unknown, unaligned, wrapping, or new
+   tuples fail closed through the old guard.
+3. **Residency is a temporal ownership mechanism, not a readback toggle.** Track which version is
+   newest (FBO or guest VRAM), every CPU/draw/transfer/texture consumer, and the first boundary that
+   must materialize it. Generation equality alone is insufficient if a later writer republishes an
+   older version.
+4. **An internal oracle does not prove final composition.** Batch-local CPU/GPU equality can pass
+   while a downstream consumer sees the wrong temporal version. Gate promotion on normal composed
+   frame dumps/window output across transitions and multiple routes. If character parts, terrain,
+   shadows, or overlays disappear, keep the behavior default-off even when timing improves.
+5. **Bound repairs by architecture.** Repair a missing edge or narrow proof in-phase when evidence
+   identifies it. If correctness needs a new ownership/versioning mechanism, revert the unsafe
+   behavior or keep it opt-in, preserve diagnostic counters, name the exact consumer blocker, and
+   open a focused follow-up phase.
 
 ---
 

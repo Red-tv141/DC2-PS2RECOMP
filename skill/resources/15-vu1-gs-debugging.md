@@ -62,7 +62,8 @@ Runtime files (from `10-agent-guardrails.md §3.5`): `ps2_vu1.cpp` (interpreter)
 | **CLIP flags** | Clip-gated VU branches wrong | Maintain the 24-bit clipping flag register from the clip judgements. |
 | **ADC / Strip Restart flags** | Triangles are completely culled (flat blue/black screen) OR giant swimming sheets/overdraw polygons cover the frame | The GS uses the MSB of the vertex coordinates (ADC bit) to flag "no-draw / strip-restart". If the VU/COP2 output fails to set/clear the ADC bit (often mapping the `.w` float field to the integer MSB via FTOI4/FTOI0), you get all-cull (all-ADC=1) or no-cull (all-ADC=0). **Verify selective ADC ratio against PCSX2/GS-dump (e.g., ~60% ADC=1 on real HW).** |
 | **SAME-PAIR upper→lower VF hazard (immediate upper commit)** | POSITIONS of a periodic vertex subset explode into screen-spanning textured "beam" tris while ADC/fog/draw% still match HW (the `.w` lane survives a `.xyz` dest mask); garbage coords decode as raw FLOAT BITS (x/y = low16 of a float, z24 = bits 4..27) | A lower op (SQ/SQI/SQD, DIV/RSQRT, MTIR, MOVE…) can **never** see its same-pair upper's result on real VU1 (FMAC latency ~4 cycles). Hand-scheduled microcode exploits this with a store-then-clobber idiom: `SUB VF24.xyz,VF17,VF16 \| SQ VF24 -> 5(VI6)` — the SQ stores the OLD VF24 (produced by an FTOI4 exactly 4 pairs earlier) while the upper computes the NEXT value in the same slot. An interpreter that runs upper-first with immediate commit stores the upper's fresh result instead. **Fix pattern: snapshot the upper op's VF dest (fd for main-space ops; ft for FTOI/ITOF/ABS; none for ACC/CLIP writers) before execUpper, expose the OLD value to execLower, then overlay the upper's dest-masked lanes afterwards (upper wins its lanes even if the lower wrote the reg).** Same family as Q latency and the flag pipeline — audit all three together. |
-| **Q-register pipeline latency** | A point-light/attenuation/perspective value is subtly wrong → e.g. neon-green lighting, slightly-off projection | HW latches `Q` **after a delay** (DIV/SQRT 7 cycles, RSQRT 13). Microcode doing `RSQRT/DIV … (no WAITQ) … MULq` at < latency distance wants the **OLD** pipelined Q. An immediate-write model feeds the fresh result. **Tell:** mixed `MULq|WAITQ` vs bare `MULq` in the same program. Stage Q into pending+delay, commit at 0, WAITQ commits immediately. |
+| **Q-register pipeline latency** | A point-light/attenuation/perspective value is subtly wrong → e.g. neon-green lighting, slightly-off projection | HW latches `Q` **after a delay** (DIV/SQRT 7 cycles, RSQRT 13). Microcode doing `RSQRT/DIV … (no WAITQ) … MULq` at < latency distance wants the **OLD** pipelined Q. An immediate-write model feeds the fresh result. **Tell:** mixed `MULq|WAITQ` vs bare `MULq` in the same program. Stage Q into pending+delay, commit at 0; WAITQ publishes it at the lower-stall point. **AND model the FDIV busy-stall:** a second DIV/SQRT/RSQRT issued while a result is in flight must COMMIT the pending Q first (real HW stalls until the first latches — PCSX2 `_vuTestFDIVStalls`/`_vuFDIVflush`); a single-slot model that just overwrites pending silently DROPS the first result and leaves Q stale for the whole window. Symptom shape: geometry a real-HW `.gs` freeze marks 100% ADC=1 gets partially DRAWN with per-vertex coords matching HW within pixels (behind-camera q<0 verts passing a Q-derived cull/guard bound). Tell: back-to-back `DIV` pairs feeding `ADDq/MULq` ~7 pairs later. |
+| **LOWER scalar stall applied after the paired upper** | A normalized lighting/transform basis suddenly reaches ~`FLT_MAX`; later colour clamps produce uniformly saturated strips even though the GS packer is faithful | Real VU1 tests the lower slot's FDIV/EFU wait or busy-pipe stall and flushes matured scalar results **before either slot executes**. Thus `MULq … | WAITQ` publishes pending Q before the upper MULq reads it; `WAITP` and a new producer issued into a busy FDIV/EFU pipe follow the same visibility ordering. An upper-then-lower interpreter consumes stale Q/P. **Fix with a pre-pair scalar stall/publication phase, then execute upper, then lower.** This is distinct from the same-pair VF hazard above: there the lower must see an old vector value; here the lower stall changes scalar visibility for the paired upper. Audit both whenever pair execution is hand-written. |
 | **Float clamp (`vuDouble`)** | Rare denormal/inf/NaN lanes corrupt a result | HW VU clamps: denormal→signed 0, inf/NaN→±`0x7f7fffff`. Often tolerable (games rarely depend on it) — implement opt-in, validate before defaulting on. |
 | **Dest-mask lane order reversed** | Partial-dest writes hit the wrong lanes → degenerate transforms (THE 50-phase dungeon-black class) | VU/COP2 lane order is X/Y/Z/W = bits 3/2/1/0 — **opposite** `_mm_movemask_ps` (0/1/2/3). Reverse before building masks. In SIMD tests use DISTINCT per-lane values; symmetric/all-ones vectors HIDE shuffle/mask defects. |
 | **Outer-product `VOPMULA/VOPMSUB`** | Cross-product / plane-normal math wrong | Rotates the source pairing — NOT component-wise multiply. Local invariant: `mgPlaneNormal` component-wise `A*B−B*A ≡ 0`. |
@@ -81,6 +82,20 @@ When you implement/audit any row above, match these EXACT rules from PCSX2 (cite
 pipe writes `REG_Q` after **DIV = 7, SQRT = 7, RSQRT = 13** cycles. So microcode doing
 `DIV/RSQRT … (no WAITQ) … MULq/ADDq` within that distance reads the OLD Q. (EFU ops ESUM/ERSQRT/
 EEXP use a SEPARATE pipe — don't lump them with Q.)
+
+**Lower scalar-stall ordering** (`VU1microInterp.cpp` `_vu1Exec`, `VUops.cpp`
+`_vuTestLowerStalls/_vuTestPipes`): before executing the instruction pair, PCSX2 decodes the
+lower hazards, tests/advances the lower pipe, flushes completed results, then executes UPPER and
+LOWER. A lower `WAITQ`, `WAITP`, or producer that encounters an already-busy FDIV/EFU pipe can
+therefore publish the older Q/P **before the paired upper reads it**. Do not implement waits only
+inside an upper-then-lower `execLower`; add a pre-pair stall/publication step.
+
+**P-register / EFU latency** (`VUops.cpp` `_vuRegs*` table): P has its own pending result and
+latency; `MFP` does not wait for a pending P, while `WAITP` and a subsequent busy EFU producer do.
+For the commonly implemented subset, use **ESADD=11, ERSADD=18, ELENG=18, ERLENG=24, ESUM=12,
+ERCPR=12, ESQRT=12, ERSQRT=18** cycles. PCSX2's `_vuTestEFUStalls` releases a producer stall one
+cycle early but `_vuTestPipes` flushes the old P before the new result replaces it; preserve that
+value visibility even in a simplified pair-level model.
 
 **`vuDouble` operand/result conditioning** (`VUops.cpp:440`) — applied to every FMAC operand+result:
 - exponent field `== 0` (denormal/zero): return `f & 0x80000000` → **flush to signed zero** (UNCONDITIONAL).
@@ -248,6 +263,13 @@ palette), `CSM` (1 = swizzled CSA layout, 2 = linear), `CSA` (start slot, 16-ent
 32-bit), `CLD` (load-control: when/whether to reload the cache). A stale palette = missing CLUT-cache
 invalidation on `CLD` change — check this before suspecting the texels.
 
+**Alias-proof rule for GPU admission:** conservative GS overlap helpers may deliberately include an
+extra page/block for unaligned bases or uncertain swizzles. That is a safety margin, not proof that
+two aligned rectangles alias. If the guard dominates CPU fallback, enumerate the exact physical
+page set for the measured `(bp,bw,psm,x,y,w,h)` tuples and compare sets. Remove slack only for the
+proven aligned tuple; retain the conservative answer for unknown, unaligned, wrapping, or new
+layouts. Never generalize one adjacent-page proof into a global weakening.
+
 ---
 
 ## §4 Methodology — How to Actually Diagnose a Graphics Bug
@@ -256,19 +278,47 @@ invalidation on `CLD` change — check this before suspecting the texels.
    TEST/scissor/XYOFFSET/colour all expected) **cannot rescue bad guest geometry.** Bucket the
    emitted primitives (tri / tristrip / trifan counts, on-screen %, centroids) and compare to
    the reference. If coverage is wrong, the bug is upstream (VU/EE), not in GS state.
-2. **Split geometry vs lighting/colour.** Probe VU-output XYZ separately from RGBA. Positions
+2. **Prove packet delivery before debugging packet contents.** If an entire sub-mesh/batch
+   disappears, but the batches that do reach VU1 have hardware-matching inputs/outputs, trace the
+   complete delivery chain: EE packet emission -> DMA tag/link -> chain-walker termination -> VIF
+   unpack -> MSCAL/XGKICK. Log the total tag count, termination reason, and every hardcoded walker
+   budget. Camera/pose/order sensitivity can move the same packet across a fixed cutoff and mimic
+   a mathematical cull. Treat runaway guards as corruption detectors, not guessed workload limits:
+   warn when approached, distinguish malformed cycles from valid long chains, and size them from
+   observed workloads with headroom.
+3. **Split geometry vs lighting/colour.** Probe VU-output XYZ separately from RGBA. Positions
    match HW but colour wrong → lighting consumption (§2 Q-latency, light-matrix channel order).
    Positions wrong → transform (§2 dest-mask, vf0, matrix).
-3. **A/B against ground truth** (`12-pcsx2-mcp-playbook.md`): breakpoint the same draw in PCSX2,
+3b. **"Draw happens but nothing appears" → per-draw PIXEL ACCOUNTING, not more state audits.**
+   For the suspect draws only, count four stages in the rasterizer: bbox pixels iterated →
+   inside (edge-test pass) → z-test pass → writePixel reached. One run pinpoints the killing
+   stage (DC2 G232: 4511 inside → 4511 zfail → 0 writes = Z, after a full GS-state audit had
+   "cleared" everything). Two traps this method retires:
+   - **A global Z-disable lever (`NO_ZTEST`-style) is NOT a valid Z rule-out** for an element
+     drawn BEFORE other geometry covering the same pixels — with Z off, painter's order lets
+     the later draws overpaint the restored element, so it stays invisible and Z gets falsely
+     exonerated. Only per-pixel `zi` vs `zdst` accounting on the exact draws rules Z in/out.
+   - When Z IS the killer, dump the full **Z history at one watched pixel** (every draw
+     touching it: source, zi, zdst, pass, zwrite) — the sequence names what owns the depth the
+     element loses to, and comparing the same relationships in the HW `.gs` (order + z VALUES)
+     splits "wrong GS state/order" from "wrong transformed Z", which points back to
+     EE/VU/physics DATA. A "missing" element can be a physics/animation divergence wearing a
+     Z-cull costume (DC2 gem: accessory-chain physics settled behind the torso).
+4. **A/B against ground truth** (`12-pcsx2-mcp-playbook.md`): breakpoint the same draw in PCSX2,
    read the registers/memory, find the FIRST divergence. **Constraint:** the PCSX2 DebugServer
    maps EE RAM + scratchpad ONLY — it **cannot** read VU micro-mem (`0x1100xxxx`) or GS
    (`0x12000000`) (they read 0). For VU/GS internal state, use an **offline `.gs` GS dump**
    (capture from PCSX2, parse the packet stream + VRAM) as the reference instead.
-4. **Probe with env-gated levers, never hard-edits** — see §5.
-5. **Loop:** OBSERVE (which primitives/state) → LOCATE (VU? GS? VIF? EE upload?) → UNDERSTAND
+5. **Probe with env-gated levers, never hard-edits** — see §5.
+6. **Loop:** OBSERVE (which primitives/state) → LOCATE (VU? GS? VIF? EE upload?) → UNDERSTAND
    (what does HW emit here — from the `.gs` dump / PCSX2) → DECIDE (one fix tool) → VERIFY
    (re-capture, re-diff). Same loop as `13-decisional-brain.md`, with the *reference* being a
    captured frame, not stdout.
+7. **Verify normal downstream composition.** An internal texel/batch oracle proves only its local
+   boundary. GPU residency can still publish the wrong temporal version to a later CPU transfer,
+   presentation latch, or composite. Inspect multi-frame output through the ordinary present/dump
+   path: character body parts, terrain, shadows, overlays, and transition frames are pass/fail
+   evidence. Any new regression blocks promotion even when the oracle is zero-bad and FPS improves.
 
 ### §4.0 Packet-level GS-stream A/B (the highest-leverage graphics method — use it EARLY)
 
@@ -294,9 +344,35 @@ patterns were completely different. The method that finally cracked it, reusable
    "HW PRIMED strips are geometry-identical to runner ALLNODRAW strips from the transform
    packer" pins the defect to VU flag execution, exonerating routing/EE/copy in one shot.
    Matched strips give a **bit-exact per-vertex ADC oracle** for validating any fix.
-5. Static scene + multi-frame dump → dedupe strips by content hash; camera drift makes borderline
+5. **For a colour mismatch, fingerprint the exact packet before tracing arithmetic.** Match by
+   GIFtag, loop count, semantic path, TBP/state, and geometry—not only by an aggregate texture-page
+   colour census. Then walk the bad RGBA qword backward: packet record/provenance → VU data qword →
+   last SQ/SQI writer → producing instruction. This cleanly distinguishes a faithful packer from
+   already-corrupt lighting input. Prefer value-triggered traces (saturation/non-finite/range) over
+   first-N logs; the failing batch may follow many correct batches.
+6. Static scene + multi-frame dump → dedupe strips by content hash; camera drift makes borderline
    guard verts flip category across frames — treat small off-diagonals in the join as drift noise
    before suspecting the fix.
+7. **`.gs` parser traps that manufacture false conclusions** (each cost a real port a phase):
+   - GS IMAGE payload is stateful and can continue across transfer records. Track remaining IMAGE
+     qwords **per semantic path** and treat them as raw texture bytes until exhausted; parsing a
+     continuation qword as a new GIFtag manufactures fake draws and colour populations.
+   - A transfer record's numeric path byte follows the dump-container convention, not the literal
+     GS path number. In the v9-shaped format above, raw byte `3` is PATH1, not PATH3. Keep synthetic
+     VU-PC marker state scoped to PATH1 records and never let it contaminate PATH2/PATH3.
+   - Preserve RGBA provenance: record index, semantic path, explicit PACKED/A+D write versus
+     inherited state. Do not merge populations whose colour origin is different.
+   - **PACKED GIF descriptors 0x06/0x07 are direct TEX0_1/TEX0_2 writes** — a parser that only
+     handles TEX0 via A+D misses every VU-emitted texture bind and reports one stale page as
+     "a consolidated atlas".
+   - Track **FRAME/TEST/ZBUF/TEX0 per context** and resolve the effective CTXT through
+     PRMODE/PRMODECONT (PRMODECONT=0 ⇒ attributes come from PRMODE, not PRIM).
+   - PACKED RGBAQ packs R@0 / **G@32 / B@64** / A@96 (a low-64-bit read fabricates "pure red"
+     verts); PACKED ST carries **Q in bits [95:64]**; PACKED XYZF2 Z is [91:68] (not a plain
+     hi-word mask); A+D kicks via addresses 0x04/0x05 use X[15:0] Y[31:16] Z[55:32]/[63:32].
+   - When the repro is IN MOTION (character falling/walking), compare SIGNS and relationships
+     (element-z minus body-z, pinned vs free vertices) across runner/reference — absolute
+     values never match across poses; the mirror/ordering signature is pose-invariant.
 
 ### §4.1 Probe methodology (hard-won — a black texture is the canonical example)
 
@@ -310,14 +386,28 @@ patterns were completely different. The method that finally cracked it, reusable
   texture manager never uploads to), not a transfer drop.
 - **An uncapped "does X ever happen?" counter beats a capped sample log.** Capped windows get
   swamped by boot/title traffic and miss the steady state. A single uncapped tally (`hitAddr=0`
-  over the whole run) gives a clean yes/no.
+  over the whole run) gives a clean yes/no. If a capped trace is load-bearing, print its saturation
+  state and prove the interesting window occurred before the cap; silence after saturation is not
+  a negative result.
+- **A transition detector identifies an interval, not necessarily the writer.** A sentinel checked
+  at draw/transfer choke points only proves that bytes changed since the previous check; another
+  thread or a direct helper can write between visits. Keep a short ring of preceding events and
+  pair it with source audit or a causal lever. Host page protection is page-granular: the trapped
+  address is the first access to that page, not automatically the exact texel/qword that changed.
 - **Find the WORKING control through the same machinery.** If one texture renders (e.g. the title
   font) and another doesn't, the IMAGE/sample path is sound — the fault is isolated to what differs
   (the failing path's address/descriptor setup). Diff the working vs broken bind.
-- **Confirm the test actually REACHED the state before concluding a feature is broken.** On a slow
-  recompiled runner a 30 s headless window may only reach a few hundred frames; scripted input
-  scheduled at a later frame simply never fires. Count the inject/marker — "0 injections" means the
-  test never ran, not that the feature failed. (Sibling of the §13 "prove reachability" rule.)
+- **Confirm the test actually REACHED the intended state/mode before concluding anything.** On a
+  slow recompiled runner a 30 s headless window may only reach a few hundred frames; scripted input
+  scheduled later simply never fires. Count the inject/marker, then assert a mode-specific visual or
+  state signature (for example, a zoom camera may remove the player/HUD). "Input injected" is not
+  enough if it fired during loading or used the wrong byte order. Prefer a live input recording,
+  convert raw scePad bits through the project's replay convention, widen short pulses when the
+  headless clock can skip them, and distinguish input `scriptFrame` from frame-dump tick numbering.
+- **Reproduce suspicious frame evidence serially.** If an image viewer or batch loader shows a
+  black/missing region, reopen that exact on-disk file alone and check simple pixel/region statistics
+  before diagnosing renderer state. Tooling/concurrent-preview artifacts must not become regressions
+  or fixes; persistent on-disk composed output is the evidence.
 
 ---
 
@@ -330,6 +420,12 @@ Graphics fixes are easy to "prove" by eye and wrong under the hood. Protect your
     regression can be bisected without a rebuild.
   - A change that only PROVES a diagnosis → make it **opt-in, default-OFF**
     (`<PREFIX>_<NAME>=1`). Never ship a proof-lever as the fix.
+  - **Read every gate ONCE into a `static const bool`** (magic statics are thread-safe) — never a
+    per-call `getenv`/env-check in a per-vertex/per-draw/per-tag/per-packet path. Windows CRT
+    `getenv` is µs-class (env lock + linear scan) and worker threads serialize on the lock; one
+    uncached gate in a vertex-kick path cost 41% of the whole frame while masquerading as an
+    architectural "parse/dispatch" cost for four phases (DC2 G268; see
+    `17-performance-optimization.md` §3 hotspot #2).
 - **NO PER-SCREEN FIXES (hard rule).** Never patch a symptom by writing game state
   (camera/projection/matrix/render-target) per-frame scoped to one screen. Shared globals leak
   the write into CONCURRENT screens (e.g. a title fix that moves a character model on another
@@ -342,9 +438,28 @@ Graphics fixes are easy to "prove" by eye and wrong under the hood. Protect your
   the legit screen and the leak. A/B the two states and DIFF the gating field: if the field you're
   keying on reads the same in the case you want to keep and the case you want to suppress, the gate
   cannot work. Don't assume a state is unique — measure it.
+- **GS-state predicates are not lifecycle predicates.** A FRAME/ZBUF/TEST tuple that correctly
+  identifies the target draw in a steady scene can also appear during boot, loading, fades, menus,
+  or render-target setup. Before promoting a GS/raster fix to default-on, pair the GS predicate with
+  a guest-state readiness predicate when available (loop/state id, live scene pointer, valid
+  camera/map/active indices). Then validate both the final target frame and the transition/loading
+  frames that lead into it. If deferred or threaded replay is involved, capture the readiness scope
+  per queued draw entry and replay that snapshot; do not read a later global scope from worker
+  threads. If the fix improves the environment but leaves character/shadow/RTT defects, document it
+  as a partial fix and split the remaining pass instead of widening the scope blindly.
 - **Clamp original-game bugs at the runtime boundary, never "fix" game-side.** Some defects are
   in the original game (e.g. an oversized DMA transfer the real DMAC tolerates). Absorb them in
   the runtime (stop when the destination rectangle is full), don't alter recompiled game logic.
+- **A GS page address is storage, not feature ownership.** Games aggressively alias the same VRAM
+  pages across costumes, work buffers, depth pyramids, menus, and transitions. A synthetic clear or
+  workaround keyed only by FBP/TBP/shape can silently hit an unrelated later lifecycle. After the
+  source defect is repaired, A/B-retire the workaround on both its original route and every known
+  aliasing route; do not preserve it by adding another per-screen exception.
+- **A passing internal oracle never waives the presentation gate.** If a residency/readback arm
+  produces missing character parts or terrain in normal composition, keep it default-off. Repair a
+  bounded, evidence-proven ownership edge in-phase; if a new versioning/consumer mechanism is
+  required, revert unsafe behavior, retain quiet diagnostics, document the exact blocker, and split
+  a focused follow-up.
 - **Don't delete a band-aid while a deeper blocker is unresolved** — it regresses to the
   earlier broken state. Mark band-aids with their kill-switch and the condition for removal.
 - **After a ROOT fix lands, SWEEP ALL older band-aids — especially pc-scoped interpreter

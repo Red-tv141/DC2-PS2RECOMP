@@ -158,6 +158,17 @@
    - Compare with recompiled behavior to find FIRST divergence
    - Full protocol: `12-pcsx2-mcp-playbook.md` §3
 
+   **Step H — Graphics/performance promotion gate.** For GS, VU, threading, or native-renderer
+   changes, do all of the following before promotion:
+   - Prove the harness reached the intended scene and mode using an injection/state marker plus a
+     mode-specific output signature. Input timing and dump-frame numbering may use different clocks.
+   - Run internal CPU/GPU or texel oracles when available, then separately inspect normal downstream
+     composition over multiple frames. Local oracle success does not prove temporal presentation.
+   - Compare candidate/control on the same binary with repeated interleaved steady windows. Split
+     inclusive timers into body/wait/flush children before naming an optimization target.
+   - A new presentation regression blocks promotion. If its repair needs a new ownership mechanism,
+     leave the arm default-off, retain diagnostics, and record a focused follow-up instead of widening.
+
 5. Write game overrides following `examples/game-override-template.cpp`.
 
 6. Address crashes using the Decision Flowchart in `10-agent-guardrails.md` §3.
