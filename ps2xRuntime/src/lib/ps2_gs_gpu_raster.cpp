@@ -1600,6 +1600,22 @@ public:
         return submitImpl(&batch, depthKey, depthUpload, depthY, depthRows, nullptr);
     }
 
+    // G275: render a guest-depth batch and read its written row window while that texture is
+    // still attached. This preserves the synchronous GPU->VRAM contract while avoiding a second
+    // worker job, promise wait, scratch-FBO bind, and depth reattachment for every write wave.
+    bool submitDepthReadback(G178Batch &batch, uint64_t depthKey,
+                             const std::vector<float> *depthUpload,
+                             int depthY, int depthRows,
+                             int readY, int readRows,
+                             std::vector<float> &depthReadback)
+    {
+        if (depthKey == 0u || readY < 0 || readRows <= 0 ||
+            readY > batch.fbH || readRows > batch.fbH - readY)
+            return false;
+        return submitImpl(&batch, depthKey, depthUpload, depthY, depthRows,
+                          &depthReadback, readY, readRows, true);
+    }
+
     bool readDepth(uint64_t depthKey, int width, int height,
                    int depthY, int depthRows, std::vector<float> &depthReadback)
     {
@@ -1609,7 +1625,8 @@ public:
         G178Batch readBatch;
         readBatch.fbW = width;
         readBatch.fbH = height;
-        return submitImpl(&readBatch, depthKey, nullptr, depthY, depthRows, &depthReadback);
+        return submitImpl(&readBatch, depthKey, nullptr, depthY, depthRows,
+                          &depthReadback, depthY, depthRows, false);
     }
 
     // G261: synchronous FBO color row-window readback (deferred RTT-wave materialization).
@@ -1689,7 +1706,9 @@ public:
 private:
     bool submitImpl(G178Batch *batch, uint64_t depthKey,
                     const std::vector<float> *depthUpload, int depthY, int depthRows,
-                    std::vector<float> *depthReadback)
+                    std::vector<float> *depthReadback,
+                    int depthReadY = 0, int depthReadRows = 0,
+                    bool renderThenReadDepth = false)
     {
         if (batch == nullptr || !m_ready.load(std::memory_order_acquire))
             return false;
@@ -1706,6 +1725,9 @@ private:
             item.depthY = depthY;
             item.depthRows = depthRows;
             item.depthReadback = depthReadback;
+            item.depthReadY = depthReadY;
+            item.depthReadRows = depthReadRows;
+            item.renderThenReadDepth = renderThenReadDepth;
             item.promise = promise;
             m_queue.push_back(std::move(item));
         }
@@ -1728,6 +1750,9 @@ private:
         int depthY = 0;
         int depthRows = 0;
         std::vector<float> *depthReadback = nullptr;
+        int depthReadY = 0;
+        int depthReadRows = 0;
+        bool renderThenReadDepth = false;
         // G261 color-readback job (batch == nullptr, colorReadback != nullptr)
         uint32_t colorFbp = 0u;
         std::vector<uint32_t> *colorReadback = nullptr;
@@ -1814,12 +1839,15 @@ private:
                     ok = writeColorOnWorker(item.colorFbp, item.colorTexW, item.colorTexH,
                                             item.colorX, item.colorY, item.colorW,
                                             item.colorRows, *item.colorWrite);
-                else if (item.depthReadback != nullptr)
+                else if (item.depthReadback != nullptr && !item.renderThenReadDepth)
                     ok = readDepthOnWorker(item.depthKey, item.batch->fbW, item.batch->fbH,
-                                           item.depthY, item.depthRows, *item.depthReadback);
+                                           item.depthReadY, item.depthReadRows,
+                                           *item.depthReadback);
                 else
                     ok = renderBatch(*item.batch, item.depthKey, item.depthUpload,
-                                     item.depthY, item.depthRows);
+                                     item.depthY, item.depthRows,
+                                     item.renderThenReadDepth ? item.depthReadback : nullptr,
+                                     item.depthReadY, item.depthReadRows);
             }
             catch (...)
             {
@@ -2603,9 +2631,17 @@ private:
     }
 
     bool renderBatch(G178Batch &b, uint64_t depthKey, const std::vector<float> *depthUpload,
-                     int depthY, int depthRows)
+                     int depthY, int depthRows,
+                     std::vector<float> *fusedDepthReadback = nullptr,
+                     int depthReadY = 0, int depthReadRows = 0)
     {
         if (!validateBatchInputs(b, depthKey, depthUpload, depthY, depthRows))
+            return false;
+        // Validate the fused read before uploads or draws: a rejected combined job must leave
+        // persistent color/depth state untouched so the front-end can safely replay on the CPU.
+        if (fusedDepthReadback != nullptr &&
+            (depthKey == 0u || depthReadY < 0 || depthReadRows <= 0 ||
+             depthReadY > b.fbH || depthReadRows > b.fbH - depthReadY))
             return false;
         ++m_batchCounter;
 
@@ -2985,6 +3021,12 @@ private:
         glDisable(GL_SCISSOR_TEST);
         if (!b.skipReadback)
             glReadPixels(0, 0, b.fbW, b.fbH, GL_RGBA, GL_UNSIGNED_BYTE, b.readback.data());
+        if (fusedDepthReadback != nullptr)
+        {
+            fusedDepthReadback->resize(static_cast<size_t>(b.fbW) * depthReadRows);
+            glReadPixels(0, depthReadY, b.fbW, depthReadRows,
+                         GL_DEPTH_COMPONENT, GL_FLOAT, fusedDepthReadback->data());
+        }
         if (g257RealDiagnostic)
         {
             GLenum fboReadError = GL_NO_ERROR;
@@ -3062,6 +3104,17 @@ bool g242_backend_submit_depth(G178Batch &batch, uint64_t depthKey,
     return G178Backend::instance().submitDepth(batch, depthKey, depthUpload, depthY, depthRows);
 }
 
+bool g275_backend_submit_depth_readback(G178Batch &batch, uint64_t depthKey,
+                                        const std::vector<float> *depthUpload,
+                                        int depthY, int depthRows,
+                                        int readY, int readRows,
+                                        std::vector<float> &depthReadback)
+{
+    return G178Backend::instance().submitDepthReadback(
+        batch, depthKey, depthUpload, depthY, depthRows,
+        readY, readRows, depthReadback);
+}
+
 bool g242_backend_read_depth(uint64_t depthKey, int width, int height,
                              int depthY, int depthRows, std::vector<float> &depthReadback)
 {
@@ -3123,6 +3176,8 @@ bool g162DecodeT8Batch(int, const uint32_t *, const uint32_t *, const int *, con
 bool g178_backend_ready() { return false; }
 bool g178_backend_submit(G178Batch &) { return false; }
 bool g242_backend_submit_depth(G178Batch &, uint64_t, const std::vector<float> *, int, int) { return false; }
+bool g275_backend_submit_depth_readback(G178Batch &, uint64_t, const std::vector<float> *,
+                                        int, int, int, int, std::vector<float> &) { return false; }
 bool g242_backend_read_depth(uint64_t, int, int, int, int, std::vector<float> &) { return false; }
 bool g178_backend_has_tex(uint64_t) { return false; }
 bool g178_backend_read_color(uint32_t, int, int, int, int, std::vector<uint32_t> &) { return false; }
