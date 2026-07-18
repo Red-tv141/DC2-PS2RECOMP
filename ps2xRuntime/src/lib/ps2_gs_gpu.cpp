@@ -43,6 +43,20 @@ std::atomic<uint64_t> g_g171RegCount[16]{};
 // bucket those separately by address to find which register dominates the 0x0E cost.
 std::atomic<uint64_t> g_g171AdNs[256]{};
 std::atomic<uint64_t> g_g171AdCount[256]{};
+// G285: exact full-page CT32 local-copy fast-path counters. Quiet unless DC2_G285_STAT=1.
+std::atomic<uint64_t> g_g285L2lCalls{0};
+std::atomic<uint64_t> g_g285L2lEligible{0};
+std::atomic<uint64_t> g_g285L2lFast{0};
+std::atomic<uint64_t> g_g285L2lBytes{0};
+std::atomic<uint64_t> g_g285L2lLegacyNs{0};
+std::atomic<uint64_t> g_g285L2lFastNs{0};
+
+// G289 private .cpp-to-.cpp bridge. The native-copy owner is audited against the exact normal
+// presentation source rectangle immediately before this TU reads guest VRAM.
+void g289_prepare_presentation_read(uint8_t *vram,
+                                    uint32_t fbp, uint32_t fbw, uint32_t psm,
+                                    uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                    bool useLocalMemoryLayout, bool frameBaseIsPages);
 
 namespace
 {
@@ -1283,6 +1297,16 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
     {
         return false;
     }
+
+    static const bool s_g289PresentationAudit =
+        !envFlagEnabled("DC2_G289_NO_GPU_LOCAL_COPY") &&
+        (std::getenv("DC2_G289_GPU_LOCAL_COPY") == nullptr ||
+         envFlagEnabled("DC2_G289_GPU_LOCAL_COPY"));
+    if (s_g289PresentationAudit)
+        g289_prepare_presentation_read(
+            m_vram, frame.fbp, frame.fbw, frame.psm,
+            sourceOriginX, sourceOriginY, width, height,
+            useLocalMemoryLayout, frameBaseIsPages);
 
     outPixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
 
@@ -3508,6 +3532,15 @@ extern void g242PrepareVramReadRect(uint8_t *vram,
                                     uint32_t w,
                                     uint32_t h);
 extern bool g242GuestDepthEnabled();
+extern bool g289TryGpuLocalCopy(uint8_t *vram, uint32_t vramSize,
+                                uint32_t sbp, uint8_t sbw, uint8_t spsm,
+                                uint32_t ssax, uint32_t ssay,
+                                uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                                uint32_t dsax, uint32_t dsay,
+                                uint32_t rrw, uint32_t rrh);
+extern void g289NoteUploadComplete(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                                   uint32_t dsax, uint32_t dsay,
+                                   uint32_t rrw, uint32_t rrh);
 
 void GS::performLocalToLocalTransfer()
 {
@@ -3574,6 +3607,11 @@ void GS::performLocalToLocalTransfer()
     // that can feed this copy has reached its GPU depth surface before we read VRAM.
     g242PrepareVramReadRect(m_vram, sbp, sbw, spsm, ssax, ssay, rrw, rrh);
 
+    const bool g289GpuCopy =
+        g289TryGpuLocalCopy(m_vram, m_vramSize,
+                            sbp, sbw, spsm, ssax, ssay,
+                            dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+
     g149BumpVramGen(); // VRAM about to change: invalidate the de-swizzle texture cache
     // G178/G242: notify only after pending draws and source depth have been resolved.
     // The hook materializes an overlapping GPU-owned destination before the CPU copy writes it.
@@ -3582,6 +3620,8 @@ void GS::performLocalToLocalTransfer()
                                           uint32_t, uint32_t, uint32_t, uint32_t);
         g178NoteVramWriteRect(m_vram, dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
     }
+    if (g289GpuCopy)
+        return; // exact logical write is versioned in fbp=0x13b's FBO
 
     PS2_IF_AGRESSIVE_LOGS({
         if ((spsm == GS_PSM_T4 || dpsm == GS_PSM_T4) &&
@@ -3601,7 +3641,62 @@ void GS::performLocalToLocalTransfer()
         }
     });
 
-    if (formatAware)
+    // G285 PROMOTION (2026-07-17): DEFAULT-ON with the native-renderer stack. A CT32 transfer
+    // whose source and destination both cover whole GS pages in the same FBW layout has an
+    // address-preserving one-to-one mapping: every 64x32 logical page occupies one contiguous
+    // 8192-byte physical page. When the physical spans are disjoint, traversal order is
+    // irrelevant, so page-sized memcpy calls are exactly equivalent to the per-pixel copy.
+    //
+    // All graph barriers, generation bumps, and downstream presentation hooks above still run.
+    // The rasterizer hook may prove a destructive destination and publish only its uncovered
+    // page-row; all other resident-target materialization remains unchanged.
+    // Fail closed on partial pages, shifted origins, unlike layouts, overlap, or VRAM wrap.
+    // Kill: DC2_G285_NO_L2L_PAGE_COPY=1. Positive flag remains accepted but is redundant.
+    static const bool s_g285PageCopyOn =
+        !envFlagEnabled("DC2_G285_NO_L2L_PAGE_COPY");
+    static const bool s_g285StatOn = envFlagEnabled("DC2_G285_STAT");
+    const uint64_t g285Bytes = static_cast<uint64_t>(rrw) *
+                               static_cast<uint64_t>(rrh) * 4ull;
+    const uint64_t g285SrcBase = static_cast<uint64_t>(sbp) * 256ull;
+    const uint64_t g285DstBase = static_cast<uint64_t>(dbp) * 256ull;
+    const uint64_t g285SrcEnd = g285SrcBase + g285Bytes;
+    const uint64_t g285DstEnd = g285DstBase + g285Bytes;
+    const bool g285Disjoint = g285SrcEnd <= g285DstBase || g285DstEnd <= g285SrcBase;
+    const bool g285Eligible =
+        formatAware &&
+        spsm == GS_PSM_CT32 &&
+        sbw == dbw &&
+        (sbp & 31u) == 0u &&
+        (dbp & 31u) == 0u &&
+        ssax == 0u && ssay == 0u &&
+        dsax == 0u && dsay == 0u &&
+        rrw == static_cast<uint32_t>(sbw) * 64u &&
+        (rrh & 31u) == 0u &&
+        g285SrcEnd <= static_cast<uint64_t>(m_vramSize) &&
+        g285DstEnd <= static_cast<uint64_t>(m_vramSize) &&
+        g285Disjoint;
+    const bool g285UsePageCopy = g260NrEnabled() && s_g285PageCopyOn && g285Eligible;
+    const auto g285BodyT0 = (s_g285StatOn && g285Eligible)
+                                ? std::chrono::steady_clock::now()
+                                : std::chrono::steady_clock::time_point{};
+
+    if (g285UsePageCopy)
+    {
+        // Keep each copy at one physical GS page. Besides mirroring the proof boundary, this
+        // avoids the CRT's large-copy streaming-store path: the destination is consumed again
+        // immediately by the renderer, so evicting/bypassing its cache lines can erase the
+        // transfer-body win in end-to-end timing.
+        constexpr size_t kG285PageBytes = 8192u;
+        const size_t pages = static_cast<size_t>(g285Bytes) / kG285PageBytes;
+        for (size_t page = 0; page < pages; ++page)
+        {
+            const size_t pageOff = page * kG285PageBytes;
+            std::memcpy(m_vram + static_cast<size_t>(g285DstBase) + pageOff,
+                        m_vram + static_cast<size_t>(g285SrcBase) + pageOff,
+                        kG285PageBytes);
+        }
+    }
+    else if (formatAware)
     {
         for (uint32_t row = 0; row < rrh; ++row)
         {
@@ -3650,6 +3745,46 @@ void GS::performLocalToLocalTransfer()
                 std::memcpy(pixelBytes, m_vram + srcOff, copyBpp);
                 std::memcpy(m_vram + dstOff, pixelBytes, copyBpp);
             }
+        }
+    }
+
+    if (s_g285StatOn)
+    {
+        const uint64_t calls =
+            g_g285L2lCalls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (g285Eligible)
+        {
+            const uint64_t bodyNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - g285BodyT0).count());
+            g_g285L2lEligible.fetch_add(1u, std::memory_order_relaxed);
+            g_g285L2lBytes.fetch_add(g285Bytes, std::memory_order_relaxed);
+            if (g285UsePageCopy)
+            {
+                g_g285L2lFast.fetch_add(1u, std::memory_order_relaxed);
+                g_g285L2lFastNs.fetch_add(bodyNs, std::memory_order_relaxed);
+            }
+            else
+            {
+                g_g285L2lLegacyNs.fetch_add(bodyNs, std::memory_order_relaxed);
+            }
+        }
+        if ((calls & 127u) == 0u)
+        {
+            std::fprintf(stderr,
+                         "[G285:l2l] calls=%llu eligible=%llu fast=%llu bytes=%llu "
+                         "legacyMs=%.3f fastMs=%.3f\n",
+                         static_cast<unsigned long long>(calls),
+                         static_cast<unsigned long long>(
+                             g_g285L2lEligible.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(
+                             g_g285L2lFast.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(
+                             g_g285L2lBytes.load(std::memory_order_relaxed)),
+                         static_cast<double>(
+                             g_g285L2lLegacyNs.load(std::memory_order_relaxed)) / 1.0e6,
+                         static_cast<double>(
+                             g_g285L2lFastNs.load(std::memory_order_relaxed)) / 1.0e6);
         }
     }
 
@@ -4465,6 +4600,11 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
                 break;
         }
     }
+
+    // G289 commits its exact partial-owner overwrite only after the complete IMAGE transfer
+    // has landed. Chunked IMAGE packets keep the owner conservative until the last chunk.
+    if (m_hwregY >= rrh)
+        g289NoteUploadComplete(dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
 
     if (t8UploadTraceEnabled() &&
         dpsm == GS_PSM_CT32 &&

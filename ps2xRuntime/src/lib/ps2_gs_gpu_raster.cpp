@@ -1458,6 +1458,45 @@ bool g258TraceOn()
     return on;
 }
 
+bool g281T8ViewRequested()
+{
+    static const bool on =
+        (g158EnvFlag("DC2_G281_T8_VIEW") ||
+         (g158EnvFlag("DC2_G282_TIGHT_ROWS") &&
+          !g158EnvFlag("DC2_G282_NO_TIGHT_ROWS") &&
+          !g158EnvDisabled("DC2_G282_TIGHT_ROWS"))) &&
+                           !g158EnvFlag("DC2_G281_NO_T8_VIEW") &&
+                           !g158EnvDisabled("DC2_G281_T8_VIEW") &&
+                           !g158EnvFlag("DC2_G280_NO_ALIAS_VIEW");
+    return on;
+}
+
+static constexpr uint32_t kG289ZeroFbpToken = 0xfffffffdu;
+static constexpr uint32_t kG289AliasCt32Token = 0xfffffffcu;
+static constexpr uint32_t kG289AliasFbp = 0xfffffffbu;
+static constexpr uint32_t kG289AliasCt24Token = 0xfffffffau;
+static constexpr uint32_t kG289WorkCt24Token = 0xfffffff9u;
+static constexpr uint32_t kG289WorkCt32Token = 0xfffffff8u;
+static uint32_t g289RealSourceFbp(uint32_t fbp)
+{
+    if (fbp == kG289ZeroFbpToken)
+        return 0u;
+    if (fbp == kG289AliasCt32Token || fbp == kG289AliasCt24Token)
+        return kG289AliasFbp;
+    if (fbp == kG289WorkCt24Token || fbp == kG289WorkCt32Token)
+        return 0x13bu;
+    return fbp;
+}
+static bool g289SourceIsCt24(uint32_t fbp)
+{
+    return fbp == kG289AliasCt24Token || fbp == kG289WorkCt24Token;
+}
+static bool g289SourceIsOwner(uint32_t fbp)
+{
+    return fbp == kG289AliasCt32Token || fbp == kG289AliasCt24Token ||
+           fbp == kG289WorkCt24Token || fbp == kG289WorkCt32Token;
+}
+
 // GL entry points needed beyond GLFns (loaded once on the G178 thread).
 typedef void(APIENTRY *PFN178BLENDFUNCSEPARATE)(GLenum, GLenum, GLenum, GLenum);
 typedef void(APIENTRY *PFN178BLENDEQUATIONSEPARATE)(GLenum, GLenum);
@@ -1703,6 +1742,115 @@ public:
         }
     }
 
+    // G280: synchronous GPU->GPU page-tile copies between two persistent target FBOs (alias
+    // view resolve). Geometry is validated on the worker against both FBOs' live dimensions.
+    bool copyColor(uint32_t srcFbp, uint32_t dstFbp, const std::vector<int32_t> &rects6)
+    {
+        if (srcFbp == dstFbp || rects6.empty() || (rects6.size() % 6u) != 0u ||
+            !m_ready.load(std::memory_order_acquire))
+            return false;
+        auto promise = std::make_shared<std::promise<bool>>();
+        std::future<bool> fut = promise->get_future();
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.colorFbp = dstFbp;
+            item.copySrcFbp = srcFbp;
+            item.copyRects = &rects6;
+            item.promise = promise;
+            m_queue.push_back(std::move(item));
+        }
+        m_cvWork.notify_one();
+        try
+        {
+            return fut.get();
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    // G289: same synchronous bit-exact color copy as G280, but the one measured work target may
+    // be first-use. Allocate its 512x512 FBO on the worker before validating/copying.
+    bool copyColorEnsureDest(uint32_t srcFbp, uint32_t dstFbp, int dstW, int dstH,
+                             const std::vector<int32_t> &rects6)
+    {
+        if (srcFbp == dstFbp || dstW <= 0 || dstH <= 0 || rects6.empty() ||
+            (rects6.size() % 6u) != 0u || !m_ready.load(std::memory_order_acquire))
+            return false;
+        auto promise = std::make_shared<std::promise<bool>>();
+        std::future<bool> fut = promise->get_future();
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.colorFbp = dstFbp;
+            item.copySrcFbp = srcFbp;
+            item.copyRects = &rects6;
+            item.copyEnsureDest = true;
+            item.colorTexW = dstW;
+            item.colorTexH = dstH;
+            item.promise = promise;
+            m_queue.push_back(std::move(item));
+        }
+        m_cvWork.notify_one();
+        try
+        {
+            return fut.get();
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    // G281: synchronously build/update one decoded RGBA texture directly from a resident CT32
+    // target FBO. The front-end supplies an exact PSMT8 byte-address map and current CLUT.
+    bool prepareT8View(uint64_t texKey, uint32_t srcFbp, int srcFbW,
+                       int texW, int texH,
+                       const std::vector<uint32_t> &mapRgba,
+                       const std::vector<uint32_t> &clutRgba,
+                       bool verify, uint64_t &verifyBad)
+    {
+        verifyBad = 0u;
+        if (texKey == 0u || srcFbp == 0u || srcFbW <= 0 || texW <= 0 || texH <= 0 ||
+            mapRgba.size() != static_cast<size_t>(texW) * texH ||
+            clutRgba.size() != 256u || !m_ready.load(std::memory_order_acquire))
+            return false;
+        auto promise = std::make_shared<std::promise<bool>>();
+        std::future<bool> fut = promise->get_future();
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.g281TexKey = texKey;
+            item.g281SrcFbp = srcFbp;
+            item.g281SrcFbW = srcFbW;
+            item.g281TexW = texW;
+            item.g281TexH = texH;
+            item.g281Map = &mapRgba;
+            item.g281Clut = &clutRgba;
+            item.g281Verify = verify;
+            item.g281VerifyBad = &verifyBad;
+            item.promise = promise;
+            m_queue.push_back(std::move(item));
+        }
+        m_cvWork.notify_one();
+        try
+        {
+            return fut.get();
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
 private:
     bool submitImpl(G178Batch *batch, uint64_t depthKey,
                     const std::vector<float> *depthUpload, int depthY, int depthRows,
@@ -1761,6 +1909,19 @@ private:
         const std::vector<uint32_t> *colorWrite = nullptr;
         int colorTexW = 0, colorTexH = 0;
         int colorX = 0, colorY = 0, colorW = 0, colorRows = 0;
+        // G280 GPU->GPU alias-page copy job (batch == nullptr, copyRects != nullptr): copy CT32
+        // page tiles from copySrcFbp's FBO into colorFbp's FBO color texture, 6 ints per rect.
+        uint32_t copySrcFbp = 0u;
+        const std::vector<int32_t> *copyRects = nullptr;
+        bool copyEnsureDest = false;
+        // G281 resident-CT32 -> decoded-PSMT8 texture-view job.
+        uint64_t g281TexKey = 0u;
+        uint32_t g281SrcFbp = 0u;
+        int g281SrcFbW = 0, g281TexW = 0, g281TexH = 0;
+        const std::vector<uint32_t> *g281Map = nullptr;
+        const std::vector<uint32_t> *g281Clut = nullptr;
+        bool g281Verify = false;
+        uint64_t *g281VerifyBad = nullptr;
         std::shared_ptr<std::promise<bool>> promise;
     };
     struct TexEntry
@@ -1803,7 +1964,8 @@ private:
             m_cvReady.notify_all();
             return;
         }
-        if (!setupProgram() || (g256ExactRttOn() && !setupExactProgram()) || !setupBuffers() ||
+        if (!setupProgram() || (g256ExactRttOn() && !setupExactProgram()) ||
+            (g281T8ViewRequested() && !setupT8ViewProgram()) || !setupBuffers() ||
             (g257ImageStoreTestOn() && !runG257ImageStoreDiagnostic()))
         {
             wglMakeCurrent(nullptr, nullptr);
@@ -1832,7 +1994,26 @@ private:
             bool ok = false;
             try
             {
-                if (item.colorReadback != nullptr)
+                if (item.g281Map != nullptr)
+                    ok = prepareT8ViewOnWorker(
+                        item.g281TexKey, item.g281SrcFbp, item.g281SrcFbW,
+                        item.g281TexW, item.g281TexH, *item.g281Map, *item.g281Clut,
+                        item.g281Verify, *item.g281VerifyBad);
+                else if (item.copyRects != nullptr)
+                {
+                    if (item.copyEnsureDest)
+                    {
+                        FboEntry &dst =
+                            ensureFbo(item.colorFbp, item.colorTexW, item.colorTexH);
+                        ok = dst.fbo != 0 &&
+                             copyColorRectsOnWorker(item.copySrcFbp, item.colorFbp,
+                                                    *item.copyRects);
+                    }
+                    else
+                        ok = copyColorRectsOnWorker(item.copySrcFbp, item.colorFbp,
+                                                    *item.copyRects);
+                }
+                else if (item.colorReadback != nullptr)
                     ok = readColorOnWorker(item.colorFbp, item.colorTexW, item.colorTexH,
                                            item.colorY, item.colorRows, *item.colorReadback);
                 else if (item.colorWrite != nullptr)
@@ -1881,6 +2062,14 @@ private:
             m_f.glDeleteProgram_(m_prog);
         if (m_progExact != 0)
             m_f.glDeleteProgram_(m_progExact);
+        if (m_g281Prog != 0)
+            m_f.glDeleteProgram_(m_g281Prog);
+        if (m_g281MapTex != 0)
+            glDeleteTextures(1, &m_g281MapTex);
+        if (m_g281ClutTex != 0)
+            glDeleteTextures(1, &m_g281ClutTex);
+        if (m_g281Fbo != 0)
+            m_f.glDeleteFramebuffers_(1, &m_g281Fbo);
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(rc);
     }
@@ -1911,7 +2100,8 @@ private:
             "}\n";
         // uMode bits: 0 = textured, 1..2 = TFX, 3 = TCC, 4 = clamp Z to PSMZ24,
         // 5 = store raw source alpha (G255 RTT second pass), 6 = G265 GEQUAL alpha test,
-        // 7..8 = G265 AREF code (0=1, 1=64, 2=127).
+        // 7..8 = G265 AREF code (0=1, 1=64, 2=127), 9 = G286 exact opaque sampler/combine,
+        // 10 = G289 CT24 direct-owner source (force TEXA TA0=128).
         // PS2 color/alpha scale: 0x80 == 1.0, so MODULATE is (t*c)>>7 -> t*c*255/128 in [0,1]
         // space (1.9921875), clamped — identical to combineTexture(). The written alpha is the
         // BLEND FACTOR encoding (As/128 clamped to 1): glBlendFunc consumes it as SRC_ALPHA. The
@@ -1926,7 +2116,63 @@ private:
             "out vec4 o;\n"
             "uniform sampler2D uTex;\n"
             "uniform int uMode;\n"
+            "uniform int uLinear;\n"
+            "uniform int uWrapU;\n"
+            "uniform int uWrapV;\n"
+            "int wrapCoord(int p, int n, int mode){\n"
+            "    if (mode != 0) return clamp(p, 0, n - 1);\n"
+            "    int r = p % n; return r < 0 ? r + n : r;\n"
+            "}\n"
+            "int floorDiv16(int v){ return v >= 0 ? v / 16 : -((-v + 15) / 16); }\n"
+            "ivec4 texel8(ivec2 p){\n"
+            "    ivec2 n = textureSize(uTex, 0);\n"
+            "    p.x = wrapCoord(p.x, n.x, uWrapU);\n"
+            "    p.y = wrapCoord(p.y, n.y, uWrapV);\n"
+            "    return clamp(ivec4(floor(texelFetch(uTex, p, 0) * 255.0 + 0.5)), 0, 255);\n"
+            "}\n"
+            "ivec4 sampleExact(vec2 uvTex){\n"
+            "    ivec2 f16 = clamp(ivec2(floor(uvTex * 16.0 + 0.5001)), ivec2(0), ivec2(65535));\n"
+            "    if (uLinear == 0) return texel8(f16 / 16);\n"
+            "    ivec2 shifted = f16 - ivec2(8);\n"
+            "    ivec2 p0 = ivec2(floorDiv16(shifted.x), floorDiv16(shifted.y));\n"
+            "    ivec2 fr = shifted - p0 * 16;\n"
+            "    ivec4 c00 = texel8(p0), c10 = texel8(p0 + ivec2(1,0));\n"
+            "    ivec4 c01 = texel8(p0 + ivec2(0,1)), c11 = texel8(p0 + ivec2(1,1));\n"
+            "    int wx0 = 16 - fr.x, wy0 = 16 - fr.y;\n"
+            "    ivec4 sum = c00 * (wx0 * wy0) + c10 * (fr.x * wy0) +\n"
+            "                c01 * (wx0 * fr.y) + c11 * (fr.x * fr.y);\n"
+            "    return clamp((sum + ivec4(128)) / 256, 0, 255);\n"
+            "}\n"
+            "ivec4 combineExact(ivec4 vc, ivec4 tc){\n"
+            "    int tfx = (uMode >> 1) & 3; bool tcc = (uMode & 8) != 0;\n"
+            "    ivec4 c = tc;\n"
+            "    if (tfx == 0) {\n"
+            "        c.rgb = (tc.rgb * vc.rgb) >> 7; c.a = tcc ? ((tc.a * vc.a) >> 7) : vc.a;\n"
+            "    } else if (tfx == 1) { c.a = tcc ? tc.a : vc.a;\n"
+            "    } else {\n"
+            "        c.rgb = ((tc.rgb * vc.rgb) >> 7) + ivec3(vc.a);\n"
+            "        c.a = (tfx == 2) ? (tcc ? tc.a + vc.a : vc.a) : (tcc ? tc.a : vc.a);\n"
+            "    }\n"
+            "    return clamp(c, 0, 255);\n"
+            "}\n"
             "void main(){\n"
+            "    if ((uMode & 512) != 0) {\n"
+            "        ivec4 vc = clamp(ivec4(floor(vColor * 255.0 + 0.5)), 0, 255);\n"
+            "        vec2 uv = vSTQ.xy / max(vSTQ.z, 1e-8);\n"
+            "        ivec4 tc = sampleExact(uv * vec2(textureSize(uTex, 0)));\n"
+            "        if ((uMode & 1024) != 0) tc.a = 128;\n"
+            "        ivec4 ec = combineExact(vc, tc);\n"
+            "        if ((uMode & 64) != 0) {\n"
+            "            int refCode = (uMode >> 7) & 3;\n"
+            "            int refA = (refCode == 0) ? 1 : ((refCode == 1) ? 64 : 127);\n"
+            "            if (ec.a < refA) discard;\n"
+            "        }\n"
+            "        o = vec4(ec) * (1.0 / 255.0);\n"
+            "        float ez = max(vZ, 0.0);\n"
+            "        if ((uMode & 16) != 0) ez = floor(min(ez, 16777215.0));\n"
+            "        gl_FragDepth = ez * (1.0 / 4294967296.0);\n"
+            "        return;\n"
+            "    }\n"
             "    vec4 c = vColor;\n"
             "    bool alphaTest = (uMode & 64) != 0;\n"
             "    int alphaByte = 0;\n"
@@ -1934,6 +2180,7 @@ private:
             "    if ((uMode & 1) != 0) {\n"
             "        vec2 uv = vSTQ.xy / max(vSTQ.z, 1e-8);\n"
             "        vec4 t = texture(uTex, uv);\n"
+            "        if ((uMode & 1024) != 0) t.a = 128.0 / 255.0;\n"
             "        int tfx = (uMode >> 1) & 3;\n"
             "        bool tcc = (uMode & 8) != 0;\n"
             "        vec3 rgb; float a;\n"
@@ -2001,8 +2248,76 @@ private:
         m_f.glUseProgram_(m_prog);
         m_locFbSize = m_f.glGetUniformLocation_(m_prog, "uFbSize");
         m_locMode = m_f.glGetUniformLocation_(m_prog, "uMode");
+        m_locLinear = m_f.glGetUniformLocation_(m_prog, "uLinear");
+        m_locWrapU = m_f.glGetUniformLocation_(m_prog, "uWrapU");
+        m_locWrapV = m_f.glGetUniformLocation_(m_prog, "uWrapV");
         const GLint locTex = m_f.glGetUniformLocation_(m_prog, "uTex");
         m_f.glUniform1i_(locTex, 0);
+        return true;
+    }
+
+    bool setupT8ViewProgram()
+    {
+        // Full-screen triangle generated from gl_VertexID. The RGBA8 map texture carries the
+        // front-end's exact AddressP8 -> CT32 inverse result, so this shader performs no guessed
+        // PSM layout math: it only selects the mapped byte lane and applies the captured CLUT.
+        static const char *kVS =
+            "#version 330 core\n"
+            "void main(){\n"
+            "    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+            "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+            "}\n";
+        static const char *kFS =
+            "#version 330 core\n"
+            "out vec4 o;\n"
+            "uniform sampler2D uSrc;\n"
+            "uniform sampler2D uMap;\n"
+            "uniform sampler2D uClut;\n"
+            "void main(){\n"
+            "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+            "    ivec4 m = clamp(ivec4(floor(texelFetch(uMap,p,0)*255.0+0.5)),0,255);\n"
+            "    ivec2 sp = ivec2(m.r, m.g | ((m.b & 1) << 8));\n"
+            "    int lane = (m.b >> 1) & 3;\n"
+            "    ivec4 raw = clamp(ivec4(floor(texelFetch(uSrc,sp,0)*255.0+0.5)),0,255);\n"
+            "    int ix = lane==0 ? raw.r : (lane==1 ? raw.g : (lane==2 ? raw.b : raw.a));\n"
+            "    o = texelFetch(uClut, ivec2(ix,0), 0);\n"
+            "}\n";
+        GLuint vs = 0, fs = 0;
+        std::string log;
+        if (!g158CompileShader(m_f, GL158_VERTEX_SHADER, kVS, vs, log))
+        {
+            std::fprintf(stderr, "[G281:backend] FAIL: VS compile: %s\n", log.c_str());
+            return false;
+        }
+        if (!g158CompileShader(m_f, GL158_FRAGMENT_SHADER, kFS, fs, log))
+        {
+            std::fprintf(stderr, "[G281:backend] FAIL: FS compile: %s\n", log.c_str());
+            m_f.glDeleteShader_(vs);
+            return false;
+        }
+        m_g281Prog = m_f.glCreateProgram_();
+        m_f.glAttachShader_(m_g281Prog, vs);
+        m_f.glAttachShader_(m_g281Prog, fs);
+        m_f.glLinkProgram_(m_g281Prog);
+        GLint linked = 0;
+        m_f.glGetProgramiv_(m_g281Prog, GL158_LINK_STATUS, &linked);
+        m_f.glDeleteShader_(vs);
+        m_f.glDeleteShader_(fs);
+        if (!linked)
+        {
+            GLint len = 0;
+            m_f.glGetProgramiv_(m_g281Prog, GL158_INFO_LOG_LENGTH, &len);
+            std::vector<char> buf(len > 0 ? static_cast<size_t>(len) : 1u);
+            m_f.glGetProgramInfoLog_(m_g281Prog, static_cast<GLsizei>(buf.size()),
+                                     nullptr, buf.data());
+            std::fprintf(stderr, "[G281:backend] FAIL: program link: %s\n", buf.data());
+            return false;
+        }
+        m_f.glUseProgram_(m_g281Prog);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g281Prog, "uSrc"), 0);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g281Prog, "uMap"), 1);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g281Prog, "uClut"), 2);
+        std::fprintf(stderr, "[G281:backend] PASS: resident PSMT8 view program ready\n");
         return true;
     }
 
@@ -2491,6 +2806,210 @@ private:
         return glGetError() == GL_NO_ERROR;
     }
 
+    // G280: copy aligned CT32 page tiles from one persistent target FBO into another target's
+    // FBO color texture. glCopyTexSubImage2D is a GL 1.1 core entry point (statically linked,
+    // no loader) that reads the bound READ framebuffer; binding GL_FRAMEBUFFER sets both READ
+    // and DRAW bindings on 3.x core. RGBA8 -> RGBA8 same-size rect copy is bit-exact. Fails
+    // closed (no partial validation): every rect is bounds-checked against BOTH live FBOs
+    // before the first copy so a rejected job leaves the destination untouched.
+    bool copyColorRectsOnWorker(uint32_t srcFbp, uint32_t dstFbp,
+                                const std::vector<int32_t> &rects6)
+    {
+        if (srcFbp == dstFbp || rects6.empty() || (rects6.size() % 6u) != 0u)
+            return false;
+        auto is = m_fbos.find(srcFbp);
+        auto id = m_fbos.find(dstFbp);
+        if (is == m_fbos.end() || is->second.fbo == 0 ||
+            id == m_fbos.end() || id->second.colorTex == 0)
+            return false;
+        const FboEntry &src = is->second;
+        const FboEntry &dst = id->second;
+        for (size_t k = 0; k < rects6.size(); k += 6u)
+        {
+            const int32_t sx = rects6[k], sy = rects6[k + 1];
+            const int32_t dx = rects6[k + 2], dy = rects6[k + 3];
+            const int32_t w = rects6[k + 4], h = rects6[k + 5];
+            if (w <= 0 || h <= 0 || sx < 0 || sy < 0 || dx < 0 || dy < 0 ||
+                sx > src.w - w || sy > src.h - h || dx > dst.w - w || dy > dst.h - h)
+                return false;
+        }
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, src.fbo);
+        glBindTexture(GL_TEXTURE_2D, dst.colorTex);
+        for (size_t k = 0; k < rects6.size(); k += 6u)
+            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, rects6[k + 2], rects6[k + 3],
+                                rects6[k], rects6[k + 1], rects6[k + 4], rects6[k + 5]);
+        return glGetError() == GL_NO_ERROR;
+    }
+
+    bool prepareT8ViewOnWorker(uint64_t texKey, uint32_t srcFbp, int srcFbW,
+                               int texW, int texH,
+                               const std::vector<uint32_t> &mapRgba,
+                               const std::vector<uint32_t> &clutRgba,
+                               bool verify, uint64_t &verifyBad)
+    {
+        static uint64_t s_failN = 0u;
+        const auto fail = [&](const char *stage) {
+            ++s_failN;
+            if (s_failN <= 8u)
+                std::fprintf(stderr,
+                             "[G281:backend-fail] n=%llu stage=%s src=%03x fbw=%d "
+                             "tex=%dx%d\n",
+                             static_cast<unsigned long long>(s_failN), stage,
+                             srcFbp, srcFbW, texW, texH);
+            return false;
+        };
+        verifyBad = 0u;
+        if (m_g281Prog == 0u || texKey == 0u || texW <= 0 || texH <= 0 ||
+            mapRgba.size() != static_cast<size_t>(texW) * texH ||
+            clutRgba.size() != 256u)
+            return fail("args");
+        const auto is = m_fbos.find(srcFbp);
+        if (is == m_fbos.end() || is->second.colorTex == 0u ||
+            is->second.w != srcFbW || is->second.h != 512)
+            return fail("source");
+        const FboEntry &src = is->second;
+
+        auto dropOutput = [&]() {
+            const auto it = m_texCache.find(texKey);
+            if (it != m_texCache.end())
+            {
+                if (it->second.id != 0u)
+                    glDeleteTextures(1, &it->second.id);
+                m_texBytes -= std::min(
+                    m_texBytes, static_cast<size_t>(it->second.w) * it->second.h * 4u);
+                m_texCache.erase(it);
+            }
+            std::lock_guard<std::mutex> lk(m_residentMtx);
+            m_resident.erase(texKey);
+        };
+
+        while (glGetError() != GL_NO_ERROR) {}
+        if (m_g281MapTex == 0u)
+            glGenTextures(1, &m_g281MapTex);
+        if (m_g281ClutTex == 0u)
+            glGenTextures(1, &m_g281ClutTex);
+        if (m_g281Fbo == 0u)
+            m_f.glGenFramebuffers_(1, &m_g281Fbo);
+        if (m_g281MapTex == 0u || m_g281ClutTex == 0u || m_g281Fbo == 0u)
+            return fail("objects");
+
+        m_f.glActiveTexture_(GL158_TEXTURE0 + 1u);
+        glBindTexture(GL_TEXTURE_2D, m_g281MapTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, texW, texH, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, mapRgba.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+
+        m_f.glActiveTexture_(GL158_TEXTURE0 + 2u);
+        glBindTexture(GL_TEXTURE_2D, m_g281ClutTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, 256, 1, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, clutRgba.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+
+        TexEntry &out = m_texCache[texKey];
+        if (out.id == 0u)
+        {
+            glGenTextures(1, &out.id);
+            if (out.id == 0u)
+            {
+                dropOutput();
+                return fail("output");
+            }
+        }
+        else
+            m_texBytes -= static_cast<size_t>(out.w) * out.h * 4u;
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, out.id);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, texW, texH, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        out.w = texW;
+        out.h = texH;
+        out.lastUse = m_batchCounter + 1u;
+        m_texBytes += static_cast<size_t>(texW) * texH * 4u;
+
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g281Fbo);
+        m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0,
+                                    GL_TEXTURE_2D, out.id, 0);
+        if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) != GL158_FRAMEBUFFER_COMPLETE)
+        {
+            dropOutput();
+            return fail("framebuffer");
+        }
+        glViewport(0, 0, texW, texH);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        m_f.glUseProgram_(m_g281Prog);
+        m_f.glBindVertexArray_(m_vao);
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, src.colorTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        if (glGetError() != GL_NO_ERROR)
+        {
+            dropOutput();
+            return fail("draw");
+        }
+
+        if (verify)
+        {
+            std::vector<uint32_t> srcPx(static_cast<size_t>(src.w) * src.h);
+            std::vector<uint32_t> outPx(static_cast<size_t>(texW) * texH);
+            m_f.glActiveTexture_(GL158_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, src.colorTex);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, srcPx.data());
+            glBindTexture(GL_TEXTURE_2D, out.id);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, outPx.data());
+            for (size_t k = 0; k < outPx.size(); ++k)
+            {
+                const uint32_t m = mapRgba[k];
+                const uint32_t sx = m & 0xFFu;
+                const uint32_t sy = ((m >> 8u) & 0xFFu) |
+                                    (((m >> 16u) & 1u) << 8u);
+                const uint32_t lane = (m >> 17u) & 3u;
+                if (sx >= static_cast<uint32_t>(src.w) ||
+                    sy >= static_cast<uint32_t>(src.h))
+                {
+                    ++verifyBad;
+                    continue;
+                }
+                const uint32_t raw = srcPx[static_cast<size_t>(sy) * src.w + sx];
+                const uint32_t index = (raw >> (lane * 8u)) & 0xFFu;
+                if (outPx[k] != clutRgba[index])
+                    ++verifyBad;
+            }
+            static uint64_t s_verifyN = 0u;
+            ++s_verifyN;
+            if (verifyBad != 0u || s_verifyN <= 8u || (s_verifyN % 256u) == 0u)
+                std::fprintf(stderr, "[G281:vfy] n=%llu texels=%zu bad=%llu\n",
+                             static_cast<unsigned long long>(s_verifyN), outPx.size(),
+                             static_cast<unsigned long long>(verifyBad));
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_residentMtx);
+            m_resident.insert(texKey);
+        }
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        return true;
+    }
+
     bool readDepthOnWorker(uint64_t depthKey, int w, int h, int depthY, int depthRows,
                            std::vector<float> &out)
     {
@@ -2614,9 +3133,10 @@ private:
             {
                 // G261 FBO-texture source: no texKey, never the batch's own target (feedback),
                 // and the source FBO must already exist (a wave rendered into it).
-                if (d.texKey != 0u || d.srcFbp == b.fbp)
+                const uint32_t srcFbp = g289RealSourceFbp(d.srcFbp);
+                if (d.texKey != 0u || srcFbp == b.fbp)
                     return false;
-                const auto it = m_fbos.find(d.srcFbp);
+                const auto it = m_fbos.find(srcFbp);
                 if (it == m_fbos.end() || it->second.fbo == 0 || it->second.colorTex == 0)
                     return false;
             }
@@ -2909,6 +3429,7 @@ private:
                                          GL_ONE, GL_ZERO);
             }
             int mode = 0;
+            const bool g286Exact = b.fbp == 0x13bu;
             // Bit 4 asks the fragment shader to clamp interpolated GS Z to PSMZ24 before
             // normalization, matching the CPU path's post-interpolation uint24 clamp.
             if ((d.depthFunc & 0x10u) != 0u)
@@ -2923,16 +3444,47 @@ private:
                 // G261: sample the producer target's persistent FBO color texture directly. The
                 // front-end already remapped UVs into the FBO's full fbW x fbH bottom-first space,
                 // and only admits in-range UVs — CLAMP here is inert insurance, never wrap.
-                const FboEntry &src = m_fbos.find(d.srcFbp)->second;
+                const FboEntry &src =
+                    m_fbos.find(g289RealSourceFbp(d.srcFbp))->second;
                 glBindTexture(GL_TEXTURE_2D, src.colorTex);
                 const GLint filter = d.bilinear ? GL_LINEAR : GL_NEAREST;
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+                const bool ownerSource = g289SourceIsOwner(d.srcFbp);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                                static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+                                ownerSource && d.wrapU == 0u
+                                    ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE));
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                                static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+                                ownerSource && d.wrapV == 0u
+                                    ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE));
                 mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
+                if (g289SourceIsCt24(d.srcFbp))
+                    mode |= 1024;
+            }
+            if (g286Exact)
+            {
+                // G287: G286's exact branch selected integer sampling/combine but skipped the
+                // ordinary texture-bind branch below. It therefore sampled whichever texture a
+                // previous draw had left bound, and uMode silently described TFX=MODULATE/TCC=0.
+                // Bind this draw's decoded PSMT8+CLUT texture explicitly and carry its real
+                // combine state into the exact shader. G287 promotes the narrowly admitted
+                // fbp=0x13b shape after exact-oracle and downstream-presentation gates.
+                TexEntry *const texture = drawTextures[drawIndex];
+                if (texture == nullptr)
+                    return false;
+                glBindTexture(GL_TEXTURE_2D, texture->id);
+                // Newly created cache textures default to a mipmapped MIN filter while this
+                // cache intentionally uploads level 0 only. The first G287 batch therefore
+                // sampled the GL incomplete-texture value until another path happened to make
+                // the object complete. Integer taps do not need filtering, but the sampler
+                // object must still be complete from first use.
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
+                mode |= 512;
+                m_f.glUniform1i_(m_locLinear, d.bilinear ? 1 : 0);
+                m_f.glUniform1i_(m_locWrapU, static_cast<GLint>(d.wrapU));
+                m_f.glUniform1i_(m_locWrapV, static_cast<GLint>(d.wrapV));
             }
             else if (d.texKey != 0)
             {
@@ -3055,8 +3607,10 @@ private:
 
     GLFns m_f;
     G178GLExt m_e;
-    GLuint m_prog = 0, m_progExact = 0, m_vao = 0, m_vbo = 0;
-    GLint m_locFbSize = -1, m_locMode = -1;
+    GLuint m_prog = 0, m_progExact = 0, m_g281Prog = 0, m_vao = 0, m_vbo = 0;
+    GLuint m_g281MapTex = 0, m_g281ClutTex = 0, m_g281Fbo = 0;
+    GLint m_locFbSize = -1, m_locMode = -1, m_locLinear = -1;
+    GLint m_locWrapU = -1, m_locWrapV = -1;
     GLint m_locExactFbSize = -1, m_locExactMode = -1, m_locExactLinear = -1;
     GLint m_locExactWrapU = -1, m_locExactWrapV = -1;
     std::map<uint32_t, FboEntry> m_fbos;
@@ -3151,6 +3705,59 @@ bool g264_backend_write_color_rect(uint32_t fbp, int texWidth, int texHeight,
                                                glX, glY, width, rows, in);
 }
 
+// G280: physical-alias page view resolve (GPU->GPU CT32 page-tile copies between target FBOs).
+bool g280_backend_copy_color_rects(uint32_t srcFbp, uint32_t dstFbp,
+                                   const std::vector<int32_t> &rects6)
+{
+    return G178Backend::instance().copyColor(srcFbp, dstFbp, rects6);
+}
+
+bool g289_backend_copy_display_to_work(uint32_t srcFbp, uint32_t dstFbp)
+{
+    static const std::vector<int32_t> s_rect = {
+        0, 96, 0, 96, 512, 416
+    };
+    return G178Backend::instance().copyColorEnsureDest(
+        srcFbp, dstFbp, 512, 512, s_rect);
+}
+
+bool g289_backend_build_work_alias_view()
+{
+    // Physical base 0x2720 is two CT32 pages before owner base 0x2760. Remap the owner's
+    // 8x13 page rectangle into that shifted logical view with two contiguous copies per row.
+    // The private synthetic destination avoids contaminating the real 0x139 target FBO.
+    static const std::vector<int32_t> s_rects = [] {
+        std::vector<int32_t> r;
+        r.reserve(27u * 6u);
+        const auto add = [&](int sx, int sy, int dx, int dy, int w, int h) {
+            r.push_back(sx); r.push_back(sy); r.push_back(dx);
+            r.push_back(dy); r.push_back(w); r.push_back(h);
+        };
+        add(0, 480, 128, 480, 384, 32);
+        for (int dstRow = 1; dstRow <= 12; ++dstRow)
+        {
+            add(384, 480 - (dstRow - 1) * 32,
+                0, 480 - dstRow * 32, 128, 32);
+            add(0, 480 - dstRow * 32,
+                128, 480 - dstRow * 32, 384, 32);
+        }
+        add(384, 96, 0, 64, 128, 32);
+        return r;
+    }();
+    return G178Backend::instance().copyColorEnsureDest(
+        0x13bu, kG289AliasFbp, 512, 512, s_rects);
+}
+
+bool g281_backend_prepare_t8_view(uint64_t texKey, uint32_t srcFbp, int srcFbW,
+                                  int texW, int texH,
+                                  const std::vector<uint32_t> &mapRgba,
+                                  const std::vector<uint32_t> &clutRgba,
+                                  bool verify, uint64_t &verifyBad)
+{
+    return G178Backend::instance().prepareT8View(
+        texKey, srcFbp, srcFbW, texW, texH, mapRgba, clutRgba, verify, verifyBad);
+}
+
 // Called once from PS2Runtime::initialize() (after g158CaptureMainContext). No-op unless
 // DC2_G178_GPU=1.
 void g178StartPersistentBackend()
@@ -3184,6 +3791,13 @@ bool g178_backend_read_color(uint32_t, int, int, int, int, std::vector<uint32_t>
 bool g178_backend_write_color(uint32_t, int, int, int, int, const std::vector<uint32_t> &) { return false; }
 bool g264_backend_write_color_rect(uint32_t, int, int, int, int, int, int,
                                    const std::vector<uint32_t> &) { return false; }
+bool g280_backend_copy_color_rects(uint32_t, uint32_t, const std::vector<int32_t> &) { return false; }
+bool g289_backend_copy_display_to_work(uint32_t, uint32_t) { return false; }
+bool g289_backend_build_work_alias_view() { return false; }
+bool g281_backend_prepare_t8_view(uint64_t, uint32_t, int, int, int,
+                                  const std::vector<uint32_t> &,
+                                  const std::vector<uint32_t> &,
+                                  bool, uint64_t &bad) { bad = 0u; return false; }
 void g178StartPersistentBackend() {}
 
 #endif
