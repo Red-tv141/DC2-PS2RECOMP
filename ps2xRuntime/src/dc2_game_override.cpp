@@ -385,6 +385,14 @@ extern bool g150_mtgs_enabled();
 extern void g150_frame_barrier(std::function<void()> latch);
 extern void g150_wait_idle();
 
+// G303: VU1-worker (MTVU) busy-time attribution — snapshotted per perf window in the G146 block
+// to place the VU1 worker on the same footing as GSimage/EE for pole attribution.
+extern uint64_t g297WorkerBusyNs();
+extern uint64_t g297WorkerKicksRun();
+extern uint64_t g297GsCollectStallNs();
+extern uint64_t g297GsCollectStalls();
+extern uint64_t g303_gs_worker_busy_ns();
+
 // G217: one-shot exact head-object packet correlation consumed by ps2_memory.cpp.
 std::atomic<uint32_t> g_dc2G217HeadDmaPacket{0u};
 std::atomic<uint32_t> g_dc2G217HeadDmaSelf{0u};
@@ -460,6 +468,19 @@ static bool dc2_phase_trace_enabled()
 {
     static const bool enabled = dc2_env_flag_enabled("DC2_PHASE_TRACE");
     return enabled;
+}
+
+// 60fps patch (perf-arc baseline, NOT default-on): raw PS2 cheat-device code
+// "20376C50 00000001" = 32-bit write of 0x00000001 to guest address 0x00376C50.
+// Opt-in via DC2_PATCH_60FPS=1; reapplied every guest frame (mgEndFrame tick) the
+// same way a real cheat-device/pnach "extended" write survives the game's own
+// resets of the value, rather than a one-shot boot write.
+static void dc2_apply_60fps_patch(uint8_t *rdram)
+{
+    static const bool enabled = dc2_env_flag_enabled("DC2_PATCH_60FPS");
+    if (!enabled)
+        return;
+    dc2_write_u32(rdram, 0x00376C50u, 0x00000001u);
 }
 
 static uint32_t g154_env_u32(const char *name, uint32_t defValue, uint32_t minValue, uint32_t maxValue)
@@ -7570,6 +7591,35 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                          s_sumGifMs / w,
                          s_sumImageMs / w,
                          s_sumLocalMs / w);
+            // G303: VU1-worker busy time per frame (delta since last window / window frames). Placed
+            // alongside GSimage so the pole can be attributed by THREAD (EE / VU1 worker / GS worker),
+            // not by a per-bucket table (thread_attribution_trap). Only meaningful when MTVU is on.
+            {
+                static uint64_t s_lastVuwNs = g297WorkerBusyNs();
+                static uint64_t s_lastVuwKicks = g297WorkerKicksRun();
+                const uint64_t vuwNs = g297WorkerBusyNs();
+                const uint64_t vuwKicks = g297WorkerKicksRun();
+                const double vuwMsPerF = (double)(vuwNs - s_lastVuwNs) / 1e6 / w;
+                const double vuwKicksPerF = (double)(vuwKicks - s_lastVuwKicks) / w;
+                s_lastVuwNs = vuwNs;
+                s_lastVuwKicks = vuwKicks;
+                static uint64_t s_lastStallNs = g297GsCollectStallNs();
+                static uint64_t s_lastStalls = g297GsCollectStalls();
+                const uint64_t stallNs = g297GsCollectStallNs();
+                const uint64_t stalls = g297GsCollectStalls();
+                const double stallMsPerF = (double)(stallNs - s_lastStallNs) / 1e6 / w;
+                const double stallsPerF = (double)(stalls - s_lastStalls) / w;
+                s_lastStallNs = stallNs;
+                s_lastStalls = stalls;
+                static uint64_t s_lastGsBusyNs = g303_gs_worker_busy_ns();
+                const uint64_t gsBusyNs = g303_gs_worker_busy_ns();
+                const double gsBusyMsPerF = (double)(gsBusyNs - s_lastGsBusyNs) / 1e6 / w;
+                s_lastGsBusyNs = gsBusyNs;
+                if (vuwKicks != 0ull)
+                    std::fprintf(stderr,
+                                 "[G303:vu1w] n=%u window=%u busyMs/f=%.1f kicks/f=%.0f gsStallMs/f=%.1f gsStalls/f=%.0f gsWorkerMs/f=%.1f\n",
+                                 n, s_perfWindow, vuwMsPerF, vuwKicksPerF, stallMsPerF, stallsPerF, gsBusyMsPerF);
+            }
             if (s_g182PerfOn)
             {
                 const double eeCpuMs = s_sumEeCpuMs / w;
@@ -7802,6 +7852,7 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
     g195_log_camera_state(rdram, n, loopNo);
     g154_observe_frame(rdram, n, scriptFrame, loopNo, nextLoopNo);
     g202_update_town_depth_scope(rdram, n, scriptFrame, loopNo);
+    dc2_apply_60fps_patch(rdram);
     g_f40_frame_counter = scriptFrame;
     f40_drive_pad(scriptFrame, loopNo);
 }
