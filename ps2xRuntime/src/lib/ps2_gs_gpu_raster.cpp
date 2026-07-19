@@ -1466,7 +1466,7 @@ bool g258TraceOn()
 
 bool g281T8ViewRequested()
 {
-    static const bool on =
+    static const bool g281 =
         (g158EnvFlag("DC2_G281_T8_VIEW") ||
          (g158EnvFlag("DC2_G282_TIGHT_ROWS") &&
           !g158EnvFlag("DC2_G282_NO_TIGHT_ROWS") &&
@@ -1474,7 +1474,28 @@ bool g281T8ViewRequested()
                            !g158EnvFlag("DC2_G281_NO_T8_VIEW") &&
                            !g158EnvDisabled("DC2_G281_T8_VIEW") &&
                            !g158EnvFlag("DC2_G280_NO_ALIAS_VIEW");
-    return on;
+    static const bool g310 =
+        !g158EnvFlag("DC2_G310_NO_LOGICAL") &&
+        !g158EnvDisabled("DC2_G310_LOGICAL") &&
+        !g158EnvFlag("DC2_G310_NO_T8_VIEW") &&
+        !g158EnvDisabled("DC2_G310_T8_VIEW");
+    return g281 || g310;
+}
+
+bool g309Requested()
+{
+    static const bool g309 =
+        !g158EnvFlag("DC2_G309_NO_MULTI_SOURCE") &&
+        !g158EnvDisabled("DC2_G309_MULTI_SOURCE") &&
+        (g158EnvFlag("DC2_G309_MULTI_SOURCE") ||
+         g158EnvFlag("DC2_G309_VERIFY"));
+    // G310 reuses the exact G309 atlas-composition program to populate one ordinary
+    // persistent texture. Its front-end arm is independent, so request shader setup here
+    // without enabling G309's direct multi-source display path.
+    static const bool g310 =
+        !g158EnvFlag("DC2_G310_NO_LOGICAL") &&
+        !g158EnvDisabled("DC2_G310_LOGICAL");
+    return g309 || g310;
 }
 
 static constexpr uint32_t kG289ZeroFbpToken = 0xfffffffdu;
@@ -1483,6 +1504,14 @@ static constexpr uint32_t kG289AliasFbp = 0xfffffffbu;
 static constexpr uint32_t kG289AliasCt24Token = 0xfffffffau;
 static constexpr uint32_t kG289WorkCt24Token = 0xfffffff9u;
 static constexpr uint32_t kG289WorkCt32Token = 0xfffffff8u;
+static constexpr uint32_t kG309CompositeToken = 0xfffffff7u;
+static constexpr uint32_t kG309CompositeFbp = 0xfffffff6u;
+// G310: one persistent 512x512 logical CT32 backing for the physical 0x2720/tbw=8 atlas.
+// It is an ordinary private FBO source (not a shader token): producer-time page copies and
+// guest-authoritative page uploads keep it current, so the display draw performs one normal
+// texture sample. Kept outside the public LLE header by cpp-to-cpp bridges below.
+static constexpr uint32_t kG310LogicalFbp = 0xfffffff5u;
+static constexpr uint32_t kG310LogicalCt24Token = 0xfffffff4u;
 static uint32_t g289RealSourceFbp(uint32_t fbp)
 {
     if (fbp == kG289ZeroFbpToken)
@@ -1491,11 +1520,16 @@ static uint32_t g289RealSourceFbp(uint32_t fbp)
         return kG289AliasFbp;
     if (fbp == kG289WorkCt24Token || fbp == kG289WorkCt32Token)
         return 0x13bu;
+    if (fbp == kG309CompositeToken)
+        return kG309CompositeFbp;
+    if (fbp == kG310LogicalCt24Token)
+        return kG310LogicalFbp;
     return fbp;
 }
 static bool g289SourceIsCt24(uint32_t fbp)
 {
-    return fbp == kG289AliasCt24Token || fbp == kG289WorkCt24Token;
+    return fbp == kG289AliasCt24Token || fbp == kG289WorkCt24Token ||
+           fbp == kG310LogicalCt24Token;
 }
 static bool g289SourceIsOwner(uint32_t fbp)
 {
@@ -1633,6 +1667,51 @@ public:
     bool submit(G178Batch &batch)
     {
         return submitImpl(&batch, 0u, nullptr, 0, 0, nullptr);
+    }
+
+    // G305: non-blocking submit of a skip-readback color batch (no guest depth, no readback out).
+    // Moves the caller's batch vectors into a backend-owned slot (scalars copied) and returns
+    // WITHOUT waiting; the render overlaps the caller's next-flush preparation. Fails closed (the
+    // caller falls back to synchronous submit) if the backend is not ready or a packet is already
+    // in flight — the caller is contracted to drainAsync() before every submit, so the in-flight
+    // guard only trips on a contract violation. All calls are on the single GS-worker/front-end
+    // thread, so m_asyncPending / m_asyncFut / m_asyncSlot need no cross-thread synchronization
+    // beyond the queue mutex that hands the slot to the worker.
+    bool submitAsync(G178Batch &batch)
+    {
+        if (!m_ready.load(std::memory_order_acquire) || m_asyncPending)
+            return false;
+        auto promise = std::make_shared<std::promise<bool>>();
+        std::future<bool> fut = promise->get_future();
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            m_asyncSlot = std::move(batch); // vectors moved out of the caller's s_batch, scalars copied
+            QueueItem item;
+            item.batch = &m_asyncSlot;
+            item.promise = promise;
+            if (g299ProfileOn())
+                item.g299Enqueue = std::chrono::steady_clock::now();
+            m_queue.push_back(std::move(item));
+        }
+        m_asyncFut = std::move(fut);
+        m_asyncPending = true;
+        m_cvWork.notify_one();
+        return true;
+    }
+
+    // G305: block until the in-flight async packet (if any) completes. Returns false when there
+    // was nothing pending; otherwise sets ok to the backend render/readback result. After this
+    // returns the worker is done with m_asyncSlot, so the front-end may reuse it.
+    bool drainAsync(bool &ok)
+    {
+        if (!m_asyncPending)
+            return false;
+        m_asyncPending = false;
+        try { ok = m_asyncFut.get(); }
+        catch (...) { ok = false; }
+        return true;
     }
 
     // G242: universal-Z batches carry the authoritative guest PSMZ24 rows beside the existing
@@ -1857,6 +1936,75 @@ public:
         }
     }
 
+    // G309: synchronously prepare five live target FBOs plus the measured 8x16 authority map.
+    // The timing path samples them directly; only the verifier builds/reads a 512x512 reference.
+    // Caller-owned staging remains live until this job completes.
+    bool buildAuthoritativeComposite(const std::vector<uint32_t> &pageMap,
+                                     const std::vector<uint32_t> &basePixels,
+                                     bool readback, std::vector<uint32_t> &out)
+    {
+        out.clear();
+        if (pageMap.size() != 128u || basePixels.size() != 512u * 512u ||
+            !m_ready.load(std::memory_order_acquire))
+            return false;
+        auto promise = std::make_shared<std::promise<bool>>();
+        std::future<bool> fut = promise->get_future();
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.g309PageMap = &pageMap;
+            item.g309BasePixels = &basePixels;
+            item.g309Readback = readback ? &out : nullptr;
+            item.promise = promise;
+            m_queue.push_back(std::move(item));
+        }
+        m_cvWork.notify_one();
+        try
+        {
+            return fut.get();
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
+    // G310: use G309's exact atlas compositor once to populate the persistent logical FBO.
+    // Unlike G309's timing arm, downstream draws sample this one ordinary texture; unlike the
+    // verifier, no readback follows the composition pass.
+    bool buildLogicalComposite(const std::vector<uint32_t> &pageMap,
+                               const std::vector<uint32_t> &basePixels)
+    {
+        if (pageMap.size() != 128u || basePixels.size() != 512u * 512u ||
+            !m_ready.load(std::memory_order_acquire))
+            return false;
+        auto promise = std::make_shared<std::promise<bool>>();
+        std::future<bool> fut = promise->get_future();
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.g309PageMap = &pageMap;
+            item.g309BasePixels = &basePixels;
+            item.g309ForceDraw = true;
+            item.g309OutputFbp = kG310LogicalFbp;
+            item.promise = promise;
+            m_queue.push_back(std::move(item));
+        }
+        m_cvWork.notify_one();
+        try
+        {
+            return fut.get();
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
 private:
     bool submitImpl(G178Batch *batch, uint64_t depthKey,
                     const std::vector<float> *depthUpload, int depthY, int depthRows,
@@ -1930,6 +2078,12 @@ private:
         const std::vector<uint32_t> *g281Clut = nullptr;
         bool g281Verify = false;
         uint64_t *g281VerifyBad = nullptr;
+        // G309 one-pass five-source authoritative CT32 atlas composite.
+        const std::vector<uint32_t> *g309PageMap = nullptr;
+        const std::vector<uint32_t> *g309BasePixels = nullptr;
+        std::vector<uint32_t> *g309Readback = nullptr;
+        bool g309ForceDraw = false;
+        uint32_t g309OutputFbp = kG309CompositeFbp;
         std::shared_ptr<std::promise<bool>> promise;
         std::chrono::steady_clock::time_point g299Enqueue{};
     };
@@ -1974,7 +2128,9 @@ private:
             return;
         }
         if (!setupProgram() || (g256ExactRttOn() && !setupExactProgram()) ||
-            (g281T8ViewRequested() && !setupT8ViewProgram()) || !setupBuffers() ||
+            (g281T8ViewRequested() && !setupT8ViewProgram()) ||
+            (g309Requested() && !setupAuthoritativeCompositeProgram()) ||
+            !setupBuffers() ||
             (g257ImageStoreTestOn() && !runG257ImageStoreDiagnostic()))
         {
             wglMakeCurrent(nullptr, nullptr);
@@ -2009,7 +2165,12 @@ private:
                     : std::chrono::steady_clock::time_point{};
             try
             {
-                if (item.g281Map != nullptr)
+                if (item.g309PageMap != nullptr)
+                    ok = buildAuthoritativeCompositeOnWorker(
+                        *item.g309PageMap, *item.g309BasePixels,
+                        item.g309Readback, item.g309ForceDraw,
+                        item.g309OutputFbp);
+                else if (item.g281Map != nullptr)
                     ok = prepareT8ViewOnWorker(
                         item.g281TexKey, item.g281SrcFbp, item.g281SrcFbW,
                         item.g281TexW, item.g281TexH, *item.g281Map, *item.g281Clut,
@@ -2134,6 +2295,12 @@ private:
             glDeleteTextures(1, &m_g281ClutTex);
         if (m_g281Fbo != 0)
             m_f.glDeleteFramebuffers_(1, &m_g281Fbo);
+        if (m_g309Prog != 0)
+            m_f.glDeleteProgram_(m_g309Prog);
+        if (m_g309MapTex != 0)
+            glDeleteTextures(1, &m_g309MapTex);
+        if (m_g309BaseTex != 0)
+            glDeleteTextures(1, &m_g309BaseTex);
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(rc);
     }
@@ -2165,7 +2332,8 @@ private:
         // uMode bits: 0 = textured, 1..2 = TFX, 3 = TCC, 4 = clamp Z to PSMZ24,
         // 5 = store raw source alpha (G255 RTT second pass), 6 = G265 GEQUAL alpha test,
         // 7..8 = G265 AREF code (0=1, 1=64, 2=127), 9 = G286 exact opaque sampler/combine,
-        // 10 = G289 CT24 direct-owner source (force TEXA TA0=128).
+        // 10 = G289 CT24 direct-owner source (force TEXA TA0=128),
+        // 11 = G309 direct authoritative-page source selection.
         // PS2 color/alpha scale: 0x80 == 1.0, so MODULATE is (t*c)>>7 -> t*c*255/128 in [0,1]
         // space (1.9921875), clamped — identical to combineTexture(). The written alpha is the
         // BLEND FACTOR encoding (As/128 clamped to 1): glBlendFunc consumes it as SRC_ALPHA. The
@@ -2179,6 +2347,12 @@ private:
             "noperspective in float vZ;\n"
             "out vec4 o;\n"
             "uniform sampler2D uTex;\n"
+            "uniform sampler2D uG309Src1;\n"
+            "uniform sampler2D uG309Src2;\n"
+            "uniform sampler2D uG309Src3;\n"
+            "uniform sampler2D uG309Src4;\n"
+            "uniform sampler2D uG309PageMap;\n"
+            "uniform sampler2D uG309Base;\n"
             "uniform int uMode;\n"
             "uniform int uLinear;\n"
             "uniform int uWrapU;\n"
@@ -2188,6 +2362,49 @@ private:
             "    int r = p % n; return r < 0 ? r + n : r;\n"
             "}\n"
             "int floorDiv16(int v){ return v >= 0 ? v / 16 : -((-v + 15) / 16); }\n"
+            "vec4 g309Owner(int owner, ivec2 p){\n"
+            "    if (owner == 0) return texelFetch(uTex, p, 0);\n"
+            "    if (owner == 1) return texelFetch(uG309Src1, p, 0);\n"
+            "    if (owner == 2) return texelFetch(uG309Src2, p, 0);\n"
+            "    if (owner == 3) return texelFetch(uG309Src3, p, 0);\n"
+            "    return texelFetch(uG309Src4, p, 0);\n"
+            "}\n"
+            "vec4 g309Filtered(int owner, vec2 uv){\n"
+            "    if (owner == 0) return texture(uTex, uv);\n"
+            "    if (owner == 1) return texture(uG309Src1, uv);\n"
+            "    if (owner == 2) return texture(uG309Src2, uv);\n"
+            "    if (owner == 3) return texture(uG309Src3, uv);\n"
+            "    return texture(uG309Src4, uv);\n"
+            "}\n"
+            "vec4 g309Pixel(ivec2 p){\n"
+            "    p = clamp(p, ivec2(0), ivec2(511));\n"
+            "    int gsY = 511 - p.y;\n"
+            "    ivec2 page = ivec2(p.x >> 6, gsY >> 5);\n"
+            "    ivec2 local = ivec2(p.x & 63, gsY & 31);\n"
+            "    ivec4 m = clamp(ivec4(floor(texelFetch(uG309PageMap,page,0)*255.0+0.5)),0,255);\n"
+            "    if (m.r == 0) return texelFetch(uG309Base, p, 0);\n"
+            "    ivec2 srcGs = ivec2(m.g * 64 + local.x, m.b * 32 + local.y);\n"
+            "    return g309Owner(m.r - 1, ivec2(srcGs.x, 511 - srcGs.y));\n"
+            "}\n"
+            "vec4 g309Linear(vec2 uv){\n"
+            "    vec2 q = uv * 512.0 - vec2(0.5);\n"
+            "    ivec2 p = ivec2(floor(q)); vec2 f = fract(q);\n"
+            "    if (all(greaterThanEqual(p,ivec2(0))) && all(lessThan(p,ivec2(511))) &&\n"
+            "        (p.x >> 6) == ((p.x + 1) >> 6) &&\n"
+            "        ((511-p.y) >> 5) == ((510-p.y) >> 5)) {\n"
+            "        int gsY = 511-p.y; ivec2 page=ivec2(p.x>>6,gsY>>5);\n"
+            "        ivec4 m=clamp(ivec4(floor(texelFetch(uG309PageMap,page,0)*255.0+0.5)),0,255);\n"
+            "        if (m.r == 0) return texture(uG309Base, uv);\n"
+            "        int owner=m.r-1; ivec2 local=ivec2(p.x&63,gsY&31);\n"
+            "        ivec2 srcGs=ivec2(m.g*64+local.x,m.b*32+local.y);\n"
+            "        ivec2 srcGl=ivec2(srcGs.x,511-srcGs.y);\n"
+            "        float sw=(owner==0)?512.0:((owner==1||owner==3)?128.0:64.0);\n"
+            "        return g309Filtered(owner,(vec2(srcGl)+f+vec2(0.5))/vec2(sw,512.0));\n"
+            "    }\n"
+            "    vec4 a = mix(g309Pixel(p), g309Pixel(p + ivec2(1,0)), f.x);\n"
+            "    vec4 b = mix(g309Pixel(p + ivec2(0,1)), g309Pixel(p + ivec2(1,1)), f.x);\n"
+            "    return mix(a, b, f.y);\n"
+            "}\n"
             "ivec4 texel8(ivec2 p){\n"
             "    ivec2 n = textureSize(uTex, 0);\n"
             "    p.x = wrapCoord(p.x, n.x, uWrapU);\n"
@@ -2243,7 +2460,7 @@ private:
             "    if (alphaTest) alphaByte = int(floor(vColor.a * 255.0 + 0.5));\n"
             "    if ((uMode & 1) != 0) {\n"
             "        vec2 uv = vSTQ.xy / max(vSTQ.z, 1e-8);\n"
-            "        vec4 t = texture(uTex, uv);\n"
+            "        vec4 t = ((uMode & 2048) != 0) ? g309Linear(uv) : texture(uTex, uv);\n"
             "        if ((uMode & 1024) != 0) t.a = 128.0 / 255.0;\n"
             "        int tfx = (uMode >> 1) & 3;\n"
             "        bool tcc = (uMode & 8) != 0;\n"
@@ -2317,6 +2534,12 @@ private:
         m_locWrapV = m_f.glGetUniformLocation_(m_prog, "uWrapV");
         const GLint locTex = m_f.glGetUniformLocation_(m_prog, "uTex");
         m_f.glUniform1i_(locTex, 0);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Src1"), 1);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Src2"), 2);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Src3"), 3);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Src4"), 4);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309PageMap"), 5);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Base"), 6);
         return true;
     }
 
@@ -2340,7 +2563,7 @@ private:
             "void main(){\n"
             "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
             "    ivec4 m = clamp(ivec4(floor(texelFetch(uMap,p,0)*255.0+0.5)),0,255);\n"
-            "    ivec2 sp = ivec2(m.r, m.g | ((m.b & 1) << 8));\n"
+            "    ivec2 sp = ivec2(m.r | ((m.b & 8) << 5), m.g | ((m.b & 1) << 8));\n"
             "    int lane = (m.b >> 1) & 3;\n"
             "    ivec4 raw = clamp(ivec4(floor(texelFetch(uSrc,sp,0)*255.0+0.5)),0,255);\n"
             "    int ix = lane==0 ? raw.r : (lane==1 ? raw.g : (lane==2 ? raw.b : raw.a));\n"
@@ -2382,6 +2605,89 @@ private:
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g281Prog, "uMap"), 1);
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g281Prog, "uClut"), 2);
         std::fprintf(stderr, "[G281:backend] PASS: resident PSMT8 view program ready\n");
+        return true;
+    }
+
+    bool setupAuthoritativeCompositeProgram()
+    {
+        // Full-screen transient composite. gl_FragCoord is in GL bottom-first space; convert
+        // it to the strip's GS top-first page/local coordinates, select that page's owner, then
+        // map the identical CT32 within-page coordinate into the owner's own FRAME/FBW layout.
+        static const char *kVS =
+            "#version 330 core\n"
+            "void main(){\n"
+            "    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+            "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+            "}\n";
+        static const char *kFS =
+            "#version 330 core\n"
+            "out vec4 o;\n"
+            "uniform sampler2D uSrc0;\n"
+            "uniform sampler2D uSrc1;\n"
+            "uniform sampler2D uSrc2;\n"
+            "uniform sampler2D uSrc3;\n"
+            "uniform sampler2D uSrc4;\n"
+            "uniform sampler2D uPageMap;\n"
+            "uniform sampler2D uBase;\n"
+            "vec4 fetchOwner(int owner, ivec2 p){\n"
+            "    if (owner == 0) return texelFetch(uSrc0, p, 0);\n"
+            "    if (owner == 1) return texelFetch(uSrc1, p, 0);\n"
+            "    if (owner == 2) return texelFetch(uSrc2, p, 0);\n"
+            "    if (owner == 3) return texelFetch(uSrc3, p, 0);\n"
+            "    return texelFetch(uSrc4, p, 0);\n"
+            "}\n"
+            "void main(){\n"
+            "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+            "    int gsY = 511 - p.y;\n"
+            "    ivec2 page = ivec2(p.x >> 6, gsY >> 5);\n"
+            "    ivec2 local = ivec2(p.x & 63, gsY & 31);\n"
+            "    ivec4 m = clamp(ivec4(floor(texelFetch(uPageMap,page,0)*255.0+0.5)),0,255);\n"
+            "    if (m.r == 0) { o = texelFetch(uBase, p, 0); return; }\n"
+            "    int owner = m.r - 1;\n"
+            "    ivec2 srcGs = ivec2(m.g * 64 + local.x, m.b * 32 + local.y);\n"
+            "    ivec2 srcGl = ivec2(srcGs.x, 511 - srcGs.y);\n"
+            "    o = fetchOwner(owner, srcGl);\n"
+            "}\n";
+        GLuint vs = 0u, fs = 0u;
+        std::string log;
+        if (!g158CompileShader(m_f, GL158_VERTEX_SHADER, kVS, vs, log))
+        {
+            std::fprintf(stderr, "[G309:backend] FAIL: VS compile: %s\n", log.c_str());
+            return false;
+        }
+        if (!g158CompileShader(m_f, GL158_FRAGMENT_SHADER, kFS, fs, log))
+        {
+            std::fprintf(stderr, "[G309:backend] FAIL: FS compile: %s\n", log.c_str());
+            m_f.glDeleteShader_(vs);
+            return false;
+        }
+        m_g309Prog = m_f.glCreateProgram_();
+        m_f.glAttachShader_(m_g309Prog, vs);
+        m_f.glAttachShader_(m_g309Prog, fs);
+        m_f.glLinkProgram_(m_g309Prog);
+        GLint linked = 0;
+        m_f.glGetProgramiv_(m_g309Prog, GL158_LINK_STATUS, &linked);
+        m_f.glDeleteShader_(vs);
+        m_f.glDeleteShader_(fs);
+        if (!linked)
+        {
+            GLint len = 0;
+            m_f.glGetProgramiv_(m_g309Prog, GL158_INFO_LOG_LENGTH, &len);
+            std::vector<char> buf(len > 0 ? static_cast<size_t>(len) : 1u);
+            m_f.glGetProgramInfoLog_(m_g309Prog, static_cast<GLsizei>(buf.size()),
+                                     nullptr, buf.data());
+            std::fprintf(stderr, "[G309:backend] FAIL: program link: %s\n", buf.data());
+            return false;
+        }
+        m_f.glUseProgram_(m_g309Prog);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uSrc0"), 0);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uSrc1"), 1);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uSrc2"), 2);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uSrc3"), 3);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uSrc4"), 4);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uPageMap"), 5);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uBase"), 6);
+        std::fprintf(stderr, "[G309:backend] PASS: authoritative-page composite program ready\n");
         return true;
     }
 
@@ -2655,8 +2961,10 @@ private:
         }
         glGenTextures(1, &imageTex);
         glBindTexture(GL_TEXTURE_2D, imageTex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        // The direct timing path can bilinearly sample a clean guest-VRAM page. The verifier uses
+        // texelFetch, so linear filtering preserves both contracts.
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, kW, kH, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                      sentinel.data());
 
@@ -2905,6 +3213,159 @@ private:
         return glGetError() == GL_NO_ERROR;
     }
 
+    bool buildAuthoritativeCompositeOnWorker(
+        const std::vector<uint32_t> &pageMap,
+        const std::vector<uint32_t> &basePixels,
+        std::vector<uint32_t> *readback,
+        bool forceDraw = false,
+        uint32_t outputFbp = kG309CompositeFbp)
+    {
+        static uint64_t s_failN = 0u;
+        const auto fail = [&](const char *stage) {
+            ++s_failN;
+            if (s_failN <= 8u)
+                std::fprintf(stderr,
+                             "[G309:backend-fail] n=%llu stage=%s\n",
+                             static_cast<unsigned long long>(s_failN), stage);
+            return false;
+        };
+        if (m_g309Prog == 0u || pageMap.size() != 128u ||
+            basePixels.size() != 512u * 512u)
+            return fail("args");
+
+        static constexpr uint32_t kSources[5] =
+            {0x139u, 0x13cu, 0x143u, 0x146u, 0x155u};
+        GLuint sourceTex[5] = {};
+        int sourceW[5] = {};
+        for (uint32_t t = 0u; t < 5u; ++t)
+        {
+            const auto it = m_fbos.find(kSources[t]);
+            if (it == m_fbos.end() || it->second.colorTex == 0u ||
+                it->second.w <= 0 || it->second.h != 512)
+                return fail("source");
+            sourceTex[t] = it->second.colorTex;
+            sourceW[t] = it->second.w;
+            m_f.glActiveTexture_(GL158_TEXTURE0 + t);
+            glBindTexture(GL_TEXTURE_2D, sourceTex[t]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        }
+        for (const uint32_t m : pageMap)
+        {
+            const uint32_t owner1 = m & 0xFFu;
+            const uint32_t srcCol = (m >> 8u) & 0xFFu;
+            const uint32_t srcRow = (m >> 16u) & 0xFFu;
+            if (owner1 == 0u)
+                continue;
+            if (owner1 > 5u || srcRow >= 16u ||
+                srcCol * 64u + 64u > static_cast<uint32_t>(sourceW[owner1 - 1u]))
+                return fail("map");
+        }
+
+        while (glGetError() != GL_NO_ERROR) {}
+        if (m_g309MapTex == 0u)
+            glGenTextures(1, &m_g309MapTex);
+        if (m_g309MapTex == 0u)
+            return fail("map-object");
+        m_f.glActiveTexture_(GL158_TEXTURE0 + 5u);
+        glBindTexture(GL_TEXTURE_2D, m_g309MapTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, 8, 16, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, pageMap.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        const bool allocateBase = m_g309BaseTex == 0u;
+        if (allocateBase)
+            glGenTextures(1, &m_g309BaseTex);
+        if (m_g309BaseTex == 0u)
+            return fail("base-object");
+        m_f.glActiveTexture_(GL158_TEXTURE0 + 6u);
+        glBindTexture(GL_TEXTURE_2D, m_g309BaseTex);
+        if (allocateBase)
+            glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, 512, 512, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        // Upload only contiguous clean-page runs. GL_UNPACK_ROW_LENGTH keeps the front-end's
+        // 512-pixel pitch, avoiding both a 1 MiB upload and a repack allocation.
+        static constexpr GLenum kG309UnpackRowLength = 0x0CF2u;
+        glPixelStorei(kG309UnpackRowLength, 512);
+        for (uint32_t yp = 0u; yp < 16u; ++yp)
+        {
+            uint32_t xp = 0u;
+            while (xp < 8u)
+            {
+                while (xp < 8u &&
+                       (pageMap[static_cast<size_t>(yp) * 8u + xp] & 0xFFu) != 0u)
+                    ++xp;
+                const uint32_t runLo = xp;
+                while (xp < 8u &&
+                       (pageMap[static_cast<size_t>(yp) * 8u + xp] & 0xFFu) == 0u)
+                    ++xp;
+                if (xp == runLo)
+                    continue;
+                const uint32_t glY = 512u - (yp + 1u) * 32u;
+                const uint32_t x = runLo * 64u;
+                glTexSubImage2D(
+                    GL_TEXTURE_2D, 0, static_cast<GLint>(x), static_cast<GLint>(glY),
+                    static_cast<GLsizei>((xp - runLo) * 64u), 32,
+                    GL_RGBA, GL_UNSIGNED_BYTE,
+                    basePixels.data() + static_cast<size_t>(glY) * 512u + x);
+            }
+        }
+        glPixelStorei(kG309UnpackRowLength, 0);
+
+        FboEntry &out = ensureFbo(outputFbp, 512, 512);
+        if (out.fbo == 0u || out.colorTex == 0u)
+            return fail("output");
+        if (readback == nullptr && !forceDraw)
+        {
+            // Timing path samples the prepared sources/map directly in the display shader.
+            // Keep the transient FBO only as the verifier's exact reference surface.
+            m_f.glActiveTexture_(GL158_TEXTURE0);
+            return glGetError() == GL_NO_ERROR;
+        }
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, out.fbo);
+        glViewport(0, 0, 512, 512);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        m_f.glUseProgram_(m_g309Prog);
+        m_f.glBindVertexArray_(m_vao);
+        for (uint32_t t = 0u; t < 5u; ++t)
+        {
+            m_f.glActiveTexture_(GL158_TEXTURE0 + t);
+            glBindTexture(GL_TEXTURE_2D, sourceTex[t]);
+        }
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        if (glGetError() != GL_NO_ERROR)
+            return fail("draw");
+
+        if (readback != nullptr)
+        {
+            readback->resize(512u * 512u);
+            m_f.glActiveTexture_(GL158_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, out.colorTex);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                          readback->data());
+            if (glGetError() != GL_NO_ERROR)
+            {
+                readback->clear();
+                return fail("readback");
+            }
+        }
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        return true;
+    }
+
     bool prepareT8ViewOnWorker(uint64_t texKey, uint32_t srcFbp, int srcFbW,
                                int texW, int texH,
                                const std::vector<uint32_t> &mapRgba,
@@ -3044,7 +3505,8 @@ private:
             for (size_t k = 0; k < outPx.size(); ++k)
             {
                 const uint32_t m = mapRgba[k];
-                const uint32_t sx = m & 0xFFu;
+                const uint32_t sx = (m & 0xFFu) |
+                                    ((((m >> 16u) & 8u) >> 3u) << 8u);
                 const uint32_t sy = ((m >> 8u) & 0xFFu) |
                                     (((m >> 16u) & 1u) << 8u);
                 const uint32_t lane = (m >> 17u) & 3u;
@@ -3508,19 +3970,38 @@ private:
                 // G261: sample the producer target's persistent FBO color texture directly. The
                 // front-end already remapped UVs into the FBO's full fbW x fbH bottom-first space,
                 // and only admits in-range UVs — CLAMP here is inert insurance, never wrap.
-                const FboEntry &src =
-                    m_fbos.find(g289RealSourceFbp(d.srcFbp))->second;
-                glBindTexture(GL_TEXTURE_2D, src.colorTex);
-                const GLint filter = d.bilinear ? GL_LINEAR : GL_NEAREST;
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
-                const bool ownerSource = g289SourceIsOwner(d.srcFbp);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                                ownerSource && d.wrapU == 0u
-                                    ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE));
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                                ownerSource && d.wrapV == 0u
-                                    ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+                if (d.srcFbp == kG309CompositeToken)
+                {
+                    static constexpr uint32_t kSources[5] =
+                        {0x139u, 0x13cu, 0x143u, 0x146u, 0x155u};
+                    for (uint32_t t = 0u; t < 5u; ++t)
+                    {
+                        m_f.glActiveTexture_(GL158_TEXTURE0 + t);
+                        glBindTexture(GL_TEXTURE_2D, m_fbos.find(kSources[t])->second.colorTex);
+                    }
+                    m_f.glActiveTexture_(GL158_TEXTURE0 + 5u);
+                    glBindTexture(GL_TEXTURE_2D, m_g309MapTex);
+                    m_f.glActiveTexture_(GL158_TEXTURE0 + 6u);
+                    glBindTexture(GL_TEXTURE_2D, m_g309BaseTex);
+                    m_f.glActiveTexture_(GL158_TEXTURE0);
+                    mode |= 2048;
+                }
+                else
+                {
+                    const FboEntry &src =
+                        m_fbos.find(g289RealSourceFbp(d.srcFbp))->second;
+                    glBindTexture(GL_TEXTURE_2D, src.colorTex);
+                    const GLint filter = d.bilinear ? GL_LINEAR : GL_NEAREST;
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+                    const bool ownerSource = g289SourceIsOwner(d.srcFbp);
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                                    ownerSource && d.wrapU == 0u
+                                        ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                                    ownerSource && d.wrapV == 0u
+                                        ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+                }
                 mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
                 if (g289SourceIsCt24(d.srcFbp))
                     mode |= 1024;
@@ -3671,8 +4152,10 @@ private:
 
     GLFns m_f;
     G178GLExt m_e;
-    GLuint m_prog = 0, m_progExact = 0, m_g281Prog = 0, m_vao = 0, m_vbo = 0;
+    GLuint m_prog = 0, m_progExact = 0, m_g281Prog = 0, m_g309Prog = 0;
+    GLuint m_vao = 0, m_vbo = 0;
     GLuint m_g281MapTex = 0, m_g281ClutTex = 0, m_g281Fbo = 0;
+    GLuint m_g309MapTex = 0, m_g309BaseTex = 0;
     GLint m_locFbSize = -1, m_locMode = -1, m_locLinear = -1;
     GLint m_locWrapU = -1, m_locWrapV = -1;
     GLint m_locExactFbSize = -1, m_locExactMode = -1, m_locExactLinear = -1;
@@ -3699,6 +4182,14 @@ private:
     std::atomic<bool> m_ready{false};
     std::atomic<bool> m_failed{false};
 
+    // G305: one-slot move-owned async submit (default-off DC2_G305_ASYNC=1). A skip-readback
+    // color wave is moved into m_asyncSlot so the front-end can reuse its s_batch immediately;
+    // the backend renders it while the GS worker prepares the next flush. At most one packet in
+    // flight (the front-end drains at every flush top before the next submit).
+    G178Batch m_asyncSlot;
+    std::future<bool> m_asyncFut;
+    bool m_asyncPending = false;
+
     std::mutex m_residentMtx;
     std::unordered_set<uint64_t> m_resident;
     uint64_t m_g299Total = 0u;
@@ -3718,6 +4209,16 @@ bool g178_backend_ready()
 bool g178_backend_submit(G178Batch &batch)
 {
     return G178Backend::instance().submit(batch);
+}
+
+// G305: one-slot move-owned async submit / drain (default-off). See G178Backend::submitAsync.
+bool g178_backend_submit_async(G178Batch &batch)
+{
+    return G178Backend::instance().submitAsync(batch);
+}
+bool g178_backend_drain_async(bool &ok)
+{
+    return G178Backend::instance().drainAsync(ok);
 }
 
 // G242 private .cpp-to-.cpp side channel; intentionally not added to a header.
@@ -3828,6 +4329,44 @@ bool g281_backend_prepare_t8_view(uint64_t texKey, uint32_t srcFbp, int srcFbW,
         texKey, srcFbp, srcFbW, texW, texH, mapRgba, clutRgba, verify, verifyBad);
 }
 
+bool g309_backend_build_authoritative_composite(
+    const std::vector<uint32_t> &pageMap, const std::vector<uint32_t> &basePixels,
+    bool readback,
+    std::vector<uint32_t> &out)
+{
+    return G178Backend::instance().buildAuthoritativeComposite(
+        pageMap, basePixels, readback, out);
+}
+
+bool g310_backend_init_logical(uint32_t seedFbp,
+                               const std::vector<uint32_t> &guestPixels)
+{
+    // copyColorEnsureDest is the existing worker-owned allocator. The seed texel is immediately
+    // overwritten by the full guest upload; requiring a live producer also proves the G310
+    // admission has reached the native RTT path before creating private state.
+    static const std::vector<int32_t> s_seedRect = {0, 0, 0, 0, 1, 1};
+    G178Backend &backend = G178Backend::instance();
+    return guestPixels.size() == 512u * 512u &&
+           backend.copyColorEnsureDest(
+               seedFbp, kG310LogicalFbp, 512, 512, s_seedRect) &&
+           backend.writeColor(
+               kG310LogicalFbp, 512, 512, 0, 0, 512, 512, guestPixels);
+}
+
+bool g310_backend_copy_logical_pages(uint32_t srcFbp,
+                                     const std::vector<int32_t> &rects6)
+{
+    return G178Backend::instance().copyColor(
+        srcFbp, kG310LogicalFbp, rects6);
+}
+
+bool g310_backend_build_logical_composite(
+    const std::vector<uint32_t> &pageMap,
+    const std::vector<uint32_t> &basePixels)
+{
+    return G178Backend::instance().buildLogicalComposite(pageMap, basePixels);
+}
+
 // Called once from PS2Runtime::initialize() (after g158CaptureMainContext). No-op unless
 // DC2_G178_GPU=1.
 void g178StartPersistentBackend()
@@ -3852,6 +4391,8 @@ bool g162DecodeT8Batch(int, const uint32_t *, const uint32_t *, const int *, con
                        const uint32_t *, const uint8_t *, size_t, uint32_t **) { return false; }
 bool g178_backend_ready() { return false; }
 bool g178_backend_submit(G178Batch &) { return false; }
+bool g178_backend_submit_async(G178Batch &) { return false; }
+bool g178_backend_drain_async(bool &ok) { ok = true; return false; }
 bool g242_backend_submit_depth(G178Batch &, uint64_t, const std::vector<float> *, int, int) { return false; }
 bool g275_backend_submit_depth_readback(G178Batch &, uint64_t, const std::vector<float> *,
                                         int, int, int, int, std::vector<float> &) { return false; }
@@ -3862,6 +4403,13 @@ bool g178_backend_write_color(uint32_t, int, int, int, int, const std::vector<ui
 bool g264_backend_write_color_rect(uint32_t, int, int, int, int, int, int,
                                    const std::vector<uint32_t> &) { return false; }
 bool g280_backend_copy_color_rects(uint32_t, uint32_t, const std::vector<int32_t> &) { return false; }
+bool g309_backend_build_authoritative_composite(
+    const std::vector<uint32_t> &, const std::vector<uint32_t> &,
+    bool, std::vector<uint32_t> &) { return false; }
+bool g310_backend_init_logical(uint32_t, const std::vector<uint32_t> &) { return false; }
+bool g310_backend_copy_logical_pages(uint32_t, const std::vector<int32_t> &) { return false; }
+bool g310_backend_build_logical_composite(
+    const std::vector<uint32_t> &, const std::vector<uint32_t> &) { return false; }
 bool g289_backend_copy_display_to_work(uint32_t, uint32_t) { return false; }
 bool g289_backend_build_work_alias_view() { return false; }
 bool g281_backend_prepare_t8_view(uint64_t, uint32_t, int, int, int,
