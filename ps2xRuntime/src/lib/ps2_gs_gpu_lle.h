@@ -91,3 +91,11 @@ bool g178_backend_read_color(uint32_t fbp, int width, int height, int glY, int r
 // GL (bottom-first) row order. The FBO must already exist with matching dimensions.
 bool g178_backend_write_color(uint32_t fbp, int width, int height, int glY, int rows,
                               const std::vector<uint32_t> &in);
+// G280: synchronous GPU->GPU copy of CT32 page tiles between two persistent target FBO color
+// textures (physical-alias page view resolve: the same GS pages rendered under two FRAME/FBW
+// layouts hold identical within-page pixel order, so a page is a 64x32 rect in both views).
+// `rects6` packs 6 ints per rect: {srcX, srcGlY, dstX, dstGlY, w, h}, GL (bottom-first) window
+// coordinates in each FBO's own space. Both FBOs must already exist and every rect must lie
+// fully inside both; the copy is a bit-exact same-format glCopyTexSubImage2D, no readback.
+bool g280_backend_copy_color_rects(uint32_t srcFbp, uint32_t dstFbp,
+                                   const std::vector<int32_t> &rects6);

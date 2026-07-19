@@ -3723,6 +3723,7 @@ uint64_t g178HashPages(const uint8_t *vram, uint32_t vramSize,
     };
     collect(bpBlocks, bw64, psm, w, h);
     collect(clutBpBlocks, 1, GS_PSM_CT32, 64, 32);
+
     uint64_t hsh = 1469598103934665603ull;
     for (uint32_t pg = 0; pg < kG178PageCount; ++pg)
     {
@@ -3964,8 +3965,9 @@ void g178DecodeWhole(GSRasterizer *self, GS *gs, uint8_t *vram, const GSContext 
 {
     const uint8_t psm = ctx.tex0.psm;
     const uint32_t pageBwT8 = ((ctx.tex0.tbw >> 1u) != 0u) ? (ctx.tex0.tbw >> 1u) : 1u;
-    for (int vv = 0; vv < texH; ++vv)
-        for (int uu = 0; uu < texW; ++uu)
+    const auto decodeRows = [&](int rowLo, int rowHi, uint32_t *dst) {
+        for (int vv = rowLo; vv <= rowHi; ++vv)
+            for (int uu = 0; uu < texW; ++uu)
         {
             uint32_t c;
             switch (psm)
@@ -4013,8 +4015,63 @@ void g178DecodeWhole(GSRasterizer *self, GS *gs, uint8_t *vram, const GSContext 
                 break;
             }
             }
-            outPx[static_cast<size_t>(vv) * static_cast<size_t>(texW) + static_cast<size_t>(uu)] = c;
+            dst[static_cast<size_t>(vv) * static_cast<size_t>(texW) +
+                static_cast<size_t>(uu)] = c;
         }
+    };
+
+    // G298 promotion (default on): whole-texture decode is a read-only VRAM/CLUT transform
+    // into independent RGBA rows. Reuse the joined row pool and complete every row before the
+    // upload is appended to the backend batch. Keep combined and stage-local kill switches.
+    static const bool s_g298ParTexDecode =
+        !envFlagEnabled("DC2_G298_NO_PAR_PREP") &&
+        !envFlagEnabled("DC2_G298_NO_PAR_TEXDECODE") &&
+        !envFlagDisabled("DC2_G298_PAR_TEXDECODE");
+    static const int s_g298TexDecodeLanes = [] {
+        const char *value = std::getenv("DC2_G298_TEXDECODE_LANES");
+        if (value == nullptr)
+            return 8;
+        return std::max(1, std::min(16, std::atoi(value)));
+    }();
+    const int pixels = texW * texH;
+    const int lanes =
+        s_g298ParTexDecode && texH >= 8 && pixels >= 4096
+            ? s_g298TexDecodeLanes
+            : 1;
+    const auto joinedDecode = [&](int rowLo, int rowHi) {
+        decodeRows(rowLo, rowHi, outPx);
+    };
+    GSRowPool::instance().run(0, texH - 1, lanes, joinedDecode);
+
+    static const bool s_g298Verify =
+        envFlagEnabled("DC2_G298_VERIFY_TEXDECODE");
+    if (s_g298ParTexDecode && s_g298Verify && texW > 0 && texH > 0)
+    {
+        static std::vector<uint32_t> s_shadow;
+        s_shadow.resize(static_cast<size_t>(texW) * texH);
+        decodeRows(0, texH - 1, s_shadow.data());
+        uint64_t bad = 0u;
+        for (size_t i = 0; i < s_shadow.size(); ++i)
+            bad += outPx[i] != s_shadow[i] ? 1u : 0u;
+        static std::atomic<uint64_t> s_calls{0u}, s_pixels{0u}, s_bad{0u};
+        const uint64_t n =
+            s_calls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        const uint64_t totalPixels =
+            s_pixels.fetch_add(static_cast<uint64_t>(pixels),
+                               std::memory_order_relaxed) +
+            static_cast<uint64_t>(pixels);
+        const uint64_t totalBad =
+            s_bad.fetch_add(bad, std::memory_order_relaxed) + bad;
+        if (bad != 0u || n <= 8u || (n % 1024u) == 0u)
+            std::fprintf(stderr,
+                         "[G298:decode-verify] calls=%llu pixels=%llu bad=%llu "
+                         "last=%dx%d lanes=%d bad=%llu\n",
+                         static_cast<unsigned long long>(n),
+                         static_cast<unsigned long long>(totalPixels),
+                         static_cast<unsigned long long>(totalBad),
+                         texW, texH, lanes,
+                         static_cast<unsigned long long>(bad));
+    }
 }
 
 // Per-entry validation + draw-state derivation. Returns false → whole flush falls back to CPU.
@@ -4918,6 +4975,16 @@ struct G261Res
     bool mirPending = false;
     int mirLo = 512, mirHi = -1;
     std::array<std::array<uint64_t, 8>, 512> mirBits{}; // max target width = 512 pixels
+    // G291: cumulative per-pixel "upload re-covered since the last wave write to this row" map
+    // (same tx/ty geometry as mirBits, but NOT cleared by the mirror flush). A 64x32 CT32 page
+    // tile whose every pixel bit is set has been fully re-written in guest VRAM by noted
+    // uploads AFTER the last GPU render of those rows, so VRAM >= FBO for that page and a
+    // texture/CLUT read overlapping only such pages needs no read-triggered materialization
+    // (the materialize round-trip — mirror VRAM->FBO then readback FBO->VRAM — is the identity
+    // on VRAM for a fully re-covered page). Bits are cleared on every wave render of the rows,
+    // on any residency reset/width flip, and are meaningful only while g291CovFbw == fbw.
+    std::array<std::array<uint64_t, 8>, 512> g291Cov{};
+    uint32_t g291CovFbw = 0;
 };
 static constexpr uint32_t kG261Fbp[kG248TargetCount] = {0x139u, 0x13cu, 0x143u, 0x146u, 0x155u};
 static G261Res g_g261Res[kG248TargetCount];
@@ -5013,6 +5080,8 @@ static std::atomic<uint64_t> g_g282Candidates{0}, g_g282TightBatches{0},
 static bool g280AliasOn();
 static bool g281ViewOn();
 static bool g282TightRowsOn();
+static bool g294OwnerTokenRequested(); // G294 combined-arm request (defined near g280 bodies)
+static bool g294OwnerTokenOn();         // G294 owner-token active (rides g280 alias-view)
 static bool g280PrepareMaterialize(int ti); // restore+drop overlays before dst publication
 static void g280DropOverlays(int ti, uint64_t *dropCounter = nullptr);
 static void g280NoteFboContentChange(int ti, int rowLo, int rowHi);
@@ -5364,10 +5433,79 @@ static bool g267CensusOn()
 
 static void g266Report(); // defined below g261AnyDirty (reads the G261 residency state)
 
+// G291 (bring-up opt-in DC2_G291_ATLAS=1; kills DC2_G291_NO_ATLAS=1 / DC2_G291_ATLAS=0):
+// persistent-residency consumer-completeness for the 0x139 work-block atlas. The G290-ON census
+// measured the exact relocation: admitting the seeded fbp=0x139/fbw=8 batch keeps the whole
+// atlas dirty-resident, and texture consumers (T8 materials at 0x34a0/0x3460/0x34e0, the T8
+// 0x143<-0x13c view source) then force kG261MatTexAlias materializations of ~4x more rows
+// (c5 3.7s -> 11.8s per run) — even though the game re-UPLOADS those exact texture pages every
+// frame (3.9 MB/f) before sampling them, so guest VRAM is already current for the pages the
+// consumers read. G291 tracks cumulative per-pixel upload re-coverage: a page whose pixels were
+// FULLY re-covered by noted uploads since the last wave write has VRAM >= FBO by construction
+// (the G264 mirror map records the exact CT32 byte->target-pixel map of every upload), so a
+// texture/CLUT read overlapping ONLY such pages needs no materialization. Writers still publish
+// through every existing edge; the skip applies to the READ-triggered materialize only, and
+// fails closed on any page not provably current or any layout change. G292 audited the G280
+// alias-view write paths and retained exact tile-coverage invalidation diagnostics, but the
+// combined behavior remains forbidden: true multi-owner pages need a per-target authority token,
+// which G283's page-global epoch does not provide. G291 implies the G290 seeded admission.
+static bool g291AtlasOn()
+{
+    // G294 combined arm: the owner-token makes the g280 alias-view exact on multi-owner pages, so
+    // G291's upload-re-coverage retire (excluded from G280 since G292) can now run ALONGSIDE it —
+    // this is the consumer-chain retire that makes the atlas residency actually pay. g294 also
+    // implies the retire (and, via g290ExactRowsOn, the seeded admission) so the whole paying arm
+    // is one behavior lever: DC2_G294_OWNER_TOKEN=1.
+    static const bool s_on = (envFlagEnabled("DC2_G291_ATLAS") || g294OwnerTokenRequested()) &&
+                             !envFlagEnabled("DC2_G291_NO_ATLAS") &&
+                             !envFlagDisabled("DC2_G291_ATLAS");
+    return s_on && (!g280AliasOn() || g294OwnerTokenOn());
+}
+static bool g291StatOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G291_STAT");
+    return s_on;
+}
+static std::atomic<uint64_t> g_g291TexSkips{0}, g_g291TexMats{0}, g_g291CurPagesSet{0},
+    g_g291CurPagesClr{0}, g_g291LayoutResets{0};
+
+// G292: any GPU-side alias copy makes this target tile potentially newer than guest VRAM.
+// Clear only the exact CT32 64x32 page tile; unrelated uploaded pages in the same row retain
+// their G291 proof. Overlay restoration later makes FBO==VRAM again, but leaving the tile clear
+// is the conservative direction until a noted upload re-covers it.
+static void g291ClearCopiedTile(int ti, uint32_t pageRow, uint32_t pageCol)
+{
+    if (!g291AtlasOn() || ti < 0 || ti >= static_cast<int>(kG248TargetCount))
+        return;
+    G261Res &r = g_g261Res[ti];
+    if (r.g291CovFbw == 0u)
+        return;
+    if (pageRow >= 16u || pageCol >= 8u)
+    {
+        r.g291Cov = {};
+        r.g291CovFbw = 0u;
+        g_g291LayoutResets.fetch_add(1u, std::memory_order_relaxed);
+        return;
+    }
+    const uint32_t y0 = pageRow * 32u;
+    for (uint32_t y = y0; y < y0 + 32u; ++y)
+        r.g291Cov[y][pageCol] = 0u;
+    g_g291CurPagesClr.fetch_add(64u * 32u, std::memory_order_relaxed);
+}
+
 static void g261Report()
 {
     if (!g261StatOn() && !g279ProfileOn())
         return;
+    if (g291StatOn())
+        std::fprintf(stderr,
+                     "[G291:stat] skips=%llu mats=%llu covSetPx=%llu covClrPx=%llu "
+                     "layoutResets=%llu\n",
+                     (unsigned long long)g_g291TexSkips.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g291TexMats.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g291CurPagesSet.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g291CurPagesClr.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g291LayoutResets.load(std::memory_order_relaxed));
     std::fprintf(stderr,
                  "[G261:stat] waves=%llu rbSkip=%llu fboBind=%llu fboBindBi=%llu fboRej=%llu inv=%llu unk=%llu "
                  "mat(cpu=%llu inl=%llu up=%llu l2l=%llu l2h=%llu tex=%llu rsync=%llu fail=%llu) "
@@ -7685,6 +7823,17 @@ static bool g267SamplePagesOverlap(const G144Entry &e, const G267TriFootprint &f
     return false;
 }
 
+// G294 (default-off, DC2_G294_OWNER_TOKEN=1; kill DC2_G294_NO_OWNER_TOKEN=1): per-physical-page
+// authoritative-owner token. Requesting it implies the whole G280/G281/G282/G283 view+fanout+epoch
+// stack so a same-binary A/B needs one behavior lever. Declared free here (env-only, no gate deps)
+// so the request chains below and g283AuthorityRequested can all reference it.
+static bool g294OwnerTokenRequested()
+{
+    if (envFlagEnabled("DC2_G294_NO_OWNER_TOKEN") || envFlagDisabled("DC2_G294_OWNER_TOKEN"))
+        return false;
+    return envFlagEnabled("DC2_G294_OWNER_TOKEN");
+}
+
 // ===== G280 bodies (state + forward decls beside the G264 telemetry above) =====
 static bool g280AliasOn()
 {
@@ -7710,7 +7859,7 @@ static bool g280AliasOn()
             !envFlagDisabled("DC2_G283_AUTHORITY");
         return envFlagEnabled("DC2_G280_ALIAS_VIEW") ||
                envFlagEnabled("DC2_G281_T8_VIEW") ||
-               g282Requested || g283Requested;
+               g282Requested || g283Requested || g294OwnerTokenRequested();
     }();
     return s_on && g261WaveOn() && !g267CensusOn() && !g277CensusOn();
 }
@@ -7757,9 +7906,52 @@ static bool g282TightRowsOn()
 // per-entry capture bounds prove rows 0..415 → color pages 313..416 and Z pages 208..311 are
 // physically disjoint (same false-alias class G273 removed for the 0x68 display tuple).
 // Independent of the default-off G280/G281/G282 alias-view stack.
+// Every 64x32 page tile of resident target `fbp` whose block interval overlaps `rd` must be
+// fully upload-re-covered (all 2048 pixel bits set in g291Cov) for the read to skip
+// materialization. Fail-closed on any layout mismatch, invalid range, or partial coverage.
+static bool g291PagesCurrent(const G261Res &r, uint32_t fbp, const G144BlockRange &rd)
+{
+    if (!rd.valid || r.g291CovFbw == 0u || r.g291CovFbw != r.fbw ||
+        r.fbw > 8u || r.fbW != static_cast<int>(r.fbw) * 64)
+    {
+        static std::atomic<uint32_t> s_shapeLog{0};
+        if (g291StatOn() && s_shapeLog.fetch_add(1u, std::memory_order_relaxed) < 8u)
+            std::fprintf(stderr,
+                         "[G291:fail-shape] t=%03x valid=%d covFbw=%u fbw=%u fbW=%d\n",
+                         fbp, rd.valid ? 1 : 0, r.g291CovFbw, r.fbw, r.fbW);
+        return false;
+    }
+    const uint32_t base = framePageBaseToBlock(fbp);
+    const uint32_t pages = 16u * r.fbw; // 512 rows / 32 per page-row
+    for (uint32_t p = 0; p < pages; ++p)
+    {
+        const uint32_t b0 = base + p * 32u;
+        const uint32_t b1 = b0 + 31u;
+        if (b1 < rd.first || b0 > rd.last)
+            continue; // page outside the read
+        const uint32_t py = p / r.fbw;
+        const uint32_t px = p % r.fbw;
+        const uint32_t rowLo = py * 32u;
+        const uint32_t word = px; // 64 pixels per uint64 word, page cols are word-aligned
+        for (uint32_t y = rowLo; y < rowLo + 32u; ++y)
+            if (r.g291Cov[y][word] != ~uint64_t{0})
+            {
+                static std::atomic<uint32_t> s_pageLog{0};
+                if (g291StatOn() && fbp == 0x139u &&
+                    s_pageLog.fetch_add(1u, std::memory_order_relaxed) < 24u)
+                    std::fprintf(stderr,
+                                 "[G291:fail-page] t=%03x rd=0x%x..0x%x page=%u py=%u px=%u "
+                                 "y=%u cov=0x%016llx\n",
+                                 fbp, rd.first, rd.last, p, py, px, y,
+                                 (unsigned long long)r.g291Cov[y][word]);
+                return false;
+            }
+    }
+    return true;
+}
 static bool g290ExactRowsOn()
 {
-    static const bool s_on = envFlagEnabled("DC2_G290_EXACT_ROWS") &&
+    static const bool s_on = (envFlagEnabled("DC2_G290_EXACT_ROWS") || g291AtlasOn()) &&
                              !envFlagEnabled("DC2_G290_NO_EXACT_ROWS") &&
                              !envFlagDisabled("DC2_G290_EXACT_ROWS");
     return s_on;
@@ -7792,8 +7984,12 @@ static bool g283AuthorityRequested()
 }
 static bool g283AuthorityOn()
 {
-    static const bool s_req = g283AuthorityRequested();
-    return s_req && g282TightRowsOn();
+    // G294 turns the epoch ON (cross-pass overlay staleness) WITHOUT g282's write-side fanout:
+    // the owner-token gives in-pass source selection, the epoch gives cross-pass invalidation, and
+    // skipping the fanout (which pre-equalizes aliases and forces G291 skips=0) leaves the retire
+    // free to pay. g282PrepareFanout still only runs under g282TightRowsOn (false under g294).
+    static const bool s_req = g283AuthorityRequested() || g294OwnerTokenRequested();
+    return s_req && (g282TightRowsOn() || g294OwnerTokenRequested());
 }
 static bool g283StatOn()
 {
@@ -7820,14 +8016,71 @@ static uint64_t g283BumpPageEpoch(uint32_t pageBlock)
     g_g283Bumps.fetch_add(1u, std::memory_order_relaxed);
     return e;
 }
+
+// ===== G294 per-physical-page authoritative-owner token (default-off, DC2_G294_OWNER_TOKEN=1) =====
+// G283's page epoch proves "someone wrote this page since resolve" but not WHO. With a REAL
+// multi-owner page (G292: physical page 0x2860 aliased by 0x13c and 0x139 with divergent content),
+// g280TryEntry copied EVERY dirty sibling overlapping the page into the same dst tile
+// (last-writer-wins) and the exact verifier caught a full-page mismatch. G294 records the CURRENT
+// authoritative owner target per physical CT32 page — the last target to INDEPENDENTLY write it
+// (wave render or VRAM upload; a g280/g282 COPY does not restamp) — plus a monotonic equivalence
+// version. g280 then copies a page ONLY from its authoritative owner; a non-owner (divergent)
+// source is skipped and the dst keeps existing VRAM/overlay bytes (fail-closed). A g282 fanout
+// leaves owner=source, so its byte-identical destinations share the owner's version implicitly; the
+// next independent write to any of them re-stamps owner to that writer, staling the equivalents.
+struct G294Owner
+{
+    int32_t ownerTi = -1;
+    uint64_t equivVer = 0u;
+};
+static std::unordered_map<uint32_t, G294Owner> g_g294Owner; // pageBlock -> authoritative owner
+static uint64_t g_g294EquivSeq = 0u; // monotonic version source (flush-owner thread only)
+static std::atomic<uint64_t> g_g294Stamps{0}, g_g294OwnerSel{0}, g_g294NonOwnerSkip{0};
+static bool g294OwnerTokenOn()
+{
+    // Rides the G280 alias-view (NOT G283): the owner-token REPLACES G282's write-side fanout as
+    // the multi-owner arbiter. G283's fanout pre-equalizes aliases so multiOwner never diverges
+    // (exact but neutral — it forces G291 skips=0, G292); the owner-token instead lets g280's
+    // read-side copy pick the one authoritative source, leaving G291's upload-re-coverage retire
+    // free to pay. commitOvl replaces the overlay per pageBlock (most-recent owner wins), so no
+    // per-overlay equivalence version is needed for exactness.
+    static const bool s_req = g294OwnerTokenRequested();
+    return s_req && g280AliasOn();
+}
+static bool g294StatOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G294_STAT");
+    return s_on;
+}
+// An INDEPENDENT write (render/upload) into target ti is the fresh authority for pageBlock.
+static void g294StampOwner(int ti, uint32_t pageBlock)
+{
+    if (!g294OwnerTokenOn())
+        return;
+    G294Owner &o = g_g294Owner[pageBlock];
+    o.ownerTi = ti;
+    o.equivVer = ++g_g294EquivSeq;
+    g_g294Stamps.fetch_add(1u, std::memory_order_relaxed);
+}
+// Current authoritative owner target of pageBlock, or -1 if none/authority-off.
+static int g294PageOwner(uint32_t pageBlock)
+{
+    if (!g294OwnerTokenOn())
+        return -1;
+    auto it = g_g294Owner.find(pageBlock);
+    return it == g_g294Owner.end() ? -1 : it->second.ownerTi;
+}
+
 // A resident target's FBO content changed over GS rows [rowLo..rowHi]. Bump the epoch of every
 // physical CT32 page the target defines in those rows, so any overlay/fan-out copy of the SAME
 // physical page made from a DIFFERENT alias is provably stale by epoch mismatch. Cheap and gated:
 // authority-off returns immediately, and the measured family is at most 13x8 pages.
 static void g283NoteTargetPages(int ti, int rowLo, int rowHi)
 {
-    if (!g283AuthorityOn() || ti < 0 || ti >= static_cast<int>(kG248TargetCount))
+    if ((!g283AuthorityOn() && !g294OwnerTokenOn()) ||
+        ti < 0 || ti >= static_cast<int>(kG248TargetCount))
         return;
+    const bool g283On = g283AuthorityOn(); // epoch bumps only under G283; owner stamps under G294
     const G261Res &r = g_g261Res[ti];
     if (r.fbw == 0u || r.fbW <= 0)
         return;
@@ -7843,7 +8096,11 @@ static void g283NoteTargetPages(int ti, int rowLo, int rowHi)
             const uint64_t first64 = static_cast<uint64_t>(base) +
                 (static_cast<uint64_t>(prow) * r.fbw + static_cast<uint32_t>(col)) * 32u;
             if (first64 <= 0x3FFFu)
-                g283BumpPageEpoch(static_cast<uint32_t>(first64));
+            {
+                if (g283On)
+                    g283BumpPageEpoch(static_cast<uint32_t>(first64));
+                g294StampOwner(ti, static_cast<uint32_t>(first64)); // G294: fresh authority
+            }
         }
     }
 }
@@ -8562,6 +8819,24 @@ static uint32_t g280TryEntry(uint32_t batchFbp, const G144Entry &e, const G178En
                     g_g280RejPage.fetch_add(1u, std::memory_order_relaxed);
                     return 0u; // src tile not provably FBO-defined under the src view
                 }
+                // G294: copy this page ONLY from its current authoritative owner. A DIVERGENT
+                // sibling (owner recorded and it is a different target — e.g. the dst 0x139 or a
+                // peer wrote the page more recently) is skipped, and the dst keeps its existing
+                // overlay/VRAM bytes for the page (fail-closed). This is the exact fix for G292's
+                // multi-owner page-0x2860 mismatch, where two aliasing siblings both copied in and
+                // the later copy overwrote the earlier. owner<0 (unknown) keeps the pre-G294
+                // single-owner behavior (already bit-exact, G280 vfyBad=0 without a multi-owner).
+                if (g294OwnerTokenOn())
+                {
+                    const int owner = g294PageOwner(pageBlock);
+                    if (owner >= 0 && owner != static_cast<int>(t))
+                    {
+                        g_g294NonOwnerSkip.fetch_add(1u, std::memory_order_relaxed);
+                        continue; // authoritative owner is elsewhere
+                    }
+                    if (owner == static_cast<int>(t))
+                        g_g294OwnerSel.fetch_add(1u, std::memory_order_relaxed);
+                }
                 bool current = false;
                 for (const G280Ovl &o : g_g280Ovl[dstTi])
                     if (o.pageBlock == pageBlock && o.srcTi == static_cast<uint8_t>(t) &&
@@ -8601,6 +8876,8 @@ static uint32_t g280TryEntry(uint32_t batchFbp, const G144Entry &e, const G178En
             {
                 if (o.srcTi != srcT)
                     continue;
+                // G292: this GPU copy changed the dst tile without changing guest VRAM.
+                g291ClearCopiedTile(dstTi, o.dstRow, o.dstCol);
                 bool replaced = false;
                 for (G280Ovl &ex : g_g280Ovl[dstTi])
                     if (ex.pageBlock == o.pageBlock)
@@ -8946,6 +9223,9 @@ static void g282CommitFanout(const std::vector<G282Fanout> &plan)
         r.dirtyHi = std::max(r.dirtyHi, y0 + 31);
         r.covLo = std::min(r.covLo, y0);
         r.covHi = std::max(r.covHi, y0 + 31);
+        // G292: fan-out copied the new 0x139 bytes into this sibling FBO tile; any prior
+        // upload-re-coverage proof for the destination tile is now stale.
+        g291ClearCopiedTile(ti, f.dstRow, f.dstCol);
         auto &ovl = g_g280Ovl[ti];
         for (size_t k = ovl.size(); k-- > 0;)
             if (ovl[k].pageBlock == f.pageBlock)
@@ -9031,6 +9311,8 @@ static void g282DropResidencyAfterFanoutFailure()
         r.mirLo = 512;
         r.mirHi = -1;
         r.mirBits = {};
+        r.g291Cov = {};
+        r.g291CovFbw = 0u;
         g261UpdateWindow(static_cast<int>(t));
         G178FbSnap &snap = g_g178FbSnap[kG261Fbp[t]];
         snap.valid = false;
@@ -9099,6 +9381,15 @@ static void g280Report()
                      (unsigned long long)g_g283MultiOwner.load(std::memory_order_relaxed),
                      (unsigned long long)g_g283FanoutPages.load(std::memory_order_relaxed),
                      g_g283Epoch.size());
+    if (g294StatOn() || g294OwnerTokenOn())
+        std::fprintf(stderr,
+                     "[G294:stat] ownerToken=%d stamps=%llu ownerSel=%llu nonOwnerSkip=%llu "
+                     "owners=%zu\n",
+                     g294OwnerTokenOn() ? 1 : 0,
+                     (unsigned long long)g_g294Stamps.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g294OwnerSel.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g294NonOwnerSkip.load(std::memory_order_relaxed),
+                     g_g294Owner.size());
 }
 
 static void g261MaterializeAllDirty(int cause)
@@ -9343,6 +9634,13 @@ static uint32_t g264NoteUploadForMirror(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
         }
         const uint64_t targetBase = static_cast<uint64_t>(framePageBaseToBlock(kG261Fbp[i])) * 256u;
         const uint64_t targetBytes = static_cast<uint64_t>(r.fbw) * 16u * 8192u;
+        const bool g291On = g291AtlasOn();
+        if (g291On && r.g291CovFbw != r.fbw)
+        {
+            r.g291Cov = {};
+            r.g291CovFbw = r.fbw;
+            g_g291LayoutResets.fetch_add(1u, std::memory_order_relaxed);
+        }
         uint32_t hits = 0u;
         uint32_t newHits = 0u;
         int hitLo = 512, hitHi = -1;
@@ -9367,6 +9665,13 @@ static uint32_t g264NoteUploadForMirror(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
                 wordRef |= bit;
                 ++newHits;
             }
+            if (g291On)
+            {
+                // G291: cumulative coverage — the upload just wrote this pixel's bytes to
+                // guest VRAM, so VRAM is current for it until the next wave render of the row.
+                r.g291Cov[ty][tx >> 6u] |= bit;
+                g_g291CurPagesSet.fetch_add(1u, std::memory_order_relaxed);
+            }
             hitLo = std::min(hitLo, static_cast<int>(ty));
             hitHi = std::max(hitHi, static_cast<int>(ty));
         }
@@ -9380,6 +9685,16 @@ static uint32_t g264NoteUploadForMirror(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
         if (hitHi > r.mirHi) r.mirHi = hitHi;
         mask |= (1u << i);
         g_g264MirNoted.fetch_add(1u, std::memory_order_relaxed);
+        {
+            // G291 bring-up diag: which uploads land in the seeded batch's row-13 texture band.
+            static std::atomic<uint32_t> s_g291HiLog{0};
+            if (g291StatOn() && dbp >= 0x3400u && kG261Fbp[i] == 0x139u &&
+                s_g291HiLog.fetch_add(1u, std::memory_order_relaxed) < 24u)
+                std::fprintf(stderr,
+                             "[G291:upnote] dbp=0x%x dbw=%u rect=%ux%u rows=%d..%d px=%u new=%u\n",
+                             dbp, static_cast<unsigned>(dbw), rrw, rrh, hitLo, hitHi,
+                             hits, newHits);
+        }
         if (g262CensusOn())
         {
             static std::atomic<uint32_t> s_g264UpLog{0};
@@ -9629,7 +9944,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // G273 diagnostic: split the proven GPU flush into front-end preparation, synchronous backend
     // submit, and post-submit VRAM/depth publication. Quiet unless DC2_G273_PROFILE=1.
     static const bool s_g273Profile = envFlagEnabled("DC2_G273_PROFILE");
+    // G298 diagnosis: split G273's large front-end "pre" bucket at architecture boundaries.
+    // Aggregate-only, cached, and behavior-inert unless explicitly requested.
+    static const bool s_g298Profile = envFlagEnabled("DC2_G298_PROFILE");
     const auto g273T0 = s_g273Profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+    const auto g298T0 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
 
     const uint32_t fbp = g_g144List[0].ctx.frame.fbp;
@@ -9901,6 +10221,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         s_g289OwnerSrc.clear();
     if (rowHi < rowLo)
         return true; // everything skipped — nothing to draw, nothing to read back
+    const auto g298T1 = s_g298Profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
     const int g282LegacyRowLo = rowLo, g282LegacyRowHi = rowHi;
     const int g282LegacyDepthLo = depthRowLo, g282LegacyDepthHi = depthRowHi;
     static std::vector<G282Fanout> s_g282Fanout;
@@ -9946,11 +10268,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g282RowHi >= g282RowLo && g282DepthHi >= g282DepthLo &&
         g282RowLo == 0 && g282RowHi <= 447 && g282DepthLo >= 32 && g282DepthHi <= 447)
     {
-        static std::vector<G282Fanout> s_g290Fanout;
-        s_g290Fanout.clear();
+        static std::vector<G282Fanout> s_emptyPlan;
+        s_emptyPlan.clear();
         if (g282PrepareFanout(s_states, guestDepth, guestDepthWrites,
-                              guestZbpPage, guestZpsm, s_g290Fanout) &&
-            s_g290Fanout.empty())
+                              guestZbpPage, guestZpsm, s_emptyPlan) &&
+            s_emptyPlan.empty())
         {
             g290Seeded = true;
             rowLo = g282RowLo;
@@ -10355,19 +10677,81 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // so uploading those rows from VRAM is pure churn — only rows the clear does not cover
         // need real VRAM bytes. Coverage invariant unchanged: rows 0..415 are valid post-clear.
         const int upLoEff = g290Seeded ? std::max(upLo, 416) : upLo;
-        for (int y = upLoEff; y <= upHi; ++y)
-        {
-            const size_t dstRow = static_cast<size_t>(kFbH - 1 - y) * fbW;
-            for (int x = 0; x < fbW; ++x)
+        // G298 promotion (default on): CT32 maps each logical pixel to one independent 32-bit
+        // staging element. Split disjoint guest-row ranges across the existing joined row pool;
+        // VRAM is read-only here and the pool joins before backend submission, snapshot
+        // publication, or any ownership transition. Keep combined and stage-local kill switches.
+        static const bool s_g298ParFbPack =
+            !envFlagEnabled("DC2_G298_NO_PAR_PREP") &&
+            !envFlagEnabled("DC2_G298_NO_PAR_FBPACK") &&
+            !envFlagDisabled("DC2_G298_PAR_FBPACK");
+        static const int s_g298FbPackLanes = [] {
+            const char *value = std::getenv("DC2_G298_FBPACK_LANES");
+            if (value == nullptr)
+                return 8;
+            return std::max(1, std::min(16, std::atoi(value)));
+        }();
+        const auto packFbRows = [&](int laneLo, int laneHi) {
+            for (int y = laneLo; y <= laneHi; ++y)
             {
-                const uint32_t off = GSPSMCT32::addrPSMCT32(fbBlock, fbw,
-                                                            static_cast<uint32_t>(x),
-                                                            static_cast<uint32_t>(y));
-                uint32_t px = 0;
-                if (off + 4u <= vramSize)
-                    std::memcpy(&px, vram + off, 4);
-                s_batch.fbPixels[dstRow + x] = px;
+                const size_t dstRow = static_cast<size_t>(kFbH - 1 - y) * fbW;
+                for (int x = 0; x < fbW; ++x)
+                {
+                    const uint32_t off = GSPSMCT32::addrPSMCT32(
+                        fbBlock, fbw, static_cast<uint32_t>(x),
+                        static_cast<uint32_t>(y));
+                    uint32_t px = 0;
+                    if (off + 4u <= vramSize)
+                        std::memcpy(&px, vram + off, 4);
+                    s_batch.fbPixels[dstRow + x] = px;
+                }
             }
+        };
+        const int packRows = upHi >= upLoEff ? (upHi - upLoEff + 1) : 0;
+        const int packLanes =
+            s_g298ParFbPack && packRows >= 8 ? s_g298FbPackLanes : 1;
+        GSRowPool::instance().run(upLoEff, upHi, packLanes, packFbRows);
+
+        // Exact same-run oracle for bring-up: independently reread every packed CT32 pixel using
+        // the serial address path after the joined dispatch. This is diagnostic-only because it
+        // deliberately repeats the staging work.
+        static const bool s_g298Verify =
+            envFlagEnabled("DC2_G298_VERIFY_FBPACK");
+        if (s_g298ParFbPack && s_g298Verify && packRows > 0)
+        {
+            uint64_t bad = 0u;
+            for (int y = upLoEff; y <= upHi; ++y)
+            {
+                const size_t dstRow = static_cast<size_t>(kFbH - 1 - y) * fbW;
+                for (int x = 0; x < fbW; ++x)
+                {
+                    const uint32_t off = GSPSMCT32::addrPSMCT32(
+                        fbBlock, fbw, static_cast<uint32_t>(x),
+                        static_cast<uint32_t>(y));
+                    uint32_t expected = 0u;
+                    if (off + 4u <= vramSize)
+                        std::memcpy(&expected, vram + off, 4);
+                    bad += s_batch.fbPixels[dstRow + x] != expected ? 1u : 0u;
+                }
+            }
+            static std::atomic<uint64_t> s_packs{0u}, s_pixels{0u}, s_bad{0u};
+            const uint64_t n =
+                s_packs.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            const uint64_t pixels = static_cast<uint64_t>(packRows) *
+                                    static_cast<uint64_t>(fbW);
+            const uint64_t totalPixels =
+                s_pixels.fetch_add(pixels, std::memory_order_relaxed) + pixels;
+            const uint64_t totalBad =
+                s_bad.fetch_add(bad, std::memory_order_relaxed) + bad;
+            if (bad != 0u || n <= 8u || (n % 256u) == 0u)
+                std::fprintf(stderr,
+                             "[G298:verify] packs=%llu pixels=%llu bad=%llu "
+                             "last(rows=%d lanes=%d bad=%llu)\n",
+                             static_cast<unsigned long long>(n),
+                             static_cast<unsigned long long>(totalPixels),
+                             static_cast<unsigned long long>(totalBad),
+                             packRows, packLanes,
+                             static_cast<unsigned long long>(bad));
         }
         snap.rowLo = upLo;
         snap.rowHi = upHi;
@@ -10642,6 +11026,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         } // end G242 persistent-depth path (G262 per-wave path above)
     }
 
+    const auto g298T2 = s_g298Profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
     // G261 FBO-bind pre-pass: entries that sample a GPU-dirty RTT target either bind the
     // producer's FBO color texture directly (skip VRAM decode entirely — the pixels never
     // round-tripped through VRAM) or, when the access shape is not provably in-range/aligned,
@@ -10852,6 +11238,30 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         g144RangeOverlaps(r.range, tex) ||
                         (clut.valid && g144RangeOverlaps(r.range, clut)))
                     {
+                        // G291: the read needs VRAM bytes, but if every overlapped 64x32 page
+                        // of this resident target was FULLY re-covered by noted uploads since
+                        // its last wave render, VRAM is already current for exactly the pages
+                        // the read touches — the materialize round-trip would be the identity
+                        // there. CLUT reads use paletted PSMs whose range test is the same
+                        // block interval. Fails closed on any partial page.
+                        if (g291AtlasOn() && tex.valid && r.range.valid &&
+                            g291PagesCurrent(r, kG261Fbp[t], tex) &&
+                            (!clut.valid || g291PagesCurrent(r, kG261Fbp[t], clut)))
+                        {
+                            const uint64_t n = g_g291TexSkips.fetch_add(
+                                                   1u, std::memory_order_relaxed) + 1u;
+                            if (g291StatOn() && (n <= 8u || (n % 4096u) == 0u))
+                                std::fprintf(stderr,
+                                             "[G291:skip] n=%llu t=%03x tex=0x%x..0x%x "
+                                             "mats=%llu\n",
+                                             (unsigned long long)n, kG261Fbp[t],
+                                             tex.first, tex.last,
+                                             (unsigned long long)g_g291TexMats.load(
+                                                 std::memory_order_relaxed));
+                            continue;
+                        }
+                        if (g291AtlasOn())
+                            g_g291TexMats.fetch_add(1u, std::memory_order_relaxed);
                         // G262 diagnosis: WHY did the direct-bind test fail for a real consumer?
                         static std::atomic<uint32_t> s_g262BindRejLog{0};
                         if (g262CensusOn() &&
@@ -10882,6 +11292,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     }
     const bool g261HaveFboSrc = g261AnyBind; // s_g261FboSrc sized to the list only when true
 
+    const auto g298T3 = s_g298Profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
     // Textures: decode + upload anything not resident or invalidated by page-gen changes.
     static std::unordered_set<uint64_t> s_batchKeys;
     s_batchKeys.clear();
@@ -11040,6 +11452,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g_g178TexDecodes.fetch_add(1u, std::memory_order_relaxed);
     }
 
+    const auto g298T4 = s_g298Profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
     // Vertices + state-batched draw runs (submission order preserved — no sorting; blending
     // depends on order).
     for (size_t i = 0; i < g_g144List.size(); ++i)
@@ -11183,6 +11597,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         }
     }
 
+    const auto g298T5 = s_g298Profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
     // G255 verification is intentionally color-only. Any batch that needs real guest depth has
     // already failed closed unless the separately opt-in G242 ownership model is active; do not
     // combine those two experiments in one oracle.
@@ -11245,6 +11661,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         }
     }
     const auto g273T2 = s_g273Profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
+    const auto g298T6 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
     if (!submitted)
     {
@@ -11514,6 +11932,14 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             r.dirty = true;
             if (rowLo < r.dirtyLo) r.dirtyLo = rowLo;
             if (rowHi > r.dirtyHi) r.dirtyHi = rowHi;
+            if (g291AtlasOn() && r.g291CovFbw != 0u)
+            {
+                // G291: the wave just rendered these rows on the GPU — the FBO is newer than
+                // VRAM for every pixel it may have written. Conservative whole-row clear
+                // (scissor columns ignored, fail-closed direction).
+                for (int y = rowLo; y <= rowHi && y < 512; ++y)
+                    r.g291Cov[static_cast<size_t>(y)].fill(0u);
+            }
             // G280: this wave changed the target's FBO content — stale any alias copies made
             // FROM it and drop any of its OWN overlay tiles the rendered rows overlap (the
             // draw layered over the resolved page state exactly as GS command order would).
@@ -11630,6 +12056,38 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     }
 
     const uint64_t nGpu = g_g178GpuFlushes.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (s_g298Profile)
+    {
+        static uint64_t s_classNs = 0u, s_fbzNs = 0u, s_depsNs = 0u, s_texNs = 0u,
+                        s_vertsNs = 0u, s_submitNs = 0u, s_postNs = 0u;
+        const auto g298T7 = std::chrono::steady_clock::now();
+        const auto ns = [](auto a, auto b) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+        };
+        s_classNs += ns(g298T0, g298T1);
+        s_fbzNs += ns(g298T1, g298T2);
+        s_depsNs += ns(g298T2, g298T3);
+        s_texNs += ns(g298T3, g298T4);
+        s_vertsNs += ns(g298T4, g298T5);
+        s_submitNs += ns(g298T5, g298T6);
+        s_postNs += ns(g298T6, g298T7);
+        if ((nGpu % 300u) == 0u)
+        {
+            const double denom = 1.0e6 * static_cast<double>(nGpu);
+            std::fprintf(stderr,
+                         "[G298:profile] gpu=%llu avgMs(class=%.3f fbz=%.3f deps=%.3f "
+                         "tex=%.3f verts=%.3f submit=%.3f post=%.3f)\n",
+                         static_cast<unsigned long long>(nGpu),
+                         static_cast<double>(s_classNs) / denom,
+                         static_cast<double>(s_fbzNs) / denom,
+                         static_cast<double>(s_depsNs) / denom,
+                         static_cast<double>(s_texNs) / denom,
+                         static_cast<double>(s_vertsNs) / denom,
+                         static_cast<double>(s_submitNs) / denom,
+                         static_cast<double>(s_postNs) / denom);
+        }
+    }
     if (s_g273Profile)
     {
         static uint64_t s_preNs = 0u, s_submitNs = 0u, s_postNs = 0u;

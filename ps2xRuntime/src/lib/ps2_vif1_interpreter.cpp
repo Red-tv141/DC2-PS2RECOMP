@@ -15,6 +15,11 @@ void g124_note_stream(uint32_t sizeBytes);
 extern std::atomic<uint32_t> g_dc2G136TraceActive;
 std::atomic<uint64_t> g_g146Vif1Ns{0};
 
+// G301 MTVU: record a VU-RAM write (UNPACK/MPG/fog) as an ordered event so the VU1 worker replays it
+// onto its PERSISTENT VU RAM in program order (fixes the G297 per-kick-snapshot cross-kick drop).
+// No-op unless MTVU is active; VIF1 still writes live RAM (EE shadow) as before. Defined in ps2_runtime.cpp.
+void g297NoteVuWrite(bool isCode, uint32_t off, const uint8_t *src, uint32_t bytes);
+
 struct Dc2G137VuOrigin
 {
     uint32_t valid;
@@ -1016,7 +1021,10 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 if (destAddr + copyBytes > PS2_VU1_CODE_SIZE)
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
                 if (pos + copyBytes <= sizeBytes)
+                {
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                    g297NoteVuWrite(true, destAddr, data + pos, copyBytes); // G301 MTVU ordered event
+                }
             }
             if (g22KickMode == G22Vu1KickMode::Upload &&
                 xgkickScan.count != 0u)
@@ -1700,6 +1708,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     {
                         uint32_t copyBytes = (bytesPerVector < 16u) ? bytesPerVector : 16u;
                         std::memcpy(m_vu1Data + destOff, srcVec, copyBytes);
+                        g297NoteVuWrite(false, destOff, srcVec, copyBytes); // G301 MTVU ordered event
                         if (g137Active)
                         {
                             uint32_t rawCopy[4] = {};
@@ -1763,6 +1772,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                     }
 
                     std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
+                    g297NoteVuWrite(false, destOff, reinterpret_cast<const uint8_t *>(lanes),
+                                    sizeof(lanes)); // G301 MTVU ordered event
                     if (g137Active)
                     {
                         g137_record_origin(g136Seq, destVec, pos - 4u,
@@ -1797,6 +1808,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                         {
                             const float hwFog[4] = {-191.25f, 255.0f, 0.0f, 535500.0f};
                             std::memcpy(m_vu1Data + 59u * 16u, hwFog, 16);
+                            g297NoteVuWrite(false, 59u * 16u, reinterpret_cast<const uint8_t *>(hwFog),
+                                            16); // G301 MTVU ordered event
                         }
                     }
                 }

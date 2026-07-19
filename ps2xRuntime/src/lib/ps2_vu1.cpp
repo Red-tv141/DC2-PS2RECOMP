@@ -22,6 +22,19 @@
 // G141: global VU1-run nanosecond accumulator (external linkage) — includes the GS raster
 // nested via XGKICK; mgEndFrame subtracts g_g141GsRasterNs to isolate VU1-interpreter-proper.
 std::atomic<uint64_t> g_g141Vu1RunNs{0};
+
+// G297 MTVU: when non-null (set on the VU1 worker thread before m_vu1.execute/resume), each XGKICK
+// Path1 packet is captured into this per-kick list instead of being submitted to the GifArbiter.
+// The EE thread later splices the list into the arbiter in kick-order (GifArbiter::submit is
+// single-writer / EE-only). Null on the EE thread → the legacy synchronous submit path is used, so
+// the default (MTVU-off) build is byte-identical. thread_local: only the worker sees it set.
+thread_local std::vector<std::vector<uint8_t>> *g_g297KickCapture = nullptr;
+// G297: the double-buffer DATA top (VIF1 TOPS latched at the kick's MSCAL) snapshotted on the EE at
+// enqueue time. The interpreter reads XTOP live from memory->vif1_regs.top, which the EE mutates at
+// the NEXT MSCAL — on the worker that would read the wrong buffer half. When g_g297KickCapture is
+// set (worker context) the XTOP read uses this captured value instead. Masked (& 0x3FF) at capture.
+thread_local uint32_t g_g297KickTop = 0u;
+
 namespace {
 struct G141PerfScope
 {
@@ -1946,6 +1959,40 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const int  s_macpipeDepth  = s_macpipeOn ? g138_macpipe_depth() : 4;
     const bool s_pairhazOn     = g139_pairhaz_enabled();
     (void)s_qlatOn;
+
+    // G295: the per-cycle diagnostic probe pile (G68..G237 census/trace blocks accumulated over
+    // 200+ phases) costs real EE-thread time even with every probe disabled — ~20 gated branches
+    // + pc/startPc compares per cycle in the hottest loop of the frame (VU1proper = 72-74% of
+    // steady MAP-0). One master gate, computed once per run, skips all four probe regions when no
+    // per-cycle diagnostic can fire this run; any probe env (or the G100 title force path / G216
+    // char census / G106 parallel-flags lever / VU1 trace) routes through the legacy interleaved
+    // body unchanged. The semantic core (fetch, LOI/E-bit, Q/P pipes, scalar prestall, MAC pipe,
+    // G139 pair hazard, exec, branch delay) is IDENTICAL on both paths.
+    // Kill: DC2_G295_VU1_DIAG_LOOP=1 forces the legacy body unconditionally.
+    // NOTE: any future per-cycle probe added to run() must add its env name to this list.
+    static const bool s_g295ForceDiagLoop = (std::getenv("DC2_G295_VU1_DIAG_LOOP") != nullptr);
+    static const bool s_g295AnyProbeEnv = [] {
+        static const char *const k[] = {
+            "DC2_G75_ROUTE1B68", "DC2_G85_NL", "DC2_G87_PL", "DC2_G68_ADC", "DC2_G69_ADC",
+            "DC2_G117_TS", "DC2_G132_COPYW", "DC2_G237_TRACE", "DC2_G70", "DC2_G198_GATE_TRACE",
+            "DC2_G200_DET_TRACE", "DC2_G72_VI1", "DC2_G71_PROBE", "DC2_G72_DISP",
+            "DC2_G140_CLIP", "DC2_G101_VFPROBE", "DC2_G102_STAT", "DC2_G108_2128_QCLIP",
+            "DC2_G108_2128_Q_STAT", "DC2_G106_FORCE_2128_MAC"};
+        for (const char *n : k)
+            if (std::getenv(n) != nullptr)
+                return true;
+        return false;
+    }();
+    // G295: skip the G139 pair-hazard save/restore/overlay when the lower op names the upper's
+    // dest VF through NEITHER of its register fields. Every lower-slot VF access (read: SQ*,
+    // DIV/SQRT/RSQRT, MTIR, RINIT, RXOR, EFU ops — via fs/ftf; write: LQ*, MFIR, MFP, RGET,
+    // RNEXT — via ft) encodes the VF index in bits 11-15 (fs) or 16-20 (ft), so an index
+    // mismatch on both fields proves the save/restore round-trip is the identity. A VI-indexed
+    // false positive merely keeps the legacy swap. Kill: DC2_G295_NO_HAZSKIP=1.
+    static const bool s_g295KeepHaz = (std::getenv("DC2_G295_NO_HAZSKIP") != nullptr);
+    const bool g295Diag = s_g295ForceDiagLoop || s_g295AnyProbeEnv || g100ForceTitleDraw ||
+                          s_g216CharExec || s_g106ParallelFlags || vu1_trace_enabled() ||
+                          g32_vu_trace_enabled() || g137_trace_enabled();
     uint32_t *const s_macPipeP     = s_vuMacPipe;
     uint32_t *const s_statusPipeP  = s_vuStatusPipe;
     uint32_t *const s_macVisP      = &s_vuMacVisible;
@@ -1957,6 +2004,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     {
         const uint32_t currentPc = m_state.pc;
         const int16_t g72_vi1_before = (int16_t)m_state.vi[1];
+        // G295 diag region A (pre-fetch): G216 census, G100/G101/G102/G106/G108 title force
+        // path, G75/G85/G87 probes. Interior indentation intentionally unchanged (see the
+        // master-gate comment above the loop).
+        if (g295Diag)
+        {
         if (s_g216CharExec && currentPc == 0x1d48u)
         {
             ++s_g216Stats.gate1d48;
@@ -2273,6 +2325,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 }
             }
         }
+        } // G295 diag region A end
+
         if (currentPc + 8 > codeSize)
         {
             stopReason = "pc-oob";
@@ -2285,6 +2339,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         lastPc = currentPc;
         lastLower = lower;
         lastUpper = upper;
+
+        // G295 diag region B (post-fetch): G68/G69/G117/G132/G237/G70 censuses, VU1 XGKICK
+        // trace, G32. Interior indentation intentionally unchanged.
+        if (g295Diag)
+        {
 
         // G68: ADC-source histogram. The title 3D map renders flat-blue because all its vertices
         // reach the GS with ADC=1 (bit15 of the stored vertex word). Histogram EVERY integer store
@@ -2681,6 +2740,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             }
         }
 
+        } // G295 diag region B end
+
         bool eBit = (upper >> 30) & 1;
 
         // G27: LOI is signaled by the I-bit (bit 31 of the UPPER word). When set,
@@ -2770,16 +2831,29 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             if (s_pairhazOn)
             {
                 const uint8_t g139op = (uint8_t)(upper & 0x3Fu);
+                uint32_t g139DstIdx = 0u;
                 if (g139op < 0x3Cu)
                 {
-                    g139dst = m_state.vf[(upper >> 6) & 0x1Fu];
+                    g139DstIdx = (upper >> 6) & 0x1Fu;
+                    g139dst = m_state.vf[g139DstIdx];
                 }
                 else
                 {
                     const uint8_t g139s2 = S2_FUNC(upper);
                     if ((g139s2 >= 0x10u && g139s2 <= 0x17u) || g139s2 == 0x1Du)
-                        g139dst = m_state.vf[(upper >> 16) & 0x1Fu];
+                    {
+                        g139DstIdx = (upper >> 16) & 0x1Fu;
+                        g139dst = m_state.vf[g139DstIdx];
+                    }
                 }
+                // G295: every lower-slot VF access (read or write) names its register in the
+                // fs (bits 11-15) or ft (bits 16-20) field. If neither equals the upper's dest,
+                // the save/restore/overlay round-trip is the identity — skip it. A VI-indexed
+                // false positive just keeps the legacy swap. Kill: DC2_G295_NO_HAZSKIP=1.
+                if (g139dst != nullptr && !s_g295KeepHaz &&
+                    ((lower >> 11u) & 0x1Fu) != g139DstIdx &&
+                    ((lower >> 16u) & 0x1Fu) != g139DstIdx)
+                    g139dst = nullptr;
                 if (g139dst)
                     std::memcpy(g139old, g139dst, 16);
             }
@@ -2795,6 +2869,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 s_g106LowerStatusRead = g106StatusBeforeUpper;
                 s_g106UseLowerFlagRead = true;
             }
+            // G295 diag region C (pre-execLower): G198/G200 probes. Interior unchanged.
+            if (g295Diag)
+            {
             // G198: refuted G197's IALU-latency hypothesis by reading PCSX2's real _vuIALUflush/
             // _vuTestALUStalls (VUops.cpp) -- IALU-pipe bookkeeping only advances VU->cycle (a
             // timing counter used elsewhere for XGKICK pacing), it never delays or forwards a
@@ -2851,6 +2928,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                         r17[0], r17[1], r17[2], r17[3]);
                 }
             }
+            } // G295 diag region C end
             execLower(lower, vuData, dataSize, gs, memory, upper);
             s_g106UseLowerFlagRead = false;
             if (g139dst)
@@ -2871,6 +2949,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             s_statusPipeP[0] = m_state.status;
         }
         const uint32_t postExecPc = m_state.pc;
+
+        // G295 diag region D (post-exec): G72 VI1/dispatch, G71 gate, G137 provenance, G140
+        // clip census. Interior indentation intentionally unchanged.
+        if (g295Diag)
+        {
 
         // G72: trace every change to VI1 in the title/model program (startPc=0x10). The
         // tristrip/trifan packer cull gate IBEQ VI10,VI1 needs VI1==208 to draw but VI1 reads 0.
@@ -3183,6 +3266,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                         (unsigned long long)s_fcandMiss.load(), (unsigned long long)s_fanVerts.load());
             }
         }
+
+        } // G295 diag region D end
 
         // Enforce VF0 invariant
         m_state.vf[0][0] = 0.0f;
@@ -4768,8 +4853,10 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                        // transform reads its vertex/count buffer relative to this. G28: was
                        // returning ITOP (0) -> reads from VU addr 0 -> runaway loop.
                 if (it != 0)
-                    m_state.vi[it] = (int32_t)(memory ? (memory->vif1_regs.top & 0x3FFu)
-                                                      : (m_state.itop & 0x3FFu));
+                    m_state.vi[it] = (int32_t)(g_g297KickCapture // G297: captured top on the worker
+                                                   ? g_g297KickTop
+                                                   : (memory ? (memory->vif1_regs.top & 0x3FFu)
+                                                             : (m_state.itop & 0x3FFu)));
                 return;
             case 0x69: // XITOP - INTEGER top (VIF1 ITOP)
                 if (it != 0)
@@ -6437,7 +6524,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                     std::memcpy(buf.data() + 16u, &adData, 8);
                     std::memcpy(buf.data() + 24u, &adAddr, 8);
                     std::memcpy(buf.data() + 32u, pkt, bytes);
-                    if (memory)
+                    if (g_g297KickCapture) // G297 MTVU: capture on the worker, splice on the EE
+                        g_g297KickCapture->emplace_back(buf.data(), buf.data() + bytes + 32u);
+                    else if (memory)
                         memory->submitGifPacket(GifPathId::Path1, buf.data(), bytes + 32u, !g95_defer_gif_enabled());
                     else
                         gs.processGIFPacket(buf.data(), bytes + 32u);
@@ -6526,7 +6615,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                             pkt = g217Patched.data();
                         }
                     }
-                    if (memory)
+                    if (g_g297KickCapture) // G297 MTVU: capture on the worker, splice on the EE
+                        g_g297KickCapture->emplace_back(pkt, pkt + bytes);
+                    else if (memory)
                         memory->submitGifPacket(GifPathId::Path1, pkt, bytes, !g95_defer_gif_enabled());
                     else
                         gs.processGIFPacket(pkt, bytes);

@@ -79,6 +79,12 @@ bool g178DefaultOn()
     return !g158EnvFlag("DC2_G178_NO_GPU") && !g158EnvDisabled("DC2_G178_GPU");
 }
 
+bool g299ProfileOn()
+{
+    static const bool on = g158EnvFlag("DC2_G299_PROFILE");
+    return on;
+}
+
 // --- Minimal GL>1.1 loader. Microsoft's <GL/gl.h> only declares GL 1.1; every entry point used
 // here beyond that is resolved lazily via wglGetProcAddress on first use (no glad/GLEW
 // dependency -- keeps this file self-contained and avoids pulling raylib.h in here at all,
@@ -1877,6 +1883,8 @@ private:
             item.depthReadRows = depthReadRows;
             item.renderThenReadDepth = renderThenReadDepth;
             item.promise = promise;
+            if (g299ProfileOn())
+                item.g299Enqueue = std::chrono::steady_clock::now();
             m_queue.push_back(std::move(item));
         }
         m_cvWork.notify_one();
@@ -1923,6 +1931,7 @@ private:
         bool g281Verify = false;
         uint64_t *g281VerifyBad = nullptr;
         std::shared_ptr<std::promise<bool>> promise;
+        std::chrono::steady_clock::time_point g299Enqueue{};
     };
     struct TexEntry
     {
@@ -1992,6 +2001,12 @@ private:
                 m_queue.pop_front();
             }
             bool ok = false;
+            const bool g299ProfileBatch =
+                item.batch != nullptr && item.depthReadback == nullptr;
+            const auto g299WorkStart =
+                g299ProfileBatch && g299ProfileOn()
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
             try
             {
                 if (item.g281Map != nullptr)
@@ -2033,6 +2048,55 @@ private:
             catch (...)
             {
                 ok = false;
+            }
+            if (g299ProfileBatch && g299ProfileOn())
+            {
+                const auto done = std::chrono::steady_clock::now();
+                const uint64_t queueNs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        g299WorkStart - item.g299Enqueue).count());
+                const uint64_t workNs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        done - g299WorkStart).count());
+                const G178Batch &b = *item.batch;
+                uint64_t packetBytes =
+                    static_cast<uint64_t>(b.fbPixels.size()) * sizeof(uint32_t) +
+                    static_cast<uint64_t>(b.verts.size()) * sizeof(G178Vtx) +
+                    static_cast<uint64_t>(b.draws.size()) * sizeof(G178Draw);
+                for (const G178TexUpload &up : b.texUploads)
+                    packetBytes += static_cast<uint64_t>(up.px.size()) * sizeof(uint32_t);
+                if (item.depthUpload != nullptr)
+                    packetBytes += static_cast<uint64_t>(item.depthUpload->size()) *
+                                   sizeof(float);
+                const unsigned cls =
+                    (b.skipReadback ? 1u : 0u) |
+                    (item.depthKey != 0u ? 2u : 0u);
+                ++m_g299Count[cls];
+                m_g299QueueNs[cls] += queueNs;
+                m_g299WorkNs[cls] += workNs;
+                m_g299PacketBytes[cls] += packetBytes;
+                m_g299Draws[cls] += b.draws.size();
+                ++m_g299Total;
+                if ((m_g299Total % 300u) == 0u)
+                {
+                    std::fprintf(stderr, "[G299:backend] total=%llu",
+                                 static_cast<unsigned long long>(m_g299Total));
+                    for (unsigned i = 0; i < 4u; ++i)
+                    {
+                        const uint64_t n = m_g299Count[i];
+                        if (n == 0u)
+                            continue;
+                        std::fprintf(
+                            stderr,
+                            " c%u(n=%llu q=%.3fms work=%.3fms packet=%.1fKiB draws=%.1f)",
+                            i, static_cast<unsigned long long>(n),
+                            static_cast<double>(m_g299QueueNs[i]) / 1.0e6 / n,
+                            static_cast<double>(m_g299WorkNs[i]) / 1.0e6 / n,
+                            static_cast<double>(m_g299PacketBytes[i]) / 1024.0 / n,
+                            static_cast<double>(m_g299Draws[i]) / n);
+                    }
+                    std::fprintf(stderr, "\n");
+                }
             }
             item.promise->set_value(ok);
         }
@@ -3637,6 +3701,12 @@ private:
 
     std::mutex m_residentMtx;
     std::unordered_set<uint64_t> m_resident;
+    uint64_t m_g299Total = 0u;
+    uint64_t m_g299Count[4]{};
+    uint64_t m_g299QueueNs[4]{};
+    uint64_t m_g299WorkNs[4]{};
+    uint64_t m_g299PacketBytes[4]{};
+    uint64_t m_g299Draws[4]{};
 };
 } // namespace
 

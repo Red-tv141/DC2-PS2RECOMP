@@ -13,6 +13,12 @@
 #include <iostream>
 #include <mutex>
 #include <thread>
+#include <vector>
+
+// G297 MTVU bridges (defined in ps2_runtime.cpp). No-ops unless DC2_G297_MTVU=1.
+extern bool g297HasPendingKicks();
+extern void g297OnWindowHandoff();
+extern void g297CollectWindowPackets(std::vector<std::vector<uint8_t>> &out);
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -503,9 +509,14 @@ namespace
 
         // EE thread: hand one drain() window (already path-sorted-equivalent when 1 packet) to the
         // GS worker, FIFO. In-frame backpressure caps queued windows so one slow frame can't blow up.
-        void enqueueWindow(const GifArbiter::ProcessPacketFn &fn, std::vector<GifArbiterPacket> &&pkts)
+        void enqueueWindow(const GifArbiter::ProcessPacketFn &fn, std::vector<GifArbiterPacket> &&pkts,
+                           bool force = false)
         {
-            if (pkts.empty())
+            // G297: `force` materializes a window even with no arbiter packets, because its real
+            // content (VU1 XGKICK Path1) arrives via the side-channel batch in processWindow. Keeps
+            // the batch/window pop 1:1. When MTVU is off, force is only ever set for non-empty pkts,
+            // so behavior is identical to the original empty-skip.
+            if (pkts.empty() && !force)
                 return;
             std::unique_lock<std::mutex> lk(m_mtx);
             if (!m_processFn)
@@ -815,6 +826,24 @@ namespace
 
         void processWindow(std::vector<GifArbiterPacket> &q)
         {
+            // G297 MTVU: pull this window's off-thread VU1 XGKICK output (Path1) and merge it into
+            // the window BEFORE the sort. Waits per-kick only if VU1 hasn't caught up (backpressure).
+            // No-op unless MTVU is active. Under MTVU, XGKICK does not submit to the arbiter, so q
+            // holds no Path1 packets; the stable sort places these kicks (in kick order) ahead of
+            // Path2/Path3 exactly as the synchronous baseline's path sort would.
+            {
+                std::vector<std::vector<uint8_t>> g297pk;
+                g297CollectWindowPackets(g297pk);
+                for (auto &pk : g297pk)
+                {
+                    GifArbiterPacket p;
+                    p.pathId = GifPathId::Path1;
+                    p.path2DirectHl = false;
+                    p.path3Image = false;
+                    p.data = std::move(pk);
+                    q.push_back(std::move(p));
+                }
+            }
             // Identical grouping/order to GifArbiter::drain(): stable path sort, then process in order.
             std::stable_sort(q.begin(), q.end(),
                              [](const GifArbiterPacket &a, const GifArbiterPacket &b)
@@ -903,6 +932,11 @@ uint64_t g175_frame_boundary_count()
 {
     return s_g175FrameBoundaryCount.load(std::memory_order_relaxed);
 }
+
+// G303: expose the MTGS worker's TOTAL per-window busy time (processWindow, accumulated since G151)
+// so the GS worker's whole-frame occupancy can be compared to the GSimage subset and the VU1-worker
+// busy time for post-MTVU pole attribution. File-scope read of the anon-namespace counter.
+uint64_t g303_gs_worker_busy_ns() { return g_g151WorkerBusyNs.load(std::memory_order_relaxed); }
 
 void g150_frame_barrier(std::function<void()> latch)
 {
@@ -1044,8 +1078,17 @@ void GifArbiter::drain()
     // GS state on the EE thread. Bit-exact — see the G150Mtgs comment above.
     if (g150_mtgs_enabled())
     {
-        G150Mtgs::instance().enqueueWindow(m_processFn, std::move(m_queue));
-        m_queue.clear();
+        // G297 MTVU: seal this window's VU1 kick batch (1:1 with the window the worker will pop in
+        // processWindow) so kick output lands in its own window in order. A geometry-only VIF chain
+        // has empty m_queue but pending kicks → still materialize the window (force) so its batch is
+        // consumed and lockstep holds. No-op unless MTVU is active (haveKicks stays false).
+        const bool haveKicks = g297HasPendingKicks();
+        if (!m_queue.empty() || haveKicks)
+        {
+            g297OnWindowHandoff();
+            G150Mtgs::instance().enqueueWindow(m_processFn, std::move(m_queue), /*force=*/true);
+            m_queue.clear();
+        }
         return;
     }
 

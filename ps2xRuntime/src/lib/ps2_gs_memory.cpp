@@ -363,5 +363,3 @@ namespace GSMem
         return PixelStorageTraits<P4HH>::Read(PageTableC32, data, bp, bw, x, y);
     }
 }
-
-
