@@ -126,43 +126,36 @@ Graphic Test" below for which route to use it on.
 
 ## Known Issues (ACTIVE)
 
-1. Low performance due to an incomplete native renderer. **Native-renderer stack (G260-G298) is
-   DEFAULT-ON; CPU-raster arc CLOSED at G259.** G298 parallelized the native CT32 framebuffer pack
-   and whole-texture decode through joined, disjoint row jobs. Final no-frame-dump MAP-0 measured
-   87.04 ms default versus 92.60 ms mean with G298 killed (~6.0% frame reduction; GSimage
-   66.38 vs 72.58 ms), while its exact oracles compared 512M+ pixels with `bad=0` and the full
-   normal-presentation matrix passed. Host/load drift is substantial, so compare arms interleaved
-   and keep capture I/O out of performance timings.
-   Master rollback `DC2_G26X_NO_NATIVE=1` (whole G260-G266 stack); per-lever kill switches are in
-   `plans/phase-history.md`'s "Current Levers" table (grep it) or each phase's own
-   `plans/phase-GXX-fix-log.md` — do not hand-maintain a duplicate lever list in this file.
-   **Durable perf premise (G302, 2026-07-19 — MTVU PROMOTED, POLE RE-FLIPPED EE→GS):** the VU1
-   interpreter now runs on a **dedicated worker thread by default** (kill switch `DC2_G297_NO_MTVU=1`;
-   flip point `ps2_runtime.cpp` `G297Mtvu::computeActive()`). This broke the EE-VU1 pole that G300–G301
-   diagnosed: interleaved MAP-0 A/B (off 91.7 / mtvu 77.6 / off2 91.5 ms) = **−15.3% frame / +18% FPS**,
-   ~70× the 0.2 ms drift; EE cpuMs **87→21**, onCPU **96%→27%**, VIF1(EE) **77→8**; GSimage flat ~55.
-   The mechanism is G301's worker-owned persistent VU RAM + ordered VIF write-events (VIF1 is the
-   complete VU-RAM funnel — 4 sites, no memory-mapped Store path; keep the live-RAM EE-shadow writes).
-   Full promotion gate passed with zero regressions: title (211650 + mural), dense title temporal &
-   MAP-0 dense body-presence (both g277 arm-compared == OFF), `correct_light`, `dungeon_1`, `map_2_zoom`,
-   MAP-0 full-Max, `map_4`, `map_4_zoom` — all reviewed against hardware references, no
-   fatal/mismatch/bad/inv/fail. Detail: `plans/phase-G302-fix-log.md`.
-   **The frame is GS-worker-bound (G303 confirmed by direct per-thread measurement).** The pole is the
-   **GS worker's TOTAL processWindow cost** (`[G303:vu1w] gsWorkerMs/f ≈ frame`; MAP-0 cool ~96 ms,
-   warm co-critical) — of which **`GSimage` is only a ~67% subset** (the rest = register replay /
-   native submit `fut.get()` / materialization+readback). The **VU1 worker (~72 ms) is BELOW the GS
-   worker and never gates it** (`gsStall=0.0`, runs ~3 frames ahead); the EE is idle (cpuMs ~18, onCPU
-   ~18%). **MTVU (G302) is regime-dependent, NOT regressive:** `mtvu on ≈ off ≈ 100 ms` in the cool/
-   EE-idle regime (offload neutral); the −15% was the warm/EE-saturated regime — MTVU wins only when
-   the EE is the pole. This **RE-ACTIVATES the G300 async native-submit lever** (the GS worker's ~4–8 ms
-   synchronous backend `fut.get()` wait is now on the pole thread). G299's `DC2_G299_PROFILE=1` census +
-   the `plans/phase-G300-preflight.md` hazard census are the ready substrate. **Attribution rules
-   (G303):** always re-run the per-thread A/B and attribute by `gsWorkerMs/f` (NOT `GSimage`, a subset);
-   derivative arms = slow GS worker `DC2_G298_NO_PAR_PREP=1`, slow VU1 worker `DC2_G303_VU1_SLOW_US=<us>`
-   (`DC2_G295_VU1_DIAG_LOOP=1` DISABLES MTVU → not a valid perturbation of the promoted path). Instrument
-   `[G303:vu1w]` under `DC2_PERF`/`DC2_G303_INSTR` (default-off). **REFUTED (do not re-chase):** "VU1
-   worker is the pole", "VU1↔GS overlap is the gap". Architecture design: `plans/arc-native-renderer.md`.
-   **Active/next phase status is tracked only in `plans/ROADMAP.MD`.**
+1. Low performance due to an incomplete native renderer. Native-renderer stack (G260-G298) is
+   DEFAULT-ON; CPU-raster arc CLOSED at G259. Master rollback `DC2_G26X_NO_NATIVE=1`; per-lever
+   kill switches are in `plans/phase-history.md` or each phase's own `plans/phase-GXX-fix-log.md`
+   — do not hand-maintain a duplicate lever list here.
+   **Current pole (G310 final direct per-thread measurement): the GS worker's TOTAL cost**
+   (84.40 ms mean default vs 94.93 ms G310-killed), of which `GSimage` is a subset
+   (54.83 vs 63.80 ms). VU1 runs on a dedicated worker thread by default since G302 (kill
+   `DC2_G297_NO_MTVU=1`), remains below the GS worker at roughly 68-73 ms, and records
+   `gsStall=0`; the EE is mostly idle.
+   **Milestone-2 status (G310, 2026-07-19): the first logical-vs-physical framebuffer slice is
+   DEFAULT-ON.** One private 512x512 CT32 logical atlas now represents publication-order authority
+   across the five physical RTT/work layouts. CT32 display consumers bind it directly; a bounded
+   overwritten-alias retirement and exact resident PSMT8 views close the measured downstream
+   chain. The observed `TA0=48, AEM=1` CT24 family remains on the legacy path. Exact coverage:
+   251.66M warmed + 83.89M rebuilt-final pixels `bad=0`; full hardware-reference route matrix,
+   996-frame dense title, and 651-frame dense Max-body gate passed. Final same-executable means:
+   92.61 ms default vs 104.39 ms kill (-11.29%, +12.7% FPS), with run-median ranges separated.
+   Rollback `DC2_G310_NO_LOGICAL=1` or `DC2_G310_LOGICAL=0`; exact verifier
+   `DC2_G310_VERIFY=1`; stats `DC2_G310_STAT=1`. G309 remains a default-off oracle/substrate.
+   **G311 (2026-07-20): batched page-delta atlas maintenance is a NO-GO** (premise gate). The
+   composite is already cheap (~230.8 µs) and there is no page-level temporal coherence (~107/128
+   pages change every refresh, `noop=0`), so the incremental path — built + proven bit-exact
+   (`bad=0`/334.8M px) — is neutral-to-regressive (306 µs/refresh, fragments into ~5-20 round-trips).
+   Kept default-off substrate `DC2_G311_INCREMENTAL=1` (kill `DC2_G311_NO_INCREMENTAL=1`); census
+   `DC2_G311_CENSUS=1`, oracle `DC2_G311_VERIFY=1`. The G310 default is unchanged (title `211650`,
+   MAP-0 full Max verified). **Next is G312:** bounded re-profile of the GS-worker's own compute
+   buckets (register replay vs raster vs CT32 pack) to find a new bounded sub-term or confirm the
+   remaining entry is a re-architecture; all bounded composite/async/pipeline slices are exhausted.
+   Architecture design + full pillar/lever history: `plans/arc-native-renderer.md`. Latest fix-log:
+   `plans/phase-G311-fix-log.md`. **Active/next phase status is tracked only in `plans/ROADMAP.MD`.**
 2. Active pre-native-renderer graphical issues
 - **Sindain inventory circular viewport** shows colored noise instead of a live 3D character
    portrait (`ref/dumps/inventory.png` vs `captures/g189_inventory.png`). Reachable via both debug
