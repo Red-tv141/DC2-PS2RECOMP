@@ -5330,6 +5330,20 @@ static std::atomic<uint64_t> g_g310MatPages[8]{};
 static std::atomic<uint64_t> g_g310T8Candidates{0}, g_g310T8Views{0},
     g_g310T8BuildFail{0}, g_g310T8RejShape{0}, g_g310T8RejPage{0},
     g_g310T8RejClut{0};
+// G311: batched page-delta maintenance of the G310 logical atlas. The full G309 compositor is
+// retained as fail-closed recovery + exact oracle; when enabled, producer transitions mark the
+// snapshot page-granular stale instead of de-initializing it, and the next display consumer
+// refreshes only changed 64x32 pages through the pre-built g310ApplyDesired incremental path
+// (GPU-to-GPU copies for resident winners, guest uploads for changed guest winners) rather than a
+// full 512x512 recomposition. Page state commits only after the backend update succeeds.
+static bool g_g310Stale = false;
+static bool g_g311InOracle = false; // suppress census timing/histogram during the verify rebuild
+static std::atomic<uint64_t> g_g311Refreshes{0}, g_g311RefreshWork{0},
+    g_g311RefreshNoop{0}, g_g311Stales{0}, g_g311CompositeN{0},
+    g_g311CompositeUs{0}, g_g311IncrementalN{0}, g_g311IncrementalUs{0},
+    g_g311VerifyN{0}, g_g311VerifyPixels{0}, g_g311VerifyBad{0},
+    g_g311VerifyMiss{0};
+static std::atomic<uint64_t> g_g311DeltaHist[8]{};
 static bool g310Requested();
 static bool g310On();
 static bool g310VerifyOn();
@@ -5345,6 +5359,10 @@ static void g310BeginFreeze();
 static void g310EndFreeze(bool submitted);
 static bool g310FrozenUsable();
 static void g310Report();
+static bool g311On();
+static bool g311CensusOn();
+static bool g311VerifyOn();
+static void g311Report();
 struct G310BatchFreeze
 {
     bool active = false;
@@ -8545,6 +8563,43 @@ static bool g310T8ViewOn()
     return s_enabled && g310On() && !g310VerifyOn();
 }
 
+// G311 incremental page-delta refresh. Default-off during bring-up (opt-in DC2_G311_INCREMENTAL);
+// after promotion this flips to default-on with kill DC2_G311_NO_INCREMENTAL. The full G310
+// composite remains the immutable control arm and the fail-closed recovery/oracle path.
+static bool g311On()
+{
+    static const bool s_on = []() {
+        if (envFlagEnabled("DC2_G311_NO_INCREMENTAL") ||
+            envFlagDisabled("DC2_G311_INCREMENTAL"))
+            return false;
+        // Bring-up default: require the explicit opt-in. Flip to `return true;` at promotion.
+        return envFlagEnabled("DC2_G311_INCREMENTAL");
+    }();
+    // The G310 verifier compares the full-composite snapshot to legacy; keep the incremental path
+    // out of that behavior-pure oracle so DC2_G310_VERIFY always exercises the control arm.
+    return s_on && g310On() && !g310VerifyOn();
+}
+
+static bool g311CensusOn()
+{
+    // Premise-gate instrument: times the full composite + histograms changed pages per rebuild.
+    // Zero behavior change; safe to leave gated with DC2_G310_STAT for a combined stat run.
+    static const bool s_on =
+        envFlagEnabled("DC2_G311_CENSUS") ||
+        envFlagEnabled("DC2_G311_INCREMENTAL") ||
+        envFlagEnabled("DC2_G311_VERIFY");
+    return s_on;
+}
+
+static bool g311VerifyOn()
+{
+    // Self-contained exact oracle: after an incremental refresh, compare the logical FBO readback
+    // to a freshly recomputed full G309 composite of the same desired page map (bad==0 proves
+    // incremental == full-composite; G310 already proved full-composite == legacy publication).
+    static const bool s_on = envFlagEnabled("DC2_G311_VERIFY");
+    return s_on && g311On();
+}
+
 static void g310Report()
 {
     if (!g310StatOn() && !g310On() &&
@@ -8618,6 +8673,47 @@ static void g310Report()
         (unsigned long long)g_g310T8RejShape.load(std::memory_order_relaxed),
         (unsigned long long)g_g310T8RejPage.load(std::memory_order_relaxed),
         (unsigned long long)g_g310T8RejClut.load(std::memory_order_relaxed));
+    g311Report();
+}
+
+static void g311Report()
+{
+    if (!g311CensusOn() && !g311On())
+        return;
+    const uint64_t compN = g_g311CompositeN.load(std::memory_order_relaxed);
+    const uint64_t incN = g_g311IncrementalN.load(std::memory_order_relaxed);
+    const uint64_t compUs = g_g311CompositeUs.load(std::memory_order_relaxed);
+    const uint64_t incUs = g_g311IncrementalUs.load(std::memory_order_relaxed);
+    std::fprintf(
+        stderr,
+        "[G311:stat] on=%d stale=%d refresh(n=%llu work=%llu noop=%llu) stales=%llu "
+        "composite(n=%llu us=%llu avg=%.1f) incremental(n=%llu us=%llu avg=%.1f) "
+        "verify(n=%llu pixels=%llu bad=%llu miss=%llu)\n",
+        g311On() ? 1 : 0, g_g310Stale ? 1 : 0,
+        (unsigned long long)g_g311Refreshes.load(std::memory_order_relaxed),
+        (unsigned long long)g_g311RefreshWork.load(std::memory_order_relaxed),
+        (unsigned long long)g_g311RefreshNoop.load(std::memory_order_relaxed),
+        (unsigned long long)g_g311Stales.load(std::memory_order_relaxed),
+        (unsigned long long)compN, (unsigned long long)compUs,
+        compN ? static_cast<double>(compUs) / static_cast<double>(compN) : 0.0,
+        (unsigned long long)incN, (unsigned long long)incUs,
+        incN ? static_cast<double>(incUs) / static_cast<double>(incN) : 0.0,
+        (unsigned long long)g_g311VerifyN.load(std::memory_order_relaxed),
+        (unsigned long long)g_g311VerifyPixels.load(std::memory_order_relaxed),
+        (unsigned long long)g_g311VerifyBad.load(std::memory_order_relaxed),
+        (unsigned long long)g_g311VerifyMiss.load(std::memory_order_relaxed));
+    // Changed-page histogram per full composite: the deletion ceiling for the incremental path.
+    // Buckets: 0, 1-4, 5-16, 17-32, 33-64, 65-96, 97-127, 128 pages changed vs the prior snapshot.
+    std::fprintf(stderr, "[G311:delta] hist(0=%llu 1-4=%llu 5-16=%llu 17-32=%llu "
+                         "33-64=%llu 65-96=%llu 97-127=%llu 128=%llu)\n",
+                 (unsigned long long)g_g311DeltaHist[0].load(std::memory_order_relaxed),
+                 (unsigned long long)g_g311DeltaHist[1].load(std::memory_order_relaxed),
+                 (unsigned long long)g_g311DeltaHist[2].load(std::memory_order_relaxed),
+                 (unsigned long long)g_g311DeltaHist[3].load(std::memory_order_relaxed),
+                 (unsigned long long)g_g311DeltaHist[4].load(std::memory_order_relaxed),
+                 (unsigned long long)g_g311DeltaHist[5].load(std::memory_order_relaxed),
+                 (unsigned long long)g_g311DeltaHist[6].load(std::memory_order_relaxed),
+                 (unsigned long long)g_g311DeltaHist[7].load(std::memory_order_relaxed));
 }
 
 // A resident target's FBO content changed over GS rows [rowLo..rowHi]. Bump the epoch of every
@@ -9042,11 +9138,52 @@ static bool g310DecodeGuestRun(uint32_t pageY, uint32_t pageX0,
     return true;
 }
 
+// Count how many of the 128 logical pages differ between two committed page states. A page differs
+// when its winning source target changes, when the resident source's generation changes, or when a
+// guest-owned page's content hash changes. This is exactly the set the incremental path re-copies,
+// so the census histogram of this count is the deletion ceiling of the full-composite cost.
+static uint32_t g311DeltaCount(const std::array<G310PageState, 128> &next,
+                               const std::array<G310PageState, 128> &prev)
+{
+    uint32_t changed = 0u;
+    for (size_t p = 0u; p < 128u; ++p)
+    {
+        const G310PageState &n = next[p];
+        const G310PageState &o = prev[p];
+        const bool same =
+            n.sourceTi == o.sourceTi &&
+            (n.sourceTi >= 0 ? n.sourceGen == o.sourceGen
+                             : n.guestHash == o.guestHash);
+        if (!same)
+            ++changed;
+    }
+    return changed;
+}
+
+static void g311RecordDelta(uint32_t changed)
+{
+    size_t bucket;
+    if (changed == 0u) bucket = 0u;
+    else if (changed <= 4u) bucket = 1u;
+    else if (changed <= 16u) bucket = 2u;
+    else if (changed <= 32u) bucket = 3u;
+    else if (changed <= 64u) bucket = 4u;
+    else if (changed <= 96u) bucket = 5u;
+    else if (changed <= 127u) bucket = 6u;
+    else bucket = 7u;
+    g_g311DeltaHist[bucket].fetch_add(1u, std::memory_order_relaxed);
+}
+
 static bool g310ApplyDesired(
     const std::array<G310DesiredPage, 128> &desired)
 {
     if (!g_g310Initialized || g_g310Frozen)
         return false;
+    // Only measure/account the incremental path when it is the active mechanism; a G311-off
+    // no-change ApplyDesired must not pollute the census run's timers/histograms.
+    const bool census = g311CensusOn() && g311On();
+    const auto t0 = census ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
     std::array<G310PageState, 128> next = g_g310Pages;
     std::array<bool, 128> guestWrite{};
     std::array<bool, 128> gpuWrite{};
@@ -9186,6 +9323,26 @@ static bool g310ApplyDesired(
     g_g310AuthorityMoves.fetch_add(moves, std::memory_order_relaxed);
     g_g310NoopPages.fetch_add(noops, std::memory_order_relaxed);
     g_g310Refresh.fetch_add(1u, std::memory_order_relaxed);
+    g_g310Stale = false;
+    const uint64_t work = noops <= 128u ? 128u - noops : 0u;
+    if (g311On())
+    {
+        g_g311Refreshes.fetch_add(1u, std::memory_order_relaxed);
+        g_g311RefreshWork.fetch_add(work, std::memory_order_relaxed);
+        if (work == 0u)
+            g_g311RefreshNoop.fetch_add(1u, std::memory_order_relaxed);
+    }
+    if (census)
+    {
+        const auto us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        g_g311IncrementalN.fetch_add(1u, std::memory_order_relaxed);
+        g_g311IncrementalUs.fetch_add(
+            static_cast<uint64_t>(us < 0 ? 0 : us), std::memory_order_relaxed);
+        g311RecordDelta(static_cast<uint32_t>(work));
+    }
     return true;
 }
 
@@ -9248,12 +9405,28 @@ static bool g310Initialize(
             next[page] = state;
         }
     }
+    const bool census = g311CensusOn() && !g_g311InOracle;
+    const auto t0 = census ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
     if (!g310_backend_build_logical_composite(s_pageMap, s_basePixels))
     {
         g310Invalidate("composite", true);
         return false;
     }
+    if (census)
+    {
+        const auto us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t0)
+                .count();
+        g_g311CompositeN.fetch_add(1u, std::memory_order_relaxed);
+        g_g311CompositeUs.fetch_add(
+            static_cast<uint64_t>(us < 0 ? 0 : us), std::memory_order_relaxed);
+        // Changed pages vs the prior committed snapshot = the incremental deletion ceiling.
+        g311RecordDelta(g311DeltaCount(next, g_g310Pages));
+    }
     g_g310Pages = next;
+    g_g310Stale = false;
     g_g310Initialized = true;
     g_g310Init.fetch_add(1u, std::memory_order_relaxed);
     g_g310Refresh.fetch_add(1u, std::memory_order_relaxed);
@@ -9383,6 +9556,77 @@ static bool g310RetireSeededAliases()
     return true;
 }
 
+// G311 exact oracle. The logical FBO currently holds the incremental page-delta result. Snapshot
+// it, force a full G309 composite of the SAME desired page map into the same FBO, snapshot that,
+// and compare all 512x512 pixels. bad==0 proves incremental == full-composite; G310 already proved
+// full-composite == legacy publication, so this transitively proves incremental == legacy. The
+// full rebuild leaves g_g310Pages/g_g310Initialized consistent (identical desired), and since the
+// two results are equal the display binds a correct snapshot either way.
+static void g311VerifyIncremental(const std::array<G310DesiredPage, 128> &desired,
+                                  int seedTi)
+{
+    static std::vector<uint32_t> s_inc;
+    static std::vector<uint32_t> s_full;
+    if (!g178_backend_read_color(kG310LogicalFbp, 512, 512, 0, 512, s_inc) ||
+        s_inc.size() != 512u * 512u)
+    {
+        g_g311VerifyMiss.fetch_add(1u, std::memory_order_relaxed);
+        return;
+    }
+    g_g311InOracle = true;
+    g_g310Initialized = false;
+    const bool ok =
+        g310Initialize(desired, seedTi) &&
+        g178_backend_read_color(kG310LogicalFbp, 512, 512, 0, 512, s_full) &&
+        s_full.size() == 512u * 512u;
+    g_g311InOracle = false;
+    if (!ok)
+    {
+        g_g311VerifyMiss.fetch_add(1u, std::memory_order_relaxed);
+        return;
+    }
+    uint64_t bad = 0u;
+    std::array<uint32_t, 128> pageBad{};
+    std::array<uint32_t, 128> firstInc{};
+    std::array<uint32_t, 128> firstFull{};
+    for (uint32_t glY = 0u; glY < 512u; ++glY)
+        for (uint32_t x = 0u; x < 512u; ++x)
+        {
+            const size_t i = static_cast<size_t>(glY) * 512u + x;
+            if (s_inc[i] == s_full[i])
+                continue;
+            const uint32_t gsY = 511u - glY;
+            const size_t page =
+                static_cast<size_t>(gsY >> 5u) * 8u + (x >> 6u);
+            if (pageBad[page]++ == 0u)
+            {
+                firstInc[page] = s_inc[i];
+                firstFull[page] = s_full[i];
+            }
+            ++bad;
+        }
+    const uint64_t n =
+        g_g311VerifyN.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    g_g311VerifyPixels.fetch_add(512u * 512u, std::memory_order_relaxed);
+    const uint64_t totalBad =
+        g_g311VerifyBad.fetch_add(bad, std::memory_order_relaxed) + bad;
+    if (bad != 0u || n <= 8u || (n % 128u) == 0u)
+        std::fprintf(stderr,
+                     "[G311:vfy] n=%llu pixels=262144 bad=%llu totalBad=%llu\n",
+                     (unsigned long long)n, (unsigned long long)bad,
+                     (unsigned long long)totalBad);
+    if (bad != 0u && n <= 4u)
+        for (size_t page = 0u; page < pageBad.size(); ++page)
+            if (pageBad[page] != 0u)
+                std::fprintf(stderr,
+                             "[G311:vfy-page] n=%llu page=0x%x py=%zu px=%zu "
+                             "bad=%u inc=%08x full=%08x\n",
+                             (unsigned long long)n,
+                             0x2720u + static_cast<uint32_t>(page) * 32u,
+                             page / 8u, page % 8u, pageBad[page],
+                             firstInc[page], firstFull[page]);
+}
+
 static bool g310EnsureCurrent()
 {
     if (!g310On())
@@ -9396,9 +9640,15 @@ static bool g310EnsureCurrent()
         g_g310Initialized = false;
         return false;
     }
-    return g_g310Initialized
-        ? g310ApplyDesired(desired)
-        : g310Initialize(desired, seedTi);
+    if (!g_g310Initialized)
+        return g310Initialize(desired, seedTi);
+    // G311: incremental page-delta refresh of the persisted snapshot. On any backend failure it
+    // fails closed (g310Invalidate → g_g310Initialized=false → full composite next consumer).
+    if (!g310ApplyDesired(desired))
+        return false;
+    if (g311VerifyOn())
+        g311VerifyIncremental(desired, seedTi);
+    return true;
 }
 
 static void g310Invalidate(const char *stage, bool backendFailure)
@@ -9454,10 +9704,17 @@ static void g310NoteProducerWrite(int ti, int rowLo, int rowHi)
         return;
     }
     // Any producer write changes page generations. Rebuilding each transition immediately caused
-    // thousands of synchronous jobs; the next admitted display consumer reconstructs one coherent
-    // snapshot with the one-pass compositor.
-    g_g310Initialized = false;
+    // thousands of synchronous jobs; the next admitted display consumer reconstructs the snapshot.
+    // G310 default: full one-pass recomposition. G311: keep the snapshot initialized and mark it
+    // page-granular stale so the consumer refreshes only the changed pages (g310ApplyDesired).
     g_g310Invalidations.fetch_add(1u, std::memory_order_relaxed);
+    if (g311On())
+    {
+        g_g310Stale = true;
+        g_g311Stales.fetch_add(1u, std::memory_order_relaxed);
+        return;
+    }
+    g_g310Initialized = false;
 }
 
 static void g310NoteTargetClean(bool publicationOk)
@@ -9474,10 +9731,17 @@ static void g310NoteTargetClean(bool publicationOk)
         g_g310RefreshPending = true;
         return;
     }
-    // Publication changes winner pages from a resident target to guest VRAM. Recompose lazily as
-    // one snapshot at the next display consumer instead of issuing per-page guest uploads here.
-    g_g310Initialized = false;
+    // Publication changes winner pages from a resident target to guest VRAM. Recompose lazily at
+    // the next display consumer instead of issuing per-page guest uploads here. G311 refreshes only
+    // the changed pages; the G310 default fully recomposes.
     g_g310Invalidations.fetch_add(1u, std::memory_order_relaxed);
+    if (g311On())
+    {
+        g_g310Stale = true;
+        g_g311Stales.fetch_add(1u, std::memory_order_relaxed);
+        return;
+    }
+    g_g310Initialized = false;
 }
 
 static void g310BeginFreeze()
@@ -9501,8 +9765,16 @@ static void g310EndFreeze(bool submitted)
         g_g310Initialized = false;
     else if (invalidate)
     {
-        g_g310Initialized = false;
+        // A producer wrote during the freeze. G311 marks the persisted snapshot stale (page-delta
+        // refresh next consumer); the G310 default de-initializes for a full recomposition.
         g_g310Invalidations.fetch_add(1u, std::memory_order_relaxed);
+        if (g311On())
+        {
+            g_g310Stale = true;
+            g_g311Stales.fetch_add(1u, std::memory_order_relaxed);
+        }
+        else
+            g_g310Initialized = false;
     }
 }
 
@@ -9606,7 +9878,7 @@ static bool g310PrepareLogical(bool &useLogical)
     }
     else
         useLogical = true;
-    if (g310StatOn() && (n == 1u || (n % 64u) == 0u))
+    if ((g310StatOn() || g311CensusOn()) && (n == 1u || (n % 64u) == 0u))
         g310Report();
     return true;
 }
