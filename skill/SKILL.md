@@ -1,11 +1,6 @@
 ---
 name: ps2-recomp-agent-skill
-description: "Expert PS2 game reverse engineering and PS2Recomp pipeline porting. Use for ISO/ELF extraction, MIPS R5900 analysis, TOML configuration, syscall stubbing, C++ runtime debugging, VU1/GS graphics debugging, hang/deadlock triage, PCSX2 A/B comparison, recompiled-runtime performance work, and GhydraMCP interaction. Use when the user mentions PS2Recomp, ps2xRuntime, cmake incremental build, SLES, SLUS, SCUS, SCES, out_*.cpp, runner/*.cpp, MIPS recompilation, game override, PCSX2 DebugServer, ref/functions static export, PS2 porting, or any PlayStation 2 static recompilation task."
-metadata:
-  category: development
-  risk: unknown
-  source: community
-  date_added: "2026-03-06"
+description: "Expert PS2 game reverse engineering and PS2Recomp pipeline porting. Use for ISO/ELF extraction, MIPS R5900 analysis, TOML configuration, syscall stubbing, C++ runtime debugging, VU1/GS graphics debugging, native-renderer residency and downstream-composition validation, hang/deadlock triage, PCSX2 A/B comparison, recompiled-runtime performance work, and GhydraMCP interaction. Use when the user mentions PS2Recomp, ps2xRuntime, cmake incremental build, SLES, SLUS, SCUS, SCES, out_*.cpp, runner/*.cpp, MIPS recompilation, game override, PCSX2 DebugServer, ref/functions static export, PS2 porting, or any PlayStation 2 static recompilation task."
 ---
 
 # PS2Recomp — Behavioral Constraint System
@@ -28,9 +23,9 @@ This table tells you WHERE to find detailed instructions. Load the resource file
 | **Syscall/stub implementation** | `04-runtime-syscalls-stubs.md` | Syscall table, stub patterns, runtime structure |
 | **Understand a function (`sub_xxx`): what it does, callers, globals, stub-vs-recompile** | `14-static-analysis-navigation.md` | **Primary** — static function DB (`ref/functions/`) + indexes + graph. No live Ghidra needed |
 | **Live Ghidra analysis (ONLY if no static export exists)** | `05-ghidra-ghydramcp-guide.md` | Fallback Ghidra scripting / MCP patterns |
-| **Graphics bug (wrong geometry/colour/texture, black/blue screen, VU1/GS)** | `15-vu1-gs-debugging.md` | VU1 interpreter correctness (opcode-table + flag-pipeline hazards FIRST), GS state checklist, packet-level `.gs` A/B (§4.0), lever doctrine |
+| **Graphics bug (wrong geometry/colour/texture, black/blue screen, VU1/GS)** | `15-vu1-gs-debugging.md` | VIF/DMA delivery, VU1 opcode/flag/scalar-pipeline ordering, GS state, deferred-VRAM ordering, packet-level `.gs` A/B (§4.0), lever doctrine |
 | **Hang / deadlock / freeze / thread starvation (no crash)** | `16-runtime-concurrency-threading.md` | Guest-lock model, release-on-wait rule, ABBA hazard, wake handoff, hang triage |
-| **Slow / low FPS / stutter (game is CORRECT but slow)** | `17-performance-optimization.md` | Measure-first doctrine, runtime hotspot classes, safe optimization protocol |
+| **Slow / low FPS / stutter / native-renderer residency work** | `17-performance-optimization.md` | Current-binary premise gate, payoff-ceiling test, inclusive-timer attribution, consumer ownership, promotion/retirement protocol |
 | **Audio bug (silence, no SFX/music, crackle, wrong pitch, stall-on-sound)** | `18-audio-spu2-iop-debugging.md` | Symptom triage, VAG/ADPCM checks, ENDX completion contract, stub tiers |
 | **Memory card / saves, pad input, disc file I/O ("file not found", save hang, dead sticks)** | `19-memcard-pads-fileio.md` | libmc async contract, pad data contract, LSN/ISO mapping |
 | **Hang/black screen at intro video / cutscene (FMV)** | `20-fmv-ipu-cutscenes.md` | Skip-first strategy tiers, 3-leg hang triage, post-skip verification |
@@ -82,7 +77,9 @@ short run timeouts, always kill the game process after a test, never list `runne
 **A.1.5 - Resume the active phase.** If `plans/ROADMAP.MD` exists, read the top ACTIVE section and
 the latest `plans/phase-*-fix-log.md` it names before changing code. For DC2 specifically, also read
 `resources/appendix-dc2-project.md` sections 3 and 6 for the current build/run and render/perf
-operating rules. Treat the roadmap/fix-log as newer than this skill when they disagree.
+operating rules. Treat the roadmap/fix-log as newer than this skill when they disagree. Treat an
+older phase's performance profile as a hypothesis only: re-profile the current executable before
+selecting or implementing the next optimization slice.
 
 **A.2 — Generate run script.** Check if `run_game_agent.bat` exists in project root.
 - **Found:** Verify paths inside it still match `PS2_PROJECT_STATE.md`.
@@ -120,7 +117,7 @@ operating rules. Treat the roadmap/fix-log as newer than this skill when they di
 ⚠️ **DANGER:** Do NOT `list_dir` or `find_by_name` inside `runner/` (30,000+ files → context crash). Safe: `Test-Path`, `(Get-ChildItem -Filter *.cpp).Count`.
 
 **C.7** — If auto-detect failed: ask for game title, ISO path, repo path.
-**C.8** — Record everything in `PS2_PROJECT_STATE.md`.
+
 
 ### Continuous Refresh — Mandatory Triggers
 
@@ -141,10 +138,10 @@ operating rules. Treat the roadmap/fix-log as newer than this skill when they di
 Violating ANY = immediate, unrecoverable failure.
 
 1. **NEVER clean the build.** No `--clean-first`, no `Remove-Item build*`, no `--target clean`, no deleting `.obj` files. Full rebuild = **30+ hours**.
-2. **NEVER modify `runner/*.cpp`.** Auto-generated from MIPS. Recompiler overwrites your changes.
-3. **NEVER modify `.h` header files.** Headers → included by ALL 30,000+ runner `.cpp` → full recompilation.
+2. **NEVER modify or create any files inside the `runner/` directory.** `runner/*.cpp` files are auto-generated from MIPS, and the recompiler will overwrite any changes.
+3. **NEVER modify standard `.h` header files** to avoid full project recompilation.
 
-   **Instead:** Use file-scope `static` variables in `.cpp`, or `extern` declarations between `.cpp` pairs. See `10-agent-guardrails.md` §4 for the concrete pattern. If a `.h` change is truly unavoidable → **STOP**, tell the user the cost, get approval.
+   **Instead:** You are allowed and encouraged to create and modify `.inc` files to split complex logic and modularize non-runner code (e.g., Runtime or Override files like `dc2_game_override.cpp`). These `.inc` files must be included directly within the specific `.cpp` files. Alternatively, use file-scope `static` variables in `.cpp`, or `extern` declarations between `.cpp` pairs. See `10-agent-guardrails.md` §4 for the concrete pattern. If a `.h` change is truly unavoidable → **STOP**, tell the user the cost, get approval.
 
 4. **NEVER run destructive git commands.** No `checkout`, `clean`, `reset`, `stash`, `pull`.
 5. **NEVER assume file names or paths.** Use `list_dir`/`find_by_name`/`grep_search` to verify. Game assets vary per title. **Never assume game files are inside the PS2Recomp repo** — they're often in a separate workspace.
@@ -153,7 +150,7 @@ Violating ANY = immediate, unrecoverable failure.
 8. **NEVER pipe BUILD output to a file and never APPEND across runs.** Read build stdout directly so you see errors/exit code. (Redirection itself is fine for *game-run* harnesses that write a FRESH log and grep it — e.g. `run_30s_diagnose.ps1` — provided each run OVERWRITES, never appends, and you read back only a bounded slice.)
 9. **NEVER run `cmake` outside vcvars64.** Without it → missing SDK headers → build fails. Use x64 Native Tools Command Prompt or wrap: `cmd.exe /c "call ""<vcvars64_path>"" && cmake --build <build_dir>"`
 10. **NEVER list/search/scan inside `runner/` directories.** 30,000+ files → context overflow crash. Safe: `Test-Path`, `Get-ChildItem -Filter *.cpp | Select -First 1`, `view_file` on ONE specific path.
-11. **NEVER create files in the project root.** Temp files → your environment's scratchpad/temp dir (`%TEMP%`, the session scratchpad, or `/tmp/` on POSIX). Only `PS2_PROJECT_STATE.md`, `run_game_agent.bat`, and the `plans/` fix-log dir belong in the project.
+11. **NEVER create files in the project root.** Temp files → your environment's scratchpad/temp dir (`%TEMP%`, the session scratchpad, or `/tmp/` on POSIX). Only `PS2_PROJECT_STATE.md`, `run_game_agent.bat`, and the `plans/` fix-log dir belong in the project root. Ensure that any new `.inc` files are created inside the correct source subdirectories (e.g., `ps2xRuntime/src/`), and NEVER in the project root.
 12. **NEVER use a split memory allocator configuration.** If you redirect any allocation function to the runtime (TOML/stub/override), you must redirect the ENTIRE family (`malloc`, `free`, `realloc`, `calloc`, `memalign`, and their `_r` variants) to prevent silent heap and texture corruption.
 13. **NEVER assume `registerFunction` will hook a direct `jal` call.** Direct MIPS calls are translated statically to direct C++ calls and bypass dynamic dispatch. Always mark target functions as stubs in the TOML first to force dynamic dispatch, or override the caller.
 
@@ -229,7 +226,7 @@ Answer from memory (no looking):
 
 ---
 
-## §7 Understanding the Original Code — Static Export FIRST, Ghidra Fallback
+## §7 Understanding the Original Code — Static Export FIRST
 
 **Detect which mode this project uses before reaching for any tool** (full guide:
 `14-static-analysis-navigation.md`):
@@ -240,17 +237,6 @@ Answer from memory (no looking):
   `Read` it. Find by name: `Grep "NAME_<symbol>" ref/functions`. Who-touches-a-global:
   `globals_index.json`. Call graph: `calls_index.json`. **If this export exists, USE IT.**
 
-- **LIVE GHIDRA (fallback only if there's no static export):**
-```
-mcp_ghydra_instances_list()          # discover instances
-mcp_ghydra_functions_decompile(name) # understand sub_xxx
-mcp_ghydra_xrefs_list(to_addr)       # trace callers/callees
-mcp_ghydra_data_list_strings(filter) # find context strings
-```
-  These MCP tools may not be present in the environment. If the project exports statically,
-  you do not need them.
-
-**NEVER ask the user to look at Ghidra for you.** Use the static export, or the MCP tools.
 
 ### §7.5 PCSX2 MCP Quick Reference
 
@@ -291,7 +277,7 @@ For full tool catalog, A/B comparison workflow, and recipes → load `12-pcsx2-m
 | `12-pcsx2-mcp-playbook.md` | PCSX2 DebugServer tools, A/B comparison, recipes |
 | `13-decisional-brain.md` | Reasoning loop, diagnosis escalation, anti-patterns |
 | `14-static-analysis-navigation.md` | Static function DB (`ref/functions/`) + indexes + graphify; the preferred "understand a function" path |
-| `15-vu1-gs-debugging.md` | VU1 interpreter correctness, GS state checklist, capture-based A/B, diagnostic-lever doctrine |
+| `15-vu1-gs-debugging.md` | VU1 interpreter correctness (including pair/scalar-pipeline ordering), GS state checklist, capture-based A/B, diagnostic-lever doctrine |
 | `16-runtime-concurrency-threading.md` | Guest-execution lock model, release-on-wait, ABBA deadlock, wake handoff, IOP stalls, hang triage |
 | `17-performance-optimization.md` | Correctness-first perf doctrine, profiling, runtime hotspot classes, verification |
 | `18-audio-spu2-iop-debugging.md` | SPU2/IOP audio path, symptom triage, VAG/ADPCM, ENDX contract, stub tiers |
@@ -366,14 +352,19 @@ For full tool catalog, A/B comparison workflow, and recipes → load `12-pcsx2-m
 ## §10 STATE PROTOCOL & SESSION CLOSE
 
 ### State Protocol
-1. Session start → check for `PS2_PROJECT_STATE.md` (create from template if missing).
+1. Session start → check for `PS2_PROJECT_STATE.md`.
 2. Follow Mandatory Triggers (§2). After every major action → update state file.
 3. Runner command = state file `§ Active Runner Command` — read verbatim, never reconstruct.
 
 ### Session Close (Mandatory)
 1. **FIX LOG:** For each executable phase, write/finish `plans/phase-<ID>-fix-log.md` from `scripts/fix-log-template.md`. The **Rejected Hypotheses** and **Stale-When** sections are NOT optional — they are what stop the next phase from re-chasing a refuted theory or trusting a finding the latest fixes invalidated. (Long ports lose more time to re-litigating dead hypotheses than to the bugs themselves.)
-2. **SYNTHESIZE:** Write patterns (not events) to `## Learned Patterns`. Format: "`X causes Y, fix with Z`".
-3. **UPDATE:** Mark checkboxes, update crash table, update current phase.
-4. **VERIFY:** Read back state file to confirm updates are coherent.
+2. **PRESENTATION:** For GS/native-renderer work, verify normal downstream composition, not only
+   an internal oracle. Assert that each harness reached the intended game mode, then compare the
+   exact capture tick to hardware/PCSX2 references when available. Check edges/background as well
+   as the main subject; test fresh first-use and the rebuilt final default. Aggregate pixel counts
+   alone are insufficient.
+3. **SYNTHESIZE:** Write patterns (not events) to `## Learned Patterns`. Format: "`X causes Y, fix with Z`".
+4. **UPDATE:** Mark checkboxes, update crash table, update current phase.
+5. **VERIFY:** Read back state file to confirm updates are coherent.
 
 This is what makes the next session smarter. Skip it and the next agent starts from scratch.
