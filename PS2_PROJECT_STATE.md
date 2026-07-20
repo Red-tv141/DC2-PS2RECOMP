@@ -1,4 +1,4 @@
-﻿# PS2 Recomp Project State — Dark Cloud 2
+# PS2 Recomp Project State — Dark Cloud 2
 
 > **General, durable, forward-useful knowledge only** — operating rules, workspace/build facts,
 > currently-open issues (as short facts, not phase narrative), and cross-cutting technical
@@ -14,7 +14,7 @@
 > (2nd pass): moved the Resolved index, Current Levers table, Refuted/Do-Not-Re-chase list,
 > Title-3D-arc digest, and single-investigation technical dumps (CDynamicAnime struct offsets,
 > dungeon/event state machines, front-end state machine, PCSX2 cutscene pause point, C++ exception
-> model, floor-select input) to `plans/phase-history.md`. File dropped from 1399 to ~700 lines.
+> model, floor-select input) to `plans/phase-history.md`. 
 
 ## Quick Rules
 - **NO PER-SCREEN FIXES (hard rule).** Do not patch a symptom by writing
@@ -25,7 +25,7 @@
   itself would set it — not as a scoped band-aid. If a scoped lever is needed to PROVE a diagnosis, gate it
   opt-in (default-off) and never ship it as the fix.
 - Build with `cmake --build <build_dir>` only; no clean targets, no build-dir deletion.
-- Do NOT modify `runner/*.cpp` (generated) or `.h` headers (force full rebuild).
+- Do NOT modify/create files in `runner/`, or modify standard headers. Split complex non-runner/override logic (e.g. `dc2_game_override.cpp`) into `.inc` files inside source subdirectories (e.g. `ps2xRuntime/src/`), never in the project root.
 - Do NOT use destructive git commands. Keep diagnostics env-gated, quiet by default.
 - Build via the **PowerShell tool**, not Bash `cmd /c` (silently no-ops → stale exe).
   Verify a change landed: `grep -c <marker> build64/Release/dc2_runner.exe`.
@@ -46,25 +46,10 @@ session's first act) and compress its `PS2_PROJECT_STATE.md` "Resolved" entry to
 
 ### Standard phase checklist
 - Use the local PS2Recomp skill at `D:/ps2r/dc2/skill/SKILL.md`. Obey this file.
-- Do not modify `runner/*.cpp`; do not modify headers without explicit approval.
-- Do not clean the build or delete build artifacts; no destructive git.
-- Keep diagnostics env-gated and quiet by default.
-- Performance phases follow the "Aggressive performance policy" below: the opt-in arm may render
-  incorrectly during bring-up, but the default path must remain clean; keep one architectural
-  variable per arm, repair discovered parity failures in the same phase, never promote incorrect
-  output.
-- Build via the PowerShell tool (`build_rt.bat` → ps2_runtime, `build_runner.bat` → dc2_runner);
-  verify a change landed with `grep -c <marker> build64/Release/dc2_runner.exe`.
-- Verify perf/render changes by FULL-FRAME DISTRIBUTION (multiple frames) + visual review, never a
-  single golden sample alone (G150, G168, G174 all caught real bugs a single sample missed).
-- For anything touching threading/pipelining (MTGS worker, G157 pipeline, G144 band-replay), soak
-  with `DC2_FRAME_DUMP_EVERY=1` (dense per-tick dumping) — the default 60-tick cadence is too
-  coarse to catch transient (few-frame) races (G174).
-- When bisecting a perf lever (G144/G178/G150/G157/G172) on a NON-title route, remember the
-  frame-dump filename is the HOST TICK, not the guest scriptFrame — disabling GPU/tile-bin levers
-  can make the CPU path several× slower in wall-clock time, so a fixed `-Seconds` budget from a
-  title-only harness may not reach the same guest state; increase it and cross-check via a state
-  trace (e.g. `DC2_TRACE_F59`) (G223).
+- Performance phases follow the "Aggressive performance policy" below: the opt-in arm may render incorrectly during bring-up, but the default path must remain clean; keep one architectural variable per arm, repair discovered parity failures in the same phase, never promote incorrect output.
+- Verify perf/render changes by FULL-FRAME DISTRIBUTION (multiple frames) + visual review, never a single golden sample alone (G150, G168, G174 all caught real bugs a single sample missed).
+- For anything touching threading/pipelining (MTGS worker, G157 pipeline, G144 band-replay), soak with `DC2_FRAME_DUMP_EVERY=1` (dense per-tick dumping) — the default 60-tick cadence is too coarse to catch transient (few-frame) races (G174).
+- When bisecting a perf lever (G144/G178/G150/G157/G172) on a NON-title route, remember the frame-dump filename is the HOST TICK, not the guest scriptFrame — disabling GPU/tile-bin levers can make the CPU path several× slower in wall-clock time, so a fixed `-Seconds` budget from a title-only harness may not reach the same guest state; increase it and cross-check via a state trace (e.g. `DC2_TRACE_F59`) (G223).
 
 ### Aggressive performance policy (user-approved 2026-07-15)
 The remaining gap to 60 FPS requires architectural experiments, not more low-yield barrier
@@ -297,7 +282,7 @@ re-trigger a re-check of that route.
   (scripted, deterministic tests — suppresses live) → connected gamepad or
   `DC2_KEYBOARD=1` (live OWNS buttons + all four axes) → F40/F66 scripted default.
 - `run_30s_diagnose.ps1` now sets `DC2_PAD_INPUT` explicitly so a plugged pad can't
-  perturb golden smoke. Trace: `DC2_TRACE_PAD_INPUT` → `[G7:live]`. No header edits;
+  perturb golden smoke. Trace: `DC2_TRACE_PAD_INPUT` → `[G7:live]`.
   cross-thread snapshot reads are unsynchronised scalars (≤1 frame stale, like F66).
   Rumble not wired (raylib gamepad has no rumble API). See `plans/phase-G7-fix-log.md`.
 - **`DC2_RSTICK` (G49) — scripted RIGHT-STICK for headless tests.** `DC2_PAD_INPUT` only injects
