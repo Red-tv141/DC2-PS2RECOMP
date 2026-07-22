@@ -40,9 +40,7 @@ each with: (1) the exact defect / rule-out question, (2) the smallest known repr
 PCSX2-vs-runner comparison point if needed, (4) clear stop conditions. No new gameplay/route
 phases unless they reduce uncertainty for the active foundation defect. Write a
 `plans/phase-GXX-fix-log.md` before ending each executable phase — `plans/ROADMAP.MD` only ever
-gets a one-line "Active Phase" entry for the CURRENT phase, never a duplicated narrative. When a
-phase closes, move its narrative to `plans/phase-history.md` in the same session (or the next
-session's first act) and compress its `PS2_PROJECT_STATE.md` "Resolved" entry to one line.
+gets a one-line "Active Phase" entry for the CURRENT phase, never a duplicated narrative. 
 
 ### Standard phase checklist
 - Use the local PS2Recomp skill at `D:/ps2r/dc2/skill/SKILL.md`. Obey this file.
@@ -51,7 +49,7 @@ session's first act) and compress its `PS2_PROJECT_STATE.md` "Resolved" entry to
 - For anything touching threading/pipelining (MTGS worker, G157 pipeline, G144 band-replay), soak with `DC2_FRAME_DUMP_EVERY=1` (dense per-tick dumping) — the default 60-tick cadence is too coarse to catch transient (few-frame) races (G174).
 - When bisecting a perf lever (G144/G178/G150/G157/G172) on a NON-title route, remember the frame-dump filename is the HOST TICK, not the guest scriptFrame — disabling GPU/tile-bin levers can make the CPU path several× slower in wall-clock time, so a fixed `-Seconds` budget from a title-only harness may not reach the same guest state; increase it and cross-check via a state trace (e.g. `DC2_TRACE_F59`) (G223).
 
-### Aggressive performance policy (user-approved 2026-07-15)
+### Aggressive performance policy
 The remaining gap to 60 FPS requires architectural experiments, not more low-yield barrier
 micro-tuning. Performance phases may deliberately push an opt-in path until graphics diverge, then
 diagnose and repair that divergence inside the same phase/arc.
@@ -111,36 +109,12 @@ Graphic Test" below for which route to use it on.
 
 ## Known Issues (ACTIVE)
 
-1. Low performance due to an incomplete native renderer. Native-renderer stack (G260-G298) is
-   DEFAULT-ON; CPU-raster arc CLOSED at G259. Master rollback `DC2_G26X_NO_NATIVE=1`; per-lever
-   kill switches are in `plans/phase-history.md` or each phase's own `plans/phase-GXX-fix-log.md`
-   — do not hand-maintain a duplicate lever list here.
-   **Current pole (G310 final direct per-thread measurement): the GS worker's TOTAL cost**
-   (84.40 ms mean default vs 94.93 ms G310-killed), of which `GSimage` is a subset
-   (54.83 vs 63.80 ms). VU1 runs on a dedicated worker thread by default since G302 (kill
-   `DC2_G297_NO_MTVU=1`), remains below the GS worker at roughly 68-73 ms, and records
-   `gsStall=0`; the EE is mostly idle.
-   **Milestone-2 status (G310, 2026-07-19): the first logical-vs-physical framebuffer slice is
-   DEFAULT-ON.** One private 512x512 CT32 logical atlas now represents publication-order authority
-   across the five physical RTT/work layouts. CT32 display consumers bind it directly; a bounded
-   overwritten-alias retirement and exact resident PSMT8 views close the measured downstream
-   chain. The observed `TA0=48, AEM=1` CT24 family remains on the legacy path. Exact coverage:
-   251.66M warmed + 83.89M rebuilt-final pixels `bad=0`; full hardware-reference route matrix,
-   996-frame dense title, and 651-frame dense Max-body gate passed. Final same-executable means:
-   92.61 ms default vs 104.39 ms kill (-11.29%, +12.7% FPS), with run-median ranges separated.
-   Rollback `DC2_G310_NO_LOGICAL=1` or `DC2_G310_LOGICAL=0`; exact verifier
-   `DC2_G310_VERIFY=1`; stats `DC2_G310_STAT=1`. G309 remains a default-off oracle/substrate.
-   **G311 (2026-07-20): batched page-delta atlas maintenance is a NO-GO** (premise gate). The
-   composite is already cheap (~230.8 µs) and there is no page-level temporal coherence (~107/128
-   pages change every refresh, `noop=0`), so the incremental path — built + proven bit-exact
-   (`bad=0`/334.8M px) — is neutral-to-regressive (306 µs/refresh, fragments into ~5-20 round-trips).
-   Kept default-off substrate `DC2_G311_INCREMENTAL=1` (kill `DC2_G311_NO_INCREMENTAL=1`); census
-   `DC2_G311_CENSUS=1`, oracle `DC2_G311_VERIFY=1`. The G310 default is unchanged (title `211650`,
-   MAP-0 full Max verified). **Next is G312:** bounded re-profile of the GS-worker's own compute
-   buckets (register replay vs raster vs CT32 pack) to find a new bounded sub-term or confirm the
-   remaining entry is a re-architecture; all bounded composite/async/pipeline slices are exhausted.
-   Architecture design + full pillar/lever history: `plans/arc-native-renderer.md`. Latest fix-log:
-   `plans/phase-G311-fix-log.md`. **Active/next phase status is tracked only in `plans/ROADMAP.MD`.**
+1. **Low performance due to an incomplete native renderer.**
+   - Native-renderer stack (G260-G298) is DEFAULT-ON; CPU-raster arc CLOSED at G259. Master rollback: `DC2_G26X_NO_NATIVE=1`.
+   - **Current Thread Pole**: GS worker TOTAL cost (~84.4 ms default vs 94.9 ms G310-killed). VU1 runs on a dedicated worker thread by default since G302 (`DC2_G297_NO_MTVU=1`) at ~68-73 ms with `gsStall=0`; EE is mostly idle.
+   - **Active Milestone 2 Status**: G310 logical atlas is DEFAULT-ON (`DC2_G310_LOGICAL=1`), decoupling the 512x512 CT32 logical atlas from physical producer layouts.
+   - **Closed G-Phase Archive**: Historical closed G-phases (G300–G330) and their detailed measurements are archived in [phase-history.md](file:///D:/ps2r/dc2/plans/phase-history.md) and their respective fix logs ([phase-G330-fix-log.md](file:///D:/ps2r/dc2/plans/phase-G330-fix-log.md), etc.). Do not duplicate closed-phase narrative here.
+
 2. Active pre-native-renderer graphical issues
 - **Sindain inventory circular viewport** shows colored noise instead of a live 3D character
    portrait (`ref/dumps/inventory.png` vs `captures/g189_inventory.png`). Reachable via both debug
@@ -148,12 +122,12 @@ Graphic Test" below for which route to use it on.
    (indexed by `MenuCommonInfo+0x54`) → per-page draw fn, not yet identified. Harness:
    `tools/run_g189_inventory_ab.ps1` / `tools/run_g189b_present_ab.ps1`. **PARKED by user during
    the performance arc (2026-07-15); regression route only, do not investigate or fix now.**
-3. **Audio absent** — no music/SFX/voice; event scripts can WAIT on sound completion and stall
+3. **Interlace / field presentation jitter** — DISPFB/SMODE2/PMODE/CSR; presentation, not
+   geometry; compare PCSX2 deinterlacing first.
+4. **Memory-card save/load** — not implemented; blocks New Game/Load + long-form testing.
+5. **Audio absent** — no music/SFX/voice; event scripts can WAIT on sound completion and stall
    (check `StreamOpenState`/voice/stream flags first). libsd/IOP path unimplemented. See Runtime
    Gaps #1 below for the upstream IOP-subsystem fix reference.
-4. **Memory-card save/load** — not implemented; blocks New Game/Load + long-form testing.
-5. **Interlace / field presentation jitter** — DISPFB/SMODE2/PMODE/CSR; presentation, not
-   geometry; compare PCSX2 deinterlacing first.
 6. **FMV / movie playback** — IPU/MPEG/IOP; only prioritize if a movie wait blocks progression.
 7. **(RETEST after G186)** georama `DrawSub__8CEditMapFi` "null-vtable" crash
    (`[dispatch:pc-zero] from=0x1b4340 ra=0x0`) — G186 showed this `ra=0x0` signature is the
@@ -177,8 +151,7 @@ Graphic Test" below for which route to use it on.
     frame as a swap/buffering bug. Legacy mode behind `DC2_FORCE_DRAW_BUFFER_LATCH=1`.
 13. **Guest C heap must sit ABOVE guest `_end` (F58, RESOLVED, verify if `bad_alloc` reappears):**
     check `[F58:setupheap]` non-zero.
-14. **Max foot shadow** missing (MAP-0/MAP-4, G202-era residual, never resolved).
-15. **G178 GPU depth parity** — `DC2_G242_GPU_DEPTH=1` persistent GPU-depth bridge is opt-in only
+14. **G178 GPU depth parity** — `DC2_G242_GPU_DEPTH=1` persistent GPU-depth bridge is opt-in only
     (`PS2_PROJECT_STATE.md`/`plans/arc-native-renderer.md` GPU stepping-stones): its dirty
     ownership invariant fails on the title (G249), blocked on finding the missing CPU-write
     barrier. Not on the critical path (native-renderer stack G260-G289 covers perf instead).
@@ -330,6 +303,24 @@ Full mechanism/evidence for any entry below: `plans/phase-history.md` "ARCHIVED
 PS2_PROJECT_STATE.md 'Learned Patterns' DETAIL as of 2026-07-14", or the phase's own fix-log.
 
 **Threading / diagnostics**
+- **G316:** when the worker runs thousands of packet windows per frame, a detailed timer per
+  packet or per window can manufacture the pole it is meant to measure. Keep root timing coarse;
+  sample one complete frame behind a cached arm, compare against armed-empty, and reconcile only
+  quantities with the same sampling denominator. A large outer Path-2 slice selects an ordering
+  mechanism investigation, not a safe micro-optimization or cross-path reorder.
+- **G315:** a perfect-deletion super-set that only touches the promotion gate is a premise failure,
+  not permission to prototype. Mandatory upload, fence, authority, fallback, and publication costs
+  are non-zero, and target-specific coverage is lower than whole-bucket credit. Stop before behavior,
+  retain the existing diagnostics, and re-rank the whole critical thread.
+- **G314:** an upload dependency drain is not an upload-node deletion ceiling. Split required
+  producer-wave preparation/execution from backend submit wait and guest publication, then trace
+  the first following consumer. On MAP-0, 80% of edges were structurally chainable while only
+  ~5.0 ms/f was removable wait and just one edge/f had existing resident authority. Edge coverage
+  is not payoff coverage; nonresident texture readers require a separate page-authority mechanism.
+- **G313:** never derive byte-writer cost by subtracting one timer from an inclusive transfer
+  bucket. Direct no-`DC2_PERF` boundaries measured the IMAGE writer at 2.1-2.7 ms/f while the
+  preceding dependency-range execution owned the large interval. Premise-gate the exact body
+  before building bulk or threaded paths; optimize the dependency/publication edge when it pays.
 - **G281:** removing one exact read-side publication does not pay when a later overlapping
   writer still needs guest-authoritative physical pages: `mat(tex) -205` became
   `mat(cpu) +205` exactly. Count total publication causes, not one bucket. A read view and a
@@ -629,6 +620,34 @@ PS2_PROJECT_STATE.md 'Learned Patterns' DETAIL as of 2026-07-14", or the phase's
   should be audited for this exact affine-disguised-as-perspective pattern if a similar "texture
   seam bends at a triangle/quad edge on large geometry only" symptom appears elsewhere (GPU path
   too — parity-match both sampler implementations).
+
+- **G317 (2026-07-21): queue readiness is not batching payoff.** On steady MAP-0, every admitted
+  Path-2 window already had queued work, yet explicit GIF/VIF/path/IMAGE fences reduced the safe
+  run to 2.39 packets on average and retaining the GS lock across runs was exactly neutral. Before
+  building a transaction layer, measure both semantic run length and the overhead it can actually
+  remove. Track IMAGE continuation across all paths; malformed classification must fail closed.
+
+- **G318 (2026-07-21): an external sampling phase needs both host permission and matching current
+  Release symbols.** A blocked profiler or a stale PDB is not evidence about a renderer leaf; keep
+  the default path unchanged, review normal composition as the control, and repair observability
+  before designing another Path-2 architecture arm.
+- **G320 (2026-07-22): an external leaf becomes a useful target only after caller and consumer
+  attribution.** Backend/readback/publication is large enough to investigate, but G305 proves that
+  same-flush `glReadPixels` cannot be removed by generic overlap; first establish the exact CPU
+  authority consumer and completion-ordered replay contract.
+
+- **G322 (2026-07-22): never add mandatory consumer costs into a perfect-deletion estimate.** The
+  whole generic non-skip color backend job is only about 1.96 ms/frame. Named color publications
+  and G278 depth materialization still occur at true consumers or the frame/presentation boundary,
+  so a frame-scoped owner must pay them. Separate diagnostic controls when their instrumentation
+  interacts, and require normal composed-output review even when renderer behavior is unchanged.
+
+- **G323 (2026-07-22): a large required producer job is not automatically a removable producer
+  job.** Split the whole successful-flush interval into exclusive scopes, discard failed flushes,
+  reconcile the sum, and compare timestamp-shape empty controls. G310 logical/T8 preparation is
+  about 9.4 ms/frame gross, but disabling it restores a larger legacy publication chain; merging it
+  synchronously merely moves time into submit. First prove hideable worker wait plus ordered
+  completion/failure replay before building a deferred producer-to-consumer transaction.
 
 **Runtime / threading / ABI**
 - DC2 `LoadFile__FPcPvPi@0x149320` aborts the WHOLE game (`0x118FB0(0)`→`_Exit`) on ANY failed
