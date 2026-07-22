@@ -2,8 +2,8 @@
 // R=src X low byte, G=src GL-Y low byte, B.bit0=GL-Y bit8, B.bits1..2=byte lane,
 // B.bit3=src X bit8. The source is restricted to one dirty CT32 FBO, and every physical page
 // must be wholly outside all other dirty owners.
-static bool g281BuildT8Map(const G144Entry &e, int srcTi, int texW, int texH,
-                           std::vector<uint32_t> &out)
+static bool g281BuildT8MapCold(const G144Entry &e, int srcTi, int texW, int texH,
+                               std::vector<uint32_t> &out)
 {
     static const G281Ct32Inverse s_inv;
     if (!s_inv.ok || srcTi < 0 || srcTi >= static_cast<int>(kG248TargetCount) ||
@@ -57,6 +57,137 @@ static bool g281BuildT8Map(const G144Entry &e, int srcTi, int texW, int texH,
                                     0xFF000000u;
             out[static_cast<size_t>(vv) * texW + static_cast<size_t>(uu)] = packed;
         }
+    return true;
+}
+
+struct G326G281TargetKey
+{
+    int32_t fbW = 0, dirtyLo = 0, dirtyHi = 0, covLo = 0, covHi = 0;
+    uint32_t rangeFirst = 0u, rangeLast = 0u;
+    uint8_t fbw = 0u;
+    bool dirty = false, rangeValid = false;
+};
+struct G326G281Key
+{
+    uint32_t tbp0 = 0u;
+    int32_t srcTi = -1, texW = 0, texH = 0;
+    uint8_t tbw = 0u, psm = 0u;
+    std::array<G326G281TargetKey, kG248TargetCount> targets{};
+};
+static G326G281Key g326G281Key(const G144Entry &e, int srcTi, int texW, int texH)
+{
+    G326G281Key key{};
+    key.tbp0 = e.ctx.tex0.tbp0;
+    key.tbw = e.ctx.tex0.tbw;
+    key.psm = e.ctx.tex0.psm;
+    key.srcTi = srcTi;
+    key.texW = texW;
+    key.texH = texH;
+    for (uint32_t t = 0u; t < kG248TargetCount; ++t)
+    {
+        const G261Res &r = g_g261Res[t];
+        key.targets[t] = G326G281TargetKey{
+            r.fbW, r.dirtyLo, r.dirtyHi, r.covLo, r.covHi,
+            r.range.first, r.range.last, static_cast<uint8_t>(r.fbw),
+            r.dirty, r.range.valid};
+    }
+    return key;
+}
+static bool g326G281KeyEqual(const G326G281Key &a, const G326G281Key &b)
+{
+    if (a.tbp0 != b.tbp0 || a.srcTi != b.srcTi || a.texW != b.texW ||
+        a.texH != b.texH || a.tbw != b.tbw || a.psm != b.psm)
+        return false;
+    for (uint32_t t = 0u; t < kG248TargetCount; ++t)
+    {
+        const G326G281TargetKey &x = a.targets[t];
+        const G326G281TargetKey &y = b.targets[t];
+        if (x.fbW != y.fbW || x.dirtyLo != y.dirtyLo || x.dirtyHi != y.dirtyHi ||
+            x.covLo != y.covLo || x.covHi != y.covHi ||
+            x.rangeFirst != y.rangeFirst || x.rangeLast != y.rangeLast ||
+            x.fbw != y.fbw || x.dirty != y.dirty || x.rangeValid != y.rangeValid)
+            return false;
+    }
+    return true;
+}
+struct G326G281Plan
+{
+    G326G281Key key{};
+    std::vector<uint32_t> map;
+    uint64_t stamp = 0u;
+};
+
+static bool g281BuildT8Map(const G144Entry &e, int srcTi, int texW, int texH,
+                            std::vector<uint32_t> &out)
+{
+    if (!g326G281On())
+        return g281BuildT8MapCold(e, srcTi, texW, texH, out);
+
+    static std::vector<G326G281Plan> s_cache;
+    static uint64_t s_stamp = 0u;
+    const G326G281Key key = g326G281Key(e, srcTi, texW, texH);
+    G326G281Plan *hit = nullptr;
+    if (!g326ForceColdOn())
+        for (G326G281Plan &plan : s_cache)
+            if (g326G281KeyEqual(plan.key, key))
+            {
+                hit = &plan;
+                break;
+            }
+
+    if (hit != nullptr)
+    {
+        hit->stamp = ++s_stamp;
+        if (g326DiagOn())
+            ++g_g326.g281Hit;
+        if (g326VerifyOn())
+        {
+            static std::vector<uint32_t> s_cold;
+            const bool coldOk = g281BuildT8MapCold(e, srcTi, texW, texH, s_cold);
+            if (!coldOk || s_cold != hit->map)
+            {
+                ++g_g326.g281Bad;
+                static uint32_t s_log = 0u;
+                if (s_log++ < 16u)
+                    std::fprintf(stderr,
+                                 "[G326:bad] product=g281 tbp=0x%x src=%d size=%dx%d "
+                                 "cold=%d cached=%zu rebuilt=%zu\n",
+                                 e.ctx.tex0.tbp0, srcTi, texW, texH, coldOk ? 1 : 0,
+                                 hit->map.size(), s_cold.size());
+                if (!coldOk)
+                    return false;
+                hit->map = s_cold; // verifier repairs before the product is consumed
+            }
+        }
+        out = hit->map;
+        return true;
+    }
+
+    if (g326DiagOn())
+        ++g_g326.g281Miss;
+    if (!g281BuildT8MapCold(e, srcTi, texW, texH, out))
+        return false;
+    if (g326ForceColdOn())
+        return true;
+    try
+    {
+        G326G281Plan plan{key, out, ++s_stamp};
+        if (s_cache.size() < 16u)
+            s_cache.push_back(std::move(plan));
+        else
+        {
+            auto oldest = std::min_element(
+                s_cache.begin(), s_cache.end(),
+                [](const G326G281Plan &a, const G326G281Plan &b) {
+                    return a.stamp < b.stamp;
+                });
+            *oldest = std::move(plan);
+        }
+    }
+    catch (...)
+    {
+        // The exact cold product is already in `out`; cache allocation is never required.
+    }
     return true;
 }
 

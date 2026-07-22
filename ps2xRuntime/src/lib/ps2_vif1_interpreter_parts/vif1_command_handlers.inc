@@ -42,6 +42,7 @@
         }
         else if (opcode == VIF_MSCNT)
         {
+            g317_note_gif_fence(kG317VifMscnt);
             if (vu1_trace_enabled())
             {
                 const uint32_t n = s_f517Mscnt.fetch_add(1u, std::memory_order_relaxed);

@@ -1409,4 +1409,3 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         break;
     }
 }
-

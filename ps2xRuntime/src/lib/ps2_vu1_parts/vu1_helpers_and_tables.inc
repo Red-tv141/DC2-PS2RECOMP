@@ -258,6 +258,13 @@ namespace
     thread_local uint32_t s_vuStatusPipe[8] = {};
     thread_local uint32_t s_vuMacVisible = 0u;
     thread_local uint32_t s_vuStatusVisible = 0u;
+    // G328: physical head for the exact circular form of the G138 MAC/STATUS pipeline.
+    // Logical entry zero (the newest completed pair) lives at this slot; walking forward
+    // modulo the configured depth reproduces the old shift-register order.  The feature is
+    // process-constant, so a thread never changes representation while work is in flight.
+    thread_local int s_g328MacPipeHead = 0;
+    thread_local uint32_t s_g328VerifyMacPipe[8] = {};
+    thread_local uint32_t s_g328VerifyStatusPipe[8] = {};
     // G139: same-pair upper->lower VF hazard (default ON, kill DC2_VU1_NO_PAIRHAZ). Real VU1
     // FMAC results land ~4 cycles after issue, so a lower op in the SAME pair as an upper op
     // always reads the register state from BEFORE that upper op. The immediate model committed
@@ -1144,4 +1151,3 @@ VU1Interpreter::VU1Interpreter()
 {
     reset();
 }
-

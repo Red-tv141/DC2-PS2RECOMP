@@ -142,42 +142,14 @@ static uint32_t g285PrepareL2lConsume(uint32_t sbp, uint8_t sbw, uint8_t spsm,
     return consumedMask;
 }
 
-static uint32_t g264NoteUploadForMirror(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
-                                        uint32_t dsax, uint32_t dsay,
-                                        uint32_t rrw, uint32_t rrh)
+struct G264InvPage
 {
-    if (!g264On() || !g261WaveOn() || rrw == 0u || rrh == 0u)
-        return 0u;
-    const G144BlockRange up = g144RangeForRect(dbp, dpsm, dbw, dsax, dsay, rrw, rrh);
-    if (!up.valid)
-        return 0u;
-    // Only exact CT32 byte replacement is supported. The common DC2 upload is 128x128 (16K
-    // pixels); cap the mapper at one full 512x512 surface so malformed state fails closed.
-    const uint64_t uploadPixels64 = static_cast<uint64_t>(rrw) * rrh;
-    auto logReject = [&](const char *why, uint32_t ti, const G261Res &r, uint32_t hits) {
-        if (!g262CensusOn())
-            return;
-        static std::atomic<uint32_t> s_g264RejectLog{0};
-        if (s_g264RejectLog.fetch_add(1u, std::memory_order_relaxed) >= 32u)
-            return;
-        std::fprintf(stderr,
-                     "[G264:rej] why=%s dbp=0x%x dbw=%u psm=0x%x sax=%u say=%u rect=%ux%u "
-                     "blocks=%x..%x -> t=%03x fbw=%u fbW=%d hits=%u "
-                     "dirty=%d..%d cov=%d..%d\n",
-                     why, dbp, static_cast<unsigned>(dbw), dpsm, dsax, dsay, rrw, rrh,
-                     up.first, up.last, kG261Fbp[ti], r.fbw, r.fbW, hits,
-                     r.dirtyLo, r.dirtyHi, r.covLo, r.covHi);
-    };
-
-    // Invert the CT32 swizzle inside one 64x32 page once. Surface page selection itself is
-    // linear in bytes; this table converts an uploaded byte address into the coordinates each
-    // resident FRAME/FBW interpretation assigns to it.
-    struct G264InvPage
-    {
-        std::array<uint16_t, 2048> x{};
-        std::array<uint16_t, 2048> y{};
-        bool valid = false;
-    };
+    std::array<uint16_t, 2048> x{};
+    std::array<uint16_t, 2048> y{};
+    bool valid = false;
+};
+static const G264InvPage &g264InvPage()
+{
     static const G264InvPage s_inv = []() {
         G264InvPage out;
         out.x.fill(0xffffu);
@@ -205,6 +177,238 @@ static uint32_t g264NoteUploadForMirror(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
             out.valid = out.valid && out.x[word] != 0xffffu;
         return out;
     }();
+    return s_inv;
+}
+
+struct G326G264Key
+{
+    uint32_t dbp = 0u, dsax = 0u, dsay = 0u, rrw = 0u, rrh = 0u;
+    uint8_t dbw = 0u, dpsm = 0u;
+    std::array<uint8_t, kG248TargetCount> targetFbw{};
+    std::array<int16_t, kG248TargetCount> targetFbW{};
+};
+struct G326G264Row
+{
+    uint16_t y = 0u;
+    std::array<uint64_t, 8> bits{};
+};
+struct G326G264TargetPlan
+{
+    std::vector<G326G264Row> rows;
+    uint32_t hits = 0u;
+};
+struct G326G264Plan
+{
+    G326G264Key key{};
+    std::array<G326G264TargetPlan, kG248TargetCount> targets{};
+    uint64_t stamp = 0u;
+};
+static G326G264Key g326G264Key(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                               uint32_t dsax, uint32_t dsay,
+                               uint32_t rrw, uint32_t rrh)
+{
+    G326G264Key key{};
+    key.dbp = dbp;
+    key.dbw = dbw;
+    key.dpsm = dpsm;
+    key.dsax = dsax;
+    key.dsay = dsay;
+    key.rrw = rrw;
+    key.rrh = rrh;
+    for (uint32_t t = 0u; t < kG248TargetCount; ++t)
+    {
+        key.targetFbw[t] = g_g261Res[t].fbw;
+        key.targetFbW[t] = static_cast<int16_t>(g_g261Res[t].fbW);
+    }
+    return key;
+}
+static bool g326G264KeyEqual(const G326G264Key &a, const G326G264Key &b)
+{
+    return a.dbp == b.dbp && a.dbw == b.dbw && a.dpsm == b.dpsm &&
+           a.dsax == b.dsax && a.dsay == b.dsay && a.rrw == b.rrw && a.rrh == b.rrh &&
+           a.targetFbw == b.targetFbw && a.targetFbW == b.targetFbW;
+}
+static bool g326BuildG264Plan(const G326G264Key &key, G326G264Plan &out)
+{
+    const G264InvPage &inv = g264InvPage();
+    const uint64_t pixels64 = static_cast<uint64_t>(key.rrw) * key.rrh;
+    if (!inv.valid || key.dpsm != GS_PSM_CT32 || key.dbw == 0u ||
+        pixels64 == 0u || pixels64 > 512u * 512u)
+        return false;
+    out = G326G264Plan{};
+    out.key = key;
+    std::vector<uint32_t> offsets(static_cast<size_t>(pixels64));
+    size_t op = 0u;
+    for (uint32_t sy = 0u; sy < key.rrh; ++sy)
+        for (uint32_t sx = 0u; sx < key.rrw; ++sx)
+            offsets[op++] = GSPSMCT32::addrPSMCT32(
+                key.dbp, key.dbw, key.dsax + sx, key.dsay + sy);
+
+    for (uint32_t t = 0u; t < kG248TargetCount; ++t)
+    {
+        const uint32_t fbw = key.targetFbw[t];
+        const int fbW = key.targetFbW[t];
+        if (fbw == 0u || fbW <= 0 || fbW > 512)
+            continue;
+        std::array<std::array<uint64_t, 8>, 512> masks{};
+        const uint64_t targetBase =
+            static_cast<uint64_t>(framePageBaseToBlock(kG261Fbp[t])) * 256u;
+        const uint64_t targetBytes = static_cast<uint64_t>(fbw) * 16u * 8192u;
+        G326G264TargetPlan &target = out.targets[t];
+        for (const uint32_t off : offsets)
+        {
+            const uint64_t off64 = off;
+            if (off64 < targetBase || off64 + 4u > targetBase + targetBytes)
+                continue;
+            const uint64_t rel = off64 - targetBase;
+            const uint32_t page = static_cast<uint32_t>(rel / 8192u);
+            const uint32_t word = static_cast<uint32_t>((rel % 8192u) >> 2u);
+            const uint32_t tx = (page % fbw) * 64u + inv.x[word];
+            const uint32_t ty = (page / fbw) * 32u + inv.y[word];
+            if (tx >= static_cast<uint32_t>(fbW) || ty >= 512u)
+                continue;
+            masks[ty][tx >> 6u] |= uint64_t{1} << (tx & 63u);
+            ++target.hits;
+        }
+        for (uint32_t y = 0u; y < 512u; ++y)
+        {
+            bool any = false;
+            for (uint32_t w = 0u; w < 8u; ++w)
+                any = any || masks[y][w] != 0u;
+            if (any)
+                target.rows.push_back(G326G264Row{static_cast<uint16_t>(y), masks[y]});
+        }
+    }
+    return true;
+}
+static bool g326G264PlanEqual(const G326G264Plan &a, const G326G264Plan &b)
+{
+    if (!g326G264KeyEqual(a.key, b.key))
+        return false;
+    for (uint32_t t = 0u; t < kG248TargetCount; ++t)
+    {
+        if (a.targets[t].hits != b.targets[t].hits ||
+            a.targets[t].rows.size() != b.targets[t].rows.size())
+            return false;
+        for (size_t r = 0u; r < a.targets[t].rows.size(); ++r)
+            if (a.targets[t].rows[r].y != b.targets[t].rows[r].y ||
+                a.targets[t].rows[r].bits != b.targets[t].rows[r].bits)
+                return false;
+    }
+    return true;
+}
+static G326G264Plan *g326GetG264Plan(const G326G264Key &key)
+{
+    static std::vector<G326G264Plan> s_cache;
+    static uint64_t s_stamp = 0u;
+    G326G264Plan *hit = nullptr;
+    if (!g326ForceColdOn())
+        for (G326G264Plan &plan : s_cache)
+            if (g326G264KeyEqual(plan.key, key))
+            {
+                hit = &plan;
+                break;
+            }
+    if (hit != nullptr)
+    {
+        hit->stamp = ++s_stamp;
+        if (g326DiagOn())
+            ++g_g326.g264Hit;
+        if (g326VerifyOn())
+        {
+            G326G264Plan cold;
+            bool equal = false;
+            try
+            {
+                equal = g326BuildG264Plan(key, cold) && g326G264PlanEqual(*hit, cold);
+            }
+            catch (...)
+            {
+                equal = false;
+            }
+            if (!equal)
+            {
+                ++g_g326.g264Bad;
+                static uint32_t s_log = 0u;
+                if (s_log++ < 16u)
+                    std::fprintf(stderr,
+                                 "[G326:bad] product=g264 dbp=0x%x rect=%ux%u\n",
+                                 key.dbp, key.rrw, key.rrh);
+                return nullptr; // caller executes the unchanged cold behavior
+            }
+        }
+        return hit;
+    }
+    if (g326DiagOn())
+        ++g_g326.g264Miss;
+    if (g326ForceColdOn())
+        return nullptr;
+    try
+    {
+        G326G264Plan plan;
+        if (!g326BuildG264Plan(key, plan))
+            return nullptr;
+        plan.stamp = ++s_stamp;
+        if (s_cache.size() < 32u)
+        {
+            s_cache.push_back(std::move(plan));
+            return &s_cache.back();
+        }
+        auto oldest = std::min_element(
+            s_cache.begin(), s_cache.end(),
+            [](const G326G264Plan &a, const G326G264Plan &b) {
+                return a.stamp < b.stamp;
+            });
+        *oldest = std::move(plan);
+        return &*oldest;
+    }
+    catch (...)
+    {
+        return nullptr;
+    }
+}
+static uint32_t g326Popcount64(uint64_t v)
+{
+    uint32_t n = 0u;
+    while (v != 0u)
+    {
+        v &= v - 1u;
+        ++n;
+    }
+    return n;
+}
+
+static uint32_t g264NoteUploadForMirror(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                                         uint32_t dsax, uint32_t dsay,
+                                         uint32_t rrw, uint32_t rrh)
+{
+    if (!g264On() || !g261WaveOn() || rrw == 0u || rrh == 0u)
+        return 0u;
+    const G144BlockRange up = g144RangeForRect(dbp, dpsm, dbw, dsax, dsay, rrw, rrh);
+    if (!up.valid)
+        return 0u;
+    // Only exact CT32 byte replacement is supported. The common DC2 upload is 128x128 (16K
+    // pixels); cap the mapper at one full 512x512 surface so malformed state fails closed.
+    const uint64_t uploadPixels64 = static_cast<uint64_t>(rrw) * rrh;
+    auto logReject = [&](const char *why, uint32_t ti, const G261Res &r, uint32_t hits) {
+        if (!g262CensusOn())
+            return;
+        static std::atomic<uint32_t> s_g264RejectLog{0};
+        if (s_g264RejectLog.fetch_add(1u, std::memory_order_relaxed) >= 32u)
+            return;
+        std::fprintf(stderr,
+                     "[G264:rej] why=%s dbp=0x%x dbw=%u psm=0x%x sax=%u say=%u rect=%ux%u "
+                     "blocks=%x..%x -> t=%03x fbw=%u fbW=%d hits=%u "
+                     "dirty=%d..%d cov=%d..%d\n",
+                     why, dbp, static_cast<unsigned>(dbw), dpsm, dsax, dsay, rrw, rrh,
+                     up.first, up.last, kG261Fbp[ti], r.fbw, r.fbW, hits,
+                     r.dirtyLo, r.dirtyHi, r.covLo, r.covHi);
+    };
+
+    // Invert the CT32 swizzle inside one 64x32 page once. Surface page selection itself is
+    // linear in bytes; this table converts an uploaded byte address into the coordinates each
+    // resident FRAME/FBW interpretation assigns to it.
+    const G264InvPage &s_inv = g264InvPage();
 
     if (dpsm != GS_PSM_CT32 || dbw == 0u || uploadPixels64 > 512u * 512u || !s_inv.valid)
     {
@@ -215,6 +419,101 @@ static uint32_t g264NoteUploadForMirror(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
                 logReject("shape", i, r, 0u);
         }
         return 0u;
+    }
+
+    if (g326G264On())
+    {
+        bool anyTarget = false;
+        for (uint32_t i = 0u; i < kG248TargetCount; ++i)
+        {
+            const G261Res &r = g_g261Res[i];
+            anyTarget = anyTarget ||
+                        (r.dirty && r.range.valid && g144RangeOverlaps(r.range, up));
+        }
+        // The legacy loop builds every source offset before discovering that no resident target
+        // observes it. This proof is the same live dirty/range predicate used by that loop.
+        if (!anyTarget)
+            return 0u;
+        G326G264Plan *plan = g326GetG264Plan(
+            g326G264Key(dbp, dbw, dpsm, dsax, dsay, rrw, rrh));
+        g326MaybeReport();
+        if (plan != nullptr)
+        {
+            uint32_t cachedMask = 0u;
+            for (uint32_t i = 0u; i < kG248TargetCount; ++i)
+            {
+                G261Res &r = g_g261Res[i];
+                if (!r.dirty || !r.range.valid || !g144RangeOverlaps(r.range, up))
+                    continue;
+                if (r.fbw == 0u || r.fbW <= 0 || r.fbW > 512)
+                {
+                    logReject("target-shape", i, r, 0u);
+                    continue;
+                }
+                const G326G264TargetPlan &target = plan->targets[i];
+                if (target.hits == 0u || target.rows.empty())
+                {
+                    logReject("alias-none", i, r, 0u);
+                    continue;
+                }
+                const bool g291On = g291AtlasOn();
+                if (g291On && r.g291CovFbw != r.fbw)
+                {
+                    r.g291Cov = {};
+                    r.g291CovFbw = r.fbw;
+                    g_g291LayoutResets.fetch_add(1u, std::memory_order_relaxed);
+                }
+                uint32_t newHits = 0u;
+                const bool countNewHits = g291StatOn() || g262CensusOn();
+                for (const G326G264Row &cachedRow : target.rows)
+                {
+                    const uint32_t y = cachedRow.y;
+                    for (uint32_t word = 0u; word < 8u; ++word)
+                    {
+                        const uint64_t bits = cachedRow.bits[word];
+                        if (bits == 0u)
+                            continue;
+                        if (countNewHits)
+                            newHits += g326Popcount64(bits & ~r.mirBits[y][word]);
+                        r.mirBits[y][word] |= bits;
+                        if (g291On)
+                            r.g291Cov[y][word] |= bits;
+                    }
+                }
+                if (g291On)
+                    g_g291CurPagesSet.fetch_add(target.hits, std::memory_order_relaxed);
+                const int hitLo = target.rows.front().y;
+                const int hitHi = target.rows.back().y;
+                r.mirPending = true;
+                if (hitLo < r.mirLo) r.mirLo = hitLo;
+                if (hitHi > r.mirHi) r.mirHi = hitHi;
+                cachedMask |= (1u << i);
+                g_g264MirNoted.fetch_add(1u, std::memory_order_relaxed);
+                {
+                    static std::atomic<uint32_t> s_g291HiLog{0};
+                    if (g291StatOn() && dbp >= 0x3400u && kG261Fbp[i] == 0x139u &&
+                        s_g291HiLog.fetch_add(1u, std::memory_order_relaxed) < 24u)
+                        std::fprintf(
+                            stderr,
+                            "[G291:upnote] dbp=0x%x dbw=%u rect=%ux%u rows=%d..%d px=%u new=%u\n",
+                            dbp, static_cast<unsigned>(dbw), rrw, rrh, hitLo, hitHi,
+                            target.hits, newHits);
+                }
+                if (g262CensusOn())
+                {
+                    static std::atomic<uint32_t> s_g264UpLog{0};
+                    if (s_g264UpLog.fetch_add(1u, std::memory_order_relaxed) < 16u)
+                        std::fprintf(
+                            stderr,
+                            "[G264:up] dbp=0x%x dbw=%u psm=0x%x sax=%u say=%u rect=%ux%u -> "
+                            "t=%03x aliasPx=%u new=%u rows=%d..%d dirty=%d..%d cov=%d..%d\n",
+                            dbp, static_cast<unsigned>(dbw), dpsm, dsax, dsay, rrw, rrh,
+                            kG261Fbp[i], target.hits, newHits, hitLo, hitHi,
+                            r.dirtyLo, r.dirtyHi, r.covLo, r.covHi);
+                }
+            }
+            return cachedMask;
+        }
     }
 
     // Compute the exact set of byte addresses the CT32 IMAGE transfer replaces. This is the
@@ -527,6 +826,10 @@ static void g305DrainPending()
 
 static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t vramSize)
 {
+    g324NoteObserver(0u); // next native flush is a G310/FBO state observer
+    G324FlushDiag g324Diag{};
+    const bool g324IsArmed = g324Armed();
+    G324DiagScope g324Scope(g324IsArmed ? &g324Diag : nullptr);
     // G305: fence the previous async packet before this flush reads any FBO/snapshot/residency
     // state or reuses s_batch. Catches a (rare) delayed backend failure before the next prep.
     if (g305AsyncOn())
@@ -629,6 +932,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // G298 diagnosis: split G273's large front-end "pre" bucket at architecture boundaries.
     // Aggregate-only, cached, and behavior-inert unless explicitly requested.
     static const bool s_g298Profile = envFlagEnabled("DC2_G298_PROFILE");
+    // G323: split G298 T2->T3 dependency preparation into exclusive complete-operation families.
+    // The empty arm takes the same cached scope timestamps but retains no counters, bounding timer
+    // self-cost without changing renderer behavior or dependency ordering.
+    static const bool s_g323Census = envFlagEnabled("DC2_G323_CENSUS");
+    static const bool s_g323Empty = !s_g323Census && envFlagEnabled("DC2_G323_EMPTY");
+    const bool g323Armed = s_g323Census || s_g323Empty;
     const auto g273T0 = s_g273Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
     const auto g298T0 = s_g298Profile ? std::chrono::steady_clock::now()
@@ -1742,6 +2051,16 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
 
     const auto g298T2 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
+    const auto g323T2 = g323Armed ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+    uint64_t g323HygieneNs = 0u, g323LogicalNs = 0u, g323CompositeNs = 0u;
+    uint64_t g323BindNs = 0u, g323MaterializeNs = 0u, g323OtherNs = 0u;
+    uint64_t g323HygieneCalls = 0u, g323LogicalCalls = 0u, g323CompositeCalls = 0u;
+    uint64_t g323BindEntries = 0u, g323MaterializeCalls = 0u;
+    const auto g323Ns = [](const auto &begin, const auto &end) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(end - begin).count());
+    };
     // G261 FBO-bind pre-pass: entries that sample a GPU-dirty RTT target either bind the
     // producer's FBO color texture directly (skip VRAM decode entirely — the pixels never
     // round-tripped through VRAM) or, when the access shape is not provably in-range/aligned,
@@ -1761,13 +2080,33 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // G280: re-sync stale/orphaned alias-overlay tiles from VRAM before any bind decision
         // this flush makes (including legacy-path binds) can sample them.
         if (g280AliasOn())
+        {
+            const auto g323ScopeT0 = g323Armed ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
             g280HygienePass();
+            if (g323Armed)
+            {
+                const uint64_t elapsed = g323Ns(g323ScopeT0, std::chrono::steady_clock::now());
+                if (s_g323Census)
+                {
+                    g323HygieneNs += elapsed;
+                    ++g323HygieneCalls;
+                }
+            }
+        }
         // G310: build every distinct self-atlas T8 snapshot before this pre-pass can publish
         // 0x139 for a later unsupported consumer. The legacy path likewise decodes textures
         // from the pre-batch image; doing this first preserves that command boundary while
         // keeping the producer FBO private. Entries sharing a texture key share one snapshot.
         if (g310T8ViewOn())
         {
+            const auto g323ScopeT0 = g323Armed ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+            const auto g324T8T0 = g_g324ActiveDiag != nullptr
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
+            uint64_t g324T8BackendNs = 0u;
+            uint64_t g324T8Jobs = 0u;
             static std::vector<uint32_t> s_g310Map, s_g310Clut;
             for (size_t i = 0; i < g_g144List.size(); ++i)
             {
@@ -1806,10 +2145,21 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                             e.ctx.tex0.cbp, e.ctx.tex0.cpsm, e.ctx.tex0.csm,
                             e.ctx.tex0.csa, e.ctx.tex0.psm);
                     uint64_t bad = 0u;
+                    const auto g324BackendT0 = g_g324ActiveDiag != nullptr
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
                     ok = g281_backend_prepare_t8_view(
                         viewKey, kG261Fbp[static_cast<uint32_t>(srcTi)],
                         g_g261Res[srcTi].fbW, st.texW, st.texH,
                         s_g310Map, s_g310Clut, g281VerifyOn(), bad);
+                    if (g_g324ActiveDiag != nullptr)
+                    {
+                        const auto done = std::chrono::steady_clock::now();
+                        g324T8BackendNs += g324ElapsedNs(g324BackendT0, done);
+                        ++g324T8Jobs;
+                        g_g324ActiveDiag->hadProducer = true;
+                        g_g324ActiveDiag->lastProducerDone = done;
+                    }
                     if (bad != 0u)
                         g_g281VerifyBad.fetch_add(bad, std::memory_order_relaxed);
                 }
@@ -1823,6 +2173,24 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 s_g281ViewSrc[i] = static_cast<int8_t>(srcTi);
                 g_g310T8Views.fetch_add(1u, std::memory_order_relaxed);
             }
+            if (g_g324ActiveDiag != nullptr)
+            {
+                const uint64_t totalNs =
+                    g324ElapsedNs(g324T8T0, std::chrono::steady_clock::now());
+                g_g324ActiveDiag->t8BackendWallNs += g324T8BackendNs;
+                g_g324ActiveDiag->t8CpuNs +=
+                    totalNs > g324T8BackendNs ? totalNs - g324T8BackendNs : 0u;
+                g_g324ActiveDiag->t8Jobs += g324T8Jobs;
+            }
+            if (g323Armed)
+            {
+                const uint64_t elapsed = g323Ns(g323ScopeT0, std::chrono::steady_clock::now());
+                if (s_g323Census)
+                {
+                    g323LogicalNs += elapsed;
+                    ++g323LogicalCalls;
+                }
+            }
         }
         bool g310Ready = false;
         bool g309Ready = false;
@@ -1831,6 +2199,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // strip entry is reached; waiting until that entry therefore loses the residency state
         // G309/G310 must consume. G310 freezes this one-texture snapshot until submission ends.
         if (g310On())
+        {
+            const auto g323ScopeT0 = g323Armed ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
             for (size_t i = 0; i < g_g144List.size(); ++i)
                 if (g310EntryShape(fbp, g_g144List[i], s_states[i]))
                 {
@@ -1839,7 +2210,20 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         g310Freeze.begin();
                     break;
                 }
+            if (g323Armed)
+            {
+                const uint64_t elapsed = g323Ns(g323ScopeT0, std::chrono::steady_clock::now());
+                if (s_g323Census)
+                {
+                    g323LogicalNs += elapsed;
+                    ++g323LogicalCalls;
+                }
+            }
+        }
         else if (g310StatOn())
+        {
+            const auto g323ScopeT0 = g323Armed ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
             for (size_t i = 0; i < g_g144List.size(); ++i)
                 if (g310EntryShape(fbp, g_g144List[i], s_states[i]))
                 {
@@ -1848,13 +2232,40 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     (void)g310BuildDesired(census, seedTi);
                     break;
                 }
+            if (g323Armed)
+            {
+                const uint64_t elapsed = g323Ns(g323ScopeT0, std::chrono::steady_clock::now());
+                if (s_g323Census)
+                {
+                    g323LogicalNs += elapsed;
+                    ++g323LogicalCalls;
+                }
+            }
+        }
         if (!g310On() && g309On())
+        {
+            const auto g323ScopeT0 = g323Armed ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
             for (size_t i = 0; i < g_g144List.size(); ++i)
                 if (g309EntryShape(fbp, g_g144List[i], s_states[i]))
                 {
                     (void)g309PrepareComposite(g309Ready);
                     break;
                 }
+            if (g323Armed)
+            {
+                const uint64_t elapsed = g323Ns(g323ScopeT0, std::chrono::steady_clock::now());
+                if (s_g323Census)
+                {
+                    g323CompositeNs += elapsed;
+                    ++g323CompositeCalls;
+                }
+            }
+        }
+        const auto g323BindT0 = g323Armed ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
+        if (s_g323Census)
+            g323BindEntries += static_cast<uint64_t>(g_g144List.size());
         for (size_t i = 0; i < g_g144List.size(); ++i)
         {
             const G178EntryState &st = s_states[i];
@@ -2126,10 +2537,29 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                          static_cast<unsigned>(st.wrapV), st.texW, st.texH);
                         g_g261FboRejects.fetch_add(1u, std::memory_order_relaxed);
                         g266NoteTexBindMat(fbp, t, e, st);
+                        const auto g323MatT0 = g323Armed ? std::chrono::steady_clock::now()
+                                                         : std::chrono::steady_clock::time_point{};
                         g261Materialize(static_cast<int>(t), kG261MatTexAlias);
+                        if (g323Armed)
+                        {
+                            const uint64_t elapsed =
+                                g323Ns(g323MatT0, std::chrono::steady_clock::now());
+                            if (s_g323Census)
+                            {
+                                g323MaterializeNs += elapsed;
+                                ++g323MaterializeCalls;
+                            }
+                        }
                     }
                 }
             }
+        }
+        if (g323Armed)
+        {
+            const uint64_t elapsed = g323Ns(g323BindT0, std::chrono::steady_clock::now());
+            if (s_g323Census)
+                g323BindNs += elapsed > g323MaterializeNs
+                    ? elapsed - g323MaterializeNs : 0u;
         }
     }
     else
@@ -2143,6 +2573,17 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
 
     const auto g298T3 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
+    uint64_t g323DepsNs = 0u;
+    if (g323Armed)
+    {
+        g323DepsNs = g323Ns(g323T2, std::chrono::steady_clock::now());
+        if (s_g323Census)
+        {
+            const uint64_t known = g323HygieneNs + g323LogicalNs + g323CompositeNs +
+                                   g323BindNs + g323MaterializeNs;
+            g323OtherNs = g323DepsNs > known ? g323DepsNs - known : 0u;
+        }
+    }
     // Textures: decode + upload anything not resident or invalidated by page-gen changes.
     static std::unordered_set<uint64_t> s_batchKeys;
     s_batchKeys.clear();
@@ -2476,9 +2917,17 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // G274: time EVERY synchronous backend submit (RTT color/depth waves AND display batches),
     // not only G273's display profile. This is the blocking future to the GPU worker; the
     // hypothesis is that per-wave submit/sync latency dominates the pending-graph drain.
-    const bool g276Probe = g276ProbeOn();
+    // G314 needs only the submits executed inside one real upload edge.  Reuse these proven
+    // category counters while that edge scope is active; no global probe or behavior arm turns on.
+    const bool g276Probe = g276ProbeOn() || g314EdgeActive();
+    const auto g324SubmitT0 = g324IsArmed && g324Diag.hadProducer
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    if (g324IsArmed && g324Diag.hadProducer)
+        g324Diag.tailPrepNs +=
+            g324ElapsedNs(g324Diag.lastProducerDone, g324SubmitT0);
     const auto g274SubT0 = (g274ZTimeOn() || g276Probe) ? std::chrono::steady_clock::now()
-                                         : std::chrono::steady_clock::time_point{};
+                                          : std::chrono::steady_clock::time_point{};
     const auto g275FusedT0 = g275FuseReadback ? std::chrono::steady_clock::now()
                                               : std::chrono::steady_clock::time_point{};
     // G305 (default-off DC2_G305_ASYNC=1): async-eligible = a skip-readback color wave with no
@@ -2500,6 +2949,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g305AsyncOn() && !g_g305ForceSync && s_batch.skipReadback && !guestDepth &&
         !g275FuseReadback && !g262WaveDepth && !g286Transient && !g282Tight &&
         !(g255Rtt && g255VerifyOn()) && !g310On();
+    // G324 premise only: this is the existing G305 pure-epilogue contract with G310 admitted as
+    // the missing completion-ordered state family. No submission behavior changes here.
+    const bool g324TxnEligible =
+        g324Diag.hadProducer && g310Freeze.active && s_batch.skipReadback && !guestDepth &&
+        !g275FuseReadback && !g262WaveDepth && !g286Transient && !g282Tight &&
+        !(g255Rtt && g255VerifyOn());
     if (g305StatOn())
     {
         static std::atomic<uint64_t> nF{0}, nSkip{0}, nNoD{0}, nElig{0};
@@ -2544,6 +2999,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                                depthGlY, depthRows)
                    : g178_backend_submit(s_batch));
     }
+    if (g324IsArmed && g324Diag.hadProducer)
+        g324Diag.submitNs +=
+            g324ElapsedNs(g324SubmitT0, std::chrono::steady_clock::now());
+    if (submitted && g324TxnEligible)
+        // Starts the independent front-end interval a future non-blocking transaction could hide
+        // behind. g324NoteObserver consumes it at the first next flush/materialize/frame boundary.
+        g324ArmObserver();
     if (g275FuseReadback)
     {
         g_g275FusedNs.fetch_add(
@@ -2972,6 +3434,117 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     }
 
     const uint64_t nGpu = g_g178GpuFlushes.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (s_g323Census)
+    {
+        static uint64_t s_depsNs = 0u, s_hygieneNs = 0u, s_logicalNs = 0u,
+                        s_compositeNs = 0u, s_bindNs = 0u, s_materializeNs = 0u,
+                        s_otherNs = 0u;
+        static uint64_t s_hygieneCalls = 0u, s_logicalCalls = 0u,
+                        s_compositeCalls = 0u, s_bindEntries = 0u,
+                        s_materializeCalls = 0u;
+        s_depsNs += g323DepsNs;
+        s_hygieneNs += g323HygieneNs;
+        s_logicalNs += g323LogicalNs;
+        s_compositeNs += g323CompositeNs;
+        s_bindNs += g323BindNs;
+        s_materializeNs += g323MaterializeNs;
+        s_otherNs += g323OtherNs;
+        s_hygieneCalls += g323HygieneCalls;
+        s_logicalCalls += g323LogicalCalls;
+        s_compositeCalls += g323CompositeCalls;
+        s_bindEntries += g323BindEntries;
+        s_materializeCalls += g323MaterializeCalls;
+        if ((nGpu % 300u) == 0u)
+        {
+            const uint64_t sumNs = s_hygieneNs + s_logicalNs + s_compositeNs +
+                                   s_bindNs + s_materializeNs + s_otherNs;
+            const double denom = 1.0e6 * static_cast<double>(nGpu);
+            std::fprintf(
+                stderr,
+                "[G323:census] gpu=%llu deps=%.3f sum=%.3f deltaNs=%lld "
+                "avgMs(hygiene=%.3f logical=%.3f g309=%.3f bind=%.3f mat=%.3f other=%.3f) "
+                "calls(hygiene=%llu logical=%llu g309=%llu bindEntries=%llu mat=%llu)\n",
+                static_cast<unsigned long long>(nGpu),
+                static_cast<double>(s_depsNs) / denom,
+                static_cast<double>(sumNs) / denom,
+                static_cast<long long>(s_depsNs) - static_cast<long long>(sumNs),
+                static_cast<double>(s_hygieneNs) / denom,
+                static_cast<double>(s_logicalNs) / denom,
+                static_cast<double>(s_compositeNs) / denom,
+                static_cast<double>(s_bindNs) / denom,
+                static_cast<double>(s_materializeNs) / denom,
+                static_cast<double>(s_otherNs) / denom,
+                static_cast<unsigned long long>(s_hygieneCalls),
+                static_cast<unsigned long long>(s_logicalCalls),
+                static_cast<unsigned long long>(s_compositeCalls),
+                static_cast<unsigned long long>(s_bindEntries),
+                static_cast<unsigned long long>(s_materializeCalls));
+        }
+    }
+    if (g324CensusOn())
+    {
+        static uint64_t s_desiredCpuNs = 0u, s_logicalCpuNs = 0u,
+                        s_logicalBackendWallNs = 0u, s_t8CpuNs = 0u,
+                        s_t8BackendWallNs = 0u, s_tailPrepNs = 0u,
+                        s_submitNs = 0u;
+        static uint64_t s_producerFlushes = 0u, s_logicalJobs = 0u,
+                        s_t8Jobs = 0u, s_skipReadback = 0u,
+                        s_noGuestDepth = 0u, s_txnEligible = 0u;
+        s_desiredCpuNs += g324Diag.desiredCpuNs;
+        s_logicalCpuNs += g324Diag.logicalCpuNs;
+        s_logicalBackendWallNs += g324Diag.logicalBackendWallNs;
+        s_t8CpuNs += g324Diag.t8CpuNs;
+        s_t8BackendWallNs += g324Diag.t8BackendWallNs;
+        s_tailPrepNs += g324Diag.tailPrepNs;
+        s_submitNs += g324Diag.submitNs;
+        s_logicalJobs += g324Diag.logicalJobs;
+        s_t8Jobs += g324Diag.t8Jobs;
+        if (g324Diag.hadProducer)
+        {
+            ++s_producerFlushes;
+            if (s_batch.skipReadback)
+                ++s_skipReadback;
+            if (!guestDepth)
+                ++s_noGuestDepth;
+            if (g324TxnEligible)
+                ++s_txnEligible;
+        }
+        if ((nGpu % 300u) == 0u)
+        {
+            const double denom = 1.0e6 * static_cast<double>(nGpu);
+            const uint64_t observerN =
+                g_g324ObserverN[0] + g_g324ObserverN[1] + g_g324ObserverN[2];
+            const uint64_t observerNs =
+                g_g324ObserverNs[0] + g_g324ObserverNs[1] + g_g324ObserverNs[2];
+            std::fprintf(
+                stderr,
+                "[G324:census] gpu=%llu producer=%llu jobs(t8=%llu logical=%llu) "
+                "avgMs(desiredCpu=%.3f t8Cpu=%.3f t8Wall=%.3f logicalCpu=%.3f "
+                "logicalWall=%.3f tailPrep=%.3f submit=%.3f) "
+                "shape(skipRb=%llu noDepth=%llu txnElig=%llu) "
+                "observer(n=%llu avgMs=%.3f flush=%llu mat=%llu frame=%llu)\n",
+                static_cast<unsigned long long>(nGpu),
+                static_cast<unsigned long long>(s_producerFlushes),
+                static_cast<unsigned long long>(s_t8Jobs),
+                static_cast<unsigned long long>(s_logicalJobs),
+                static_cast<double>(s_desiredCpuNs) / denom,
+                static_cast<double>(s_t8CpuNs) / denom,
+                static_cast<double>(s_t8BackendWallNs) / denom,
+                static_cast<double>(s_logicalCpuNs) / denom,
+                static_cast<double>(s_logicalBackendWallNs) / denom,
+                static_cast<double>(s_tailPrepNs) / denom,
+                static_cast<double>(s_submitNs) / denom,
+                static_cast<unsigned long long>(s_skipReadback),
+                static_cast<unsigned long long>(s_noGuestDepth),
+                static_cast<unsigned long long>(s_txnEligible),
+                static_cast<unsigned long long>(observerN),
+                observerN != 0u
+                    ? static_cast<double>(observerNs) / 1.0e6 / observerN : 0.0,
+                static_cast<unsigned long long>(g_g324ObserverN[0]),
+                static_cast<unsigned long long>(g_g324ObserverN[1]),
+                static_cast<unsigned long long>(g_g324ObserverN[2]));
+        }
+    }
     if (s_g298Profile)
     {
         static uint64_t s_classNs = 0u, s_fbzNs = 0u, s_depsNs = 0u, s_texNs = 0u,

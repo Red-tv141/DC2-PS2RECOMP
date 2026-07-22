@@ -727,6 +727,7 @@ static void g178CensusScan();
 
 void g144FlushPending()
 {
+    g324NoteObserver(2u); // frame/presentation boundary
     // G305: fence any trailing async packet at the frame boundary (before present), even when the
     // deferred list is empty because the last flush submitted async. Under the default MTGS+pipeline
     // config this runs on the same GS-worker thread as the mid-frame flushes (see g150_frame_barrier
@@ -968,6 +969,226 @@ void g144FlushPendingUpload()
     }
 }
 
+struct G314EdgeScope
+{
+    bool active = false;
+    G314UploadShape *shape = nullptr;
+    G144BlockRange dst{};
+    std::chrono::steady_clock::time_point t0{};
+    uint64_t gpuOk = 0u, gpuFail = 0u, cpuEntries = 0u;
+    uint64_t gpuNs = 0u, replayNs = 0u;
+    uint64_t submitNs = 0u, submits = 0u, skipRb = 0u;
+    uint64_t publications = 0u;
+};
+
+static uint64_t g314PublicationCount()
+{
+    uint64_t total = g_g276Flushes.load(std::memory_order_relaxed) +
+                     g_g278Flushes.load(std::memory_order_relaxed) +
+                     g_g289Materializes.load(std::memory_order_relaxed);
+    for (const auto &v : g_g261Mat)
+        total += v.load(std::memory_order_relaxed);
+    return total;
+}
+
+static uint64_t g314SubmitCount()
+{
+    return g_g274SubN.load(std::memory_order_relaxed);
+}
+
+static uint64_t g314SkipReadbackCount()
+{
+    return g_g276SubN[1][0].load(std::memory_order_relaxed) +
+           g_g276SubN[1][1].load(std::memory_order_relaxed);
+}
+
+static G314EdgeScope g314BeginEdge(uint32_t dbp, uint32_t dbw, uint32_t dpsm,
+                                   uint32_t dsax, uint32_t dsay,
+                                   uint32_t rrw, uint32_t rrh,
+                                   const G144BlockRange &dst)
+{
+    G314EdgeScope out;
+    if (!g314CensusOn())
+        return out;
+
+    out.active = true;
+    out.shape = g314FindShape(dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+    out.dst = dst;
+    ++out.shape->edges;
+    ++g_g314Edges;
+
+    const auto countBatch = [&](const G260RangeSet &wr, const G260RangeSet &rd,
+                                size_t entries) {
+        ++out.shape->batches;
+        out.shape->entries += entries;
+        if (wr.unknown || rd.unknown)
+            ++out.shape->conflictUnknown;
+        if (wr.overlaps(dst))
+            ++out.shape->conflictWr;
+        if (rd.overlaps(dst))
+            ++out.shape->conflictRd;
+    };
+    for (const G260Batch &b : g_g260Graph)
+        if (!b.entries.empty())
+            countBatch(b.wr, b.rd, b.entries.size());
+    if (!g_g144List.empty())
+        countBatch(g_g260OpenWr, g_g260OpenRd, g_g144List.size());
+
+    out.gpuOk = g_g290GpuOk;
+    out.gpuFail = g_g290GpuFail;
+    out.cpuEntries = g_g290CpuEntries;
+    out.gpuNs = g_g290GpuOkNs;
+    out.replayNs = g_g290ReplayNs;
+    out.submitNs = g_g274SubNs.load(std::memory_order_relaxed);
+    out.submits = g314SubmitCount();
+    out.skipRb = g314SkipReadbackCount();
+    out.publications = g314PublicationCount();
+    out.t0 = std::chrono::steady_clock::now();
+    g_g314EdgeActive = true;
+    return out;
+}
+
+static void g314Report()
+{
+    if (!g314CensusOn() || g_g314Edges == 0u || (g_g314Edges % 512u) != 0u)
+        return;
+    uint64_t eligible = 0u, resident = 0u, drainNs = 0u, submitNs = 0u,
+             eligibleDrainNs = 0u, eligibleSubmitNs = 0u, pubs = 0u;
+    for (const G314UploadShape &s : g_g314Shapes)
+    {
+        if (!s.used || s.edges == 0u)
+            continue;
+        eligible += s.transportEligible;
+        resident += s.residentEligible;
+        drainNs += s.drainNs;
+        submitNs += s.submitNs;
+        eligibleDrainNs += s.eligibleDrainNs;
+        eligibleSubmitNs += s.eligibleSubmitNs;
+        pubs += s.publicationEvents;
+    }
+    std::fprintf(stderr,
+                 "[G314:sum] edges=%llu transport=%llu resident=%llu drain=%.3f "
+                 "submit=%.3f eligibleDrain=%.3f eligibleSubmit=%.3f pubs=%llu ms\n",
+                 static_cast<unsigned long long>(g_g314Edges),
+                 static_cast<unsigned long long>(eligible),
+                 static_cast<unsigned long long>(resident), drainNs / 1.0e6,
+                 submitNs / 1.0e6, eligibleDrainNs / 1.0e6,
+                 eligibleSubmitNs / 1.0e6,
+                 static_cast<unsigned long long>(pubs));
+    for (const G314UploadShape &s : g_g314Shapes)
+    {
+        if (!s.used || s.edges == 0u)
+            continue;
+        std::fprintf(stderr,
+                     "[G314:shape] dbp=%x/%u/%x xy=%u,%u wh=%ux%u edges=%llu "
+                     "conf(wr=%llu rd=%llu unk=%llu) graph=%llub/%llue "
+                     "gpu=%llu/%llu cpuE=%llu skipRb=%llu/%llu mirror=%llu/%llu "
+                     "eligible=%llu/%llu drain=%.3f gpuMs=%.3f replay=%.3f "
+                     "submit=%.3f pubs=%llu next=%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                     s.dbp, s.dbw, s.dpsm, s.dsax, s.dsay, s.rrw, s.rrh,
+                     static_cast<unsigned long long>(s.edges),
+                     static_cast<unsigned long long>(s.conflictWr),
+                     static_cast<unsigned long long>(s.conflictRd),
+                     static_cast<unsigned long long>(s.conflictUnknown),
+                     static_cast<unsigned long long>(s.batches),
+                     static_cast<unsigned long long>(s.entries),
+                     static_cast<unsigned long long>(s.gpuOk),
+                     static_cast<unsigned long long>(s.gpuFail),
+                     static_cast<unsigned long long>(s.cpuEntries),
+                     static_cast<unsigned long long>(s.skipRb),
+                     static_cast<unsigned long long>(s.submits),
+                     static_cast<unsigned long long>(s.mirrorEdges),
+                     static_cast<unsigned long long>(s.mirrorTargets),
+                     static_cast<unsigned long long>(s.transportEligible),
+                     static_cast<unsigned long long>(s.residentEligible),
+                     s.drainNs / 1.0e6, s.gpuNs / 1.0e6, s.replayNs / 1.0e6,
+                     s.submitNs / 1.0e6,
+                     static_cast<unsigned long long>(s.publicationEvents),
+                     static_cast<unsigned long long>(s.next[0]),
+                     static_cast<unsigned long long>(s.next[1]),
+                     static_cast<unsigned long long>(s.next[2]),
+                     static_cast<unsigned long long>(s.next[3]),
+                     static_cast<unsigned long long>(s.next[4]),
+                     static_cast<unsigned long long>(s.next[5]),
+                     static_cast<unsigned long long>(s.next[6]));
+    }
+}
+
+static void g314FinishEdge(G314EdgeScope &edge, uint32_t mirrorMask,
+                           uint32_t dbp, uint32_t dbw, uint32_t dpsm,
+                           uint32_t dsax, uint32_t dsay,
+                           uint32_t rrw, uint32_t rrh)
+{
+    if (!edge.active || edge.shape == nullptr)
+        return;
+    g_g314EdgeActive = false;
+    G314UploadShape &s = *edge.shape;
+    const uint64_t gpuOk = g_g290GpuOk - edge.gpuOk;
+    const uint64_t gpuFail = g_g290GpuFail - edge.gpuFail;
+    const uint64_t cpuEntries = g_g290CpuEntries - edge.cpuEntries;
+    const uint64_t gpuNs = g_g290GpuOkNs - edge.gpuNs;
+    const uint64_t replayNs = g_g290ReplayNs - edge.replayNs;
+    const uint64_t submitNs = g_g274SubNs.load(std::memory_order_relaxed) - edge.submitNs;
+    const uint64_t submits = g314SubmitCount() - edge.submits;
+    const uint64_t skipRb = g314SkipReadbackCount() - edge.skipRb;
+    const uint64_t publications = g314PublicationCount() - edge.publications;
+    const uint64_t drainNs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - edge.t0).count());
+
+    s.gpuOk += gpuOk;
+    s.gpuFail += gpuFail;
+    s.cpuEntries += cpuEntries;
+    s.gpuNs += gpuNs;
+    s.replayNs += replayNs;
+    s.submitNs += submitNs;
+    s.submits += submits;
+    s.skipRb += skipRb;
+    s.publicationEvents += publications;
+    s.drainNs += drainNs;
+    if (mirrorMask != 0u)
+    {
+        ++s.mirrorEdges;
+        for (uint32_t m = mirrorMask; m != 0u; m >>= 1u)
+            s.mirrorTargets += m & 1u;
+    }
+
+    // Transport eligibility is intentionally broader than existing G264 mirror admission: it is
+    // the absolute ceiling for a NEW ordered backend payload node.  Resident eligibility is the
+    // subset already representable by today's exact FBO mirror ownership.
+    const bool transport = gpuOk != 0u && gpuFail == 0u && cpuEntries == 0u &&
+                           submits == gpuOk && skipRb == submits && publications == 0u;
+    if (transport)
+    {
+        ++s.transportEligible;
+        s.eligibleDrainNs += drainNs;
+        s.eligibleSubmitNs += submitNs;
+        if (mirrorMask != 0u)
+            ++s.residentEligible;
+    }
+
+    if (g_g314Pending.armed)
+    {
+        if (edge.dst.valid && g_g314Pending.range.valid &&
+            g144RangeOverlaps(edge.dst, g_g314Pending.range))
+            g314ResolveNext(kG314NextUploadWrite);
+        else
+            g314ResolveNext(kG314NextUnresolved);
+    }
+    g_g314Pending.waitingForComplete = true;
+    g_g314Pending.armed = false;
+    g_g314Pending.shape = &s;
+    g_g314Pending.range = edge.dst;
+    g_g314Pending.dbp = dbp;
+    g_g314Pending.dbw = dbw;
+    g_g314Pending.dpsm = dpsm;
+    g_g314Pending.dsax = dsax;
+    g_g314Pending.dsay = dsay;
+    g_g314Pending.rrw = rrw;
+    g_g314Pending.rrh = rrh;
+    g314Report();
+}
+
 // G145 (experimental, opt-in DC2_G145_DIRTY_UPLOAD=1): dirty-region upload flush gate. G144 flushed
 // before every upload/local-copy because any VRAM write can invalidate deferred texture sampling.
 // This keeps that behavior on uncertainty, but skips flushes whose destination does not overlap any
@@ -1016,10 +1237,14 @@ void g144FlushPendingUploadRange(uint32_t dbp,
         }
         if (!g289UploadOverwrite)
             g289MaterializeForRanges(G144BlockRange{}, dst, false, dstUnknown, 7);
+        G314EdgeScope g314Edge;
         if (g260HasPending())
         {
-            if (g260VramEventNeedsExecute(G144BlockRange{}, dst, false, dstUnknown))
+            const bool needsExecute =
+                g260VramEventNeedsExecute(G144BlockRange{}, dst, false, dstUnknown);
+            if (needsExecute)
             {
+                g314Edge = g314BeginEdge(dbp, dbw, dpsm, dsax, dsay, rrw, rrh, dst);
                 g178CensusScan();
                 G146PerfScope g146FlushScope(g_g146G144FlushUploadNs, g_g146G144FlushUploadCount);
                 static const bool s_seqUpload260 = (std::getenv("DC2_G144_SEQUPLOAD") != nullptr);
@@ -1039,19 +1264,42 @@ void g144FlushPendingUploadRange(uint32_t dbp,
         // over current bytes and the residency record cannot go stale-partial.
         // G264: eligible rects are deferred to a VRAM→FBO mirror at the next flush edge instead
         // (the mask suppresses only the exact targets that accepted the deferral; fail-closed).
+        uint32_t g327OverlapMask = 0u;
+        if (g327CensusOn() && !dstUnknown)
+            for (uint32_t i = 0u; i < kG248TargetCount; ++i)
+                if (g_g261Res[i].dirty && g_g261Res[i].range.valid &&
+                    g144RangeOverlaps(g_g261Res[i].range, dst))
+                    g327OverlapMask |= 1u << i;
+        std::chrono::steady_clock::time_point g327T0;
+        if (g327CensusOn())
+            g327T0 = std::chrono::steady_clock::now();
         const uint32_t g264Mask = dstUnknown
             ? 0u
             : g264NoteUploadForMirror(dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        const uint64_t g327NoteNs = g327CensusOn()
+            ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - g327T0).count())
+            : 0u;
         (void)g278FlushPendingDepthForRanges(
             7, G144BlockRange{}, dst, false, dstUnknown);
+        if (g327CensusOn())
+            g327T0 = std::chrono::steady_clock::now();
         g261MaterializeForRanges(G144BlockRange{}, dst, false, dstUnknown, kG261MatUpload,
                                  g264Mask);
+        const uint64_t g327MatNs = g327CensusOn()
+            ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                  std::chrono::steady_clock::now() - g327T0).count())
+            : 0u;
+        g327RecordUpload(dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
+                         g327OverlapMask, g264Mask, g327NoteNs, g327MatNs);
         (void)g278FlushPendingDepthForDisplayOwners(7);
         g272MaterializeForRanges(G144BlockRange{}, dst, false, dstUnknown, 7);
         g277CensusRangeEdge(7, G144BlockRange{}, dst, false, dstUnknown);
         // G276/G284: publish deferred display readbacks before this l2h upload edge — unless G284
         // proves the upload dst is disjoint from the pending display rows (then keep it coalesced).
         g276FlushPendingDisplayForRanges(7, G144BlockRange{}, dst, false, dstUnknown);
+        g314FinishEdge(g314Edge, g264Mask, dbp, dbw, dpsm,
+                       dsax, dsay, rrw, rrh);
         return;
     }
     if (g_g144List.empty())
@@ -1091,6 +1339,7 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
         const G144BlockRange dst = g144RangeForRect(dbp, dpsm, dbw, dsax, dsay, rrw, rrh);
         const bool srcUnknown = (rrw != 0u && rrh != 0u && !src.valid);
         const bool dstUnknown = (rrw != 0u && rrh != 0u && !dst.valid);
+        g314ObserveTransfer(src, dst, srcUnknown, dstUnknown);
         g289MaterializeForRanges(src, dst, srcUnknown, dstUnknown, 8);
         if (g260HasPending())
         {

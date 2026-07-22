@@ -567,6 +567,9 @@ static bool g310ApplyDesired(
 static bool g310Initialize(
     const std::array<G310DesiredPage, 128> &desired, int seedTi)
 {
+    const auto g324CpuT0 = g_g324ActiveDiag != nullptr
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
     if (seedTi < 0 || seedTi >= static_cast<int>(kG248TargetCount))
     {
         g_g310FailMissing.fetch_add(1u, std::memory_order_relaxed);
@@ -574,8 +577,17 @@ static bool g310Initialize(
     }
     static std::vector<uint32_t> s_pageMap;
     static std::vector<uint32_t> s_basePixels;
+    static std::array<bool, 128> s_g326GuestValid{};
+    static std::array<uint64_t, 128> s_g326GuestGen{};
+    static std::array<uint64_t, 128> s_g326GuestHash{};
+    static uint8_t *s_g326Vram = nullptr;
     s_pageMap.resize(128u);
     s_basePixels.resize(512u * 512u);
+    if (g326G310On() && s_g326Vram != g_g144LastVram)
+    {
+        s_g326GuestValid.fill(false);
+        s_g326Vram = g_g144LastVram;
+    }
     std::array<G310PageState, 128> next{};
     uint64_t gpuPages = 0u, guestPages = 0u;
     for (uint32_t py = 0u; py < 16u; ++py)
@@ -599,23 +611,84 @@ static bool g310Initialize(
             else
             {
                 s_pageMap[page] = 0xFF000000u;
-                if (!g310GuestPageMeta(
-                        page, state.guestGen, state.guestHash))
+                const uint32_t pageBlock =
+                    0x2720u + static_cast<uint32_t>(page) * 32u;
+                const uint64_t trackedGen =
+                    g_g178PageGen[pageBlock >> 5u].load(std::memory_order_relaxed);
+                bool cacheHit = g326G310On() && !g326ForceColdOn() &&
+                                s_g326GuestValid[page] &&
+                                s_g326GuestGen[page] == trackedGen;
+                if (cacheHit && g326VerifyOn())
+                {
+                    uint64_t coldGen = 0u, coldHash = 0u;
+                    bool bad = !g310GuestPageMeta(page, coldGen, coldHash) ||
+                               coldGen != s_g326GuestGen[page] ||
+                               coldHash != s_g326GuestHash[page];
+                    for (uint32_t localY = 0u; !bad && localY < 32u; ++localY)
+                    {
+                        const uint32_t gsY = py * 32u + localY;
+                        const uint32_t glY = 511u - gsY;
+                        for (uint32_t localX = 0u; localX < 64u; ++localX)
+                        {
+                            const uint32_t x = px * 64u + localX;
+                            const uint32_t cold = GSMem::ReadCT32(
+                                g_g144LastVram, 0x2720u, 8u, x, gsY);
+                            if (s_basePixels[static_cast<size_t>(glY) * 512u + x] != cold)
+                            {
+                                bad = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (bad)
+                    {
+                        ++g_g326.g310Bad;
+                        cacheHit = false; // rebuild and repair before backend consumption
+                        static uint32_t s_log = 0u;
+                        if (s_log++ < 16u)
+                            std::fprintf(stderr,
+                                         "[G326:bad] product=g310 page=%zu gen=%llu/%llu\n",
+                                         page,
+                                         static_cast<unsigned long long>(
+                                             s_g326GuestGen[page]),
+                                         static_cast<unsigned long long>(trackedGen));
+                    }
+                }
+                if (cacheHit)
+                {
+                    state.guestGen = s_g326GuestGen[page];
+                    state.guestHash = s_g326GuestHash[page];
+                    if (g326DiagOn())
+                        ++g_g326.g310Hit;
+                }
+                else if (!g310GuestPageMeta(
+                             page, state.guestGen, state.guestHash))
                 {
                     g_g310FailMissing.fetch_add(1u, std::memory_order_relaxed);
                     g_g310Initialized = false;
                     return false;
                 }
-                for (uint32_t localY = 0u; localY < 32u; ++localY)
+                if (!cacheHit)
                 {
-                    const uint32_t gsY = py * 32u + localY;
-                    const uint32_t glY = 511u - gsY;
-                    for (uint32_t localX = 0u; localX < 64u; ++localX)
+                    if (g326G310On() && g326DiagOn())
+                        ++g_g326.g310Miss;
+                    for (uint32_t localY = 0u; localY < 32u; ++localY)
                     {
-                        const uint32_t x = px * 64u + localX;
-                        s_basePixels[static_cast<size_t>(glY) * 512u + x] =
-                            GSMem::ReadCT32(
-                                g_g144LastVram, 0x2720u, 8u, x, gsY);
+                        const uint32_t gsY = py * 32u + localY;
+                        const uint32_t glY = 511u - gsY;
+                        for (uint32_t localX = 0u; localX < 64u; ++localX)
+                        {
+                            const uint32_t x = px * 64u + localX;
+                            s_basePixels[static_cast<size_t>(glY) * 512u + x] =
+                                GSMem::ReadCT32(
+                                    g_g144LastVram, 0x2720u, 8u, x, gsY);
+                        }
+                    }
+                    if (g326G310On() && !g326ForceColdOn())
+                    {
+                        s_g326GuestValid[page] = true;
+                        s_g326GuestGen[page] = state.guestGen;
+                        s_g326GuestHash[page] = state.guestHash;
                     }
                 }
                 ++guestPages;
@@ -626,7 +699,23 @@ static bool g310Initialize(
     const bool census = g311CensusOn() && !g_g311InOracle;
     const auto t0 = census ? std::chrono::steady_clock::now()
                            : std::chrono::steady_clock::time_point{};
-    if (!g310_backend_build_logical_composite(s_pageMap, s_basePixels))
+    const auto g324BackendT0 = g_g324ActiveDiag != nullptr
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    if (g_g324ActiveDiag != nullptr)
+        g_g324ActiveDiag->logicalCpuNs += g324ElapsedNs(g324CpuT0, g324BackendT0);
+    const bool backendOk =
+        g310_backend_build_logical_composite(s_pageMap, s_basePixels);
+    if (g_g324ActiveDiag != nullptr)
+    {
+        const auto done = std::chrono::steady_clock::now();
+        g_g324ActiveDiag->logicalBackendWallNs +=
+            g324ElapsedNs(g324BackendT0, done);
+        ++g_g324ActiveDiag->logicalJobs;
+        g_g324ActiveDiag->hadProducer = true;
+        g_g324ActiveDiag->lastProducerDone = done;
+    }
+    if (!backendOk)
     {
         g310Invalidate("composite", true);
         return false;
@@ -853,7 +942,14 @@ static bool g310EnsureCurrent()
         return g310FrozenUsable();
     std::array<G310DesiredPage, 128> desired{};
     int seedTi = -1;
-    if (!g310BuildDesired(desired, seedTi))
+    const auto g324DesiredT0 = g_g324ActiveDiag != nullptr
+        ? std::chrono::steady_clock::now()
+        : std::chrono::steady_clock::time_point{};
+    const bool desiredOk = g310BuildDesired(desired, seedTi);
+    if (g_g324ActiveDiag != nullptr)
+        g_g324ActiveDiag->desiredCpuNs +=
+            g324ElapsedNs(g324DesiredT0, std::chrono::steady_clock::now());
+    if (!desiredOk)
     {
         g_g310Initialized = false;
         return false;

@@ -33,7 +33,7 @@ static thread_local uint32_t s_g106LowerStatusRead = 0u;
 // VUops.cpp) would change the value. If DC2 never hits these, H2 is moot. Env DC2_G71_CLAMPCOUNT.
 static const bool s_g71clampcount = (std::getenv("DC2_G71_CLAMPCOUNT") != nullptr);
 static std::atomic<uint64_t> s_g71denorm{0}, s_g71infnan{0}, s_g71total{0};
-static inline uint32_t vu1MakeMac(const float *result, uint8_t dest)
+static inline uint32_t vu1MakeMacLegacy(const float *result, uint8_t dest)
 {
     uint32_t mac = 0u;
     for (int i = 0; i < 4; ++i)
@@ -68,6 +68,40 @@ static inline uint32_t vu1MakeMac(const float *result, uint8_t dest)
     }
     return mac;
 }
+
+// G329: classify all four FMAC result lanes together.  The legacy scalar loop above performs
+// up to four memcpy/exponent/sign tests and four destination branches per upper arithmetic op;
+// external G325 sampling attributed 119/777 VU-path leaf samples to this flag builder.  SSE2
+// produces the same four lane predicates directly, and the nibble reversal maps host lane bits
+// [wzyx] to the VU MAC nibble [xyzw].  Kept opt-in until full route validation.
+static inline uint32_t g329ReverseLaneNibble(uint32_t v)
+{
+    return ((v & 0x1u) << 3u) | ((v & 0x2u) << 1u) |
+           ((v & 0x4u) >> 1u) | ((v & 0x8u) >> 3u);
+}
+
+static inline uint32_t g329MakeMacSimd(const float *result, uint8_t dest)
+{
+    const __m128i bits = _mm_loadu_si128(reinterpret_cast<const __m128i *>(result));
+    const __m128i zero = _mm_setzero_si128();
+    const __m128i expMask = _mm_set1_epi32(0x7F800000u);
+    const __m128i absBits = _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFFu));
+    const __m128i expBits = _mm_and_si128(bits, expMask);
+    const __m128i isZero = _mm_cmpeq_epi32(absBits, zero);
+    const __m128i expZero = _mm_cmpeq_epi32(expBits, zero);
+    const __m128i isUnder = _mm_andnot_si128(isZero, expZero);
+    const __m128i isOver = _mm_cmpeq_epi32(expBits, expMask);
+    const uint32_t d = static_cast<uint32_t>(dest);
+    const uint32_t z = g329ReverseLaneNibble(
+        static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(isZero)))) & d;
+    const uint32_t s = g329ReverseLaneNibble(
+        static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(bits)))) & d;
+    const uint32_t u = g329ReverseLaneNibble(
+        static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(isUnder)))) & d;
+    const uint32_t o = g329ReverseLaneNibble(
+        static_cast<uint32_t>(_mm_movemask_ps(_mm_castsi128_ps(isOver)))) & d;
+    return z | (s << 4u) | (u << 8u) | (o << 12u);
+}
 // G71/H1: derive the VU STATUS flag register from the MAC flags after each FMAC op (PCSX2
 // VU_STAT_UPDATE + the sticky accumulate of VUops.cpp). status[3:0]=current Z/S/U/O present,
 // [5:4]=D/I (kept), [11:6]=sticky (OR-accumulated). Was a sibling of the MAC bug: m_state.status
@@ -82,17 +116,52 @@ static inline void vu1UpdateStatus(uint32_t &statusReg, uint32_t mac)
     if (mac & 0xF000u) cur |= 0x8u; // O
     statusReg = (statusReg & 0xFF0u) | cur | (cur << 6); // keep D/I + sticky, set current, accumulate sticky
 }
+
+static inline void g329UpdateStatus(uint32_t &statusReg, uint32_t mac)
+{
+    // Fold every four-bit MAC group to its low bit, then pack Z/S/U/O into STATUS[3:0].
+    uint32_t folded = mac | (mac >> 1u);
+    folded |= folded >> 2u;
+    const uint32_t cur = (folded & 0x1u) | ((folded >> 3u) & 0x2u) |
+                         ((folded >> 6u) & 0x4u) | ((folded >> 9u) & 0x8u);
+    statusReg = (statusReg & 0xFF0u) | cur | (cur << 6u);
+}
 // G71/H2: optional VU1 result clamp (PCSX2 vuDouble / MAC_UPDATE). Off by default (DC2 renders
 // without it); DC2_VU1_CLAMP enables. Flags are taken from the ORIGINAL result (so U/O are set),
 // then the stored value is clamped: denormal -> signed zero, inf/NaN/exp-saturated -> +-0x7f7fffff.
 // Caller must run this BEFORE applyDest so the clamped value is what gets stored.
 static const bool s_vu1Clamp = (std::getenv("DC2_VU1_CLAMP") != nullptr);
-static inline void vu1UpdateMac(uint32_t &macReg, uint32_t &statusReg, float *result, uint8_t dest)
+static inline void g329UpdateMacSelected(uint32_t &macReg, uint32_t &statusReg,
+                                         float *result, uint8_t dest)
 {
+    static const bool s_g329SimdOn = (std::getenv("DC2_G329_SIMD_MAC") != nullptr);
+    static const bool s_g329Verify = (std::getenv("DC2_G329_VERIFY") != nullptr);
     if (!s_vu1MacDisabled)
     {
-        macReg = vu1MakeMac(result, dest);
-        vu1UpdateStatus(statusReg, macReg);
+        if (s_g329SimdOn && !s_g71clampcount)
+        {
+            const uint32_t statusBefore = statusReg;
+            macReg = g329MakeMacSimd(result, dest);
+            g329UpdateStatus(statusReg, macReg);
+            if (s_g329Verify)
+            {
+                const uint32_t legacyMac = vu1MakeMacLegacy(result, dest);
+                uint32_t legacyStatus = statusBefore;
+                vu1UpdateStatus(legacyStatus, legacyMac);
+                if (macReg != legacyMac || statusReg != legacyStatus)
+                {
+                    std::fprintf(stderr,
+                        "[G329:verify] mismatch dest=%x mac=%08x/%08x status=%08x/%08x\n",
+                        static_cast<unsigned>(dest), macReg, legacyMac, statusReg, legacyStatus);
+                    std::abort();
+                }
+            }
+        }
+        else
+        {
+            macReg = vu1MakeMacLegacy(result, dest);
+            vu1UpdateStatus(statusReg, macReg);
+        }
     }
     if (s_vu1Clamp)
     {
@@ -112,6 +181,47 @@ static inline void vu1UpdateMac(uint32_t &macReg, uint32_t &statusReg, float *re
             std::memcpy(&result[i], &bits, 4);
         }
     }
+}
+
+// G330: fuse the verified G329 flag classifier into each upper arithmetic case.  MSVC kept the
+// larger selected helper above out-of-line, forcing every FMAC result through a stack spill,
+// call, SIMD reload, return, then a second result read by applyDest.  The tiny armed fast path
+// stays in the producer and routes every diagnostic/legacy mode through the old helper.
+#if defined(_MSC_VER)
+#define DC2_G330_FORCEINLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define DC2_G330_FORCEINLINE inline __attribute__((always_inline))
+#else
+#define DC2_G330_FORCEINLINE inline
+#endif
+
+static const bool s_g330FusedMacOn = (std::getenv("DC2_G330_FUSED_MAC") != nullptr);
+static const bool s_g330Verify = (std::getenv("DC2_G330_VERIFY") != nullptr);
+
+static DC2_G330_FORCEINLINE void vu1UpdateMac(uint32_t &macReg, uint32_t &statusReg,
+                                              float *result, uint8_t dest)
+{
+    if (s_g330FusedMacOn && !s_vu1MacDisabled && !s_g71clampcount && !s_vu1Clamp)
+    {
+        const uint32_t statusBefore = statusReg;
+        macReg = g329MakeMacSimd(result, dest);
+        g329UpdateStatus(statusReg, macReg);
+        if (s_g330Verify)
+        {
+            const uint32_t legacyMac = vu1MakeMacLegacy(result, dest);
+            uint32_t legacyStatus = statusBefore;
+            vu1UpdateStatus(legacyStatus, legacyMac);
+            if (macReg != legacyMac || statusReg != legacyStatus)
+            {
+                std::fprintf(stderr,
+                    "[G330:verify] mismatch dest=%x mac=%08x/%08x status=%08x/%08x\n",
+                    static_cast<unsigned>(dest), macReg, legacyMac, statusReg, legacyStatus);
+                std::abort();
+            }
+        }
+        return;
+    }
+    g329UpdateMacSelected(macReg, statusReg, result, dest);
 }
 
 void VU1Interpreter::applyDest(float *dst, const float *result, uint8_t dest)
@@ -717,4 +827,3 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
     }
     run(vuCode, codeSize, vuData, dataSize, gs, memory, maxCycles);
 }
-

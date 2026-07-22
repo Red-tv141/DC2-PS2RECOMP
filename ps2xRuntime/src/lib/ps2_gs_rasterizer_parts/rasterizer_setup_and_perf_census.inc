@@ -84,6 +84,24 @@ static std::atomic<uint32_t> g_g232PxWrite{0}, g_g232PxRedWrite{0}, g_g232PxZlog
 // touching it (tbp, zi vs zdst, pass) -> full per-frame Z history at the gem's screen pixel.
 static std::atomic<int> g_g232GemX{-1}, g_g232GemY{-1};
 
+// ===== G312 segment census (default-off, DC2_G312_STAT=1) =====
+// Splits the drawPrimitive entry->capture window into segments to localize per-draw cost:
+//   seg0 = entry stamp -> end of the G45/G49 costume-Z block
+//   seg1 = seg0 end -> end of the F31..G34 diagnostic pile
+//   seg2 = seg1 end -> capture start, sub-split 2a (DC2_PERF G141 counter block) /
+//          2b (tilebin eligibility) / 2c (pre-flush checks)
+// G312 finding (2026-07-21): with all diagnostic envs off the whole window is ~119 ns/draw
+// (seg0=28, pile=17, seg2=74). Under DC2_PERF=1 the G141 counter block alone inflates to
+// ~855 ns/draw (~12.6 ms/f of GS-worker time at 14.7k draws/f) — the entire suspected
+// "register-replay/draw-capture pole term" was profiler self-cost, not game work. Keep this
+// census for any future prologue attribution; NEVER bucket-hunt inside a DC2_PERF run.
+// Report: [G312:seg] cumulative ms + ns/draw every 8000 draws.
+static const bool g_g312SegStat = (std::getenv("DC2_G312_STAT") != nullptr);
+static std::atomic<uint64_t> g_g312Seg0Ns{0}, g_g312Seg1Ns{0}, g_g312Seg2Ns{0}, g_g312SegN{0};
+static std::atomic<uint64_t> g_g312Seg2aNs{0}, g_g312Seg2bNs{0};
+static thread_local std::chrono::steady_clock::time_point t_g312Seg2Start{};
+static thread_local std::chrono::steady_clock::time_point t_g312Seg2aEnd{}, t_g312Seg2bEnd{};
+
 void GSRasterizer::drawPrimitive(GS *gs)
 {
     static const bool s_g141PerfOn = (std::getenv("DC2_PERF") != nullptr);
@@ -108,6 +126,8 @@ void GSRasterizer::drawPrimitive(GS *gs)
     }
     const std::chrono::steady_clock::time_point g156FnT0 =
         g_g156Stat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const std::chrono::steady_clock::time_point g312T0 =
+        g_g312SegStat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     const auto &ctx = gs->activeContext();
     // G45: clear the costume model's PRIVATE Z buffer exactly once per costume frame, on the
@@ -166,6 +186,11 @@ void GSRasterizer::drawPrimitive(GS *gs)
                              sn, prevFbp, ctx.frame.fbp, (unsigned)didClear);
         }
     }
+    const std::chrono::steady_clock::time_point g312T1 =
+        g_g312SegStat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // (G312 note: a master skip-branch over the F31..G34 diagnostic pile below was built and
+    // REVERTED — the pile costs only ~17 ns/draw with gates off; the suspected ~1.1 us/draw
+    // prologue cost was DC2_PERF instrument self-cost. See [G312:seg] census + the G312 fix log.)
     if (phaseDiagnosticsEnabled())
     {
         static std::atomic<uint32_t> s_f31PrimCount{0};
@@ -1007,6 +1032,17 @@ void GSRasterizer::drawPrimitive(GS *gs)
                       << std::dec << std::endl;
         }
     });
+    if (g_g312SegStat)
+    {
+        const auto g312T2 = std::chrono::steady_clock::now();
+        g_g312Seg0Ns.fetch_add(
+            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(g312T1 - g312T0).count(),
+            std::memory_order_relaxed);
+        g_g312Seg1Ns.fetch_add(
+            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(g312T2 - g312T1).count(),
+            std::memory_order_relaxed);
+        t_g312Seg2Start = g312T2;
+    }
 
     if (gs->m_hasPreferredDisplaySource && ctx.frame.fbp == gs->m_preferredDisplayDestFbp)
     {
@@ -1039,3 +1075,5 @@ void GSRasterizer::drawPrimitive(GS *gs)
                          din ? static_cast<double>(ddr) / static_cast<double>(din) : 0.0);
         }
     }
+    if (g_g312SegStat)
+        t_g312Seg2aEnd = std::chrono::steady_clock::now(); // G312 seg2a end (perf-counter block done)

@@ -112,6 +112,329 @@ static std::atomic<uint64_t> g_g310MatPages[8]{};
 static std::atomic<uint64_t> g_g310T8Candidates{0}, g_g310T8Views{0},
     g_g310T8BuildFail{0}, g_g310T8RejShape{0}, g_g310T8RejPage{0},
     g_g310T8RejClut{0};
+// G326: one default-off persistent cache for descriptor-derived frontend products. The renderer's
+// existing builders remain the cold path and the verifier oracle; no authority or ordering state
+// is cached here. These gates are process-constant and disappear to one predictable branch when
+// the arm is absent.
+static bool g326PlanCacheOn()
+{
+    static const bool v = envFlagEnabled("DC2_G326_PLAN_CACHE");
+    return v;
+}
+static bool g326VerifyOn()
+{
+    static const bool v = envFlagEnabled("DC2_G326_VERIFY");
+    return v;
+}
+static bool g326StatOn()
+{
+    static const bool v = envFlagEnabled("DC2_G326_STAT");
+    return v;
+}
+static bool g326ForceColdOn()
+{
+    static const bool v = envFlagEnabled("DC2_G326_FORCE_COLD");
+    return v;
+}
+static bool g326G264On()
+{
+    static const bool v = !envFlagEnabled("DC2_G326_NO_G264");
+    return g326PlanCacheOn() && v;
+}
+static bool g326G281On()
+{
+    static const bool v = !envFlagEnabled("DC2_G326_NO_G281");
+    return g326PlanCacheOn() && v;
+}
+static bool g326G310On()
+{
+    static const bool v = !envFlagEnabled("DC2_G326_NO_G310");
+    return g326PlanCacheOn() && v;
+}
+static bool g326DiagOn() { return g326VerifyOn() || g326StatOn(); }
+struct G326Counters
+{
+    uint64_t g264Hit = 0u, g264Miss = 0u, g264Bad = 0u;
+    uint64_t g281Hit = 0u, g281Miss = 0u, g281Bad = 0u;
+    uint64_t g310Hit = 0u, g310Miss = 0u, g310Bad = 0u;
+    uint64_t reports = 0u;
+};
+static G326Counters g_g326{}; // all three products are owned by the single flush/GS worker
+static void g326MaybeReport()
+{
+    if (!g326StatOn())
+        return;
+    const uint64_t work = g_g326.g264Hit + g_g326.g264Miss;
+    if (work == 0u || (work % 128u) != 0u || g_g326.reports == work)
+        return;
+    g_g326.reports = work;
+    std::fprintf(stderr,
+                 "[G326:stat] g264=%llu/%llu bad=%llu g281=%llu/%llu bad=%llu "
+                 "g310=%llu/%llu bad=%llu cold=%d\n",
+                 static_cast<unsigned long long>(g_g326.g264Hit),
+                 static_cast<unsigned long long>(g_g326.g264Miss),
+                 static_cast<unsigned long long>(g_g326.g264Bad),
+                 static_cast<unsigned long long>(g_g326.g281Hit),
+                 static_cast<unsigned long long>(g_g326.g281Miss),
+                 static_cast<unsigned long long>(g_g326.g281Bad),
+                 static_cast<unsigned long long>(g_g326.g310Hit),
+                 static_cast<unsigned long long>(g_g326.g310Miss),
+                 static_cast<unsigned long long>(g_g326.g310Bad),
+                 g326ForceColdOn() ? 1 : 0);
+}
+// G327 premise census: classify the two sides of one host-upload conflict contract before
+// building the physical-byte overlay. Timers exist only under the explicit census flag; the
+// default renderer pays one cached false branch at the existing upload/mirror boundaries.
+static bool g327CensusOn()
+{
+    static const bool v = envFlagEnabled("DC2_G327_CENSUS");
+    return v;
+}
+struct G327PsmCensus
+{
+    uint64_t hooks = 0u, overlapHooks = 0u;
+    uint64_t mirrorHooks = 0u, fallbackHooks = 0u;
+    uint64_t mirrorTargets = 0u, fallbackTargets = 0u;
+    uint64_t noteNs = 0u, materializeNs = 0u;
+    uint64_t transfers = 0u, chunks = 0u, bytes = 0u;
+    uint64_t mirrorTransfers = 0u, fallbackTransfers = 0u, mixedTransfers = 0u;
+};
+struct G327TransferWatch
+{
+    bool active = false;
+    uint32_t dbp = 0u, dsax = 0u, dsay = 0u, rrw = 0u, rrh = 0u;
+    uint8_t dbw = 0u, dpsm = 0u;
+    uint32_t mirrorMask = 0u, fallbackMask = 0u;
+    uint64_t chunks = 0u, bytes = 0u;
+};
+static std::array<G327PsmCensus, 64> g_g327Psm{};
+static G327TransferWatch g_g327Watch{};
+static uint64_t g_g327MirrorFlushes = 0u, g_g327MirrorFlushNs = 0u;
+static uint64_t g_g327WatchAborts = 0u, g_g327LastReport = 0u;
+static uint32_t g327BitCount(uint32_t v)
+{
+    uint32_t n = 0u;
+    while (v != 0u)
+    {
+        v &= v - 1u;
+        ++n;
+    }
+    return n;
+}
+static bool g327WatchMatches(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                             uint32_t dsax, uint32_t dsay,
+                             uint32_t rrw, uint32_t rrh)
+{
+    return g_g327Watch.active && g_g327Watch.dbp == dbp && g_g327Watch.dbw == dbw &&
+           g_g327Watch.dpsm == dpsm && g_g327Watch.dsax == dsax &&
+           g_g327Watch.dsay == dsay && g_g327Watch.rrw == rrw && g_g327Watch.rrh == rrh;
+}
+static void g327MaybeReport()
+{
+    if (!g327CensusOn())
+        return;
+    uint64_t overlap = 0u;
+    for (const G327PsmCensus &p : g_g327Psm)
+        overlap += p.overlapHooks;
+    if (overlap == 0u || (overlap % 1024u) != 0u || overlap == g_g327LastReport)
+        return;
+    g_g327LastReport = overlap;
+    std::fprintf(stderr,
+                 "[G327:total] overlap=%llu mirrorFlush=%llu/%.3fms watchAbort=%llu\n",
+                 static_cast<unsigned long long>(overlap),
+                 static_cast<unsigned long long>(g_g327MirrorFlushes),
+                 static_cast<double>(g_g327MirrorFlushNs) / 1000000.0,
+                 static_cast<unsigned long long>(g_g327WatchAborts));
+    for (uint32_t psm = 0u; psm < g_g327Psm.size(); ++psm)
+    {
+        const G327PsmCensus &p = g_g327Psm[psm];
+        if (p.overlapHooks == 0u)
+            continue;
+        std::fprintf(stderr,
+                     "[G327:psm] psm=0x%02x hook=%llu overlap=%llu mirror=%llu/%llu "
+                     "fallback=%llu/%llu note=%.3fms mat=%.3fms "
+                     "xfer=%llu chunks=%llu bytes=%llu kind=%llu/%llu/%llu\n",
+                     psm, static_cast<unsigned long long>(p.hooks),
+                     static_cast<unsigned long long>(p.overlapHooks),
+                     static_cast<unsigned long long>(p.mirrorHooks),
+                     static_cast<unsigned long long>(p.mirrorTargets),
+                     static_cast<unsigned long long>(p.fallbackHooks),
+                     static_cast<unsigned long long>(p.fallbackTargets),
+                     static_cast<double>(p.noteNs) / 1000000.0,
+                     static_cast<double>(p.materializeNs) / 1000000.0,
+                     static_cast<unsigned long long>(p.transfers),
+                     static_cast<unsigned long long>(p.chunks),
+                     static_cast<unsigned long long>(p.bytes),
+                     static_cast<unsigned long long>(p.mirrorTransfers),
+                     static_cast<unsigned long long>(p.fallbackTransfers),
+                     static_cast<unsigned long long>(p.mixedTransfers));
+    }
+}
+static void g327RecordUpload(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                             uint32_t dsax, uint32_t dsay,
+                             uint32_t rrw, uint32_t rrh,
+                             uint32_t overlapMask, uint32_t mirrorMask,
+                             uint64_t noteNs, uint64_t materializeNs)
+{
+    if (!g327CensusOn())
+        return;
+    G327PsmCensus &p = g_g327Psm[dpsm & 0x3fu];
+    ++p.hooks;
+    if (overlapMask == 0u)
+        return;
+    const uint32_t fallbackMask = overlapMask & ~mirrorMask;
+    ++p.overlapHooks;
+    p.noteNs += noteNs;
+    p.materializeNs += materializeNs;
+    if (mirrorMask != 0u)
+    {
+        ++p.mirrorHooks;
+        p.mirrorTargets += g327BitCount(mirrorMask);
+    }
+    if (fallbackMask != 0u)
+    {
+        ++p.fallbackHooks;
+        p.fallbackTargets += g327BitCount(fallbackMask);
+    }
+    if (g_g327Watch.active && !g327WatchMatches(dbp, dbw, dpsm, dsax, dsay, rrw, rrh))
+    {
+        ++g_g327WatchAborts;
+        g_g327Watch = G327TransferWatch{};
+    }
+    if (!g_g327Watch.active)
+    {
+        g_g327Watch.active = true;
+        g_g327Watch.dbp = dbp;
+        g_g327Watch.dbw = dbw;
+        g_g327Watch.dpsm = dpsm;
+        g_g327Watch.dsax = dsax;
+        g_g327Watch.dsay = dsay;
+        g_g327Watch.rrw = rrw;
+        g_g327Watch.rrh = rrh;
+        g_g327Watch.mirrorMask = mirrorMask;
+        g_g327Watch.fallbackMask = fallbackMask;
+        static uint32_t s_logs = 0u;
+        if (s_logs++ < 48u)
+            std::fprintf(stderr,
+                         "[G327:edge] n=%u dbp=0x%x dbw=%u psm=0x%x xy=%u,%u "
+                         "size=%ux%u overlap=0x%x mirror=0x%x fallback=0x%x\n",
+                         s_logs, dbp, static_cast<unsigned>(dbw),
+                         static_cast<unsigned>(dpsm), dsax, dsay, rrw, rrh,
+                         overlapMask, mirrorMask, fallbackMask);
+    }
+    else
+    {
+        g_g327Watch.mirrorMask |= mirrorMask;
+        g_g327Watch.fallbackMask |= fallbackMask;
+    }
+    g327MaybeReport();
+}
+// Cross-TU completion bridge from GS::processImageData. It records only transfers armed by an
+// actual dirty-resident overlap, and never retains or copies IMAGE bytes.
+void g327NoteImageChunk(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                        uint32_t dsax, uint32_t dsay,
+                        uint32_t rrw, uint32_t rrh,
+                        uint32_t sizeBytes, bool complete)
+{
+    if (!g327CensusOn() || !g327WatchMatches(dbp, dbw, dpsm, dsax, dsay, rrw, rrh))
+        return;
+    ++g_g327Watch.chunks;
+    g_g327Watch.bytes += sizeBytes;
+    if (!complete)
+        return;
+    G327PsmCensus &p = g_g327Psm[dpsm & 0x3fu];
+    ++p.transfers;
+    p.chunks += g_g327Watch.chunks;
+    p.bytes += g_g327Watch.bytes;
+    if (g_g327Watch.mirrorMask != 0u && g_g327Watch.fallbackMask != 0u)
+        ++p.mixedTransfers;
+    else if (g_g327Watch.mirrorMask != 0u)
+        ++p.mirrorTransfers;
+    else
+        ++p.fallbackTransfers;
+    g_g327Watch = G327TransferWatch{};
+}
+struct G327MirrorTimer
+{
+    G327MirrorTimer() : start(std::chrono::steady_clock::now()) {}
+    ~G327MirrorTimer()
+    {
+        ++g_g327MirrorFlushes;
+        g_g327MirrorFlushNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - start).count());
+    }
+    std::chrono::steady_clock::time_point start;
+};
+// G324 diagnostics: split G310 producer preparation into CPU staging versus synchronous backend
+// wall time, then measure how much ordinary front-end work exists before the first external
+// observer. The active pointer is scoped to one g178TryFlushGpu call; all gates are cached and the
+// default path executes no clocks or counter updates.
+static bool g324CensusOn()
+{
+    static const bool v = envFlagEnabled("DC2_G324_CENSUS");
+    return v;
+}
+static bool g324EmptyOn()
+{
+    static const bool v = !g324CensusOn() && envFlagEnabled("DC2_G324_EMPTY");
+    return v;
+}
+static bool g324Armed() { return g324CensusOn() || g324EmptyOn(); }
+static uint64_t g324ElapsedNs(const std::chrono::steady_clock::time_point &a,
+                              const std::chrono::steady_clock::time_point &b)
+{
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+}
+struct G324FlushDiag
+{
+    uint64_t desiredCpuNs = 0u;
+    uint64_t logicalCpuNs = 0u;
+    uint64_t logicalBackendWallNs = 0u;
+    uint64_t t8CpuNs = 0u;
+    uint64_t t8BackendWallNs = 0u;
+    uint64_t tailPrepNs = 0u;
+    uint64_t submitNs = 0u;
+    uint64_t logicalJobs = 0u;
+    uint64_t t8Jobs = 0u;
+    bool hadProducer = false;
+    std::chrono::steady_clock::time_point lastProducerDone{};
+};
+static thread_local G324FlushDiag *g_g324ActiveDiag = nullptr;
+struct G324DiagScope
+{
+    explicit G324DiagScope(G324FlushDiag *diag) : previous(g_g324ActiveDiag)
+    {
+        g_g324ActiveDiag = diag;
+    }
+    ~G324DiagScope() { g_g324ActiveDiag = previous; }
+    G324FlushDiag *previous = nullptr;
+};
+static bool g_g324ObserverPending = false;
+static std::chrono::steady_clock::time_point g_g324ObserverReady{};
+static uint64_t g_g324ObserverNs[3]{};
+static uint64_t g_g324ObserverN[3]{};
+static void g324NoteObserver(unsigned kind)
+{
+    if (!g324Armed() || !g_g324ObserverPending)
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    g_g324ObserverPending = false;
+    if (g324CensusOn())
+    {
+        kind = std::min(kind, 2u);
+        g_g324ObserverNs[kind] += g324ElapsedNs(g_g324ObserverReady, now);
+        ++g_g324ObserverN[kind];
+    }
+}
+static void g324ArmObserver()
+{
+    if (!g324Armed())
+        return;
+    g_g324ObserverReady = std::chrono::steady_clock::now();
+    g_g324ObserverPending = true;
+}
 // G311: batched page-delta maintenance of the G310 logical atlas. The full G309 compositor is
 // retained as fail-closed recovery + exact oracle; when enabled, producer transitions mark the
 // snapshot page-granular stale instead of de-initializing it, and the next display consumer
@@ -1008,6 +1331,9 @@ static bool g264FlushMirror(int ti)
     G261Res &r = g_g261Res[ti];
     if (!r.mirPending)
         return true;
+    std::unique_ptr<G327MirrorTimer> g327Timer;
+    if (g327CensusOn())
+        g327Timer = std::make_unique<G327MirrorTimer>();
     const int lo = r.mirLo, hi = r.mirHi;
     const uint32_t fbp = kG261Fbp[ti];
     const uint32_t fbBlock = framePageBaseToBlock(fbp);
@@ -1184,6 +1510,7 @@ static void g305DrainPending();
 
 static void g261Materialize(int ti, int cause)
 {
+    g324NoteObserver(1u); // direct resident-FBO/guest-authority consumer
     if (g305AsyncOn())
         g305DrainPending();
     G261Res &r = g_g261Res[ti];
@@ -1757,6 +2084,28 @@ void g289NoteUploadComplete(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
                      dbp, s_g289PendingUpload.replacedThroughBlock,
                      s_g289Owner.firstOwnedBlock, s_g289Owner.lastOwnedBlock,
                      fullyReplaced ? 1u : 0u);
+}
+
+// G314 cross-TU bridge from GS::processImageData. Arm first-consumer tracking only after every
+// IMAGE chunk has landed; otherwise continuation chunks would be misclassified as consumers.
+// This sits beside the proven G289 completion bridge so it has the same external linkage.
+void g314NoteImageComplete(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                           uint32_t dsax, uint32_t dsay,
+                           uint32_t rrw, uint32_t rrh)
+{
+    if (!g314CensusOn() || !g_g314Pending.waitingForComplete)
+        return;
+    const bool exact = g_g314Pending.dbp == dbp && g_g314Pending.dbw == dbw &&
+                       g_g314Pending.dpsm == dpsm && g_g314Pending.dsax == dsax &&
+                       g_g314Pending.dsay == dsay && g_g314Pending.rrw == rrw &&
+                       g_g314Pending.rrh == rrh;
+    g_g314Pending.waitingForComplete = false;
+    if (!exact || g_g314Pending.shape == nullptr || !g_g314Pending.range.valid)
+    {
+        g_g314Pending.shape = nullptr;
+        return;
+    }
+    g_g314Pending.armed = true;
 }
 
 // The following exact fbp=0x139 display sprite overwrites physical pages 0x2720..0x341f.

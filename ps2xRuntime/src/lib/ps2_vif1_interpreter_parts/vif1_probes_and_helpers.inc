@@ -20,6 +20,15 @@ std::atomic<uint64_t> g_g146Vif1Ns{0};
 // No-op unless MTVU is active; VIF1 still writes live RAM (EE shadow) as before. Defined in ps2_runtime.cpp.
 void g297NoteVuWrite(bool isCode, uint32_t off, const uint8_t *src, uint32_t bytes);
 
+// G317: explicit GIF-order fence provenance for the default-off Path-2 census.
+// Values mirror g317_path2_fence_census.inc without changing a public header.
+void g317_note_gif_fence(uint32_t reason);
+static constexpr uint32_t kG317VifFlush  = 1u << 0u;
+static constexpr uint32_t kG317VifFlusha = 1u << 1u;
+static constexpr uint32_t kG317VifMscal  = 1u << 2u;
+static constexpr uint32_t kG317VifMscalf = 1u << 3u;
+static constexpr uint32_t kG317VifMscnt  = 1u << 4u;
+
 struct Dc2G137VuOrigin
 {
     uint32_t valid;
@@ -433,4 +442,3 @@ namespace
         return static_cast<uint32_t>(tagLo & 0x7FFFu);
     }
 }
-

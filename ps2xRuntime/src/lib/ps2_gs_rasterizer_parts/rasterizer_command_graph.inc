@@ -289,12 +289,150 @@ namespace
     // g144 upload drain can be located. Accumulated single-threaded on the drain thread.
     bool g290ProbeOn()
     {
-        static const bool s_on = envFlagEnabled("DC2_G290_PROBE");
+        // G314 reuses the already-proven per-batch decomposition while its upload-edge
+        // census is active.  The gate is cached and remains completely inert by default.
+        static const bool s_on = envFlagEnabled("DC2_G290_PROBE") ||
+                                 envFlagEnabled("DC2_G314_CENSUS");
         return s_on;
     }
     uint64_t g_g290PrepNs = 0, g_g290ResolveNs = 0, g_g290GpuOkNs = 0, g_g290GpuFailNs = 0,
              g_g290PubNs = 0, g_g290ReplayNs = 0, g_g290NoteNs = 0;
     uint64_t g_g290GpuOk = 0, g_g290GpuFail = 0, g_g290CpuEntries = 0, g_g290Drains = 0;
+
+    // G314 premise census: characterize only real host->local dependency edges.  A backend
+    // upload-node architecture can remove synchronization/publication, but it cannot delete the
+    // dependent draws themselves.  Keep those terms separate so another inclusive subtraction
+    // cannot mistake required GPU work for a removable upload cost (the G313 lesson).
+    enum G314NextKind : uint32_t
+    {
+        kG314NextGpuRead = 0,
+        kG314NextGpuWrite = 1,
+        kG314NextGpuReadWrite = 2,
+        kG314NextLocalRead = 3,
+        kG314NextLocalWrite = 4,
+        kG314NextUploadWrite = 5,
+        kG314NextUnresolved = 6,
+        kG314NextCount = 7,
+    };
+
+    struct G314UploadShape
+    {
+        bool used = false;
+        uint32_t dbp = 0u, dbw = 0u, dpsm = 0u;
+        uint32_t dsax = 0u, dsay = 0u, rrw = 0u, rrh = 0u;
+        uint64_t edges = 0u, conflictWr = 0u, conflictRd = 0u, conflictUnknown = 0u;
+        uint64_t batches = 0u, entries = 0u;
+        uint64_t gpuOk = 0u, gpuFail = 0u, cpuEntries = 0u;
+        uint64_t skipRb = 0u, submits = 0u;
+        uint64_t mirrorEdges = 0u, mirrorTargets = 0u;
+        uint64_t transportEligible = 0u, residentEligible = 0u;
+        uint64_t publicationEvents = 0u;
+        uint64_t drainNs = 0u, gpuNs = 0u, replayNs = 0u, submitNs = 0u;
+        uint64_t eligibleDrainNs = 0u, eligibleSubmitNs = 0u;
+        uint64_t next[kG314NextCount]{};
+    };
+
+    static std::array<G314UploadShape, 24> g_g314Shapes{};
+    static uint64_t g_g314Edges = 0u;
+    static bool g_g314EdgeActive = false;
+
+    struct G314PendingUpload
+    {
+        bool waitingForComplete = false;
+        bool armed = false;
+        G314UploadShape *shape = nullptr;
+        G144BlockRange range{};
+        uint32_t dbp = 0u, dbw = 0u, dpsm = 0u;
+        uint32_t dsax = 0u, dsay = 0u, rrw = 0u, rrh = 0u;
+    };
+    static G314PendingUpload g_g314Pending{};
+
+    static bool g314CensusOn()
+    {
+        static const bool s_on = envFlagEnabled("DC2_G314_CENSUS");
+        return s_on;
+    }
+
+    static bool g314EdgeActive()
+    {
+        return g314CensusOn() && g_g314EdgeActive;
+    }
+
+    static G314UploadShape *g314FindShape(uint32_t dbp, uint32_t dbw, uint32_t dpsm,
+                                         uint32_t dsax, uint32_t dsay,
+                                         uint32_t rrw, uint32_t rrh)
+    {
+        G314UploadShape *freeShape = nullptr;
+        for (G314UploadShape &s : g_g314Shapes)
+        {
+            if (!s.used)
+            {
+                if (freeShape == nullptr)
+                    freeShape = &s;
+                continue;
+            }
+            if (s.dbp == dbp && s.dbw == dbw && s.dpsm == dpsm &&
+                s.dsax == dsax && s.dsay == dsay && s.rrw == rrw && s.rrh == rrh)
+                return &s;
+        }
+        if (freeShape == nullptr)
+            freeShape = &g_g314Shapes.back(); // bounded overflow bucket; never changes behavior
+        if (!freeShape->used)
+        {
+            freeShape->used = true;
+            freeShape->dbp = dbp;
+            freeShape->dbw = dbw;
+            freeShape->dpsm = dpsm;
+            freeShape->dsax = dsax;
+            freeShape->dsay = dsay;
+            freeShape->rrw = rrw;
+            freeShape->rrh = rrh;
+        }
+        return freeShape;
+    }
+
+    static void g314ResolveNext(G314NextKind kind)
+    {
+        if (!g314CensusOn() || !g_g314Pending.armed || g_g314Pending.shape == nullptr)
+            return;
+        ++g_g314Pending.shape->next[static_cast<uint32_t>(kind)];
+        g_g314Pending.armed = false;
+        g_g314Pending.shape = nullptr;
+    }
+
+    static void g314ObservePendingDraw(bool writeHit, bool readHit, bool unknown)
+    {
+        if (!g314CensusOn() || !g_g314Pending.armed)
+            return;
+        if (unknown)
+        {
+            g314ResolveNext(kG314NextUnresolved);
+            return;
+        }
+        if (readHit && writeHit)
+            g314ResolveNext(kG314NextGpuReadWrite);
+        else if (readHit)
+            g314ResolveNext(kG314NextGpuRead);
+        else if (writeHit)
+            g314ResolveNext(kG314NextGpuWrite);
+    }
+
+    static void g314ObserveTransfer(const G144BlockRange &src,
+                                    const G144BlockRange &dst,
+                                    bool srcUnknown, bool dstUnknown)
+    {
+        if (!g314CensusOn() || !g_g314Pending.armed)
+            return;
+        if (srcUnknown || dstUnknown)
+        {
+            g314ResolveNext(kG314NextUnresolved);
+            return;
+        }
+        if (src.valid && g144RangeOverlaps(src, g_g314Pending.range))
+            g314ResolveNext(kG314NextLocalRead);
+        else if (dst.valid && g144RangeOverlaps(dst, g_g314Pending.range))
+            g314ResolveNext(kG314NextLocalWrite);
+    }
 
     // G271 (DEFAULT OFF, DC2_G271_PREFIX_BARRIER=1): an upload that conflicts with one recorded
     // batch only needs submission-order execution through the LAST conflicting batch. Independent
@@ -343,39 +481,75 @@ namespace
     // Accumulate one just-recorded entry's read/write ranges into the open-batch sets.
     void g260NoteAppend(const G144Entry &e)
     {
+        bool g314WriteHit = false;
+        bool g314ReadHit = false;
+        bool g314Unknown = false;
         // color target (written and, under blending/fbmsk, read back) — scissor-bounded
         const G144BlockRange color = g144TargetRange(e);
         if (!color.valid &&
             e.ctx.scissor.x1 >= e.ctx.scissor.x0 && e.ctx.scissor.y1 >= e.ctx.scissor.y0)
+        {
             g_g260OpenWr.markUnknown();
+            g314Unknown = true;
+        }
         else
+        {
             g_g260OpenWr.add(color);
+            g314WriteHit = g314WriteHit ||
+                (g_g314Pending.armed && color.valid &&
+                 g144RangeOverlaps(color, g_g314Pending.range));
+        }
         // active Z surface (read for ZTST, written unless ZMSK) — treat as write-class
         const G254Surface depth = g254DepthSurface(e);
         if (depth.active)
         {
             if (!depth.range.valid)
+            {
                 g_g260OpenWr.markUnknown();
+                g314Unknown = true;
+            }
             else
+            {
                 g_g260OpenWr.add(depth.range);
+                g314WriteHit = g314WriteHit ||
+                    (g_g314Pending.armed &&
+                     g144RangeOverlaps(depth.range, g_g314Pending.range));
+            }
         }
         // texture + CLUT reads
         if (e.prim.tme)
         {
             const G144BlockRange tex = g144TextureRange(e);
             if (!tex.valid)
+            {
                 g_g260OpenRd.markUnknown();
+                g314Unknown = true;
+            }
             else
+            {
                 g_g260OpenRd.add(tex);
+                g314ReadHit = g314ReadHit ||
+                    (g_g314Pending.armed &&
+                     g144RangeOverlaps(tex, g_g314Pending.range));
+            }
             if (g144IsPalettedPsm(e.ctx.tex0.psm))
             {
                 const G144BlockRange clut = g144ClutRange(e);
                 if (!clut.valid)
+                {
                     g_g260OpenRd.markUnknown();
+                    g314Unknown = true;
+                }
                 else
+                {
                     g_g260OpenRd.add(clut);
+                    g314ReadHit = g314ReadHit ||
+                        (g_g314Pending.armed &&
+                         g144RangeOverlaps(clut, g_g314Pending.range));
+                }
             }
         }
+        g314ObservePendingDraw(g314WriteHit, g314ReadHit, g314Unknown);
     }
 
     bool g260HasPending()

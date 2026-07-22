@@ -4,6 +4,19 @@ bool g178EnvEnabled()
     return on;
 }
 
+// G324 diagnostics mirror the front-end armed/census split. They time only the existing logical
+// composite and T8-view QueueItems; default runs pay cached-boolean branches only.
+bool g324BackendCensusOn()
+{
+    static const bool on = g158EnvFlag("DC2_G324_CENSUS");
+    return on;
+}
+bool g324BackendArmed()
+{
+    static const bool on = g324BackendCensusOn() || g158EnvFlag("DC2_G324_EMPTY");
+    return on;
+}
+
 // G256/G258 diagnostic only: exact PS2 fragment arithmetic for the dependency-preserving G255
 // RTT path.  G258 found this backend performance-neutral after parity, so do not expose it as a
 // standalone behavior arm: require the CPU shadow oracle whenever it is requested.
@@ -488,6 +501,11 @@ public:
             item.g281Clut = &clutRgba;
             item.g281Verify = verify;
             item.g281VerifyBad = &verifyBad;
+            if (g324BackendArmed())
+            {
+                item.g324Class = 1u;
+                item.g324Enqueue = std::chrono::steady_clock::now();
+            }
             item.promise = promise;
             m_queue.push_back(std::move(item));
         }
@@ -557,6 +575,11 @@ public:
             item.g309BasePixels = &basePixels;
             item.g309ForceDraw = true;
             item.g309OutputFbp = kG310LogicalFbp;
+            if (g324BackendArmed())
+            {
+                item.g324Class = 2u;
+                item.g324Enqueue = std::chrono::steady_clock::now();
+            }
             item.promise = promise;
             m_queue.push_back(std::move(item));
         }
@@ -652,6 +675,8 @@ private:
         uint32_t g309OutputFbp = kG309CompositeFbp;
         std::shared_ptr<std::promise<bool>> promise;
         std::chrono::steady_clock::time_point g299Enqueue{};
+        uint8_t g324Class = 0u; // 1=G310 T8 view, 2=G310 logical composite
+        std::chrono::steady_clock::time_point g324Enqueue{};
     };
     struct TexEntry
     {
@@ -729,6 +754,11 @@ private:
                 g299ProfileBatch && g299ProfileOn()
                     ? std::chrono::steady_clock::now()
                     : std::chrono::steady_clock::time_point{};
+            const bool g324Profile =
+                item.g324Class != 0u && g324BackendArmed();
+            const auto g324WorkStart = g324Profile
+                ? std::chrono::steady_clock::now()
+                : std::chrono::steady_clock::time_point{};
             try
             {
                 if (item.g309PageMap != nullptr)
@@ -775,6 +805,44 @@ private:
             catch (...)
             {
                 ok = false;
+            }
+            if (g324Profile)
+            {
+                const auto done = std::chrono::steady_clock::now();
+                const uint64_t queueNs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        g324WorkStart - item.g324Enqueue).count());
+                const uint64_t workNs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        done - g324WorkStart).count());
+                if (g324BackendCensusOn())
+                {
+                    const unsigned cls = std::min<unsigned>(item.g324Class, 2u);
+                    ++m_g324Count[cls];
+                    m_g324QueueNs[cls] += queueNs;
+                    m_g324WorkNs[cls] += workNs;
+                    ++m_g324Total;
+                    if ((m_g324Total % 256u) == 0u)
+                    {
+                        std::fprintf(stderr, "[G324:backend] total=%llu",
+                                     static_cast<unsigned long long>(m_g324Total));
+                        for (unsigned i = 1u; i <= 2u; ++i)
+                        {
+                            const uint64_t n = m_g324Count[i];
+                            if (n == 0u)
+                                continue;
+                            std::fprintf(
+                                stderr,
+                                " c%u(n=%llu q=%.3fms work=%.3fms qTotal=%.3fms workTotal=%.3fms)",
+                                i, static_cast<unsigned long long>(n),
+                                static_cast<double>(m_g324QueueNs[i]) / 1.0e6 / n,
+                                static_cast<double>(m_g324WorkNs[i]) / 1.0e6 / n,
+                                static_cast<double>(m_g324QueueNs[i]) / 1.0e6,
+                                static_cast<double>(m_g324WorkNs[i]) / 1.0e6);
+                        }
+                        std::fprintf(stderr, "\n");
+                    }
+                }
             }
             if (g299ProfileBatch && g299ProfileOn())
             {
@@ -2764,6 +2832,9 @@ private:
     uint64_t m_g299WorkNs[4]{};
     uint64_t m_g299PacketBytes[4]{};
     uint64_t m_g299Draws[4]{};
+    uint64_t m_g324Total = 0u;
+    uint64_t m_g324Count[3]{};
+    uint64_t m_g324QueueNs[3]{};
+    uint64_t m_g324WorkNs[3]{};
 };
 } // namespace
-

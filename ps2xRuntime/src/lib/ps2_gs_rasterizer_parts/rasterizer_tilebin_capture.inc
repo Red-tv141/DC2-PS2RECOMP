@@ -346,6 +346,8 @@
                                     (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u ||
                                       g252RttTarget)) ||
                                    g260RttTri || g270LineWave || g286Transient;
+        if (g_g312SegStat)
+            t_g312Seg2bEnd = std::chrono::steady_clock::now(); // G312 seg2b end (eligibility computed)
         // G156: count deferred vs inline tris + the non-deferrable reason (see g156Report). Report
         // fires from HERE (every tri) so a line prints even if 100% defer (inline=0) or 100% inline.
         if (g_g156Stat && isTri144)
@@ -380,6 +382,43 @@
                 g_g286Captured.fetch_add(1u, std::memory_order_relaxed);
             const std::chrono::steady_clock::time_point g156CapT0 =
                 g_g156Stat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            // G312 segment census: close seg2 (post-pile -> capture start) and report periodically.
+            if (g_g312SegStat)
+            {
+                const auto g312End = std::chrono::steady_clock::now();
+                g_g312Seg2Ns.fetch_add(
+                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        g312End - t_g312Seg2Start)
+                        .count(),
+                    std::memory_order_relaxed);
+                g_g312Seg2aNs.fetch_add(
+                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        t_g312Seg2aEnd - t_g312Seg2Start)
+                        .count(),
+                    std::memory_order_relaxed);
+                g_g312Seg2bNs.fetch_add(
+                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        t_g312Seg2bEnd - t_g312Seg2aEnd)
+                        .count(),
+                    std::memory_order_relaxed);
+                const uint64_t n312 = g_g312SegN.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if ((n312 % 8000u) == 0u)
+                {
+                    const double s0 = g_g312Seg0Ns.load(std::memory_order_relaxed) / 1.0e6;
+                    const double s1 = g_g312Seg1Ns.load(std::memory_order_relaxed) / 1.0e6;
+                    const double s2 = g_g312Seg2Ns.load(std::memory_order_relaxed) / 1.0e6;
+                    const double s2a = g_g312Seg2aNs.load(std::memory_order_relaxed) / 1.0e6;
+                    const double s2b = g_g312Seg2bNs.load(std::memory_order_relaxed) / 1.0e6;
+                    std::fprintf(stderr,
+                                 "[G312:seg] n=%llu seg0(g45)=%.1fms (%.0f ns/d) seg1(pile)=%.1fms "
+                                 "(%.0f ns/d) seg2(elig)=%.1fms (%.0f ns/d) [2a(cnt)=%.0f 2b(elig)=%.0f "
+                                 "2c(preflush)=%.0f ns/d]\n",
+                                 (unsigned long long)n312, s0, s0 * 1e6 / (double)n312, s1,
+                                 s1 * 1e6 / (double)n312, s2, s2 * 1e6 / (double)n312,
+                                 s2a * 1e6 / (double)n312, s2b * 1e6 / (double)n312,
+                                 (s2 - s2a - s2b) * 1e6 / (double)n312);
+                }
+            }
             if (g_g156Stat)
                 g_g156PrologueNs.fetch_add(
                     (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(g156CapT0 - g156FnT0)

@@ -45,6 +45,13 @@ extern bool g289TryGpuLocalCopy(uint8_t *vram, uint32_t vramSize,
 extern void g289NoteUploadComplete(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
                                    uint32_t dsax, uint32_t dsay,
                                    uint32_t rrw, uint32_t rrh);
+extern void g314NoteImageComplete(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                                  uint32_t dsax, uint32_t dsay,
+                                  uint32_t rrw, uint32_t rrh);
+extern void g327NoteImageChunk(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                               uint32_t dsax, uint32_t dsay,
+                               uint32_t rrw, uint32_t rrh,
+                               uint32_t sizeBytes, bool complete);
 
 void GS::performLocalToLocalTransfer()
 {
@@ -603,7 +610,23 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
     if (m_trxdir != 0 || !m_vram)
         return;
 
+    static const bool s_g313Census = envFlagEnabled("DC2_G313_CENSUS");
+    struct G313ImageSegStat
+    {
+        uint64_t calls = 0u;
+        uint64_t rangeNs = 0u;
+        uint64_t genNs = 0u;
+        uint64_t bumpNs = 0u;
+        uint64_t prewriterNs = 0u;
+        uint64_t writerNs = 0u;
+        uint64_t commitNs = 0u;
+    };
+    static thread_local G313ImageSegStat s_g313Seg{};
+    std::chrono::steady_clock::time_point g313StepT0;
+
     // G145: flush only if this upload overlaps a pending deferred draw's texture/CLUT/target.
+    if (s_g313Census)
+        g313StepT0 = std::chrono::steady_clock::now();
     if (g145DirtyUpload)
     {
         g144FlushPendingUploadRange(m_bitbltbuf.dbp,
@@ -614,14 +637,35 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
                                     m_trxreg.rrw,
                                     m_trxreg.rrh);
     }
+    if (s_g313Census)
+    {
+        s_g313Seg.rangeNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g313StepT0).count());
+        g313StepT0 = std::chrono::steady_clock::now();
+    }
 
     g149BumpVramGen(); // host-to-local upload about to write VRAM: invalidate the texture cache
+    if (s_g313Census)
+    {
+        s_g313Seg.genNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g313StepT0).count());
+        g313StepT0 = std::chrono::steady_clock::now();
+    }
     // G178/G242: notify only after the pending-draw barrier above has established GS order.
     {
         extern void g178NoteVramWriteRect(uint8_t *, uint32_t, uint32_t, uint32_t,
                                           uint32_t, uint32_t, uint32_t, uint32_t);
         g178NoteVramWriteRect(m_vram, m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
                               m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh);
+    }
+    if (s_g313Census)
+    {
+        s_g313Seg.bumpNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g313StepT0).count());
+        g313StepT0 = std::chrono::steady_clock::now();
     }
 
     // [G37:seq] GS-order trace of writes to the 0x2720 work page (uploads), shared with the
@@ -816,6 +860,99 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
                          static_cast<uint32_t>(dpsm), rrw, rrh, dsax, dsay,
                          m_hwregX, m_hwregY);
         }
+    }
+
+    if (s_g313Census)
+    {
+        s_g313Seg.prewriterNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g313StepT0).count());
+    }
+
+    // G313 premise census: time only the serial IMAGE writer below, after every ordering
+    // barrier, diagnostic preview, and pending-graph drain. Keep this independent of DC2_PERF;
+    // G312 proved that coarse hot-path instrumentation can manufacture a false pole term.
+    struct G313ImagePsmStat
+    {
+        uint64_t calls = 0u;
+        uint64_t bytes = 0u;
+        uint64_t ns = 0u;
+        uint64_t shapeCalls[4]{}; // mid-row, row-start partial, whole rows, whole aligned blocks
+        uint64_t shapeBytes[4]{};
+        uint64_t shapeNs[4]{};
+    };
+    static thread_local G313ImagePsmStat s_g313Psm[64]{};
+    static thread_local uint64_t s_g313Calls = 0u;
+    const uint32_t g313EntryX = m_hwregX;
+    const uint32_t g313EntryY = m_hwregY;
+    uint32_t g313Shape = 0u;
+    std::chrono::steady_clock::time_point g313T0;
+    if (s_g313Census)
+    {
+        uint32_t blockW = 1u;
+        uint32_t blockH = 1u;
+        switch (dpsm)
+        {
+        case GS_PSM_CT32:
+        case GS_PSM_CT24:
+        case GS_PSM_Z32:
+        case GS_PSM_Z24:
+        case GS_PSM_T8H:
+        case GS_PSM_T4HL:
+        case GS_PSM_T4HH:
+            blockW = 8u;
+            blockH = 8u;
+            break;
+        case GS_PSM_CT16:
+        case GS_PSM_CT16S:
+        case GS_PSM_Z16:
+        case GS_PSM_Z16S:
+            blockW = 16u;
+            blockH = 8u;
+            break;
+        case GS_PSM_T8:
+            blockW = 16u;
+            blockH = 16u;
+            break;
+        case GS_PSM_T4:
+            blockW = 32u;
+            blockH = 16u;
+            break;
+        default:
+            break;
+        }
+
+        uint64_t payloadPixels = 0u;
+        if (dpsm == GS_PSM_T4 || dpsm == GS_PSM_T4HL || dpsm == GS_PSM_T4HH)
+            payloadPixels = static_cast<uint64_t>(sizeBytes) * 2u;
+        else if (dpsm == GS_PSM_CT24 || dpsm == GS_PSM_Z24)
+            payloadPixels = sizeBytes / 3u;
+        else
+        {
+            const uint32_t transferBytesPerPixel = std::max<uint32_t>(1u, bpp / 8u);
+            payloadPixels = sizeBytes / transferBytesPerPixel;
+        }
+
+        const uint64_t rowsLeft = (g313EntryY < rrh) ? (rrh - g313EntryY) : 0u;
+        const uint64_t pixelsLeft = rowsLeft * rrw -
+                                    ((rowsLeft != 0u && g313EntryX < rrw) ? g313EntryX : 0u);
+        payloadPixels = std::min<uint64_t>(payloadPixels, pixelsLeft);
+        if (g313EntryX == 0u)
+        {
+            g313Shape = 1u;
+            if (rrw != 0u && payloadPixels >= rrw && (payloadPixels % rrw) == 0u)
+            {
+                g313Shape = 2u;
+                const uint64_t rowCount = payloadPixels / rrw;
+                if (((dsax % blockW) == 0u) && ((rrw % blockW) == 0u) &&
+                    (((dsay + g313EntryY) % blockH) == 0u) &&
+                    ((rowCount % blockH) == 0u))
+                {
+                    g313Shape = 3u;
+                }
+            }
+        }
+        g313T0 = std::chrono::steady_clock::now();
     }
 
     if (dpsm == GS_PSM_T4HL || dpsm == GS_PSM_T4HH)
@@ -1105,10 +1242,86 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         }
     }
 
+    if (s_g313Census)
+    {
+        const uint64_t elapsedNs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g313T0).count());
+        G313ImagePsmStat &stat = s_g313Psm[dpsm & 0x3fu];
+        ++stat.calls;
+        stat.bytes += sizeBytes;
+        stat.ns += elapsedNs;
+        ++s_g313Seg.calls;
+        s_g313Seg.writerNs += elapsedNs;
+        ++stat.shapeCalls[g313Shape];
+        stat.shapeBytes[g313Shape] += sizeBytes;
+        stat.shapeNs[g313Shape] += elapsedNs;
+
+        ++s_g313Calls;
+        if ((s_g313Calls % 4096u) == 0u)
+        {
+            std::fprintf(stderr, "[G313:census] calls=%llu (writer-only; DC2_PERF must be off)\n",
+                         static_cast<unsigned long long>(s_g313Calls));
+            for (uint32_t psm = 0u; psm < 64u; ++psm)
+            {
+                const G313ImagePsmStat &p = s_g313Psm[psm];
+                if (p.calls == 0u)
+                    continue;
+                const double totalMs = static_cast<double>(p.ns) / 1000000.0;
+                const double mib = static_cast<double>(p.bytes) / (1024.0 * 1024.0);
+                const double mibPerSec = (p.ns != 0u) ? (mib * 1000000000.0 / p.ns) : 0.0;
+                std::fprintf(stderr,
+                             "[G313:psm] psm=0x%02x calls=%llu bytes=%llu ms=%.3f MiBps=%.2f "
+                             "mid=%llu/%.3f row=%llu/%.3f full=%llu/%.3f block=%llu/%.3f\n",
+                             psm,
+                             static_cast<unsigned long long>(p.calls),
+                             static_cast<unsigned long long>(p.bytes),
+                             totalMs,
+                             mibPerSec,
+                             static_cast<unsigned long long>(p.shapeCalls[0]),
+                             static_cast<double>(p.shapeNs[0]) / 1000000.0,
+                             static_cast<unsigned long long>(p.shapeCalls[1]),
+                             static_cast<double>(p.shapeNs[1]) / 1000000.0,
+                             static_cast<unsigned long long>(p.shapeCalls[2]),
+                             static_cast<double>(p.shapeNs[2]) / 1000000.0,
+                             static_cast<unsigned long long>(p.shapeCalls[3]),
+                             static_cast<double>(p.shapeNs[3]) / 1000000.0);
+            }
+        }
+    }
+
     // G289 commits its exact partial-owner overwrite only after the complete IMAGE transfer
     // has landed. Chunked IMAGE packets keep the owner conservative until the last chunk.
-    if (m_hwregY >= rrh)
+    if (s_g313Census)
+        g313StepT0 = std::chrono::steady_clock::now();
+    const bool imageComplete = m_hwregY >= rrh;
+    static const bool s_g327Census = envFlagEnabled("DC2_G327_CENSUS");
+    if (s_g327Census)
+        g327NoteImageChunk(dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
+                           sizeBytes, imageComplete);
+    if (imageComplete)
+    {
         g289NoteUploadComplete(dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        g314NoteImageComplete(dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+    }
+    if (s_g313Census)
+    {
+        s_g313Seg.commitNs += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g313StepT0).count());
+        if ((s_g313Calls % 4096u) == 0u)
+        {
+            std::fprintf(stderr,
+                         "[G313:seg] calls=%llu range=%.3f gen=%.3f bump=%.3f pre=%.3f writer=%.3f commit=%.3f ms\n",
+                         static_cast<unsigned long long>(s_g313Seg.calls),
+                         static_cast<double>(s_g313Seg.rangeNs) / 1000000.0,
+                         static_cast<double>(s_g313Seg.genNs) / 1000000.0,
+                         static_cast<double>(s_g313Seg.bumpNs) / 1000000.0,
+                         static_cast<double>(s_g313Seg.prewriterNs) / 1000000.0,
+                         static_cast<double>(s_g313Seg.writerNs) / 1000000.0,
+                         static_cast<double>(s_g313Seg.commitNs) / 1000000.0);
+        }
+    }
 
     if (t8UploadTraceEnabled() &&
         dpsm == GS_PSM_CT32 &&

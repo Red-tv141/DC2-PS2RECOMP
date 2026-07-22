@@ -91,6 +91,15 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool s_macpipeOn     = g138_macpipe_enabled();
     const int  s_macpipeDepth  = s_macpipeOn ? g138_macpipe_depth() : 4;
     const bool s_pairhazOn     = g139_pairhaz_enabled();
+    // G328: the G138 implementation shifted DEPTH-1 MAC words plus DEPTH-1 STATUS words
+    // on every executed VU pair.  A circular physical layout is the same delay line with no
+    // bulk copies.  Opt-in while measured: DC2_G328_MAC_RING=1.  VERIFY keeps a shadow copy
+    // of the legacy shift register and aborts on the first visible/logical mismatch.
+    static const bool s_g328RingOn = (std::getenv("DC2_G328_MAC_RING") != nullptr);
+    static const bool s_g328Verify = (std::getenv("DC2_G328_VERIFY") != nullptr);
+    static const bool s_g328Stat = (std::getenv("DC2_G328_STAT") != nullptr);
+    static std::atomic<uint64_t> s_g328Cycles{0u};
+    static std::atomic<uint64_t> s_g328Bad{0u};
     (void)s_qlatOn;
 
     // G295: the per-cycle diagnostic probe pile (G68..G237 census/trace blocks accumulated over
@@ -938,12 +947,44 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (s_macpipeOn)
         {
             const int g138d = s_macpipeDepth;
-            *s_macVisP = s_macPipeP[g138d - 1];
-            *s_statusVisP = s_statusPipeP[g138d - 1];
-            for (int g138i = g138d - 1; g138i > 0; --g138i)
+            if (s_g328RingOn)
             {
-                s_macPipeP[g138i] = s_macPipeP[g138i - 1];
-                s_statusPipeP[g138i] = s_statusPipeP[g138i - 1];
+                const int g328next = (s_g328MacPipeHead != 0)
+                    ? (s_g328MacPipeHead - 1) : (g138d - 1);
+                *s_macVisP = s_macPipeP[g328next];
+                *s_statusVisP = s_statusPipeP[g328next];
+                s_g328MacPipeHead = g328next;
+
+                if (s_g328Verify)
+                {
+                    bool g328bad =
+                        *s_macVisP != s_g328VerifyMacPipe[g138d - 1] ||
+                        *s_statusVisP != s_g328VerifyStatusPipe[g138d - 1];
+                    for (int g328i = g138d - 1; g328i > 0; --g328i)
+                    {
+                        s_g328VerifyMacPipe[g328i] = s_g328VerifyMacPipe[g328i - 1];
+                        s_g328VerifyStatusPipe[g328i] = s_g328VerifyStatusPipe[g328i - 1];
+                    }
+                    if (g328bad)
+                    {
+                        s_g328Bad.fetch_add(1u, std::memory_order_relaxed);
+                        std::fprintf(stderr,
+                            "[G328:verify] visible mismatch pc=0x%x depth=%d mac=%08x/%08x status=%08x/%08x\n",
+                            currentPc, g138d, *s_macVisP, s_g328VerifyMacPipe[g138d - 1],
+                            *s_statusVisP, s_g328VerifyStatusPipe[g138d - 1]);
+                        std::abort();
+                    }
+                }
+            }
+            else
+            {
+                *s_macVisP = s_macPipeP[g138d - 1];
+                *s_statusVisP = s_statusPipeP[g138d - 1];
+                for (int g138i = g138d - 1; g138i > 0; --g138i)
+                {
+                    s_macPipeP[g138i] = s_macPipeP[g138i - 1];
+                    s_statusPipeP[g138i] = s_statusPipeP[g138i - 1];
+                }
             }
         }
 
@@ -1078,8 +1119,40 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         // G138: the newest pipeline entry is this pair's post-upper architectural flags.
         if (s_macpipeOn)
         {
-            s_macPipeP[0] = m_state.mac;
-            s_statusPipeP[0] = m_state.status;
+            const int g328newest = s_g328RingOn ? s_g328MacPipeHead : 0;
+            s_macPipeP[g328newest] = m_state.mac;
+            s_statusPipeP[g328newest] = m_state.status;
+            if (s_g328RingOn && s_g328Verify)
+            {
+                s_g328VerifyMacPipe[0] = m_state.mac;
+                s_g328VerifyStatusPipe[0] = m_state.status;
+                for (int g328i = 0; g328i < s_macpipeDepth; ++g328i)
+                {
+                    const int g328phys = s_g328MacPipeHead + g328i < s_macpipeDepth
+                        ? s_g328MacPipeHead + g328i
+                        : s_g328MacPipeHead + g328i - s_macpipeDepth;
+                    if (s_macPipeP[g328phys] != s_g328VerifyMacPipe[g328i] ||
+                        s_statusPipeP[g328phys] != s_g328VerifyStatusPipe[g328i])
+                    {
+                        s_g328Bad.fetch_add(1u, std::memory_order_relaxed);
+                        std::fprintf(stderr,
+                            "[G328:verify] logical mismatch pc=0x%x depth=%d slot=%d mac=%08x/%08x status=%08x/%08x\n",
+                            currentPc, s_macpipeDepth, g328i,
+                            s_macPipeP[g328phys], s_g328VerifyMacPipe[g328i],
+                            s_statusPipeP[g328phys], s_g328VerifyStatusPipe[g328i]);
+                        std::abort();
+                    }
+                }
+            }
+            if (s_g328RingOn && s_g328Stat)
+            {
+                const uint64_t g328n = s_g328Cycles.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if ((g328n % 5000000u) == 0u)
+                    std::fprintf(stderr, "[G328:stat] cycles=%llu bad=%llu depth=%d\n",
+                                 (unsigned long long)g328n,
+                                 (unsigned long long)s_g328Bad.load(std::memory_order_relaxed),
+                                 s_macpipeDepth);
+            }
         }
         const uint32_t postExecPc = m_state.pc;
 

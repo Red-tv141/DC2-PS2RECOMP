@@ -438,6 +438,8 @@ namespace
 }
 
 // ===== G150 MTGS (multi-threaded GS) — DEFAULT OFF (DC2_G150_MTGS=1) =====
+#include "ps2_gif_arbiter_parts/g317_path2_fence_census.inc"
+
 // Architectural perf lever (user chose "big lever", 2026-07-07): move the whole GS-drain
 // (processGIFPacket → register writes + drawPrimitive raster + processImageData) off the guest
 // EE thread onto a dedicated GS worker thread, so the EE thread (VIF unpack + VU1 interp + packet
@@ -485,6 +487,156 @@ namespace
     std::atomic<uint64_t> g_g184BoundaryNs{0};
     std::atomic<uint64_t> g_g184BoundaryCount{0};
 
+    // G316 (diagnosis only, default off): current-binary, mutually-exclusive GS-worker census.
+    // G312 proved that per-draw timing can manufacture a pole. G316 therefore measures root work
+    // at worker-window/boundary/apply granularity and samples path groups for one frame in 30.
+    // The sampled leaf sum is exact: MTVU merge + stable sort + three path runs + residual loop work.
+    // DC2_G316_EMPTY=1 runs identical sampling timestamps without leaf atomic updates.
+    enum G316PathIndex : uint32_t
+    {
+        kG316Path1 = 0u,
+        kG316Path2 = 1u,
+        kG316Path3 = 2u,
+    };
+
+    std::atomic<uint64_t> g_g316WindowNs{0};
+    std::atomic<uint64_t> g_g316BoundaryNs{0};
+    std::atomic<uint64_t> g_g316ApplyNs{0};
+    std::atomic<uint64_t> g_g316MergeNs{0};
+    std::atomic<uint64_t> g_g316SortNs{0};
+    std::atomic<uint64_t> g_g316PathNs[3]{};
+    std::atomic<uint64_t> g_g316Windows{0};
+    std::atomic<uint64_t> g_g316Boundaries{0};
+    std::atomic<uint64_t> g_g316Applies{0};
+    std::atomic<uint64_t> g_g316PathPackets[3]{};
+    // Leaf timing is armed for one full worker frame every 30 boundaries. This keeps the
+    // diagnostic below G312's per-packet self-cost threshold while retaining a real path split.
+    std::atomic<uint64_t> g_g316SampleWindowNs{0};
+    std::atomic<uint64_t> g_g316SampleBoundaryNs{0};
+    std::atomic<uint64_t> g_g316SampleApplyNs{0};
+    std::atomic<uint64_t> g_g316SampledFrames{0};
+
+    bool g316TimingOn()
+    {
+        static const bool s_on = f50_12_env_flag("DC2_G316_CENSUS") ||
+                                 f50_12_env_flag("DC2_G316_EMPTY");
+        return s_on;
+    }
+
+    bool g316RecordOn()
+    {
+        static const bool s_on = f50_12_env_flag("DC2_G316_CENSUS");
+        return s_on;
+    }
+
+    static uint64_t g316ElapsedNs(std::chrono::steady_clock::time_point t0)
+    {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count());
+    }
+
+    static void g316ReportBoundary()
+    {
+        if (!g316TimingOn())
+            return;
+
+        const uint64_t frame = g_g316Boundaries.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if ((frame % 60u) != 0u)
+            return;
+
+        static uint64_t s_lastWindowNs = 0u, s_lastBoundaryNs = 0u, s_lastApplyNs = 0u;
+        static uint64_t s_lastMergeNs = 0u, s_lastSortNs = 0u;
+        static uint64_t s_lastSampleWindowNs = 0u, s_lastSampleBoundaryNs = 0u,
+                        s_lastSampleApplyNs = 0u, s_lastSampledFrames = 0u;
+        static uint64_t s_lastPathNs[3]{};
+        static uint64_t s_lastWindows = 0u, s_lastApplies = 0u, s_lastPathPackets[3]{};
+
+        const uint64_t windowNs = g_g316WindowNs.load(std::memory_order_relaxed);
+        const uint64_t boundaryNs = g_g316BoundaryNs.load(std::memory_order_relaxed);
+        const uint64_t applyNs = g_g316ApplyNs.load(std::memory_order_relaxed);
+        const uint64_t mergeNs = g_g316MergeNs.load(std::memory_order_relaxed);
+        const uint64_t sortNs = g_g316SortNs.load(std::memory_order_relaxed);
+        const uint64_t windows = g_g316Windows.load(std::memory_order_relaxed);
+        const uint64_t applies = g_g316Applies.load(std::memory_order_relaxed);
+        const uint64_t sampleWindowNs = g_g316SampleWindowNs.load(std::memory_order_relaxed);
+        const uint64_t sampleBoundaryNs = g_g316SampleBoundaryNs.load(std::memory_order_relaxed);
+        const uint64_t sampleApplyNs = g_g316SampleApplyNs.load(std::memory_order_relaxed);
+        const uint64_t sampledFrames = g_g316SampledFrames.load(std::memory_order_relaxed);
+
+        uint64_t pathNs[3]{};
+        uint64_t pathPackets[3]{};
+        for (uint32_t i = 0u; i < 3u; ++i)
+        {
+            pathNs[i] = g_g316PathNs[i].load(std::memory_order_relaxed);
+            pathPackets[i] = g_g316PathPackets[i].load(std::memory_order_relaxed);
+        }
+
+        const uint64_t dWindowNs = windowNs - s_lastWindowNs;
+        const uint64_t dBoundaryNs = boundaryNs - s_lastBoundaryNs;
+        const uint64_t dApplyNs = applyNs - s_lastApplyNs;
+        const uint64_t dMergeNs = mergeNs - s_lastMergeNs;
+        const uint64_t dSortNs = sortNs - s_lastSortNs;
+        const uint64_t dWindows = windows - s_lastWindows;
+        const uint64_t dApplies = applies - s_lastApplies;
+        const uint64_t dSampleWindowNs = sampleWindowNs - s_lastSampleWindowNs;
+        const uint64_t dSampleBoundaryNs = sampleBoundaryNs - s_lastSampleBoundaryNs;
+        const uint64_t dSampleApplyNs = sampleApplyNs - s_lastSampleApplyNs;
+        const uint64_t dSampledFrames = sampledFrames - s_lastSampledFrames;
+        uint64_t dPathNs[3]{};
+        uint64_t dPathPackets[3]{};
+        for (uint32_t i = 0u; i < 3u; ++i)
+        {
+            dPathNs[i] = pathNs[i] - s_lastPathNs[i];
+            dPathPackets[i] = pathPackets[i] - s_lastPathPackets[i];
+            s_lastPathNs[i] = pathNs[i];
+            s_lastPathPackets[i] = pathPackets[i];
+        }
+
+        s_lastWindowNs = windowNs;
+        s_lastBoundaryNs = boundaryNs;
+        s_lastApplyNs = applyNs;
+        s_lastMergeNs = mergeNs;
+        s_lastSortNs = sortNs;
+        s_lastWindows = windows;
+        s_lastApplies = applies;
+        s_lastSampleWindowNs = sampleWindowNs;
+        s_lastSampleBoundaryNs = sampleBoundaryNs;
+        s_lastSampleApplyNs = sampleApplyNs;
+        s_lastSampledFrames = sampledFrames;
+
+        const uint64_t leafWindowNs = dMergeNs + dSortNs + dPathNs[kG316Path1] +
+                                      dPathNs[kG316Path2] + dPathNs[kG316Path3];
+        const uint64_t sampleResidualNs = dSampleWindowNs >= leafWindowNs
+                                              ? dSampleWindowNs - leafWindowNs
+                                              : 0u;
+        const uint64_t rootWorkerNs = dWindowNs + dBoundaryNs + dApplyNs;
+        const uint64_t sampleWorkerNs = dSampleWindowNs + dSampleBoundaryNs + dSampleApplyNs;
+        const uint64_t sampleReconciledNs = leafWindowNs + sampleResidualNs +
+                                             dSampleBoundaryNs + dSampleApplyNs;
+        const double rootDenom = 60.0 * 1.0e6;
+        const double sampleDenom = static_cast<double>(dSampledFrames) * 1.0e6;
+
+        std::fprintf(stderr,
+                     "[G316:worker] mode=%s frames=60 root=%.3fms/f "
+                     "[window=%.3f boundary=%.3f apply=%.3f/%llu windows=%.2f] "
+                     "samples=%llu sample=%.3fms/f [merge=%.3f sort=%.3f p1=%.3f/%llu "
+                     "p2=%.3f/%llu p3=%.3f/%llu other=%.3f boundary=%.3f apply=%.3f] "
+                     "reconcile=%.3fms/f\n",
+                     g316RecordOn() ? "census" : "empty", rootWorkerNs / rootDenom,
+                     dWindowNs / rootDenom, dBoundaryNs / rootDenom, dApplyNs / rootDenom,
+                     static_cast<unsigned long long>(dApplies), static_cast<double>(dWindows) / 60.0,
+                     static_cast<unsigned long long>(dSampledFrames), sampleWorkerNs / sampleDenom,
+                     dMergeNs / sampleDenom, dSortNs / sampleDenom,
+                     dPathNs[kG316Path1] / sampleDenom,
+                     static_cast<unsigned long long>(dPathPackets[kG316Path1]),
+                     dPathNs[kG316Path2] / sampleDenom,
+                     static_cast<unsigned long long>(dPathPackets[kG316Path2]),
+                     dPathNs[kG316Path3] / sampleDenom,
+                     static_cast<unsigned long long>(dPathPackets[kG316Path3]),
+                     sampleResidualNs / sampleDenom, dSampleBoundaryNs / sampleDenom,
+                     dSampleApplyNs / sampleDenom, sampleReconciledNs / sampleDenom);
+    }
+
     // G157: one queue item is either a draw window (packets) or a frame-boundary marker (the
     // G144-flush + present-latch closure). Both travel through the SAME FIFO deque, so the
     // marker is guaranteed to be processed strictly after all of its frame's windows and
@@ -496,6 +648,9 @@ namespace
         std::function<void()> frameBoundaryFn; // set when isFrameBoundary or isApply
         bool isFrameBoundary = false;
         bool isApply = false; // G177: plain in-order closure, no frame-marker accounting
+        uint64_t g317FenceEpoch = 0u;
+        uint32_t g317FenceReasons = 0u;
+        bool g317HadQueuedSuccessor = false;
     };
 
     class G150Mtgs
@@ -529,6 +684,7 @@ namespace
                 return;
             QueueItem item;
             item.packets = std::move(pkts);
+            g317StampItem(item);
             m_items.push_back(std::move(item));
             m_cvWork.notify_one();
         }
@@ -561,6 +717,7 @@ namespace
             QueueItem item;
             item.isFrameBoundary = true;
             item.frameBoundaryFn = std::move(onComplete);
+            g317StampItem(item);
             m_items.push_back(std::move(item));
             m_cvWork.notify_one();
         }
@@ -584,6 +741,7 @@ namespace
             QueueItem item;
             item.isApply = true;
             item.frameBoundaryFn = std::move(fn);
+            g317StampItem(item);
             m_items.push_back(std::move(item));
             m_cvWork.notify_one();
             return true;
@@ -675,6 +833,151 @@ namespace
         static constexpr size_t kMaxWindows = 8192;
         static constexpr int kPipelineDepth = 1; // G157: max frames the EE may run ahead of the worker
 
+        static void g317StampItem(QueueItem &item)
+        {
+            if (!g317FenceCensusOn())
+                return;
+            item.g317FenceEpoch = g_g317VifFenceEpoch.load(std::memory_order_acquire);
+            item.g317FenceReasons = g_g317VifFenceReasons.exchange(0u, std::memory_order_acq_rel);
+        }
+
+        void g317CloseRun()
+        {
+            if (m_g317RunPackets == 0u)
+                return;
+            ++m_g317Stats.runs;
+            m_g317Stats.maxRun = std::max<uint64_t>(m_g317Stats.maxRun, m_g317RunPackets);
+            ++m_g317Stats.runBins[g317RunBin(m_g317RunPackets)];
+            m_g317RunPackets = 0u;
+        }
+
+        void g317Barrier(G317BarrierIndex barrier)
+        {
+            g317CloseRun();
+            ++m_g317Stats.barriers[barrier];
+        }
+
+        void g317ObserveItemFence(const QueueItem &item)
+        {
+            if (!g317FenceCensusOn() || item.g317FenceEpoch == m_g317LastFenceEpoch)
+                return;
+
+            g317CloseRun();
+            m_g317Stats.explicitEpochs += item.g317FenceEpoch - m_g317LastFenceEpoch;
+            m_g317LastFenceEpoch = item.g317FenceEpoch;
+            const uint32_t reasons = item.g317FenceReasons;
+            if (reasons & kG317VifFlush)  ++m_g317Stats.barriers[kG317BarrierFlush];
+            if (reasons & kG317VifFlusha) ++m_g317Stats.barriers[kG317BarrierFlusha];
+            if (reasons & kG317VifMscal)  ++m_g317Stats.barriers[kG317BarrierMscal];
+            if (reasons & kG317VifMscalf) ++m_g317Stats.barriers[kG317BarrierMscalf];
+            if (reasons & kG317VifMscnt)  ++m_g317Stats.barriers[kG317BarrierMscnt];
+        }
+
+        bool g317ObservePacket(const GifArbiterPacket &pkt, bool firstEligibleInWindow,
+                               bool hadQueuedSuccessor)
+        {
+            // Track IMAGE continuation across every GIF path. A non-Path-2
+            // packet is still a barrier, but it may start or consume global
+            // IMAGE state that makes following Path-2 bytes ineligible.
+            const G317Path2Class cls = g317ClassifyPath2Packet(pkt, m_g317Path2Scan);
+            if (pkt.pathId == GifPathId::Path1)
+            {
+                g317Barrier(kG317BarrierPath1);
+                return false;
+            }
+            if (pkt.pathId == GifPathId::Path3)
+            {
+                g317Barrier(kG317BarrierPath3);
+                return false;
+            }
+            if (pkt.pathId != GifPathId::Path2)
+            {
+                g317Barrier(kG317BarrierUnknown);
+                return false;
+            }
+
+            if (cls == G317Path2Class::Image)
+            {
+                g317Barrier(kG317BarrierImage);
+                return false;
+            }
+            if (cls == G317Path2Class::DirectHl)
+            {
+                g317Barrier(kG317BarrierDirectHl);
+                return false;
+            }
+            if (cls == G317Path2Class::Unknown)
+            {
+                g317Barrier(kG317BarrierUnknown);
+                return false;
+            }
+
+            ++m_g317RunPackets;
+            ++m_g317Stats.eligiblePackets;
+            m_g317Stats.eligibleBytes += pkt.data.size();
+            if (firstEligibleInWindow)
+            {
+                ++m_g317Stats.eligibleWindows;
+                if (hadQueuedSuccessor)
+                    ++m_g317Stats.readyWindows;
+            }
+            return true;
+        }
+
+        void g317ReportFrame()
+        {
+            if (!g317FenceCensusOn())
+                return;
+            g317Barrier(kG317BarrierFrame);
+            m_g317Path2Scan = {};
+            if ((++m_g317Stats.frames % 60u) != 0u)
+                return;
+
+            const double avgRun = m_g317Stats.runs != 0u
+                                      ? static_cast<double>(m_g317Stats.eligiblePackets) /
+                                            static_cast<double>(m_g317Stats.runs)
+                                      : 0.0;
+            const double readyPct = m_g317Stats.eligibleWindows != 0u
+                                        ? 100.0 * static_cast<double>(m_g317Stats.readyWindows) /
+                                              static_cast<double>(m_g317Stats.eligibleWindows)
+                                        : 0.0;
+            std::fprintf(stderr,
+                         "[G317:fence] frames=60 runs=%llu eligible=%llu bytes=%llu "
+                         "avg=%.2f max=%llu bins=[%llu,%llu,%llu,%llu,%llu,%llu,%llu] "
+                         "ready=%llu/%llu(%.1f%%) epochs=%llu "
+                         "bar=[flush=%llu flusha=%llu mscal=%llu mscalf=%llu mscnt=%llu "
+                         "p1=%llu p3=%llu image=%llu directhl=%llu unknown=%llu apply=%llu frame=%llu] "
+                         "pendingImageQwc=%llu\n",
+                         static_cast<unsigned long long>(m_g317Stats.runs),
+                         static_cast<unsigned long long>(m_g317Stats.eligiblePackets),
+                         static_cast<unsigned long long>(m_g317Stats.eligibleBytes), avgRun,
+                         static_cast<unsigned long long>(m_g317Stats.maxRun),
+                         static_cast<unsigned long long>(m_g317Stats.runBins[0]),
+                         static_cast<unsigned long long>(m_g317Stats.runBins[1]),
+                         static_cast<unsigned long long>(m_g317Stats.runBins[2]),
+                         static_cast<unsigned long long>(m_g317Stats.runBins[3]),
+                         static_cast<unsigned long long>(m_g317Stats.runBins[4]),
+                         static_cast<unsigned long long>(m_g317Stats.runBins[5]),
+                         static_cast<unsigned long long>(m_g317Stats.runBins[6]),
+                         static_cast<unsigned long long>(m_g317Stats.readyWindows),
+                         static_cast<unsigned long long>(m_g317Stats.eligibleWindows), readyPct,
+                         static_cast<unsigned long long>(m_g317Stats.explicitEpochs),
+                         static_cast<unsigned long long>(m_g317Stats.barriers[kG317BarrierFlush]),
+                         static_cast<unsigned long long>(m_g317Stats.barriers[kG317BarrierFlusha]),
+                         static_cast<unsigned long long>(m_g317Stats.barriers[kG317BarrierMscal]),
+                         static_cast<unsigned long long>(m_g317Stats.barriers[kG317BarrierMscalf]),
+                         static_cast<unsigned long long>(m_g317Stats.barriers[kG317BarrierMscnt]),
+                         static_cast<unsigned long long>(m_g317Stats.barriers[kG317BarrierPath1]),
+                         static_cast<unsigned long long>(m_g317Stats.barriers[kG317BarrierPath3]),
+                         static_cast<unsigned long long>(m_g317Stats.barriers[kG317BarrierImage]),
+                         static_cast<unsigned long long>(m_g317Stats.barriers[kG317BarrierDirectHl]),
+                         static_cast<unsigned long long>(m_g317Stats.barriers[kG317BarrierUnknown]),
+                         static_cast<unsigned long long>(m_g317Stats.barriers[kG317BarrierApply]),
+                         static_cast<unsigned long long>(m_g317Stats.barriers[kG317BarrierFrame]),
+                         static_cast<unsigned long long>(m_g317Path2Scan.pendingImageQwc));
+            m_g317Stats = {};
+        }
+
         void startLocked()
         {
             if (!m_started)
@@ -704,15 +1007,23 @@ namespace
                     return;
                 QueueItem item = std::move(m_items.front());
                 m_items.pop_front();
+                item.g317HadQueuedSuccessor = !m_items.empty();
                 m_busy = true;
                 m_cvSpace.notify_all(); // a window slot freed
                 lk.unlock();
 
                 if (item.isApply)
                 {
+                    g317ObserveItemFence(item);
+                    if (g317FenceCensusOn())
+                        g317Barrier(kG317BarrierApply);
                     g_g189WorkerStage.store(2, std::memory_order_relaxed);
                     // G177: ordered side-effect (dispenv register writes). No marker/credit to
                     // release — just run it at its FIFO position.
+                    const bool g316On = g316TimingOn();
+                    const bool g316Sample = g316On && m_g316LeafSample;
+                    const auto g316T0 = g316On ? std::chrono::steady_clock::now()
+                                                : std::chrono::steady_clock::time_point{};
                     try
                     {
                         if (item.frameBoundaryFn)
@@ -726,6 +1037,14 @@ namespace
                     {
                         std::fprintf(stderr, "[G177:apply] unknown exception\n");
                     }
+                    if (g316On)
+                    {
+                        const uint64_t g316ApplyNs = g316ElapsedNs(g316T0);
+                        g_g316ApplyNs.fetch_add(g316ApplyNs, std::memory_order_relaxed);
+                        if (g316Sample)
+                            g_g316SampleApplyNs.fetch_add(g316ApplyNs, std::memory_order_relaxed);
+                        g_g316Applies.fetch_add(1u, std::memory_order_relaxed);
+                    }
                     lk.lock();
                     m_busy = false;
                     if (m_items.empty())
@@ -735,6 +1054,7 @@ namespace
 
                 if (item.isFrameBoundary)
                 {
+                    g317ObserveItemFence(item);
                     g_g189WorkerStage.store(3, std::memory_order_relaxed);
                     // G157: this frame's draws are all ahead of us in FIFO order and have already
                     // been processed, so VRAM is complete; the register-write gate
@@ -743,7 +1063,11 @@ namespace
                     // gs_regs still belongs to THIS frame. Running the closure (G144 flush + the
                     // UNMODIFIED GS::latchHostPresentationFrame()) here is therefore correct.
                     static const bool s_g184Stat = (std::getenv("DC2_G184_BOUNDARY_STAT") != nullptr);
+                    const bool g316On = g316TimingOn();
+                    const bool g316Sample = g316On && m_g316LeafSample;
                     const auto g184T0 = s_g184Stat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    const auto g316T0 = g316On ? std::chrono::steady_clock::now()
+                                                : std::chrono::steady_clock::time_point{};
                     try
                     {
                         if (item.frameBoundaryFn)
@@ -773,6 +1097,21 @@ namespace
                         }
                     }
                     g_g184BoundaryCount.fetch_add(1u, std::memory_order_relaxed);
+                    if (g316On)
+                    {
+                        const uint64_t g316BoundaryNs = g316ElapsedNs(g316T0);
+                        g_g316BoundaryNs.fetch_add(g316BoundaryNs, std::memory_order_relaxed);
+                        if (g316Sample)
+                        {
+                            g_g316SampleBoundaryNs.fetch_add(g316BoundaryNs, std::memory_order_relaxed);
+                            g_g316SampledFrames.fetch_add(1u, std::memory_order_relaxed);
+                        }
+                        g316ReportBoundary();
+                        // Arm the NEXT complete worker frame once every 30 boundaries. The current
+                        // frame's sample (if any) was fully accounted before this state changes.
+                        m_g316LeafSample = ((++m_g316BoundaryN % 30u) == 0u);
+                    }
+                    g317ReportFrame();
 
                     lk.lock();
                     m_busy = false;
@@ -797,7 +1136,8 @@ namespace
                 // wrapped the same way in ps2_runtime.cpp). Swallow + continue so the pipeline drains.
                 try
                 {
-                    processWindow(item.packets);
+                    g317ObserveItemFence(item);
+                    processWindow(item.packets, item.g317HadQueuedSuccessor);
                 }
                 catch (const std::exception &e)
                 {
@@ -824,14 +1164,21 @@ namespace
             }
         }
 
-        void processWindow(std::vector<GifArbiterPacket> &q)
+        void processWindow(std::vector<GifArbiterPacket> &q, bool g317HadQueuedSuccessor)
         {
+            const bool g316On = g316TimingOn();
+            const bool g316Record = g316RecordOn();
+            const bool g316Sample = g316On && m_g316LeafSample;
+            const auto g316WindowT0 = g316On ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
             // G297 MTVU: pull this window's off-thread VU1 XGKICK output (Path1) and merge it into
             // the window BEFORE the sort. Waits per-kick only if VU1 hasn't caught up (backpressure).
             // No-op unless MTVU is active. Under MTVU, XGKICK does not submit to the arbiter, so q
             // holds no Path1 packets; the stable sort places these kicks (in kick order) ahead of
             // Path2/Path3 exactly as the synchronous baseline's path sort would.
             {
+                const auto g316MergeT0 = g316Sample ? std::chrono::steady_clock::now()
+                                                     : std::chrono::steady_clock::time_point{};
                 std::vector<std::vector<uint8_t>> g297pk;
                 g297CollectWindowPackets(g297pk);
                 for (auto &pk : g297pk)
@@ -843,8 +1190,16 @@ namespace
                     p.data = std::move(pk);
                     q.push_back(std::move(p));
                 }
+                if (g316Sample)
+                {
+                    const uint64_t g316MergeNs = g316ElapsedNs(g316MergeT0);
+                    if (g316Record)
+                        g_g316MergeNs.fetch_add(g316MergeNs, std::memory_order_relaxed);
+                }
             }
             // Identical grouping/order to GifArbiter::drain(): stable path sort, then process in order.
+            const auto g316SortT0 = g316Sample ? std::chrono::steady_clock::now()
+                                                : std::chrono::steady_clock::time_point{};
             std::stable_sort(q.begin(), q.end(),
                              [](const GifArbiterPacket &a, const GifArbiterPacket &b)
                              {
@@ -857,9 +1212,81 @@ namespace
                                  }
                                  return static_cast<uint8_t>(a.pathId) < static_cast<uint8_t>(b.pathId);
                              });
-            for (auto &pkt : q)
-                if (!pkt.data.empty() && m_processFn)
-                    m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+            if (g316Sample)
+            {
+                const uint64_t g316SortNs = g316ElapsedNs(g316SortT0);
+                if (g316Record)
+                    g_g316SortNs.fetch_add(g316SortNs, std::memory_order_relaxed);
+            }
+            if (!g316Sample)
+            {
+                // Default and non-sampled diagnostic frames retain the original dispatch loop.
+                bool g317FirstEligibleInWindow = true;
+                for (auto &pkt : q)
+                {
+                    if (g317FenceCensusOn())
+                    {
+                        if (g317ObservePacket(pkt, g317FirstEligibleInWindow, g317HadQueuedSuccessor))
+                            g317FirstEligibleInWindow = false;
+                    }
+                    if (!pkt.data.empty() && m_processFn)
+                        m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+                }
+            }
+            else
+            {
+                // The stable sort makes each path a contiguous run. Time the run, not individual
+                // packet dispatches: G312 proved a packet/draw timer changes this renderer's result.
+                bool g317FirstEligibleInWindow = true;
+                for (size_t begin = 0u; begin < q.size();)
+                {
+                    const GifPathId pathId = q[begin].pathId;
+                    const auto g316PathT0 = std::chrono::steady_clock::now();
+                    uint64_t g316PathPackets = 0u;
+                    size_t end = begin;
+                    do
+                    {
+                        auto &pkt = q[end];
+                        if (g317FenceCensusOn())
+                        {
+                            if (g317ObservePacket(pkt, g317FirstEligibleInWindow, g317HadQueuedSuccessor))
+                                g317FirstEligibleInWindow = false;
+                        }
+                        if (!pkt.data.empty() && m_processFn)
+                        {
+                            m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+                            ++g316PathPackets;
+                        }
+                        ++end;
+                    }
+                    while (end < q.size() && q[end].pathId == pathId);
+
+                    if (g316Record)
+                    {
+                        const uint32_t path = static_cast<uint32_t>(pathId);
+                        if (path >= 1u && path <= 3u)
+                        {
+                            const uint32_t index = path - 1u;
+                            g_g316PathNs[index].fetch_add(g316ElapsedNs(g316PathT0), std::memory_order_relaxed);
+                            g_g316PathPackets[index].fetch_add(g316PathPackets, std::memory_order_relaxed);
+                        }
+                    }
+                    else
+                    {
+                        // Empty arm: preserve the same sampled-frame timestamp cadence.
+                        (void)g316ElapsedNs(g316PathT0);
+                    }
+                    begin = end;
+                }
+            }
+            if (g316On)
+            {
+                const uint64_t g316WindowNs = g316ElapsedNs(g316WindowT0);
+                g_g316WindowNs.fetch_add(g316WindowNs, std::memory_order_relaxed);
+                if (g316Sample)
+                    g_g316SampleWindowNs.fetch_add(g316WindowNs, std::memory_order_relaxed);
+                g_g316Windows.fetch_add(1u, std::memory_order_relaxed);
+            }
         }
 
         std::mutex m_mtx;
@@ -872,6 +1299,12 @@ namespace
         bool m_started = false;
         bool m_stop = false;
         bool m_busy = false;
+        bool m_g316LeafSample = false; // worker-thread only; one complete frame every 30 boundaries
+        uint64_t m_g316BoundaryN = 0u;
+        G317CensusStats m_g317Stats{};
+        G317Path2ScanState m_g317Path2Scan{};
+        uint64_t m_g317LastFenceEpoch = 0u;
+        uint64_t m_g317RunPackets = 0u;
     };
 } // namespace
 

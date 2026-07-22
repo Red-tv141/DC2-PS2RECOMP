@@ -436,10 +436,14 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         else if (opcode == VIF_FLUSHE || opcode == VIF_FLUSH || opcode == VIF_FLUSHA)
         {
             if (opcode == VIF_FLUSH || opcode == VIF_FLUSHA)
+            {
+                g317_note_gif_fence((opcode == VIF_FLUSH) ? kG317VifFlush : kG317VifFlusha);
                 g95DrainDeferredGif((opcode == VIF_FLUSH) ? "FLUSH" : "FLUSHA");
+            }
             continue;
         }
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
+            g317_note_gif_fence((opcode == VIF_MSCAL) ? kG317VifMscal : kG317VifMscalf);
             if (opcode == VIF_MSCALF)
                 g95DrainDeferredGif("MSCALF-pre");
