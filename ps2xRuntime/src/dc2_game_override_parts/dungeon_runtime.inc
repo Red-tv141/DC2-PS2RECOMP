@@ -1002,6 +1002,107 @@ static void f48_2_key_main_chara_bg_probe(uint8_t *rdram, R5900Context *ctx, PS2
     f48_2_log_charbg("KeyMainCharaBG.exit", n, ra, pre, post, ret, reason, readRet);
 }
 
+// ---------------------------------------------------------------------------
+// G358: Sindain inventory circular viewport — DIAGNOSIS TRACE (root FIXED elsewhere).
+// The circle is the captured-field image, drawn by MenuFormDraw@0x229e70 form-piece
+// type 0x1f = MenuMainFrameImgDraw@0x224d80 -> DrawMenuMainFrmImg@0x223f00: a 2D
+// sprite blit (Begin(6)/PrimQuad) of texture *(MenuPosData+0x3c) = MenuFrameTex, with
+//   alpha = (MenuMainFrame_Display_Mode_Cnt/10)*128. This trace PROVED the blit itself is
+// correct (opaque, valid texture) and localised the noise to MenuFrameTex's CPU data being
+// garbage — the corruption is the MTGS async GS local->host readback in MenuCapture
+// (fixed in sceGsExecStoreImage via g150_wait_idle; see gs_stub_draw_env_and_packets.inc).
+// Retained default-off diagnostic (DC2_G358_FORM=1). Globals (gp=0x37E4F0):
+//   MenuMainFrame_Display_Mode s16 @0x003778A4, _Display_Mode_Cnt f32 @0x003778A8,
+//   _Lenze_Pos f32 @0x003778B0, LoopMode s32 @0x0037716C, DAT_01ecd62c s32 @0x01ECD62C,
+//   circle texture = *(u32*)(*(u32*)0x00377940 + 0x3c) (mgCTexture*; data ptr at +0x50).
+static bool g358_form_trace_enabled()
+{
+    static const bool e = dc2_env_flag_enabled("DC2_G358_FORM");
+    return e;
+}
+static float g358_bits_to_f32(uint32_t b)
+{
+    float f;
+    std::memcpy(&f, &b, sizeof(f));
+    return f;
+}
+static void g358_diag(uint8_t *rdram)
+{
+    const uint32_t mgr = dc2_read_u32(rdram, 0x00377940u); // *MenuPosData = CPosDataManage*
+    const int16_t dispMode = static_cast<int16_t>(dc2_read_u32(rdram, 0x003778A4u) & 0xFFFFu);
+    const float dispCnt = g358_bits_to_f32(dc2_read_u32(rdram, 0x003778A8u));
+    const float lenze = g358_bits_to_f32(dc2_read_u32(rdram, 0x003778B0u));
+    const int32_t sceneMode = static_cast<int32_t>(dc2_read_u32(rdram, 0x01ECD62Cu));
+    const int32_t loopMode = static_cast<int32_t>(dc2_read_u32(rdram, 0x0037716Cu)); // LoopMode (gp-0x7384)
+    uint32_t texPtr = 0u; int32_t texBlock = -1;
+    if (mgr > 0x80000u && mgr < 0x2000000u)
+    {
+        texPtr = dc2_read_u32(rdram, mgr + 0x3cu);
+        if (texPtr > 0x80000u && texPtr < 0x2000000u)
+            texBlock = static_cast<int16_t>(dc2_read_u32(rdram, texPtr) & 0xFFFFu);
+    }
+    static uint32_t s_n = 0u;
+    static int32_t s_lastMode = 0x7FFFFFFF;
+    static uint32_t s_lastTex = 0xDEADBEEFu;
+    static bool s_scanned = false;
+    if (!s_scanned && mgr > 0x80000u && mgr < 0x2000000u)
+    {
+        s_scanned = true;
+        const uint32_t base = dc2_read_u32(rdram, mgr + 0x18u);
+        const uint32_t count = dc2_read_u32(rdram, mgr + 0x1cu) & 0xFFFFu;
+        if (base > 0x80000u && base < 0x2000000u && count <= 512u)
+        {
+            std::fprintf(stderr, "[G358:formscan] mgr=0x%x base=0x%x count=%u types=", mgr, base, count);
+            for (uint32_t i = 0u; i < count; ++i)
+                std::fprintf(stderr, "%02x ", (dc2_read_u32(rdram, base + i * 0x80u) >> 16) & 0xFFu);
+            std::fprintf(stderr, "\n");
+        }
+    }
+    if (s_n < 120u || dispMode != s_lastMode || texPtr != s_lastTex)
+    {
+        std::fprintf(stderr,
+            "[G358:img] frame=%u LoopMode=%d dispMode=%d dispCnt=%.2f alpha=%d lenze=%.1f sceneMode=0x%x circleTex=0x%x block=0x%x\n",
+            g_f40_frame_counter, loopMode, (int)dispMode, dispCnt,
+            (dispMode == 1) ? 128 : (int)((dispCnt / 10.0f) * 128.0f),
+            lenze, sceneMode, texPtr, texBlock);
+        ++s_n; s_lastMode = dispMode; s_lastTex = texPtr;
+    }
+    // One-shot dump of the circle blit texture's CPU data (captured+2x2-downsampled field,
+    // 256x208 RGBA8 written by MenuCapture). Distinguishes a corrupt CAPTURE from a bad UPLOAD —
+    // this dump was band noise before the fix, clean after.
+    static bool s_dumped = false;
+    if (!s_dumped && dispMode == 0 && dispCnt >= 9.0f &&
+        texPtr > 0x80000u && texPtr < 0x2000000u)
+    {
+        const uint32_t dataPtr = dc2_read_u32(rdram, texPtr + 0x50u); // mgCTexture data ptr (byte +0x50)
+        if (dataPtr > 0x80000u && dataPtr < 0x2000000u)
+        {
+            s_dumped = true;
+            const int W = 256, H = 208;
+            const uint8_t *src = static_cast<const uint8_t *>(getConstMemPtr(rdram, dataPtr));
+            if (src)
+            {
+                FILE *fp = std::fopen("D:/ps2r/dc2/captures/g358_circletex.ppm", "wb");
+                if (fp)
+                {
+                    std::fprintf(fp, "P6\n%d %d\n255\n", W, H);
+                    for (int i = 0; i < W * H; ++i)
+                    { std::fputc(src[i * 4 + 0], fp); std::fputc(src[i * 4 + 1], fp); std::fputc(src[i * 4 + 2], fp); }
+                    std::fclose(fp);
+                }
+            }
+            std::fprintf(stderr, "[G358:dump] circleTex=0x%x data=0x%x block=0x%x wrote g358_circletex.ppm\n",
+                         texPtr, dataPtr, texBlock);
+        }
+    }
+}
+static void g358_intern_select_draw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    if (g358_form_trace_enabled())
+        g358_diag(rdram);
+    MenuInternSelectDraw__Fv_0x236850(rdram, ctx, runtime);
+}
+
 static void f49_read_bg_sync_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     static uint32_t calls = 0u;

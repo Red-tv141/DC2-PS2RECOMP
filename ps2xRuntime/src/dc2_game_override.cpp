@@ -254,6 +254,8 @@ extern void ReadBGSync__Fv_0x148e70(uint8_t* rdram, R5900Context* ctx, PS2Runtim
 extern void ReadMainCharaBG__Fv_0x2bbc80(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void KeyMainCharaBG__Fv_0x2bc150(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void MenuCostumeKey__Fv_0x2be030(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G358: Sindain inventory circular viewport (type-0x0d form-piece live-vs-cached diagnosis).
+extern void MenuInternSelectDraw__Fv_0x236850(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void InitDungeonMain__F13INIT_LOOP_ARG_0x1cc040(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void LoopDungeonMain__Fv_0x1cea00(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void Step__12CMenuTreeMapFv_0x1eff40(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -391,6 +393,10 @@ extern uint64_t g297WorkerBusyNs();
 extern uint64_t g297WorkerKicksRun();
 extern uint64_t g297GsCollectStallNs();
 extern uint64_t g297GsCollectStalls();
+// G344: TOTAL time in collectWindowPackets (all windows). merge OVERHEAD = total - stall,
+// distinguishing removable per-window handoff cost from VU1-catch-up idle (the stall).
+extern uint64_t g297GsCollectTotalNs();
+extern uint64_t g297GsCollectCalls();
 extern uint64_t g303_gs_worker_busy_ns();
 
 // G217: one-shot exact head-object packet correlation consumed by ps2_memory.cpp.

@@ -283,14 +283,28 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                 const double stallsPerF = (double)(stalls - s_lastStalls) / w;
                 s_lastStallNs = stallNs;
                 s_lastStalls = stalls;
+                // G344 premise-gate: TOTAL collectWindowPackets time (all windows, matched
+                // denominator with stall). merge OVERHEAD = collectMs - gsStallMs; anything the
+                // rest of collectMs is VU1-catch-up idle (the stall), NOT removable handoff cost.
+                static uint64_t s_lastCollectNs = g297GsCollectTotalNs();
+                static uint64_t s_lastCollectCalls = g297GsCollectCalls();
+                const uint64_t collectNs = g297GsCollectTotalNs();
+                const uint64_t collectCalls = g297GsCollectCalls();
+                const double collectMsPerF = (double)(collectNs - s_lastCollectNs) / 1e6 / w;
+                const double collectCallsPerF = (double)(collectCalls - s_lastCollectCalls) / w;
+                const double mergeOverheadMsPerF = collectMsPerF - stallMsPerF;
+                s_lastCollectNs = collectNs;
+                s_lastCollectCalls = collectCalls;
                 static uint64_t s_lastGsBusyNs = g303_gs_worker_busy_ns();
                 const uint64_t gsBusyNs = g303_gs_worker_busy_ns();
                 const double gsBusyMsPerF = (double)(gsBusyNs - s_lastGsBusyNs) / 1e6 / w;
                 s_lastGsBusyNs = gsBusyNs;
                 if (vuwKicks != 0ull)
                     std::fprintf(stderr,
-                                 "[G303:vu1w] n=%u window=%u busyMs/f=%.1f kicks/f=%.0f gsStallMs/f=%.1f gsStalls/f=%.0f gsWorkerMs/f=%.1f\n",
-                                 n, s_perfWindow, vuwMsPerF, vuwKicksPerF, stallMsPerF, stallsPerF, gsBusyMsPerF);
+                                 "[G303:vu1w] n=%u window=%u busyMs/f=%.1f kicks/f=%.0f gsStallMs/f=%.1f gsStalls/f=%.0f gsWorkerMs/f=%.1f "
+                                 "| [G344:merge] collectMs/f=%.1f overheadMs/f=%.2f windows/f=%.0f\n",
+                                 n, s_perfWindow, vuwMsPerF, vuwKicksPerF, stallMsPerF, stallsPerF, gsBusyMsPerF,
+                                 collectMsPerF, mergeOverheadMsPerF, collectCallsPerF);
             }
             if (s_g182PerfOn)
             {

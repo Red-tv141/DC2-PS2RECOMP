@@ -307,6 +307,7 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     runtime.registerFunction(0x002BBC80u, f48_2_read_main_chara_bg_probe); // ReadMainCharaBG step-23 audit probe
     runtime.registerFunction(0x002BC150u, f48_2_key_main_chara_bg_probe); // KeyMainCharaBG step-23 audit probe
     runtime.registerFunction(0x002BE030u, f48_2_menu_costume_key_probe); // MenuCostumeKey step-23 audit probe
+    runtime.registerFunction(0x00236850u, g358_intern_select_draw_probe); // G358 Sindain circle type-0x0d form diag + force-blit proof lever
     runtime.registerFunction(0x001CBD70u, f50_1_memory_init);             // F50.1 memoryInit (was auto-stub) ג€” create dungeon mgCMemory pools
     runtime.registerFunction(0x0012E600u, f50_9_mg_load_image_probe);     // F50.9 mgLoadImage CLUT/texture upload probe (DC2_TRACE_F50_9)
     runtime.registerFunction(0x0012E850u, f51_reload_texture_packet_probe); // F51 ReloadTexture packet-wrapper reach probe (DC2_TRACE_T8_UPLOAD)
