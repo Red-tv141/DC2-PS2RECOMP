@@ -197,6 +197,21 @@ namespace
         return enabled;
     }
 
+    // G353: DC2 configures the GS for interlaced FIELD output (SMODE2.INT=1, FFMD=0), so the
+    // host present path bobbed one field per vsync — applyFieldPresentation line-doubles the
+    // even source lines (0,0,2,2,...) one frame and the odd lines (1,1,3,3,...) the next,
+    // alternating on GetCurrentVSyncTick parity. On a real CRT the two fields interlace into
+    // one stable image; presenting them progressively at field rate makes a STATIC framebuffer
+    // bounce one line every frame = the "screen shake" (Known Issue #3 / G353). DC2 renders a
+    // full-height progressive framebuffer, so instead we present it whole every vsync (weave):
+    // stable AND full vertical resolution, no per-screen scope. Set DC2_G353_FIELD_BOB=1 to
+    // restore the legacy per-field bob (pre-G353 behavior / same-binary A/B control).
+    bool g353FieldBobEnabled()
+    {
+        static const bool enabled = envFlagEnabled("DC2_G353_FIELD_BOB");
+        return enabled;
+    }
+
     // G268: diagnostic/lever env vars are process-constant in every DC2 harness, but several
     // per-vertex/per-packet hot paths still called getenv() on EVERY invocation (Windows CRT
     // getenv = env lock + linear scan, microseconds). The G268 MAP-0 census measured packed

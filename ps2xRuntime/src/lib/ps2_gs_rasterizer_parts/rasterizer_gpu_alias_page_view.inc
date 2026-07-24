@@ -533,11 +533,27 @@ struct G278PendDepth
     int rowLo = 512, rowHi = -1;
     std::array<uint64_t, 8> staleRows{}; // CPU-written rows outside dirty union; backend is stale
 };
-static G278PendDepth s_g278Pend; // flush-owner thread only (same contract as s_g276Pend)
+// G337 (Pillar-4 slice 1, default-off DC2_G337_ZAUTH=1): persistent cross-wave/cross-frame GPU
+// depth authority. The G278 pending owner generalizes to a small per-depthKey slot table and is
+// allowed to (a) cover alias-family waves that skip their color readback (no VRAM color write can
+// race the deferred Z), and (b) survive the frame boundary (G336 proved the boundary Z publish is
+// WAR-dead: the next frame's Z-clear overwrites the published pages in ~0.04 ms). Guest VRAM Z is
+// materialized lazily at the existing fail-closed consumer edges only. Arm off = slot 0 only,
+// byte-identical legacy behavior.
+static constexpr int kG278PendSlots = 6;
+static G278PendDepth s_g278PendTab[kG278PendSlots]; // flush-owner thread only (as s_g276Pend)
+static G278PendDepth &s_g278Pend = s_g278PendTab[0]; // legacy single-slot alias (arm-off path)
 static std::atomic<uint64_t> g_g278Deferred{0}, g_g278Flushes{0}, g_g278Saved{0},
     g_g278FlushRows{0}, g_g278UploadSkips{0}, g_g278FlushFail{0},
     g_g278InvariantFail{0}, g_g278StaleMarks{0}, g_g278Reinits{0};
 static std::atomic<uint64_t> g_g278FlushByCause[9] = {};
+// G337 telemetry: boundary carries, cross-key slot evictions, cross-slot physical-overlap
+// flushes, widened (alias-family) deferrals, audit-forced publications by class.
+static std::atomic<uint64_t> g_g337Carried{0}, g_g337SlotEvict{0}, g_g337OvlFlush{0},
+    g_g337WideDefer{0}, g_g337AuditTex{0}, g_g337AuditTarget{0}, g_g337AuditCrossKey{0};
+// Why a Z-writing wave still took the DIRECT per-wave readback under the arm (attribution).
+static std::atomic<uint64_t> g_g337DirSeeded{0}, g_g337DirTight{0}, g_g337DirNoSkipRb{0},
+    g_g337DirOther{0};
 // G274: total wall-time inside the synchronous backend submit (all waves) + count.
 static std::atomic<uint64_t> g_g274SubNs{0}, g_g274SubN{0};
 // G275: one synchronous worker job now owns the render and its mandatory immediate Z readback.
@@ -656,7 +672,38 @@ struct G289CopyOwner
     uint8_t *vram = nullptr;
     uint32_t vramSize = 0u;
 };
-static G289CopyOwner s_g289Owner;
+// G346: N-slot versioned owner table. Slot 0 is the legacy single owner (every pre-G346 site
+// keeps its exact semantics through the s_g289Owner reference); slots 1..N-1 are populated ONLY
+// under DC2_G345_CLOSURE (g345ClosureOn), so the default path is byte-identical single-slot.
+static constexpr uint32_t kG345OwnerSlots = 4u;
+static G289CopyOwner s_g289Owners[kG345OwnerSlots];
+static G289CopyOwner &s_g289Owner = s_g289Owners[0];
+static bool g345AnyOwnerActive()
+{
+    for (uint32_t i = 0u; i < kG345OwnerSlots; ++i)
+        if (s_g289Owners[i].active)
+            return true;
+    return false;
+}
+// Active owner for a destination fbp (slot 0 first). Closure-off this degenerates to slot 0.
+static G289CopyOwner *g345OwnerFor(uint32_t dstFbp)
+{
+    for (uint32_t i = 0u; i < kG345OwnerSlots; ++i)
+        if (s_g289Owners[i].active && s_g289Owners[i].dstFbp == dstFbp)
+            return &s_g289Owners[i];
+    return nullptr;
+}
+static G289CopyOwner *g345FreeSlot()
+{
+    if (!s_g289Owners[0].active)
+        return &s_g289Owners[0];
+    if (!g345ClosureOn())
+        return nullptr; // legacy single-slot admission
+    for (uint32_t i = 1u; i < kG345OwnerSlots; ++i)
+        if (!s_g289Owners[i].active)
+            return &s_g289Owners[i];
+    return nullptr;
+}
 struct G289PendingUploadOverwrite
 {
     bool active = false;
@@ -747,7 +794,48 @@ static bool g278DepthRbOn()
                              !envFlagDisabled("DC2_G278_Z_RB_COALESCE");
     return s_on && g261WaveOn() && !g277CensusOn();
 }
-static G144BlockRange g278PendingDepthWholeRange();
+// G337 arm (default-off): persistent depth authority. Rides G278 (so every oracle/census/kill
+// that disables G278 disables this too, and DC2_G26X_NO_NATIVE=1 kills the whole stack).
+static bool g337ZAuthOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G337_ZAUTH");
+    return s_on && g278DepthRbOn();
+}
+// G338: retire the CT24 display-composite consumer that re-reads a resident CT32 producer FBO at
+// the SAME base/width by binding a resident CT24-alpha view (RGB copied from the FBO, alpha
+// re-derived per-texel from TEXA) instead of materializing the producer. The view is byte-identical
+// to the legacy CT24->RGBA8 decode, so the consumer's own GL_LINEAR matches exactly. Rides the
+// native wave stack. Verify with DC2_G338_VERIFY.
+// G352 PROMOTION (2026-07-23): DEFAULT-ON — fork option 2, the accept-floor close of
+// arc-total-closure (the ≥10% closure stack is unreachable: both bounded 0x139 composition forms
+// are G304 local minima, G349/G351). Standalone bit-exact (DC2_G338_VERIFY bad=0), tex-alias
+// 448->0, GS worker -3.8 ms/f, frame -2.6% (VU1-capped), G339 route-matrix PASS.
+// Rollback: DC2_G338_NO_CT24_VIEW=1 (or DC2_G338_CT24_VIEW=0, or the whole-stack
+// DC2_G26X_NO_NATIVE=1 via g261WaveOn) restores the legacy CPU CT24 display composite.
+// DC2_G338_CT24_VIEW=1 stays accepted (now redundant).
+static bool g338Ct24ViewOn()
+{
+    static const bool s_on = !envFlagEnabled("DC2_G338_NO_CT24_VIEW") &&
+                             !envFlagDisabled("DC2_G338_CT24_VIEW");
+    return s_on && g261WaveOn();
+}
+static bool g338VerifyOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G338_VERIFY");
+    return s_on && g338Ct24ViewOn();
+}
+static uint64_t g338ViewKey(uint64_t base)
+{
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ull; };
+    mix(base);
+    mix(0x4732333843543234ull); // "G338CT24": distinct from T8 views and guest-VRAM textures
+    return h | (1ull << 63);
+}
+static std::atomic<uint64_t> g_g338Views{0}, g_g338BuildFail{0}, g_g338VerifyBad{0};
+static G144BlockRange g278PendingDepthWholeRangeP(const G278PendDepth &p);
+static G144BlockRange g278PendingDepthRangeP(const G278PendDepth &p);
+static bool g278FlushPendSlot(G278PendDepth &p, int cause);
 static bool g278FlushPendingDepth(int cause);
 static bool g278FlushPendingDepthForRanges(int cause,
                                            const G144BlockRange &src,
@@ -841,6 +929,37 @@ static bool g261StatOn()
     return s_on;
 }
 
+// ---- G340: lazy-VRAM payoff-ceiling census (behavior-pure, default-off DC2_G340_CENSUS=1) -----
+// The arc's #1 unexplored lever (lazy materialized guest VRAM) proposes deferring the per-target
+// materialize glReadPixels until a guest/runtime consumer actually READS the guest-VRAM bytes,
+// via page protection. But `g261Materialize` ALREADY defers readback to consumer edges — it fires
+// only when a consumer's block range overlaps a dirty resident target. So a page-fault lazy scheme
+// can only save the readback for dirty rows that NO consumer actually reads before they are
+// overwritten. This census measures that ceiling directly, without any SEH/VirtualProtect risk:
+// at each range-triggered materialize, split the target's dirty rows (the readback unit,
+// == g_g279MatRows) three ways —
+//   consumed : the triggering copy's SRC rect dirty-overlaps them  -> a real read; lazy CANNOT skip.
+//   overwrite: only the DST rect dirty-overlaps them (no src)      -> written over; lazy skips IFF
+//              the write fully covers (upper-bounded skippable).
+//   conserv  : NEITHER src nor dst dirty-overlaps (materialize fired purely on the coarse
+//              full-target range) -> pure conservative barrier; 100% skippable by an exact scheme.
+// unknown    : srcUnknown/dstUnknown fail-closed (counted as consumed = safe "needed" upper bound).
+// Skippable = overwrite + conserv. If consumed dominates, lazy-VRAM is the G280/G304/G339 local
+// minimum (deferral just relocates the read); if skippable dominates, a page-exact scheme pays.
+static bool g340CensusOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G340_CENSUS");
+    return s_on;
+}
+static std::atomic<uint64_t> g_g340Mats{0};        // range-triggered materializes censused
+static std::atomic<uint64_t> g_g340RowsTotal{0};   // Σ dirty rows materialized (== consumed+skippable)
+static std::atomic<uint64_t> g_g340RowsConsumed{0};// Σ rows the consumer src-reads (lazy cannot skip)
+static std::atomic<uint64_t> g_g340RowsOverwrite{0};// Σ rows only dst-written (skippable if write total)
+static std::atomic<uint64_t> g_g340RowsConserv{0}; // Σ rows neither src nor dst dirty-overlap (dead)
+static std::atomic<uint64_t> g_g340RowsUnknown{0}; // Σ rows under fail-closed unknown ranges
+static std::atomic<uint64_t> g_g340CauseTotal[8]{};    // per-cause total rows
+static std::atomic<uint64_t> g_g340CauseSkippable[8]{};// per-cause (overwrite+conserv) rows
+
 static bool g267CensusOn()
 {
     static const bool s_on = envFlagEnabled("DC2_G267_CENSUS");
@@ -916,7 +1035,7 @@ static void g291ClearCopiedTile(int ti, uint32_t pageRow, uint32_t pageCol)
 
 static void g261Report()
 {
-    if (!g261StatOn() && !g279ProfileOn() && !g310StatOn())
+    if (!g261StatOn() && !g279ProfileOn() && !g310StatOn() && !g340CensusOn())
         return;
     if (g291StatOn())
         std::fprintf(stderr,
@@ -1040,6 +1159,34 @@ static void g261Report()
                          (unsigned long long)g_g279DisplayN[i].load(std::memory_order_relaxed));
         std::fprintf(stderr, " (total/read/count)\n");
     }
+    if (g340CensusOn())
+    {
+        const uint64_t tot = g_g340RowsTotal.load(std::memory_order_relaxed);
+        const uint64_t cons = g_g340RowsConsumed.load(std::memory_order_relaxed);
+        const uint64_t ovr = g_g340RowsOverwrite.load(std::memory_order_relaxed);
+        const uint64_t con = g_g340RowsConserv.load(std::memory_order_relaxed);
+        const uint64_t unk = g_g340RowsUnknown.load(std::memory_order_relaxed);
+        const uint64_t skip = ovr + con;
+        std::fprintf(stderr,
+                     "[G340:ceiling] mats=%llu rows=%llu consumed=%llu overwrite=%llu "
+                     "conserv=%llu unknown=%llu skippable=%llu (%.1f%% of rows)\n",
+                     (unsigned long long)g_g340Mats.load(std::memory_order_relaxed),
+                     (unsigned long long)tot, (unsigned long long)cons,
+                     (unsigned long long)ovr, (unsigned long long)con,
+                     (unsigned long long)unk, (unsigned long long)skip,
+                     tot ? 100.0 * (double)skip / (double)tot : 0.0);
+        std::fprintf(stderr, "[G340:bycause]");
+        for (int i = 0; i < 8; ++i)
+        {
+            const uint64_t ct = g_g340CauseTotal[i].load(std::memory_order_relaxed);
+            if (ct == 0u)
+                continue;
+            const uint64_t cs = g_g340CauseSkippable[i].load(std::memory_order_relaxed);
+            std::fprintf(stderr, " c%d=%llu/%lluskip", i,
+                         (unsigned long long)cs, (unsigned long long)ct);
+        }
+        std::fprintf(stderr, " (skippable/total rows; c2=upload c3=l2l)\n");
+    }
     if (g284StatOn())
     {
         std::fprintf(stderr, "[G284:stat] uploadCoalesce=%d skipped=%llu flushed=%llu\n",
@@ -1085,6 +1232,13 @@ static void g261Report()
                      (unsigned long long)s_g289Owner.version,
                      s_g289Owner.firstOwnedBlock, s_g289Owner.lastOwnedBlock);
     }
+    if (g338Ct24ViewOn())
+        std::fprintf(stderr, "[G338:stat] views=%llu buildFail=%llu verifyBad=%llu\n",
+                     (unsigned long long)g_g338Views.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g338BuildFail.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g338VerifyBad.load(std::memory_order_relaxed));
+    g345PrintEscape();
+    g347PrintUp139();
     g262Report();
     g265Report();
     g266Report();
@@ -1421,9 +1575,17 @@ static bool g264FlushMirror(int ti)
                                 vram + off, 4);
                 }
             }
+            // G351: a mirror patch carries VRAM-authoritative bytes — under the surface split
+            // the sibling FBO may be the one a later materialize reads, so patch it too
+            // (writing newest-VRAM bytes into both FBOs is always coherent).
+            const bool g351MirDup = g351SplitOn() && fbp == 0x139u &&
+                                    (s_g351Band0IsB || s_g351Band1IsB);
             if (!packed ||
                 !g264_backend_write_color_rect(fbp, r.fbW, 512, x0, glY,
-                                                width, rows, s_g264Px))
+                                                width, rows, s_g264Px) ||
+                (g351MirDup &&
+                 !g264_backend_write_color_rect(kG351Sprite139, r.fbW, 512, x0, glY,
+                                                width, rows, s_g264Px)))
             {
                 clearBits();
                 g_g264MirFail.fetch_add(1u, std::memory_order_relaxed);
@@ -1527,6 +1689,12 @@ static void g261Materialize(int ti, int cause)
                                     : std::chrono::steady_clock::time_point{};
     const uint32_t fbp = kG261Fbp[ti];
     const int rows = r.dirtyHi - r.dirtyLo + 1;
+    if (g345StatOn() && g345FamilyFbp(fbp) && rows > 0)
+        g345NoteFamReadbackFbp(fbp, static_cast<uint64_t>(rows));
+    // G351: attribute this 0x139 FBO→VRAM publication (and the consumer demand behind its cause)
+    // to the surface that last wrote the wide FBO — the split's consumer→surface map.
+    if (fbp == 0x139u && rows > 0)
+        g351NoteCon(kG351SiteMat, cause, static_cast<uint64_t>(rows));
     if (g310StatOn())
     {
         const int pageLo = std::max(0, r.dirtyLo) / 32;
@@ -1562,7 +1730,42 @@ static void g261Materialize(int ti, int cause)
         const int glY = 512 - 1 - r.dirtyHi;
         const auto g279ReadT0 = g279Profile ? std::chrono::steady_clock::now()
                                             : std::chrono::steady_clock::time_point{};
-        const bool readOk = g178_backend_read_color(fbp, r.fbW, 512, glY, rows, s_g261Px);
+        // G351: under the surface split the CURRENT wide-0x139 content lives in the per-band
+        // routed FBO (scene rows on the fbp key, sprite-only rows possibly on the sibling).
+        const bool g351Split139 = g351SplitOn() && fbp == 0x139u;
+        const uint32_t g351K0 = g351Split139 ? g351Band0Key139() : fbp; // rows <= 415
+        const uint32_t g351K1 = g351Split139 ? g351Band1Key139() : fbp; // rows >= 416
+        bool readOk;
+        uint32_t g351ReadKey = fbp; // 0 = mixed-band read (no single FBO equals VRAM after)
+        if (!g351Split139 || g351K0 == g351K1 || r.dirtyLo >= 416 || r.dirtyHi <= 415)
+        {
+            const uint32_t k = r.dirtyLo >= 416 ? g351K1 : g351K0;
+            g351ReadKey = k;
+            readOk = g178_backend_read_color(k, r.fbW, 512, glY, rows, s_g261Px);
+        }
+        else
+        {
+            // Two-part read: the dirty span crosses the band boundary and the bands live in
+            // different FBOs. GL rows are bottom-first, so band-1 (higher GS rows) fills the
+            // buffer head and band-0 the tail — same layout the copy loop below expects.
+            ++s_g351MixedMat;
+            g351ReadKey = 0u;
+            static std::vector<uint32_t> s_g351Hi, s_g351Lo; // flush-owner thread only
+            const int rows1 = r.dirtyHi - 416 + 1, rows0 = 415 - r.dirtyLo + 1;
+            readOk = g178_backend_read_color(g351K1, r.fbW, 512, glY, rows1, s_g351Hi) &&
+                     g178_backend_read_color(g351K0, r.fbW, 512, 512 - 1 - 415, rows0,
+                                             s_g351Lo) &&
+                     s_g351Hi.size() == static_cast<size_t>(r.fbW) * rows1 &&
+                     s_g351Lo.size() == static_cast<size_t>(r.fbW) * rows0;
+            if (readOk)
+            {
+                s_g261Px.resize(static_cast<size_t>(r.fbW) * rows);
+                std::memcpy(s_g261Px.data(), s_g351Hi.data(),
+                            s_g351Hi.size() * sizeof(uint32_t));
+                std::memcpy(s_g261Px.data() + s_g351Hi.size(), s_g351Lo.data(),
+                            s_g351Lo.size() * sizeof(uint32_t));
+            }
+        }
         if (g279Profile)
             g_g279MatReadNs[cause & 7].fetch_add(
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1588,13 +1791,37 @@ static void g261Materialize(int ti, int cause)
             g178BumpRectImpl(fbBlock, r.fbw, GS_PSM_CT32, 0u,
                              static_cast<uint32_t>(r.dirtyLo),
                              static_cast<uint32_t>(r.fbW), static_cast<uint32_t>(rows));
-            // FBO still equals VRAM for this target: refresh the snapshot past our own bump.
-            G178FbSnap &snap = g_g178FbSnap[fbp];
-            snap.valid = true;
-            if (r.covLo < snap.rowLo) snap.rowLo = r.covLo;
-            if (r.covHi > snap.rowHi) snap.rowHi = r.covHi;
-            snap.genSum = g178GenSumRect(fbBlock, r.fbw, GS_PSM_CT32, 0u, 0u,
-                                         static_cast<uint32_t>(r.fbW), 512u);
+            // FBO still equals VRAM for this target: refresh the snapshot past our own bump —
+            // G351: for the FBO key actually READ; a mixed-band publication leaves neither
+            // single FBO equal to VRAM, so both surface snapshots go conservative-invalid.
+            if (g351ReadKey != 0u)
+            {
+                G178FbSnap &snap = g_g178FbSnap[g351ReadKey];
+                snap.valid = true;
+                if (r.covLo < snap.rowLo) snap.rowLo = r.covLo;
+                if (r.covHi > snap.rowHi) snap.rowHi = r.covHi;
+                snap.genSum = g178GenSumRect(fbBlock, r.fbw, GS_PSM_CT32, 0u, 0u,
+                                             static_cast<uint32_t>(r.fbW), 512u);
+                if (g351ReadKey != fbp)
+                {
+                    G178FbSnap &phys = g_g178FbSnap[fbp];
+                    phys.valid = false;
+                    phys.genSum = 0;
+                    phys.rowLo = 1 << 30;
+                    phys.rowHi = -1;
+                }
+            }
+            else
+            {
+                for (const uint32_t k : {fbp, kG351Sprite139})
+                {
+                    G178FbSnap &sn = g_g178FbSnap[k];
+                    sn.valid = false;
+                    sn.genSum = 0;
+                    sn.rowLo = 1 << 30;
+                    sn.rowHi = -1;
+                }
+            }
         }
     }
     if (!ok)
@@ -1605,12 +1832,18 @@ static void g261Materialize(int ti, int cause)
                      fbp, r.dirtyLo, r.dirtyHi, r.fbW, cause);
         g_g261Mat[kG261MatFail].fetch_add(1u, std::memory_order_relaxed);
         // FBO↔VRAM equality is unknown now — force a fresh upload. Reset in place (callers may
-        // hold live references into g_g178FbSnap; erase would invalidate them).
-        G178FbSnap &failSnap = g_g178FbSnap[fbp];
-        failSnap.valid = false;
-        failSnap.genSum = 0;
-        failSnap.rowLo = 1 << 30;
-        failSnap.rowHi = -1;
+        // hold live references into g_g178FbSnap; erase would invalidate them). G351: both
+        // surface snapshots (the split routes 0x139 across two FBO keys).
+        for (const uint32_t k : {fbp, kG351Sprite139})
+        {
+            G178FbSnap &failSnap = g_g178FbSnap[k];
+            failSnap.valid = false;
+            failSnap.genSum = 0;
+            failSnap.rowLo = 1 << 30;
+            failSnap.rowHi = -1;
+            if (!(g351SplitOn() && fbp == 0x139u))
+                break; // split off (or another target): original single-key behavior
+        }
     }
     r.dirty = false;
     r.dirtyLo = 512;
@@ -1669,13 +1902,16 @@ static void g276FlushPendingDisplay(int cause)
         static_cast<uint32_t>(s_g276Pend.rowLo),
         static_cast<uint32_t>(s_g276Pend.fbW),
         static_cast<uint32_t>(s_g276Pend.rowHi - s_g276Pend.rowLo + 1));
-    if (s_g278Pend.active)
+    for (int s = 0; s < kG278PendSlots; ++s)
     {
-        const G144BlockRange depthWhole = g278PendingDepthWholeRange();
+        G278PendDepth &pz = s_g278PendTab[s];
+        if (!pz.active)
+            continue;
+        const G144BlockRange depthWhole = g278PendingDepthWholeRangeP(pz);
         if (!depthWhole.valid || !displayRange.valid ||
             g144RangeOverlaps(depthWhole, displayRange))
         {
-            if (!g278FlushPendingDepth(cause))
+            if (!g278FlushPendSlot(pz, cause))
                 return;
         }
     }
@@ -1719,6 +1955,10 @@ static void g276FlushPendingDisplay(int cause)
                         std::memcpy(vram + off, &s_g276Px[srcRow + x], 4);
                 }
             }
+            // G336: this display-color readback published guest VRAM rows rowLo..rowHi at
+            // (fbBlock,fbw) as CT32 — capture it into the boundary's published set (no-op unless
+            // DC2_G336_RUNWAY=1 and inside the boundary window).
+            g336NotePublish(p.fbBlock, p.fbw, p.fbW, p.rowLo, p.rowHi);
         }
     }
     if (ok)
@@ -1926,27 +2166,47 @@ static uint32_t g289DirectDisplayToken()
         e.v[1].u == 512u * 16u && e.v[1].v == 416u * 16u;
     if (!exact)
         return 0u;
-    if (s_g289Owner.active && !g289Resolve14aBeforeDirect())
+    if (g345AnyOwnerActive() && !g289Resolve14aBeforeDirect())
         return 0u;
+    if (g345AnyOwnerActive())
+        return 0u; // G346: another slot survived the 0x14a resolve — fail closed to normal path
     return s_g276Pend.fbp == 0u ? kG289ZeroFbpToken : s_g276Pend.fbp;
 }
 
+// G346: union across every active slot. Overlap consumers become fail-closed conservative for
+// multi-slot states; closure-off (single active slot at most) this is the original range.
 static G144BlockRange g289OwnerRange()
 {
     G144BlockRange out;
-    out.first = s_g289Owner.firstOwnedBlock;
-    out.last = s_g289Owner.lastOwnedBlock;
-    out.valid = s_g289Owner.active && out.first <= out.last;
+    out.valid = false;
+    for (uint32_t i = 0u; i < kG345OwnerSlots; ++i)
+    {
+        const G289CopyOwner &o = s_g289Owners[i];
+        if (!o.active || o.firstOwnedBlock > o.lastOwnedBlock)
+            continue;
+        if (!out.valid)
+        {
+            out.first = o.firstOwnedBlock;
+            out.last = o.lastOwnedBlock;
+            out.valid = true;
+        }
+        else
+        {
+            out.first = std::min(out.first, o.firstOwnedBlock);
+            out.last = std::max(out.last, o.lastOwnedBlock);
+        }
+    }
     return out;
 }
 
-static bool g289MaterializeOwner(int cause)
+static bool g345MaterializeSlot(G289CopyOwner &slot, int cause)
 {
-    if (!s_g289Owner.active)
+    if (!slot.active)
         return true;
-    G289CopyOwner owner = s_g289Owner;
-    s_g289Owner.active = false;
-    s_g289PendingUpload.active = false;
+    G289CopyOwner owner = slot;
+    slot.active = false;
+    if (&slot == &s_g289Owners[0])
+        s_g289PendingUpload.active = false;
 
     static std::vector<uint32_t> s_px;
     const bool ok =
@@ -1980,10 +2240,29 @@ static bool g289MaterializeOwner(int cause)
                      static_cast<void *>(owner.vram), owner.vramSize);
     }
     G178FbSnap &snap = g_g178FbSnap[owner.dstFbp];
-    snap.valid = false;
-    snap.genSum = 0u;
-    snap.rowLo = 1 << 30;
-    snap.rowHi = -1;
+    if (ok && g345ClosureOn())
+    {
+        // G346 write-side retirement: the readback above published the FULL 416-row FBO content
+        // and bumped those pages' generations, so FBO == VRAM for rows 0..415 of dstFbp right
+        // now. Revalidating (the proven G272-materialize pattern) lets the next wave skip the
+        // stale re-upload that G343 measured as the conserving edge. Non-closure keeps the
+        // original conservative invalidation.
+        snap.valid = true;
+        snap.genSum = g178GenSumRect(framePageBaseToBlock(owner.dstFbp), 8u, GS_PSM_CT32,
+                                     0u, 0u, 512u, 512u);
+        snap.rowLo = std::min(snap.rowLo, 0);
+        snap.rowHi = std::max(snap.rowHi, 415);
+        g_g345SnapRevalidates.fetch_add(1u, std::memory_order_relaxed);
+    }
+    else
+    {
+        snap.valid = false;
+        snap.genSum = 0u;
+        snap.rowLo = 1 << 30;
+        snap.rowHi = -1;
+    }
+    if (g345ClosureOn())
+        g345NoteEscMat(cause, owner.dstFbp, 416u);
     if (g289StatOn())
     {
         const uint64_t n =
@@ -1996,6 +2275,16 @@ static bool g289MaterializeOwner(int cause)
                          static_cast<unsigned long long>(owner.version), owner.dstFbp,
                          cause, ok ? 1u : 0u);
     }
+    return ok;
+}
+
+// Fail-closed edge: resolve EVERY active owner slot (closure-off: only slot 0 can be active).
+static bool g289MaterializeOwner(int cause)
+{
+    bool ok = true;
+    for (uint32_t i = 0u; i < kG345OwnerSlots; ++i)
+        if (s_g289Owners[i].active)
+            ok = g345MaterializeSlot(s_g289Owners[i], cause) && ok;
     return ok;
 }
 
@@ -2016,14 +2305,15 @@ static bool g289PrepareUploadOverwrite(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
     const bool exactCt32Tail =
         dbw == 1u && dpsm == GS_PSM_CT32 &&
         dsax == 0u && dsay == 0u && rrw == 64u && rrh == 64u;
-    if (!s_g289Owner.active || s_g289Owner.dstFbp != 0x14au ||
+    G289CopyOwner *o14a = g345OwnerFor(0x14au);
+    if (o14a == nullptr ||
         (!exactT4 && !exactCt32 && !exactCt32Tail) ||
-        !dst.valid || dst.first > s_g289Owner.firstOwnedBlock ||
-        dst.last < s_g289Owner.firstOwnedBlock ||
-        s_g289Owner.lastOwnedBlock != 0x363fu)
+        !dst.valid || dst.first > o14a->firstOwnedBlock ||
+        dst.last < o14a->firstOwnedBlock ||
+        o14a->lastOwnedBlock != 0x363fu)
         return false;
     s_g289PendingUpload.active = true;
-    s_g289PendingUpload.ownerVersion = s_g289Owner.version;
+    s_g289PendingUpload.ownerVersion = o14a->version;
     s_g289PendingUpload.dbp = dbp;
     s_g289PendingUpload.dbw = dbw;
     s_g289PendingUpload.dpsm = dpsm;
@@ -2042,10 +2332,10 @@ void g289NoteUploadComplete(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
 {
     if (!s_g289PendingUpload.active)
         return;
+    G289CopyOwner *o14a = g345OwnerFor(0x14au);
     const bool exact =
-        s_g289Owner.active &&
-        s_g289Owner.version == s_g289PendingUpload.ownerVersion &&
-        s_g289Owner.dstFbp == 0x14au &&
+        o14a != nullptr &&
+        o14a->version == s_g289PendingUpload.ownerVersion &&
         dbp == s_g289PendingUpload.dbp &&
         dbw == s_g289PendingUpload.dbw &&
         dpsm == s_g289PendingUpload.dpsm &&
@@ -2058,16 +2348,16 @@ void g289NoteUploadComplete(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
         s_g289PendingUpload.active = false;
         return;
     }
-    s_g289Owner.firstOwnedBlock =
-        std::max(s_g289Owner.firstOwnedBlock,
+    o14a->firstOwnedBlock =
+        std::max(o14a->firstOwnedBlock,
                  s_g289PendingUpload.replacedThroughBlock + 1u);
     s_g289PendingUpload.active = false;
     const bool fullyReplaced =
-        s_g289Owner.firstOwnedBlock > s_g289Owner.lastOwnedBlock;
+        o14a->firstOwnedBlock > o14a->lastOwnedBlock;
     if (fullyReplaced)
     {
-        s_g289Owner.active = false;
-        G178FbSnap &snap = g_g178FbSnap[s_g289Owner.dstFbp];
+        o14a->active = false;
+        G178FbSnap &snap = g_g178FbSnap[o14a->dstFbp];
         snap.valid = false;
         snap.genSum = 0u;
         snap.rowLo = 1 << 30;
@@ -2080,9 +2370,9 @@ void g289NoteUploadComplete(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
                      "[G289:upload-overwrite] n=%llu version=%llu "
                      "upload=%x..%x owner=%x..%x full=%u\n",
                      static_cast<unsigned long long>(n),
-                     static_cast<unsigned long long>(s_g289Owner.version),
+                     static_cast<unsigned long long>(o14a->version),
                      dbp, s_g289PendingUpload.replacedThroughBlock,
-                     s_g289Owner.firstOwnedBlock, s_g289Owner.lastOwnedBlock,
+                     o14a->firstOwnedBlock, o14a->lastOwnedBlock,
                      fullyReplaced ? 1u : 0u);
 }
 
@@ -2114,14 +2404,15 @@ void g314NoteImageComplete(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
 // the normal direct sprite may execute with no unresolved alias owner.
 static bool g289Resolve14aBeforeDirect()
 {
-    if (!s_g289Owner.active || s_g289Owner.dstFbp != 0x14au ||
-        s_g289Owner.firstOwnedBlock < 0x29a0u ||
-        s_g289Owner.firstOwnedBlock > s_g289Owner.lastOwnedBlock ||
-        s_g289Owner.lastOwnedBlock != 0x363fu ||
-        s_g289Owner.vram == nullptr || s_g289Owner.vramSize == 0u)
+    G289CopyOwner *o14a = g345OwnerFor(0x14au);
+    if (o14a == nullptr ||
+        o14a->firstOwnedBlock < 0x29a0u ||
+        o14a->firstOwnedBlock > o14a->lastOwnedBlock ||
+        o14a->lastOwnedBlock != 0x363fu ||
+        o14a->vram == nullptr || o14a->vramSize == 0u)
         return false;
 
-    G289CopyOwner owner = s_g289Owner;
+    G289CopyOwner owner = *o14a;
     static std::vector<uint32_t> s_px;
     const bool readOk =
         g178_backend_read_color(owner.dstFbp, 512, 512, 96, 96, s_px) &&
@@ -2143,8 +2434,10 @@ static bool g289Resolve14aBeforeDirect()
         }
     }
     g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 320u, 512u, 96u);
-    s_g289Owner.active = false;
+    o14a->active = false;
     s_g289PendingUpload.active = false;
+    if (g345StatOn())
+        g345NoteFamReadbackFbp(owner.dstFbp, 96u);
     G178FbSnap &snap = g_g178FbSnap[owner.dstFbp];
     snap.valid = false;
     snap.genSum = 0u;
@@ -2164,13 +2457,28 @@ static void g289MaterializeForRanges(const G144BlockRange &src,
                                      const G144BlockRange &dst,
                                      bool srcUnknown, bool dstUnknown, int cause)
 {
-    if (!s_g289Owner.active)
+    if (srcUnknown || dstUnknown)
+    {
+        if (g345AnyOwnerActive())
+            (void)g289MaterializeOwner(cause);
         return;
-    const G144BlockRange owner = g289OwnerRange();
-    if (srcUnknown || dstUnknown || !owner.valid ||
-        (src.valid && g144RangeOverlaps(owner, src)) ||
-        (dst.valid && g144RangeOverlaps(owner, dst)))
-        (void)g289MaterializeOwner(cause);
+    }
+    // G346 partial escape (contract I3): only the slots the ranges actually touch pay; the rest
+    // stay resident. Closure-off at most slot 0 is active, so behavior is unchanged.
+    for (uint32_t i = 0u; i < kG345OwnerSlots; ++i)
+    {
+        G289CopyOwner &o = s_g289Owners[i];
+        if (!o.active)
+            continue;
+        G144BlockRange range;
+        range.first = o.firstOwnedBlock;
+        range.last = o.lastOwnedBlock;
+        range.valid = o.firstOwnedBlock <= o.lastOwnedBlock;
+        if (!range.valid ||
+            (src.valid && g144RangeOverlaps(range, src)) ||
+            (dst.valid && g144RangeOverlaps(range, dst)))
+            (void)g345MaterializeSlot(o, cause);
+    }
 }
 
 static void g310NotePresentationRead(uint32_t fbp, uint32_t fbw, uint32_t psm,
@@ -2217,9 +2525,13 @@ void g289_prepare_presentation_read(uint8_t *vram,
 {
     g310NotePresentationRead(
         fbp, fbw, psm, x, y, w, h, useLocalMemoryLayout, frameBaseIsPages);
-    if (!s_g289Owner.active || w == 0u || h == 0u)
+    if (!g345AnyOwnerActive() || w == 0u || h == 0u)
         return;
-    if (vram != s_g289Owner.vram || !useLocalMemoryLayout)
+    bool vramMismatch = !useLocalMemoryLayout;
+    for (uint32_t i = 0u; i < kG345OwnerSlots && !vramMismatch; ++i)
+        if (s_g289Owners[i].active && vram != s_g289Owners[i].vram)
+            vramMismatch = true;
+    if (vramMismatch)
     {
         (void)g289MaterializeOwner(13);
         return;
@@ -2318,13 +2630,59 @@ static G289InlineAudit g289AuditInline(const GSPrimReg &prim, const GSVertex *ve
     return out;
 }
 
+// G346: the exact display-grab shape (the l2l family this slice closes), src display fbp derived
+// from sbp — never from the pend (the closure arm can admit with the pend already flushed).
+static bool g345GrabShape(uint32_t sbp, uint8_t sbw, uint8_t spsm,
+                          uint32_t ssax, uint32_t ssay,
+                          uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                          uint32_t dsax, uint32_t dsay,
+                          uint32_t rrw, uint32_t rrh, uint32_t &srcFbpOut)
+{
+    srcFbpOut = 0xffffffffu;
+    const bool shape =
+        sbw == 8u && spsm == GS_PSM_CT32 && ssax == 0u && ssay == 0u &&
+        (dbp == framePageBaseToBlock(0x13bu) ||
+         dbp == framePageBaseToBlock(0x14au)) &&
+        dbw == 8u && dpsm == GS_PSM_CT32 && dsax == 0u && dsay == 0u &&
+        rrw == 512u && rrh == 416u;
+    if (!shape)
+        return false;
+    if (sbp == framePageBaseToBlock(0u))
+        srcFbpOut = 0u;
+    else if (sbp == framePageBaseToBlock(0x68u))
+        srcFbpOut = 0x68u;
+    else
+        return false;
+    return true;
+}
+
+// G346 closure source authority: the src display FBO provably equals guest VRAM for rows 0..415
+// (valid snapshot covering the rows whose stored gen sum still matches the CURRENT sum, computed
+// with the same window the wave upload gate uses — the G277 416-row aligned window for the 0x68
+// tuple). Then the GPU FBO->FBO copy reads exactly the bytes the CPU copy would read from VRAM;
+// a pending deferred readback only means the FBO is NEWER, which is still the copy's source of
+// truth. Any doubt fails closed to the CPU copy.
+static bool g345SnapshotSourceAuthoritative(uint32_t srcFbp, uint32_t sbp)
+{
+    const auto it = g_g178FbSnap.find(srcFbp);
+    if (it == g_g178FbSnap.end())
+        return false;
+    const G178FbSnap &snap = it->second;
+    if (!snap.valid || snap.rowLo > 0 || snap.rowHi < 415)
+        return false;
+    const uint64_t genNow = (srcFbp == 0x68u && snap.rowHi <= 415)
+        ? g277GenSumAligned(sbp, 8u, 416u)
+        : g178GenSumRect(sbp, 8u, GS_PSM_CT32, 0u, 0u, 512u, 512u);
+    return genNow == snap.genSum;
+}
+
 static bool g289CanDeferLocalCopy(uint32_t sbp, uint8_t sbw, uint8_t spsm,
                                   uint32_t ssax, uint32_t ssay,
                                   uint32_t dbp, uint8_t dbw, uint8_t dpsm,
                                   uint32_t dsax, uint32_t dsay,
                                   uint32_t rrw, uint32_t rrh)
 {
-    const bool can = g289LocalCopyOn() && !s_g289Owner.active && s_g276Pend.active &&
+    bool can = g289LocalCopyOn() && !s_g289Owner.active && s_g276Pend.active &&
            s_g276Pend.fbW == 512 && s_g276Pend.fbw == 8u &&
            s_g276Pend.rowLo == 0 && s_g276Pend.rowHi == 415 &&
            framePageBaseToBlock(s_g276Pend.fbp) == sbp &&
@@ -2333,6 +2691,26 @@ static bool g289CanDeferLocalCopy(uint32_t sbp, uint8_t sbw, uint8_t spsm,
             dbp == framePageBaseToBlock(0x14au)) &&
            dbw == 8u && dpsm == GS_PSM_CT32 && dsax == 0u && dsay == 0u &&
            rrw == 512u && rrh == 416u;
+    if (!can && g345ClosureOn() && g289LocalCopyOn())
+    {
+        // G346 widened admission: (a) a secondary slot or a same-dst owner reuse covers the
+        // single-slot reject; (b) an exact pend for this src OR snapshot source authority covers
+        // the pend-inactive reject. Everything else still falls to the CPU copy (counted escape).
+        uint32_t srcFbp = 0xffffffffu;
+        if (g345GrabShape(sbp, sbw, spsm, ssax, ssay,
+                          dbp, dbw, dpsm, dsax, dsay, rrw, rrh, srcFbp))
+        {
+            const bool pendSrc = s_g276Pend.active &&
+                s_g276Pend.fbW == 512 && s_g276Pend.fbw == 8u &&
+                s_g276Pend.rowLo == 0 && s_g276Pend.rowHi == 415 &&
+                s_g276Pend.fbp == srcFbp;
+            const bool snapSrc = !pendSrc && g345SnapshotSourceAuthoritative(srcFbp, sbp);
+            const uint32_t dstFbp = dbp >> 5u;
+            const bool slotOk =
+                g345OwnerFor(dstFbp) != nullptr || g345FreeSlot() != nullptr;
+            can = (pendSrc || snapSrc) && slotOk;
+        }
+    }
     if (!can && g289LocalCopyOn() && s_g276Pend.active && g289StatOn())
     {
         static std::atomic<uint32_t> s_logs{0};
@@ -2361,11 +2739,33 @@ bool g289TryGpuLocalCopy(uint8_t *vram, uint32_t vramSize,
                          uint32_t dsax, uint32_t dsay,
                          uint32_t rrw, uint32_t rrh)
 {
+    uint32_t g345SrcFbp = 0xffffffffu;
+    const bool g345Grab = g345GrabShape(sbp, sbw, spsm, ssax, ssay,
+                                        dbp, dbw, dpsm, dsax, dsay, rrw, rrh, g345SrcFbp);
+    if (g345Grab)
+        g_g345GrabEdges.fetch_add(1u, std::memory_order_relaxed);
     if (!g289CanDeferLocalCopy(sbp, sbw, spsm, ssax, ssay,
                                dbp, dbw, dpsm, dsax, dsay, rrw, rrh))
+    {
+        if (g345Grab)
+        {
+            // Aggregate reject-cause census (the G291 rule — never trust the capped early prints).
+            g_g345GrabCpu.fetch_add(1u, std::memory_order_relaxed);
+            if (!g289LocalCopyOn())
+                g_g345RejOther.fetch_add(1u, std::memory_order_relaxed);
+            else if (g345OwnerFor(dbp >> 5u) == nullptr && g345FreeSlot() == nullptr)
+                g_g345RejOwnerBusy.fetch_add(1u, std::memory_order_relaxed);
+            else if (!s_g276Pend.active)
+                g_g345RejPendInactive.fetch_add(1u, std::memory_order_relaxed);
+            else
+                g_g345RejPendMismatch.fetch_add(1u, std::memory_order_relaxed);
+        }
         return false;
+    }
 
-    const uint32_t sourceFbp = s_g276Pend.fbp;
+    // Source fbp: derived from sbp (grab-shaped whenever admission passed); the legacy pend
+    // admission implies the same value it used before (blockOf(pend.fbp) == sbp).
+    const uint32_t sourceFbp = g345Grab ? g345SrcFbp : s_g276Pend.fbp;
     const uint32_t destFbp = dbp >> 5u;
     if (!g289_backend_copy_display_to_work(sourceFbp, destFbp))
     {
@@ -2375,27 +2775,81 @@ bool g289TryGpuLocalCopy(uint8_t *vram, uint32_t vramSize,
                      "[G289:copy-fail] n=%llu src=0x%x dst=0x%x; legacy fallback\n",
                      static_cast<unsigned long long>(n), sourceFbp, destFbp);
         g276FlushPendingDisplay(8);
+        if (g345Grab)
+            g_g345GrabCpu.fetch_add(1u, std::memory_order_relaxed);
         return false;
     }
 
-    s_g289Owner.active = true;
-    ++s_g289Owner.version;
-    s_g289Owner.srcFbp = sourceFbp;
-    s_g289Owner.dstFbp = destFbp;
+    // G346 slot select: reuse the same-dst active owner (its whole range is superseded by this
+    // identical-range copy) else take a free slot. Admission guaranteed one exists.
+    G289CopyOwner *slot = g345OwnerFor(destFbp);
+    const bool reused = slot != nullptr;
+    if (slot == nullptr)
+        slot = g345FreeSlot();
+    if (slot == nullptr)
+    {
+        // Cannot represent ownership — fail closed: publish everything, let the CPU copy run.
+        (void)g289MaterializeOwner(14);
+        g276FlushPendingDisplay(8);
+        if (g345Grab)
+            g_g345GrabCpu.fetch_add(1u, std::memory_order_relaxed);
+        return false;
+    }
     const G144BlockRange ownerRange =
         g144RangeForRect(dbp, GS_PSM_CT32, 8u, 0u, 0u, 512u, 416u);
-    s_g289Owner.firstOwnedBlock = ownerRange.first;
-    s_g289Owner.lastOwnedBlock = ownerRange.last;
-    s_g289Owner.vram = vram;
-    s_g289Owner.vramSize = vramSize;
-    s_g289PendingUpload.active = false;
+    // G346 owner-supersede (contract I1): this copy destructively overwrites every physical block
+    // in ownerRange, so any OTHER active owner's claim on those blocks is dead. A superseded
+    // PREFIX trims (the carried 0x14a owner vs a new 0x13b grab); full coverage deactivates; any
+    // other overlap shape fails closed to materialization of that slot.
+    for (uint32_t i = 0u; i < kG345OwnerSlots; ++i)
+    {
+        G289CopyOwner &o = s_g289Owners[i];
+        if (!o.active || &o == slot)
+            continue;
+        if (o.firstOwnedBlock > o.lastOwnedBlock ||
+            ownerRange.last < o.firstOwnedBlock || ownerRange.first > o.lastOwnedBlock)
+            continue; // disjoint
+        if (ownerRange.first <= o.firstOwnedBlock && ownerRange.last >= o.lastOwnedBlock)
+        {
+            o.active = false; // fully superseded
+            g_g345Supersedes.fetch_add(1u, std::memory_order_relaxed);
+        }
+        else if (ownerRange.first <= o.firstOwnedBlock && ownerRange.last < o.lastOwnedBlock)
+        {
+            o.firstOwnedBlock = ownerRange.last + 1u; // prefix superseded, suffix survives
+            g_g345Supersedes.fetch_add(1u, std::memory_order_relaxed);
+        }
+        else
+        {
+            (void)g345MaterializeSlot(o, 15); // unsupported overlap shape — fail closed
+        }
+    }
+    if (reused)
+        g_g345Supersedes.fetch_add(1u, std::memory_order_relaxed);
+    if (g345Grab)
+    {
+        g_g345GrabGpu.fetch_add(1u, std::memory_order_relaxed);
+        if (slot != &s_g289Owners[0])
+            g_g345Copies2nd.fetch_add(1u, std::memory_order_relaxed);
+        if (!(s_g276Pend.active && s_g276Pend.fbp == sourceFbp))
+            g_g345SnapAdmits.fetch_add(1u, std::memory_order_relaxed);
+    }
+    slot->active = true;
+    ++slot->version;
+    slot->srcFbp = sourceFbp;
+    slot->dstFbp = destFbp;
+    slot->firstOwnedBlock = ownerRange.first;
+    slot->lastOwnedBlock = ownerRange.last;
+    slot->vram = vram;
+    slot->vramSize = vramSize;
+    s_g289PendingUpload.active = false; // unconditional, exactly as the single-slot code did
     const uint64_t copyN =
         g_g289Copies.fetch_add(1u, std::memory_order_relaxed) + 1u;
     if (g289StatOn() && (copyN <= 16u || (copyN % 256u) == 0u))
         std::fprintf(stderr,
                      "[G289:copy] n=%llu version=%llu src=0x%x dst=0x%x rows=0..415\n",
                      static_cast<unsigned long long>(copyN),
-                     static_cast<unsigned long long>(s_g289Owner.version), sourceFbp,
+                     static_cast<unsigned long long>(slot->version), sourceFbp,
                      destFbp);
 
     if (g289VerifyOn())
@@ -2444,11 +2898,12 @@ bool g289TryGpuLocalCopy(uint8_t *vram, uint32_t vramSize,
 
 static bool g289CanConsumeOwner(uint8_t *vram, uint32_t vramSize)
 {
-    if (!s_g289Owner.active || s_g289Owner.vram != vram ||
-        s_g289Owner.vramSize != vramSize || s_g289Owner.dstFbp != 0x13bu ||
+    const G289CopyOwner *o13b = g345OwnerFor(0x13bu);
+    if (o13b == nullptr || o13b->vram != vram ||
+        o13b->vramSize != vramSize ||
         g_g144List.size() != 1u)
     {
-        if (s_g289Owner.active && g289StatOn())
+        if (g345AnyOwnerActive() && g289StatOn())
         {
             static std::atomic<uint32_t> s_earlyRejectLogs{0};
             const uint32_t n = s_earlyRejectLogs.fetch_add(1u, std::memory_order_relaxed);
@@ -2456,7 +2911,9 @@ static bool g289CanConsumeOwner(uint8_t *vram, uint32_t vramSize)
                 std::fprintf(
                     stderr,
                     "[G289:consume-early-reject] n=%u ownerVram=%p/%u vram=%p/%u entries=%zu\n",
-                    n + 1u, static_cast<void *>(s_g289Owner.vram), s_g289Owner.vramSize,
+                    n + 1u,
+                    static_cast<void *>(o13b != nullptr ? o13b->vram : nullptr),
+                    o13b != nullptr ? o13b->vramSize : 0u,
                     static_cast<void *>(vram), vramSize, g_g144List.size());
         }
         return false;
@@ -2592,9 +3049,9 @@ static bool g289OwnerAliasTuple(const G144Entry &e)
 // fail-closed materialization until exact per-entry tap footprints are available.
 static bool g289CanTryOwnerView(uint8_t *vram, uint32_t vramSize)
 {
-    if (!s_g289Owner.active || s_g289Owner.vram != vram ||
-        s_g289Owner.dstFbp != 0x13bu ||
-        s_g289Owner.vramSize != vramSize || g_g144List.empty())
+    const G289CopyOwner *o13b = g345OwnerFor(0x13bu);
+    if (o13b == nullptr || o13b->vram != vram ||
+        o13b->vramSize != vramSize || g_g144List.empty())
         return false;
     const uint32_t fbp = g_g144List[0].ctx.frame.fbp;
     if (fbp != 0u && fbp != 0x68u)
@@ -2636,7 +3093,7 @@ struct G289ConsumeGuard
     bool armed = false;
     ~G289ConsumeGuard()
     {
-        if (armed && s_g289Owner.active)
+        if (armed && g345OwnerFor(0x13bu) != nullptr)
         {
             g_g289Unexpected.fetch_add(1u, std::memory_order_relaxed);
             (void)g289MaterializeOwner(10);
@@ -2649,7 +3106,7 @@ struct G289OwnerViewGuard
     bool armed = false;
     ~G289OwnerViewGuard()
     {
-        if (armed && s_g289Owner.active)
+        if (armed && g345OwnerFor(0x13bu) != nullptr)
         {
             g_g289OwnerViewFail.fetch_add(1u, std::memory_order_relaxed);
             (void)g289MaterializeOwner(11);
@@ -2833,26 +3290,24 @@ static void g277CensusInlineEdge(const GSPrimReg &prim, const GSVertex *verts,
 // pending row union. Same-key waves render directly against that texture, without uploading stale
 // VRAM. The union is published before the first actual VRAM-Z consumer and unconditionally at the
 // drain/presentation boundary. This is deliberately NOT G242 ownership: no state crosses a frame.
-static G144BlockRange g278PendingDepthRange()
+static G144BlockRange g278PendingDepthRangeP(const G278PendDepth &p)
 {
-    if (!s_g278Pend.active || s_g278Pend.fbW <= 0 ||
-        s_g278Pend.rowHi < s_g278Pend.rowLo)
+    if (!p.active || p.fbW <= 0 || p.rowHi < p.rowLo)
         return {};
-    return g144RangeForRect(s_g278Pend.zbpPage << 5u, GS_PSM_Z24,
-                            s_g278Pend.fbw, 0u,
-                            static_cast<uint32_t>(s_g278Pend.rowLo),
-                            static_cast<uint32_t>(s_g278Pend.fbW),
-                            static_cast<uint32_t>(
-                                s_g278Pend.rowHi - s_g278Pend.rowLo + 1));
+    return g144RangeForRect(p.zbpPage << 5u, GS_PSM_Z24,
+                            p.fbw, 0u,
+                            static_cast<uint32_t>(p.rowLo),
+                            static_cast<uint32_t>(p.fbW),
+                            static_cast<uint32_t>(p.rowHi - p.rowLo + 1));
 }
 
-static G144BlockRange g278PendingDepthWholeRange()
+static G144BlockRange g278PendingDepthWholeRangeP(const G278PendDepth &p)
 {
-    if (!s_g278Pend.active || s_g278Pend.fbW <= 0)
+    if (!p.active || p.fbW <= 0)
         return {};
-    return g144RangeForRect(s_g278Pend.zbpPage << 5u, GS_PSM_Z24,
-                            s_g278Pend.fbw, 0u, 0u,
-                            static_cast<uint32_t>(s_g278Pend.fbW), 512u);
+    return g144RangeForRect(p.zbpPage << 5u, GS_PSM_Z24,
+                            p.fbw, 0u, 0u,
+                            static_cast<uint32_t>(p.fbW), 512u);
 }
 
 static bool g278StaleRowsAny(const G278PendDepth &p)
@@ -2863,38 +3318,46 @@ static bool g278StaleRowsAny(const G278PendDepth &p)
     return false;
 }
 
-static bool g278StaleRowsOverlap(int lo, int hi)
+static bool g278StaleRowsOverlapP(const G278PendDepth &p, int lo, int hi)
 {
-    if (!s_g278Pend.active || hi < lo)
+    if (!p.active || hi < lo)
         return false;
     lo = std::max(0, lo);
     hi = std::min(511, hi);
     for (int y = lo; y <= hi; ++y)
-        if ((s_g278Pend.staleRows[static_cast<size_t>(y >> 6)] >>
+        if ((p.staleRows[static_cast<size_t>(y >> 6)] >>
              static_cast<uint32_t>(y & 63)) & 1u)
             return true;
     return false;
 }
 
-static void g278MarkStaleRowsForRange(const G144BlockRange &write)
+static void g278MarkStaleRowsForRangeP(G278PendDepth &p, const G144BlockRange &write)
 {
-    if (!s_g278Pend.active || !write.valid)
+    if (!p.active || !write.valid)
         return;
-    const G144BlockRange whole = g278PendingDepthWholeRange();
+    const G144BlockRange whole = g278PendingDepthWholeRangeP(p);
     if (!whole.valid || !g144RangeOverlaps(whole, write))
         return;
     const uint32_t firstBlock = std::max(whole.first, write.first);
     const uint32_t lastBlock = std::min(whole.last, write.last);
     const uint32_t firstPage = (firstBlock - whole.first) >> 5u;
     const uint32_t lastPage = (lastBlock - whole.first) >> 5u;
-    const uint32_t pagesPerRow = std::max(1u, s_g278Pend.fbw);
+    const uint32_t pagesPerRow = std::max(1u, p.fbw);
     const int lo = static_cast<int>(firstPage / pagesPerRow) * 32;
     const int hi = std::min(
         511, static_cast<int>(lastPage / pagesPerRow) * 32 + 31);
     for (int y = lo; y <= hi; ++y)
-        s_g278Pend.staleRows[static_cast<size_t>(y >> 6)] |=
+        p.staleRows[static_cast<size_t>(y >> 6)] |=
             1ull << static_cast<uint32_t>(y & 63);
     g_g278StaleMarks.fetch_add(1u, std::memory_order_relaxed);
+}
+
+// Mark every active slot whose whole range the write touches (each slot clamps internally).
+static void g278MarkStaleRowsForRange(const G144BlockRange &write)
+{
+    for (int s = 0; s < kG278PendSlots; ++s)
+        if (s_g278PendTab[s].active)
+            g278MarkStaleRowsForRangeP(s_g278PendTab[s], write);
 }
 
 static bool g278StatOn()
@@ -2929,13 +3392,33 @@ static void g278Report(uint64_t flushes)
         (unsigned long long)g_g278FlushByCause[6].load(std::memory_order_relaxed),
         (unsigned long long)g_g278FlushByCause[7].load(std::memory_order_relaxed),
         (unsigned long long)g_g278FlushByCause[8].load(std::memory_order_relaxed));
+    if (g337ZAuthOn())
+        std::fprintf(
+            stderr,
+            "[G337:zauth] carried=%llu evict=%llu ovlFlush=%llu wideDefer=%llu "
+            "auditTex=%llu auditTarget=%llu auditXKey=%llu\n",
+            (unsigned long long)g_g337Carried.load(std::memory_order_relaxed),
+            (unsigned long long)g_g337SlotEvict.load(std::memory_order_relaxed),
+            (unsigned long long)g_g337OvlFlush.load(std::memory_order_relaxed),
+            (unsigned long long)g_g337WideDefer.load(std::memory_order_relaxed),
+            (unsigned long long)g_g337AuditTex.load(std::memory_order_relaxed),
+            (unsigned long long)g_g337AuditTarget.load(std::memory_order_relaxed),
+            (unsigned long long)g_g337AuditCrossKey.load(std::memory_order_relaxed));
+    if (g337ZAuthOn())
+        std::fprintf(
+            stderr,
+            "[G337:direct] seeded=%llu tight=%llu noSkipRb=%llu other=%llu\n",
+            (unsigned long long)g_g337DirSeeded.load(std::memory_order_relaxed),
+            (unsigned long long)g_g337DirTight.load(std::memory_order_relaxed),
+            (unsigned long long)g_g337DirNoSkipRb.load(std::memory_order_relaxed),
+            (unsigned long long)g_g337DirOther.load(std::memory_order_relaxed));
 }
 
-static bool g278FlushPendingDepth(int cause)
+static bool g278FlushPendSlot(G278PendDepth &slot, int cause)
 {
-    if (!s_g278Pend.active)
+    if (!slot.active)
         return true;
-    const G278PendDepth p = s_g278Pend;
+    const G278PendDepth p = slot;
     const int rows = p.rowHi - p.rowLo + 1;
     const int glY = 512 - 1 - p.rowHi;
     static std::vector<float> s_readback; // flush-owner thread only
@@ -2986,6 +3469,7 @@ static bool g278FlushPendingDepth(int cause)
                      static_cast<uint32_t>(p.rowLo),
                      static_cast<uint32_t>(p.fbW),
                      static_cast<uint32_t>(rows));
+    g336NotePublishZ(zbpBlock, p.fbw, p.fbW, p.rowLo, p.rowHi); // G336: capture Z publish in-boundary
     g149BumpVramGen();
     if (g274ZTimeOn())
         g_g274ZRbNs.fetch_add(
@@ -3009,9 +3493,9 @@ static bool g278FlushPendingDepth(int cause)
     if (p.display)
         g_g265ZReadbacks.fetch_add(1u, std::memory_order_relaxed);
 
-    s_g278Pend = {};
-    s_g278Pend.rowLo = 512;
-    s_g278Pend.rowHi = -1;
+    slot = {};
+    slot.rowLo = 512;
+    slot.rowHi = -1;
     const uint64_t n =
         g_g278Flushes.fetch_add(1u, std::memory_order_relaxed) + 1u;
     g_g278FlushRows.fetch_add(static_cast<uint64_t>(rows),
@@ -3022,54 +3506,91 @@ static bool g278FlushPendingDepth(int cause)
     return true;
 }
 
+// Conservative edge: publish EVERY pending owner (arm-off: only slot 0 is ever active, so this
+// is byte-identical to the historical single-slot flush).
+static bool g278FlushPendingDepth(int cause)
+{
+    bool ok = true;
+    for (int s = 0; s < kG278PendSlots; ++s)
+        if (s_g278PendTab[s].active)
+            ok = g278FlushPendSlot(s_g278PendTab[s], cause) && ok;
+    return ok;
+}
+
 static bool g278FlushPendingDepthForRanges(int cause,
                                            const G144BlockRange &src,
                                            const G144BlockRange &dst,
                                            bool srcUnknown,
                                            bool dstUnknown)
 {
-    if (!s_g278Pend.active)
-        return true;
-    if (srcUnknown || dstUnknown)
-        return g278FlushPendingDepth(cause);
-    const G144BlockRange dirty = g278PendingDepthRange();
-    const G144BlockRange whole = g278PendingDepthWholeRange();
-    if (!dirty.valid || !whole.valid)
-        return g278FlushPendingDepth(cause); // unknown owner window fails closed
-    // Reads only require unpublished rows. A write that touches dirty rows must preserve the
-    // historical GPU-Z-before-CPU-write order, so publish first. A write elsewhere in the same
-    // target can proceed without forcing a readback: remember its rows as backend-stale and force
-    // a full re-init when this owner ends (or publish before a same-key wave reaches those rows).
-    if ((src.valid && g144RangeOverlaps(dirty, src)) ||
-        (dst.valid && g144RangeOverlaps(dirty, dst)))
-        return g278FlushPendingDepth(cause);
-    if (dst.valid && g144RangeOverlaps(whole, dst))
-        g278MarkStaleRowsForRange(dst);
-    return true;
+    bool ok = true;
+    for (int s = 0; s < kG278PendSlots; ++s)
+    {
+        G278PendDepth &p = s_g278PendTab[s];
+        if (!p.active)
+            continue;
+        if (srcUnknown || dstUnknown)
+        {
+            ok = g278FlushPendSlot(p, cause) && ok;
+            continue;
+        }
+        const G144BlockRange dirty = g278PendingDepthRangeP(p);
+        const G144BlockRange whole = g278PendingDepthWholeRangeP(p);
+        if (!dirty.valid || !whole.valid)
+        {
+            ok = g278FlushPendSlot(p, cause) && ok; // unknown owner window fails closed
+            continue;
+        }
+        // Reads only require unpublished rows. A write that touches dirty rows must preserve the
+        // historical GPU-Z-before-CPU-write order, so publish first. A write elsewhere in the same
+        // target can proceed without forcing a readback: remember its rows as backend-stale and
+        // force a full re-init when this owner ends (or publish before a same-key wave reaches
+        // those rows).
+        if ((src.valid && g144RangeOverlaps(dirty, src)) ||
+            (dst.valid && g144RangeOverlaps(dirty, dst)))
+        {
+            ok = g278FlushPendSlot(p, cause) && ok;
+            continue;
+        }
+        if (dst.valid && g144RangeOverlaps(whole, dst))
+            g278MarkStaleRowsForRangeP(p, dst);
+    }
+    return ok;
 }
 
 static bool g278FlushPendingDepthForDisplayOwners(int cause)
 {
-    if (!s_g278Pend.active)
-        return true;
-    const G144BlockRange whole = g278PendingDepthWholeRange();
-    if (!whole.valid)
-        return g278FlushPendingDepth(cause);
-    for (int di = 0; di < 2; ++di)
+    bool ok = true;
+    for (int s = 0; s < kG278PendSlots; ++s)
     {
-        uint32_t fbp = 0u, fbw = 0u;
-        G144BlockRange dirty{};
-        if (g272DirtyInfo(di, fbp, fbw, dirty) &&
-            (!dirty.valid || g144RangeOverlaps(whole, dirty)))
-            return g278FlushPendingDepth(cause);
+        G278PendDepth &p = s_g278PendTab[s];
+        if (!p.active)
+            continue;
+        const G144BlockRange whole = g278PendingDepthWholeRangeP(p);
+        if (!whole.valid)
+        {
+            ok = g278FlushPendSlot(p, cause) && ok;
+            continue;
+        }
+        bool flush = false;
+        for (int di = 0; di < 2 && !flush; ++di)
+        {
+            uint32_t fbp = 0u, fbw = 0u;
+            G144BlockRange dirty{};
+            if (g272DirtyInfo(di, fbp, fbw, dirty) &&
+                (!dirty.valid || g144RangeOverlaps(whole, dirty)))
+                flush = true;
+        }
+        if (!flush && s_g276Pend.active)
+        {
+            const G144BlockRange display = g277PendingDisplayRange();
+            if (!display.valid || g144RangeOverlaps(whole, display))
+                flush = true;
+        }
+        if (flush)
+            ok = g278FlushPendSlot(p, cause) && ok;
     }
-    if (s_g276Pend.active)
-    {
-        const G144BlockRange display = g277PendingDisplayRange();
-        if (!display.valid || g144RangeOverlaps(whole, display))
-            return g278FlushPendingDepth(cause);
-    }
-    return true;
+    return ok;
 }
 
 // Exact inline edge: fully clipped primitives consume nothing. Otherwise publish only when the
@@ -3079,7 +3600,10 @@ static bool g278FlushPendingDepthForInline(const GSPrimReg &prim,
                                            const GSContext &ctx,
                                            const GSTexClutReg &texclut)
 {
-    if (!s_g278Pend.active)
+    bool anyActive = false;
+    for (int s = 0; s < kG278PendSlots && !anyActive; ++s)
+        anyActive = s_g278PendTab[s].active;
+    if (!anyActive)
         return true;
     int n = 3;
     switch (prim.type)
@@ -3112,60 +3636,81 @@ static bool g278FlushPendingDepthForInline(const GSPrimReg &prim,
     if (cx1 < cx0 || cy1 < cy0)
         return true;
 
-    const G144BlockRange dirty = g278PendingDepthRange();
-    const G144BlockRange whole = g278PendingDepthWholeRange();
-    if (!dirty.valid || !whole.valid)
-        return g278FlushPendingDepth(4);
     const uint32_t x = static_cast<uint32_t>(cx0);
     const uint32_t y = static_cast<uint32_t>(cy0);
     const uint32_t w = static_cast<uint32_t>(cx1 - cx0 + 1);
     const uint32_t h = static_cast<uint32_t>(cy1 - cy0 + 1);
-    const auto readsPending = [&](const G144BlockRange &r) {
-        return !r.valid || g144RangeOverlaps(dirty, r);
-    };
-    const auto writesOwner = [&](const G144BlockRange &r) {
-        return !r.valid || g144RangeOverlaps(whole, r);
-    };
-
+    // Build the primitive's consumed/produced ranges ONCE, then test each pending owner.
     const G144BlockRange target =
         g144RangeForRect(framePageBaseToBlock(ctx.frame.fbp), ctx.frame.psm,
                          ctx.frame.fbw, x, y, w, h);
-    bool mustPublish = writesOwner(target);
     const uint64_t test = ctx.test;
     const bool zte = ((test >> 16u) & 1u) != 0u;
     const uint32_t ztst = static_cast<uint32_t>((test >> 17u) & 3u);
     const bool zmsk = ((ctx.zbuf >> 32u) & 1u) != 0u;
     const bool depthReads = zte && ztst >= 2u;
     const bool depthWrites = !zmsk;
-    if (!mustPublish && (depthReads || depthWrites))
+    G144BlockRange zr{};
+    if (depthReads || depthWrites)
     {
         const uint32_t zbpBlock =
             (static_cast<uint32_t>(ctx.zbuf) & 0x1FFu) << 5u;
         const uint32_t zpsm =
             static_cast<uint32_t>((ctx.zbuf >> 24u) & 0xFu);
-        const G144BlockRange zr = g144RangeForRect(
-            zbpBlock, zpsm, ctx.frame.fbw, x, y, w, h);
-        mustPublish = (depthReads && readsPending(zr)) ||
-                      (depthWrites && writesOwner(zr));
+        zr = g144RangeForRect(zbpBlock, zpsm, ctx.frame.fbw, x, y, w, h);
     }
-    if (!mustPublish && prim.tme)
+    G144BlockRange tex{}, clut{};
+    bool texValidKnown = false, clutNeeded = false;
+    if (prim.tme)
     {
         const uint32_t texW = 1u << std::min<uint8_t>(ctx.tex0.tw, 15u);
         const uint32_t texH = 1u << std::min<uint8_t>(ctx.tex0.th, 15u);
-        mustPublish = readsPending(g144RangeForRect(
-            ctx.tex0.tbp0, ctx.tex0.psm, ctx.tex0.tbw,
-            0u, 0u, texW, texH));
-        if (!mustPublish && g144IsPalettedPsm(ctx.tex0.psm))
+        tex = g144RangeForRect(ctx.tex0.tbp0, ctx.tex0.psm, ctx.tex0.tbw,
+                               0u, 0u, texW, texH);
+        texValidKnown = true;
+        if (g144IsPalettedPsm(ctx.tex0.psm))
         {
             const uint32_t clutBw =
                 texclut.cbw != 0u ? static_cast<uint32_t>(texclut.cbw) : 1u;
-            mustPublish = readsPending(g144RangeForRect(
-                ctx.tex0.cbp, ctx.tex0.cpsm, clutBw,
-                static_cast<uint32_t>(texclut.cou),
-                static_cast<uint32_t>(texclut.cov), 16u, 16u));
+            clut = g144RangeForRect(ctx.tex0.cbp, ctx.tex0.cpsm, clutBw,
+                                    static_cast<uint32_t>(texclut.cou),
+                                    static_cast<uint32_t>(texclut.cov), 16u, 16u);
+            clutNeeded = true;
         }
     }
-    return !mustPublish || g278FlushPendingDepth(4);
+    bool ok = true;
+    for (int s = 0; s < kG278PendSlots; ++s)
+    {
+        G278PendDepth &p = s_g278PendTab[s];
+        if (!p.active)
+            continue;
+        const G144BlockRange dirty = g278PendingDepthRangeP(p);
+        const G144BlockRange whole = g278PendingDepthWholeRangeP(p);
+        if (!dirty.valid || !whole.valid)
+        {
+            ok = g278FlushPendSlot(p, 4) && ok;
+            continue;
+        }
+        const auto readsPending = [&](const G144BlockRange &r) {
+            return !r.valid || g144RangeOverlaps(dirty, r);
+        };
+        const auto writesOwner = [&](const G144BlockRange &r) {
+            return !r.valid || g144RangeOverlaps(whole, r);
+        };
+        bool mustPublish = writesOwner(target);
+        if (!mustPublish && (depthReads || depthWrites))
+            mustPublish = (depthReads && readsPending(zr)) ||
+                          (depthWrites && writesOwner(zr));
+        if (!mustPublish && texValidKnown)
+        {
+            mustPublish = readsPending(tex);
+            if (!mustPublish && clutNeeded)
+                mustPublish = readsPending(clut);
+        }
+        if (mustPublish)
+            ok = g278FlushPendSlot(p, 4) && ok;
+    }
+    return ok;
 }
 
 // G263: exact GL-tap footprint admission for a BILINEAR FST sprite that samples a resident RTT

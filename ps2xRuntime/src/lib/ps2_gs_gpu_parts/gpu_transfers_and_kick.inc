@@ -1466,6 +1466,40 @@ void GS::performLocalToHostToBuffer()
     uint32_t ssax = m_trxpos.ssax;
     uint32_t ssay = m_trxpos.ssay;
 
+    // G356/G359: for the Sindain-menu grab (CT32, 512-wide) dump BOTH display blocks (0x0 and 0xd00)
+    // straight from VRAM. G359: fire once per PARITY — the readback reads block 0x0 (parity A, clean)
+    // OR block 0xd00 (parity B, garbage) depending on frame timing. Dump both blocks at BOTH parities
+    // so we can see whether block 0xd00 is stale/garbage in VRAM at the parity-B (garbage) capture.
+    static const bool s_g356Blk = (std::getenv("DC2_G356_STORE") != nullptr);
+    if (s_g356Blk && (spsm == GS_PSM_CT32) && rrw >= 256u && rrh >= 256u &&
+        (sbp == 0u || sbp == 0x6800u))
+    {
+        const char parity = (sbp == 0u) ? 'A' : 'B';
+        static std::atomic<uint32_t> s_dumpedA{0}, s_dumpedB{0};
+        auto &guard = (sbp == 0u) ? s_dumpedA : s_dumpedB;
+        if (guard.fetch_add(1u, std::memory_order_relaxed) == 0u)
+        {
+            for (uint32_t blk : {0u, 0xd00u})
+            {
+                char path[64];
+                std::snprintf(path, sizeof(path), "captures/g359_p%c_blk%x.ppm", parity, blk);
+                FILE *fp = std::fopen(path, "wb");
+                if (!fp) continue;
+                std::fprintf(fp, "P6\n%u %u\n255\n", rrw, rrh);
+                for (uint32_t y = 0; y < rrh; ++y)
+                    for (uint32_t x = 0; x < rrw; ++x)
+                    {
+                        const uint32_t o = GSPSMCT32::addrPSMCT32(blk, sbw, ssax + x, ssay + y);
+                        uint8_t rgb[3] = {0,0,0};
+                        if (o + 3u < m_vramSize) { rgb[0]=m_vram[o]; rgb[1]=m_vram[o+1]; rgb[2]=m_vram[o+2]; }
+                        std::fwrite(rgb, 1, 3, fp);
+                    }
+                std::fclose(fp);
+                std::fprintf(stderr, "[G359:blk] parity=%c readsSbp=0x%x dumped %s\n", parity, sbp, path);
+            }
+        }
+    }
+
     // G242: establish GS submission order first, then publish any persistent depth aliased by the
     // source.  Keep the historical default-off path byte-for-byte unchanged.
     if (g242GuestDepthEnabled())
@@ -1567,6 +1601,36 @@ void GS::performLocalToHostToBuffer()
             }
         }
     }
+    // G358: census every local->host fill (which one feeds the Sindain grab's consume?) + dump the
+    // CT32 fill result buffer for the store-shaped transfer. Behavior-pure (read-only diag).
+    if (std::getenv("DC2_G358_BUF") != nullptr)
+    {
+        static std::atomic<uint32_t> s_call{0};
+        const uint32_t c = s_call.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        std::fprintf(stderr, "[G358:l2h] call=%u sbp=0x%x sbw=%u spsm=0x%x rrw=%u rrh=%u ssa=(%u,%u) bufBytes=%zu\n",
+                     c, sbp, sbw, spsm, rrw, rrh, ssax, ssay, m_localToHostBuffer.size());
+        if (spsm == GS_PSM_CT32 && rrw >= 256u && rrh >= 256u && c <= 8u)
+        {
+            char path[64];
+            std::snprintf(path, sizeof(path), "captures/g358_l2h_c%u.ppm", c);
+            FILE *fp = std::fopen(path, "wb");
+            if (fp)
+            {
+                std::fprintf(fp, "P6\n%u %u\n255\n", rrw, rrh);
+                const size_t n = m_localToHostBuffer.size();
+                for (uint32_t y = 0; y < rrh; ++y)
+                    for (uint32_t x = 0; x < rrw; ++x)
+                    {
+                        const size_t i = (static_cast<size_t>(y) * rrw + x) * 4u;
+                        uint8_t rgb[3] = {0,0,0};
+                        if (i + 2u < n) { rgb[0]=m_localToHostBuffer[i]; rgb[1]=m_localToHostBuffer[i+1]; rgb[2]=m_localToHostBuffer[i+2]; }
+                        std::fwrite(rgb, 1, 3, fp);
+                    }
+                std::fclose(fp);
+                std::fprintf(stderr, "[G358:l2h] dumped %s\n", path);
+            }
+        }
+    }
 }
 
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
@@ -1587,6 +1651,13 @@ uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
     if (!dst || maxBytes == 0)
         return 0;
     size_t avail = m_localToHostBuffer.size() - m_localToHostReadPos;
+    if (std::getenv("DC2_G358_BUF") != nullptr)
+    {
+        static std::atomic<uint32_t> s_c{0};
+        std::fprintf(stderr, "[G358:consume] n=%u bufSize=%zu readPos=%zu avail=%zu maxBytes=%u\n",
+                     s_c.fetch_add(1u, std::memory_order_relaxed) + 1u,
+                     m_localToHostBuffer.size(), m_localToHostReadPos, avail, maxBytes);
+    }
     if (avail == 0)
         return 0;
     size_t toCopy = (avail < maxBytes) ? avail : static_cast<size_t>(maxBytes);

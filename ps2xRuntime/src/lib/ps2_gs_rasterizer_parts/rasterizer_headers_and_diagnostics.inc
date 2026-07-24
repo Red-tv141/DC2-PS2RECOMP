@@ -53,6 +53,11 @@ bool g281_backend_prepare_t8_view(uint64_t texKey, uint32_t srcFbp, int srcFbW,
                                   const std::vector<uint32_t> &mapRgba,
                                   const std::vector<uint32_t> &clutRgba,
                                   bool verify, uint64_t &verifyBad);
+// G338: install a resident CT24-alpha view of a CT32 producer FBO under `texKey` (RGB copied
+// from srcFbp's FBO, alpha re-derived per-texel from TEXA: a=(aem&&rgb==0)?0:ta0).
+bool g338_backend_prepare_ct24_view(uint64_t texKey, uint32_t srcFbp, int srcFbW,
+                                    int texW, int texH, int ta0, int aem,
+                                    bool verify, uint64_t &verifyBad);
 
 // G309 private .cpp-to-.cpp bridge: compose the 128 physical CT32 pages of the measured
 // 0x2720/tbw=8 atlas from the five live target FBOs in one GPU pass. `pageMap` is an 8x16

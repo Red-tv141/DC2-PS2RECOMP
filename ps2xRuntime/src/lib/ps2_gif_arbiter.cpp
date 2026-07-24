@@ -42,6 +42,10 @@ static uint64_t g156ThreadCpuNs()
 static uint64_t g156ThreadCpuNs() { return 0ull; }
 #endif
 
+// G332: defined at global scope in ps2_gs_gpu_raster.cpp (lle_gpu_raster_backend.inc). Forward-
+// declared here at global scope so the anon-namespace g332ReportBoundary() resolves it externally.
+void g332_backend_snapshot(uint64_t nsOut[4], uint64_t cntOut[4]);
+
 namespace
 {
     std::atomic<uint32_t> s_debugGifArbiterSubmitCount{0};
@@ -439,6 +443,7 @@ namespace
 
 // ===== G150 MTGS (multi-threaded GS) — DEFAULT OFF (DC2_G150_MTGS=1) =====
 #include "ps2_gif_arbiter_parts/g317_path2_fence_census.inc"
+#include "ps2_gif_arbiter_parts/g341_parallel_census.inc"
 
 // Architectural perf lever (user chose "big lever", 2026-07-07): move the whole GS-drain
 // (processGIFPacket → register writes + drawPrimitive raster + processImageData) off the guest
@@ -453,6 +458,13 @@ namespace
 // (m_stateMutex-guarded, produced by this worker at the frame barrier), so it never races a partial
 // frame. Overlap is bounded to ~1 frame by the frame-barrier backpressure (no unbounded run-ahead,
 // no memory blowup, ≤1 frame added input latency — the named trade-off).
+
+// G336 (diagnosis only, default-off DC2_G336_RUNWAY=1): boundary-publication runway census defined
+// in ps2_gs_rasterizer.cpp (rasterizer_g336_runway.inc). Bracket the frame-boundary closure so the
+// census sees the publish window and the moment next-frame front-end begins. No-op unless armed.
+extern void g336_boundary_begin();
+extern void g336_boundary_end();
+
 namespace
 {
     // G151 (diagnostic, DEFAULT OFF, DC2_G151_STAT=1): measure the MTGS worker's per-frame busy
@@ -460,6 +472,18 @@ namespace
     // than inference. Accumulated in the worker loop, printed from frameDrain() (the per-frame EE hook).
     std::atomic<uint64_t> g_g151WorkerBusyNs{0};
     std::atomic<uint64_t> g_g151WorkerCpuNs{0}; // G156: worker CPU time (user+kernel) over the window
+
+    // G332 (diagnosis only, default OFF): the GS worker's TOTAL per-frame busy time across ALL three
+    // worker-loop branches — packet window, frame-boundary closure (present latch + G276/G278
+    // readbacks), and apply. g_g151WorkerBusyNs above is window-ONLY, so it under-reports the pole.
+    // Paired with the backend GL-busy-by-type census (lle_gpu_raster_backend.inc) to derive
+    // frontEnd = workerTotal - Σ backend. Printed once/frame from frameDrain(). See phase-G332-fix-log.
+    std::atomic<uint64_t> g_g332WorkerTotalNs{0};
+    bool g332WorkerCensusOn()
+    {
+        static const bool s_on = f50_12_env_flag("DC2_G332_CENSUS");
+        return s_on;
+    }
     std::atomic<uint64_t> g_g151WindowCount{0};
     std::atomic<uint64_t> g_g151PktCount{0};
 
@@ -635,6 +659,41 @@ namespace
                      static_cast<unsigned long long>(dPathPackets[kG316Path3]),
                      sampleResidualNs / sampleDenom, dSampleBoundaryNs / sampleDenom,
                      dSampleApplyNs / sampleDenom, sampleReconciledNs / sampleDenom);
+    }
+
+    // G332: per-frame print of the clean GS-worker reducible-term breakdown. Called from the
+    // isFrameBoundary worker branch (frameDrain is bypassed under the default G157 pipeline). Reads
+    // the worker TOTAL (window+boundary+apply) + backend GL-busy-by-type, deltas over 30 frames.
+    // frontEnd = total - Σ backend = GIF-parse + register-replay + CPU-raster + CT32 pack/deswizzle.
+    void g332ReportBoundary()
+    {
+        if (!g332WorkerCensusOn())
+            return;
+        static uint64_t s_frame = 0, s_lastTotal = 0;
+        static uint64_t s_lastBeNs[4] = {0}, s_lastBeCnt[4] = {0};
+        ++s_frame;
+        if ((s_frame % 30u) != 0u)
+            return;
+        const uint64_t total = g_g332WorkerTotalNs.load(std::memory_order_relaxed);
+        uint64_t beNs[4], beCnt[4];
+        g332_backend_snapshot(beNs, beCnt);
+        const double totMs = (total - s_lastTotal) / 1e6 / 30.0;
+        double beMs[4], beC[4], beSum = 0.0;
+        for (int i = 0; i < 4; ++i)
+        {
+            beMs[i] = (beNs[i] - s_lastBeNs[i]) / 1e6 / 30.0;
+            beC[i] = static_cast<double>(beCnt[i] - s_lastBeCnt[i]) / 30.0;
+            beSum += beMs[i];
+            s_lastBeNs[i] = beNs[i];
+            s_lastBeCnt[i] = beCnt[i];
+        }
+        const double frontMs = totMs > beSum ? totMs - beSum : 0.0;
+        std::fprintf(stderr,
+                     "[G332:gsw] frame=%llu window=30 totalMs/f=%.1f frontMs/f=%.1f | "
+                     "render=%.1f/%.0f readback=%.1f/%.0f copy=%.1f/%.0f other=%.1f/%.0f (backendMs/f=%.1f)\n",
+                     static_cast<unsigned long long>(s_frame), totMs, frontMs,
+                     beMs[0], beC[0], beMs[1], beC[1], beMs[2], beC[2], beMs[3], beC[3], beSum);
+        s_lastTotal = total;
     }
 
     // G157: one queue item is either a draw window (packets) or a frame-boundary marker (the
@@ -1024,6 +1083,9 @@ namespace
                     const bool g316Sample = g316On && m_g316LeafSample;
                     const auto g316T0 = g316On ? std::chrono::steady_clock::now()
                                                 : std::chrono::steady_clock::time_point{};
+                    const bool g332On = g332WorkerCensusOn();
+                    const auto g332T0 = g332On ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
                     try
                     {
                         if (item.frameBoundaryFn)
@@ -1037,6 +1099,8 @@ namespace
                     {
                         std::fprintf(stderr, "[G177:apply] unknown exception\n");
                     }
+                    if (g332On)
+                        g_g332WorkerTotalNs.fetch_add(g316ElapsedNs(g332T0), std::memory_order_relaxed);
                     if (g316On)
                     {
                         const uint64_t g316ApplyNs = g316ElapsedNs(g316T0);
@@ -1068,6 +1132,10 @@ namespace
                     const auto g184T0 = s_g184Stat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
                     const auto g316T0 = g316On ? std::chrono::steady_clock::now()
                                                 : std::chrono::steady_clock::time_point{};
+                    const bool g332On = g332WorkerCensusOn();
+                    const auto g332T0 = g332On ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+                    g336_boundary_begin(); // G336: open the publish-capture window (no-op unless armed)
                     try
                     {
                         if (item.frameBoundaryFn)
@@ -1081,6 +1149,7 @@ namespace
                     {
                         std::fprintf(stderr, "[G157:pipeline] frame-boundary unknown exception\n");
                     }
+                    g336_boundary_end(); // G336: close the window; next captures are next-frame consumers
                     if (s_g184Stat)
                     {
                         const uint64_t ns = static_cast<uint64_t>(
@@ -1097,6 +1166,8 @@ namespace
                         }
                     }
                     g_g184BoundaryCount.fetch_add(1u, std::memory_order_relaxed);
+                    if (g332On)
+                        g_g332WorkerTotalNs.fetch_add(g316ElapsedNs(g332T0), std::memory_order_relaxed);
                     if (g316On)
                     {
                         const uint64_t g316BoundaryNs = g316ElapsedNs(g316T0);
@@ -1111,6 +1182,8 @@ namespace
                         // frame's sample (if any) was fully accounted before this state changes.
                         m_g316LeafSample = ((++m_g316BoundaryN % 30u) == 0u);
                     }
+                    g332ReportBoundary();
+                    g341ReportBoundary(); // G341: VIF-content census delta print (no-op unless armed)
                     g317ReportFrame();
 
                     lk.lock();
@@ -1150,9 +1223,11 @@ namespace
 
                 const auto g151T1 = std::chrono::steady_clock::now();
                 const uint64_t g151Cpu1 = s_g151cpu ? g156ThreadCpuNs() : 0ull;
-                g_g151WorkerBusyNs.fetch_add(
-                    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(g151T1 - g151T0).count()),
-                    std::memory_order_relaxed);
+                const uint64_t g151WinNs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(g151T1 - g151T0).count());
+                g_g151WorkerBusyNs.fetch_add(g151WinNs, std::memory_order_relaxed);
+                if (g332WorkerCensusOn())
+                    g_g332WorkerTotalNs.fetch_add(g151WinNs, std::memory_order_relaxed);
                 g_g151WorkerCpuNs.fetch_add(g151Cpu1 - g151Cpu0, std::memory_order_relaxed);
                 g_g151WindowCount.fetch_add(1u, std::memory_order_relaxed);
                 g_g151PktCount.fetch_add(static_cast<uint64_t>(g151NPkt), std::memory_order_relaxed);
@@ -1218,6 +1293,7 @@ namespace
                 if (g316Record)
                     g_g316SortNs.fetch_add(g316SortNs, std::memory_order_relaxed);
             }
+            g341ScanWindow(q); // G341: behavior-pure VIF-content census (no-op unless DC2_G341_CENSUS=1)
             if (!g316Sample)
             {
                 // Default and non-sampled diagnostic frames retain the original dispatch loop.
@@ -1370,6 +1446,9 @@ uint64_t g175_frame_boundary_count()
 // so the GS worker's whole-frame occupancy can be compared to the GSimage subset and the VU1-worker
 // busy time for post-MTVU pole attribution. File-scope read of the anon-namespace counter.
 uint64_t g303_gs_worker_busy_ns() { return g_g151WorkerBusyNs.load(std::memory_order_relaxed); }
+
+// G332: GS-worker total busy across window+boundary+apply branches (census-gated accumulation).
+uint64_t g332_gs_worker_total_ns() { return g_g332WorkerTotalNs.load(std::memory_order_relaxed); }
 
 void g150_frame_barrier(std::function<void()> latch)
 {

@@ -62,6 +62,9 @@ struct G178TexUpload
 struct G178Batch
 {
     uint32_t fbp = 0;
+    // G351 surface-key FBO override (0 = key by fbp). Routes ONLY the backend FBO selection —
+    // every fbp-gated semantic (g256 exact-depth family, RTT self-reference) stays on fbp.
+    uint32_t fboKey = 0;
     int fbW = 0, fbH = 0;
     bool clearDepth = false;
     bool uploadFb = false;              // VRAM framebuffer copy is newer than the FBO

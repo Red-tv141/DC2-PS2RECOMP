@@ -60,6 +60,8 @@ bool g281_backend_prepare_t8_view(uint64_t, uint32_t, int, int, int,
                                   const std::vector<uint32_t> &,
                                   const std::vector<uint32_t> &,
                                   bool, uint64_t &bad) { bad = 0u; return false; }
+bool g338_backend_prepare_ct24_view(uint64_t, uint32_t, int, int, int, int, int,
+                                    bool, uint64_t &bad) { bad = 0u; return false; }
 void g178StartPersistentBackend() {}
 
 #endif

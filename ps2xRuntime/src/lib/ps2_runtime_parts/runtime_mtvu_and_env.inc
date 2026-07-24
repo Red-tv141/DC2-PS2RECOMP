@@ -68,6 +68,10 @@ bool (*g_f66_drive_dungeon_pad_hook)(uint32_t) = nullptr;
 extern thread_local std::vector<std::vector<uint8_t>> *g_g297KickCapture; // defined in ps2_vu1.cpp
 extern thread_local uint32_t g_g297KickTop;                              // defined in ps2_vu1.cpp
 extern bool g150_mtgs_enabled();                                          // defined in ps2_gif_arbiter.cpp
+extern std::atomic<uint64_t> g_dc2PresentTick;  // global scope (defined in dc2_game_override.cpp); this
+                                                // .inc is included before runtime_dispatch_and_memory.inc's
+                                                // own extern, and it must NOT be declared inside the anon
+                                                // namespace below (G260 anon-namespace-linkage trap).
 
 namespace {
 
@@ -96,6 +100,108 @@ struct G297KickItem
     std::atomic<bool> ready{false};
 };
 using G297KickPtr = std::shared_ptr<G297KickItem>;
+
+// ---------------------------------------------------------------------------
+// G331 kick-redundancy census (DC2_G331_KICKCENSUS=1). EE-thread only (called
+// from enqueueKick, the single MSCAL/MSCNT producer). Reads COUNTS, not timings,
+// and runs on the mostly-idle EE thread, so its self-cost does NOT perturb the
+// VU1/GS worker pole (the thing we want to shrink). Question it answers: of the
+// ~1250 kicks/frame at MAP-0, how many are REDUNDANT work?
+//   - intra-frame duplicate  = byte-identical kick already issued THIS frame
+//                              (multi-pass: same geometry to RTT + display, etc.)
+//   - inter-frame duplicate  = byte-identical to a kick in the PREVIOUS frame
+//                              (static geometry: transformed output is cacheable)
+// A kick's identity is (startPC,itop,top, FNV-1a of writeBytes). Resume (MSCNT)
+// kicks carry no writeBytes and depend on persistent VU state, so they are counted
+// separately and EXCLUDED from dup detection (they would all collide falsely).
+// The writeBytes-only identity ignores un-rewritten persistent VU RAM, so a match
+// is NECESSARY-but-not-sufficient for true redundancy => the reported dup fraction
+// is an UPPER BOUND. A low number here definitively rules redundancy out; a high
+// number is a lead to confirm. (g_dc2PresentTick extern-declared at global scope
+// in runtime_dispatch_and_memory.inc; do NOT re-declare it inside this anon namespace.)
+static inline void g331KickCensus(uint32_t startPC, uint32_t itop, uint32_t top,
+                                  const std::vector<uint8_t> &wb, bool isResume)
+{
+    static const bool s_on = (std::getenv("DC2_G331_KICKCENSUS") != nullptr);
+    if (!s_on)
+        return;
+
+    static uint64_t s_lastTick = ~0ull;
+    static std::unordered_map<uint64_t, uint32_t> s_frame;     // hash -> count, current frame
+    static std::unordered_map<uint64_t, uint32_t> s_prevFrame; // previous frame's hashes
+    // window (30-frame) accumulators
+    static uint32_t s_winFrames = 0u;
+    static uint64_t s_winKicks = 0ull, s_winResume = 0ull;
+    static uint64_t s_winDupIntra = 0ull, s_winDupInter = 0ull;
+    static uint64_t s_winWriteBytes = 0ull;
+    static std::unordered_map<uint32_t, uint64_t> s_winStartPC; // startPC -> count over window
+
+    const uint64_t tick = g_dc2PresentTick.load(std::memory_order_relaxed);
+    if (tick != s_lastTick)
+    {
+        // frame boundary: finalize the frame that just ended
+        for (const auto &kv : s_frame)
+            if (kv.second > 1u)
+                s_winDupIntra += (kv.second - 1u);
+        s_prevFrame.swap(s_frame);
+        s_frame.clear();
+        s_lastTick = tick;
+        ++s_winFrames;
+        if (s_winFrames >= 30u)
+        {
+            // top-3 startPCs by frequency
+            uint32_t t0 = 0u, t1 = 0u, t2 = 0u;
+            uint64_t c0 = 0u, c1 = 0u, c2 = 0u;
+            for (const auto &kv : s_winStartPC)
+            {
+                if (kv.second > c0) { t2 = t1; c2 = c1; t1 = t0; c1 = c0; t0 = kv.first; c0 = kv.second; }
+                else if (kv.second > c1) { t2 = t1; c2 = c1; t1 = kv.first; c1 = kv.second; }
+                else if (kv.second > c2) { t2 = kv.first; c2 = kv.second; }
+            }
+            const double w = (double)s_winFrames;
+            const uint64_t geom = s_winKicks - s_winResume;
+            std::fprintf(stderr,
+                "[G331:kicks] frames=%u kicks/f=%.0f resume/f=%.0f distinctPC=%zu "
+                "dupIntra/f=%.0f (%.1f%%) dupInter/f=%.0f (%.1f%%) avgWB=%.0f | "
+                "topPC=[0x%x:%.0f 0x%x:%.0f 0x%x:%.0f]/f\n",
+                s_winFrames, (double)s_winKicks / w, (double)s_winResume / w, s_winStartPC.size(),
+                (double)s_winDupIntra / w, geom ? 100.0 * (double)s_winDupIntra / (double)geom : 0.0,
+                (double)s_winDupInter / w, geom ? 100.0 * (double)s_winDupInter / (double)geom : 0.0,
+                s_winKicks ? (double)s_winWriteBytes / (double)s_winKicks : 0.0,
+                t0, (double)c0 / w, t1, (double)c1 / w, t2, (double)c2 / w);
+            s_winFrames = 0u;
+            s_winKicks = s_winResume = 0ull;
+            s_winDupIntra = s_winDupInter = 0ull;
+            s_winWriteBytes = 0ull;
+            s_winStartPC.clear();
+        }
+    }
+
+    ++s_winKicks;
+    s_winWriteBytes += wb.size();
+    ++s_winStartPC[startPC];
+    if (isResume)
+    {
+        ++s_winResume;
+        return; // resume kicks excluded from dup detection
+    }
+
+    // FNV-1a 64 over (startPC,itop,top,writeBytes)
+    uint64_t h = 1469598103934665603ull;
+    auto mix = [&h](const void *p, size_t n) {
+        const uint8_t *b = static_cast<const uint8_t *>(p);
+        for (size_t i = 0; i < n; ++i) { h ^= b[i]; h *= 1099511628211ull; }
+    };
+    mix(&startPC, sizeof(startPC));
+    mix(&itop, sizeof(itop));
+    mix(&top, sizeof(top));
+    if (!wb.empty())
+        mix(wb.data(), wb.size());
+
+    if (s_prevFrame.find(h) != s_prevFrame.end())
+        ++s_winDupInter;
+    ++s_frame[h];
+}
 
 class G297Mtvu
 {
@@ -154,6 +260,7 @@ public:
         item->isResume = isResume;
         m_curBatch.push_back(item);                    // EE-only accumulator (issue order)
         ++m_kicksEnq;
+        g331KickCensus(item->startPC, item->itop, item->top, item->writeBytes, item->isResume);
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             m_work.push_back(item);
@@ -183,6 +290,9 @@ public:
     uint64_t workerKicksRun() const { return m_workerKicksRun.load(std::memory_order_relaxed); }
     uint64_t gsCollectStallNs() const { return m_gsCollectStallNs.load(std::memory_order_relaxed); }
     uint64_t gsCollectStalls() const { return m_gsCollectStalls.load(std::memory_order_relaxed); }
+    // G344: TOTAL collectWindowPackets time + call count (all windows). overhead = total - stall.
+    uint64_t gsCollectTotalNs() const { return m_gsCollectTotalNs.load(std::memory_order_relaxed); }
+    uint64_t gsCollectCalls() const { return m_gsCollectCalls.load(std::memory_order_relaxed); }
 
     // EE thread, at every drain() window handoff: seal the current kick batch 1:1 with the window
     // (push even when empty, so the worker's per-window pop stays in lockstep).
@@ -219,6 +329,29 @@ public:
     // their Path1 packets (kick order) to `out` for merge before the stable path sort.
     void collectWindowPackets(std::vector<std::vector<uint8_t>> &out)
     {
+        // G344 premise-gate: time the WHOLE collect call (all windows, all exit paths) so the
+        // per-window handoff OVERHEAD = gsCollectTotal - gsCollectStall on a MATCHED all-window
+        // denominator (the G316 `merge` timer is 1-in-30 sampled and its variance is VU1-stall,
+        // not overhead). RAII covers the early-return (empty-batch / m_stop) paths too.
+        const bool g344Instr = g303InstrOn();
+        struct G344Timer
+        {
+            G297Mtvu *self;
+            bool on;
+            std::chrono::steady_clock::time_point t0;
+            ~G344Timer()
+            {
+                if (!on)
+                    return;
+                self->m_gsCollectTotalNs.fetch_add(
+                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0).count(),
+                    std::memory_order_relaxed);
+                self->m_gsCollectCalls.fetch_add(1ull, std::memory_order_relaxed);
+            }
+        } g344Timer{this, g344Instr,
+                    g344Instr ? std::chrono::steady_clock::now()
+                              : std::chrono::steady_clock::time_point{}};
         std::vector<G297KickPtr> batch;
         {
             std::lock_guard<std::mutex> lk(m_batchMtx);
@@ -426,6 +559,9 @@ private:
     // G303 GS-worker stall on VU1 (GS-worker-written in collectWindowPackets, EE-snapshot).
     std::atomic<uint64_t> m_gsCollectStallNs{0ull};
     std::atomic<uint64_t> m_gsCollectStalls{0ull};
+    // G344 premise-gate: total collectWindowPackets time + call count (overhead = total - stall).
+    std::atomic<uint64_t> m_gsCollectTotalNs{0ull};
+    std::atomic<uint64_t> m_gsCollectCalls{0ull};
 };
 
 } // namespace
@@ -460,6 +596,8 @@ uint64_t g297WorkerBusyNs() { return G297Mtvu::activeCached() ? G297Mtvu::instan
 uint64_t g297WorkerKicksRun() { return G297Mtvu::activeCached() ? G297Mtvu::instance().workerKicksRun() : 0ull; }
 uint64_t g297GsCollectStallNs() { return G297Mtvu::activeCached() ? G297Mtvu::instance().gsCollectStallNs() : 0ull; }
 uint64_t g297GsCollectStalls() { return G297Mtvu::activeCached() ? G297Mtvu::instance().gsCollectStalls() : 0ull; }
+uint64_t g297GsCollectTotalNs() { return G297Mtvu::activeCached() ? G297Mtvu::instance().gsCollectTotalNs() : 0ull; }
+uint64_t g297GsCollectCalls() { return G297Mtvu::activeCached() ? G297Mtvu::instance().gsCollectCalls() : 0ull; }
 
 
 // ============================================================================

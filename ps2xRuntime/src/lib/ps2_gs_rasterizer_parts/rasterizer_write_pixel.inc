@@ -33,6 +33,111 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
         return;
     }
 
+    // G356: watch the Sindain menu circle-centre pixel (screen ~340,200) of the display buffers.
+    // Logs every draw that writes it — prim/tex/incoming-colour/alpha — to identify the writer that
+    // degrades the circle from field to garbage after menu-open. Tightly gated (exact pixel), capped.
+    {
+        static const bool s_g356w = (std::getenv("DC2_G356_WATCH") != nullptr);
+        if (s_g356w && x == 340 && y == 200 &&
+            (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u))
+        {
+            static std::atomic<uint32_t> s_wn{0};
+            const uint32_t wn = s_wn.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (wn <= 400u)
+                std::fprintf(stderr,
+                    "[G356:watch] wn=%u fbp=0x%x fbw=%u fpsm=0x%x xyoff=(%d,%d) prim=%u tme=%u abe=%u tbp=0x%x psm=0x%x "
+                    "in_rgba=(%u,%u,%u,%u) alpha=0x%llx test=0x%llx\n",
+                    wn, ctx.frame.fbp, ctx.frame.fbw, static_cast<uint32_t>(ctx.frame.psm),
+                    ctx.xyoffset.ofx >> 4, ctx.xyoffset.ofy >> 4,
+                    gs->m_prim.type, gs->m_prim.tme, gs->m_prim.abe,
+                    ctx.tex0.tbp0, static_cast<uint32_t>(ctx.tex0.psm), r, g, b, a,
+                    static_cast<unsigned long long>(ctx.alpha),
+                    static_cast<unsigned long long>(ctx.test));
+            // Dump EACH distinct texture feeding the circle once — reveals which composite layer
+            // turns the field into blue/magenta noise. Deduped by tbp (small fixed table).
+            static std::atomic<uint32_t> s_dumpedTbp[8] = {};
+            static std::atomic<int> s_dumpCount{0};
+            bool dumpThis = false;
+            // G357: LATE dump — re-dump each circle source texture once the menu has frozen
+            // (wn>=300) via the SAME sampler decode, to see whether the frozen source is clean
+            // (=> geometry/projection bug) or garbage (=> texture upload/decode bug).
+            if (std::getenv("DC2_G357_LATETEX") != nullptr && wn >= 300u && wn <= 360u &&
+                gs->m_prim.tme && ctx.tex0.psm == GS_PSM_T8 && ctx.tex0.tw >= 6 && ctx.tex0.th >= 6)
+            {
+                static std::atomic<uint32_t> s_lateDumped[8] = {};
+                static std::atomic<int> s_lateN{0};
+                bool seen = false;
+                const int cap = s_lateN.load(std::memory_order_relaxed);
+                for (int i = 0; i < cap && i < 8; ++i)
+                    if (s_lateDumped[i].load(std::memory_order_relaxed) == ctx.tex0.tbp0) { seen = true; break; }
+                if (!seen)
+                {
+                    const int slot = s_lateN.fetch_add(1, std::memory_order_relaxed);
+                    if (slot < 8)
+                    {
+                        s_lateDumped[slot].store(ctx.tex0.tbp0, std::memory_order_relaxed);
+                        const auto &tx = ctx.tex0;
+                        const int dw = 1 << tx.tw, dh = 1 << tx.th;
+                        char path[128];
+                        std::snprintf(path, sizeof(path), "captures/g357_late_%x_cbp%x.ppm", tx.tbp0, tx.cbp);
+                        FILE *fp = std::fopen(path, "wb");
+                        if (fp)
+                        {
+                            std::fprintf(fp, "P6\n%d %d\n255\n", dw, dh);
+                            for (int yy = 0; yy < dh; ++yy)
+                                for (int xx = 0; xx < dw; ++xx)
+                                {
+                                    uint8_t ix = static_cast<uint8_t>(GSMem::ReadP8(gs->m_vram, tx.tbp0,
+                                                     tx.tbw >> 1, (uint32_t)xx, (uint32_t)yy));
+                                    uint32_t c = lookupCLUT(gs, ix, tx.cbp, tx.cpsm, tx.csm, tx.csa, tx.psm);
+                                    uint8_t rgb[3] = { (uint8_t)(c & 0xFF), (uint8_t)((c >> 8) & 0xFF), (uint8_t)((c >> 16) & 0xFF) };
+                                    std::fwrite(rgb, 1, 3, fp);
+                                }
+                            std::fclose(fp);
+                            std::fprintf(stderr, "[G357:latetex] wrote %s wn=%u\n", path, wn);
+                        }
+                    }
+                }
+            }
+            if (gs->m_prim.tme && ctx.tex0.psm == GS_PSM_T8 && ctx.tex0.tw >= 6 && ctx.tex0.th >= 6)
+            {
+                bool seen = false;
+                const int cap = s_dumpCount.load(std::memory_order_relaxed);
+                for (int i = 0; i < cap && i < 8; ++i)
+                    if (s_dumpedTbp[i].load(std::memory_order_relaxed) == ctx.tex0.tbp0) { seen = true; break; }
+                if (!seen)
+                {
+                    const int slot = s_dumpCount.fetch_add(1, std::memory_order_relaxed);
+                    if (slot < 8) { s_dumpedTbp[slot].store(ctx.tex0.tbp0, std::memory_order_relaxed); dumpThis = true; }
+                }
+            }
+            if (dumpThis)
+            {
+                const auto &tx = ctx.tex0;
+                const int dw = 1 << tx.tw, dh = 1 << tx.th;
+                char path[128];
+                std::snprintf(path, sizeof(path), "captures/g356_ct_%x_cbp%x.ppm", tx.tbp0, tx.cbp);
+                FILE *fp = std::fopen(path, "wb");
+                if (fp)
+                {
+                    std::fprintf(fp, "P6\n%d %d\n255\n", dw, dh);
+                    for (int yy = 0; yy < dh; ++yy)
+                        for (int xx = 0; xx < dw; ++xx)
+                        {
+                            uint8_t ix = static_cast<uint8_t>(GSMem::ReadP8(gs->m_vram, tx.tbp0,
+                                             tx.tbw >> 1, (uint32_t)xx, (uint32_t)yy));
+                            uint32_t c = lookupCLUT(gs, ix, tx.cbp, tx.cpsm, tx.csm, tx.csa, tx.psm);
+                            uint8_t rgb[3] = { (uint8_t)(c & 0xFF), (uint8_t)((c >> 8) & 0xFF), (uint8_t)((c >> 16) & 0xFF) };
+                            std::fwrite(rgb, 1, 3, fp);
+                        }
+                    std::fclose(fp);
+                    std::fprintf(stderr, "[G356:circtex] wrote %s dw=%d dh=%d tbw=%u cbp=0x%x csa=%u\n",
+                        path, dw, dh, tx.tbw, tx.cbp, (unsigned)tx.csa);
+                }
+            }
+        }
+    }
+
     const AlphaTestResult alphaTest = classifyAlphaTest(ctx.test, a);
     if (!alphaTest.writeFramebuffer)
     {

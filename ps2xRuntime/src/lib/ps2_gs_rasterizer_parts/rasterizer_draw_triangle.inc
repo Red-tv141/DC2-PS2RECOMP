@@ -326,6 +326,41 @@ void GSRasterizer::drawTriangle(GS *gs)
         }
     }
 
+    // G357: Sindain menu circle-preview per-draw geometry census. The circle is a live perspective
+    // 3D terrain render (fst=0) into the display buffer; count behind-camera (q<=0) vertices and log
+    // scissor to test whether near-plane vertices project to garbage screen XY (band noise) vs the
+    // HW flat-snapshot blit. Menu scope: display fbp + field textures 0x2720..0x2a80, textured.
+    {
+        static const bool s_g357g = (std::getenv("DC2_G357_GEO") != nullptr);
+        if (s_g357g && gs->m_prim.tme &&
+            (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u) &&
+            ctx.tex0.tbp0 >= 0x2720u && ctx.tex0.tbp0 <= 0x2a80u)
+        {
+            static std::atomic<uint32_t> s_g357gn{0};
+            static std::atomic<uint32_t> s_g357gBehind{0};
+            static std::atomic<uint32_t> s_g357gOff{0};
+            const uint32_t k = s_g357gn.fetch_add(1u, std::memory_order_relaxed);
+            const int b = (v0.q <= 0.0f ? 1 : 0) + (v1.q <= 0.0f ? 1 : 0) + (v2.q <= 0.0f ? 1 : 0);
+            if (b) s_g357gBehind.fetch_add(1u, std::memory_order_relaxed);
+            const int ox = ctx.xyoffset.ofx >> 4, oy = ctx.xyoffset.ofy >> 4;
+            const float sx0 = v0.x - ox, sy0 = v0.y - oy, sx1 = v1.x - ox, sy1 = v1.y - oy,
+                        sx2 = v2.x - ox, sy2 = v2.y - oy;
+            const bool anyOff = sx0 < -50 || sx0 > 560 || sx1 < -50 || sx1 > 560 || sx2 < -50 || sx2 > 560 ||
+                                sy0 < -50 || sy0 > 470 || sy1 < -50 || sy1 > 470 || sy2 < -50 || sy2 > 470;
+            if (anyOff) s_g357gOff.fetch_add(1u, std::memory_order_relaxed);
+            if (k < 8u || (k % 200u) == 0u)
+                std::fprintf(stderr,
+                    "[G357:geo] k=%u fbp=0x%x tbp=0x%x scis=[%d,%d,%d,%d] behind=%d anyOff=%d "
+                    "q=(%.4f,%.4f,%.4f) px0=(%.0f,%.0f) px1=(%.0f,%.0f) px2=(%.0f,%.0f) "
+                    "cumBehind=%u cumOff=%u\n",
+                    k, ctx.frame.fbp, ctx.tex0.tbp0,
+                    ctx.scissor.x0, ctx.scissor.x1, ctx.scissor.y0, ctx.scissor.y1,
+                    b, anyOff ? 1 : 0, v0.q, v1.q, v2.q, sx0, sy0, sx1, sy1, sx2, sy2,
+                    s_g357gBehind.load(std::memory_order_relaxed),
+                    s_g357gOff.load(std::memory_order_relaxed));
+        }
+    }
+
     // G87: streaks diagnosis. Dump the first rock triangles' SCREEN positions + texcoords
     // (FST/ST/Q + derived UV s/q,t/q) so we can tell horizontal-geometry-stretch from degenerate
     // texture coords. DC2_G87_UV=1, title scope (fbp!=0x139), rock tbps.
@@ -1098,7 +1133,16 @@ void GSRasterizer::drawTriangle(GS *gs)
     const bool zEnabled = !s_zTestDisabled && zScope && zte != 0u && gs->m_vram != nullptr;
     const bool z16 = (zpsm == 0x2u || zpsm == 0xAu || zpsm == 0xBu); // PSMZ16 / PSMZ16S
     const bool z24 = (zpsm == 0x1u); // PSMZ24
-    const bool zWrite = zEnabled && !zmsk && ztst != 0u; // ZTST=NEVER never writes
+    // G357 (default-off): Sindain menu circle-viewport diagnosis. The HW Inventory.gs blits the
+    // circle field FLAT (test=0x30003, ZTST=ALWAYS, Z=0) after a full-screen ztst=ALWAYS/zmsk=0
+    // Z-clear to 0; the runner's guest instead emits ZTST=GEQUAL (test=0x5000b) for the field
+    // composite, so under G203 universal-Z the field depth-tests + depth-writes against the display
+    // Z buffer and accumulates band noise. DC2_G357_FLAT forces those display-target textured
+    // GEQUAL draws to ALWAYS+no-write (matching HW) to PROVE the depth-accumulation mechanism.
+    static const bool s_g357flat = (std::getenv("DC2_G357_FLAT") != nullptr);
+    const bool g357FlatDraw = s_g357flat && gs->m_prim.tme && ztst == 2u &&
+                              (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u);
+    const bool zWrite = zEnabled && !zmsk && ztst != 0u && !g357FlatDraw; // ZTST=NEVER never writes
     // G219 (default-off, DC2_G219_SKYPX=1): triangle twin of the [G219:spzbp] sprite watch.
     {
         static const bool s_g219z = (std::getenv("DC2_G219_SKYPX") != nullptr);
@@ -1463,6 +1507,26 @@ void GSRasterizer::drawTriangle(GS *gs)
                 case 1:  zPass = true;  break;            // ALWAYS
                 case 2:  zPass = (zi >= zdst); break;     // GEQUAL
                 default: zPass = (zi >  zdst); break;     // GREATER
+                }
+                if (g357FlatDraw) zPass = true; // G357 proof lever: flat blit like HW
+                // G357 diagnosis: watch the circle-centre depth interaction of the menu field
+                // composite — is GEQUAL rejecting against an accumulating/stale display Z?
+                {
+                    static const bool s_g357z = (std::getenv("DC2_G357_ZTRACE") != nullptr);
+                    if (s_g357z && x == 340 && y == 200 && gs->m_prim.tme &&
+                        (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u))
+                    {
+                        static std::atomic<uint32_t> s_g357zn{0};
+                        const uint32_t n = s_g357zn.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                        if (n <= 400u)
+                            std::fprintf(stderr,
+                                "[G357:ztri] n=%u fbp=0x%x tbp=0x%x ztst=%u zbp=0x%x zbw=%u zpsm=0x%x "
+                                "zmsk=%u zi=%u zdst=%u pass=%u zwr=%u test=0x%llx\n",
+                                n, ctx.frame.fbp, ctx.tex0.tbp0, ztst, zbp, zbw, zpsm,
+                                static_cast<uint32_t>(zmsk), zi, zdst, static_cast<uint32_t>(zPass),
+                                static_cast<uint32_t>(zWrite),
+                                static_cast<unsigned long long>(ctx.test));
+                    }
                 }
             }
             // G219 (default-off, DC2_G219_SKYPX=1): MAP-4 zoom top-right black region. Trace the

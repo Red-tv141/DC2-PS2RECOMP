@@ -101,6 +101,23 @@ void GSRasterizer::drawSprite(GS *gs)
         sZi = static_cast<uint32_t>(zf);
     }
     const bool sZWrite = sZActive && !sZmsk && sZtst != 0u; // ZTST=NEVER never writes
+    // G357 diagnosis: log Z-writing sprites at the display target — does DC2's per-frame
+    // full-screen ztst=ALWAYS/zmsk=0 clear reach the menu Z buffer (zbp=0xd0) with value 0,
+    // so the circle field's GEQUAL depth test passes cleanly? (see rasterizer_draw_triangle.inc)
+    {
+        static const bool s_g357z = (std::getenv("DC2_G357_ZTRACE") != nullptr);
+        if (s_g357z && sZWrite && (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u))
+        {
+            static std::atomic<uint32_t> s_g357sn{0};
+            const uint32_t n = s_g357sn.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 200u)
+                std::fprintf(stderr,
+                    "[G357:zclr] n=%u fbp=0x%x zbp=0x%x zbw=%u ztst=%u zmsk=%u tme=%u sZi=%u "
+                    "rect=(%.0f,%.0f)-(%.0f,%.0f)\n",
+                    n, ctx.frame.fbp, sZbp, sZbw, sZtst, static_cast<uint32_t>(sZmsk),
+                    static_cast<uint32_t>(gs->m_prim.tme), sZi, v0.x, v0.y, v1.x, v1.y);
+        }
+    }
     // G219 (default-off, DC2_G219_SKYPX=1): flag any sprite whose Z BUFFER lands in the
     // 0x139-0x140 work-page range — a deferred display sprite with such a zbp would zero the
     // work page during replay (the [G219:dif] clobber signature).
@@ -839,25 +856,55 @@ void g144FlushPending()
     {
         // Normal downstream presentation and dumps read guest VRAM. This fence is the display
         // color ownership boundary: at most one readback per dirty display target per frame.
-        (void)g278FlushPendingDepth(5); // never cross presentation/frame ownership
+        // G337 (default-off): the boundary Z publish is WAR-dead on the steady route (G336 —
+        // the next frame's Z-clear overwrites the published pages in ~0.04 ms, and presentation
+        // reads color only). Under the arm the pending owners carry across the frame; every
+        // consumer edge (cause 0/3/4/6/7/8 + ranged gates) still publishes lazily, fail-closed.
+        if (!g337ZAuthOn())
+            (void)g278FlushPendingDepth(5); // never cross presentation/frame ownership
+        else
+            g_g337Carried.fetch_add(1u, std::memory_order_relaxed);
         // G289's measured 0x14a work owner is not itself a display surface. Let it cross this
         // boundary only in the exact post-upload state; copyFrameToHostRgbaUnlocked audits every
         // actual display/preferred/fallback source before reading. Raw-VRAM diagnostics retain the
         // old all-authoritative boundary.
-        const bool g289FrameCarry =
-            s_g289Owner.active && s_g289Owner.dstFbp == 0x14au &&
-            s_g289Owner.firstOwnedBlock >= 0x2b20u &&
-            s_g289Owner.firstOwnedBlock <= s_g289Owner.lastOwnedBlock &&
-            s_g289Owner.lastOwnedBlock == 0x363fu &&
-            !g289RawVramDiagOn();
-        if (g289FrameCarry)
+        // G346: the carry test is per-slot — only the measured exact post-upload 0x14a state may
+        // cross the presentation boundary; every other active slot publishes here (closure-off at
+        // most slot 0 is active, so this is the original single-owner decision).
+        bool g289AnyCarried = false;
+        for (uint32_t g289Si = 0u; g289Si < kG345OwnerSlots; ++g289Si)
+        {
+            G289CopyOwner &g289Slot = s_g289Owners[g289Si];
+            if (!g289Slot.active)
+                continue;
+            const bool g289FrameCarry =
+                g289Slot.dstFbp == 0x14au &&
+                g289Slot.firstOwnedBlock >= 0x2b20u &&
+                g289Slot.firstOwnedBlock <= g289Slot.lastOwnedBlock &&
+                g289Slot.lastOwnedBlock == 0x363fu &&
+                !g289RawVramDiagOn();
+            if (g289FrameCarry)
+                g289AnyCarried = true;
+            else
+                (void)g345MaterializeSlot(g289Slot, 5);
+        }
+        if (g289AnyCarried)
             g_g289FrameCarries.fetch_add(1u, std::memory_order_relaxed);
-        else
-            (void)g289MaterializeOwner(5);
         g272MaterializeAll(5);
         g277CensusHardEdge(5);
         g276FlushPendingDisplay(5); // G276: publish the frame's coalesced display readback here
         g242PrepareVramReadAll(g_g144LastVram);
+        if (g345StatOn())
+        {
+            static uint64_t s_g345Frames = 0; // frame-boundary owner thread only
+            if ((++s_g345Frames % 120u) == 0u)
+            {
+                g345PrintEscape();
+                g347PrintUp139();
+                g350PrintOwnCensus();
+                g351PrintCon();
+            }
+        }
     }
 }
 
@@ -1340,7 +1387,25 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
         const bool srcUnknown = (rrw != 0u && rrh != 0u && !src.valid);
         const bool dstUnknown = (rrw != 0u && rrh != 0u && !dst.valid);
         g314ObserveTransfer(src, dst, srcUnknown, dstUnknown);
+        // G343 (behavior-pure, default-off): attribute this l2l edge's materialize/publication
+        // time + resident-row demand to the copy shape. Rows estimated BEFORE any materialize
+        // clears dirty state; spans exclude the g260 graph execution (draw work, not pin cost).
+        const bool g343On = g343CensusOn();
+        uint64_t g343SrcRows = 0, g343DstRows = 0, g343FcRows = 0;
+        uint32_t g343Unknown = 0, g343HitFbp = 0;
+        uint64_t g343MatNs = 0;
+        std::chrono::steady_clock::time_point g343T0;
+        if (g343On)
+        {
+            g343EstimateRows(src, dst, srcUnknown, dstUnknown, dbp, dbw, dpsm, rrw, rrh,
+                             g343SrcRows, g343DstRows, g343FcRows, g343Unknown, g343HitFbp);
+            g343T0 = std::chrono::steady_clock::now();
+        }
         g289MaterializeForRanges(src, dst, srcUnknown, dstUnknown, 8);
+        if (g343On)
+            g343MatNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - g343T0).count());
         if (g260HasPending())
         {
             if (g260VramEventNeedsExecute(src, dst, srcUnknown, dstUnknown))
@@ -1359,6 +1424,8 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
         // dst — both must see real VRAM bytes for any GPU-resident RTT row they touch.
         g266NoteLocalCopy(sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
                           src, dst, srcUnknown, dstUnknown);
+        if (g343On)
+            g343T0 = std::chrono::steady_clock::now();
         (void)g278FlushPendingDepthForRanges(
             8, src, dst, srcUnknown, dstUnknown);
         const uint32_t g285Consumed = g285PrepareL2lConsume(
@@ -1366,6 +1433,13 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
             src, dst, srcUnknown, dstUnknown);
         g261MaterializeForRanges(src, dst, srcUnknown, dstUnknown, kG261MatLocal,
                                  g285Consumed);
+        if (g343On)
+        {
+            g343MatNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - g343T0).count());
+            g343T0 = std::chrono::steady_clock::now();
+        }
         (void)g278FlushPendingDepthForDisplayOwners(8);
         g272MaterializeForRanges(src, dst, srcUnknown, dstUnknown, 8);
         g277CensusRangeEdge(8, src, dst, srcUnknown, dstUnknown);
@@ -1374,6 +1448,15 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
         if (!g289CanDeferLocalCopy(sbp, sbw, spsm, ssax, ssay,
                                     dbp, dbw, dpsm, dsax, dsay, rrw, rrh))
             g276FlushPendingDisplayForRanges(8, src, dst, srcUnknown, dstUnknown);
+        if (g343On)
+        {
+            const uint64_t g343PubNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - g343T0).count());
+            g343NoteL2l(sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay,
+                        rrw, rrh, g343SrcRows, g343DstRows, g343FcRows,
+                        g343Unknown, g343HitFbp, g343MatNs, g343PubNs);
+        }
         return;
     }
     if (g_g144List.empty())

@@ -578,6 +578,7 @@
             }
             if (g260NrOn())
                 g260NoteAppend(e); // accumulate this entry's R/W block ranges (open batch)
+            g336NoteConsumer(e); // G336: first next-frame consumer of boundary-published state (default-off)
             g_g144List.push_back(e);
             if (g_g156Stat)
                 g_g156CaptureNs.fetch_add(
@@ -640,10 +641,10 @@
             gs->m_prim, gs->m_vtxQueue, ctx, gs->m_texclut);
         (void)g278FlushPendingDepthForDisplayOwners(4);
         const G289InlineAudit g289Inline =
-            s_g289Owner.active
+            g345AnyOwnerActive()
                 ? g289AuditInline(gs->m_prim, gs->m_vtxQueue, ctx, gs->m_texclut)
                 : G289InlineAudit{};
-        if (s_g289Owner.active && g289StatOn())
+        if (g345AnyOwnerActive() && g289StatOn())
         {
             static std::atomic<uint32_t> s_g289InlineLog{0};
             const uint32_t n = s_g289InlineLog.fetch_add(1u, std::memory_order_relaxed);

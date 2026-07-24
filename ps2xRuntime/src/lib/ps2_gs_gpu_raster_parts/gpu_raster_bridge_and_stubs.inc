@@ -126,6 +126,14 @@ bool g281_backend_prepare_t8_view(uint64_t texKey, uint32_t srcFbp, int srcFbW,
         texKey, srcFbp, srcFbW, texW, texH, mapRgba, clutRgba, verify, verifyBad);
 }
 
+bool g338_backend_prepare_ct24_view(uint64_t texKey, uint32_t srcFbp, int srcFbW,
+                                    int texW, int texH, int ta0, int aem,
+                                    bool verify, uint64_t &verifyBad)
+{
+    return G178Backend::instance().prepareCt24View(
+        texKey, srcFbp, srcFbW, texW, texH, ta0, aem, verify, verifyBad);
+}
+
 bool g309_backend_build_authoritative_composite(
     const std::vector<uint32_t> &pageMap, const std::vector<uint32_t> &basePixels,
     bool readback,

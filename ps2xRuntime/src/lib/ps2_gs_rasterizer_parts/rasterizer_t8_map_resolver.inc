@@ -994,6 +994,11 @@ static uint32_t g280TryEntry(uint32_t batchFbp, const G144Entry &e, const G178En
             }
             if (s_rects.empty())
                 continue;
+            if (t == 0u) // G351: overlay copy sourcing the wide 0x139 FBO (FBO-medium consumer)
+            {
+                g351NoteCon(kG351SiteOvl, 0, static_cast<uint64_t>(s_rects.size() / 6u) * 32u);
+                (void)g351FanSourceSafe();
+            }
             if (!g280_backend_copy_color_rects(kG261Fbp[t],
                                                kG261Fbp[static_cast<uint32_t>(dstTi)],
                                                s_rects))
@@ -1253,6 +1258,11 @@ static bool g282ExecuteFanout(const std::vector<G282Fanout> &plan)
         }
         if (s_rects.empty())
             continue;
+        // G351: FBO-medium consumer — the fan-out reads the WIDE 0x139 FBO directly. If the
+        // sprite band has been routed to the sibling, the fbp-keyed FBO is missing rows 416..447
+        // (fail-closed detector; zero on MAP-0 — fan consumers are absent there).
+        g351NoteCon(kG351SiteFan, 0, static_cast<uint64_t>(s_rects.size() / 6u) * 32u);
+        (void)g351FanSourceSafe();
         if (!g280_backend_copy_color_rects(0x139u, kG261Fbp[t], s_rects))
         {
             const uint64_t n =

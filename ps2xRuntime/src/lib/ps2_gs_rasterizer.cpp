@@ -16,7 +16,12 @@
 #include "ps2_gs_rasterizer_parts/rasterizer_command_graph.inc"
 
 
+#include "ps2_gs_rasterizer_parts/rasterizer_g336_runway.inc"
+
+
 #include "ps2_gs_rasterizer_parts/rasterizer_rtt_census_and_waves.inc"
+
+#include "ps2_gs_rasterizer_parts/g345_closure.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_gpu_alias_page_view.inc"
 
@@ -38,6 +43,12 @@
 
 #include "ps2_gs_rasterizer_parts/rasterizer_t8_map_resolver.inc"
 
+// G342 arc#6 slice-1 premise-gate: per-consumer-shape TIME census of c5 tex-alias materialize.
+// Included before vram_materialization.inc so g342NoteTexAlias is visible at the trigger site.
+#include "ps2_gs_rasterizer_parts/g342_texalias_time_census.inc"
+
+// G343: arc#4 slice-1 — per-shape TIME census of the l2l consumer-floor edge (default-off)
+#include "ps2_gs_rasterizer_parts/g343_l2l_floor_census.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_vram_materialization.inc"
 

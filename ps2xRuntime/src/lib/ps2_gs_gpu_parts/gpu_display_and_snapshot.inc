@@ -320,12 +320,39 @@ void GS::latchHostPresentationFrame()
 
     const GSPmodeState pmode = decodePmode(m_privRegs->pmode);
     const GSSmode2State smode2 = decodeSMode2(m_privRegs->smode2);
-    const bool applyFieldMode = smode2.interlaced && !smode2.frameMode;
+    // G353: interlaced FIELD output. By default weave it into a whole-frame present (no
+    // per-field bob) to remove the one-line-per-frame screen shake; DC2_G353_FIELD_BOB=1
+    // restores the legacy bob. See g353FieldBobEnabled() for the full rationale.
+    const bool interlacedField = smode2.interlaced && !smode2.frameMode;
+    const bool applyFieldMode = interlacedField && g353FieldBobEnabled();
     const bool oddField = (ps2_syscalls::GetCurrentVSyncTick() & 1ull) != 0ull;
     const GSFrameReg displayFrame1 = decodeDisplayFrame(m_privRegs->dispfb1);
     const GSFrameReg displayFrame2 = decodeDisplayFrame(m_privRegs->dispfb2);
     const GSDisplayReadOrigin displayOrigin1 = decodeDisplayReadOrigin(m_privRegs->dispfb1);
     const GSDisplayReadOrigin displayOrigin2 = decodeDisplayReadOrigin(m_privRegs->dispfb2);
+
+    // G353 evidence trace (video-mode facts + per-field DBY, to confirm the bob is the sole
+    // shake source and DBY is not alternating). Quiet unless DC2_PHASE_TRACE=1.
+    if (phaseDiagnosticsEnabled())
+    {
+        static std::atomic<uint32_t> s_g353Field{0};
+        const uint32_t n = s_g353Field.fetch_add(1, std::memory_order_relaxed) + 1u;
+        if (n <= 8u || (n % 120u) == 0u)
+        {
+            std::fprintf(stderr,
+                         "[G353:field] n=%u smode2=0x%llx int=%u ffmd=%u interlacedField=%u "
+                         "bob=%u odd=%u dbY1=%u dbY2=%u\n",
+                         n,
+                         static_cast<unsigned long long>(m_privRegs->smode2),
+                         smode2.interlaced ? 1u : 0u,
+                         smode2.frameMode ? 1u : 0u,
+                         interlacedField ? 1u : 0u,
+                         applyFieldMode ? 1u : 0u,
+                         oddField ? 1u : 0u,
+                         displayOrigin1.y,
+                         displayOrigin2.y);
+        }
+    }
 
     uint32_t width1 = 0u;
     uint32_t height1 = 0u;
@@ -336,6 +363,31 @@ void GS::latchHostPresentationFrame()
 
     const bool validCrt1 = pmode.enableCrt1 && hasDisplaySetup(m_privRegs->display1, displayFrame1);
     const bool validCrt2 = pmode.enableCrt2 && hasDisplaySetup(m_privRegs->display2, displayFrame2);
+
+    // G356: per-present timeline of BOTH display double-buffers' circle-region VRAM content
+    // (block 0x0 and block 0xd00), + which fbp is displayed. Pins exactly when block-0's field
+    // is destroyed relative to the MenuCapture grab (Sindain inventory circle diagnosis).
+    static const bool s_g356Tl = (std::getenv("DC2_G356_TL") != nullptr);
+    if (s_g356Tl && m_vram && m_vramSize)
+    {
+        auto circ = [&](uint32_t blk) -> std::pair<double,double> {
+            uint64_t sumG = 0, accG = 0; int prev = -1; uint32_t c = 0;
+            for (int x = 300; x <= 380; ++x) {
+                const uint32_t o = GSPSMCT32::addrPSMCT32(blk, 8u, (uint32_t)x, 200u);
+                uint32_t px = 0; if (o + 4u <= m_vramSize) std::memcpy(&px, m_vram + o, 4);
+                const int g = (int)((px >> 8) & 0xFFu); sumG += (uint32_t)g;
+                if (prev >= 0) accG += (uint32_t)std::abs(g - prev); prev = g; ++c;
+            }
+            return { c ? (double)sumG/c : 0.0, c>1 ? (double)accG/(c-1) : 0.0 };
+        };
+        auto b0 = circ(0x0u); auto bd = circ(0xd00u);
+        static std::atomic<uint32_t> s_tl{0};
+        const uint32_t n = s_tl.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        std::fprintf(stderr,
+            "[G356:tl] n=%u dispFbp1=0x%x dispFbp2=0x%x blk0(G=%.0f D=%.1f) blkD00(G=%.0f D=%.1f)\n",
+            n, displayFrame1.fbp, displayFrame2.fbp, b0.first, b0.second, bd.first, bd.second);
+    }
+
     uint32_t f50_12_latch_n = 0u;
     if (f50_12_trace_enabled())
     {

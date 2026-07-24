@@ -17,6 +17,26 @@ bool g324BackendArmed()
     return on;
 }
 
+// G332 (diagnosis only, default OFF): clean per-type GS-backend GL-busy census. The backend is a
+// single worker thread and (async default-off) synchronous, so backend GL busy over a frame ≈ the
+// GS worker's fut.get() backend-wait. Timing ONE choke point (the worker loop) classified by item
+// type avoids per-draw self-cost (G312/G316). Buckets: 0=render(submit) 1=readback 2=copy 3=other.
+std::atomic<uint64_t> g_g332BackendNs[4] = {};
+std::atomic<uint64_t> g_g332BackendCount[4] = {};
+bool g332BackendCensusOn()
+{
+    static const bool on = g158EnvFlag("DC2_G332_CENSUS");
+    return on;
+}
+bool g332BackendArmed()
+{
+    static const bool on = g332BackendCensusOn() || g158EnvFlag("DC2_G332_EMPTY");
+    return on;
+}
+// NOTE: this whole .inc is inside the anonymous namespace opened in persistent_t8_decoder.inc
+// (closed at the end of this file). The cross-TU accessor g332_backend_snapshot() is therefore
+// defined AFTER that close (see bottom of file) so it keeps external linkage.
+
 // G256/G258 diagnostic only: exact PS2 fragment arithmetic for the dependency-preserving G255
 // RTT path.  G258 found this backend performance-neutral after parity, so do not expose it as a
 // standalone behavior arm: require the CPU shadow oracle whenever it is requested.
@@ -77,6 +97,17 @@ bool g309Requested()
     return g309 || g310;
 }
 
+// G338: the resident CT24-alpha view program is needed when the CT24 display-composite consumer
+// of a resident CT32 FBO is being retired. G352 PROMOTION (2026-07-23): DEFAULT-ON (accept-floor
+// close of arc-total-closure); rollback DC2_G338_NO_CT24_VIEW=1 or DC2_G338_CT24_VIEW=0. Mirrors
+// the front-end g338Ct24ViewOn() gate so the program is built iff the consumer is retired.
+bool g338Ct24ViewRequested()
+{
+    static const bool on = !g158EnvFlag("DC2_G338_NO_CT24_VIEW") &&
+                           !g158EnvDisabled("DC2_G338_CT24_VIEW");
+    return on;
+}
+
 static constexpr uint32_t kG289ZeroFbpToken = 0xfffffffdu;
 static constexpr uint32_t kG289AliasCt32Token = 0xfffffffcu;
 static constexpr uint32_t kG289AliasFbp = 0xfffffffbu;
@@ -91,6 +122,28 @@ static constexpr uint32_t kG309CompositeFbp = 0xfffffff6u;
 // texture sample. Kept outside the public LLE header by cpp-to-cpp bridges below.
 static constexpr uint32_t kG310LogicalFbp = 0xfffffff5u;
 static constexpr uint32_t kG310LogicalCt24Token = 0xfffffff4u;
+// G349 (closure core, color side): the 0x139 display-strip residency-teardown root. [G349:fbolife]
+// confirmed 0x139's FBO is destroyed+recreated ~910x/run (ONLY 0x139) because m_fbos is keyed by
+// fbp ALONE while 0x139 is written at BOTH fbw=8 (512-wide display strip) and fbw=2 (128-wide narrow
+// population, G347 w2=22%). Each width flip clears the other's FBO → the snapInv 100% FBO-read-fail.
+// De-collide: route the narrow (w!=512) 0x139 population to a private sibling FBO key so the 512-wide
+// display FBO PERSISTS across frames. This is the substrate for the G350 front-end upload-skip; the
+// shadow oracle (DC2_G347_SHADOW) eq% on the now-persistent wide FBO is that skip's GO/NO-GO signal.
+// Default-off (DC2_G349_DECOL=1; DC2_G349_NO_DECOL=1 wins); a DC2_G345_CLOSURE stack member. VRAM
+// stays the coherence medium (the narrow batch still reads back to VRAM), so composition is exact by
+// construction; verified visually. Only the three (w,h)-checked FBO accessors are remapped — every
+// other consumer reads 0x139 at 512 (the wide display FBO), unaffected.
+static constexpr uint32_t kG349Narrow139 = 0xfffffff3u;
+static bool g349DecolOn()
+{
+    static const bool on = g158EnvFlag("DC2_G349_DECOL") && !g158EnvDisabled("DC2_G349_DECOL") &&
+                           !g158EnvFlag("DC2_G349_NO_DECOL");
+    return on;
+}
+static uint32_t g349FboKey(uint32_t fbp, int w)
+{
+    return (g349DecolOn() && fbp == 0x139u && w != 512) ? kG349Narrow139 : fbp;
+}
 static uint32_t g289RealSourceFbp(uint32_t fbp)
 {
     if (fbp == kG289ZeroFbpToken)
@@ -520,6 +573,52 @@ public:
         }
     }
 
+    // G338: build/update one resident CT24-alpha view texture from a resident CT32 target FBO.
+    // Same worker-queue contract as prepareT8View; alpha is re-derived from TEXA (ta0/aem).
+    bool prepareCt24View(uint64_t texKey, uint32_t srcFbp, int srcFbW,
+                         int texW, int texH, int ta0, int aem,
+                         bool verify, uint64_t &verifyBad)
+    {
+        verifyBad = 0u;
+        if (texKey == 0u || srcFbp == 0u || srcFbW <= 0 || texW <= 0 || texH <= 0 ||
+            !m_ready.load(std::memory_order_acquire))
+            return false;
+        auto promise = std::make_shared<std::promise<bool>>();
+        std::future<bool> fut = promise->get_future();
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.g338Ct24View = true;
+            item.g281TexKey = texKey;
+            item.g281SrcFbp = srcFbp;
+            item.g281SrcFbW = srcFbW;
+            item.g281TexW = texW;
+            item.g281TexH = texH;
+            item.g338Ta0 = ta0;
+            item.g338Aem = aem;
+            item.g281Verify = verify;
+            item.g281VerifyBad = &verifyBad;
+            if (g324BackendArmed())
+            {
+                item.g324Class = 1u;
+                item.g324Enqueue = std::chrono::steady_clock::now();
+            }
+            item.promise = promise;
+            m_queue.push_back(std::move(item));
+        }
+        m_cvWork.notify_one();
+        try
+        {
+            return fut.get();
+        }
+        catch (...)
+        {
+            return false;
+        }
+    }
+
     // G309: synchronously prepare five live target FBOs plus the measured 8x16 authority map.
     // The timing path samples them directly; only the verifier builds/reads a 512x512 reference.
     // Caller-owned staging remains live until this job completes.
@@ -667,6 +766,10 @@ private:
         const std::vector<uint32_t> *g281Clut = nullptr;
         bool g281Verify = false;
         uint64_t *g281VerifyBad = nullptr;
+        // G338 resident-CT32 -> CT24-alpha texture-view job (reuses the g281* common fields for
+        // texKey/srcFbp/dims/verify; distinguished by g338Ct24View).
+        bool g338Ct24View = false;
+        int g338Ta0 = 0, g338Aem = 0;
         // G309 one-pass five-source authoritative CT32 atlas composite.
         const std::vector<uint32_t> *g309PageMap = nullptr;
         const std::vector<uint32_t> *g309BasePixels = nullptr;
@@ -720,6 +823,7 @@ private:
         }
         if (!setupProgram() || (g256ExactRttOn() && !setupExactProgram()) ||
             (g281T8ViewRequested() && !setupT8ViewProgram()) ||
+            (g338Ct24ViewRequested() && !setupCt24ViewProgram()) ||
             (g309Requested() && !setupAuthoritativeCompositeProgram()) ||
             !setupBuffers() ||
             (g257ImageStoreTestOn() && !runG257ImageStoreDiagnostic()))
@@ -759,6 +863,24 @@ private:
             const auto g324WorkStart = g324Profile
                 ? std::chrono::steady_clock::now()
                 : std::chrono::steady_clock::time_point{};
+            // G332: classify this item into one backend GL-busy bucket before the work runs.
+            const bool g332Armed = g332BackendArmed();
+            uint32_t g332Cls = 0u; // 0=render(submit) 1=readback 2=copy 3=other
+            if (g332Armed)
+            {
+                if (item.g309PageMap != nullptr || item.g281Map != nullptr ||
+                    item.g338Ct24View || item.colorWrite != nullptr)
+                    g332Cls = 3u; // decode / composite / upload
+                else if (item.copyRects != nullptr)
+                    g332Cls = 2u; // GPU->GPU alias copy
+                else if (item.colorReadback != nullptr ||
+                         (item.depthReadback != nullptr && !item.renderThenReadDepth))
+                    g332Cls = 1u; // blocking glReadPixels
+                else
+                    g332Cls = 0u; // renderBatch native submission (incl. renderThenReadDepth)
+            }
+            const auto g332WorkStart = g332Armed ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
             try
             {
                 if (item.g309PageMap != nullptr)
@@ -770,6 +892,11 @@ private:
                     ok = prepareT8ViewOnWorker(
                         item.g281TexKey, item.g281SrcFbp, item.g281SrcFbW,
                         item.g281TexW, item.g281TexH, *item.g281Map, *item.g281Clut,
+                        item.g281Verify, *item.g281VerifyBad);
+                else if (item.g338Ct24View)
+                    ok = prepareCt24ViewOnWorker(
+                        item.g281TexKey, item.g281SrcFbp, item.g281SrcFbW,
+                        item.g281TexW, item.g281TexH, item.g338Ta0, item.g338Aem,
                         item.g281Verify, *item.g281VerifyBad);
                 else if (item.copyRects != nullptr)
                 {
@@ -805,6 +932,17 @@ private:
             catch (...)
             {
                 ok = false;
+            }
+            if (g332Armed)
+            {
+                const uint64_t workNs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - g332WorkStart).count());
+                if (g332BackendCensusOn())
+                {
+                    g_g332BackendNs[g332Cls].fetch_add(workNs, std::memory_order_relaxed);
+                    g_g332BackendCount[g332Cls].fetch_add(1u, std::memory_order_relaxed);
+                }
             }
             if (g324Profile)
             {
@@ -1239,6 +1377,220 @@ private:
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g281Prog, "uMap"), 1);
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g281Prog, "uClut"), 2);
         std::fprintf(stderr, "[G281:backend] PASS: resident PSMT8 view program ready\n");
+        return true;
+    }
+
+    bool setupCt24ViewProgram()
+    {
+        // G338: resident CT24-alpha view. A CT24 texture whose base/width equal a resident CT32
+        // FBO is that FBO's RGB with alpha re-derived per-texel from TEXA (a=(aem&&rgb==0)?0:ta0,
+        // exactly GSMem applyTexa). This shader copies RGB straight from the producer FBO and
+        // re-writes only alpha, producing a texture byte-identical to the legacy CT24->RGBA8
+        // decode. The consumer then does its own GL_LINEAR, so filtering matches the legacy path
+        // regardless of scale. Identity map: view texel (x,y)=GS pixel (x,y); the FBO stores GS
+        // row y at GL row (uSrcH-1-y), so flip the sampled row here so the OUTPUT texture is
+        // top-origin like any decoded texture (consumer samples it without the g261Bound flip).
+        static const char *kVS =
+            "#version 330 core\n"
+            "void main(){\n"
+            "    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+            "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+            "}\n";
+        static const char *kFS =
+            "#version 330 core\n"
+            "out vec4 o;\n"
+            "uniform sampler2D uSrc;\n"
+            "uniform int uSrcH;\n"
+            "uniform int uTa0;\n"
+            "uniform int uAem;\n"
+            "void main(){\n"
+            "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+            "    ivec2 sp = ivec2(p.x, (uSrcH - 1) - p.y);\n"
+            "    ivec4 raw = clamp(ivec4(floor(texelFetch(uSrc, sp, 0) * 255.0 + 0.5)), 0, 255);\n"
+            "    bool rgb0 = (raw.r == 0 && raw.g == 0 && raw.b == 0);\n"
+            "    int a = (uAem != 0 && rgb0) ? 0 : uTa0;\n"
+            "    o = vec4(vec3(raw.rgb) * (1.0 / 255.0), float(a) * (1.0 / 255.0));\n"
+            "}\n";
+        GLuint vs = 0, fs = 0;
+        std::string log;
+        if (!g158CompileShader(m_f, GL158_VERTEX_SHADER, kVS, vs, log))
+        {
+            std::fprintf(stderr, "[G338:backend] FAIL: VS compile: %s\n", log.c_str());
+            return false;
+        }
+        if (!g158CompileShader(m_f, GL158_FRAGMENT_SHADER, kFS, fs, log))
+        {
+            std::fprintf(stderr, "[G338:backend] FAIL: FS compile: %s\n", log.c_str());
+            m_f.glDeleteShader_(vs);
+            return false;
+        }
+        m_g338Prog = m_f.glCreateProgram_();
+        m_f.glAttachShader_(m_g338Prog, vs);
+        m_f.glAttachShader_(m_g338Prog, fs);
+        m_f.glLinkProgram_(m_g338Prog);
+        GLint linked = 0;
+        m_f.glGetProgramiv_(m_g338Prog, GL158_LINK_STATUS, &linked);
+        m_f.glDeleteShader_(vs);
+        m_f.glDeleteShader_(fs);
+        if (!linked)
+        {
+            GLint len = 0;
+            m_f.glGetProgramiv_(m_g338Prog, GL158_INFO_LOG_LENGTH, &len);
+            std::vector<char> buf(len > 0 ? static_cast<size_t>(len) : 1u);
+            m_f.glGetProgramInfoLog_(m_g338Prog, static_cast<GLsizei>(buf.size()),
+                                     nullptr, buf.data());
+            std::fprintf(stderr, "[G338:backend] FAIL: program link: %s\n", buf.data());
+            return false;
+        }
+        m_f.glUseProgram_(m_g338Prog);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g338Prog, "uSrc"), 0);
+        m_locG338SrcH = m_f.glGetUniformLocation_(m_g338Prog, "uSrcH");
+        m_locG338Ta0 = m_f.glGetUniformLocation_(m_g338Prog, "uTa0");
+        m_locG338Aem = m_f.glGetUniformLocation_(m_g338Prog, "uAem");
+        std::fprintf(stderr, "[G338:backend] PASS: resident CT24-alpha view program ready\n");
+        return true;
+    }
+
+    // G338: build/refresh the resident CT24-alpha view of a CT32 producer FBO. Runs on the backend
+    // worker thread inside the GL context (same contract as prepareT8ViewOnWorker). Returns true
+    // when m_texCache[texKey] holds the exact CT24->RGBA8 decode of srcFbp's current pixels.
+    bool prepareCt24ViewOnWorker(uint64_t texKey, uint32_t srcFbp, int srcFbW, int texW, int texH,
+                                 int ta0, int aem, bool verify, uint64_t &verifyBad)
+    {
+        static uint64_t s_failN = 0u;
+        const auto fail = [&](const char *stage) {
+            ++s_failN;
+            if (s_failN <= 8u)
+                std::fprintf(stderr,
+                             "[G338:backend-fail] n=%llu stage=%s src=%03x fbw=%d tex=%dx%d\n",
+                             static_cast<unsigned long long>(s_failN), stage, srcFbp, srcFbW,
+                             texW, texH);
+            return false;
+        };
+        verifyBad = 0u;
+        if (m_g338Prog == 0u || texKey == 0u || texW <= 0 || texH <= 0)
+            return fail("args");
+        const auto is = m_fbos.find(srcFbp);
+        if (is == m_fbos.end() || is->second.colorTex == 0u ||
+            is->second.w != srcFbW || is->second.h != 512)
+            return fail("source");
+        const FboEntry &src = is->second;
+
+        auto dropOutput = [&]() {
+            const auto it = m_texCache.find(texKey);
+            if (it != m_texCache.end())
+            {
+                if (it->second.id != 0u)
+                    glDeleteTextures(1, &it->second.id);
+                m_texBytes -= std::min(
+                    m_texBytes, static_cast<size_t>(it->second.w) * it->second.h * 4u);
+                m_texCache.erase(it);
+            }
+            std::lock_guard<std::mutex> lk(m_residentMtx);
+            m_resident.erase(texKey);
+        };
+
+        while (glGetError() != GL_NO_ERROR) {}
+        if (m_g281Fbo == 0u)
+            m_f.glGenFramebuffers_(1, &m_g281Fbo);
+        if (m_g281Fbo == 0u)
+            return fail("objects");
+
+        TexEntry &out = m_texCache[texKey];
+        if (out.id == 0u)
+        {
+            glGenTextures(1, &out.id);
+            if (out.id == 0u)
+            {
+                dropOutput();
+                return fail("output");
+            }
+        }
+        else
+            m_texBytes -= static_cast<size_t>(out.w) * out.h * 4u;
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, out.id);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, texW, texH, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        out.w = texW;
+        out.h = texH;
+        out.lastUse = m_batchCounter + 1u;
+        m_texBytes += static_cast<size_t>(texW) * texH * 4u;
+
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g281Fbo);
+        m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0,
+                                    GL_TEXTURE_2D, out.id, 0);
+        if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) != GL158_FRAMEBUFFER_COMPLETE)
+        {
+            dropOutput();
+            return fail("framebuffer");
+        }
+        glViewport(0, 0, texW, texH);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        m_f.glUseProgram_(m_g338Prog);
+        m_f.glBindVertexArray_(m_vao);
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, src.colorTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        m_f.glUniform1i_(m_locG338SrcH, src.h);
+        m_f.glUniform1i_(m_locG338Ta0, ta0 & 0xFF);
+        m_f.glUniform1i_(m_locG338Aem, aem != 0 ? 1 : 0);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        if (glGetError() != GL_NO_ERROR)
+        {
+            dropOutput();
+            return fail("draw");
+        }
+
+        if (verify)
+        {
+            std::vector<uint32_t> srcPx(static_cast<size_t>(src.w) * src.h);
+            std::vector<uint32_t> outPx(static_cast<size_t>(texW) * texH);
+            m_f.glActiveTexture_(GL158_TEXTURE0);
+            glBindTexture(GL_TEXTURE_2D, src.colorTex);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, srcPx.data());
+            glBindTexture(GL_TEXTURE_2D, out.id);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, outPx.data());
+            const uint32_t ta = static_cast<uint32_t>(ta0 & 0xFF);
+            for (int yo = 0; yo < texH; ++yo)
+                for (int x = 0; x < texW; ++x)
+                {
+                    // out row yo (top-origin) == GS row yo == src GL row (src.h-1-yo).
+                    const int sRow = src.h - 1 - yo;
+                    if (x >= src.w || sRow < 0)
+                    {
+                        ++verifyBad;
+                        continue;
+                    }
+                    const uint32_t raw = srcPx[static_cast<size_t>(sRow) * src.w + x];
+                    const bool rgb0 = (raw & 0x00FFFFFFu) == 0u;
+                    const uint32_t a = (aem != 0 && rgb0) ? 0u : ta;
+                    const uint32_t expected = (raw & 0x00FFFFFFu) | (a << 24u);
+                    if (outPx[static_cast<size_t>(yo) * texW + x] != expected)
+                        ++verifyBad;
+                }
+            static uint64_t s_verifyN = 0u;
+            ++s_verifyN;
+            if (verifyBad != 0u || s_verifyN <= 8u || (s_verifyN % 256u) == 0u)
+                std::fprintf(stderr, "[G338:vfy] n=%llu texels=%zu bad=%llu\n",
+                             static_cast<unsigned long long>(s_verifyN), outPx.size(),
+                             static_cast<unsigned long long>(verifyBad));
+        }
+        {
+            std::lock_guard<std::mutex> lk(m_residentMtx);
+            m_resident.insert(texKey);
+        }
+        m_f.glActiveTexture_(GL158_TEXTURE0);
         return true;
     }
 
@@ -1711,7 +2063,70 @@ private:
 
     FboEntry &ensureFbo(uint32_t fbp, int w, int h)
     {
-        FboEntry &e = m_fbos[fbp];
+        // G349 de-collide: the narrow (w!=512) 0x139 population gets a private sibling FBO key so it
+        // stops destroying the persistent 512-wide display FBO (default-off; identity otherwise).
+        const uint32_t fboKey = g349FboKey(fbp, w);
+        FboEntry &e = m_fbos[fboKey];
+        // G349 (behavior-pure, DC2_G349_FBOLIFE=1): the G348 Stale-When prerequisite for the
+        // closure-core build — is a family target's persistent FBO DESTROYED between flushes, or
+        // merely not-yet-bound? m_fbos is keyed by fbp ALONE, and destroyFbo()+recreate fires on any
+        // (w,h) change (the new FBO is cleared, line below). Hypothesis: 0x139 is written at both
+        // fbw=8 (512-wide display strip) and fbw=2 (128-wide narrow population, G347 census w2=22%),
+        // so the two widths MUTUALLY destroy each other's FBO every frame → the snapInv 100%
+        // FBO-read-fail. Trace confirms/refutes before any persistence is built.
+        static const bool s_g349FboLife = (std::getenv("DC2_G349_FBOLIFE") != nullptr);
+        if (s_g349FboLife &&
+            (fbp == 0x139u || fbp == 0x13bu || fbp == 0x143u ||
+             fbp == 0x146u || fbp == 0x14au || fbp == 0x155u))
+        {
+            static const uint32_t s_fam[6] = {0x139u, 0x13bu, 0x143u, 0x146u, 0x14au, 0x155u};
+            static std::atomic<uint64_t> s_ev[6][3] = {}; // [fi][0=reuse 1=recreate 2=fresh-create]
+            static std::atomic<uint32_t> s_recPrints{0};
+            static std::atomic<uint64_t> s_agg{0};
+            const bool reuse = (e.fbo != 0 && e.w == w && e.h == h);
+            const int cls = reuse ? 0 : (e.fbo != 0 ? 1 : 2);
+            int fi = 0;
+            for (; fi < 6; ++fi)
+                if (s_fam[fi] == fbp)
+                    break;
+            const uint64_t n = s_ev[fi][cls].fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (cls == 1 && s_recPrints.fetch_add(1u, std::memory_order_relaxed) < 40u)
+                std::fprintf(stderr, "[G349:fbolife] RECREATE fbp=0x%x (%dx%d)->(%dx%d) n=%llu\n",
+                             fbp, e.w, e.h, w, h, (unsigned long long)n);
+            if ((s_agg.fetch_add(1u, std::memory_order_relaxed) % 512u) == 0u)
+            {
+                char b[288];
+                int o = 0;
+                b[0] = '\0';
+                for (int i = 0; i < 6; ++i)
+                {
+                    const uint64_t ru = s_ev[i][0].load(std::memory_order_relaxed);
+                    const uint64_t rc = s_ev[i][1].load(std::memory_order_relaxed);
+                    const uint64_t cr = s_ev[i][2].load(std::memory_order_relaxed);
+                    if ((ru | rc | cr) != 0u && o < 236)
+                        o += std::snprintf(b + o, sizeof(b) - o,
+                                           " %x:re=%llu rec=%llu new=%llu", s_fam[i],
+                                           (unsigned long long)ru, (unsigned long long)rc,
+                                           (unsigned long long)cr);
+                }
+                std::fprintf(stderr, "[G349:fbolife-agg]%s\n", b);
+            }
+        }
+        // G356: display-FBO (0x0/0x68) reuse-vs-recreate census. A recreate (destroy+clear below)
+        // would wipe the persistent field the Sindain menu circle depends on.
+        {
+            static const bool s_g356Tr = (std::getenv("DC2_G356_TRACE") != nullptr);
+            if (s_g356Tr && (fbp == 0x0u || fbp == 0x68u))
+            {
+                const bool reuse = (e.fbo != 0 && e.w == w && e.h == h);
+                static std::atomic<uint32_t> s_g356F{0};
+                const uint32_t n = s_g356F.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (!reuse || n <= 8u || (n % 200u) == 0u)
+                    std::fprintf(stderr,
+                        "[G356:fbo] n=%u fbp=0x%x %s old(%dx%d fbo=%u) new(%dx%d)\n",
+                        n, fbp, reuse ? "REUSE" : "RECREATE", e.w, e.h, e.fbo, w, h);
+            }
+        }
         if (e.fbo != 0 && e.w == w && e.h == h)
             return e;
         destroyFbo(e);
@@ -1781,7 +2196,7 @@ private:
     {
         if (w <= 0 || h <= 0 || rows <= 0 || glY < 0 || glY > h || rows > h - glY)
             return false;
-        auto it = m_fbos.find(fbp);
+        auto it = m_fbos.find(g349FboKey(fbp, w)); // G349 de-collide (narrow 0x139 → sibling)
         if (it == m_fbos.end() || it->second.fbo == 0 || it->second.w != w || it->second.h != h)
             return false;
         out.resize(static_cast<size_t>(w) * rows);
@@ -1802,7 +2217,7 @@ private:
             glX > texW || w > texW - glX || glY > texH || rows > texH - glY ||
             in.size() != static_cast<size_t>(w) * rows)
             return false;
-        auto it = m_fbos.find(fbp);
+        auto it = m_fbos.find(g349FboKey(fbp, texW)); // G349 de-collide (narrow 0x139 → sibling)
         if (it == m_fbos.end() || it->second.colorTex == 0 || it->second.w != texW ||
             it->second.h != texH)
             return false;
@@ -2376,7 +2791,8 @@ private:
         else
             b.readback.resize(static_cast<size_t>(b.fbW) * b.fbH);
 
-        FboEntry &fbo = ensureFbo(b.fbp, b.fbW, b.fbH);
+        // G351: an explicit surface key (Owner-B sprite → sibling FBO) overrides the fbp key.
+        FboEntry &fbo = ensureFbo(b.fboKey != 0u ? b.fboKey : b.fbp, b.fbW, b.fbH);
         if (fbo.fbo == 0)
             return false;
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, fbo.fbo);
@@ -2787,6 +3203,8 @@ private:
     GLFns m_f;
     G178GLExt m_e;
     GLuint m_prog = 0, m_progExact = 0, m_g281Prog = 0, m_g309Prog = 0;
+    GLuint m_g338Prog = 0;
+    GLint m_locG338SrcH = -1, m_locG338Ta0 = -1, m_locG338Aem = -1;
     GLuint m_vao = 0, m_vbo = 0;
     GLuint m_g281MapTex = 0, m_g281ClutTex = 0, m_g281Fbo = 0;
     GLuint m_g309MapTex = 0, m_g309BaseTex = 0;
@@ -2838,3 +3256,14 @@ private:
     uint64_t m_g324WorkNs[3]{};
 };
 } // namespace
+
+// G332: global-scope accessor (external linkage) so ps2_gif_arbiter.cpp's frameDrain print can read
+// the per-type backend GL-busy accumulators. Anon-namespace names above remain file-visible here.
+void g332_backend_snapshot(uint64_t nsOut[4], uint64_t cntOut[4])
+{
+    for (int i = 0; i < 4; ++i)
+    {
+        nsOut[i] = g_g332BackendNs[i].load(std::memory_order_relaxed);
+        cntOut[i] = g_g332BackendCount[i].load(std::memory_order_relaxed);
+    }
+}
