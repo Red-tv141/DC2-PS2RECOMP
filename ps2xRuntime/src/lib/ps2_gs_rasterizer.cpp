@@ -69,4 +69,5 @@
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_draw_line.inc"
+// G360: item-grid gray-panel decode probe added in rasterizer_write_pixel.inc + draw_sprite.inc (force recompile v2).
 

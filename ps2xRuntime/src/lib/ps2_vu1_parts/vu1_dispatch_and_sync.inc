@@ -2581,6 +2581,62 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 g136DumpXgkick(vuData + addr, totalBytes);
                 f50_12_vu_scan_xgkick_packet(addr, totalBytes, vuData + addr);
                 g67_vu_scan_xgkick_packet(addr, totalBytes, vuData + addr, m_state.pc, s_g65CurStartPC, m_state.itop);
+                // [G360] localize the item-slot UV loss: on the 0x2b20 menu XGKICK, dump the VU1
+                // program startPC + output UV A+D qwords (expect 0) + the VU input region at ITOP.
+                {
+                    static const bool s_g360k = (std::getenv("DC2_G360_GRAYBG") != nullptr);
+                    if (s_g360k)
+                    {
+                        const uint8_t *pk = vuData + addr;
+                        // Fire on any A+D UV register write whose DATA is zero (the broken menu
+                        // cell-bg pattern); TEX0 may live in a separate adjacent PATH1 packet.
+                        bool is2b20 = false; uint32_t tex2b20 = 0u;
+                        for (uint32_t o = 0u; o + 16u <= totalBytes; o += 16u)
+                        {
+                            if (pk[o + 8u] == 0x06u || pk[o + 8u] == 0x07u)
+                            {
+                                uint32_t tv; std::memcpy(&tv, pk + o, 4);
+                                if ((tv & 0x3FFFu) == 0x2b20u) tex2b20 = 1u;
+                            }
+                            if (pk[o + 8u] == 0x03u)
+                            {
+                                uint64_t d; std::memcpy(&d, pk + o, 8);
+                                if ((d & 0xFFFFFFFFull) == 0ull) { is2b20 = true; }
+                            }
+                        }
+                        static std::atomic<uint32_t> s_g360reach{0};
+                        if (s_g360reach.fetch_add(1u, std::memory_order_relaxed) < 3u)
+                            std::fprintf(stderr, "[G360:reach] xgkick startPC=0x%x bytes=%u zeroUV=%u tex2b20=%u\n",
+                                         s_g65CurStartPC, totalBytes, is2b20 ? 1u : 0u, tex2b20);
+                        if (is2b20)
+                        {
+                            static std::atomic<uint32_t> s_g360kN{0};
+                            const uint32_t kn = s_g360kN.fetch_add(1u, std::memory_order_relaxed);
+                            if (kn < 4u)
+                            {
+                                std::fprintf(stderr, "[G360:kick] n=%u startPC=0x%x xgkPC=0x%x itop=0x%x addr=0x%x bytes=%u\n",
+                                             kn, s_g65CurStartPC, m_state.pc, m_state.itop, addr, totalBytes);
+                                int uvn = 0;
+                                for (uint32_t o = 0u; o + 16u <= totalBytes && uvn < 6; o += 16u)
+                                    if (pk[o + 8u] == 0x03u)
+                                    {
+                                        uint64_t d; std::memcpy(&d, pk + o, 8);
+                                        std::fprintf(stderr, "   OUT UV[%d] off=0x%x data=0x%016llx\n", uvn, o, (unsigned long long)d); ++uvn;
+                                    }
+                                const uint32_t ib = m_state.itop * 16u;
+                                for (uint32_t q = 0u; q < 8u; ++q)
+                                {
+                                    const uint32_t a = ib + q * 16u;
+                                    if (a + 16u <= dataSize)
+                                    {
+                                        uint64_t lo, hi; std::memcpy(&lo, vuData + a, 8); std::memcpy(&hi, vuData + a + 8, 8);
+                                        std::fprintf(stderr, "   IN[itop+%u @0x%x] 0x%016llx 0x%016llx\n", q, a, (unsigned long long)lo, (unsigned long long)hi);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 vu1_dump_xgkick(addr, totalBytes, vuData + addr);
                 g96Submit(vuData + addr, totalBytes);
             }

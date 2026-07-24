@@ -1105,7 +1105,21 @@ private:
         // 5 = store raw source alpha (G255 RTT second pass), 6 = G265 GEQUAL alpha test,
         // 7..8 = G265 AREF code (0=1, 1=64, 2=127), 9 = G286 exact opaque sampler/combine,
         // 10 = G289 CT24 direct-owner source (force TEXA TA0=128),
-        // 11 = G309 direct authoritative-page source selection.
+        // 11 = G309 direct authoritative-page source selection,
+        // 12 = G362 guarded fixed-point POINT fetch (see below).
+        //
+        // G362: `texture()` with GL_NEAREST decides the texel from floor() of an interpolated
+        // float. The front-end shifts FST sprite UVs by -0.5 texel-per-pixel so a fragment's
+        // center maps to the CPU sampler's texel coordinate exactly — which puts every sample
+        // of an axis-aligned 2D sprite EXACTLY on a texel boundary. Whether floor() then returns
+        // the intended texel or the one before it is decided by the last ULP of the raster
+        // interpolation, so a whole row/column of a menu sprite could sample the neighbouring
+        // atlas patch (Items-menu grey slot panel: brown separator rows bleeding in at the cell
+        // seams; per-icon black notch from the atlas row above the icon tile). The CPU path
+        // computes the same coordinate in exact 12.4 fixed point and truncates, so it never
+        // mis-picks. Bit 12 routes point-sampled draws through sampleExact()'s integer branch,
+        // which reconstructs the 12.4 coordinate with the G258 +0.5001 rounding guard and is
+        // therefore decided by the intended mapping instead of by float error.
         // PS2 color/alpha scale: 0x80 == 1.0, so MODULATE is (t*c)>>7 -> t*c*255/128 in [0,1]
         // space (1.9921875), clamped — identical to combineTexture(). The written alpha is the
         // BLEND FACTOR encoding (As/128 clamped to 1): glBlendFunc consumes it as SRC_ALPHA. The
@@ -1232,7 +1246,11 @@ private:
             "    if (alphaTest) alphaByte = int(floor(vColor.a * 255.0 + 0.5));\n"
             "    if ((uMode & 1) != 0) {\n"
             "        vec2 uv = vSTQ.xy / max(vSTQ.z, 1e-8);\n"
-            "        vec4 t = ((uMode & 2048) != 0) ? g309Linear(uv) : texture(uTex, uv);\n"
+            "        vec4 t;\n"
+            "        if ((uMode & 2048) != 0) t = g309Linear(uv);\n"
+            "        else if ((uMode & 4096) != 0)\n"
+            "            t = vec4(sampleExact(uv * vec2(textureSize(uTex, 0)))) * (1.0 / 255.0);\n"
+            "        else t = texture(uTex, uv);\n"
             "        if ((uMode & 1024) != 0) t.a = 128.0 / 255.0;\n"
             "        int tfx = (uMode >> 1) & 3;\n"
             "        bool tcc = (uMode & 8) != 0;\n"
@@ -3006,6 +3024,12 @@ private:
             }
             int mode = 0;
             const bool g286Exact = b.fbp == 0x13bu;
+            // G362: point-sampled draws on the legacy shader path take the guarded fixed-point
+            // fetch (uMode bit 12) instead of GL_NEAREST's float floor(). Default-ON; roll back
+            // with DC2_G362_NO_UVGUARD=1. Bilinear draws keep texture()'s filtered path, and the
+            // G256/G286 exact programs already reconstruct the coordinate themselves.
+            static const bool s_g362NoGuard = g158EnvFlag("DC2_G362_NO_UVGUARD");
+            const bool g362PointGuard = !s_g362NoGuard && !g256Exact && !g286Exact && !d.bilinear;
             // Bit 4 asks the fragment shader to clamp interpolated GS Z to PSMZ24 before
             // normalization, matching the CPU path's post-interpolation uint24 clamp.
             if ((d.depthFunc & 0x10u) != 0u)
@@ -3055,6 +3079,9 @@ private:
                 mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
                 if (g289SourceIsCt24(d.srcFbp))
                     mode |= 1024;
+                // G362: the G309 composite branch (bit 11) does its own page-mapped fetch.
+                if (g362PointGuard && (mode & 2048) == 0)
+                    mode |= 4096;
             }
             if (g286Exact)
             {
@@ -3093,6 +3120,21 @@ private:
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
                                 d.wrapV == 0 ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE));
                 mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
+                if (g362PointGuard)
+                    mode |= 4096;
+            }
+            if ((mode & 4096) != 0)
+            {
+                // sampleExact()'s point branch wraps the texel index itself, so the wrap mode has
+                // to travel as a uniform (the GL sampler params above only bind filtered fetches).
+                m_f.glUniform1i_(m_locLinear, 0);
+                m_f.glUniform1i_(m_locWrapU, static_cast<GLint>(d.wrapU));
+                m_f.glUniform1i_(m_locWrapV, static_cast<GLint>(d.wrapV));
+                m_g362GuardDraws += 1u;
+            }
+            else if ((mode & 1) != 0)
+            {
+                m_g362PlainDraws += 1u;
             }
             if (g255RttAlpha && d.blend != 0u)
             {
@@ -3197,6 +3239,23 @@ private:
         if (guestDepth)
             m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
                                            GL178_RENDERBUFFER, fbo.depthRb);
+        // G362 census (default OFF, DC2_G362_CENSUS=1): how much of the textured legacy path is
+        // actually served by the guarded fetch. Periodic aggregate, not an early-capped print.
+        {
+            static const bool s_g362Census = g158EnvFlag("DC2_G362_CENSUS");
+            if (s_g362Census)
+            {
+                static uint64_t s_next = 0;
+                const uint64_t total = m_g362GuardDraws + m_g362PlainDraws;
+                if (total >= s_next)
+                {
+                    s_next = total + 20000u;
+                    std::fprintf(stderr, "[G362:pt] guarded=%llu plain=%llu\n",
+                                 static_cast<unsigned long long>(m_g362GuardDraws),
+                                 static_cast<unsigned long long>(m_g362PlainDraws));
+                }
+            }
+        }
         return true;
     }
 
@@ -3219,6 +3278,10 @@ private:
     uint64_t m_batchCounter = 0;
     uint64_t m_g257RealBatches = 0;
     uint64_t m_g258TraceBatches = 0;
+    // G362 census: textured legacy-path draws taking the guarded fixed-point point fetch vs the
+    // float floor()/texture() path. Reported by [G362:pt] under DC2_G362_CENSUS=1.
+    uint64_t m_g362GuardDraws = 0;
+    uint64_t m_g362PlainDraws = 0;
     std::vector<uint32_t> m_g257ImageAfter;
     size_t m_g257Changed = 0, m_g257Covered = 0;
     GLenum m_g257PreError = GL_NO_ERROR, m_g257PostError = GL_NO_ERROR;

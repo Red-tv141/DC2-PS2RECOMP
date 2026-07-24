@@ -346,6 +346,28 @@ void GSRasterizer::drawSprite(GS *gs)
             }
         }
 
+        // [G360] per-sprite vertex-UV probe for the item-grid gray panel (tbp=0x2b20). The
+        // per-pixel probe in sampleTexture showed every gray-cell pixel samples texel (0,0);
+        // this prints the INCOMING vertex UV/STQ so we can tell whether the guest emitted a
+        // degenerate UV (upstream) or the GS derived sampleU=0 from a valid UV (GS bug).
+        {
+            static const bool s_g360s = (std::getenv("DC2_G360_GRAYBG") != nullptr);
+            if (s_g360s && tex.tbp0 == 0x2b20u)
+            {
+                static std::atomic<uint32_t> s_g360sN{0};
+                const uint32_t gsn = s_g360sN.fetch_add(1u, std::memory_order_relaxed);
+                if (gsn < 24u)
+                    std::fprintf(stderr,
+                        "[G360:spr] n=%u fst=%u scr=(%d,%d)-(%d,%d) uv0=(%d,%d) uv1=(%d,%d) "
+                        "st0=(%.3f,%.3f,q%.3f) st1=(%.3f,%.3f,q%.3f) tbw=%u cbp=0x%x tw=%d th=%d\n",
+                        gsn, static_cast<uint32_t>(gs->m_prim.fst), x0, y0, x1, y1,
+                        static_cast<int>(v0.u), static_cast<int>(v0.v),
+                        static_cast<int>(v1.u), static_cast<int>(v1.v),
+                        v0.s, v0.t, v0.q, v1.s, v1.t, v1.q,
+                        static_cast<uint32_t>(tex.tbw), tex.cbp, texW, texH);
+            }
+        }
+
         // G8: env-gated one-shot trace of the 2D sprite sampling parameters
         // (filter mode, UV span vs screen span) to characterise font/HUD blur+dots.
         {

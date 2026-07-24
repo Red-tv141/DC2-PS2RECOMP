@@ -1056,6 +1056,26 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
                 idx = gs->m_vram[off];
             }
             uint32_t clutColor = lookupCLUT(gs, idx, tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
+            // [G360] item-grid gray-panel decode probe (default OFF, DC2_G360_GRAYBG=1). The item
+            // slot backgrounds are CT32-aliased PSMT8 at tbp=0x2b20/cbp=0x3fb4 and VANISH (the
+            // blend is Cs*As+Cd*(1-As) with As=texture-alpha, so alpha~0 => brown shows through)
+            // while the directly-T8-uploaded icons render. Log idx + decoded RGBA to pin whether
+            // the index read (upload/addr) or the CLUT alpha is wrong.
+            {
+                static const bool s_g360 = (std::getenv("DC2_G360_GRAYBG") != nullptr);
+                if (s_g360 && tex.tbp0 == 0x2b20u)
+                {
+                    static std::atomic<int> s_g360n{0};
+                    const int gn = s_g360n.fetch_add(1, std::memory_order_relaxed);
+                    if (gn < 96)
+                        std::fprintf(stderr,
+                            "[G360:graybg] n=%d tbw=%u uv=(%d,%d) pageBwT8=%u idx=%u clut=0x%08x A=%u cbp=0x%x cpsm=%u csa=%u\n",
+                            gn, static_cast<uint32_t>(t8tbw), sampleU, sampleV,
+                            (((t8tbw >> 1u) != 0u) ? (t8tbw >> 1u) : 1u), static_cast<uint32_t>(idx),
+                            clutColor, static_cast<uint32_t>((clutColor >> 24) & 0xFFu), tex.cbp,
+                            static_cast<uint32_t>(tex.cpsm), static_cast<uint32_t>(tex.csa));
+                }
+            }
             f50_12_log_pal_sample(sampleU, sampleV, idx, clutColor);
             // [F51.5] decisive: the displayed map texture is tbp=0x3220. Log its actual idx/color.
             // idx==0 -> texture reads 0 at the sampled UV (UV/overwrite); idx!=0 && color==0 -> CLUT

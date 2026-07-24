@@ -381,6 +381,33 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
     g138DumpSubmit(pathId, data, sizeBytes);
 
+    // [G360] pin the delivery PATH of the item-slot cell-bg packet (TEX0 tbp=0x2b20) at the single
+    // submit convergence point, and confirm its UV A+D DATA is already zero here. path=3/2 => the
+    // packet is EE-built and forwarded verbatim (=> EE recompile / GIF-DMA loses the UV); path=1 =>
+    // VU1 built it. Default-off DC2_G360_GRAYBG=1.
+    {
+        static const bool s_g360sub = (std::getenv("DC2_G360_GRAYBG") != nullptr);
+        if (s_g360sub && sizeBytes >= 32u)
+        {
+            bool tex2b20 = false; int uvZero = 0, uvNz = 0;
+            for (uint32_t o = 0u; o + 16u <= sizeBytes; o += 16u)
+            {
+                const uint8_t ad = data[o + 8u];
+                uint32_t lo32; std::memcpy(&lo32, data + o, 4);
+                if ((ad == 0x06u || ad == 0x07u) && (lo32 & 0x3FFFu) == 0x2b20u) tex2b20 = true;
+                if (ad == 0x03u) { uint64_t d; std::memcpy(&d, data + o, 8); if ((d & 0xFFFFFFFFull) == 0ull) ++uvZero; else ++uvNz; }
+            }
+            if (tex2b20 && (uvZero + uvNz) > 0)
+            {
+                static std::atomic<uint32_t> s_g360subN{0};
+                const int pid = (pathId == GifPathId::Path1) ? 1 : (pathId == GifPathId::Path2) ? 2 : 3;
+                if (s_g360subN.fetch_add(1u, std::memory_order_relaxed) < 8u)
+                    std::fprintf(stderr, "[G360:submit] path=%d bytes=%u tex2b20=1 uvZero=%d uvNz=%d\n",
+                                 pid, sizeBytes, uvZero, uvNz);
+            }
+        }
+    }
+
     if (vu1_trace_enabled())
     {
         const int pid = (pathId == GifPathId::Path1) ? 1 : (pathId == GifPathId::Path2) ? 2 : 3;
