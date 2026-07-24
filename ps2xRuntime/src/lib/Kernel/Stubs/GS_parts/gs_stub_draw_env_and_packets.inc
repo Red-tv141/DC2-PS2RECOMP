@@ -134,7 +134,18 @@
             return;
         }
 
-        uint32_t sbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
+        // G359 (Sindain inventory circle, 2nd root — the intermittent one): img.vram_addr is the guest
+        // TBP0 block pointer (256-byte block units, e.g. 0xd00 for the fbp=0x68 display buffer), which
+        // is EXACTLY what BITBLTBUF.SBP and the readback's addrPSMCT32 expect. The old `* 2048 / 256`
+        // (= *8) wrongly rescaled it as if page-units: 0xd00 -> 0x6800, and the `& 0x3FFF` SBP field
+        // then TRUNCATED that to 0x2800 -> the readback read the wrong VRAM block (0x2800) instead of
+        // the field (0xd00). It only escaped detection when the display buffer was at TBP0=0 (parity A,
+        // 0*8=0); the other double-buffer (TBP0=0xd00, parity B) read block 0x2800, whose stale content
+        // is sometimes field-like (looks ok) and sometimes junk (band noise) => the intermittent circle.
+        // Use the block pointer directly. Rollback (restores the truncation bug): DC2_G359_NO_SBP_FIX=1.
+        static const bool s_g359NoSbpFix = envFlagEnabled("DC2_G359_NO_SBP_FIX");
+        uint32_t sbp = s_g359NoSbpFix ? ((static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u)
+                                      : static_cast<uint32_t>(img.vram_addr);
         uint64_t bitbltbuf = (static_cast<uint64_t>(sbp & 0x3FFFu) << 0) |
                              (static_cast<uint64_t>(fbw & 0x3Fu) << 16) |
                              (static_cast<uint64_t>(img.psm & 0x3Fu) << 24) |
@@ -182,7 +193,77 @@
         mem.writeIORegister(GIF_CHANNEL + 0x00u, CHCR_STR_MODE0);
         mem.processPendingTransfers();
 
+        // G358 (Sindain inventory circle root fix): under MTGS (default-on), GifArbiter::drain hands
+        // the local->host readback packet to the GS worker thread and RETURNS immediately — the
+        // worker performs the TRXDIR=1 transfer (performLocalToHostToBuffer) asynchronously. On real
+        // PS2 a local->host GIF transfer stalls the EE until it completes, so the guest reads valid
+        // pixels. Without a wait, the EE thread ran consumeLocalToHostBytes while m_localToHostBuffer
+        // was still empty (bufSize=0) -> it returned 0 and left the guest destination as stale garbage,
+        // which the menu then blit into the circular viewport as band noise. Block until the worker is
+        // idle so the readback is synchronous, matching HW. Rollback (restores the async bug):
+        // DC2_G358_NO_READBACK_SYNC=1. No-op when MTGS is off (the inline path already completed above).
+        static const bool s_g358NoReadbackSync = envFlagEnabled("DC2_G358_NO_READBACK_SYNC");
+        if (!s_g358NoReadbackSync)
+            g150_wait_idle();
+
         runtime->gs().consumeLocalToHostBytes(dst, totalImageBytes);
+        // G356: diagnose the Sindain menu circle grab (MenuCapture -> mgStoreImage -> here). Log the
+        // source descriptor + a stat of the bytes actually read back, so we can see whether the GS
+        // local->host download read the field or garbage, and from what VRAM address/format.
+        if (std::getenv("DC2_G356_STORE") != nullptr)
+        {
+            uint64_t nz = 0, sumG = 0; uint32_t cnt = 0;
+            const uint32_t step = (img.psm == GS_PSM_CT24) ? 3u : 4u;
+            for (uint32_t i = 0; i + step <= totalImageBytes && cnt < 200000u; i += step)
+            {
+                if (dst[i] | dst[i + 1] | dst[i + 2]) nz++;
+                sumG += dst[i + 1];
+                cnt++;
+            }
+            // G359: banding metric — mean within-row green stddev over the circle-centre region of the
+            // full-res readback result. Band noise ⇒ high (>14); clean field ⇒ ~8. Ground truth per
+            // capture, independent of frame-dump timing.
+            double banding = 0.0;
+            if (img.width >= 440u && img.height >= 250u && step == 4u)
+            {
+                double devSum = 0.0; uint32_t rows = 0;
+                for (uint32_t y = 150; y < 250; ++y)
+                {
+                    double m = 0.0; for (uint32_t x = 280; x < 440; ++x) m += dst[(y * img.width + x) * 4u + 1u];
+                    m /= 160.0;
+                    double v = 0.0; for (uint32_t x = 280; x < 440; ++x) { double d = dst[(y * img.width + x) * 4u + 1u] - m; v += d * d; }
+                    devSum += std::sqrt(v / 160.0); ++rows;
+                }
+                banding = rows ? devSum / rows : 0.0;
+            }
+            static std::atomic<uint32_t> s_n{0};
+            const uint32_t nn = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            // Read the guest double-buffer toggle (gp-0x77e8 = 0x00376D08) + frame_tex.tbp
+            // (0x003824C8) straight from EE RAM at the capture instant, so we know the parity.
+            uint32_t toggle = 0, ftex = 0;
+            { const uint8_t *p = getConstMemPtr(rdram, 0x00376D08u); if (p) std::memcpy(&toggle, p, 4); }
+            { const uint8_t *p = getConstMemPtr(rdram, 0x003824C8u); if (p) std::memcpy(&ftex, p, 4); }
+            std::fprintf(stderr,
+                "[G356:store] n=%u vram_addr=0x%x sbp=0x%x vram_w=%u psm=0x%x w=%u h=%u x=%u y=%u "
+                "totBytes=%u pxN=%u nonzero=%u meanG=%.1f banding=%.1f %s toggle=%u frameTexTbp=0x%x\n",
+                nn, img.vram_addr, sbp, img.vram_width, img.psm, img.width, img.height,
+                img.x, img.y, totalImageBytes, cnt, (unsigned)nz,
+                cnt ? (double)sumG / cnt : 0.0, banding, (banding > 14.0 ? "GARBAGE" : "ok"),
+                toggle, ftex & 0x3fffu);
+            if (img.width > 0 && img.height > 0)
+            {
+                char path[64];
+                std::snprintf(path, sizeof(path), "captures/g359_cap%u.ppm", nn);
+                FILE *fp = std::fopen(path, "wb");
+                if (fp)
+                {
+                    std::fprintf(fp, "P6\n%u %u\n255\n", img.width, img.height);
+                    for (uint32_t i = 0; i + step <= totalImageBytes; i += step)
+                        std::fwrite(dst + i, 1, 3, fp);
+                    std::fclose(fp);
+                }
+            }
+        }
         runtime->guestFree(pktAddr);
 
         setReturnS32(ctx, 0);

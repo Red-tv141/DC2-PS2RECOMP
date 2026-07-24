@@ -15,6 +15,10 @@ extern std::atomic<uint64_t> g_f60_gsSyncV;
 // Returns false when MTGS is off / worker not running — caller applies inline.
 #include <functional>
 extern bool g150_enqueue_apply(std::function<void()> fn);
+// G358 (defined in ps2_gif_arbiter.cpp): block the EE thread until the MTGS GS worker has drained
+// its queue. Needed so a GS local->host readback (sceGsExecStoreImage) is synchronous vs the worker.
+// No-op when MTGS is off (the synchronous path already completes the transfer inline).
+extern void g150_wait_idle();
 
 namespace ps2_stubs
 {
