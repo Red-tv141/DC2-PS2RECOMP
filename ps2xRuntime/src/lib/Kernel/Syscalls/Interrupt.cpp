@@ -283,6 +283,45 @@ namespace ps2_syscalls
         }
     }
 
+
+    // G375: pending DMAC completion causes (bitmask), drained on the vblank tick.
+    static std::mutex g_dmac_pending_mutex;
+    static uint32_t g_dmac_pending_causes = 0u;
+
+    // G375: deferred DMAC completion interrupts.
+    // libdma kicks a channel with TIE=1 and the runtime completes the transfer
+    // synchronously inside sceDmaSend. Dispatching the guest's DMAC handler right there
+    // is WRONG in ordering: DC2's FMV kicks the image DMA from vblankHandler and only
+    // ARMS its "image in flight" gate byte (gp-0x66EC) on the instruction AFTER the call
+    // returns, so an in-call handler always saw the gate clear and never ran
+    // voBufDecCount -> the movie's video-out ring never drained. On hardware the
+    // interrupt arrives later, so queue the cause here and dispatch it from the vblank
+    // interrupt worker, after the kicking guest code has returned.
+    void queueDmacCompletionIrq(uint32_t cause)
+    {
+        if (cause >= 32u)
+            return;
+        std::lock_guard<std::mutex> lock(g_dmac_pending_mutex);
+        g_dmac_pending_causes |= (1u << cause);
+    }
+
+    void drainDmacCompletionIrqs(uint8_t *rdram, PS2Runtime *runtime)
+    {
+        uint32_t pending = 0u;
+        {
+            std::lock_guard<std::mutex> lock(g_dmac_pending_mutex);
+            pending = g_dmac_pending_causes;
+            g_dmac_pending_causes = 0u;
+        }
+        for (uint32_t cause = 0u; pending != 0u && cause < 32u; ++cause)
+        {
+            if ((pending & (1u << cause)) == 0u)
+                continue;
+            pending &= ~(1u << cause);
+            dispatchDmacHandlersForCause(rdram, runtime, cause);
+        }
+    }
+
     void dispatchDmacHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause)
     {
         if (!rdram || !runtime)
@@ -425,6 +464,7 @@ namespace ps2_syscalls
                 const auto t1 = clock::now();
                 ps2_stubs::dispatchGsSyncVCallback(rdram, runtime, tickValue);
                 const auto t2 = clock::now();
+                drainDmacCompletionIrqs(rdram, runtime); // G375
                 dispatchIntcHandlersForCause(rdram, runtime, kIntcVblankStart);
                 const auto t3 = clock::now();
                 std::this_thread::sleep_for(std::chrono::microseconds(500));

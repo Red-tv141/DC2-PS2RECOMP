@@ -1372,6 +1372,31 @@ namespace
                 std::fprintf(stderr, "[F63:dma] n=%u ch=0x%x AFTER processPendingTransfers\n", n, channelBase);
         }
 
+        // G375: raise the channel's DMAC completion interrupt.
+        // libdma kicks with TIE=1, and the transfer above already ran to completion
+        // synchronously, so on hardware the DMAC would now interrupt and the guest's
+        // AddDmacHandler(cause=<channel>) handler would run. Nothing dispatched those:
+        // only cause 5 (SIF0) was ever raised. DC2's FMV registers
+        // handler_endimage@0x2998E0 on cause 2 (GIF) and that handler is the ONLY
+        // caller of voBufDecCount — without it the movie's video-out ring fills after
+        // two frames, decBs0 blocks forever, and playback freezes on frame 2.
+        // Rollback lever: DC2_G375_NO_DMAC_IRQ=1.
+        {
+            static const bool s_dmacIrqDisabled = []() {
+                const char *v = std::getenv("DC2_G375_NO_DMAC_IRQ");
+                return v && v[0] != 0 && std::strcmp(v, "0") != 0;
+            }();
+            if (!s_dmacIrqDisabled && (chcr & 0x80u) != 0u)
+            {
+                const auto it = std::find(kDmaChannelBases.begin(), kDmaChannelBases.end(), channelBase);
+                if (it != kDmaChannelBases.end())
+                {
+                    const uint32_t cause = static_cast<uint32_t>(std::distance(kDmaChannelBases.begin(), it));
+                    ps2_syscalls::queueDmacCompletionIrq(cause);
+                }
+            }
+        }
+
         std::lock_guard<std::mutex> lock(g_dmaStubMutex);
         g_dmaPendingPolls[channelBase] = 1;
         if (g_dmaStubLogCount < kMaxDmaStubLogs)

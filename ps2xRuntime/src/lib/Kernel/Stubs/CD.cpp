@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "CD.h"
 #include "ps2_iso_mount.h"
+#include "MPEG.h" // G375: notifyMpegCdStream{Start,Eof}
 
 namespace ps2_stubs
 {
@@ -110,6 +111,43 @@ namespace ps2_stubs
                 written += chunk;
             }
             return written == byteCount;
+        }
+
+        // G375: single resolution rule for EVERY absolute-LBN read path.
+        // sceCdRead already fell back to the mounted image for LBNs that no
+        // pseudo-LBN host file covers; sceCdStRead / sceCdReadChain called
+        // readCdSectors() directly and therefore failed on any raw disc LBN
+        // ("sceCdRead unresolved LBN ..."). The FMV streamer (\MOVIE\*.PSS,
+        // opened via sceCdSearchFile -> real image LBN) reads exclusively that
+        // way, so streaming never delivered a byte and the movie loop spun.
+        bool cdReadSectorsAny(uint32_t lbn, uint32_t sectors, uint8_t *dst, size_t byteCount)
+        {
+            if (isResolvableCdLbn(lbn))
+            {
+                return readCdSectors(lbn, sectors, dst, byteCount);
+            }
+            return f55IsoMountReadSectors(lbn, sectors, dst, byteCount);
+        }
+
+        // G375: streaming extent. The libmpeg movie player streams \MOVIE\*.PSS via
+        // sceCdStStart/sceCdStRead and never issues a short read of its own — it stops
+        // when the demuxer reports end of stream. With no end LBN the streamer walks off
+        // the end of the file into neighbouring disc data forever, the decoder never sees
+        // an MPEG sequence-end, and sceMpegGetPicture blocks. Remember the extent of the
+        // last sceCdSearchFile hit and derive the end LBN from it.
+        uint32_t g_cdStreamingEndLbn = 0xFFFFFFFFu;
+        CdFileEntry g_lastSearchEntry{};
+        bool g_lastSearchEntryValid = false;
+
+        uint32_t cdStreamingEndLbnForStart(uint32_t lbn)
+        {
+            if (g_lastSearchEntryValid &&
+                lbn >= g_lastSearchEntry.baseLbn &&
+                lbn < g_lastSearchEntry.baseLbn + g_lastSearchEntry.sectors)
+            {
+                return g_lastSearchEntry.baseLbn + g_lastSearchEntry.sectors;
+            }
+            return 0xFFFFFFFFu;
         }
     }
     void sceCdRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -409,7 +447,7 @@ namespace ps2_stubs
                 bytes = maxBytes;
             }
 
-            if (!readCdSectors(lbn, sectors, rdram + offset, bytes))
+            if (!cdReadSectorsAny(lbn, sectors, rdram + offset, bytes))
             {
                 ok = false;
                 break;
@@ -584,6 +622,10 @@ namespace ps2_stubs
         }
 
         g_cdStreamingLbn = resolvedEntry.baseLbn;
+        // G375: remember the extent so a following sceCdStStart can bound the stream.
+        g_lastSearchEntry = resolvedEntry;
+        g_lastSearchEntryValid = true;
+        g_cdStreamingEndLbn = resolvedEntry.baseLbn + resolvedEntry.sectors;
         if (shouldTrace)
         {
             RUNTIME_LOG("[sceCdSearchFile:ok] path=\"" << sanitizeForLog(path)
@@ -628,11 +670,37 @@ namespace ps2_stubs
 
     void sceCdStRead(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        uint32_t sectors = getRegU32(ctx, 4);
+        const uint32_t requestedSectors = getRegU32(ctx, 4);
+        uint32_t sectors = requestedSectors;
         uint32_t buf = getRegU32(ctx, 5);
         uint32_t errAddr = getRegU32(ctx, 7);
 
         uint32_t offset = buf & PS2_RAM_MASK;
+        const size_t requestedBytes =
+            std::min<size_t>(static_cast<size_t>(requestedSectors) * kCdSectorSize, PS2_RAM_SIZE - offset);
+
+        // G375: clamp to the streamed file's extent and report EOF to the MPEG layer
+        // once the last sector has been delivered, so the decoder can drain and the
+        // guest's movie loop can finish instead of streaming past the file forever.
+        bool hitStreamEnd = false;
+        if (g_cdStreamingEndLbn != 0xFFFFFFFFu)
+        {
+            if (g_cdStreamingLbn >= g_cdStreamingEndLbn)
+            {
+                sectors = 0u;
+                hitStreamEnd = true;
+            }
+            else
+            {
+                const uint32_t remaining = g_cdStreamingEndLbn - g_cdStreamingLbn;
+                if (sectors > remaining)
+                {
+                    sectors = remaining;
+                    hitStreamEnd = true;
+                }
+            }
+        }
+
         size_t bytes = static_cast<size_t>(sectors) * kCdSectorSize;
         const size_t maxBytes = PS2_RAM_SIZE - offset;
         if (bytes > maxBytes)
@@ -640,10 +708,26 @@ namespace ps2_stubs
             bytes = maxBytes;
         }
 
-        const bool ok = readCdSectors(g_cdStreamingLbn, sectors, rdram + offset, bytes);
+        const bool ok = (sectors > 0u) && cdReadSectorsAny(g_cdStreamingLbn, sectors, rdram + offset, bytes);
         if (ok)
         {
             g_cdStreamingLbn += sectors;
+            if (requestedBytes > bytes)
+            {
+                std::memset(rdram + offset + bytes, 0, requestedBytes - bytes);
+            }
+            if (hitStreamEnd || g_cdStreamingLbn == g_cdStreamingEndLbn)
+            {
+                notifyMpegCdStreamEof();
+            }
+        }
+        else
+        {
+            if (requestedBytes > 0u)
+            {
+                std::memset(rdram + offset, 0, requestedBytes);
+            }
+            notifyMpegCdStreamEof();
         }
 
         if (int32_t *err = reinterpret_cast<int32_t *>(getMemPtr(rdram, errAddr)); err)
@@ -667,18 +751,26 @@ namespace ps2_stubs
     void sceCdStSeek(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         g_cdStreamingLbn = getRegU32(ctx, 4);
+        g_cdStreamingEndLbn = cdStreamingEndLbnForStart(g_cdStreamingLbn); // G375
         setReturnS32(ctx, 1);
     }
 
     void sceCdStSeekF(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         g_cdStreamingLbn = getRegU32(ctx, 4);
+        g_cdStreamingEndLbn = cdStreamingEndLbnForStart(g_cdStreamingLbn); // G375
         setReturnS32(ctx, 1);
     }
 
     void sceCdStStart(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         g_cdStreamingLbn = getRegU32(ctx, 4);
+        // G375: bound the stream and arm a fresh MPEG playback generation.
+        g_cdStreamingEndLbn = cdStreamingEndLbnForStart(g_cdStreamingLbn);
+        notifyMpegCdStreamStart();
+        RUNTIME_LOG("[sceCdStStart] lbn=0x" << std::hex << g_cdStreamingLbn
+                                            << " endLbn=0x" << g_cdStreamingEndLbn
+                                            << std::dec << std::endl);
         setReturnS32(ctx, 1);
     }
 
@@ -689,6 +781,7 @@ namespace ps2_stubs
 
     void sceCdStStop(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        notifyMpegCdStreamEof(); // G375
         setReturnS32(ctx, 1);
     }
 

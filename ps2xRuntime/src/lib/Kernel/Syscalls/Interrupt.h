@@ -27,6 +27,8 @@ namespace ps2_syscalls
     }
 
     void dispatchDmacHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause);
+    void queueDmacCompletionIrq(uint32_t cause);            // G375
+    void drainDmacCompletionIrqs(uint8_t *rdram, PS2Runtime *runtime); // G375
     void EnsureVSyncWorkerRunning(uint8_t *rdram, PS2Runtime *runtime);
     uint64_t GetCurrentVSyncTick();
     void stopInterruptWorker();
