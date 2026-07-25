@@ -4,6 +4,9 @@
 #include <iostream>
 #include <stdexcept>
 #include <sstream>
+#include <algorithm>
+#include <limits>
+#include <thread>
 
 namespace ps2recomp
 {
@@ -29,6 +32,24 @@ namespace ps2recomp
             config.ghidraMapPath = toml::find_or<std::string>(general, "ghidra_output", "");
             config.outputPath = toml::find<std::string>(general, "output");
             config.singleFileOutput = toml::find_or<bool>(general, "single_file_output", false);
+            config.giantFunctionInstructionThreshold = static_cast<uint32_t>(
+                toml::find_or<int64_t>(general, "giant_function_instruction_threshold",
+                                       static_cast<int64_t>(config.giantFunctionInstructionThreshold)));
+            config.lowMemoryMode = toml::find_or<bool>(general, "low_memory_mode", config.lowMemoryMode);
+            const int64_t configuredOutputWorkers = toml::find_or<int64_t>(
+                general,
+                "output_worker_threads",
+                toml::find_or<int64_t>(general, "output_worker_thread", config.outputWorkerThreads));
+            const int64_t clampedOutputWorkers = std::clamp<int64_t>(
+                configuredOutputWorkers,
+                0,
+                std::thread::hardware_concurrency() * 2);
+            if (configuredOutputWorkers != clampedOutputWorkers)
+            {
+                std::cerr << "Warning: output_worker_threads value " << configuredOutputWorkers
+                          << " is out of range; clamped to " << clampedOutputWorkers << "." << std::endl;
+            }
+            config.outputWorkerThreads = static_cast<uint32_t>(clampedOutputWorkers);
             config.patchSyscalls = toml::find_or<bool>(general, "patch_syscalls", config.patchSyscalls);
             config.patchCop0 = toml::find_or<bool>(general, "patch_cop0", config.patchCop0);
             config.patchCache = toml::find_or<bool>(general, "patch_cache", config.patchCache);
@@ -49,6 +70,17 @@ namespace ps2recomp
             else if (data.contains("skip") && data.at("skip").is_array())
             {
                 config.skipFunctions = toml::find<std::vector<std::string>>(data, "skip");
+            }
+
+            if (general.contains("external_call_target_manifests") && general.at("external_call_target_manifests").is_array())
+            {
+                config.externalCallTargetManifests =
+                    toml::find<std::vector<std::string>>(general, "external_call_target_manifests");
+            }
+            else if (data.contains("external_call_target_manifests") && data.at("external_call_target_manifests").is_array())
+            {
+                config.externalCallTargetManifests =
+                    toml::find<std::vector<std::string>>(data, "external_call_target_manifests");
             }
 
             if (data.contains("patches") && data.at("patches").is_table())
@@ -234,11 +266,18 @@ namespace ps2recomp
         general["ghidra_output"] = config.ghidraMapPath;
         general["output"] = config.outputPath;
         general["single_file_output"] = config.singleFileOutput;
+        general["giant_function_instruction_threshold"] = static_cast<int64_t>(config.giantFunctionInstructionThreshold);
+        general["low_memory_mode"] = config.lowMemoryMode;
+        general["output_worker_threads"] = static_cast<int64_t>(config.outputWorkerThreads);
         general["patch_syscalls"] = config.patchSyscalls;
         general["patch_cop0"] = config.patchCop0;
         general["patch_cache"] = config.patchCache;
         general["skip"] = config.skipFunctions;
         general["stubs"] = config.stubImplementations;
+        if (!config.externalCallTargetManifests.empty())
+        {
+            general["external_call_target_manifests"] = config.externalCallTargetManifests;
+        }
         data["general"] = general;
 
         if (!config.mmioByInstructionAddress.empty())

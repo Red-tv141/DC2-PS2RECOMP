@@ -1,6 +1,7 @@
 #include "ps2recomp/code_generator.h"
 #include "ps2recomp/instructions.h"
 #include "ps2recomp/ps2_recompiler.h"
+#include "ps2recomp/r5900_decoder.h"
 #include "ps2recomp/types.h"
 #include "ps2_runtime_calls.h"
 #include <fmt/format.h>
@@ -12,6 +13,7 @@
 #include <iostream>
 #include <cctype>
 #include <cmath>
+#include <vector>
 
 namespace ps2recomp
 {
@@ -231,6 +233,16 @@ namespace ps2recomp
         }
     }
 
+    void CodeGenerator::setEmitInstructionComments(bool emitInstructionComments)
+    {
+        m_emitInstructionComments = emitInstructionComments;
+    }
+
+    void CodeGenerator::setGiantFunctionInstructionThreshold(uint32_t threshold)
+    {
+        m_giantFunctionInstructionThreshold = threshold;
+    }
+
     std::string CodeGenerator::getFunctionName(uint32_t address) const
     {
         auto it = m_renamedFunctions.find(address);
@@ -290,11 +302,16 @@ namespace ps2recomp
         std::string delaySlotSuffix = "";
         if (hasValidDelaySlot) {
             delaySlotPrefix = "ctx->in_delay_slot = true; ctx->branch_pc = 0x" + fmt::format("{:X}", branchInst.address) + "u;\n        ";
-            delaySlotCode = "    // 0x" + fmt::format("{:x}", delaySlot.address) + ": 0x" + fmt::format("{:x}", delaySlot.raw);
-            if (!delaySlot.disassembly.empty()) {
-                delaySlotCode += "  " + delaySlot.disassembly;
+            if (m_emitInstructionComments)
+            {
+                delaySlotCode = "    // 0x" + fmt::format("{:x}", delaySlot.address) + ": 0x" + fmt::format("{:x}", delaySlot.raw);
+                std::string disassembly = R5900Decoder::disassembleInstruction(delaySlot);
+                if (!disassembly.empty()) {
+                    delaySlotCode += "  " + disassembly;
+                }
+                delaySlotCode += " (Delay Slot)\n        ";
             }
-            delaySlotCode += " (Delay Slot)\n        " + translateInstruction(delaySlot);
+            delaySlotCode += translateInstruction(delaySlot);
             delaySlotSuffix = "\n        ctx->in_delay_slot = false;";
         }
 
@@ -326,19 +343,17 @@ namespace ps2recomp
 
         std::vector<uint32_t> sortedInternalTargets;
         if (branchInst.opcode == OPCODE_SPECIAL &&
-            (branchInst.function == SPECIAL_JR || branchInst.function == SPECIAL_JALR) &&
+            ((branchInst.function == SPECIAL_JR && branchInst.rs != 31) ||
+             branchInst.function == SPECIAL_JALR) &&
             !internalTargets.empty())
         {
+            // Only emit local indirect-jump switches for jump tables we actually resolved.
+            // Falling back to every internal target here can duplicate huge switches at each
+            // indirect branch. Unresolved JR/JALR targets are registered as resumable entries
+            // instead, so runtime dispatch can re-enter this function at ctx->pc.
             auto jtIt = analysisResult.jumpTableTargets.find(branchInst.address);
             if (jtIt != analysisResult.jumpTableTargets.end()) {
                 sortedInternalTargets = jtIt->second;
-                std::sort(sortedInternalTargets.begin(), sortedInternalTargets.end());
-            } else {
-                sortedInternalTargets.reserve(internalTargets.size());
-                for (uint32_t t : internalTargets)
-                {
-                    sortedInternalTargets.push_back(t);
-                }
                 std::sort(sortedInternalTargets.begin(), sortedInternalTargets.end());
             }
         }
@@ -894,7 +909,7 @@ namespace ps2recomp
 
         if (hasIndirectRegisterJump)
         {
-            bool needsJrFallback = false;
+            bool needsIndirectFallback = false;
             for (const Instruction* jrInst : indirectJumps) {
                 if (jrInst->function == SPECIAL_JALR)
                 {
@@ -1064,19 +1079,19 @@ namespace ps2recomp
                     }
                 }
                 if (!foundTable) {
-                    if (!(jrInst->function == SPECIAL_JALR))
-                    {
-                        needsJrFallback = true;
-                    }
+                    needsIndirectFallback = true;
                 }
             }
 
-            if (needsJrFallback) {
+            if (needsIndirectFallback) {
                 for (uint32_t addr : instructionAddresses)
                 {
                     if (addr >= function.start && addr < function.end)
                     {
                         result.entryPoints.insert(addr);
+                        // Keep labels and runtime registration for unresolved JR/JALR targets
+                        // without emitting a local switch over every possible target.
+                        result.indirectFallbackEntryPoints.insert(addr);
                     }
                 }
             }
@@ -1132,6 +1147,23 @@ namespace ps2recomp
             sanitizedName = nameBuilder.str();
         }
 
+        const bool isGiantFunction =
+            m_giantFunctionInstructionThreshold != 0 &&
+            instructions.size() > m_giantFunctionInstructionThreshold;
+        if (isGiantFunction)
+        {
+            ss << "// Giant function: " << instructions.size()
+               << " instructions exceeds threshold " << m_giantFunctionInstructionThreshold << ".\n";
+            ss << "// Compiled at -O1 only to keep build time bounded. GCC's manual documents\n";
+            ss << "// the optimize attribute as \"used for debugging purposes only\" and \"not\n";
+            ss << "// suitable in production code\". Separately, as a practical matter, a\n";
+            ss << "// per-function optimize attribute may not survive LTO; that failure mode is\n";
+            ss << "// benign -- the function then falls back to the TU's optimization level,\n";
+            ss << "// with no correctness impact.\n";
+            ss << "#if defined(__GNUC__) && !defined(__clang__)\n";
+            ss << "__attribute__((optimize(\"O1\")))\n";
+            ss << "#endif\n";
+        }
         ss << "void " << sanitizedName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
         ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
         ss << "    PS_LOG_ENTRY(\"" << sanitizedName << "\");\n";
@@ -1160,11 +1192,15 @@ namespace ps2recomp
                 ss << "label_" << std::hex << inst.address << std::dec << ":\n";
             }
 
-            ss << "    // 0x" << std::hex << inst.address << ": 0x" << inst.raw << std::dec;
-            if (!inst.disassembly.empty()) {
-                ss << "  " << inst.disassembly;
+            if (m_emitInstructionComments)
+            {
+                ss << "    // 0x" << std::hex << inst.address << ": 0x" << inst.raw << std::dec;
+                std::string disassembly = R5900Decoder::disassembleInstruction(inst);
+                if (!disassembly.empty()) {
+                    ss << "  " << disassembly;
+                }
+                ss << "\n";
             }
-            ss << "\n";
 
             try
             {
@@ -1573,9 +1609,12 @@ namespace ps2recomp
         case SPECIAL_SLTU:
             return fmt::format("SET_GPR_U64(ctx, {}, ((uint64_t)GPR_U64(ctx, {}) < (uint64_t)GPR_U64(ctx, {})) ? 1 : 0);", inst.rd, inst.rs, inst.rt);
         case SPECIAL_MOVZ:
-            return fmt::format("if (GPR_U64(ctx, {}) == 0) SET_GPR_VEC(ctx, {}, GPR_VEC(ctx, {}));", inst.rt, inst.rd, inst.rs);
+            // R5900 movz/movn are 64-bit (doubleword) conditional moves, like the other
+            // 64-bit ALU ops (daddu/or/...). Use SET_GPR_U64, NOT SET_GPR_VEC: a 128-bit
+            // copy would clobber rd's upper 64 bits with rs's upper 64 bits.
+            return fmt::format("if (GPR_U64(ctx, {}) == 0) SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}));", inst.rt, inst.rd, inst.rs);
         case SPECIAL_MOVN:
-            return fmt::format("if (GPR_U64(ctx, {}) != 0) SET_GPR_VEC(ctx, {}, GPR_VEC(ctx, {}));", inst.rt, inst.rd, inst.rs);
+            return fmt::format("if (GPR_U64(ctx, {}) != 0) SET_GPR_U64(ctx, {}, GPR_U64(ctx, {}));", inst.rt, inst.rd, inst.rs);
         case SPECIAL_MFSA:
             return fmt::format("SET_GPR_U32(ctx, {}, ctx->sa);", inst.rd);
         case SPECIAL_MTSA:
@@ -1861,10 +1900,14 @@ namespace ps2recomp
             case COP1_S_MUL:
                 return fmt::format("ctx->f[{}] = FPU_MUL_S(ctx->f[{}], ctx->f[{}]);", fd, fs, ft);
             case COP1_S_DIV:
-                return fmt::format("if (ctx->f[{}] == 0.0f) {{ ctx->fcr31 |= 0x100000; /* DZ flag */ "
-                                   "ctx->f[{}] = copysignf(INFINITY, ctx->f[{}] * 0.0f); }} "
-                                   "else ctx->f[{}] = ctx->f[{}] / ctx->f[{}];",
-                                   ft, fd, fs, fd, fs, ft);
+                // G371: the EE FPU has no Infinity. A zero denominator saturates to
+                // +/-0x7F7FFFFF (signed by the XOR of the operand signs); emitting
+                // copysignf(INFINITY, ...) here let `inf - inf` produce a NaN, which then
+                // defeats the guest's own `!= 0.0` guards. FPU_DIV_S implements the hardware
+                // rule (ps2_runtime_macros.h). The D flag is still raised.
+                return fmt::format("{{ if (ctx->f[{}] == 0.0f) ctx->fcr31 |= 0x100000; /* DZ flag */ "
+                                   "ctx->f[{}] = FPU_DIV_S(ctx->f[{}], ctx->f[{}]); }}",
+                                   ft, fd, fs, ft);
             case COP1_S_SQRT:
                 return fmt::format("ctx->f[{}] = FPU_SQRT_S(ctx->f[{}]);", fd, fs);
             case COP1_S_ABS:

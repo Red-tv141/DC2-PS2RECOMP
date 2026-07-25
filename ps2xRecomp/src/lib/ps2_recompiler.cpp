@@ -7,14 +7,21 @@
 #include <iostream>
 #include <fstream>
 #include <sstream>
+#include <iomanip>
 #include <algorithm>
 #include <stdexcept>
 #include <filesystem>
 #include <cctype>
+#include <condition_variable>
+#include <exception>
+#include <mutex>
+#include <queue>
 #include <unordered_set>
 #include <optional>
 #include <limits>
 #include <functional>
+#include <thread>
+#include <utility>
 
 namespace fs = std::filesystem;
 
@@ -75,6 +82,36 @@ namespace ps2recomp
         bool shouldGenerateCodeForFunction(const Function &function)
         {
             return function.isRecompiled || function.isStub || function.isSkipped;
+        }
+
+        size_t resolveOutputWorkerCount(uint32_t configuredWorkerCount)
+        {
+            if (configuredWorkerCount > 0)
+            {
+                return configuredWorkerCount;
+            }
+
+            const unsigned int hardwareWorkers = std::thread::hardware_concurrency();
+            if (hardwareWorkers >= 2)
+            {
+                return static_cast<size_t>(hardwareWorkers - 1);
+            }
+
+            return 1;
+        }
+
+        void writeCombinedOutputPreamble(std::ostream &output)
+        {
+            output << "#include \"ps2_recompiled_functions.h\"\n\n";
+            output << "#include \"ps2_runtime_macros.h\"\n";
+            output << "#include \"ps2_runtime.h\"\n";
+            output << "#include \"ps2_recompiled_stubs.h\"\n";
+            output << "#include \"ps2_syscalls.h\"\n";
+            output << "#include \"ps2_stubs.h\"\n";
+            output << "#ifdef _DEBUG\n";
+            output << "#include \"ps2_log.h\"\n";
+            output << "#endif\n";
+            output << "\n";
         }
 
         enum class PatchClass
@@ -850,6 +887,8 @@ namespace ps2recomp
             m_codeGenerator->setRelocationCallNames(relocationCallNames);
             m_codeGenerator->setBootstrapInfo(m_bootstrapInfo);
             m_codeGenerator->setConfiguredJumpTables(m_config.jumpTables);
+            m_codeGenerator->setEmitInstructionComments(true);
+            m_codeGenerator->setGiantFunctionInstructionThreshold(m_config.giantFunctionInstructionThreshold);
 
             fs::create_directories(m_config.outputPath);
 
@@ -907,6 +946,7 @@ namespace ps2recomp
 #endif
             }
 
+            loadExternalCallTargetManifests();
             discoverAdditionalEntryPoints();
 
             if (failedCount > 0)
@@ -928,6 +968,14 @@ namespace ps2recomp
     {
         try
         {
+            if (!m_codeGenerator)
+            {
+                // initialize() failed (or was never called): the output worker
+                // threads below copy-construct from *m_codeGenerator, so running
+                // without it is a guaranteed access violation.
+                throw std::runtime_error("generateOutput() requires a successful initialize()");
+            }
+
             m_functionRenames.clear();
 
             auto makeName = [&](const Function &function) -> std::string
@@ -1050,110 +1098,497 @@ namespace ps2recomp
 
             generateFunctionHeader();
 
+            std::vector<const Function *> outputFunctions;
+            outputFunctions.reserve(m_functions.size());
+            for (const auto &function : m_functions)
+            {
+                if (shouldGenerateCodeForFunction(function))
+                {
+                    outputFunctions.push_back(&function);
+                }
+            }
+
+            const size_t outputWorkerCount = m_config.lowMemoryMode ? 1 : resolveOutputWorkerCount(m_config.outputWorkerThreads);
+            if (outputFunctions.size() > 1 && outputWorkerCount > 1)
+            {
+                std::cout << "Generating function output with " << outputWorkerCount << " worker(s)." << std::endl;
+            }
+
+            const auto &generatedStubs = m_generatedStubs;
+            const auto &decodedFunctions = m_decodedFunctions;
+
+            auto generateFunctionCode = [&](CodeGenerator &codeGenerator, const Function &function, bool useHeaders) -> std::string
+            {
+                try
+                {
+                    if (function.isStub || function.isSkipped)
+                    {
+                        if (!useHeaders)
+                        {
+                            return generatedStubs.at(function.start);
+                        }
+
+                        std::stringstream stubFile;
+                        stubFile << "#include \"ps2_runtime.h\"\n";
+                        stubFile << "#include \"ps2_syscalls.h\"\n";
+                        stubFile << "#include \"ps2_stubs.h\"\n";
+                        stubFile << "#ifdef _DEBUG\n";
+                        stubFile << "#include \"ps2_log.h\"\n";
+                        stubFile << "#endif\n";
+                        stubFile << "\n";
+                        stubFile << generatedStubs.at(function.start) << "\n";
+                        return stubFile.str();
+                    }
+
+                    const auto &instructions = decodedFunctions.at(function.start);
+                    return codeGenerator.generateFunction(function, instructions, useHeaders);
+                }
+                catch (const std::exception &e)
+                {
+                    std::cerr << "Error generating code for function "
+                              << function.name << " (start 0x"
+                              << std::hex << function.start << std::dec << "): "
+                              << e.what() << std::endl;
+                    throw;
+                }
+            };
+
             if (m_config.singleFileOutput)
             {
-                std::stringstream combinedOutput;
-
-                combinedOutput << "#include \"ps2_recompiled_functions.h\"\n\n";
-                combinedOutput << "#include \"ps2_runtime_macros.h\"\n";
-                combinedOutput << "#include \"ps2_runtime.h\"\n";
-                combinedOutput << "#include \"ps2_recompiled_stubs.h\"\n";
-                combinedOutput << "#include \"ps2_syscalls.h\"\n";
-                combinedOutput << "#include \"ps2_stubs.h\"\n";
-                combinedOutput << "#ifdef _DEBUG\n";
-                combinedOutput << "#include \"ps2_log.h\"\n";
-                combinedOutput << "#endif\n";
-                combinedOutput << "\n";
-
-                for (const auto &function : m_functions)
+                fs::path outputPath = fs::path(m_config.outputPath) / "ps2_recompiled_functions.cpp";
+                std::ofstream combinedOutput(outputPath);
+                if (!combinedOutput)
                 {
-                    if (!shouldGenerateCodeForFunction(function))
+                    throw std::runtime_error("Failed to open combined output: " + outputPath.string());
+                }
+
+                writeCombinedOutputPreamble(combinedOutput);
+
+                if (outputWorkerCount <= 1)
+                {
+                    for (const Function *function : outputFunctions)
                     {
-                        continue;
+                        combinedOutput << generateFunctionCode(*m_codeGenerator, *function, false) << "\n\n";
                     }
+                }
+                else
+                {
+                    struct CompletedCode
+                    {
+                        size_t outputIndex = 0;
+                        std::string code;
+                    };
+
+                    std::mutex outputMutex;
+                    std::condition_variable workAvailable;
+                    std::condition_variable resultAvailable;
+                    std::queue<size_t> pendingWork;
+                    std::queue<CompletedCode> readyCode;
+                    std::unordered_map<size_t, std::string> completedCode;
+                    std::exception_ptr workerException;
+                    bool stopWorkers = false;
+                    size_t outstandingWork = 0;
+                    size_t nextFunction = 0;
+                    size_t nextOutputIndex = 0;
+                    const size_t maxBufferedOutput = std::max<size_t>(outputWorkerCount * 2, outputWorkerCount + 1);
+
+                    auto workerMain = [&]()
+                    {
+                        CodeGenerator generator(*m_codeGenerator);
+                        while (true)
+                        {
+                            size_t outputIndex = 0;
+                            {
+                                std::unique_lock<std::mutex> lock(outputMutex);
+                                workAvailable.wait(lock, [&]()
+                                                   { return stopWorkers || !pendingWork.empty(); });
+                                if (stopWorkers)
+                                {
+                                    return;
+                                }
+
+                                outputIndex = pendingWork.front();
+                                pendingWork.pop();
+                            }
+
+                            try
+                            {
+                                std::string code = generateFunctionCode(generator, *outputFunctions[outputIndex], false);
+                                {
+                                    std::lock_guard<std::mutex> lock(outputMutex);
+                                    readyCode.push(CompletedCode{outputIndex, std::move(code)});
+                                    --outstandingWork;
+                                }
+                                resultAvailable.notify_one();
+                            }
+                            catch (...)
+                            {
+                                {
+                                    std::lock_guard<std::mutex> lock(outputMutex);
+                                    if (!workerException)
+                                    {
+                                        workerException = std::current_exception();
+                                    }
+                                    --outstandingWork;
+                                    stopWorkers = true;
+                                }
+                                resultAvailable.notify_one();
+                                workAvailable.notify_all();
+                                return;
+                            }
+                        }
+                    };
+
+                    std::vector<std::thread> workers;
+                    workers.reserve(outputWorkerCount);
+                    for (size_t i = 0; i < outputWorkerCount; ++i)
+                    {
+                        workers.emplace_back(workerMain);
+                    }
+
+                    auto stopAndJoinWorkers = [&]()
+                    {
+                        {
+                            std::lock_guard<std::mutex> lock(outputMutex);
+                            stopWorkers = true;
+                        }
+                        workAvailable.notify_all();
+                        for (std::thread &worker : workers)
+                        {
+                            if (worker.joinable())
+                            {
+                                worker.join();
+                            }
+                        }
+                    };
+
+                    auto scheduleAvailableWork = [&]()
+                    {
+                        bool scheduledAny = false;
+                        {
+                            std::lock_guard<std::mutex> lock(outputMutex);
+                            while (nextFunction < outputFunctions.size() &&
+                                   outstandingWork + completedCode.size() < maxBufferedOutput &&
+                                   !stopWorkers)
+                            {
+                                pendingWork.push(nextFunction++);
+                                ++outstandingWork;
+                                scheduledAny = true;
+                            }
+                        }
+
+                        if (scheduledAny)
+                        {
+                            workAvailable.notify_all();
+                        }
+                    };
+
+                    auto flushCompletedOutput = [&]()
+                    {
+                        while (true)
+                        {
+                            auto completedIt = completedCode.find(nextOutputIndex);
+                            if (completedIt == completedCode.end())
+                            {
+                                break;
+                            }
+
+                            combinedOutput << completedIt->second << "\n\n";
+                            completedCode.erase(completedIt);
+                            ++nextOutputIndex;
+
+                            if (!combinedOutput)
+                            {
+                                throw std::runtime_error("Failed while writing combined output: " + outputPath.string());
+                            }
+                        }
+                    };
 
                     try
                     {
-                        if (function.isStub || function.isSkipped)
+                        scheduleAvailableWork();
+
+                        while (nextOutputIndex < outputFunctions.size())
                         {
-                            combinedOutput << m_generatedStubs.at(function.start) << "\n\n";
+                            std::unique_lock<std::mutex> lock(outputMutex);
+                            resultAvailable.wait(lock, [&]()
+                                                 { return workerException || !readyCode.empty() || (outstandingWork == 0 && nextFunction >= outputFunctions.size()); });
+
+                            if (workerException)
+                            {
+                                lock.unlock();
+                                stopAndJoinWorkers();
+                                std::rethrow_exception(workerException);
+                            }
+
+                            while (!readyCode.empty())
+                            {
+                                CompletedCode completed = std::move(readyCode.front());
+                                readyCode.pop();
+                                completedCode.emplace(completed.outputIndex, std::move(completed.code));
+                            }
+                            lock.unlock();
+
+                            flushCompletedOutput();
+                            scheduleAvailableWork();
+
+                            if (nextOutputIndex >= outputFunctions.size())
+                            {
+                                break;
+                            }
+
+                            std::lock_guard<std::mutex> finalLock(outputMutex);
+                            if (outstandingWork == 0 && nextFunction >= outputFunctions.size() && completedCode.empty())
+                            {
+                                throw std::runtime_error("Internal error: combined output completion queue is missing index " + std::to_string(nextOutputIndex));
+                            }
                         }
-                        else
-                        {
-                            const auto &instructions = m_decodedFunctions.at(function.start);
-                            std::string code = m_codeGenerator->generateFunction(function, instructions, false);
-                            combinedOutput << code << "\n\n";
-                        }
+
+                        stopAndJoinWorkers();
                     }
-                    catch (const std::exception &e)
+                    catch (...)
                     {
-                        std::cerr << "Error generating code for function "
-                                  << function.name << " (start 0x"
-                                  << std::hex << function.start << "): "
-                                  << e.what() << std::endl;
+                        stopAndJoinWorkers();
                         throw;
                     }
                 }
 
-                fs::path outputPath = fs::path(m_config.outputPath) / "ps2_recompiled_functions.cpp";
-                if (!writeToFile(outputPath.string(), combinedOutput.str()))
+                combinedOutput.close();
+                if (!combinedOutput)
                 {
-                    throw std::runtime_error("Failed to write combined output: " + outputPath.string());
+                    throw std::runtime_error("Failed to finish combined output: " + outputPath.string());
                 }
+
                 std::cout << "Wrote recompiled to combined output to: " << outputPath << std::endl;
             }
             else
             {
-                for (const auto &function : m_functions)
+                struct GeneratedFile
                 {
-                    if (!shouldGenerateCodeForFunction(function))
+                    fs::path outputPath;
+                    std::string code;
+                };
+
+                std::vector<fs::path> outputPaths;
+                outputPaths.reserve(outputFunctions.size());
+                for (const Function *function : outputFunctions)
+                {
+                    outputPaths.push_back(getOutputPath(*function));
+                }
+
+                auto generateFile = [&](CodeGenerator &codeGenerator, size_t outputIndex) -> GeneratedFile
+                {
+                    return GeneratedFile{outputPaths[outputIndex], generateFunctionCode(codeGenerator, *outputFunctions[outputIndex], true)};
+                };
+
+                auto writeGeneratedFile = [&](GeneratedFile generated)
+                {
+                    fs::create_directories(generated.outputPath.parent_path());
+                    if (!writeToFile(generated.outputPath.string(), generated.code))
                     {
-                        continue;
+                        throw std::runtime_error("Failed to write function output: " + generated.outputPath.string());
+                    }
+                };
+
+                if (outputWorkerCount <= 1)
+                {
+                    for (size_t outputIndex = 0; outputIndex < outputFunctions.size(); ++outputIndex)
+                    {
+                        writeGeneratedFile(generateFile(*m_codeGenerator, outputIndex));
+                    }
+                }
+                else
+                {
+                    std::mutex outputMutex;
+                    std::condition_variable workAvailable;
+                    std::condition_variable resultAvailable;
+                    std::queue<size_t> pendingWork;
+                    std::queue<GeneratedFile> readyFiles;
+                    std::exception_ptr workerException;
+                    bool stopWorkers = false;
+                    size_t outstandingWork = 0;
+                    size_t nextFunction = 0;
+                    const size_t maxBufferedOutput = std::max<size_t>(outputWorkerCount * 2, outputWorkerCount + 1);
+
+                    auto workerMain = [&]()
+                    {
+                        CodeGenerator generator(*m_codeGenerator);
+                        while (true)
+                        {
+                            size_t outputIndex = 0;
+                            {
+                                std::unique_lock<std::mutex> lock(outputMutex);
+                                workAvailable.wait(lock, [&]()
+                                                   { return stopWorkers || !pendingWork.empty(); });
+                                if (stopWorkers)
+                                {
+                                    return;
+                                }
+
+                                outputIndex = pendingWork.front();
+                                pendingWork.pop();
+                            }
+
+                            try
+                            {
+                                GeneratedFile generated = generateFile(generator, outputIndex);
+                                {
+                                    std::lock_guard<std::mutex> lock(outputMutex);
+                                    readyFiles.push(std::move(generated));
+                                    --outstandingWork;
+                                }
+                                resultAvailable.notify_one();
+                            }
+                            catch (...)
+                            {
+                                {
+                                    std::lock_guard<std::mutex> lock(outputMutex);
+                                    if (!workerException)
+                                    {
+                                        workerException = std::current_exception();
+                                    }
+                                    --outstandingWork;
+                                    stopWorkers = true;
+                                }
+                                resultAvailable.notify_one();
+                                workAvailable.notify_all();
+                                return;
+                            }
+                        }
+                    };
+
+                    std::vector<std::thread> workers;
+                    workers.reserve(outputWorkerCount);
+                    for (size_t i = 0; i < outputWorkerCount; ++i)
+                    {
+                        workers.emplace_back(workerMain);
                     }
 
-                    std::string code;
+                    auto stopAndJoinWorkers = [&]()
+                    {
+                        {
+                            std::lock_guard<std::mutex> lock(outputMutex);
+                            stopWorkers = true;
+                        }
+                        workAvailable.notify_all();
+                        for (std::thread &worker : workers)
+                        {
+                            if (worker.joinable())
+                            {
+                                worker.join();
+                            }
+                        }
+                    };
+
+                    auto scheduleAvailableWork = [&]()
+                    {
+                        {
+                            std::lock_guard<std::mutex> lock(outputMutex);
+                            while (nextFunction < outputFunctions.size() &&
+                                   outstandingWork < maxBufferedOutput &&
+                                   !stopWorkers)
+                            {
+                                pendingWork.push(nextFunction++);
+                                ++outstandingWork;
+                            }
+                        }
+                        workAvailable.notify_all();
+                    };
+
                     try
                     {
-                        if (function.isStub || function.isSkipped)
-                        {
-                            std::stringstream stubFile;
-                            stubFile << "#include \"ps2_runtime.h\"\n";
-                            stubFile << "#include \"ps2_syscalls.h\"\n";
-                            stubFile << "#include \"ps2_stubs.h\"\n";
-                            stubFile << "#ifdef _DEBUG\n";
-                            stubFile << "#include \"ps2_log.h\"\n";
-                            stubFile << "#endif\n";
-                            stubFile << "\n";
-                            stubFile << m_generatedStubs.at(function.start) << "\n";
-                            code = stubFile.str();
-                        }
-                        else
-                        {
-                            const auto &instructions = m_decodedFunctions.at(function.start);
-                            code = m_codeGenerator->generateFunction(function, instructions, true);
-                        }
-                    }
-                    catch (const std::exception &e)
-                    {
-                        std::cerr << "Error generating code for function "
-                                  << function.name << " (start 0x"
-                                  << std::hex << function.start << "): "
-                                  << e.what() << std::endl;
-                        throw;
-                    }
+                        scheduleAvailableWork();
 
-                    fs::path outputPath = getOutputPath(function);
-                    fs::create_directories(outputPath.parent_path());
-                    if (!writeToFile(outputPath.string(), code))
+                        size_t writtenCount = 0;
+                        while (writtenCount < outputFunctions.size())
+                        {
+                            std::unique_lock<std::mutex> lock(outputMutex);
+                            resultAvailable.wait(lock, [&]()
+                                                 { return workerException || !readyFiles.empty() || (outstandingWork == 0 && nextFunction >= outputFunctions.size()); });
+
+                            if (workerException)
+                            {
+                                lock.unlock();
+                                stopAndJoinWorkers();
+                                std::rethrow_exception(workerException);
+                            }
+
+                            if (readyFiles.empty())
+                            {
+                                break;
+                            }
+
+                            GeneratedFile generated = std::move(readyFiles.front());
+                            readyFiles.pop();
+                            lock.unlock();
+
+                            writeGeneratedFile(std::move(generated));
+                            ++writtenCount;
+                            scheduleAvailableWork();
+                        }
+
+                        stopAndJoinWorkers();
+                    }
+                    catch (...)
                     {
-                        throw std::runtime_error("Failed to write function output: " + outputPath.string());
+                        stopAndJoinWorkers();
+                        throw;
                     }
                 }
 
                 std::cout << "Wrote individual function files to: " << m_config.outputPath << std::endl;
             }
 
+            // Emit oversized_tus.txt: one output-dir-relative TU filename per line
+            // (deduplicated), listing translation units that contain a function past
+            // the giant-function threshold. A downstream build reads this to compile
+            // just those TUs at -O1 (e.g. set_source_files_properties(... COMPILE_OPTIONS -O1)).
+            // In single_file_output mode this is the single combined TU (whole-program -O1).
+            if (m_config.giantFunctionInstructionThreshold != 0)
+            {
+                std::vector<std::pair<std::string, size_t>> translationUnitInstructionCounts;
+                translationUnitInstructionCounts.reserve(outputFunctions.size());
+                for (const Function *function : outputFunctions)
+                {
+                    auto decodedIt = decodedFunctions.find(function->start);
+                    if (decodedIt == decodedFunctions.end())
+                    {
+                        continue;
+                    }
+
+                    std::string translationUnitName = m_config.singleFileOutput
+                        ? std::string("ps2_recompiled_functions.cpp")
+                        : getOutputPath(*function).filename().string();
+                    translationUnitInstructionCounts.emplace_back(std::move(translationUnitName), decodedIt->second.size());
+                }
+
+                std::vector<std::string> oversizedTus = ComputeOversizedTranslationUnits(
+                    translationUnitInstructionCounts, m_config.giantFunctionInstructionThreshold);
+
+                std::ostringstream manifest;
+                for (const std::string &name : oversizedTus)
+                {
+                    manifest << name << "\n";
+                }
+
+                fs::path manifestPath = fs::path(m_config.outputPath) / "oversized_tus.txt";
+                if (!writeToFile(manifestPath.string(), manifest.str()))
+                {
+                    throw std::runtime_error("Failed to write oversized TU manifest: " + manifestPath.string());
+                }
+
+                {
+                    std::ostringstream msg;
+                    msg << "wrote oversized TU manifest (" << oversizedTus.size()
+                        << " entries) to " << manifestPath;
+                    std::cout << msg.str() << std::endl;
+                }
+            }
+
+            m_decodedFunctions.clear();
+
             std::string registerFunctions = m_codeGenerator->generateFunctionRegistration(m_functions, m_generatedStubs);
+            m_generatedStubs.clear();
 
             fs::path registerPath = fs::path(m_config.outputPath) / "register_functions.cpp";
             if (!writeToFile(registerPath.string(), registerFunctions))
@@ -1261,6 +1696,126 @@ namespace ps2recomp
         }
     }
 
+    void PS2Recompiler::loadExternalCallTargetManifests()
+    {
+        m_ingestedExternalCallTargets.clear();
+
+        std::vector<uint32_t> merged;
+        for (const auto &manifestPath : m_config.externalCallTargetManifests)
+        {
+            std::ifstream manifestFile(manifestPath);
+            if (!manifestFile)
+            {
+                std::cerr << "Warning: failed to open external call target manifest for reading: "
+                          << manifestPath << std::endl;
+                continue;
+            }
+
+            const std::vector<uint32_t> parsed = ParseCallTargetManifest(manifestFile);
+            merged.insert(merged.end(), parsed.begin(), parsed.end());
+
+            std::ostringstream msg;
+            msg << "ingested " << parsed.size() << " external call target(s) from " << manifestPath;
+            std::cout << msg.str() << std::endl;
+        }
+
+        std::sort(merged.begin(), merged.end());
+        merged.erase(std::unique(merged.begin(), merged.end()), merged.end());
+        m_ingestedExternalCallTargets = std::move(merged);
+    }
+
+    std::vector<uint32_t> PS2Recompiler::CollectExternalCallTargets(
+        const std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions,
+        const std::vector<Function> &functions,
+        const std::vector<Section> &sections)
+    {
+        std::vector<uint32_t> externalTargets;
+
+        auto isInsideExecutableSection = [&](uint32_t address) -> bool
+        {
+            for (const auto &section : sections)
+            {
+                if (!section.isCode)
+                {
+                    continue;
+                }
+
+                if (address >= section.address && address < section.address + section.size)
+                {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        auto isInsideRecompiledFunction = [&](uint32_t address) -> bool
+        {
+            for (const auto &function : functions)
+            {
+                if (!function.isRecompiled || function.isStub || function.isSkipped)
+                {
+                    continue;
+                }
+
+                if (address >= function.start && address < function.end)
+                {
+                    return true;
+                }
+            }
+            return false;
+        };
+
+        for (const auto &[functionStart, instructions] : decodedFunctions)
+        {
+            for (const auto &inst : instructions)
+            {
+                if (inst.opcode != OPCODE_JAL && inst.opcode != OPCODE_J)
+                {
+                    continue;
+                }
+
+                const uint32_t target = decodeAbsoluteJumpTarget(inst.address, inst.target);
+                if (!isInsideExecutableSection(target))
+                {
+                    continue;
+                }
+
+                if (isInsideRecompiledFunction(target))
+                {
+                    continue;
+                }
+
+                externalTargets.push_back(target);
+            }
+        }
+
+        std::sort(externalTargets.begin(), externalTargets.end());
+        externalTargets.erase(std::unique(externalTargets.begin(), externalTargets.end()), externalTargets.end());
+
+        return externalTargets;
+    }
+
+    void PS2Recompiler::emitExternalCallTargetManifest()
+    {
+        const std::vector<uint32_t> externalTargets =
+            CollectExternalCallTargets(m_decodedFunctions, m_functions, m_sections);
+
+        std::ostringstream ss;
+        for (uint32_t target : externalTargets)
+        {
+            ss << "0x" << std::hex << std::setw(8) << std::setfill('0') << target << std::dec << "\n";
+        }
+
+        const fs::path manifestPath = fs::path(m_config.outputPath) / "external_call_targets.txt";
+        writeToFile(manifestPath.string(), ss.str());
+
+        {
+            std::ostringstream msg;
+            msg << "wrote " << externalTargets.size() << " candidate cross-unit call target(s) to " << manifestPath;
+            std::cout << msg.str() << std::endl;
+        }
+    }
+
     void PS2Recompiler::discoverAdditionalEntryPoints()
     {
         m_resumeEntryTargetsByOwner.clear();
@@ -1338,6 +1893,9 @@ namespace ps2recomp
             ownerTargets.insert(ownerTargets.end(),
                                 analysisResult.resumeEntryPoints.begin(),
                                 analysisResult.resumeEntryPoints.end());
+            ownerTargets.insert(ownerTargets.end(),
+                                analysisResult.indirectFallbackEntryPoints.begin(),
+                                analysisResult.indirectFallbackEntryPoints.end());
 
             for (uint32_t target : analysisResult.externalEntryPoints)
             {
@@ -1354,6 +1912,65 @@ namespace ps2recomp
 
                 auto &targets = m_resumeEntryTargetsByOwner[owner->start];
                 targets.push_back(target);
+            }
+        }
+
+        for (uint32_t target : m_ingestedExternalCallTargets)
+        {
+            const Function *owner = findContainingFunction(target);
+            if (!owner)
+            {
+                continue;
+            }
+
+            if (owner->start == target)
+            {
+                continue;
+            }
+
+            auto &targets = m_resumeEntryTargetsByOwner[owner->start];
+            targets.push_back(target);
+        }
+
+        if (m_elfParser)
+        {
+            try
+            {
+                const std::vector<uint32_t> threadEntries = DiscoverDataEmbeddedThreadEntries(
+                    m_decodedFunctions,
+                    [this](uint32_t address) { return m_elfParser->isValidAddress(address); },
+                    [this](uint32_t address) { return m_elfParser->readWord(address); });
+
+                size_t mappedThreadEntries = 0u;
+                for (uint32_t target : threadEntries)
+                {
+                    const Function *owner = findContainingFunction(target);
+                    if (!owner)
+                    {
+                        continue;
+                    }
+
+                    if (owner->start == target)
+                    {
+                        continue;
+                    }
+
+                    auto &targets = m_resumeEntryTargetsByOwner[owner->start];
+                    targets.push_back(target);
+                    ++mappedThreadEntries;
+                }
+
+                if (mappedThreadEntries > 0u)
+                {
+                    std::ostringstream msg;
+                    msg << "mapped " << mappedThreadEntries << " data-embedded thread entry point(s)";
+                    std::cout << msg.str() << std::endl;
+                }
+            }
+            catch (const std::exception &ex)
+            {
+                std::cerr << "Warning: failed to discover data-embedded thread entries: "
+                          << ex.what() << std::endl;
             }
         }
 
@@ -1382,6 +1999,8 @@ namespace ps2recomp
                       << m_resumeEntryTargetsByOwner.size()
                       << " owner function(s)." << std::endl;
         }
+
+        emitExternalCallTargetManifest();
     }
 
     bool PS2Recompiler::decodeFunction(Function &function)
@@ -1428,7 +2047,7 @@ namespace ps2recomp
                     }
                 }
 
-                Instruction inst = m_decoder->decodeInstruction(address, rawInstruction);
+                Instruction inst = m_decoder->decodeInstruction(address, rawInstruction, !m_config.lowMemoryMode);
 
                 auto mmioIt = m_config.mmioByInstructionAddress.find(address);
                 if (mmioIt != m_config.mmioByInstructionAddress.end())
@@ -1503,6 +2122,27 @@ namespace ps2recomp
         file.close();
 
         return true;
+    }
+
+    std::vector<std::string> PS2Recompiler::ComputeOversizedTranslationUnits(
+        const std::vector<std::pair<std::string, size_t>>& translationUnitInstructionCounts,
+        uint32_t instructionThreshold)
+    {
+        std::vector<std::string> oversizedTus;
+        if (instructionThreshold == 0)
+        {
+            return oversizedTus;
+        }
+
+        std::unordered_set<std::string> seen;
+        for (const auto &entry : translationUnitInstructionCounts)
+        {
+            if (entry.second > instructionThreshold && seen.insert(entry.first).second)
+            {
+                oversizedTus.push_back(entry.first);
+            }
+        }
+        return oversizedTus;
     }
 
     std::filesystem::path PS2Recompiler::getOutputPath(const Function &function) const
@@ -1645,5 +2285,298 @@ namespace ps2recomp
     std::string PS2Recompiler::ClampFilenameLength(const std::string& baseName, const std::string& extension, std::size_t maxLength)
     {
         return clampFilenameLength(baseName, extension, maxLength);
+    }
+
+    std::vector<uint32_t> PS2Recompiler::ParseCallTargetManifest(std::istream &input)
+    {
+        std::vector<uint32_t> targets;
+        std::string line;
+
+        while (std::getline(input, line))
+        {
+            const size_t firstNonSpace = line.find_first_not_of(" \t\r\n");
+            if (firstNonSpace == std::string::npos)
+            {
+                continue;
+            }
+
+            if (line[firstNonSpace] == '#')
+            {
+                continue;
+            }
+
+            try
+            {
+                uint32_t target = static_cast<uint32_t>(std::stoul(line.substr(firstNonSpace), nullptr, 0));
+                targets.push_back(target);
+            }
+            catch (const std::exception &)
+            {
+                continue;
+            }
+        }
+
+        std::sort(targets.begin(), targets.end());
+        targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
+        return targets;
+    }
+
+    namespace
+    {
+        constexpr uint32_t kSyscallCreateThreadNumber = 0x20u;
+        constexpr uint32_t kThreadEntryRegV1 = 3u;
+        constexpr uint32_t kThreadEntryRegA0 = 4u;
+        constexpr size_t kThreadWrapperScanWindow = 8u;
+        constexpr size_t kThreadSyscallBackScanWindow = 8u;
+        constexpr size_t kThreadConstantScanWindow = 12u;
+
+        bool isAddiuV1SyscallImm(const Instruction &inst)
+        {
+            return inst.opcode == OPCODE_ADDIU && inst.rt == kThreadEntryRegV1 && inst.rs == 0u &&
+                   (inst.immediate & 0xFFFFu) == kSyscallCreateThreadNumber;
+        }
+
+        bool isSyscallInstruction(const Instruction &inst)
+        {
+            return inst.opcode == OPCODE_SPECIAL && inst.function == SPECIAL_SYSCALL;
+        }
+
+        // Simplified "who writes this register" model shared by the $v1 clobber check
+        // and the $a0 constant-propagation walk below: for I-type opcodes the written
+        // register is rt, for OPCODE_SPECIAL it is rd. $zero is never considered written.
+        // J-type instructions (j/jal) are excluded: the decoder unconditionally populates
+        // rs/rt/rd from the raw instruction bits (see R5900Decoder::decodeInstruction),
+        // but for a 26-bit jump target those bit positions are part of the target, not a
+        // register field, so treating them as a register write would be spurious.
+        uint32_t writtenRegisterOrZero(const Instruction &inst)
+        {
+            if (inst.opcode == OPCODE_J || inst.opcode == OPCODE_JAL)
+            {
+                return 0u;
+            }
+            if (inst.opcode == OPCODE_SPECIAL)
+            {
+                return inst.rd;
+            }
+            return inst.rt;
+        }
+
+        bool writesTrackedRegister(const Instruction &inst, uint32_t reg)
+        {
+            if (reg == 0u)
+            {
+                return false;
+            }
+            return writtenRegisterOrZero(inst) == reg;
+        }
+
+        struct ThreadCreateCallSite
+        {
+            const std::vector<Instruction> *instructions;
+            size_t index;
+            bool isJal;
+        };
+    }
+
+    std::vector<uint32_t> PS2Recompiler::DiscoverDataEmbeddedThreadEntries(
+        const std::unordered_map<uint32_t, std::vector<Instruction>> &decodedFunctions,
+        const std::function<bool(uint32_t)> &isValidAddress,
+        const std::function<uint32_t(uint32_t)> &readWord)
+    {
+        std::vector<uint32_t> results;
+
+        // Step 1: identify CreateThread (syscall 0x20) wrapper function entry points -
+        // functions whose first few instructions set $v1 = 0x20 and execute a syscall.
+        std::unordered_set<uint32_t> wrapperStarts;
+        for (const auto &[functionStart, instructions] : decodedFunctions)
+        {
+            const size_t window = std::min(instructions.size(), kThreadWrapperScanWindow);
+            bool sawAddiuV1Syscall = false;
+            bool isWrapper = false;
+            for (size_t idx = 0; idx < window; ++idx)
+            {
+                const Instruction &inst = instructions[idx];
+                if (isAddiuV1SyscallImm(inst))
+                {
+                    sawAddiuV1Syscall = true;
+                    continue;
+                }
+                if (sawAddiuV1Syscall && isSyscallInstruction(inst))
+                {
+                    isWrapper = true;
+                    break;
+                }
+            }
+
+            if (isWrapper)
+            {
+                wrapperStarts.insert(functionStart);
+            }
+        }
+
+        // Step 2: find CreateThread invocation sites - either a jal to a wrapper found
+        // above, or a direct inline syscall preceded (within a small window, with no
+        // intervening write to $v1) by addiu $v1, $zero, 0x20.
+        std::vector<ThreadCreateCallSite> callSites;
+        for (const auto &[functionStart, instructions] : decodedFunctions)
+        {
+            (void)functionStart;
+            for (size_t idx = 0; idx < instructions.size(); ++idx)
+            {
+                const Instruction &inst = instructions[idx];
+
+                if (inst.opcode == OPCODE_JAL)
+                {
+                    const uint32_t target = decodeAbsoluteJumpTarget(inst.address, inst.target);
+                    if (wrapperStarts.count(target) != 0u)
+                    {
+                        callSites.push_back(ThreadCreateCallSite{&instructions, idx, true});
+                    }
+                    continue;
+                }
+
+                if (!isSyscallInstruction(inst))
+                {
+                    continue;
+                }
+
+                // Note: this back-scan can double-attribute a single `addiu $v1,$zero,0x20`
+                // write to two syscall instructions if both sit within the scan window with no
+                // intervening $v1 clobber. That is harmless here: the worst case is one extra
+                // in-range candidate entry, which is de-duplicated downstream (results are sorted
+                // and uniqued, and the resume-target map dedups per owner), so no logic change.
+                const size_t lowerBound = (idx >= kThreadSyscallBackScanWindow) ? idx - kThreadSyscallBackScanWindow : 0u;
+                bool foundAddiuV1 = false;
+                for (size_t p = idx; p > lowerBound;)
+                {
+                    --p;
+                    const Instruction &prior = instructions[p];
+                    if (isAddiuV1SyscallImm(prior))
+                    {
+                        foundAddiuV1 = true;
+                        break;
+                    }
+                    if (writesTrackedRegister(prior, kThreadEntryRegV1))
+                    {
+                        break;
+                    }
+                }
+
+                if (foundAddiuV1)
+                {
+                    callSites.push_back(ThreadCreateCallSite{&instructions, idx, false});
+                }
+            }
+        }
+
+        // Step 3 + 4: recover the static $a0 (ThreadParam*) value at each call site by
+        // walking a small constant-propagation window forward, then read the embedded
+        // entry function pointer (word offset +4 in the ThreadParam struct) from ELF data.
+        for (const ThreadCreateCallSite &site : callSites)
+        {
+            const std::vector<Instruction> &instructions = *site.instructions;
+
+            size_t windowEnd;
+            if (site.isJal)
+            {
+                windowEnd = (site.index + 1u < instructions.size()) ? site.index + 1u : site.index;
+            }
+            else
+            {
+                if (site.index == 0u)
+                {
+                    continue;
+                }
+                windowEnd = site.index - 1u;
+            }
+            const size_t windowStart =
+                (site.index >= kThreadConstantScanWindow) ? site.index - kThreadConstantScanWindow : 0u;
+
+            std::unordered_map<uint32_t, uint32_t> resolved;
+            auto invalidate = [&resolved](uint32_t reg)
+            {
+                if (reg != 0u)
+                {
+                    resolved.erase(reg);
+                }
+            };
+
+            for (size_t idx = windowStart; idx <= windowEnd; ++idx)
+            {
+                const Instruction &inst = instructions[idx];
+
+                if (inst.opcode == OPCODE_LUI)
+                {
+                    if (inst.rt != 0u)
+                    {
+                        resolved[inst.rt] = (inst.immediate & 0xFFFFu) << 16;
+                    }
+                    continue;
+                }
+
+                if (inst.opcode == OPCODE_ADDIU)
+                {
+                    auto srcIt = resolved.find(inst.rs);
+                    if (inst.rs != 0u && srcIt != resolved.end())
+                    {
+                        const int32_t lo = static_cast<int32_t>(static_cast<int16_t>(inst.immediate & 0xFFFFu));
+                        if (inst.rt != 0u)
+                        {
+                            resolved[inst.rt] = static_cast<uint32_t>(static_cast<int32_t>(srcIt->second) + lo);
+                        }
+                        continue;
+                    }
+                }
+                else if (inst.opcode == OPCODE_ORI)
+                {
+                    auto srcIt = resolved.find(inst.rs);
+                    if (inst.rs != 0u && srcIt != resolved.end())
+                    {
+                        const uint32_t lo = inst.immediate & 0xFFFFu;
+                        if (inst.rt != 0u)
+                        {
+                            resolved[inst.rt] = srcIt->second | lo;
+                        }
+                        continue;
+                    }
+                }
+
+                invalidate(writtenRegisterOrZero(inst));
+            }
+
+            auto a0It = resolved.find(kThreadEntryRegA0);
+            if (a0It == resolved.end())
+            {
+                continue;
+            }
+
+            const uint32_t paramAddress = a0It->second;
+            if (!isValidAddress(paramAddress) || !isValidAddress(paramAddress + 4u))
+            {
+                continue;
+            }
+
+            uint32_t entry = 0u;
+            try
+            {
+                entry = readWord(paramAddress + 4u);
+            }
+            catch (const std::exception &)
+            {
+                // A section can satisfy isValidAddress's byte-range check yet still have
+                // no backing data (e.g. BSS), in which case readWord throws. Skip this
+                // candidate rather than losing the whole discovery pass.
+                continue;
+            }
+
+            if (entry != 0u)
+            {
+                results.push_back(entry);
+            }
+        }
+
+        std::sort(results.begin(), results.end());
+        results.erase(std::unique(results.begin(), results.end()), results.end());
+        return results;
     }
 }
