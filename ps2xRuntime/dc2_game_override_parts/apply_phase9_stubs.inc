@@ -633,6 +633,10 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     // PHASE F5 ג€” DVD path prefix fix + Exit halt
     // -------------------------------------------------------------------------
     runtime.registerFunction(0x00149240u, getfullpath_shim);
+
+    // PHASE G363 (opt-in DC2_G363_PATHTRACE=1): CurrentDir provenance trace.
+    if (g363_trace_enabled())
+        g363_register_probes(runtime);
     // Exit_0x118FB0 uses a tail-j to _Exit (0x10FD00) so 0x10FD00 is a direct C++ call
     // in the runner, not a dispatch-table lookup. Bind the Exit wrapper itself instead.
     runtime.registerFunction(0x00118FB0u, exit_halt_stub);

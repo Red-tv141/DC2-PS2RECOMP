@@ -574,6 +574,32 @@ static void scelogofade_done_stub(uint8_t *rdram, R5900Context *ctx, PS2Runtime 
 // Real convention: a0=input_filename, a1=output_buf (the auto-stub in dc2_auto_stubs.cpp
 // had the args reversed and never prepended a drive prefix, so fioOpen got "").
 // Bare filenames get "cdrom0:\" prepended; paths that already contain ':' pass through.
+//
+// PHASE G363: the F5 shim dropped the guest's CurrentDir prepend. Hardware
+// GetFullPath__FPcPc@0x149240 is:
+//     devType = GetDevType(src, stripped);           // -1 => no device spec in src
+//     if (devType == -1) { useCurrentDir = 1; devType = DefaultFileDev; }
+//     dest = <device prefix for devType>;
+//     if (useCurrentDir) strcat(dest, CurrentDir);   // <-- the missing step
+//     strcat(dest, stripped);
+// CurrentDir (0x00334390) is set by SetCurrentDir/ChangeDir, driven from the script
+// commands _SET_CURRENT_DIR / _CHANGE_DIR. Any asset family loaded as a BARE filename
+// under a script-set directory therefore opened from the wrong place: the Spheda
+// mini-game does `_SET_CURRENT_DIR("dungeon/sphida/")` then loads "eng_sphida_bar.img",
+// "bball.chr", "rball.chr", "rgool.chr", "rgool2.chr", "gool_a.mds" ג€” all of which
+// missed, so mgCTextureManager::GetTexture("sphida_bar") returned NULL, the HUD sprite
+// group emitted no TEX0 at all, and every HUD widget sampled whatever texture was bound
+// last (the dungeon wall atlas at tbp=0x2720). See plans/phase-G363-fix-log.md.
+//
+// Rollback to the F5 behavior: DC2_G363_NO_CURDIR=1.
+static constexpr uint32_t kG363CurrentDirAddr = 0x00334390u; // CurrentDir[] (SetCurrentDir__FPc asm)
+
+static bool g363_curdir_fix_enabled()
+{
+    static const bool off = dc2_env_flag_enabled("DC2_G363_NO_CURDIR");
+    return !off;
+}
+
 static void getfullpath_shim(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     const uint32_t srcAddr  = getRegU32(ctx, 4); // $a0 = input filename
@@ -585,9 +611,23 @@ static void getfullpath_shim(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runt
     if (src && dest)
     {
         if (::strchr(src, ':'))
+        {
             ::snprintf(dest, 256, "%s", src);
+        }
         else
-            ::snprintf(dest, 256, "cdrom0:\\%s", src);
+        {
+            // No device spec => hardware prepends CurrentDir. Empty CurrentDir
+            // reproduces the F5 behavior byte-for-byte.
+            const char *curDir = "";
+            if (g363_curdir_fix_enabled())
+            {
+                const char *cd = reinterpret_cast<const char *>(
+                    getConstMemPtr(rdram, kG363CurrentDirAddr));
+                if (cd)
+                    curDir = cd;
+            }
+            ::snprintf(dest, 256, "cdrom0:\\%s%s", curDir, src);
+        }
     }
 
     setReturnU32(ctx, destAddr);

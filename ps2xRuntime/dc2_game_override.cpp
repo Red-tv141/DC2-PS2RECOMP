@@ -199,6 +199,8 @@ extern void sndStep__Ff_0x18d650(uint8_t* rdram, R5900Context* ctx, PS2Runtime* 
 extern void StepSnd__6CSceneFv_0x2a7940(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void TitleDraw__Fv_0x2a0ab0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void GetPoly__8CEditMapFiP6CCPolyR9mgVu0FBOXi_0x1b0780(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G363: real SetCurrentDir body (wrapped by the DC2_G363_PATHTRACE probe).
+extern void SetCurrentDir__FPc_0x148760(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void Step__14CCameraControlFi_0x2ec110(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void SetFollow__15mgCCameraFollowFfff_0x131990(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void DngMainDraw__Fv_0x1cf090(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -436,6 +438,7 @@ namespace
 
 #include "dc2_game_override_parts/title_draw_runtime.inc"
 #include "dc2_game_override_parts/frame_end_and_core_helpers.inc"
+#include "dc2_game_override_parts/g363_spheda_probes.inc"
 #include "dc2_game_override_parts/object_init_and_pad.inc"
 
 #include "dc2_game_override_parts/live_input_and_stubs.inc"
