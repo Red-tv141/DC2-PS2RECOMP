@@ -2,6 +2,7 @@
 #define PS2_RUNTIME_MACROS_H
 #include <cstdint>
 #include <cmath>
+#include <cstdlib> // G371: getenv for the COP1 saturation rollback lever
 #include <cstring>
 #include <bit>
 #if defined(_MSC_VER)
@@ -549,12 +550,138 @@ inline __m128i ps2_u64_to_epi64_pair(uint64_t value)
 #define PS2_PMFHL_LH(hi, lo) _mm_shuffle_epi32(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0))
 #define PS2_PMFHL_SH(hi, lo) _mm_shufflehi_epi16(_mm_shufflelo_epi16(_mm_packs_epi32(ps2_u64_to_epi64_pair(lo), ps2_u64_to_epi64_pair(hi)), _MM_SHUFFLE(3, 1, 2, 0)), _MM_SHUFFLE(3, 1, 2, 0))
 
-// FPU (COP1) operations
-#define FPU_ADD_S(a, b) ((float)(a) + (float)(b))
-#define FPU_SUB_S(a, b) ((float)(a) - (float)(b))
-#define FPU_MUL_S(a, b) ((float)(a) * (float)(b))
-#define FPU_DIV_S(a, b) ((float)(a) / (float)(b))
-#define FPU_SQRT_S(a) sqrtf((float)(a))
+// ---------------------------------------------------------------------------
+// FPU (COP1) operations — R5900 semantics (G371)
+//
+// The EE FPU is NOT IEEE-754. It has no Infinity, no NaN and no denormals: every
+// arithmetic result is saturated to +/-0x7F7FFFFF (1.7014118e38), and a division by zero
+// yields that same saturated magnitude with the sign of the operands. Guest code is written
+// against that: it keeps computing on saturated-but-FINITE values, and its own `!= 0.0` /
+// `<` guards keep working.
+//
+// Emitting host IEEE arithmetic instead breaks that contract in two steps. First an already
+// saturated 1.7014118e38 operand (produced legitimately by a COP2/VU0 macro op, which DOES
+// saturate here) overflows to +/-inf on the next multiply or add. Then `inf - inf` (or
+// `inf * 0`) produces a NaN, and NaN defeats every comparison the guest uses to protect
+// itself — `x != 0.0f` is TRUE for NaN, so the zero-length guards in the camera/matrix code
+// are silently bypassed.
+//
+// G371 measured exactly that chain in the first cutscene: the EE camera matrix in
+// mgRENDER_INFO (+0x1a0) and the camera position (+0x3a0) go NaN in X and Z (Y stays finite)
+// while the projection stays clean; the poison then rides the VIF into VU1, where G370 had
+// already traced it to an all-zero transformed vertex, a saturating 1/w divide, and finally
+// the NaN `q` that puts every vertex of the scene at (0,0) -> flat gray screen.
+//
+// Saturating here is the hardware behaviour, so it is default-ON. Rollback to the previous
+// IEEE arithmetic with DC2_G371_NO_FPUCLAMP=1.
+//
+// Deliberately NOT done here (would be a second mechanism, and the game shows no dependence
+// on it): denormal flush-to-zero on operands and results.
+// ---------------------------------------------------------------------------
+
+// 0x7F7FFFFF — the largest magnitude an R5900 COP1 register can hold.
+#define PS2_FPU_MAXF 3.4028234663852886e+38f
+
+// Namespace-scope inline variable, NOT a function-local static: this is read by every single
+// guest float op, and a magic-static guard load per op is exactly the class of per-op cost the
+// G268 rule is about. `getenv` runs once, at static-init time, before any guest code executes.
+inline const bool g_ps2FpuNoClamp = (std::getenv("DC2_G371_NO_FPUCLAMP") != nullptr);
+
+// G372: denormal flush-to-zero, the other half of the non-IEEE format. The EE has no denormal
+// encoding at all — an operand or result below the smallest normal is a signed zero. This is
+// exactly what the COP2/VU0-macro FMAC path has always done (its flag block folds `exp == 0 &&
+// mantissa != 0` to the sign bit alone); COP1 simply never did. Separate kill switch from the
+// saturation half so the two can be bisected independently.
+#define PS2_FPU_MIN_NORMALF 1.17549435e-38f
+inline const bool g_ps2FpuNoDenormFlush = (std::getenv("DC2_G372_NO_DENORM") != nullptr);
+
+// Saturate an arithmetic result the way the EE FPU does. The NaN case cannot arise once every
+// op is clamped, but a NaN can still be LOADED from guest memory written before this was on
+// (or by a path that bypasses COP1), so it is folded to the saturated magnitude too.
+inline float ps2_fpu_finish(float v)
+{
+    if (g_ps2FpuNoClamp)
+        return v;
+    if (v != v)
+        return PS2_FPU_MAXF;
+    if (v > PS2_FPU_MAXF)
+        return PS2_FPU_MAXF;
+    if (v < -PS2_FPU_MAXF)
+        return -PS2_FPU_MAXF;
+    if (!g_ps2FpuNoDenormFlush && v > -PS2_FPU_MIN_NORMALF && v < PS2_FPU_MIN_NORMALF)
+        return std::signbit(v) ? -0.0f : 0.0f;
+    return v;
+}
+
+// DIV.S: a zero denominator sets the D flag and returns the saturated magnitude, signed by the
+// XOR of the operand signs (this includes 0/0). No Infinity is ever produced.
+inline float ps2_fpu_div(float a, float b)
+{
+    if (g_ps2FpuNoClamp)
+    {
+        if (b == 0.0f)
+            return copysignf(INFINITY, a * 0.0f);
+        return a / b;
+    }
+    if (b == 0.0f)
+        return (std::signbit(a) != std::signbit(b)) ? -PS2_FPU_MAXF : PS2_FPU_MAXF;
+    return ps2_fpu_finish(a / b);
+}
+
+// SQRT.S: the EE takes the square root of the ABSOLUTE value (a negative operand only raises
+// the I flag); host sqrtf would return NaN.
+inline float ps2_fpu_sqrt(float a)
+{
+    if (g_ps2FpuNoClamp)
+        return sqrtf(a);
+    return sqrtf(fabsf(a));
+}
+
+// ---------------------------------------------------------------------------
+// COP2 / VU0 macro-mode Q register (G372)
+//
+// NOTE for whoever reads this next: the VU0-macro **FMAC** ops (VADD/VSUB/VMUL/VMADD/...) are
+// already PS2-correct and need nothing here — the MAC-flag block the code generator emits after
+// every one of them re-encodes the result (`exp == 0x7F800000` -> sign|0x7F7FFFFF, denormal ->
+// signed zero) *after* computing the flags from the raw value, which is both the hardware
+// saturation and the hardware flag semantics. Do not "fix" PS2_VADD/PS2_VMUL by clamping inside
+// them: that would compute the O/U flags from an already-clamped value and break them.
+//
+// What was NOT covered is the lower-pipeline Q ops, which bypass the FMAC path entirely and were
+// emitted with invented fallbacks rather than hardware behaviour:
+//   VDIV   was `(ft != 0) ? fs/ft : 0.0f`   -> hardware returns +/-MAX (sign = XOR of signs)
+//   VSQRT  was `sqrtf(max(0, ft))`          -> hardware square-roots the ABSOLUTE value
+//   VRSQRT was `(ft > 0) ? 1/sqrtf(ft) : 0` -> hardware computes `fs / sqrt(|ft|)`; it is a
+//                                              DIVIDE and it does not ignore fs
+// A normalize whose length underflows therefore produced Q = 0 (collapsing the direction to the
+// zero vector) where hardware produces a huge-but-finite Q. Same family as G371.
+// ---------------------------------------------------------------------------
+inline float ps2_vu_divq(float fs, float ft)
+{
+    if (g_ps2FpuNoClamp)
+        return (ft != 0.0f) ? (fs / ft) : 0.0f;
+    return ps2_fpu_div(fs, ft);
+}
+
+inline float ps2_vu_sqrtq(float ft)
+{
+    if (g_ps2FpuNoClamp)
+        return sqrtf(ft < 0.0f ? 0.0f : ft);
+    return ps2_fpu_finish(sqrtf(fabsf(ft)));
+}
+
+inline float ps2_vu_rsqrtq(float fs, float ft)
+{
+    if (g_ps2FpuNoClamp)
+        return (ft > 0.0f) ? (1.0f / sqrtf(ft)) : 0.0f;
+    return ps2_fpu_div(fs, sqrtf(fabsf(ft)));
+}
+
+#define FPU_ADD_S(a, b) ps2_fpu_finish((float)(a) + (float)(b))
+#define FPU_SUB_S(a, b) ps2_fpu_finish((float)(a) - (float)(b))
+#define FPU_MUL_S(a, b) ps2_fpu_finish((float)(a) * (float)(b))
+#define FPU_DIV_S(a, b) ps2_fpu_div((float)(a), (float)(b))
+#define FPU_SQRT_S(a) ps2_fpu_sqrt((float)(a))
 #define FPU_ABS_S(a) fabsf((float)(a))
 #define FPU_MOV_S(a) ((float)(a))
 #define FPU_NEG_S(a) (-(float)(a))
