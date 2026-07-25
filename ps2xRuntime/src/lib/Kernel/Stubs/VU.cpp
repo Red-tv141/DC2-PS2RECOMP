@@ -140,6 +140,64 @@ namespace ps2_stubs
             out[15] = 1.0f;
         }
 
+        // G372: single source of truth for the three single-axis rotation stubs, so that
+        // sceVu0RotMatrix (which the hardware implements purely by chaining Z -> Y -> X) cannot
+        // drift from sceVu0RotMatrix{X,Y,Z}. axis: 0 = X, 1 = Y, 2 = Z.
+        void vu0RotateAxis(uint8_t *rdram, uint32_t dstAddr, uint32_t srcAddr, float angle, int axis)
+        {
+            float src[16]{}, rot[16]{}, out[16]{};
+            if (!readVuMatrix4f(rdram, srcAddr, src))
+                return;
+            makeIdentityMatrix(rot);
+            const float cs = std::cos(angle);
+            const float sn = std::sin(angle);
+            switch (axis)
+            {
+            case 0: rot[5] = cs;  rot[6] = sn;  rot[9] = -sn; rot[10] = cs; break;
+            case 1: rot[0] = cs;  rot[2] = -sn; rot[8] = sn;  rot[10] = cs; break;
+            default: rot[0] = cs; rot[1] = sn;  rot[4] = -sn; rot[5] = cs;  break;
+            }
+            mulVuMatrix(src, rot, out);
+            (void)writeVuMatrix4f(rdram, dstAddr, out);
+        }
+
+        // G373 (diagnostic, default-off: DC2_G373_THROW=1) — instrument the item-throw vector.
+        //
+        // `ThrowItemObject__12CActionCharaFv` @0x0016AF40 builds the thrown object's target as:
+        //     dir  = copy of  this+0x690            (sceVu0CopyVector,  ra=0x16AF80)
+        //     pos  = (*vtable[0x18])(this)          (writes sp+0x30)
+        //     dir  = dir * 120.0f                   (sceVu0ScaleVector, ra=0x16AFA8, f12=0x42F00000)
+        //     out  = dir + pos                      (sceVu0AddVector,   ra=0x16AFB8)
+        //     SetScriptVect1(effectMan, out, ...)
+        // so a wrong throw direction is either a wrong `this+0x690` direction vector or a wrong
+        // vtable[0x18] position — and this prints both, plus the result, without needing a hook on
+        // the recompiled function itself.
+        //
+        // The recompiled body writes real guest return addresses into $ra before each stub call,
+        // so gating on `ra` inside the function's extent isolates THIS call site from the hundreds
+        // of other sceVu0* callers per frame.
+        static const bool s_DC2_G373_THROW = (std::getenv("DC2_G373_THROW") != nullptr);
+        constexpr uint32_t kG373ThrowLo = 0x0016AF40u;
+        constexpr uint32_t kG373ThrowHi = 0x0016B020u;
+
+        bool g373InThrow(const R5900Context *ctx)
+        {
+            if (!s_DC2_G373_THROW || ctx == nullptr)
+                return false;
+            const uint32_t ra = getRegU32(ctx, 31);
+            return ra >= kG373ThrowLo && ra < kG373ThrowHi;
+        }
+
+        void g373NoteThrow(const char *what, const R5900Context *ctx, uint32_t addr,
+                           const float *v, float scale)
+        {
+            std::fprintf(stderr, "[G373:throw] %-5s ra=0x%06x addr=0x%08x v=(% .4f % .4f % .4f % .4f)",
+                         what, getRegU32(ctx, 31), addr, v[0], v[1], v[2], v[3]);
+            if (scale == scale && scale != 0.0f)
+                std::fprintf(stderr, " f12=% .4f", scale);
+            std::fprintf(stderr, "\n");
+        }
+
         float dotVuVec3(const float (&lhs)[4], const float (&rhs)[4])
         {
             return (lhs[0] * rhs[0]) + (lhs[1] * rhs[1]) + (lhs[2] * rhs[2]);
@@ -187,6 +245,12 @@ namespace ps2_stubs
                 out[i] = lhs[i] + rhs[i];
             }
             (void)writeVuVec4f(rdram, dstAddr, out);
+            if (g373InThrow(ctx))
+            {
+                g373NoteThrow("velo", ctx, lhsAddr, lhs, 0.0f); // dir * 120
+                g373NoteThrow("pos ", ctx, rhsAddr, rhs, 0.0f); // vtable[0x18] output
+                g373NoteThrow("targ", ctx, dstAddr, out, 0.0f); // what SetScriptVect1 receives
+            }
         }
         setReturnS32(ctx, 0);
     }
@@ -329,6 +393,12 @@ namespace ps2_stubs
         if (dst && src)
         {
             std::memcpy(dst, src, sizeof(float) * 4u);
+            if (g373InThrow(ctx))
+            {
+                float v[4];
+                std::memcpy(v, src, sizeof(v));
+                g373NoteThrow("dir", ctx, srcAddr, v, 0.0f); // this+0x690, the facing vector
+            }
         }
         setReturnS32(ctx, 0);
     }
@@ -357,7 +427,10 @@ namespace ps2_stubs
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         const float scale = ctx ? ctx->f[12] : 0.0f;
-        const float q = 1.0f / scale; // matches VU vdiv (scale==0 -> inf, as on HW)
+        // G372: the VU has no Infinity. VDIV with a zero denominator returns +/-0x7F7FFFFF
+        // (sign = XOR of the operand signs), not inf — the comment this replaces had the
+        // hardware rule backwards, and the inf it produced became a NaN one multiply later.
+        const float q = ps2_fpu_div(1.0f, scale);
         float v[4]{};
         if (readVuVec4f(rdram, srcAddr, v))
         {
@@ -374,7 +447,7 @@ namespace ps2_stubs
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         const float scale = ctx ? ctx->f[12] : 0.0f;
-        const float q = 1.0f / scale;
+        const float q = ps2_fpu_div(1.0f, scale); // G372: VU saturation, never inf
         float v[4]{};
         if (readVuVec4f(rdram, srcAddr, v))
         {
@@ -424,6 +497,14 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // G372: the dot product is THREE-component, not four. Real sceVu0InnerProduct @0x00106F58:
+    //   vmul.xyz vf5,vf4,vf5 ; vaddy.x vf5,vf5,vf5 ; vaddz.x vf5,vf5,vf5 ; qmfc2 v0,vf5
+    // i.e. x*x' + y*y' + z*z' — the W lane is multiplied by nothing and never summed.
+    // Including W (the pre-G372 code) silently corrupted every dot product taken against a
+    // POSITION vector, which carries w=1.0 by convention: `dot += 1*1` added a constant 1 to
+    // distances, projections, reflections and angle tests. Same defect class as G233
+    // (sceVu0Normalize summing 4 lanes instead of the VU0 ESADD's 3) — this is that audit's
+    // second hit; the callers most affected are physics/trajectory, not rendering.
     void sceVu0InnerProduct(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t lhsAddr = getRegU32(ctx, 4);
@@ -432,7 +513,7 @@ namespace ps2_stubs
         float dot = 0.0f;
         if (readVuVec4f(rdram, lhsAddr, lhs) && readVuVec4f(rdram, rhsAddr, rhs))
         {
-            dot = (lhs[0] * rhs[0]) + (lhs[1] * rhs[1]) + (lhs[2] * rhs[2]) + (lhs[3] * rhs[3]);
+            dot = (lhs[0] * rhs[0]) + (lhs[1] * rhs[1]) + (lhs[2] * rhs[2]);
         }
 
         if (ctx)
@@ -666,29 +747,39 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // G372: was an unimplemented TODO that left the destination matrix STALE while returning -1.
+    // Reachable from `DrawEffect__11CCharacter2Fv` @0x00177CB0 and `LightingEdit__FP6CScene`
+    // @0x001A8440. Real sceVu0RotMatrix @0x00107480 is pure composition, in this order:
+    //   RotMatrixZ(dst, src, angles[2]) -> RotMatrixY(dst, dst, angles[1])
+    //                                   -> RotMatrixX(dst, dst, angles[0])   (tail call)
+    // a0=dst, a1=src matrix, a2=pointer to the three angles.
     void sceVu0RotMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceVu0RotMatrix", rdram, ctx, runtime);
+        const uint32_t dstAddr = getRegU32(ctx, 4);
+        const uint32_t srcAddr = getRegU32(ctx, 5);
+        const uint32_t angleAddr = getRegU32(ctx, 6);
+        float angles[4]{};
+        if (!readVuVec4f(rdram, angleAddr, angles))
+        {
+            setReturnS32(ctx, 0);
+            return;
+        }
+
+        // Chain the same single-axis helper the X/Y/Z stubs use, in the real function's order.
+        // The first pass reads `src`; the following two read back `dst`. Guest registers are
+        // left alone (the real chain reloads a0/a1 itself, so nothing observable depends on it).
+        vu0RotateAxis(rdram, dstAddr, srcAddr, angles[2], 2);
+        vu0RotateAxis(rdram, dstAddr, dstAddr, angles[1], 1);
+        vu0RotateAxis(rdram, dstAddr, dstAddr, angles[0], 0);
+        setReturnS32(ctx, 0);
     }
 
     void sceVu0RotMatrixX(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
-        const float angle = ctx ? ctx->f[12] : 0.0f;
-        float src[16]{}, rot[16]{}, out[16]{};
-        if (readVuMatrix4f(rdram, srcAddr, src))
-        {
-            makeIdentityMatrix(rot);
-            const float cs = std::cos(angle);
-            const float sn = std::sin(angle);
-            rot[5] = cs;
-            rot[6] = sn;
-            rot[9] = -sn;
-            rot[10] = cs;
-            mulVuMatrix(src, rot, out);
-            (void)writeVuMatrix4f(rdram, dstAddr, out);
-        }
+        // G372: shared with sceVu0RotMatrix, which the hardware builds by chaining these.
+        vu0RotateAxis(rdram, dstAddr, srcAddr, ctx ? ctx->f[12] : 0.0f, 0);
         setReturnS32(ctx, 0);
     }
 
@@ -696,20 +787,8 @@ namespace ps2_stubs
     {
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
-        const float angle = ctx ? ctx->f[12] : 0.0f;
-        float src[16]{}, rot[16]{}, out[16]{};
-        if (readVuMatrix4f(rdram, srcAddr, src))
-        {
-            makeIdentityMatrix(rot);
-            const float cs = std::cos(angle);
-            const float sn = std::sin(angle);
-            rot[0] = cs;
-            rot[2] = -sn;
-            rot[8] = sn;
-            rot[10] = cs;
-            mulVuMatrix(src, rot, out);
-            (void)writeVuMatrix4f(rdram, dstAddr, out);
-        }
+        // G372: shared with sceVu0RotMatrix, which the hardware builds by chaining these.
+        vu0RotateAxis(rdram, dstAddr, srcAddr, ctx ? ctx->f[12] : 0.0f, 1);
         setReturnS32(ctx, 0);
     }
 
@@ -717,20 +796,8 @@ namespace ps2_stubs
     {
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
-        const float angle = ctx ? ctx->f[12] : 0.0f;
-        float src[16]{}, rot[16]{}, out[16]{};
-        if (readVuMatrix4f(rdram, srcAddr, src))
-        {
-            makeIdentityMatrix(rot);
-            const float cs = std::cos(angle);
-            const float sn = std::sin(angle);
-            rot[0] = cs;
-            rot[1] = sn;
-            rot[4] = -sn;
-            rot[5] = cs;
-            mulVuMatrix(src, rot, out);
-            (void)writeVuMatrix4f(rdram, dstAddr, out);
-        }
+        // G372: shared with sceVu0RotMatrix, which the hardware builds by chaining these.
+        vu0RotateAxis(rdram, dstAddr, srcAddr, ctx ? ctx->f[12] : 0.0f, 2);
         setReturnS32(ctx, 0);
     }
 
@@ -749,16 +816,13 @@ namespace ps2_stubs
         const uint32_t dstAddr = getRegU32(ctx, 4);
         const uint32_t srcAddr = getRegU32(ctx, 5);
         float src[4]{}, out[4]{};
-        float scale = ctx ? ctx->f[12] : 0.0f;
-        if (scale == 0.0f)
-        {
-            uint32_t raw = getRegU32(ctx, 6);
-            std::memcpy(&scale, &raw, sizeof(scale));
-            if (scale == 0.0f)
-            {
-                scale = static_cast<float>(getRegU32(ctx, 6));
-            }
-        }
+        // G372: the scale is `f12` and ONLY `f12`. Real sceVu0ScaleVector @0x00107128:
+        //   lqc2 vf4,(a1) ; mfc1 t0,f12 ; qmtc2 t0,vf5 ; vmulx.xyzw vf6,vf4,vf5 ; sqc2 vf6,(a0)
+        // — $a2 is not read at all. The pre-G372 code treated `f12 == 0` as "argument missing"
+        // and substituted $a2's raw bits reinterpreted as a float (then as an integer), so a
+        // LEGITIMATE scale of 0.0 — the ordinary way to zero a velocity or a delta — multiplied
+        // the vector by an arbitrary leftover register value instead of by zero.
+        const float scale = ctx ? ctx->f[12] : 0.0f;
 
         if (readVuVec4f(rdram, srcAddr, src))
         {
@@ -767,6 +831,11 @@ namespace ps2_stubs
                 out[i] = src[i] * scale;
             }
             (void)writeVuVec4f(rdram, dstAddr, out);
+            if (g373InThrow(ctx))
+            {
+                g373NoteThrow("scl<", ctx, srcAddr, src, scale);
+                g373NoteThrow("scl>", ctx, dstAddr, out, 0.0f);
+            }
         }
         setReturnS32(ctx, 0);
     }
@@ -806,9 +875,28 @@ namespace ps2_stubs
         setReturnS32(ctx, 0);
     }
 
+    // G372: was an unimplemented TODO that left the destination matrix STALE while returning -1.
+    // It is reachable — `Draw Effect__11CCharacter2Fv` @0x00177CB0 calls it twice. Real
+    // sceVu0TransMatrix @0x00107140:
+    //   lqc2 vf4,(a2) ; lqc2 vf5,0x30(a1) ; lq a3,(a1) ; lq t0,0x10(a1) ; lq t1,0x20(a1)
+    //   vadd.xyz vf5,vf5,vf4 ; sq a3,(a0) ; sq t0,0x10(a0) ; sq t1,0x20(a0) ; sqc2 vf5,0x30(a0)
+    // i.e. rows 0..2 copied verbatim, row 3 (the translation) gets the a2 vector ADDED in XYZ
+    // with W preserved. a0=dst, a1=src matrix, a2=translation.
     void sceVu0TransMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        TODO_NAMED("sceVu0TransMatrix", rdram, ctx, runtime);
+        const uint32_t dstAddr = getRegU32(ctx, 4);
+        const uint32_t srcAddr = getRegU32(ctx, 5);
+        const uint32_t transAddr = getRegU32(ctx, 6);
+        float m[16]{}, t[4]{};
+        if (readVuMatrix4f(rdram, srcAddr, m) && readVuVec4f(rdram, transAddr, t))
+        {
+            m[12] += t[0];
+            m[13] += t[1];
+            m[14] += t[2];
+            // m[15] (W) deliberately untouched: `vadd.xyz` leaves the W lane alone.
+            (void)writeVuMatrix4f(rdram, dstAddr, m);
+        }
+        setReturnS32(ctx, 0);
     }
 
     void sceVu0TransposeMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

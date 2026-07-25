@@ -918,16 +918,85 @@ namespace ps2_stubs
         setReturnS32(ctx, ret);
     }
 
+    // ---------------------------------------------------------------------------
+    // G373: the SOFTWARE-DOUBLE libm ABI.
+    //
+    // The EE FPU is single-precision only — it has no double-precision registers and no
+    // double-precision instructions. Metrowerks therefore implements `double` in SOFTWARE, in the
+    // 64-bit integer GPRs: `fptodp` @0x002893C0 widens a float to a double, `dpmul` @0x00287FF8
+    // multiplies two of them, `dptofp` @0x002887C8 narrows back. The double-precision libm entry
+    // points (`sin` @0x0011E1C0, `cos` @0x0011DA28, ...) follow the same convention:
+    //
+    //     argument(s): $a0 (and $a1 for two-argument functions), each a full 64-bit IEEE-754
+    //                  double BIT PATTERN held in one 64-bit GPR
+    //     result:      $v0, same encoding
+    //
+    // Proof, from the guest `sin` prologue: `move v0,a0 ; dsra32 a1,v0,0 ; and a1,a1,0x7FFFFFFF ;
+    // slt v0,0x3FE921FB,a1` — it extracts the HIGH WORD of $a0 and compares it against the high
+    // word of the double pi/4. `fabs` @0x0011DB30 likewise just clears bit 63 of $a0.
+    //
+    // These stubs previously read `ctx->f[12]` and wrote `ctx->f[0]` — the single-precision ABI.
+    // That is not merely imprecise, it returns NOTHING the caller reads: the caller takes its
+    // result from $v0, which the stub never touched, so it silently consumed whatever $v0 happened
+    // to hold. In `Throw__4CPotFv` @0x002CCEF0 that stale $v0 is the output of the immediately
+    // preceding `fptodp`, i.e. the throw ANGLE itself instead of its sine/cosine:
+    //     vel.x = 10.0 * sin(angle)  became  vel.x = 10.0 * angle
+    //     vel.z = 10.0 * cos(angle)  became  vel.z = 10.0 * angle   (identical to x)
+    // so every thrown object flew along the x==z diagonal at a speed proportional to the raw
+    // angle in radians. Same defect for every other double-precision libm caller in the game.
+    // ---------------------------------------------------------------------------
+    namespace
+    {
+        double ps2GetDoubleArg(const R5900Context *ctx, int reg)
+        {
+            if (ctx == nullptr)
+                return 0.0;
+            const uint64_t bits = GPR_U64(ctx, reg);
+            double d;
+            std::memcpy(&d, &bits, sizeof(d));
+            return d;
+        }
+
+        void ps2SetDoubleReturn(R5900Context *ctx, double value)
+        {
+            if (ctx == nullptr)
+                return;
+            uint64_t bits;
+            std::memcpy(&bits, &value, sizeof(bits));
+            SET_GPR_U64(ctx, 2, bits); // $v0
+        }
+
+        // G373 (diagnostic, default-off: DC2_G373_THROW=1) — prove the software-double ABI in
+        // the live game. `Throw__4CPotFv` @0x002CCEF0 calls sin then cos with the same angle
+        // (ra = 0x002CCF78 and 0x002CCFAC respectively), so a correct run prints one sin/cos pair
+        // per throw with sin^2+cos^2 == 1. Before the fix the caller read a stale $v0 and both
+        // components came out equal to the raw angle.
+        static const bool s_DC2_G373_THROW = (std::getenv("DC2_G373_THROW") != nullptr);
+
+        void g373NoteLibm(const char *fn, const R5900Context *ctx, double in, double out)
+        {
+            if (!s_DC2_G373_THROW || ctx == nullptr)
+                return;
+            static std::atomic<uint32_t> s_n{0};
+            const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed);
+            if (n >= 400u)
+                return;
+            std::fprintf(stderr, "[G373:libm] %-5s ra=0x%06x in=% .6f out=% .6f\n",
+                         fn, getRegU32(ctx, 31), in, out);
+        }
+    }
+
     void sqrt(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::sqrtf(arg);
+        ps2SetDoubleReturn(ctx, ::sqrt(ps2GetDoubleArg(ctx, 4)));
     }
 
     void sin(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::sinf(arg);
+        const double in = ps2GetDoubleArg(ctx, 4);
+        const double out = ::sin(in);
+        ps2SetDoubleReturn(ctx, out);
+        g373NoteLibm("sin", ctx, in, out);
     }
 
     void __kernel_sinf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -940,8 +1009,10 @@ namespace ps2_stubs
 
     void cos(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::cosf(arg);
+        const double in = ps2GetDoubleArg(ctx, 4);
+        const double out = ::cos(in);
+        ps2SetDoubleReturn(ctx, out);
+        g373NoteLibm("cos", ctx, in, out);
     }
 
     void __kernel_cosf(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -982,16 +1053,14 @@ namespace ps2_stubs
 
     void atan2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float y = ctx->f[12];
-        float x = ctx->f[14];
-        ctx->f[0] = ::atan2f(y, x);
+        // $a0 = y, $a1 = x (guest prologue: `move s1,a1 ; move s0,a0`).
+        ps2SetDoubleReturn(ctx, ::atan2(ps2GetDoubleArg(ctx, 4), ps2GetDoubleArg(ctx, 5)));
     }
 
     void pow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float base = ctx->f[12];
-        float exp = ctx->f[14];
-        ctx->f[0] = ::powf(base, exp);
+        // $a0 = base, $a1 = exponent (guest prologue: `move s2,a0 ; move s0,a1`).
+        ps2SetDoubleReturn(ctx, ::pow(ps2GetDoubleArg(ctx, 4), ps2GetDoubleArg(ctx, 5)));
     }
 
     void exp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1020,14 +1089,13 @@ namespace ps2_stubs
 
     void floor(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::floorf(arg);
+        ps2SetDoubleReturn(ctx, ::floor(ps2GetDoubleArg(ctx, 4)));
     }
 
     void fabs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::fabsf(arg);
+        // The guest body is pure bit manipulation on $a0 (clear bit 63), so this is exact.
+        ps2SetDoubleReturn(ctx, ::fabs(ps2GetDoubleArg(ctx, 4)));
     }
     void abs(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
@@ -1042,21 +1110,10 @@ namespace ps2_stubs
 
     void atan(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float in = ctx ? ctx->f[12] : 0.0f;
-        if (in == 0.0f)
-        {
-            uint32_t raw = getRegU32(ctx, 4);
-            std::memcpy(&in, &raw, sizeof(in));
-        }
-        const float out = std::atan(in);
-        if (ctx)
-        {
-            ctx->f[0] = out;
-        }
-
-        uint32_t outRaw = 0u;
-        std::memcpy(&outRaw, &out, sizeof(outRaw));
-        setReturnU32(ctx, outRaw);
+        // Previously this read $a0's LOW 32 BITS as a float when f12 happened to be 0, and returned
+        // a 32-bit float pattern through setReturnU32 (which sign-extends). Both halves were wrong:
+        // the value is a full 64-bit double in $a0, and the result belongs in $v0 as a double.
+        ps2SetDoubleReturn(ctx, ::atan(ps2GetDoubleArg(ctx, 4)));
     }
 
     void memchr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

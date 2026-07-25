@@ -1,6 +1,8 @@
 #include "Common.h"
 #include "MemoryCard.h"
 
+#include <cstdarg>
+
 namespace ps2_stubs
 {
     namespace
@@ -82,6 +84,59 @@ namespace ps2_stubs
             bool formatted = true;
         };
 
+        // G374: opt-in libmc call trace (`DC2_G374_MC_TRACE=1`). Bounded so a long run
+        // cannot flood stderr. Never call getenv per-call — cached in a function-local
+        // static (see the getenv hot-path rule from G268).
+        bool mcTraceEnabled()
+        {
+            static const bool s_on = []() {
+                const char *v = std::getenv("DC2_G374_MC_TRACE");
+                return v != nullptr && *v != '\0' && *v != '0';
+            }();
+            return s_on;
+        }
+
+        void mcTrace(const char *fmt, ...)
+        {
+            if (!mcTraceEnabled())
+            {
+                return;
+            }
+
+            static std::atomic<uint32_t> s_count{0};
+            if (s_count.fetch_add(1u) >= 4096u)
+            {
+                return;
+            }
+
+            std::va_list args;
+            va_start(args, fmt);
+            std::fprintf(stderr, "[G374:mc] ");
+            std::vfprintf(stderr, fmt, args);
+            va_end(args);
+            std::fputc('\n', stderr);
+            std::fflush(stderr);
+        }
+
+        // G374 ROOT FIX #2 — argument ABI. These stubs used to fetch the 5th and later
+        // arguments off the caller's stack (the o32 convention). The R5900 EE ABI the game
+        // is built with passes the first EIGHT integer arguments in registers: $a0-$a3
+        // ($4-$7) then $t0-$t3 ($8-$11). Proven from the guest prologues:
+        //   sceMcGetInfo @0x00122F20:  `move s5,t0`      -> arg5 (the FORMAT out-pointer)
+        //   sceMcGetDir  @0x00123118:  `move s1,t0` / `move s2,t1` -> args 5 and 6
+        // Reading arg5 off the stack returned garbage (observed: 0x0000000A), so
+        // sceMcGetInfo wrote the "card is formatted" flag to a junk address instead of
+        // MC_CARD_INFO[2]. The field stayed 0, and every `info[2] == 0` test in the save
+        // menu (CSaveMenuClass::KeyStep, SubGameSaveKey) read "unformatted" and pushed the
+        // player into the format prompt. Same class of defect as G373: a hand-written
+        // stub's register convention guessed instead of read from the guest prologue.
+        uint32_t getArgU32(R5900Context *ctx, int index)
+        {
+            // 0..3 -> $a0-$a3 ($4-$7); 4..7 -> $t0-$t3 ($8-$11).
+            const int reg = (index < 4) ? (4 + index) : (8 + (index - 4));
+            return getRegU32(ctx, reg);
+        }
+
         std::mutex g_mcStateMutex;
         int32_t g_mcNextFd = 1;
         int32_t g_mcLastCmd = 0;
@@ -94,9 +149,31 @@ namespace ps2_stubs
         constexpr int32_t kCvMcConfigCapacityBytes = 0x00008000;
         constexpr int32_t kCvMcIconCapacityBytes = 0x00004000;
 
+        // G374 ROOT FIX. This gate used to demand `slot == 0`, which rejected EVERY libmc
+        // call DC2 makes: the game passes slot = 1 at every call site
+        // (`sceMcGetInfo(SlotSelect, 1, ...)`, `sceMcChdir(SlotSelect, 1, ...)`, ... — see
+        // `CMemoryCardManager::SearchMcType` @0x002F21E0). With the gate failing,
+        // sceMcGetInfo wrote cardType = 0 / format = 0 and reported kMcResultNoEntry, so
+        // `McCheckMCPs2` @0x002F5390 (which requires MC_CARD_INFO[1] == 2) answered "no
+        // card" and the save UI refused to open.
+        //
+        // On real hardware the slot argument only selects a multitap sub-slot; mcserv
+        // serves the base card for the non-multitap slots the game uses, so accepting any
+        // slot on a valid port is the faithful behaviour, not a workaround.
+        // Rollback lever: DC2_G374_NO_MC_SLOT=1 restores the old slot == 0 gate.
         bool isValidMcPortSlot(int32_t port, int32_t slot)
         {
-            return port >= 0 && port < static_cast<int32_t>(g_mcPorts.size()) && slot == 0;
+            if (port < 0 || port >= static_cast<int32_t>(g_mcPorts.size()))
+            {
+                return false;
+            }
+
+            static const bool s_strictSlot = []() {
+                const char *v = std::getenv("DC2_G374_NO_MC_SLOT");
+                return v != nullptr && *v != '\0' && *v != '0';
+            }();
+
+            return s_strictSlot ? (slot == 0) : true;
         }
 
         std::filesystem::path getMcRootPath(int32_t port)
@@ -339,7 +416,17 @@ namespace ps2_stubs
                 }
             }
 
-            while (patternPos < pattern.size() && pattern[patternPos] == '*')
+            // G374 ROOT FIX #3. A trailing '?' must also match the END of the name, not
+            // just one character. DC2 CREATES its save directories with
+            // `"BASCUS-97213dkcl%d"` (slot 0 -> "BASCUS-97213dkcl0", a ONE-digit suffix)
+            // but ENUMERATES them with the query `"BASCUS-97213dkcl??"` — see
+            // `CMemoryCardManager::MakeDir` @0x002F2550 and the query observed in the
+            // sceMcGetDir trace. Under a strict "'?' == exactly one character" matcher the
+            // game can never find the saves it just wrote, so the save list came back
+            // empty. mcserv's matcher accepts the short name; a strict matcher is what was
+            // wrong here, and the game's own create/search pair is the proof.
+            while (patternPos < pattern.size() &&
+                   (pattern[patternPos] == '*' || pattern[patternPos] == '?'))
             {
                 ++patternPos;
             }
@@ -509,6 +596,8 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdChdir, result);
         }
+        mcTrace("Chdir port=%d slot=%d req='%s' cwd='%s' -> %d",
+                port, slot, requestedDir.c_str(), currentDir.c_str(), result);
 
         writeMcCString(rdram, currentDirAddr, currentDir);
         setReturnS32(ctx, 0);
@@ -531,6 +620,7 @@ namespace ps2_stubs
             }
             setMcCommandResultLocked(kMcCmdClose, result);
         }
+        mcTrace("Close fd=%d -> %d", fd, result);
         setReturnS32(ctx, 0);
     }
 
@@ -579,6 +669,7 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdDelete, result);
         }
+        mcTrace("Delete -> %d", result);
         setReturnS32(ctx, 0);
     }
 
@@ -613,6 +704,7 @@ namespace ps2_stubs
             }
             setMcCommandResultLocked(kMcCmdFlush, result);
         }
+        mcTrace("Flush fd=%d -> %d", fd, result);
         setReturnS32(ctx, 0);
     }
 
@@ -643,6 +735,7 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdFormat, result);
         }
+        mcTrace("Format port=%d slot=%d -> %d", port, slot, result);
         setReturnS32(ctx, 0);
     }
 
@@ -651,8 +744,8 @@ namespace ps2_stubs
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string rawPath = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
-        const int32_t maxEntries = static_cast<int32_t>(readStackU32(rdram, ctx, 16));
-        const uint32_t tableAddr = readStackU32(rdram, ctx, 20);
+        const int32_t maxEntries = static_cast<int32_t>(getArgU32(ctx, 4)); // $t0
+        const uint32_t tableAddr = getArgU32(ctx, 5);                       // $t1
 
         std::vector<SceMcTblGetDir> entries;
         int32_t result = kMcResultNoEntry;
@@ -794,6 +887,9 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdGetDir, result);
         }
+        mcTrace("GetDir port=%d slot=%d query='%s' mode=%u max=%d table=0x%08x -> %d",
+                port, slot, rawPath.c_str(), static_cast<unsigned>(getRegU32(ctx, 7)),
+                maxEntries, tableAddr, result);
         setReturnS32(ctx, 0);
     }
 
@@ -808,7 +904,7 @@ namespace ps2_stubs
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const uint32_t typePtr = getRegU32(ctx, 6);
         const uint32_t freePtr = getRegU32(ctx, 7);
-        const uint32_t formatPtr = readStackU32(rdram, ctx, 16);
+        const uint32_t formatPtr = getArgU32(ctx, 4); // $t0 — see getArgU32 above
 
         int32_t cardType = 0;
         int32_t freeBlocks = 0;
@@ -848,6 +944,26 @@ namespace ps2_stubs
             if (uint8_t *out = getMemPtr(rdram, formatPtr))
             {
                 std::memcpy(out, &format, sizeof(format));
+            }
+        }
+
+        mcTrace("GetInfo port=%d slot=%d -> type=%d free=%d format=%d result=%d",
+                port, slot, cardType, freeBlocks, format, result);
+
+        // G374 diagnostic: the guest passes `&MC_CARD_INFO.format` as the 5th arg
+        // (`sceMcGetInfo(port, 1, &info[1], &info[5], &info[2])` in
+        // `CMemoryCardManager::SearchMcType`), so the struct base is formatPtr - 8. Dump
+        // the whole 8-word record: info[0]=present, [1]=type, [2]=format, [3]=changed,
+        // [5]=free, [7]=last sync result. This is what `McCheckMCPs2` and the save menu's
+        // "is it formatted" test (`info[2] == 0`) actually read.
+        if (mcTraceEnabled() && formatPtr >= 8u)
+        {
+            if (const uint8_t *base = getMemPtr(rdram, formatPtr - 8u))
+            {
+                int32_t w[8];
+                std::memcpy(w, base, sizeof(w));
+                mcTrace("  MC_CARD_INFO@0x%08x = [%d %d %d %d %d %d %d %d]",
+                        formatPtr - 8u, w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
             }
         }
 
@@ -919,6 +1035,7 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdMkdir, result);
         }
+        mcTrace("Mkdir port=%d slot=%d path='%s' -> %d", port, slot, path.c_str(), result);
         setReturnS32(ctx, 0);
     }
 
@@ -982,6 +1099,8 @@ namespace ps2_stubs
             }
             setMcCommandResultLocked(kMcCmdOpen, result);
         }
+        mcTrace("Open port=%d slot=%d path='%s' flags=0x%x -> %d",
+                port, slot, path.c_str(), static_cast<unsigned>(flags), result);
         setReturnS32(ctx, 0);
     }
 
@@ -1020,6 +1139,7 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdRead, result);
         }
+        mcTrace("Read fd=%d size=%d -> %d", fd, size, result);
         setReturnS32(ctx, 0);
     }
 
@@ -1096,6 +1216,7 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdSeek, result);
         }
+        mcTrace("Seek fd=%d -> %d", fd, result);
         setReturnS32(ctx, 0);
     }
 
@@ -1129,6 +1250,7 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdSetFileInfo, result);
         }
+        mcTrace("SetFileInfo -> %d", result);
         setReturnS32(ctx, 0);
     }
 
@@ -1158,6 +1280,8 @@ namespace ps2_stubs
                 std::memcpy(out, &result, sizeof(result));
             }
         }
+
+        mcTrace("Sync -> cmd=%d result=%d", cmd, result);
 
         // 1 = command finished in this runtime's immediate model.
         setReturnS32(ctx, 1);
@@ -1232,6 +1356,7 @@ namespace ps2_stubs
 
             setMcCommandResultLocked(kMcCmdWrite, result);
         }
+        mcTrace("Write fd=%d size=%d -> %d", fd, size, result);
         setReturnS32(ctx, 0);
     }
 
