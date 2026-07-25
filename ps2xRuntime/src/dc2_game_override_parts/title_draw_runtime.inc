@@ -344,6 +344,58 @@ static const std::vector<F40RStick> &f40_get_rstick_events()
     return events;
 }
 
+// G374: parse DC2_LSTICK into per-frame LEFT-stick (lx,ly) byte pairs. Unlike DC2_RSTICK's
+// direction tokens this carries the raw recorded axis bytes, so replay_from_rec.py can
+// reproduce an analog walk exactly rather than quantising it to 4 directions.
+//   "start..end:0xLX,0xLY;..."   (0x80 = centre)
+struct F40LStick { uint32_t frame; uint8_t lx; uint8_t ly; };
+static const std::vector<F40LStick> &f40_get_lstick_events()
+{
+    static std::vector<F40LStick> events = []() {
+        std::vector<F40LStick> ev;
+        const char *spec = std::getenv("DC2_LSTICK");
+        if (!spec || !*spec) return ev;
+        const char *p = spec;
+        while (*p)
+        {
+            while (*p == ' ' || *p == '\t') ++p;
+            char *end;
+            const uint32_t firstFrame = static_cast<uint32_t>(std::strtoul(p, &end, 10));
+            if (end == p) break;
+            uint32_t rangeStart = firstFrame, rangeEnd = firstFrame;
+            if (end[0] == '.' && end[1] == '.')
+            {
+                p = end + 2;
+                rangeEnd = static_cast<uint32_t>(std::strtoul(p, &end, 10));
+                if (end == p || *end != ':') break;
+                if (rangeEnd < rangeStart) std::swap(rangeStart, rangeEnd);
+                p = end + 1;
+            }
+            else if (*end == ':') { p = end + 1; }
+            else break;
+
+            const unsigned long lxv = std::strtoul(p, &end, 0);
+            if (end == p || *end != ',') break;
+            p = end + 1;
+            const unsigned long lyv = std::strtoul(p, &end, 0);
+            if (end == p) break;
+            p = end;
+
+            const uint8_t lx = static_cast<uint8_t>(lxv & 0xFFu);
+            const uint8_t ly = static_cast<uint8_t>(lyv & 0xFFu);
+            for (uint32_t f = rangeStart; f <= rangeEnd; ++f)
+            {
+                ev.push_back({f, lx, ly});
+                if (f == 0xFFFFFFFFu) break;
+            }
+            while (*p && *p != ';') ++p;
+            if (*p == ';') ++p;
+        }
+        return ev;
+    }();
+    return events;
+}
+
 static uint16_t f40_scripted_press_for_frame_range(uint32_t firstFrame, uint32_t lastFrame)
 {
     if (firstFrame > lastFrame)
@@ -501,6 +553,22 @@ static void f40_drive_pad(uint32_t frame, uint32_t loopNo)
             if (e.frame >= rangeStart && e.frame <= frame) { rx = e.rx; ry = e.ry; found = true; }
         if (found) { g_f40_rx = rx; g_f40_ry = ry; }
         else { g_f40_rx = 0x80u; g_f40_ry = 0x80u; }
+    }
+
+    // G374: same latch for the scripted LEFT stick (DC2_LSTICK). Inert (and
+    // g_f40_lstick_active stays false, so the F66 dungeon driver keeps ownership of the
+    // left stick) unless DC2_LSTICK was configured.
+    {
+        const auto &lev = f40_get_lstick_events();
+        if (!lev.empty())
+        {
+            uint8_t lx = 0x80u, ly = 0x80u;
+            for (const auto &e : lev)
+                if (e.frame >= rangeStart && e.frame <= frame) { lx = e.lx; ly = e.ly; }
+            g_f40_lx = lx;
+            g_f40_ly = ly;
+            g_f40_lstick_active = true;
+        }
     }
 
     // Keep Cross-window confirmations from being consumed by TitleModeKey.

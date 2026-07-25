@@ -539,6 +539,27 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
     g154_observe_frame(rdram, n, scriptFrame, loopNo, nextLoopNo);
     g202_update_town_depth_scope(rdram, n, scriptFrame, loopNo);
     dc2_apply_60fps_patch(rdram);
+    // G361 bisect aid: per-N-frame player world position + map number, so the
+    // "__sinit_mainloop moves the MAP-0 spawn" regression can be measured as
+    // numbers instead of screenshots. Default-off: DC2_G361_POS=1.
+    {
+        static const bool g361Pos = dc2_env_flag_enabled("DC2_G361_POS");
+        if (g361Pos && (n % 60u) == 0u)
+        {
+            const uint32_t mainChara = dc2_read_u32(rdram, 0x003772C8u);
+            const uint32_t mapNo = dc2_read_u32(rdram, gpReg + 0xFFFF9EACu); // gp-0x6154
+            float px = 0.f, py = 0.f, pz = 0.f;
+            if (mainChara > 0x80000u && mainChara < 0x2000000u)
+            {
+                const uint32_t bx = dc2_read_u32(rdram, mainChara + 0xE0u);
+                const uint32_t by = dc2_read_u32(rdram, mainChara + 0xE4u);
+                const uint32_t bz = dc2_read_u32(rdram, mainChara + 0xE8u);
+                std::memcpy(&px, &bx, 4); std::memcpy(&py, &by, 4); std::memcpy(&pz, &bz, 4);
+            }
+            std::fprintf(stderr, "[G361:pos] n=%u sf=%u loop=%u mapNo=%u chara=0x%x pos=(%.2f,%.2f,%.2f)\n",
+                         n, scriptFrame, loopNo, mapNo, mainChara, px, py, pz);
+        }
+    }
     g_f40_frame_counter = scriptFrame;
     f40_drive_pad(scriptFrame, loopNo);
 }
@@ -553,6 +574,32 @@ static void scelogofade_done_stub(uint8_t *rdram, R5900Context *ctx, PS2Runtime 
 // Real convention: a0=input_filename, a1=output_buf (the auto-stub in dc2_auto_stubs.cpp
 // had the args reversed and never prepended a drive prefix, so fioOpen got "").
 // Bare filenames get "cdrom0:\" prepended; paths that already contain ':' pass through.
+//
+// PHASE G363: the F5 shim dropped the guest's CurrentDir prepend. Hardware
+// GetFullPath__FPcPc@0x149240 is:
+//     devType = GetDevType(src, stripped);           // -1 => no device spec in src
+//     if (devType == -1) { useCurrentDir = 1; devType = DefaultFileDev; }
+//     dest = <device prefix for devType>;
+//     if (useCurrentDir) strcat(dest, CurrentDir);   // <-- the missing step
+//     strcat(dest, stripped);
+// CurrentDir (0x00334390) is set by SetCurrentDir/ChangeDir, driven from the script
+// commands _SET_CURRENT_DIR / _CHANGE_DIR. Any asset family loaded as a BARE filename
+// under a script-set directory therefore opened from the wrong place: the Spheda
+// mini-game does `_SET_CURRENT_DIR("dungeon/sphida/")` then loads "eng_sphida_bar.img",
+// "bball.chr", "rball.chr", "rgool.chr", "rgool2.chr", "gool_a.mds" ג€” all of which
+// missed, so mgCTextureManager::GetTexture("sphida_bar") returned NULL, the HUD sprite
+// group emitted no TEX0 at all, and every HUD widget sampled whatever texture was bound
+// last (the dungeon wall atlas at tbp=0x2720). See plans/phase-G363-fix-log.md.
+//
+// Rollback to the F5 behavior: DC2_G363_NO_CURDIR=1.
+static constexpr uint32_t kG363CurrentDirAddr = 0x00334390u; // CurrentDir[] (SetCurrentDir__FPc asm)
+
+static bool g363_curdir_fix_enabled()
+{
+    static const bool off = dc2_env_flag_enabled("DC2_G363_NO_CURDIR");
+    return !off;
+}
+
 static void getfullpath_shim(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     const uint32_t srcAddr  = getRegU32(ctx, 4); // $a0 = input filename
@@ -564,9 +611,23 @@ static void getfullpath_shim(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runt
     if (src && dest)
     {
         if (::strchr(src, ':'))
+        {
             ::snprintf(dest, 256, "%s", src);
+        }
         else
-            ::snprintf(dest, 256, "cdrom0:\\%s", src);
+        {
+            // No device spec => hardware prepends CurrentDir. Empty CurrentDir
+            // reproduces the F5 behavior byte-for-byte.
+            const char *curDir = "";
+            if (g363_curdir_fix_enabled())
+            {
+                const char *cd = reinterpret_cast<const char *>(
+                    getConstMemPtr(rdram, kG363CurrentDirAddr));
+                if (cd)
+                    curDir = cd;
+            }
+            ::snprintf(dest, 256, "cdrom0:\\%s%s", curDir, src);
+        }
     }
 
     setReturnU32(ctx, destAddr);
@@ -649,6 +710,14 @@ static void dc2_write_pad_status(uint8_t *rdram, uint32_t statusAddr, uint32_t m
         // G7: live controller owns all four axes (both sticks).
         outLX = g_pad_live_lx; outLY = g_pad_live_ly;
         outRX = g_pad_live_rx; outRY = g_pad_live_ry;
+    }
+    else if (g_f40_lstick_active)
+    {
+        // G374: a scripted LEFT stick (DC2_LSTICK) reproduces a recorded analog walk. It
+        // outranks the F66 dungeon driver because it carries the exact recorded axis bytes
+        // rather than 4-way quantised deflection.
+        outLX = g_f40_lx; outLY = g_f40_ly;
+        outRX = g_f40_rx; outRY = g_f40_ry;
     }
     else if (g_f66_dungeon_active)
     {

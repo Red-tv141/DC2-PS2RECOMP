@@ -308,6 +308,7 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     runtime.registerFunction(0x002BC150u, f48_2_key_main_chara_bg_probe); // KeyMainCharaBG step-23 audit probe
     runtime.registerFunction(0x002BE030u, f48_2_menu_costume_key_probe); // MenuCostumeKey step-23 audit probe
     runtime.registerFunction(0x00236850u, g358_intern_select_draw_probe); // G358 Sindain circle type-0x0d form diag + force-blit proof lever
+    runtime.registerFunction(0x002DED50u, g361_map_jump_probe);           // G361 MapJump entrance/spawn probe (DC2_G361_POS)
     runtime.registerFunction(0x001CBD70u, f50_1_memory_init);             // F50.1 memoryInit (was auto-stub) ג€” create dungeon mgCMemory pools
     runtime.registerFunction(0x0012E600u, f50_9_mg_load_image_probe);     // F50.9 mgLoadImage CLUT/texture upload probe (DC2_TRACE_F50_9)
     runtime.registerFunction(0x0012E850u, f51_reload_texture_packet_probe); // F51 ReloadTexture packet-wrapper reach probe (DC2_TRACE_T8_UPLOAD)
@@ -632,6 +633,10 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     // PHASE F5 ג€” DVD path prefix fix + Exit halt
     // -------------------------------------------------------------------------
     runtime.registerFunction(0x00149240u, getfullpath_shim);
+
+    // PHASE G363 (opt-in DC2_G363_PATHTRACE=1): CurrentDir provenance trace.
+    if (g363_trace_enabled())
+        g363_register_probes(runtime);
     // Exit_0x118FB0 uses a tail-j to _Exit (0x10FD00) so 0x10FD00 is a direct C++ call
     // in the runner, not a dispatch-table lookup. Bind the Exit wrapper itself instead.
     runtime.registerFunction(0x00118FB0u, exit_halt_stub);

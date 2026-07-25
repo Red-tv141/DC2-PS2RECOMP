@@ -648,6 +648,13 @@ static void pad_button_read_stub(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
         outLX = g_f66_dungeon_lx;
         outLY = g_f66_dungeon_ly;
     }
+    // G374: a scripted LEFT stick (DC2_LSTICK, scriptFrame-keyed) carries the exact
+    // recorded axis bytes, so it wins over the 4-way F66 deflection when configured.
+    if (g_f40_lstick_active)
+    {
+        outLX = g_f40_lx;
+        outLY = g_f40_ly;
+    }
 
     // Write the active-high mask into *param_1 (PAD_STATUS+0x00) where the
     // CGamePad accessors read it. Sticks default to 0x80 centre; F66 deflects the

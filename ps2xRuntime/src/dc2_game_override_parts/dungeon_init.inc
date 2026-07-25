@@ -107,6 +107,37 @@ static bool f55_trace_enabled();
 // cdrom0:\DATA.HD3;1. Without it every SearchFile-based load (LoadFileBG, the
 // dungeon-map menu pack menu/N/dmapN.pac, ...) silently fails, which is the F53
 // dungeon free-map black-rectangle root cause. Run the real generated body here.
+//
+// G361 ROOT FIX (the systemic "un-run __sinit_*" class: F50.4 / F50.7 / G12 /
+// G193 / G224 / G334 were all per-object band-aids for THIS one omission).
+// init__Fv also calls mwInit@0x00100190 (asm 0x0015C1A8) — the Metrowerks C++
+// runtime entry, which is the ONLY caller of __initialize_cpp_rts@0x001009D0:
+//     __initialize_cpp_rts(0x00374D80 /*start*/, 0x00374E40 /*end*/)
+// walks a dense 48-entry .ctors-style pointer table and `jalr`s every
+// __sinit_<file>.cpp static initialiser. Because the whole of init__Fv is
+// nop'd here, NONE of those 48 initialisers has ever run in this port, so every
+// object/table they construct stays at its BSS zero value. The Items-menu defect
+// is one instance: __sinit_menudraw.cpp@0x00374310 does
+//     Set__9mgRect<i>(0x01ECCED0, 32, 32, 40, 50)   (asm 0x003743A4-0x003743BC)
+// which is the item-slot cell SOURCE rect that MenuItemBrdDraw@0x00227900 loads
+// (`lui at,0x1ed; lw t0,-0x3130(at)` … -> sp+0xd0) and hands to
+// PrimQuad<i>@0x00232970 -> TextureCrd@0x00134D70 -> TextureCrd4@0x00134D30,
+// which packs it into the A+D `UV` register DATA. With the rect still {0,0,0,0}
+// every cell sprite emits UV=0x00000000 (vs HW 0x02000200 / 0x05200480), samples
+// texel (0,0) of the CT32-aliased PSMT8 atlas tbp=0x2b20 -> CLUT index 117 ->
+// 0x00000000 (alpha 0) -> the flat grey slot panel vanishes and the sparse
+// non-zero-alpha texels at (0,0) leave the black notch on each icon. XYZ2 is
+// byte-exact against ref/dumps/items.gs because it comes from the OTHER rect.
+// Verified against live PCSX2 at the same menu: 0x01ECCED0 = {32,32,40,50}.
+//
+// Fix at the source: run the game's own mwInit exactly once, at the point
+// init__Fv would have called it (before InitCDFile, matching the HW order
+// 0x15C1A8 < 0x15C374). The 48 initialisers are pure in-memory ctor/Set/memset
+// work (no file or hardware I/O — see plans/phase-G361-fix-log.md for the audit),
+// so this is safe to run inside the boot stub. The pre-existing per-object
+// repairs (f50_4 / f50_7 / G12 menu_long_hand / G224 camera) are all idempotent
+// "only when still zero" writes, so they self-disable once this runs, and they
+// still cover the rollback path. Rollback: DC2_G361_NO_SINIT=1.
 static void f55_boot_init_stub(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     const uint32_t ra = getRegU32(ctx, 31);
@@ -115,6 +146,83 @@ static void f55_boot_init_stub(uint8_t *rdram, R5900Context *ctx, PS2Runtime *ru
     if (!s_initCdDone)
     {
         s_initCdDone = true;
+        static const bool g361NoSinit = dc2_env_flag_enabled("DC2_G361_NO_SINIT");
+        if (!g361NoSinit)
+        {
+            const uint32_t beforeU = dc2_read_u32(rdram, 0x01ECCED0u);
+            const uint32_t beforeH = dc2_read_u32(rdram, 0x01ECCEDCu);
+            // Walk the ctor table exactly as __initialize_cpp_rts@0x001009D0 does
+            // (`lw v0,0(s0); jalr v0; addiu s0,s0,4`). Bounds are mwInit@0x00100190's
+            // own immediates. Doing the walk here instead of calling mwInit is
+            // behaviourally identical, and lets a bisect select a sub-range:
+            //   DC2_G361_SINIT_FIRST / DC2_G361_SINIT_LAST  (inclusive entry indices)
+            //   DC2_G361_SINIT_SKIP=<i>[,<i>...]            (entries to leave un-run)
+            //   DC2_G361_SINIT_TRACE=1                      (print index -> addr)
+            //
+            // ONE ENTRY IS EXCLUDED BY DEFAULT: __sinit_mainloop.cpp@0x00373580
+            // (table index 5). Bisected with the levers above (0..4 correct, 0..11 and
+            // 0..23 wrong, skip-just-5 correct): running it moves the MAP-0 player spawn
+            // to a different point of the same map — MapJump's request is byte-identical
+            // in both arms (`[G361:mapjump]` scene/info/mapNo/prevMainMapNo and
+            // info[0..7] all equal), so the divergence is downstream, in the post-load
+            // placement. This initialiser is the one that also constructs
+            // CUserDataManager / CQuestData / CEditData / CVillagerData; on hardware the
+            // normal title -> New Game / save-load path overwrites those defaults, but
+            // this port has no memory-card load (Known Issue #4) and enters via the debug
+            // menu, so the ctor defaults survive where hardware would replace them. Until
+            // that user-data path exists, running it REGRESSES parity with
+            // ref/dumps/map_0.png; leaving it out keeps the pre-G361 (reference-matching)
+            // behaviour, which the F50.4 MainScene-vtable repair already covers.
+            // Set DC2_G361_SINIT_ALL=1 to include it (that is the arm to re-test once the
+            // user-data/New-Game path is implemented).
+            constexpr uint32_t kCtorFirst = 0x00374D80u;
+            constexpr uint32_t kCtorEnd = 0x00374E40u;
+            constexpr uint32_t kSinitMainloop = 0x00373580u;
+            const uint32_t nCtors = (kCtorEnd - kCtorFirst) / 4u;
+            const bool runAll = dc2_env_flag_enabled("DC2_G361_SINIT_ALL");
+            auto envU32 = [](const char *name, uint32_t dflt) -> uint32_t {
+                const char *e = std::getenv(name);
+                return (e && e[0]) ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : dflt;
+            };
+            const uint32_t idxFirst = envU32("DC2_G361_SINIT_FIRST", 0u);
+            const uint32_t idxLast = envU32("DC2_G361_SINIT_LAST", 0xFFFFFFFFu);
+            const bool sinitTrace = dc2_env_flag_enabled("DC2_G361_SINIT_TRACE");
+            const char *skipList = std::getenv("DC2_G361_SINIT_SKIP");
+            uint32_t ran = 0u, skipped = 0u;
+            for (uint32_t i = 0; i < nCtors; ++i)
+            {
+                const uint32_t fnAddr = dc2_read_u32(rdram, kCtorFirst + i * 4u);
+                bool skip = (i < idxFirst) || (i > idxLast) || (fnAddr == 0u) ||
+                            (!runAll && fnAddr == kSinitMainloop);
+                if (!skip && skipList && skipList[0])
+                {
+                    const char *p = skipList;
+                    while (*p)
+                    {
+                        char *endp = nullptr;
+                        const unsigned long v = std::strtoul(p, &endp, 0);
+                        if (endp == p) break;
+                        if (static_cast<uint32_t>(v) == i) { skip = true; break; }
+                        p = endp;
+                        while (*p == ',' || *p == ' ') ++p;
+                    }
+                }
+                if (sinitTrace)
+                    std::fprintf(stderr, "[G361:ctor] i=%u addr=0x%x %s\n", i, fnAddr, skip ? "SKIP" : "run");
+                if (skip) { ++skipped; continue; }
+                f50_callg(rdram, ctx, runtime, fnAddr, 0u, 0u, 0u, 0u);
+                ++ran;
+            }
+            std::fprintf(stderr, "[G361:sinit] ctors n=%u ran=%u skipped=%u\n", nCtors, ran, skipped);
+            std::fprintf(stderr,
+                         "[G361:sinit] mwInit ran: menudraw cellRect 0x1ECCED0 {%u,%u,%u,%u} (was u=%u h=%u) "
+                         "longHand 0x1ECCE50 {%u,%u,%u,%u}\n",
+                         dc2_read_u32(rdram, 0x01ECCED0u), dc2_read_u32(rdram, 0x01ECCED4u),
+                         dc2_read_u32(rdram, 0x01ECCED8u), dc2_read_u32(rdram, 0x01ECCEDCu),
+                         beforeU, beforeH,
+                         dc2_read_u32(rdram, 0x01ECCE50u), dc2_read_u32(rdram, 0x01ECCE54u),
+                         dc2_read_u32(rdram, 0x01ECCE58u), dc2_read_u32(rdram, 0x01ECCE5Cu));
+        }
         const uint32_t ret = f50_callg(rdram, ctx, runtime, 0x148F70u, 0u, 0u, 0u, 0u);
         const uint32_t gp = getRegU32(ctx, 28);
         const uint32_t headerNum = dc2_read_u32(rdram, gp - 0x7764u);
@@ -131,6 +239,28 @@ static void f55_boot_init_stub(uint8_t *rdram, R5900Context *ctx, PS2Runtime *ru
     ctx->r[31] = savedRa;
     setReturnU32(ctx, 0u);
     ctx->pc = ra;
+}
+
+// G361 bisect aid: MapJump@0x002DED50(a0=CScene*, a1=SCN_LOADMAP_INFO2*, a2=mapNo).
+// Dumps the jump request + the "previous map" word MapJump latches into
+// MainScene+0x1a1c (gp-0x6154 = MainMapNo), which is what selects the entrance /
+// spawn point on arrival. Default-off: DC2_G361_POS=1 (shares the position lever).
+static void g361_map_jump_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    static const bool on = dc2_env_flag_enabled("DC2_G361_POS");
+    if (on)
+    {
+        const uint32_t gp = getRegU32(ctx, 28);
+        const uint32_t info = getRegU32(ctx, 5);
+        std::fprintf(stderr,
+                     "[G361:mapjump] scene=0x%x info=0x%x mapNo=%u prevMainMapNo=%u info[0..7]=",
+                     getRegU32(ctx, 4), info, getRegU32(ctx, 6),
+                     dc2_read_u32(rdram, gp + 0xFFFF9EACu));
+        for (uint32_t k = 0; k < 8u; ++k)
+            std::fprintf(stderr, " %08x", dc2_read_u32(rdram, info + k * 4u));
+        std::fprintf(stderr, "\n");
+    }
+    MapJump__FP6CSceneP17SCN_LOADMAP_INFO2i_0x2ded50(rdram, ctx, runtime);
 }
 
 static void f50_1_memory_init(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

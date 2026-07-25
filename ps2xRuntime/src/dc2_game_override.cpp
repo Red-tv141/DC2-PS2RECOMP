@@ -199,6 +199,8 @@ extern void sndStep__Ff_0x18d650(uint8_t* rdram, R5900Context* ctx, PS2Runtime* 
 extern void StepSnd__6CSceneFv_0x2a7940(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void TitleDraw__Fv_0x2a0ab0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void GetPoly__8CEditMapFiP6CCPolyR9mgVu0FBOXi_0x1b0780(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G363: real SetCurrentDir body (wrapped by the DC2_G363_PATHTRACE probe).
+extern void SetCurrentDir__FPc_0x148760(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void Step__14CCameraControlFi_0x2ec110(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void SetFollow__15mgCCameraFollowFfff_0x131990(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void DngMainDraw__Fv_0x1cf090(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -316,6 +318,7 @@ extern void GetReadBGFile__Fi_0x148c70(uint8_t* rdram, R5900Context* ctx, PS2Run
 extern void LoadFileBG__FPcP1Pi_0x148930(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void InitReadBG__Fv_0x1488d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void StartReadBG__Fv_0x148cc0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void MapJump__FP6CSceneP17SCN_LOADMAP_INFO2i_0x2ded50(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G361 spawn probe
 extern void WaitVSync__Fii_0x1412a0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void VSyncCallBack__Fi_0x141200(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void sceGsSyncVCallback_0x1041e8(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -406,6 +409,12 @@ std::atomic<uint32_t> g_dc2G217HeadDmaKind{0u};
 std::atomic<uint32_t> g_dc2G217DirectPackets[128]{};
 std::atomic<uint32_t> g_dc2G217DirectPacketWrite{0u};
 
+// G361: force-recompile marker — dungeon_init.inc gained the mwInit/__sinit boot
+// repair ([G361:sinit]) and then the per-entry ctor-table walk + bisect levers
+// ([G361:ctor], DC2_G361_SINIT_FIRST/LAST/SKIP/TRACE); MSBuild does not reliably
+// rebuild this TU on .inc-only edits (G359 stale-link trap), so this comment must
+// change with it. Now also carries [G361:pos] / [G361:mapjump] (DC2_G361_POS=1)
+// and the default exclusion of __sinit_mainloop.cpp (DC2_G361_SINIT_ALL=1 re-includes).
 namespace
 {
 #include "dc2_game_override_parts/common_state.inc"
@@ -429,6 +438,7 @@ namespace
 
 #include "dc2_game_override_parts/title_draw_runtime.inc"
 #include "dc2_game_override_parts/frame_end_and_core_helpers.inc"
+#include "dc2_game_override_parts/g363_spheda_probes.inc"
 #include "dc2_game_override_parts/object_init_and_pad.inc"
 
 #include "dc2_game_override_parts/live_input_and_stubs.inc"
