@@ -473,10 +473,18 @@ static void dc2_seed_title_mode(uint8_t *rdram, R5900Context *ctx)
 
     const uint32_t mode = dc2_read_u32(rdram, titleInfo + 0u);
     const uint32_t sub = dc2_read_u32(rdram, titleInfo + 4u);
-    if ((mode == 3u || mode == 0u) && sub == 0xFFFFFFFFu)
+    // G376: the F21 seed's mode-0 arm was an FMV SKIP band-aid — it existed only because
+    // movie playback was unimplemented. G375 brought FMV up end-to-end, so mode 0
+    // (RushMovie, the attract/intro movie) is now allowed to run for real and only the
+    // mode-3 memory-card check is still seeded. Restore the old skip with
+    // DC2_G376_SEED_FMV_SKIP=1.
+    static const bool g376SeedFmvSkip = dc2_env_flag_enabled("DC2_G376_SEED_FMV_SKIP");
+    const bool seedThisMode = (mode == 3u) || (mode == 0u && g376SeedFmvSkip);
+    if (seedThisMode && sub == 0xFFFFFFFFu)
     {
-        // F21 seed: the intro FMV (mode 0 RushMovie) / MC-check (mode 3) can't play
-        // headless, so jump the title into TitleMode (mode 1) so the 3D background runs.
+        // F21 seed: the MC-check (mode 3) — and, with the G376 lever, the intro FMV
+        // (mode 0 RushMovie) — jump the title into TitleMode (mode 1) so the 3D
+        // background runs.
         dc2_write_u32(rdram, titleInfo + 0u, 1u);
         dc2_write_u32(rdram, titleInfo + 4u, 0xFFFFFFFFu);
         dc2_write_u32(rdram, titleInfo + 8u, 0u);
@@ -2584,6 +2592,11 @@ struct G67TexHit
 // callee frames overlap EditDraw's save area. Log sp/ra at EditLoop/EditDraw
 // entry+exit each frame. Opt-in DC2_G186_SPTRACE=1.
 #include "dc2_game_override_parts/level_load_debug_probes.inc"
+
+// PHASE G375: FMV / movie playback — DIntr/EIntr critical-section pair used by the
+// guest movie DMA path (see fmv_ipu.inc). Must precede apply_phase9_stubs.inc, which
+// calls applyDC2G375FmvOverrides().
+#include "dc2_game_override_parts/fmv_ipu.inc"
 
 #include "dc2_game_override_parts/apply_phase9_stubs.inc"
 

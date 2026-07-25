@@ -168,6 +168,13 @@ extern void EditDraw__Fv_0x1ae3d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime*
 extern void EditLoop__Fv_0x1abcf0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern bool g_g186SpBalArmed; // ps2_runtime.cpp — G186 sp-balance logging armed while inside EditDraw
 extern void TitleLoop__Fv_0x29ffa0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void vblankHandler__Fi_0x299800(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G375 movie chain
+extern void handler_endimage__Fi_0x2998e0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G375 movie chain
+extern void voBufIncCount__FP5VoBuf_0x299a40(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G375 movie chain
+extern void voBufDecCount__FP5VoBuf_0x299b90(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G375 movie chain
+extern void startDisplay__Fi_0x29b820(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G375 movie chain
+extern void stepMain__Fv_0x299330(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G375 movie chain
+extern void decBs0__FP8VideoDec_0x29b8a0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime); // G375 movie chain
 extern void TitleModeInit__Fv_0x2a1020(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void MenuInit__F13INIT_LOOP_ARG_0x191970(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void MenuLoop__Fv_0x191c30(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -415,6 +422,10 @@ std::atomic<uint32_t> g_dc2G217DirectPacketWrite{0u};
 // rebuild this TU on .inc-only edits (G359 stale-link trap), so this comment must
 // change with it. Now also carries [G361:pos] / [G361:mapjump] (DC2_G361_POS=1)
 // and the default exclusion of __sinit_mainloop.cpp (DC2_G361_SINIT_ALL=1 re-includes).
+// G376: F21 seed's mode-0 FMV-skip arm retired (DC2_G376_SEED_FMV_SKIP=1 restores).
+// G375b: also carries fmv_ipu.inc (real DIntr/EIntr for the movie DMA path +
+// DC2_G375_MOVIE_TRACE census probes,
+// kill switch DC2_G375_NO_INTR=1) — bump this marker on every .inc-only edit.
 namespace
 {
 #include "dc2_game_override_parts/common_state.inc"

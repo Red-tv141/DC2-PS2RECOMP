@@ -641,6 +641,9 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     // in the runner, not a dispatch-table lookup. Bind the Exit wrapper itself instead.
     runtime.registerFunction(0x00118FB0u, exit_halt_stub);
 
+    // PHASE G375: FMV bring-up — real DIntr/EIntr (kill: DC2_G375_NO_INTR=1).
+    applyDC2G375FmvOverrides(runtime);
+
     // PHASE G186 (opt-in DC2_G186_SPTRACE=1): sp-desync probe on the edit loop/draw.
     if (g186_sptrace_enabled())
     {
