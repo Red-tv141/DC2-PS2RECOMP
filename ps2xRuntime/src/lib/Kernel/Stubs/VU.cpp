@@ -11,6 +11,41 @@ namespace ps2_stubs
 
     namespace
     {
+        // G371 (diagnostic, default-off: DC2_G371_VU0NAN=1) — non-finite watch on the VU0-macro
+        // math stubs. The cutscene gray screen is an EE-side poison: the camera matrix in
+        // mgRENDER_INFO (+0x1a0) and the camera position (+0x3a0) go NaN mid-cutscene while the
+        // projection stays clean. Every sceVu0* stub reads and writes guest vectors through these
+        // two helpers, so watching them names the guest ADDRESS that first holds a NaN — which is
+        // then resolvable to an owning object via ref/index/globals_index.json.
+        // Reads and writes are reported separately: a NaN arriving on a READ means the poison was
+        // already in guest RAM (an EE FPU computation upstream), a NaN leaving on a WRITE whose
+        // inputs were clean means the stub itself manufactured it.
+        static const bool s_DC2_G371_VU0NAN = (std::getenv("DC2_G371_VU0NAN") != nullptr);
+
+        void g371NoteVuNan(const char *dir, uint32_t addr, const float *v, int n)
+        {
+            if (!s_DC2_G371_VU0NAN)
+                return;
+            bool bad = false;
+            for (int i = 0; i < n; ++i)
+                if (!std::isfinite(v[i]))
+                    bad = true;
+            if (!bad)
+                return;
+            // Dedup by address so one poisoned object does not drown the log.
+            static std::atomic<uint32_t> s_seen[64]{};
+            static std::atomic<uint32_t> s_nSeen{0};
+            const uint32_t have = s_nSeen.load(std::memory_order_relaxed);
+            for (uint32_t i = 0; i < have && i < 64u; ++i)
+                if (s_seen[i].load(std::memory_order_relaxed) == addr)
+                    return;
+            if (have < 64u)
+                s_seen[have].store(addr, std::memory_order_relaxed), s_nSeen.fetch_add(1u, std::memory_order_relaxed);
+            std::fprintf(stderr, "[G371:vu0nan] %s addr=0x%08x n=%d v=(% .6g % .6g % .6g % .6g)\n",
+                         dir, addr, n, v[0], n > 1 ? v[1] : 0.0f, n > 2 ? v[2] : 0.0f,
+                         n > 3 ? v[3] : 0.0f);
+        }
+
         bool readVuVec4f(uint8_t *rdram, uint32_t addr, float (&out)[4])
         {
             const uint8_t *ptr = getConstMemPtr(rdram, addr);
@@ -19,6 +54,7 @@ namespace ps2_stubs
                 return false;
             }
             std::memcpy(out, ptr, sizeof(out));
+            g371NoteVuNan("read4", addr, out, 4);
             return true;
         }
 
@@ -29,6 +65,7 @@ namespace ps2_stubs
             {
                 return false;
             }
+            g371NoteVuNan("writ4", addr, in, 4);
             std::memcpy(ptr, in, sizeof(in));
             return true;
         }
@@ -63,6 +100,7 @@ namespace ps2_stubs
                 return false;
             }
             std::memcpy(out, ptr, sizeof(out));
+            g371NoteVuNan("read16", addr, out, 16);
             return true;
         }
 
@@ -73,6 +111,7 @@ namespace ps2_stubs
             {
                 return false;
             }
+            g371NoteVuNan("writ16", addr, in, 16);
             std::memcpy(ptr, in, sizeof(in));
             return true;
         }
