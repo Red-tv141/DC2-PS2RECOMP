@@ -37,6 +37,14 @@ static uint8_t  g_pad_live_ry        = 0x80u;
 // applied in dc2_write_pad_status when no live pad is connected. Default 0x80 => inert.
 static uint8_t  g_f40_rx             = 0x80u;
 static uint8_t  g_f40_ry             = 0x80u;
+// G374: scripted LEFT-STICK deflection (DC2_LSTICK). replay_from_rec.py only ever emitted
+// the digital buttons and the right stick, so a recorded session that WALKED the player
+// with the left analog stick replayed as a player who never moved. Env DC2_LSTICK uses the
+// same scriptFrame range syntax as DC2_PAD_INPUT but carries the RAW recorded axis bytes:
+//   "start..end:0xLX,0xLY;..."  (0x80 = centre). Default inert.
+static bool     g_f40_lstick_active  = false;
+static uint8_t  g_f40_lx             = 0x80u;
+static uint8_t  g_f40_ly             = 0x80u;
 static uint32_t g_f48_2_log_count   = 0u;
 static uint32_t g_f48_3_log_count   = 0u;
 static bool dc2_env_flag_enabled(const char *name)

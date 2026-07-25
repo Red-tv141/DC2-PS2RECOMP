@@ -711,6 +711,14 @@ static void dc2_write_pad_status(uint8_t *rdram, uint32_t statusAddr, uint32_t m
         outLX = g_pad_live_lx; outLY = g_pad_live_ly;
         outRX = g_pad_live_rx; outRY = g_pad_live_ry;
     }
+    else if (g_f40_lstick_active)
+    {
+        // G374: a scripted LEFT stick (DC2_LSTICK) reproduces a recorded analog walk. It
+        // outranks the F66 dungeon driver because it carries the exact recorded axis bytes
+        // rather than 4-way quantised deflection.
+        outLX = g_f40_lx; outLY = g_f40_ly;
+        outRX = g_f40_rx; outRY = g_f40_ry;
+    }
     else if (g_f66_dungeon_active)
     {
         outLX = g_f66_dungeon_lx; outLY = g_f66_dungeon_ly;
