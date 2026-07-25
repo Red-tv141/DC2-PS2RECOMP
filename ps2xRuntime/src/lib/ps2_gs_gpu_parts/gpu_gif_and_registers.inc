@@ -1323,9 +1323,14 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     case GS_REG_PABE:
         m_pabe = (value & 1u) != 0u;
         break;
+    // G364: FOGCOL is the second operand of the per-pixel fog blend; it used to be discarded
+    // together with the genuinely-unimplemented registers below, which is why DC2's dungeon
+    // distance fade never appeared (see plans/phase-G364-fix-log.md).
+    case GS_REG_FOGCOL:
+        g_g364FogCol = static_cast<uint32_t>(value & 0x00FFFFFFu);
+        break;
     case GS_REG_TEXFLUSH:
     case GS_REG_SCANMSK:
-    case GS_REG_FOGCOL:
     case GS_REG_DIMX:
     case GS_REG_DTHE:
     case GS_REG_COLCLAMP:

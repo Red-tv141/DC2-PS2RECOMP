@@ -1305,6 +1305,31 @@ void GSRasterizer::drawTriangle(GS *gs)
         const int sv = wrapTextureCoordinate(sv0, g141WrapV, g141TexH, g141MinV, g141MaxV);
         // G149 fast path: single read-only linear lookup of the pre-decoded, CLUT-pre-applied buffer.
         const size_t g149Idx = static_cast<size_t>(sv) * static_cast<size_t>(g141TexW) + static_cast<size_t>(su);
+        // G365 (diagnostic, default-off): compare the G149 pre-decoded texture cache against a
+        // live VRAM read for the far-right texels of the scene RTT, while drawing the display
+        // buffer. A mismatch means the cache — not the sampler — feeds the right-edge line.
+        {
+            static const bool s_g365t = (std::getenv("DC2_G365_WATCH") != nullptr);
+            if (s_g365t && ctx.tex0.tbp0 == 0x2720u && su0 >= 500)
+            {
+                const uint32_t live = (g141Psm == GS_PSM_CT32 || g141Psm == GS_PSM_CT24)
+                    ? applyTexa(gs->m_texa, g141Psm,
+                                readTexelPSMCT32(gs, ctx.tex0.tbp0, ctx.tex0.tbw, su, sv))
+                    : 0u;
+                const uint32_t cached = g149Px ? g149Px[g149Idx] : 0u;
+                static std::atomic<uint32_t> s_tn{0}, s_bad{0};
+                const uint32_t tn = s_tn.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                const bool bad = (g149Px != nullptr && cached != live);
+                if (bad) s_bad.fetch_add(1u, std::memory_order_relaxed);
+                if (tn <= 200u || (tn % 20000u) == 0u)
+                    std::fprintf(stderr,
+                        "[G365:tc] n=%u bad=%u su0=%d su=%d sv=%d texW=%d texH=%d cache=%u "
+                        "cached=0x%08x live=0x%08x psm=0x%x tbw=%u\n",
+                        tn, s_bad.load(std::memory_order_relaxed), su0, su, sv,
+                        g141TexW, g141TexH, g149Px ? 1u : 0u, cached, live,
+                        (unsigned)g141Psm, (unsigned)ctx.tex0.tbw);
+            }
+        }
         if (g149Px && !s_g149Verify)
             return g149Px[g149Idx];
         uint32_t leaf;
@@ -2003,6 +2028,18 @@ void GSRasterizer::drawTriangle(GS *gs)
                 a = color.a;
             }
 
+            // G364: GS per-pixel FOG. Applied to the post-texture RGB (alpha untouched) and BEFORE
+            // alpha blending, exactly where the GS pixel pipeline puts it. F is a real interpolator
+            // on the GS — it is Gouraud-interpolated regardless of PRIM.IIP.
+            if (gs->m_prim.fge && g364FogEnabled())
+            {
+                const float ff = static_cast<float>(v0.fog) * w0 +
+                                 static_cast<float>(v1.fog) * w1 +
+                                 static_cast<float>(v2.fog) * w2;
+                const uint32_t f = static_cast<uint32_t>(clampU8(static_cast<int>(ff + 0.5f)));
+                g364ApplyFog(f, r, g, b);
+            }
+
             // G240: alpha-test failure controls framebuffer and depth writes independently.
             // The old path let writePixel suppress AFAIL=KEEP framebuffer writes, then wrote Z
             // unconditionally below. Transparent cutout texels consequently occluded later
@@ -2114,6 +2151,42 @@ void GSRasterizer::drawTriangle(GS *gs)
                 g_g232PxWrite.fetch_add(1u, std::memory_order_relaxed);
                 if (r > 150u && g < 90u && b < 110u)
                     g_g232PxRedWrite.fetch_add(1u, std::memory_order_relaxed);
+            }
+            // G365 (diagnostic, default-off): attribute the MAP-160 right-edge line. Logs every
+            // TRIANGLE fragment that writes a non-black colour into the display buffer's last
+            // columns, with the draw state that produced it (m_prim can be stale in a tile-bin
+            // replay, so this logs from inside the draw itself).
+            {
+                static const bool s_g365f = (std::getenv("DC2_G365_WATCH") != nullptr);
+                if (s_g365f && ctx.frame.fbp == 0x68u && x >= 508 && x <= 511 &&
+                    (static_cast<uint32_t>(r) | g | b) != 0u && fragmentAlpha.writeFramebuffer)
+                {
+                    static std::atomic<uint32_t> s_fn{0};
+                    const uint32_t fn = s_fn.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    if (fn <= 200u || (fn % 20000u) == 0u)
+                        std::fprintf(stderr,
+                            "[G365:tri] n=%u xy=(%d,%d) tme=%u abe=%u iip=%u fst=%u tbp=0x%x "
+                            "tpsm=0x%x tfx=%u rgb=(%u,%u,%u) a=%u v0c=(%u,%u,%u) v1c=(%u,%u,%u) "
+                            "v2c=(%u,%u,%u) v0=(%.1f,%.1f) v1=(%.1f,%.1f) v2=(%.1f,%.1f) replay=%u "
+                            "ofx=%d ofy=%d bbox=(%d,%d)-(%d,%d) uv0=(%u,%u) uv1=(%u,%u) uv2=(%u,%u) "
+                            "fraguv=(%.2f,%.2f) texel=0x%08x\n",
+                            fn, x, y, (unsigned)gs->m_prim.tme, (unsigned)gs->m_prim.abe,
+                            (unsigned)gs->m_prim.iip, (unsigned)gs->m_prim.fst, ctx.tex0.tbp0,
+                            (unsigned)ctx.tex0.psm, (unsigned)ctx.tex0.tfx, r, g, b, a,
+                            (unsigned)v0.r, (unsigned)v0.g, (unsigned)v0.b,
+                            (unsigned)v1.r, (unsigned)v1.g, (unsigned)v1.b,
+                            (unsigned)v2.r, (unsigned)v2.g, (unsigned)v2.b,
+                            v0.x, v0.y, v1.x, v1.y, v2.x, v2.y,
+                            t_g144InReplay ? 1u : 0u, ofx, ofy, minX, minY, maxX, maxY,
+                            (unsigned)(v0.u >> 4), (unsigned)(v0.v >> 4),
+                            (unsigned)(v1.u >> 4), (unsigned)(v1.v >> 4),
+                            (unsigned)(v2.u >> 4), (unsigned)(v2.v >> 4),
+                            (double)(v0.u * w0 + v1.u * w1 + v2.u * w2) / 16.0,
+                            (double)(v0.v * w0 + v1.v * w1 + v2.v * w2) / 16.0,
+                            readTexelPSMCT32(gs, ctx.tex0.tbp0, ctx.tex0.tbw,
+                                (int)((v0.u * w0 + v1.u * w1 + v2.u * w2)) >> 4,
+                                (int)((v0.v * w0 + v1.v * w1 + v2.v * w2)) >> 4));
+                }
             }
             if (!s_g141SkipWrite && fragmentAlpha.writeFramebuffer)
                 writePixel(gs, x, y, r, g, b, a);

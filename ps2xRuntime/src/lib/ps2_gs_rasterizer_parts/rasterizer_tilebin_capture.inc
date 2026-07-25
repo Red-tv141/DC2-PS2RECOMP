@@ -152,6 +152,7 @@
                             s_rg.m_texa = e.texa;
                             s_rg.m_texclut = e.texclut;
                             s_rg.m_pabe = e.pabe;
+                            t_g364FogCol = e.fogcol; // G364
                             t_g144TitleRockScopeOverride = true;
                             t_g144TitleRockScope = e.titleRockScope;
                             t_g144TownDepthScopeOverride = true;
@@ -247,6 +248,7 @@
                     s_seq.m_texa = e.texa;
                     s_seq.m_texclut = e.texclut;
                     s_seq.m_pabe = e.pabe;
+                    t_g364FogCol = e.fogcol; // G364
                     t_g144TitleRockScopeOverride = true;
                     t_g144TitleRockScope = e.titleRockScope;
                     t_g144TownDepthScopeOverride = true;
@@ -542,6 +544,7 @@
             e.texa = gs->m_texa;
             e.texclut = gs->m_texclut;
             e.pabe = gs->m_pabe;
+            e.fogcol = g_g364FogCol; // G364
             e.titleRockScope = g_dc2TitleRockScope.load(std::memory_order_relaxed);
             e.townDepthScope = g_dc2TownDepthScope.load(std::memory_order_relaxed);
             e.minY = clampInt(crawMinY, ctx.scissor.y0, ctx.scissor.y1);

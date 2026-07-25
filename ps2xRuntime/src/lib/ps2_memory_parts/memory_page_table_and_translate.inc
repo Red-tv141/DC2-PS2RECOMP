@@ -381,6 +381,14 @@ void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t 
 
     g138DumpSubmit(pathId, data, sizeBytes);
 
+    // [G370] attribute the G369 cutscene NaN-`q` poison to a delivery PATH + EE source address.
+    // Default-off (DC2_G370_QSRC=1); this is the single convergence point where path and source
+    // buffer are both still known.
+    {
+        const int g370Path = (pathId == GifPathId::Path1) ? 1 : (pathId == GifPathId::Path2) ? 2 : 3;
+        g370ScanPacket(g370Path, data, sizeBytes, m_rdram);
+    }
+
     // [G360] pin the delivery PATH of the item-slot cell-bg packet (TEX0 tbp=0x2b20) at the single
     // submit convergence point, and confirm its UV A+D DATA is already zero here. path=3/2 => the
     // packet is EE-built and forwarded verbatim (=> EE recompile / GIF-DMA loses the UV); path=1 =>

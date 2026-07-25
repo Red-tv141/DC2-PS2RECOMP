@@ -15,6 +15,7 @@ struct G144Entry
     GSTexaReg texa;
     GSTexClutReg texclut;
     bool pabe;
+    uint32_t fogcol; // G364: FOGCOL is global (not per-context) GS state — snapshot it per entry
     bool titleRockScope;
     bool townDepthScope;
     GSVertex v[3];
@@ -157,6 +158,36 @@ static thread_local bool t_g144Banded = false;
 static thread_local int t_g144BandY0 = 0;
 static thread_local int t_g144BandY1 = 0;
 static thread_local size_t t_g258EntryIndex = static_cast<size_t>(-1);
+
+// ===== G364: GS per-pixel FOG =====
+// PRIM.FGE=1 blends the post-texture fragment colour towards the global FOGCOL by the
+// interpolated per-vertex F byte (F=0xFF -> unfogged, F=0 -> pure fog colour; alpha untouched,
+// applied BEFORE alpha blending). The GS state was parsed but never applied, so DC2's dungeon
+// distance fade (72% of the scene's vertices carry FGE=1, FOGCOL=0x3c2828) was missing entirely.
+// Rollback: DC2_G364_NO_FOG=1.
+static bool g364FogEnabled()
+{
+    static const bool disabled = envFlagEnabled("DC2_G364_NO_FOG");
+    return !disabled;
+}
+// During a deferred tile-bin band replay the live register may already have moved on, so read the
+// value snapshotted into the G144 entry instead.
+static inline uint32_t g364FogColNow()
+{
+    return t_g144InReplay ? t_g364FogCol : g_g364FogCol;
+}
+static inline uint8_t g364FogLerp(uint8_t c, uint32_t f, uint32_t fc)
+{
+    // Exact at both endpoints: f=255 -> c, f=0 -> fc.
+    return static_cast<uint8_t>((static_cast<uint32_t>(c) * f + fc * (255u - f) + 127u) / 255u);
+}
+static inline void g364ApplyFog(uint32_t f, uint8_t &r, uint8_t &g, uint8_t &b)
+{
+    const uint32_t fc = g364FogColNow();
+    r = g364FogLerp(r, f, fc & 0xFFu);
+    g = g364FogLerp(g, f, (fc >> 8) & 0xFFu);
+    b = g364FogLerp(b, f, (fc >> 16) & 0xFFu);
+}
 
 // ===== G248 MEASURE ONLY (DEFAULT OFF, DC2_G248_STAT=1) =====
 // G247 found that A+D XYZ2 kicks to the character-RTT work targets dominate map_0's

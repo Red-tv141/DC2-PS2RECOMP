@@ -24,6 +24,11 @@
 std::atomic<uint32_t> g_g37_seq{0};
 std::atomic<int> g_g37_armed{0};
 bool g_g37_seq_trace = (std::getenv("DC2_G37_SEQ") != nullptr);
+// G364: GS FOGCOL (register 0x3D, RGB only — the GS has ONE global fog colour, it is not
+// per-context). Kept as a plain global instead of a GSGpu member so this fix does not touch
+// include/runtime/ps2_gs_gpu.h (a public header = the 30h full rebuild). Written only from the
+// GS register path and read only from the rasterizer, both of which run on the GS thread.
+uint32_t g_g364FogCol = 0u;
 std::atomic<uint64_t> g_g146GsImageNs{0};
 std::atomic<uint64_t> g_g146GsLocalNs{0};
 std::atomic<uint64_t> g_g147GsGifPacketNs{0};

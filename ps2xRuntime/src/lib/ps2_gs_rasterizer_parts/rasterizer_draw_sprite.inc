@@ -161,15 +161,73 @@ void GSRasterizer::drawSprite(GS *gs)
     int ofx = ctx.xyoffset.ofx >> 4;
     int ofy = ctx.xyoffset.ofy >> 4;
 
-    int x0 = static_cast<int>(v0.x) - ofx;
-    int y0 = static_cast<int>(v0.y) - ofy;
-    int x1 = static_cast<int>(v1.x) - ofx;
-    int y1 = static_cast<int>(v1.y) - ofy;
+    // G365 coverage rule — DEFAULT-ON again since G368 (kill: DC2_G365_NO_SPRITE_EDGE=1).
+    //
+    // G365 established that a GS sprite covers pixel P iff X0 <= P < X1 in the SUB-PIXEL domain
+    // (covered range [ceil(x0), ceil(x1)-1]) rather than the truncate-then-span rule below, because
+    // DC2's half-res downscale sprite (display 0xd00 -> RTT 0x139) is emitted at
+    // (-0.5,-0.5)-(255.5,207.5) and truncation writes only 0..254 x 0..206, leaving the last
+    // column/row of the 256x208 image stale (the source of the right-edge colour line).
+    //
+    // G366/G367 retired this rule to default-off because turning it on made MAP-160 show the
+    // character sliced into 32-row bands. G368 root-caused that tear and it is NOT this rule:
+    // block-matching a torn frame against a clean one showed every 32-row band displaced by
+    // exactly +128 px, i.e. a 512-px buffer re-read at a 640-px page stride. The culprit is the
+    // presentation all-black fallback in GS::latchHostPresentationFrame, which substituted a
+    // DRAWING context's FRAME register (DC2 parks context 1 at fbp=0x0 fbw=10) and read the
+    // display buffer at that width. With that fixed the full ceil rule runs the MAP-160 dense
+    // scan at tornFrames=0/2218 AND removes the right-edge colour line. See
+    // plans/phase-G368-fix-log.md.
+    static const bool s_g365Edge = !envFlagEnabled("DC2_G365_NO_SPRITE_EDGE");
+    // G367 bisect selector (diagnostic): which sprite CLASS the ceil rule is applied to.
+    //   bit0 = the display-source / downscale sprite (tex tbp 0xd00) — the one the line needs
+    //   bit1 = the RTT blur ping-pong quadrant tiles (tbp 0x2860 / 0x28a0 / 0x28e0)
+    //   bit2 = everything else
+    // Unset = 7 (all), i.e. the plain G365 behaviour.
+    static const int s_g367Sel = []() -> int {
+        const char *e = std::getenv("DC2_G367_SEL");
+        return e ? std::atoi(e) : 7;
+    }();
+    const uint32_t g367Tbp = ctx.tex0.tbp0;
+    const bool g367IsBlur = (g367Tbp == 0x2860u || g367Tbp == 0x28a0u || g367Tbp == 0x28e0u);
+    const bool g367IsDisp = (g367Tbp == 0x0d00u);
+    const int g367Bit = g367IsDisp ? 1 : (g367IsBlur ? 2 : 4);
+    int x0, y0, x1, y1;
+    if (s_g365Edge && (s_g367Sel & g367Bit))
+    {
+        float fx0 = v0.x - static_cast<float>(ofx);
+        float fy0 = v0.y - static_cast<float>(ofy);
+        float fx1 = v1.x - static_cast<float>(ofx);
+        float fy1 = v1.y - static_cast<float>(ofy);
+        if (fx0 > fx1)
+            std::swap(fx0, fx1);
+        if (fy0 > fy1)
+            std::swap(fy0, fy1);
+        x0 = static_cast<int>(std::ceil(fx0));
+        y0 = static_cast<int>(std::ceil(fy0));
+        // Exclusive edges; the span below turns them back into an inclusive last pixel.
+        x1 = static_cast<int>(std::ceil(fx1));
+        y1 = static_cast<int>(std::ceil(fy1));
+        // G367: under the ceil rule a sprite whose span collapses to zero covers NO pixel on
+        // hardware, so it must draw nothing. The `max(1, span)` expansion below is a non-hardware
+        // hack that only made sense under the truncate convention; keeping it while switching to
+        // ceil is what pushed the RTT blur chain's sub-pixel quadrant tiles one pixel outside
+        // their 128x128 region and produced G366's page-row tearing.
+        if (x1 <= x0 || y1 <= y0)
+            return;
+    }
+    else
+    {
+        x0 = static_cast<int>(v0.x) - ofx;
+        y0 = static_cast<int>(v0.y) - ofy;
+        x1 = static_cast<int>(v1.x) - ofx;
+        y1 = static_cast<int>(v1.y) - ofy;
 
-    if (x0 > x1)
-        std::swap(x0, x1);
-    if (y0 > y1)
-        std::swap(y0, y1);
+        if (x0 > x1)
+            std::swap(x0, x1);
+        if (y0 > y1)
+            std::swap(y0, y1);
+    }
 
     const int unclippedX0 = x0;
     const int unclippedY0 = y0;
@@ -733,9 +791,32 @@ void GSRasterizer::drawSprite(GS *gs)
                 if (!spriteZPass(x, y)) // G203: guest Z test
                     continue;
                 const AlphaTestResult alphaTest = classifyAlphaTest(ctx.test, color.a);
-                g219SpritePixelProbe(ctx, gs, x, y, color.r, color.g, color.b, color.a, 1);
+                // G364: fog the post-texture RGB (a sprite's F is flat = second vertex's).
+                uint8_t fr = color.r, fg = color.g, fb = color.b;
+                if (gs->m_prim.fge && g364FogEnabled())
+                    g364ApplyFog(v1.fog, fr, fg, fb);
+                g219SpritePixelProbe(ctx, gs, x, y, fr, fg, fb, color.a, 1);
+                // G365 (diagnostic, default-off): textured-SPRITE half of the right-edge-line
+                // attribution (see the matching [G365:tri] probe in drawTriangle).
+                {
+                    static const bool s_g365s = (std::getenv("DC2_G365_WATCH") != nullptr);
+                    if (s_g365s && ctx.frame.fbp == 0x68u && x >= 508 && x <= 511 &&
+                        (static_cast<uint32_t>(fr) | fg | fb) != 0u && alphaTest.writeFramebuffer)
+                    {
+                        static std::atomic<uint32_t> s_sn2{0};
+                        const uint32_t sn = s_sn2.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                        if (sn <= 200u || (sn % 20000u) == 0u)
+                            std::fprintf(stderr,
+                                "[G365:spr] n=%u xy=(%d,%d) tbp=0x%x tpsm=0x%x tfx=%u tbw=%u "
+                                "rgb=(%u,%u,%u) a=%u v0=(%.1f,%.1f uv=%u,%u) v1=(%.1f,%.1f uv=%u,%u)\n",
+                                sn, x, y, tex.tbp0, (unsigned)tex.psm, (unsigned)tex.tfx,
+                                (unsigned)tex.tbw, fr, fg, fb, color.a,
+                                v0.x, v0.y, (unsigned)v0.u, (unsigned)v0.v,
+                                v1.x, v1.y, (unsigned)v1.u, (unsigned)v1.v);
+                    }
+                }
                 if (alphaTest.writeFramebuffer)
-                    writePixel(gs, x, y, color.r, color.g, color.b, color.a);
+                    writePixel(gs, x, y, fr, fg, fb, color.a);
                 if (alphaTest.writeDepth)
                     spriteZStore(x, y); // G203: guest Z write (e.g. the game's clear-sprite)
             }
@@ -743,15 +824,19 @@ void GSRasterizer::drawSprite(GS *gs)
     }
     else
     {
+        // G364: untextured sprite — flat colour, so fog once up front.
+        uint8_t ur = r, ug = g, ub = b;
+        if (gs->m_prim.fge && g364FogEnabled())
+            g364ApplyFog(v1.fog, ur, ug, ub);
         for (int y = drawY0; y <= drawY1; ++y)
             for (int x = drawX0; x <= drawX1; ++x)
             {
                 if (!spriteZPass(x, y)) // G203: guest Z test
                     continue;
                 const AlphaTestResult alphaTest = classifyAlphaTest(ctx.test, a);
-                g219SpritePixelProbe(ctx, gs, x, y, r, g, b, a, 0);
+                g219SpritePixelProbe(ctx, gs, x, y, ur, ug, ub, a, 0);
                 if (alphaTest.writeFramebuffer)
-                    writePixel(gs, x, y, r, g, b, a);
+                    writePixel(gs, x, y, ur, ug, ub, a);
                 if (alphaTest.writeDepth)
                     spriteZStore(x, y); // G203: guest Z write (e.g. the game's clear-sprite)
             }

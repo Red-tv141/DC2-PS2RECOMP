@@ -1089,13 +1089,16 @@ private:
             "layout(location=0) in vec3 aPos;\n"
             "layout(location=1) in vec3 aSTQ;\n"
             "layout(location=2) in vec4 aColor;\n"
+            "layout(location=3) in vec4 aFog;\n"
             "uniform vec2 uFbSize;\n"
             "noperspective out vec3 vSTQ;\n"
             "noperspective out vec4 vColor;\n"
             "noperspective out float vZ;\n"
+            "noperspective out float vFog;\n"
             "void main(){\n"
             "    vSTQ = aSTQ;\n"
             "    vColor = aColor;\n"
+            "    vFog = aFog.x;\n"
             "    vZ = aPos.z;\n"
             "    float ndcX = aPos.x / uFbSize.x * 2.0 - 1.0;\n"
             "    float ndcY = 1.0 - aPos.y / uFbSize.y * 2.0;\n"
@@ -1106,7 +1109,8 @@ private:
         // 7..8 = G265 AREF code (0=1, 1=64, 2=127), 9 = G286 exact opaque sampler/combine,
         // 10 = G289 CT24 direct-owner source (force TEXA TA0=128),
         // 11 = G309 direct authoritative-page source selection,
-        // 12 = G362 guarded fixed-point POINT fetch (see below).
+        // 12 = G362 guarded fixed-point POINT fetch (see below),
+        // 13 = G364 PRIM.FGE (blend RGB towards uFogCol by the interpolated per-vertex F).
         //
         // G362: `texture()` with GL_NEAREST decides the texel from floor() of an interpolated
         // float. The front-end shifts FST sprite UVs by -0.5 texel-per-pixel so a fragment's
@@ -1131,7 +1135,9 @@ private:
             "noperspective in vec3 vSTQ;\n"
             "noperspective in vec4 vColor;\n"
             "noperspective in float vZ;\n"
+            "noperspective in float vFog;\n"
             "out vec4 o;\n"
+            "uniform int uFogCol;\n" // G364: packed 0x00BBGGRR (int keeps to the loaded uniform set)
             "uniform sampler2D uTex;\n"
             "uniform sampler2D uG309Src1;\n"
             "uniform sampler2D uG309Src2;\n"
@@ -1222,6 +1228,14 @@ private:
             "    }\n"
             "    return clamp(c, 0, 255);\n"
             "}\n"
+            // G364: identical integer form to the CPU rasterizer's g364FogLerp, so the GPU and the
+            // DC2_G178_NO_GPU=1 oracle agree bit-for-bit. F=255 -> unfogged, F=0 -> pure fog colour.
+            "ivec3 fogExact(ivec3 c){\n"
+            "    if ((uMode & 8192) == 0) return c;\n"
+            "    int f = clamp(int(floor(vFog * 255.0 + 0.5)), 0, 255);\n"
+            "    ivec3 fc = ivec3(uFogCol & 255, (uFogCol >> 8) & 255, (uFogCol >> 16) & 255);\n"
+            "    return (c * f + fc * (255 - f) + ivec3(127)) / 255;\n"
+            "}\n"
             "void main(){\n"
             "    if ((uMode & 512) != 0) {\n"
             "        ivec4 vc = clamp(ivec4(floor(vColor * 255.0 + 0.5)), 0, 255);\n"
@@ -1234,6 +1248,7 @@ private:
             "            int refA = (refCode == 0) ? 1 : ((refCode == 1) ? 64 : 127);\n"
             "            if (ec.a < refA) discard;\n"
             "        }\n"
+            "        ec.rgb = fogExact(ec.rgb);\n"
             "        o = vec4(ec) * (1.0 / 255.0);\n"
             "        float ez = max(vZ, 0.0);\n"
             "        if ((uMode & 16) != 0) ez = floor(min(ez, 16777215.0));\n"
@@ -1285,6 +1300,8 @@ private:
             "        if (alphaByte < refA) discard;\n"
             "    }\n"
             "    float outA = ((uMode & 32) != 0) ? c.a : min(c.a * 1.9921875, 1.0);\n"
+            "    if ((uMode & 8192) != 0)\n"
+            "        c.rgb = vec3(fogExact(clamp(ivec3(floor(c.rgb * 255.0 + 0.5)), 0, 255))) * (1.0 / 255.0);\n"
             "    o = vec4(c.rgb, outA);\n"
             "    float z = max(vZ, 0.0);\n"
             "    if ((uMode & 16) != 0) z = floor(min(z, 16777215.0));\n"
@@ -1319,6 +1336,7 @@ private:
         m_f.glUseProgram_(m_prog);
         m_locFbSize = m_f.glGetUniformLocation_(m_prog, "uFbSize");
         m_locMode = m_f.glGetUniformLocation_(m_prog, "uMode");
+        m_locFogCol = m_f.glGetUniformLocation_(m_prog, "uFogCol"); // G364
         m_locLinear = m_f.glGetUniformLocation_(m_prog, "uLinear");
         m_locWrapU = m_f.glGetUniformLocation_(m_prog, "uWrapU");
         m_locWrapV = m_f.glGetUniformLocation_(m_prog, "uWrapV");
@@ -1838,16 +1856,21 @@ private:
         m_f.glBindVertexArray_(m_vao);
         m_f.glGenBuffers_(1, &m_vbo);
         m_f.glBindBuffer_(GL158_ARRAY_BUFFER, m_vbo);
-        static_assert(sizeof(G178Vtx) == 28, "G178Vtx must be tightly packed (6 floats + 4 bytes)");
+        static_assert(sizeof(G178Vtx) == 32,
+                      "G178Vtx must be tightly packed (6 floats + RGBA + G364 fog/pad)");
         m_f.glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, sizeof(G178Vtx),
                                    reinterpret_cast<const void *>(0));
         m_f.glVertexAttribPointer_(1, 3, GL_FLOAT, GL_FALSE, sizeof(G178Vtx),
                                    reinterpret_cast<const void *>(12));
         m_f.glVertexAttribPointer_(2, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(G178Vtx),
                                    reinterpret_cast<const void *>(24));
+        // G364: per-vertex fog byte (normalized; .x carries F, .yzw are the struct padding).
+        m_f.glVertexAttribPointer_(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(G178Vtx),
+                                   reinterpret_cast<const void *>(28));
         m_f.glEnableVertexAttribArray_(0);
         m_f.glEnableVertexAttribArray_(1);
         m_f.glEnableVertexAttribArray_(2);
+        m_f.glEnableVertexAttribArray_(3);
         return true;
     }
 
@@ -3136,6 +3159,14 @@ private:
             {
                 m_g362PlainDraws += 1u;
             }
+            // G364: GS per-pixel fog. Bit 13 + the packed FOGCOL travel per draw (FOGCOL is global
+            // GS state; the front-end snapshots it into each G178Draw so a mid-frame change splits
+            // the batch through g178StateEqual).
+            if (d.fge != 0u)
+            {
+                mode |= 8192;
+                m_f.glUniform1i_(m_locFogCol, static_cast<GLint>(d.fogCol & 0x00FFFFFFu));
+            }
             if (g255RttAlpha && d.blend != 0u)
             {
                 // Fixed-function blending needs As/128 in the shader alpha channel, while PS2
@@ -3267,7 +3298,7 @@ private:
     GLuint m_vao = 0, m_vbo = 0;
     GLuint m_g281MapTex = 0, m_g281ClutTex = 0, m_g281Fbo = 0;
     GLuint m_g309MapTex = 0, m_g309BaseTex = 0;
-    GLint m_locFbSize = -1, m_locMode = -1, m_locLinear = -1;
+    GLint m_locFbSize = -1, m_locMode = -1, m_locLinear = -1, m_locFogCol = -1;
     GLint m_locWrapU = -1, m_locWrapV = -1;
     GLint m_locExactFbSize = -1, m_locExactMode = -1, m_locExactLinear = -1;
     GLint m_locExactWrapU = -1, m_locExactWrapV = -1;

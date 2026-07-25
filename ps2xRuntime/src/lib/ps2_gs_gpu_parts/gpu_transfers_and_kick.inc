@@ -607,6 +607,30 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
                 m_trxreg.rrw, m_trxreg.rrh, sizeBytes, nz, s_pendingImageBytes);
         }
     }
+    // G365 (diagnostic, default-off): every host->local upload whose destination block lands
+    // inside the scene RTT's page range (fbp 0x139 = blocks 0x2720..0x3420) or the display
+    // buffer's (fbp 0x68 = blocks 0xd00..0x1a00). The MAP-160 right-edge line is frozen VRAM,
+    // so an upload landing in the RTT's last page column is a prime suspect.
+    {
+        static const bool s_g365u = (std::getenv("DC2_G365_WATCH") != nullptr);
+        if (s_g365u)
+        {
+            const uint32_t dbp = m_bitbltbuf.dbp;
+            const bool inRtt = (dbp >= 0x2720u && dbp < 0x3420u);
+            const bool inDisp = (dbp >= 0x0d00u && dbp < 0x1a00u);
+            if (inRtt || inDisp)
+            {
+                static std::atomic<uint32_t> s_g365un{0};
+                const uint32_t un = s_g365un.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (un <= 120u || (un % 500u) == 0u)
+                    std::fprintf(stderr,
+                        "[G365:up] n=%u where=%s dbp=0x%x dbw=%u dpsm=0x%x dsa=(%u,%u) rr=%ux%u bytes=%u\n",
+                        un, inRtt ? "rtt" : "disp", dbp, (unsigned)m_bitbltbuf.dbw,
+                        (unsigned)m_bitbltbuf.dpsm, m_trxpos.dsax, m_trxpos.dsay,
+                        m_trxreg.rrw, m_trxreg.rrh, sizeBytes);
+            }
+        }
+    }
     if (m_trxdir != 0 || !m_vram)
         return;
 

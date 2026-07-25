@@ -1,6 +1,7 @@
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "ps2_log.h"
+#include "ps2_gif_arbiter_parts/g370_nan_source_probe.inc"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -1306,7 +1307,11 @@ namespace
                             g317FirstEligibleInWindow = false;
                     }
                     if (!pkt.data.empty() && m_processFn)
+                    {
+                        g370ScanPacket(static_cast<int>(pkt.pathId), pkt.data.data(),
+                                       static_cast<uint32_t>(pkt.data.size()), nullptr);
                         m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
+                    }
                 }
             }
             else
@@ -1330,6 +1335,8 @@ namespace
                         }
                         if (!pkt.data.empty() && m_processFn)
                         {
+                            g370ScanPacket(static_cast<int>(pkt.pathId), pkt.data.data(),
+                                           static_cast<uint32_t>(pkt.data.size()), nullptr);
                             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
                             ++g316PathPackets;
                         }
@@ -1644,6 +1651,8 @@ void GifArbiter::drain()
                                                << std::endl);
             }
             f50_12_scan_gif_packet(pkt, debugIndex);
+            g370ScanPacket(static_cast<int>(pkt.pathId), pkt.data.data(),
+                           static_cast<uint32_t>(pkt.data.size()), nullptr);
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
         }
     }

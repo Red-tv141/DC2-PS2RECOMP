@@ -1116,6 +1116,40 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 if (g139m & 0x1u) g139dst[3] = g139new[3];
             }
         }
+        // G369 (diagnostic, default-off DC2_G369_VUNAN=1): the cutscene gray screen was measured
+        // at the GS as every vertex arriving with NaN/Inf. VIF source data is clean, so the
+        // poison is born inside VU1. Report the FIRST instruction pair after which any vf lane
+        // becomes non-finite, with the pc and both opcode words, then keep counting.
+        {
+            static const bool s_g369vu = (std::getenv("DC2_G369_VUNAN") != nullptr);
+            if (s_g369vu)
+            {
+                static thread_local bool s_wasClean = true;
+                bool bad = false;
+                int badReg = -1;
+                for (int r = 1; r < 32 && !bad; ++r)
+                    for (int l = 0; l < 4; ++l)
+                        if (!std::isfinite(m_state.vf[r][l]))
+                        {
+                            bad = true;
+                            badReg = r;
+                            break;
+                        }
+                if (bad && s_wasClean)
+                {
+                    static std::atomic<uint32_t> s_n{0};
+                    const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    if (n <= 30u || (n % 200u) == 0u)
+                        std::fprintf(stderr,
+                                     "[G369:vunan] n=%u pc=0x%x upper=0x%08x lower=0x%08x vf%d=(%g %g %g %g)\n",
+                                     n, m_state.pc, upper, lower, badReg,
+                                     m_state.vf[badReg][0], m_state.vf[badReg][1],
+                                     m_state.vf[badReg][2], m_state.vf[badReg][3]);
+                }
+                s_wasClean = !bad;
+            }
+        }
+
         // G138: the newest pipeline entry is this pair's post-upper architectural flags.
         if (s_macpipeOn)
         {

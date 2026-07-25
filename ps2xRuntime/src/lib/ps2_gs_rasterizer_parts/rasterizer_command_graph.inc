@@ -1406,6 +1406,8 @@ struct G178EntryState
     uint64_t texKey = 0;
     int texW = 0, texH = 0;
     uint8_t blend = 0, tfx = 0, tcc = 0;
+    uint8_t fge = 0;      // G364
+    uint32_t fogCol = 0;  // G364
     uint8_t depthFunc = 0;
     bool depthWrite = false, bilinear = false;
     uint8_t wrapU = 0, wrapV = 0;

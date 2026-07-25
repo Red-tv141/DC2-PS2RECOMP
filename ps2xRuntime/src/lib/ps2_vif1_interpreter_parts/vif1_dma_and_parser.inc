@@ -20,6 +20,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         return;
 
     g124_note_stream(sizeBytes); // [G124] DMA-transfer boundary in the ordered interleave log
+    g371RenderInfoCensus(m_rdram); // [G371] once-per-present-tick EE mgRENDER_INFO dump (default-off)
     const uint32_t g136Seq = g136_trace_enabled()
         ? g_dc2G136TraceActive.load(std::memory_order_relaxed)
         : 0u;

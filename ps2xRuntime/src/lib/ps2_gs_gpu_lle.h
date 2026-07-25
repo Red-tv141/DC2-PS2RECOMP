@@ -25,6 +25,9 @@ struct G178Vtx
     float x, y, z;
     float sq, tq, iq;
     uint8_t r, g, b, a;
+    // G364: GS per-vertex FOG byte (F). Interpolated by the FS and blended towards G178Draw::fogCol
+    // when the draw's fge flag is set. pad keeps the 4-byte attribute alignment explicit.
+    uint8_t fog, pad0, pad1, pad2;
 };
 
 // One state-batched draw run over a contiguous vertex range (triangles, 3 verts each).
@@ -41,6 +44,8 @@ struct G178Draw
     uint8_t blend = 0;   // 0=off (Cv=Cs), 1=standard (Cs-Cd)*As+Cd, 2=additive Cs*As+Cd
     uint8_t tfx = 0;     // GS TFX (0 modulate / 1 decal / 2 highlight / 3 highlight2)
     uint8_t tcc = 0;
+    uint8_t fge = 0;     // G364: PRIM.FGE — blend RGB towards fogCol by the per-vertex F byte
+    uint32_t fogCol = 0; // G364: GS FOGCOL, 0x00BBGGRR (global state, snapshotted per draw)
     uint8_t depthFunc = 0; // 0=disabled, 1=ALWAYS, 2=GEQUAL, 3=GREATER
     bool depthWrite = false;
     bool bilinear = false;

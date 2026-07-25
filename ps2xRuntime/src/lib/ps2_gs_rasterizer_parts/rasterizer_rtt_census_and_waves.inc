@@ -250,6 +250,10 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
     g265NoteSeen(e);
     g262NoteSeen(e);
     const GSContext &ctx = e.ctx;
+    // G364: GS per-pixel fog is exact on the GPU (interpolated F, RGB lerp towards FOGCOL before
+    // blending), so a fogged entry stays GPU-eligible rather than falling back to CPU.
+    st.fge = (e.prim.fge && g364FogEnabled()) ? 1u : 0u;
+    st.fogCol = st.fge ? e.fogcol : 0u;
     // Frame target: CT32 display buffer, no channel masking, no dest-alpha tricks.
     if (ctx.frame.psm != GS_PSM_CT32 || ctx.frame.fbmsk != 0u || ctx.frame.fbw == 0u ||
         (ctx.fba & 1ull) != 0ull || e.pabe)
@@ -480,6 +484,8 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
 bool g178StateEqual(const G178EntryState &x, const G178EntryState &y)
 {
     return x.texKey == y.texKey && x.blend == y.blend && x.tfx == y.tfx && x.tcc == y.tcc &&
+           x.fge == y.fge && x.fogCol == y.fogCol && // G364
+
            x.depthFunc == y.depthFunc && x.depthWrite == y.depthWrite &&
            x.bilinear == y.bilinear && x.wrapU == y.wrapU && x.wrapV == y.wrapV &&
            x.scX0 == y.scX0 && x.scY0 == y.scY0 && x.scX1 == y.scX1 && x.scY1 == y.scY1;
@@ -494,6 +500,9 @@ void g178PushVertex(std::vector<G178Vtx> &out, const GSVertex &v, int ofx, int o
     o.y = v.y - static_cast<float>(ofy);
     o.z = v.z;
     o.r = colorSrc.r; o.g = colorSrc.g; o.b = colorSrc.b; o.a = colorSrc.a;
+    // G364: F rides the GEOMETRIC vertex (a real GS interpolator, independent of IIP). Sprite
+    // callers pre-copy the flat second-vertex F onto their corner vertices, mirroring `z`.
+    o.fog = v.fog; o.pad0 = 0; o.pad1 = 0; o.pad2 = 0;
     if (!tme)
     {
         o.sq = 0.0f; o.tq = 0.0f; o.iq = 1.0f;

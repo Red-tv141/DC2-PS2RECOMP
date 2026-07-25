@@ -121,6 +121,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         {
             float tmp[4];
             std::memcpy(tmp, vuData + addr, 16);
+            g370NoteVuLoad(m_state.pc, addr, tmp, dest); // G370 load-watch (default-off)
             applyDest(m_state.vf[it], tmp, dest);
         }
         return;
@@ -145,7 +146,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 tmp[2] = m_state.vf[is][2];
             if (dest & 0x1)
                 tmp[3] = m_state.vf[is][3];
-            std::memcpy(vuData + addr, tmp, 16);
+            g370NoteVuStore(m_state.pc, 0u, is, addr, tmp, dest); // G370 store-watch (default-off)
+                    std::memcpy(vuData + addr, tmp, 16);
         }
         return;
     }
@@ -628,6 +630,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                                          (unsigned long long)s_g133skipN.load(),
                                          (unsigned long long)s_g133keepN.load());
                     }
+                    g370NoteVuStore(m_state.pc, 0u, is, addr, tmp, dest); // G370 store-watch (default-off)
                     std::memcpy(vuData + addr, tmp, 16);
                 }
                 if (it != 0)
@@ -644,6 +647,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 {
                     float tmp[4];
                     std::memcpy(tmp, vuData + addr, 16);
+                    g370NoteVuLoad(m_state.pc, addr, tmp, dest); // G370 load-watch (default-off)
                     applyDest(m_state.vf[it], tmp, dest);
                 }
                 return;
@@ -666,6 +670,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                         tmp[2] = m_state.vf[is][2];
                     if (dest & 0x1)
                         tmp[3] = m_state.vf[is][3];
+                    g370NoteVuStore(m_state.pc, 0u, is, addr, tmp, dest); // G370 store-watch (default-off)
                     std::memcpy(vuData + addr, tmp, 16);
                 }
                 return;
@@ -679,6 +684,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 float qv = (den != 0.0f)
                     ? (num / den)
                     : ((num >= 0.0f) ? std::numeric_limits<float>::max() : -std::numeric_limits<float>::max());
+                g370NoteVuDiv(m_state.pc, num, den, m_state.vf[is], m_state.vf[it], m_state.vf, is, it); // G370 (default-off)
                 if (g87_q_latency_enabled()) { if (g200_qstall_enabled() && s_vuQDelay > 0) m_state.q = s_vuQPending; s_vuQPending = qv; s_vuQDelay = 7; } // G200 FDIV busy-stall
                 else m_state.q = qv;
                 if (s_g29DivTrace.load(std::memory_order_relaxed) > 0)
@@ -996,6 +1002,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                                          (unsigned long long)s_g133skipN.load(),
                                          (unsigned long long)s_g133keepN.load());
                     }
+                    g370NoteVuStore(m_state.pc, 0u, is, addr, tmp, dest); // G370 store-watch (default-off)
                     std::memcpy(vuData + addr, tmp, 16);
                 }
                 if (it != 0)
@@ -1012,6 +1019,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 {
                     float tmp[4];
                     std::memcpy(tmp, vuData + addr, 16);
+                    g370NoteVuLoad(m_state.pc, addr, tmp, dest); // G370 load-watch (default-off)
                     applyDest(m_state.vf[it], tmp, dest);
                 }
                 return;
@@ -1034,6 +1042,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                         tmp[2] = m_state.vf[is][2];
                     if (dest & 0x1)
                         tmp[3] = m_state.vf[is][3];
+                    g370NoteVuStore(m_state.pc, 0u, is, addr, tmp, dest); // G370 store-watch (default-off)
                     std::memcpy(vuData + addr, tmp, 16);
                 }
                 return;
@@ -1047,6 +1056,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 float qv = (den != 0.0f)
                     ? (num / den)
                     : ((num >= 0.0f) ? std::numeric_limits<float>::max() : -std::numeric_limits<float>::max());
+                g370NoteVuDiv(m_state.pc, num, den, m_state.vf[is], m_state.vf[it], m_state.vf, is, it); // G370 (default-off)
                 if (g87_q_latency_enabled()) { if (g200_qstall_enabled() && s_vuQDelay > 0) m_state.q = s_vuQPending; s_vuQPending = qv; s_vuQDelay = 7; } // G200 FDIV busy-stall
                 else m_state.q = qv;
                 if (s_g29DivTrace.load(std::memory_order_relaxed) > 0)

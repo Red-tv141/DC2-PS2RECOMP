@@ -282,6 +282,11 @@ static bool g144EffectiveTownDepthScope()
 std::atomic<int> g_dc2TitleCurBlock{-1};
 std::atomic<int> g_g34_in_divsprite{0};
 
+// G364: GS per-pixel FOG. `g_g364FogCol` is the live FOGCOL register (defined in ps2_gs_gpu.cpp);
+// `t_g364FogCol` is the value snapshotted into the G144 entry, used while replaying a deferred
+// tile-bin band (FOGCOL is global GS state and can change between capture and replay).
+extern uint32_t g_g364FogCol;
+thread_local uint32_t t_g364FogCol = 0u;
 
 namespace
 {

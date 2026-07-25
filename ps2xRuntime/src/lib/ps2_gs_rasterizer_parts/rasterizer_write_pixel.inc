@@ -33,6 +33,99 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
         return;
     }
 
+    // G365 (diagnostic, default-off): watch the far-right screen columns of the scene RTT
+    // (fbp=0x139 / tbp 0x2720) and of the display buffer (fbp=0x68). The MAP-160 right-edge
+    // colour line lives at x=509..510, rows ~61..386, and is frozen across frames, so this
+    // pins whether ANY rasterized draw writes those columns (vs a transfer/upload).
+    {
+        static const bool s_g365w = (std::getenv("DC2_G365_WATCH") != nullptr);
+        // Per-column coverage census: how many writes (and how many BLACK writes) each of the
+        // right-hand columns of the display buffer receives. A hole at x=509/510 means the
+        // final black cover has a 2-column gap; equal counts mean the gap is in the SOURCE.
+        static const int s_g365Col0 = []() -> int {
+            const char *e = std::getenv("DC2_G365_COL0");
+            return e ? std::atoi(e) : 500;
+        }();
+        if (s_g365w && x >= s_g365Col0 && x < s_g365Col0 + 12 &&
+            (ctx.frame.fbp == 0x68u || ctx.frame.fbp == 0x139u))
+        {
+            const int fi = (ctx.frame.fbp == 0x68u) ? 0 : 1;
+            static std::atomic<uint64_t> s_col[2][12] = {};
+            static std::atomic<uint64_t> s_colBlack[2][12] = {};
+            static std::atomic<uint64_t> s_tot{0};
+            const int idx = x - s_g365Col0;
+            s_col[fi][idx].fetch_add(1u, std::memory_order_relaxed);
+            if ((static_cast<uint32_t>(r) | g | b) == 0u)
+                s_colBlack[fi][idx].fetch_add(1u, std::memory_order_relaxed);
+            const uint64_t tn = s_tot.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if ((tn % 200000ull) == 0ull)
+            {
+                for (int f = 0; f < 2; ++f)
+                {
+                    char buf[512]; int p = 0;
+                    p += std::snprintf(buf + p, sizeof(buf) - p, "[G365:cov] n=%llu fbp=%s",
+                                       (unsigned long long)tn, f ? "0x139" : "0x68");
+                    for (int i = 0; i < 12; ++i)
+                        p += std::snprintf(buf + p, sizeof(buf) - p, " x%d=%llu/%llu", s_g365Col0 + i,
+                                           (unsigned long long)s_colBlack[f][i].load(std::memory_order_relaxed),
+                                           (unsigned long long)s_col[f][i].load(std::memory_order_relaxed));
+                    std::fprintf(stderr, "%s (black/total)\n", buf);
+                }
+            }
+        }
+        // Ordered log of EVERY write to one watched display row, so the LAST writer of the
+        // right-edge columns can be identified (DC2_G365_ROW=1).
+        {
+            static const bool s_g365row = (std::getenv("DC2_G365_ROW") != nullptr);
+            if (s_g365row && ctx.frame.fbp == 0x68u && y == 200 && x >= 504 && x <= 511)
+            {
+                static std::atomic<uint32_t> s_rn{0};
+                const uint32_t rn = s_rn.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (rn > 3000u && rn <= 3200u)
+                    std::fprintf(stderr,
+                        "[G365:row] n=%u x=%d prim=%u tme=%u tbp=0x%x tpsm=0x%x rgb=(%u,%u,%u) a=%u\n",
+                        rn, x, gs->m_prim.type, gs->m_prim.tme, ctx.tex0.tbp0,
+                        (unsigned)ctx.tex0.psm, r, g, b, a);
+            }
+        }
+        // Watch the two half-res source columns of the scene RTT that feed the right-edge line.
+        if (s_g365w && ctx.frame.fbp == 0x139u && (x == 254 || x == 255) &&
+            (y == 40 || y == 92 || y == 137))
+        {
+            static std::atomic<uint32_t> s_hn{0};
+            const uint32_t hn = s_hn.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (hn <= 400u || (hn % 2000u) == 0u)
+                std::fprintf(stderr,
+                    "[G365:half] n=%u x=%d y=%d prim=%u tme=%u tbp=0x%x tpsm=0x%x tfx=%u "
+                    "rgb=(%u,%u,%u) a=%u abe=%u\n",
+                    hn, x, y, gs->m_prim.type, gs->m_prim.tme, ctx.tex0.tbp0,
+                    (unsigned)ctx.tex0.psm, (unsigned)ctx.tex0.tfx, r, g, b, a,
+                    (unsigned)gs->m_prim.abe);
+        }
+        if (s_g365w && x >= 508 && x <= 511 && ctx.frame.fbp == 0x68u &&
+            (static_cast<uint32_t>(r) | g | b) != 0u)
+        {
+            static std::atomic<uint32_t> s_g365n{0};
+            const uint32_t wn = s_g365n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (wn <= 300u || (wn % 2000u) == 0u)
+                std::fprintf(stderr,
+                    "[G365:px] n=%u fbp=0x%x x=%d y=%d prim=%u tme=%u fst=%u tbp=0x%x tpsm=0x%x "
+                    "tw=%u th=%u tbw=%u clamp=0x%llx rgb=(%u,%u,%u) "
+                    "v0=(%.1f,%.1f uv=%.1f,%.1f st=%.4f,%.4f q=%.3f) "
+                    "v1=(%.1f,%.1f uv=%.1f,%.1f st=%.4f,%.4f q=%.3f)\n",
+                    wn, ctx.frame.fbp, x, y, gs->m_prim.type, gs->m_prim.tme, gs->m_prim.fst,
+                    ctx.tex0.tbp0, static_cast<uint32_t>(ctx.tex0.psm),
+                    ctx.tex0.tw, ctx.tex0.th, ctx.tex0.tbw,
+                    static_cast<unsigned long long>(ctx.clamp), r, g, b,
+                    gs->m_vtxQueue[0].x, gs->m_vtxQueue[0].y,
+                    (double)gs->m_vtxQueue[0].u / 16.0, (double)gs->m_vtxQueue[0].v / 16.0,
+                    gs->m_vtxQueue[0].s, gs->m_vtxQueue[0].t, gs->m_vtxQueue[0].q,
+                    gs->m_vtxQueue[1].x, gs->m_vtxQueue[1].y,
+                    (double)gs->m_vtxQueue[1].u / 16.0, (double)gs->m_vtxQueue[1].v / 16.0,
+                    gs->m_vtxQueue[1].s, gs->m_vtxQueue[1].t, gs->m_vtxQueue[1].q);
+        }
+    }
+
     // G356: watch the Sindain menu circle-centre pixel (screen ~340,200) of the display buffers.
     // Logs every draw that writes it — prim/tex/incoming-colour/alpha — to identify the writer that
     // degrades the circle from field to garbage after menu-open. Tightly gated (exact pixel), capped.
@@ -481,8 +574,35 @@ uint32_t GSRasterizer::readTexelPSMCT32(GS *gs, uint32_t tbp0, uint32_t tbw, int
 {
     if (tbw == 0)
         tbw = 1;
-    return GSMem::ReadCT32(gs->m_vram, tbp0, tbw,
-                           static_cast<uint32_t>(texU), static_cast<uint32_t>(texV));
+    const uint32_t g365c = GSMem::ReadCT32(gs->m_vram, tbp0, tbw,
+                                           static_cast<uint32_t>(texU), static_cast<uint32_t>(texV));
+    // G365 (diagnostic, default-off): per-column census of the far-right texels fetched from the
+    // scene RTT (tbp 0x2720). Answers whether the right-edge line's colour comes OUT of VRAM.
+    {
+        static const bool s_g365r = (std::getenv("DC2_G365_WATCH") != nullptr);
+        if (s_g365r && tbp0 == 0x2720u && texU >= 500 && texU <= 511)
+        {
+            static std::atomic<uint64_t> s_n[12] = {};
+            static std::atomic<uint64_t> s_nz[12] = {};
+            static std::atomic<uint64_t> s_tot{0};
+            const int i = texU - 500;
+            s_n[i].fetch_add(1u, std::memory_order_relaxed);
+            if ((g365c & 0xFFFFFFu) != 0u) s_nz[i].fetch_add(1u, std::memory_order_relaxed);
+            const uint64_t tn = s_tot.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if ((tn % 500000ull) == 0ull)
+            {
+                char buf[512]; int p = 0;
+                p += std::snprintf(buf + p, sizeof(buf) - p, "[G365:rd] n=%llu",
+                                   (unsigned long long)tn);
+                for (int k = 0; k < 12; ++k)
+                    p += std::snprintf(buf + p, sizeof(buf) - p, " u%d=%llu/%llu", 500 + k,
+                                       (unsigned long long)s_nz[k].load(std::memory_order_relaxed),
+                                       (unsigned long long)s_n[k].load(std::memory_order_relaxed));
+                std::fprintf(stderr, "%s (nonblack/total)\n", buf);
+            }
+        }
+    }
+    return g365c;
 }
 
 uint32_t GSRasterizer::readTexelPSMCT16(GS *gs, uint32_t tbp0, uint32_t tbw, int texU, int texV)
@@ -664,8 +784,27 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
 
     auto samplePoint = [&](int sampleU, int sampleV) -> uint32_t
     {
+        const int rawU = sampleU;
         sampleU = wrapTextureCoordinate(sampleU, wrapU, texW, minU, maxU);
         sampleV = wrapTextureCoordinate(sampleV, wrapV, texH, minV, maxV);
+
+        // G365 (diagnostic, default-off): trace the far-right texel fetches of the scene RTT
+        // used as a texture (tbp 0x2720) while drawing the display buffer.
+        {
+            static const bool s_g365s = (std::getenv("DC2_G365_WATCH") != nullptr);
+            if (s_g365s && tex.tbp0 == 0x2720u && rawU >= 500)
+            {
+                const uint32_t c = readTexelPSMCT32(gs, tex.tbp0, tex.tbw, sampleU, sampleV);
+                static std::atomic<uint32_t> s_sn{0};
+                const uint32_t sn = s_sn.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (sn <= 200u || (sn % 20000u) == 0u)
+                    std::fprintf(stderr,
+                        "[G365:tex] n=%u fbp=0x%x rawU=%d u=%d v=%d texW=%d texH=%d wrapU=%u minU=%d maxU=%d "
+                        "tbw=%u psm=0x%x fst=%u c=0x%08x\n",
+                        sn, ctx.frame.fbp, rawU, sampleU, sampleV, texW, texH, wrapU, minU, maxU,
+                        tex.tbw, (unsigned)tex.psm, (unsigned)gs->m_prim.fst, c);
+            }
+        }
 
         if (tex.psm == GS_PSM_CT32 || tex.psm == GS_PSM_CT24)
             return applyTexa(gs->m_texa, tex.psm, readTexelPSMCT32(gs, tex.tbp0, tex.tbw, sampleU, sampleV));

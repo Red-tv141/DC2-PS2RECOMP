@@ -109,6 +109,18 @@ void GSRasterizer::drawPrimitive(GS *gs)
     static uint32_t s_g141Win = 0u;
     G141PerfScope g141Scope(s_g141PerfOn, &s_g141Sum, &s_g141Win, "gs.drawPrimitive", 4000u);
     g141Scope.accumNs = &g_g141GsRasterNs;
+    // G369 (diagnostic, default-off DC2_G369_CENSUS=1): count every submitted primitive here,
+    // at the front door — after this point a draw can be deferred (G144) or handed to the GPU
+    // backend (G178) and never reach drawTriangle/drawSprite on this thread.
+    {
+        extern void g369NoteDrawPrim(uint32_t type, const GSVertex &v0, const GSVertex &v1,
+                                     const GSVertex &v2, uint32_t fbp, uint32_t tbp0, uint32_t tme);
+        const auto &g369ctx = gs->activeContext();
+        g369NoteDrawPrim(static_cast<uint32_t>(gs->m_prim.type),
+                         gs->m_vtxQueue[0], gs->m_vtxQueue[1], gs->m_vtxQueue[2],
+                         g369ctx.frame.fbp, g369ctx.tex0.tbp0,
+                         static_cast<uint32_t>(gs->m_prim.tme));
+    }
     // G219 transition sentinel (inert unless DC2_G219_SKYPX=1).
     {
         static const bool s_g219on = (std::getenv("DC2_G219_SKYPX") != nullptr);

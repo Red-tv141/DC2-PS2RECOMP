@@ -19,6 +19,10 @@ extern std::atomic<uint32_t> g_dc2G217HeadDmaSelf;
 extern std::atomic<uint32_t> g_dc2G217HeadDmaKind;
 extern std::atomic<uint32_t> g_dc2G217DirectPackets[128];
 
+// G370 (default-off DC2_G370_QSRC=1): NaN-`q` GIF-packet source probe, defined in
+// ps2_gif_arbiter.cpp (this part file starts mid-function, so it cannot host the definition).
+extern void g370ScanPacket(int pathId, const uint8_t *data, uint32_t sizeBytes, const uint8_t *rdram);
+
 std::atomic<uint32_t> g_dc2G136TraceActive{0};
 std::atomic<uint32_t> g_dc2G136TraceSeq{0};
 // G138: last VU1 XGKICK program counter (packer entry), published by ps2_vu1.cpp just

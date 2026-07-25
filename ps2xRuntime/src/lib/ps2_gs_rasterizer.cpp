@@ -1,3 +1,4 @@
+// G368: G365 sprite coverage rule promoted back to default-on (kill DC2_G365_NO_SPRITE_EDGE=1).
 #include "ps2_gs_rasterizer_parts/rasterizer_headers_and_diagnostics.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_g214_cap_trace.inc"
@@ -58,6 +59,11 @@
 
 #include "ps2_gs_rasterizer_parts/rasterizer_tilebin_capture.inc"
 
+
+// G369 cutscene gray-screen census (default-off: DC2_G369_CENSUS=1). Must sit AFTER the
+// anonymous namespace opened in rasterizer_headers_and_diagnostics.inc has closed, because it
+// declares the externally-linked g_dc2PresentTick from ps2_runtime.cpp.
+#include "ps2_gs_rasterizer_parts/rasterizer_g369_scene_census.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_write_pixel.inc"
 

@@ -3260,12 +3260,78 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 // drawSprite first truncates screen positions, sorts the bounds, and expands a
                 // zero span to one pixel.  The RTT effects deliberately submit full rectangles
                 // plus degenerate edge/corner sprites; raw GL triangles silently drop the latter.
-                int sx0 = static_cast<int>(a.x) - ofx;
-                int sy0 = static_cast<int>(a.y) - ofy;
-                int sx1 = static_cast<int>(b.x) - ofx;
-                int sy1 = static_cast<int>(b.y) - ofy;
-                if (sx0 > sx1) std::swap(sx0, sx1);
-                if (sy0 > sy1) std::swap(sy0, sy1);
+                //
+                // G365 coverage rule, GPU half — DEFAULT-ON again since G368 (kill:
+                // DC2_G365_NO_SPRITE_EDGE=1). See the long note in drawSprite: G366/G367 blamed
+                // this rule for the MAP-160 page-row tear, but G368 measured the tear to be the
+                // presentation black-fallback reading a 512-wide display buffer at fbw=10, and
+                // this rule only perturbed which context that fallback picked.
+                static const bool s_g365EdgeGpu = !envFlagEnabled("DC2_G365_NO_SPRITE_EDGE");
+                // G367 bisect selector — see the matching note in drawSprite.
+                static const int s_g367SelGpu = []() -> int {
+                    const char *e = std::getenv("DC2_G367_SEL");
+                    return e ? std::atoi(e) : 7;
+                }();
+                const uint32_t g367Tbp = e.ctx.tex0.tbp0;
+                const bool g367IsBlur = (g367Tbp == 0x2860u || g367Tbp == 0x28a0u || g367Tbp == 0x28e0u);
+                const int g367Bit = (g367Tbp == 0x0d00u) ? 1 : (g367IsBlur ? 2 : 4);
+                int sx0, sy0, sx1, sy1;
+                if (s_g365EdgeGpu && (s_g367SelGpu & g367Bit))
+                {
+                    float fx0 = a.x - static_cast<float>(ofx);
+                    float fy0 = a.y - static_cast<float>(ofy);
+                    float fx1 = b.x - static_cast<float>(ofx);
+                    float fy1 = b.y - static_cast<float>(ofy);
+                    if (fx0 > fx1) std::swap(fx0, fx1);
+                    if (fy0 > fy1) std::swap(fy0, fy1);
+                    sx0 = static_cast<int>(std::ceil(fx0));
+                    sy0 = static_cast<int>(std::ceil(fy0));
+                    sx1 = static_cast<int>(std::ceil(fx1));
+                    sy1 = static_cast<int>(std::ceil(fy1));
+                    // G367: zero span under the ceil rule = covers nothing on hardware. Drop the
+                    // sprite instead of letting the legacy `max(1,·)` expansion below force it to
+                    // one pixel at the wrong place (that combination caused G366's page-row tear).
+                    if (sx1 <= sx0 || sy1 <= sy0)
+                        continue;
+                }
+                else
+                {
+                    sx0 = static_cast<int>(a.x) - ofx;
+                    sy0 = static_cast<int>(a.y) - ofy;
+                    sx1 = static_cast<int>(b.x) - ofx;
+                    sy1 = static_cast<int>(b.y) - ofy;
+                    if (sx0 > sx1) std::swap(sx0, sx1);
+                    if (sy0 > sy1) std::swap(sy0, sy1);
+                }
+                // G366 (diagnostic, default-off): every RTT/transient sprite whose ceil-rect
+                // differs from the legacy trunc-rect — i.e. exactly the draws G365's GPU-side
+                // change moves. Deduped by the rect pair so the log stays short.
+                {
+                    static const bool s_g366 = (std::getenv("DC2_G366_RECT") != nullptr);
+                    if (s_g366)
+                    {
+                        int tx0 = static_cast<int>(a.x) - ofx, ty0 = static_cast<int>(a.y) - ofy;
+                        int tx1 = static_cast<int>(b.x) - ofx, ty1 = static_cast<int>(b.y) - ofy;
+                        if (tx0 > tx1) std::swap(tx0, tx1);
+                        if (ty0 > ty1) std::swap(ty0, ty1);
+                        if (tx0 != sx0 || ty0 != sy0 || tx1 != sx1 || ty1 != sy1)
+                        {
+                            char key[256];
+                            std::snprintf(key, sizeof(key),
+                                "fbp=0x%x tbp=0x%x tme=%u trunc=(%d,%d)-(%d,%d) ceil=(%d,%d)-(%d,%d) "
+                                "raw=(%.2f,%.2f)-(%.2f,%.2f)",
+                                fbp, e.ctx.tex0.tbp0, (unsigned)e.prim.tme,
+                                tx0, ty0, tx1, ty1, sx0, sy0, sx1, sy1,
+                                a.x - (float)ofx, a.y - (float)ofy,
+                                b.x - (float)ofx, b.y - (float)ofy);
+                            static std::mutex s_m;
+                            static std::unordered_set<std::string> s_seen;
+                            std::lock_guard<std::mutex> lk(s_m);
+                            if (s_seen.size() < 64u && s_seen.insert(key).second)
+                                std::fprintf(stderr, "[G366:rect] %s\n", key);
+                        }
+                    }
+                }
                 q0.x = static_cast<float>(sx0 + ofx);
                 q0.y = static_cast<float>(sy0 + ofy);
                 q1.x = static_cast<float>(sx0 + std::max(1, sx1 - sx0) + ofx);
@@ -3298,6 +3364,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             // The GS uses the second kick's Z as one flat value for a sprite. Interpolating the
             // two endpoint Z values would turn a clear sprite into a depth ramp.
             c00.z = c10.z = c11.z = c01.z = b.z;
+            c00.fog = c10.fog = c11.fog = c01.fog = b.fog; // G364: sprite F is flat (2nd vertex)
             const bool tme = e.prim.tme, fst = e.prim.fst;
             g178PushVertex(s_batch.verts, c00, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU, uvShiftV);
             g178PushVertex(s_batch.verts, c10, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU, uvShiftV);
@@ -3341,6 +3408,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             d.blend = st.blend;
             d.tfx = st.tfx;
             d.tcc = st.tcc;
+            d.fge = st.fge;       // G364
+            d.fogCol = st.fogCol; // G364
             d.depthFunc = st.depthFunc;
             d.depthWrite = st.depthWrite;
             d.bilinear = st.bilinear;

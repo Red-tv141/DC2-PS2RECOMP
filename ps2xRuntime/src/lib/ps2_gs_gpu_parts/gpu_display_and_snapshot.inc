@@ -354,6 +354,45 @@ void GS::latchHostPresentationFrame()
         }
     }
 
+    // G365 (diagnostic, default-off): dump the scene RTT (fbp 0x139 = tbp 0x2720) and the
+    // display buffer as raw CT32 PPMs at latch time, so the MAP-160 right-edge line can be
+    // located in VRAM (RTT vs display) instead of only in the presented frame.
+    {
+        static const bool s_g365rtt = (std::getenv("DC2_G365_RTTDUMP") != nullptr);
+        if (s_g365rtt && m_vram)
+        {
+            static std::atomic<uint32_t> s_n{0};
+            const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n == 600u || n == 900u)
+            {
+                const struct { const char *tag; uint32_t fbp; } targets[2] = {
+                    { "rtt", 0x139u }, { "disp", 0x68u } };
+                for (const auto &t : targets)
+                {
+                    char path[128];
+                    std::snprintf(path, sizeof(path), "captures/g365_%s_%u.ppm", t.tag, n);
+                    FILE *fp = std::fopen(path, "wb");
+                    if (!fp) continue;
+                    std::fprintf(fp, "P6\n512 416\n255\n");
+                    const uint32_t base = GSInternal::framePageBaseToBlock(t.fbp);
+                    for (uint32_t yy = 0; yy < 416u; ++yy)
+                        for (uint32_t xx = 0; xx < 512u; ++xx)
+                        {
+                            const uint32_t off = GSPSMCT32::addrPSMCT32(base, 8u, xx, yy);
+                            uint32_t px = 0u;
+                            if (off + 4u <= m_vramSize) std::memcpy(&px, m_vram + off, 4);
+                            const uint8_t rgb[3] = { (uint8_t)(px & 0xFFu),
+                                                     (uint8_t)((px >> 8) & 0xFFu),
+                                                     (uint8_t)((px >> 16) & 0xFFu) };
+                            std::fwrite(rgb, 1, 3, fp);
+                        }
+                    std::fclose(fp);
+                    std::fprintf(stderr, "[G365:vram] wrote %s\n", path);
+                }
+            }
+        }
+    }
+
     uint32_t width1 = 0u;
     uint32_t height1 = 0u;
     uint32_t width2 = 0u;
@@ -527,7 +566,19 @@ void GS::latchHostPresentationFrame()
         {
             for (int contextIndex = 0; contextIndex < 2; ++contextIndex)
             {
-                const GSFrameReg &candidate = m_ctx[contextIndex].frame;
+                // G368: this fallback presents a DRAWING context's FRAME register as the display
+                // image, but a display image's row stride is defined by DISPFB.FBW, never by
+                // whatever width the guest last happened to draw at. DC2 keeps context 1 at
+                // {fbp=0x0, fbw=10} (640 px) while both display buffers are fbw=8 (512 px), so
+                // whenever the primary read came back all-black this branch re-read a perfectly
+                // good 512-wide buffer at a 640-wide page stride: PSMCT32 pages are 64x32, so
+                // every 32-row page row slid +128 px sideways = the MAP-160 "character sliced
+                // into bands" tear. Read the candidate BUFFER, but at the DISPLAY's stride.
+                // Rollback (restores the raw context fbw): DC2_G368_NO_DISPFBW=1.
+                static const bool s_g368DispFbw = !envFlagEnabled("DC2_G368_NO_DISPFBW");
+                GSFrameReg candidate = m_ctx[contextIndex].frame;
+                if (s_g368DispFbw)
+                    candidate.fbw = displayFrame.fbw;
                 if (candidate.fbp == selectedFrame.fbp &&
                     candidate.fbw == selectedFrame.fbw &&
                     candidate.psm == selectedFrame.psm)
@@ -610,6 +661,31 @@ void GS::latchHostPresentationFrame()
                     scratch = candidate.pixels;
                     usedPreferred = true;
                 }
+            }
+        }
+
+        // G368 (diagnostic, default-off: DC2_G368_TRACE=1). The MAP-160 band tear was measured to
+        // be the display buffer re-read at a 640-px (fbw=10) page stride instead of its own 512-px
+        // (fbw=8) one — a 32-row page-row shear of +128 px per band. Every substitution branch
+        // above can hand back a `selectedFrame` whose fbw/fbp is NOT the DISPFB one, so log the
+        // anomaly (and only the anomaly) to pin which branch fires on the torn ticks.
+        {
+            static const bool s_g368 = (std::getenv("DC2_G368_TRACE") != nullptr);
+            if (s_g368 && (selectedFrame.fbw != displayFrame.fbw ||
+                           selectedFrame.fbp != displayFrame.fbp))
+            {
+                static std::atomic<uint32_t> s_g368n{0};
+                const uint32_t n = s_g368n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                std::fprintf(stderr,
+                             "[G368:src] n=%u dispFbp=0x%x dispFbw=%u -> srcFbp=0x%x srcFbw=%u "
+                             "srcPsm=0x%x pref=%u size=%ux%u nonblack=%u ctx0(fbp=0x%x fbw=%u) "
+                             "ctx1(fbp=0x%x fbw=%u)\n",
+                             n, displayFrame.fbp, static_cast<uint32_t>(displayFrame.fbw),
+                             selectedFrame.fbp, static_cast<uint32_t>(selectedFrame.fbw),
+                             static_cast<uint32_t>(selectedFrame.psm), usedPreferred ? 1u : 0u,
+                             width, height, countNonBlackPixels(scratch, width, height),
+                             m_ctx[0].frame.fbp, static_cast<uint32_t>(m_ctx[0].frame.fbw),
+                             m_ctx[1].frame.fbp, static_cast<uint32_t>(m_ctx[1].frame.fbw));
             }
         }
 

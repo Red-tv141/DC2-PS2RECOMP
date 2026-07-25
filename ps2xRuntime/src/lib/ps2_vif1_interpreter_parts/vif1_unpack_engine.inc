@@ -57,6 +57,41 @@
                 }
             }
 
+            // G369 (diagnostic, default-off DC2_G369_NANWATCH=1): the cutscene "gray screen" was
+            // measured at the GS as every transformed vertex collapsing to (0,0) with a NaN q.
+            // Scan V4_32 unpack SOURCE floats for NaN/Inf here: a hit means the EE already
+            // handed VU1 poisoned data (camera/light/vertex math upstream), a miss means the
+            // VU1 program itself produced it.
+            {
+                static const bool s_g369nan = (std::getenv("DC2_G369_NANWATCH") != nullptr);
+                // All 32-bit unpack formats (S_32 0x60, V2_32 0x64, V3_32 0x68, V4_32 0x6C).
+                const bool g369Is32 = ((opcode & 0x0Fu) == 0x0Cu) || (opcode == 0x60u) ||
+                                      (opcode == 0x64u) || (opcode == 0x68u) || (opcode == 0x6Cu);
+                if (s_g369nan && g369Is32)
+                {
+                    for (uint32_t q = 0u; q + 4u <= totalBytes && pos + q + 4u <= sizeBytes; q += 4u)
+                    {
+                        float fv;
+                        std::memcpy(&fv, data + pos + q, 4);
+                        if (!std::isfinite(fv))
+                        {
+                            static std::atomic<uint32_t> s_n{0};
+                            const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                            if (n <= 40u || (n % 500u) == 0u)
+                            {
+                                extern std::atomic<uint64_t> g_dc2PresentTick;
+                                std::fprintf(stderr,
+                                             "[G369:nan] n=%u tick=%llu vuAddr=0x%x num=%u srcOff=+%u val=%a\n",
+                                             n,
+                                             (unsigned long long)g_dc2PresentTick.load(std::memory_order_relaxed),
+                                             (uint32_t)imm & 0x3FFu, writeVectorCount, q, (double)fv);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+
             uint32_t vuAddr = (uint32_t)imm & 0x3FFu;
             if ((imm & 0x8000u) != 0u)
                 vuAddr = (vuAddr + (vif1_regs.tops & 0x3FFu)) & 0x3FFu;
