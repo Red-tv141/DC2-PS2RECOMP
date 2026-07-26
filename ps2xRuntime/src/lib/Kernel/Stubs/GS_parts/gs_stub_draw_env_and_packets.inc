@@ -69,7 +69,9 @@
             return;
         }
 
-        uint32_t dbp = (static_cast<uint32_t>(img.vram_addr) * 2048u) / 256u;
+        // G383: sceGsSetDefLoadImage receives VRAM address in the same 256-byte block
+        // units used by BITBLTBUF.DBP. Scaling by 8 truncated/wrapped non-zero uploads.
+        uint32_t dbp = static_cast<uint32_t>(img.vram_addr);
         uint32_t dsax = static_cast<uint32_t>(img.x);
         uint32_t dsay = static_cast<uint32_t>(img.y);
 

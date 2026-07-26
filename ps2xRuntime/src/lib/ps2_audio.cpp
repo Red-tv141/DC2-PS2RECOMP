@@ -1,7 +1,17 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
+#include "ps2_iso_mount.h"
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cctype>
+#include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace
@@ -326,3 +336,12 @@ void PS2AudioBackend::stopAll()
     m_impl->activeSounds.clear();
 #endif
 }
+
+// DC2's MODMIDI path uses headerless PS-ADPCM bodies plus Sony .HD metadata.
+// Keep that game-specific parser/sampler out of the generic public audio header.
+#include "ps2_audio_parts/dc2_g385_game_audio.inc"
+
+// DC2's EZBGM voice service reads standard WAV/BWF clips through the
+// SOUND.HD3 -> SOUND.DAT sector index. Keep this game-specific service out of
+// the generic public audio header.
+#include "ps2_audio_parts/dc2_g386_voice_audio.inc"

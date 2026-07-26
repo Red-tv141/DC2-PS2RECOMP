@@ -10,6 +10,16 @@
 #include <cstring>
 #include <iostream>
 
+// G385 DC2 game-audio bank association. Implemented in ps2_audio.cpp through an
+// .inc to keep DC2-only structures out of the runtime's public headers.
+void dc2G385CommitMidiBank(uint32_t port, uint32_t bodySize);
+void dc2G385CommitMidiSequence(uint32_t port);
+void dc2G385HandleMidiCommand(uint32_t family, uint32_t port,
+                              uint32_t arg0);
+bool dc2G386HandleVoiceRpc(uint32_t rpcNum,
+                           const uint8_t *sendData, uint32_t sendSize,
+                           uint32_t &replyWord);
+
 namespace
 {
     constexpr uint32_t kEzMidiFamilyMask = 0xFFF0u;
@@ -54,6 +64,47 @@ namespace
     {
         static const bool enabled = envFlagEnabled("DC2_PHASE_TRACE");
         return enabled;
+    }
+
+    bool g385AudioTraceEnabled()
+    {
+        static const bool enabled = envFlagEnabled("DC2_G385_AUDIO_TRACE");
+        return enabled;
+    }
+
+    void g385TraceRpc(const uint8_t *rdram,
+                      uint32_t sid, uint32_t rpcNum,
+                      uint32_t sendBufAddr, uint32_t sendSize,
+                      uint32_t recvBufAddr, uint32_t recvSize)
+    {
+        if (!g385AudioTraceEnabled() || (sid != 0x00012345u && sid != 0x00012346u))
+        {
+            return;
+        }
+
+        static uint32_t traceCount = 0u;
+        if (traceCount >= 512u)
+        {
+            return;
+        }
+
+        const uint8_t *sendPtr =
+            (rdram != nullptr && sendBufAddr != 0u) ? getConstMemPtr(rdram, sendBufAddr) : nullptr;
+        std::cerr << "[G385:rpc] n=" << std::dec << traceCount
+                  << " sid=0x" << std::hex << sid
+                  << " rpc=0x" << rpcNum
+                  << " send=0x" << sendBufAddr << "/0x" << sendSize
+                  << " recv=0x" << recvBufAddr << "/0x" << recvSize
+                  << " data=";
+        const uint32_t bytesToLog = std::min(sendSize, 64u);
+        for (uint32_t i = 0u; sendPtr != nullptr && i < bytesToLog; ++i)
+        {
+            static constexpr char kHex[] = "0123456789abcdef";
+            const uint8_t byte = sendPtr[i];
+            std::cerr << kHex[byte >> 4u] << kHex[byte & 0x0Fu];
+        }
+        std::cerr << std::dec << std::endl;
+        ++traceCount;
     }
 
     uint32_t readRpcWord(const uint8_t *sendPtr, uint32_t sendSize, size_t wordIndex)
@@ -207,6 +258,7 @@ bool ps2_iop::handleEzMidiRpc(uint32_t sid, uint32_t rpcNum,
         {
             port.status = kEzMidiStatusReady;
         }
+        dc2G385CommitMidiSequence(static_cast<uint32_t>(portIndex));
         break;
 
     case kEzMidiCmdSetHd:
@@ -215,6 +267,7 @@ bool ps2_iop::handleEzMidiRpc(uint32_t sid, uint32_t rpcNum,
         port.dataSize = arg3;
         port.loaded = (arg1 != 0u) || (arg2 != 0u) || (arg3 != 0u);
         port.status = port.loaded ? kEzMidiStatusReady : kEzMidiStatusStopped;
+        dc2G385CommitMidiBank(static_cast<uint32_t>(portIndex), arg3);
         writeRpcWord(replyPtr, replyCapacity, 1u, port.iopAddrA);
         writeRpcWord(replyPtr, replyCapacity, 2u, port.iopAddrB);
         writeRpcWord(replyPtr, replyCapacity, 3u, port.dataSize);
@@ -306,6 +359,35 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
         return false;
     }
 
+    g385TraceRpc(m_rdram, sid, rpcNum,
+                 sendBufAddr, sendSize, recvBufAddr, recvSize);
+
+    if (sid == 0x00012345u)
+    {
+        const uint8_t *sendPtr =
+            sendBufAddr ? getConstMemPtr(m_rdram, sendBufAddr) : nullptr;
+        uint32_t replyWord = 0u;
+        if (dc2G386HandleVoiceRpc(rpcNum, sendPtr, sendSize, replyWord))
+        {
+            const uint32_t replyBufAddr =
+                recvBufAddr ? recvBufAddr : sendBufAddr;
+            uint32_t replyCapacity = recvSize;
+            if (replyBufAddr != 0u && replyCapacity == 0u)
+            {
+                replyCapacity = std::max(sendSize, 0x10u);
+            }
+            uint8_t *replyPtr =
+                replyBufAddr ? getMemPtr(m_rdram, replyBufAddr) : nullptr;
+            if (replyPtr != nullptr && replyCapacity > 0u)
+            {
+                std::memset(replyPtr, 0, replyCapacity);
+                writeRpcWord(replyPtr, replyCapacity, 0u, replyWord);
+            }
+            resultPtr = replyBufAddr;
+            return true;
+        }
+    }
+
     if (ps2_syscalls::handleSoundDriverRpcService(m_rdram, runtime,
                                                   sid, rpcNum,
                                                   sendBufAddr, sendSize,
@@ -338,11 +420,25 @@ bool ps2_iop::handleRPC(PS2Runtime *runtime,
                       << std::dec << std::endl;
         }
     }
+    const bool isEzMidiRequest =
+        m_ezMidiCompat.rpcSid != 0u && sid == m_ezMidiCompat.rpcSid;
+    const uint8_t *ezMidiSendPtr =
+        (isEzMidiRequest && sendBufAddr != 0u)
+            ? getConstMemPtr(m_rdram, sendBufAddr)
+            : nullptr;
+    const uint32_t ezMidiArg0 =
+        readRpcWord(ezMidiSendPtr, sendSize, 0u);
     if (handleEzMidiRpc(sid, rpcNum,
                         sendBufAddr, sendSize,
                         recvBufAddr, recvSize,
                         resultPtr))
     {
+        if (isEzMidiRequest)
+        {
+            dc2G385HandleMidiCommand(
+                rpcNum & kEzMidiFamilyMask,
+                rpcNum & kEzMidiPortMask, ezMidiArg0);
+        }
         return true;
     }
 

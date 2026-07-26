@@ -1047,8 +1047,10 @@ namespace ps2_stubs
 
     void tan(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::tanf(arg);
+        // G378 (G373 class): C `tan` is double-precision. Metrowerks implements `double`
+        // in software inside 64-bit GPRs, so the argument is $a0 and the result is $v0.
+        // No `tan` symbol is bound in DC2's ELF today, so this is a latent-landmine fix.
+        ps2SetDoubleReturn(ctx, ::tan(ps2GetDoubleArg(ctx, 4)));
     }
 
     void atan2(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -1065,26 +1067,34 @@ namespace ps2_stubs
 
     void exp(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::expf(arg);
+        // G378 (G373 class): C `exp` is double-precision. Metrowerks implements `double`
+        // in software inside 64-bit GPRs, so the argument is $a0 and the result is $v0.
+        // No `exp` symbol is bound in DC2's ELF today, so this is a latent-landmine fix.
+        ps2SetDoubleReturn(ctx, ::exp(ps2GetDoubleArg(ctx, 4)));
     }
 
     void log(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::logf(arg);
+        // G378 (G373 class): C `log` is double-precision. Metrowerks implements `double`
+        // in software inside 64-bit GPRs, so the argument is $a0 and the result is $v0.
+        // No `log` symbol is bound in DC2's ELF today, so this is a latent-landmine fix.
+        ps2SetDoubleReturn(ctx, ::log(ps2GetDoubleArg(ctx, 4)));
     }
 
     void log10(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::log10f(arg);
+        // G378 (G373 class): C `log10` is double-precision. Metrowerks implements `double`
+        // in software inside 64-bit GPRs, so the argument is $a0 and the result is $v0.
+        // No `log10` symbol is bound in DC2's ELF today, so this is a latent-landmine fix.
+        ps2SetDoubleReturn(ctx, ::log10(ps2GetDoubleArg(ctx, 4)));
     }
 
     void ceil(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
-        float arg = ctx->f[12];
-        ctx->f[0] = ::ceilf(arg);
+        // G378 (G373 class): C `ceil` is double-precision. Metrowerks implements `double`
+        // in software inside 64-bit GPRs, so the argument is $a0 and the result is $v0.
+        // No `ceil` symbol is bound in DC2's ELF today, so this is a latent-landmine fix.
+        ps2SetDoubleReturn(ctx, ::ceil(ps2GetDoubleArg(ctx, 4)));
     }
 
     void floor(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

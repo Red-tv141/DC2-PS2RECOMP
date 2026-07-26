@@ -8,6 +8,10 @@
 // F60 spin diagnostics (defined in ps2_runtime.cpp).
 extern std::atomic<uint64_t> g_f60_dmaStat;
 
+// G385 DC2 game-audio bank capture. Implemented in ps2_audio.cpp through an .inc
+// so the generic SIF layer does not need a DC2-specific public header.
+void dc2G385CaptureIopDma(const uint8_t *data, uint32_t sizeBytes);
+
 namespace ps2_stubs
 {
     void sceSifCmdIntrHdlr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -22,9 +26,15 @@ namespace ps2_stubs
 
     void sceSifSendCmd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
+        // G378 (G374 class): sceSifSendCmd(cmd, packet, packet_size, src_extra,
+        // dest_extra, size_extra). The R5900 EABI passes integer args 5-8 in $t0-$t3,
+        // so `dest_extra`/`size_extra` are NOT on the stack. Proven by the guest wrapper
+        // @0x001127E8, which shuffles a2->a3, a3->t0, t0->t1 before tail-calling
+        // _sceSifSendCmd @0x001126B0. The old readStackU32(16/20) reads picked up caller
+        // stack junk, so every extra-data SIF command copied garbage (or nothing).
         const uint32_t srcAddr = getRegU32(ctx, 7); // $a3
-        const uint32_t dstAddr = readStackU32(rdram, ctx, 16);
-        const uint32_t size = readStackU32(rdram, ctx, 20);
+        const uint32_t dstAddr = getRegU32(ctx, 8); // $t0
+        const uint32_t size = getRegU32(ctx, 9);    // $t1
         if (size != 0u && srcAddr != 0u && dstAddr != 0u)
         {
             for (uint32_t i = 0; i < size; ++i)
@@ -66,12 +76,84 @@ namespace ps2_stubs
         bool g_sifCmdInitialized = false;
         uint32_t g_sifGetRegLogCount = 0u;
         uint32_t g_sifSetRegLogCount = 0u;
+        uint32_t g_g385AudioDmaTraceCount = 0u;
 
         constexpr uint32_t kSifRegBootStatus = 0x4u;
         constexpr uint32_t kSifRegMainAddr = 0x80000000u;
         constexpr uint32_t kSifRegSubAddr = 0x80000001u;
         constexpr uint32_t kSifRegMsCom = 0x80000002u;
         constexpr uint32_t kSifBootReadyMask = 0x00020000u;
+        constexpr uint32_t kG385AudioDmaDescriptor = 0x003D3670u;
+
+        bool g385AudioTraceEnabled()
+        {
+            static const bool enabled = []()
+            {
+                const char *value = std::getenv("DC2_G385_AUDIO_TRACE");
+                return value != nullptr && value[0] != '\0' &&
+                       std::strcmp(value, "0") != 0 &&
+                       std::strcmp(value, "false") != 0 &&
+                       std::strcmp(value, "FALSE") != 0;
+            }();
+            return enabled;
+        }
+
+        void g385TraceAndDumpAudioDma(uint8_t *rdram, uint32_t dmatAddr,
+                                      const Ps2SifDmaTransfer &xfer)
+        {
+            if (!g385AudioTraceEnabled() ||
+                ((dmatAddr & 0x1FFFFFFFu) != kG385AudioDmaDescriptor) ||
+                g_g385AudioDmaTraceCount >= 128u ||
+                xfer.size <= 0)
+            {
+                return;
+            }
+
+            const uint32_t traceIndex = g_g385AudioDmaTraceCount++;
+            const uint32_t sizeBytes = static_cast<uint32_t>(xfer.size);
+            const uint8_t *src = getConstMemPtr(rdram, xfer.src);
+            std::fprintf(stderr,
+                         "[G385:dma] n=%u src=0x%08x dst=0x%08x size=0x%x head=",
+                         traceIndex, xfer.src, xfer.dest, sizeBytes);
+            const uint32_t headSize = std::min(sizeBytes, 32u);
+            for (uint32_t i = 0u; src != nullptr && i < headSize; ++i)
+            {
+                std::fprintf(stderr, "%02x", static_cast<unsigned>(src[i]));
+            }
+            std::fprintf(stderr, "\n");
+
+            char filename[192]{};
+            std::snprintf(filename, sizeof(filename),
+                          "captures/g385_dma_%03u_src_%08x_dst_%08x_size_%08x.bin",
+                          traceIndex, xfer.src, xfer.dest, sizeBytes);
+            FILE *file = std::fopen(filename, "wb");
+            if (file == nullptr)
+            {
+                std::fprintf(stderr, "[G385:dma] dump-open-failed path=%s\n", filename);
+                return;
+            }
+
+            std::vector<uint8_t> bytes(sizeBytes);
+            bool complete = true;
+            for (uint32_t i = 0u; i < sizeBytes; ++i)
+            {
+                const uint8_t *byte = getConstMemPtr(rdram, xfer.src + i);
+                if (byte == nullptr)
+                {
+                    complete = false;
+                    bytes.resize(i);
+                    break;
+                }
+                bytes[i] = *byte;
+            }
+            if (!bytes.empty())
+            {
+                std::fwrite(bytes.data(), 1u, bytes.size(), file);
+            }
+            std::fclose(file);
+            std::fprintf(stderr, "[G385:dma] dumped=%zu complete=%u path=%s\n",
+                         bytes.size(), complete ? 1u : 0u, filename);
+        }
 
         void seedDefaultSifRegsLocked()
         {
@@ -675,6 +757,16 @@ namespace ps2_stubs
                 {
                     ok = false;
                     break;
+                }
+
+                g385TraceAndDumpAudioDma(rdram, dmatAddr, xfer);
+                if ((dmatAddr & 0x1FFFFFFFu) == kG385AudioDmaDescriptor)
+                {
+                    const uint8_t *src = getConstMemPtr(rdram, xfer.src);
+                    if (src != nullptr)
+                    {
+                        dc2G385CaptureIopDma(src, static_cast<uint32_t>(xfer.size));
+                    }
                 }
 
                 ps2_syscalls::noteDtxSifDmaTransfer(

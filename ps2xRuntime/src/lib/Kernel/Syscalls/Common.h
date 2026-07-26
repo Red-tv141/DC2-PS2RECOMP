@@ -27,6 +27,7 @@
 #include <sys/stat.h>
 #endif
 #include <ThreadNaming.h>
+#include <optional> // [G379] guest-execution scope on the alarm-callback thread
 
 std::string translatePs2Path(const char *ps2Path);
 

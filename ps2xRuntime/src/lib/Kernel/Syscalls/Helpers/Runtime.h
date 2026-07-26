@@ -189,7 +189,20 @@ static void ensureAlarmWorkerRunning()
                     callbackCtx.pc = readyAlarm->handler;
 
                     PS2Runtime::RecompiledFunction func = readyAlarm->runtime->lookupFunction(readyAlarm->handler);
-                    func(readyAlarm->rdram, &callbackCtx, readyAlarm->runtime);
+                    {
+                        // [G379] The alarm handler is guest code and this is a detached
+                        // host timer thread, so it must hold the guest-execution lock —
+                        // same rule as the INTC/DMAC dispatchers (G377) and the RPC/MPEG/
+                        // IPU/thread callback paths. Rollback: DC2_G379_NO_CB_GUESTLOCK=1.
+                        static const bool s_g379AlarmGuestLock =
+                            (std::getenv("DC2_G379_NO_CB_GUESTLOCK") == nullptr);
+                        std::optional<PS2Runtime::GuestExecutionScope> g379GuestLock;
+                        if (s_g379AlarmGuestLock)
+                        {
+                            g379GuestLock.emplace(readyAlarm->runtime);
+                        }
+                        func(readyAlarm->rdram, &callbackCtx, readyAlarm->runtime);
+                    }
                 }
                 catch (const ThreadExitException &)
                 {

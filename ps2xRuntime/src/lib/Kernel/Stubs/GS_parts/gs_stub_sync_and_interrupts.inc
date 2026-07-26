@@ -508,6 +508,13 @@
         resetGsSyncVState();
     }
 
+    // [G379] see dispatchGsSyncVCallback below.
+    static bool g379CallbackGuestLockEnabled()
+    {
+        static const bool s_enabled = (std::getenv("DC2_G379_NO_CB_GUESTLOCK") == nullptr);
+        return s_enabled;
+    }
+
     void dispatchGsSyncVCallback(uint8_t *rdram, PS2Runtime *runtime, uint64_t tick)
     {
         if (!rdram || !runtime)
@@ -562,6 +569,19 @@
 
         try
         {
+            // [G379] This runs recompiled guest code on the INTERRUPT WORKER thread
+            // (interruptWorkerMain -> Interrupt.cpp), so it must hold the guest-execution
+            // lock exactly like dispatchIntcHandlersForCause/dispatchDmacHandlersForCause
+            // (fixed in G377) and like PS2Runtime::dispatchLoop. Without it the guest's
+            // vsync callback ran concurrently with the EE thread. The lock is a recursive
+            // mutex with thread_local depth, so taking it here is free when the caller
+            // already holds it. Rollback: DC2_G379_NO_CB_GUESTLOCK=1.
+            std::optional<PS2Runtime::GuestExecutionScope> g379GuestLock;
+            if (g379CallbackGuestLockEnabled())
+            {
+                g379GuestLock.emplace(runtime);
+            }
+
             R5900Context callbackCtx{};
             SET_GPR_U32(&callbackCtx, 28, gp);
             SET_GPR_U32(&callbackCtx, 29, (callbackStackTop != 0u) ? callbackStackTop : (PS2_RAM_SIZE - 0x10u));

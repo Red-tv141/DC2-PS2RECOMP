@@ -761,7 +761,14 @@ namespace
               m_ctx(ctx),
               m_runtime(runtime),
               m_fixedArgs(fixedArgs),
-              m_stackBase(getRegU32(ctx, 29) + 0x10)
+              // G378: the R5900 EABI reserves NO 16-byte argument-save area. Args 1-8 are
+              // in $a0-$a3/$t0-$t3 and arg 9 onwards start at the caller's `sp + 0`, in
+              // 8-byte slots. Proven by `sceGifPkRefLoadImage` @0x00106958
+              // (`addiu sp,sp,-0xc0` then `lw s1,0xc0(sp)` = arg9, `lw v0,0xc8(sp)` = arg10)
+              // and by the guest's own `scePrintf` @0x00112298, which spills $a1-$t3 into an
+              // 8-byte-stride va_area. The old `sp + 0x10` base with a 4-byte stride was the
+              // o32 convention and read caller stack junk for the 9th and later argument.
+              m_stackBase(getRegU32(ctx, 29))
         {
             if (m_fixedArgs < 0)
             {
@@ -779,31 +786,35 @@ namespace
 
         uint64_t nextU64()
         {
-            // O32 ABI aligns 64-bit variadic values on even 32-bit slots.
-            if ((m_slotIndex & 1u) != 0u)
-            {
-                ++m_slotIndex;
-            }
-            const uint64_t low = readWordAtSlot(m_slotIndex);
-            const uint64_t high = readWordAtSlot(m_slotIndex + 1u);
-            m_slotIndex += 2u;
-            return low | (high << 32);
+            // G378: one argument == one 64-bit slot. A `double` (software-implemented in a
+            // 64-bit GPR on this toolchain — see G373) occupies ONE register, not a pair, so
+            // the old "combine two 32-bit slots" path desynchronised every argument after it.
+            const uint64_t value = readSlot(m_slotIndex);
+            ++m_slotIndex;
+            return value;
         }
 
     private:
-        uint32_t readWordAtSlot(uint32_t slotIndex) const
+        uint64_t readSlot(uint32_t slotIndex) const
         {
             if (slotIndex < 8u)
             {
                 // EE calls use eight integer argument registers (a0-a3, t0-t3 / r4-r11).
-                return getRegU32(m_ctx, 4 + static_cast<int>(slotIndex));
+                return GPR_U64(m_ctx, (4 + static_cast<int>(slotIndex)));
             }
 
             const uint32_t stackIndex = slotIndex - 8u;
-            const uint32_t stackAddr = m_stackBase + stackIndex * 4u;
-            uint32_t value = 0;
-            (void)tryReadWordFromGuest(m_rdram, m_runtime, stackAddr, value);
-            return value;
+            const uint32_t stackAddr = m_stackBase + stackIndex * 8u;
+            uint32_t low = 0;
+            uint32_t high = 0;
+            (void)tryReadWordFromGuest(m_rdram, m_runtime, stackAddr, low);
+            (void)tryReadWordFromGuest(m_rdram, m_runtime, stackAddr + 4u, high);
+            return static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 32);
+        }
+
+        uint32_t readWordAtSlot(uint32_t slotIndex) const
+        {
+            return static_cast<uint32_t>(readSlot(slotIndex) & 0xFFFFFFFFull);
         }
 
         uint8_t *m_rdram;
@@ -822,20 +833,25 @@ namespace
         {
         }
 
+        // G378: guest va_areas on this toolchain are 8-byte-strided. `scePrintf` @0x00112298
+        // spills $a1-$t3 with `sd` at 0x78,0x80,...,0xa8 and hands `sp+0x78` to vfprintf, so
+        // every variadic argument — int or software `double` — consumes exactly 8 bytes.
         uint32_t nextU32()
         {
             uint32_t value = 0;
             (void)tryReadWordFromGuest(m_rdram, m_runtime, m_curr, value);
-            m_curr += 4;
+            m_curr += 8;
             return value;
         }
 
         uint64_t nextU64()
         {
-            m_curr = (m_curr + 7u) & ~7u;
-            const uint64_t low = nextU32();
-            const uint64_t high = nextU32();
-            return low | (high << 32);
+            uint32_t low = 0;
+            uint32_t high = 0;
+            (void)tryReadWordFromGuest(m_rdram, m_runtime, m_curr, low);
+            (void)tryReadWordFromGuest(m_rdram, m_runtime, m_curr + 4u, high);
+            m_curr += 8;
+            return static_cast<uint64_t>(low) | (static_cast<uint64_t>(high) << 32);
         }
 
     private:
@@ -1731,6 +1747,25 @@ namespace
         const uint32_t reg9 = getRegU32(ctx, 9);
         const uint32_t reg10 = getRegU32(ctx, 10);
         const uint32_t reg11 = getRegU32(ctx, 11);
+
+        // G378: sceGsSetDef{Load,Store}Image(packet, vram_addr, vram_width, psm, x, y, w, h)
+        // is a plain 8-argument EABI call — $a1-$a3 then $t0-$t3. Guest
+        // sceGsSetDefStoreImage @0x00103898 sign-extends $a1/$a3/$t0/$t2/$t3 directly and
+        // never touches the caller stack. The stack/legacy branches below could only fire on
+        // an all-zero register set, in which case they substituted caller stack junk.
+        // Rollback: DC2_G378_GS_ARG_LEGACY=1.
+        static const bool s_g378GsImageLegacy = (std::getenv("DC2_G378_GS_ARG_LEGACY") != nullptr);
+        if (!s_g378GsImageLegacy)
+        {
+            decoded.vramAddr = getRegU32(ctx, 5);
+            decoded.vramWidth = getRegU32(ctx, 6);
+            decoded.psm = getRegU32(ctx, 7);
+            decoded.x = reg8;
+            decoded.y = reg9;
+            decoded.width = reg10;
+            decoded.height = reg11;
+            return decoded;
+        }
 
         const uint32_t stack0 = readStackU32(rdram, ctx, 16);
         const uint32_t stack1 = readStackU32(rdram, ctx, 20);

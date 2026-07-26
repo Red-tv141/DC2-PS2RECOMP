@@ -6,6 +6,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <optional> // [G379] guest-execution scope on the vsync-callback path
 #include <cstring>
 
 // F60 spin diagnostics (defined in ps2_runtime.cpp).
@@ -129,10 +130,25 @@ namespace ps2_stubs
             uint32_t arg2 = 0u;
         };
 
+        // G378: args 5-8 of the sceGs* entry points are in $t0-$t3, never on the stack.
+        // Proven from the guest bodies: sceGsSetDefDispEnv @0x00102838 (`sll t0,t0,0x10`,
+        // `sll t1,t1,0x10`), sceGsSetDefDrawEnv @0x00102C30, sceGsSetDefStoreImage
+        // @0x00103898 (`sll t0/t2/t3`). The old regs-first-with-stack-fallback decode was
+        // wrong exactly when the real arguments were all ZERO — e.g. sceGsSetDefDispEnv with
+        // dx=dy=0, or sceGsSetDefDrawEnv with ztest=zpsm=0 — because "all regs zero" was
+        // misread as "arguments must be on the stack" and caller stack junk won instead.
+        // Rollback: DC2_G378_GS_ARG_LEGACY=1 restores the stack fallback.
+        static const bool s_g378GsArgLegacy = (std::getenv("DC2_G378_GS_ARG_LEGACY") != nullptr);
+
         GsTrailingArgs2 decodeGsTrailingArgs2(uint8_t *rdram, R5900Context *ctx)
         {
             const uint32_t reg8 = getRegU32(ctx, 8);
             const uint32_t reg9 = getRegU32(ctx, 9);
+            if (!s_g378GsArgLegacy)
+            {
+                return {reg8, reg9};
+            }
+
             const uint32_t stack0 = readStackU32(rdram, ctx, 16);
             const uint32_t stack1 = readStackU32(rdram, ctx, 20);
 
@@ -151,6 +167,11 @@ namespace ps2_stubs
             const uint32_t reg8 = getRegU32(ctx, 8);
             const uint32_t reg9 = getRegU32(ctx, 9);
             const uint32_t reg10 = getRegU32(ctx, 10);
+            if (!s_g378GsArgLegacy)
+            {
+                return {reg8, reg9, reg10};
+            }
+
             const uint32_t stack0 = readStackU32(rdram, ctx, 16);
             const uint32_t stack1 = readStackU32(rdram, ctx, 20);
             const uint32_t stack2 = readStackU32(rdram, ctx, 24);

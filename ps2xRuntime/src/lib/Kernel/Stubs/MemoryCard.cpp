@@ -3,6 +3,13 @@
 
 #include <cstdarg>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#define NOUSER
+#include <Windows.h>
+#endif
+
 namespace ps2_stubs
 {
     namespace
@@ -44,7 +51,14 @@ namespace ps2_stubs
         constexpr uint16_t kMcAttrFile = 0x0010;
         constexpr uint16_t kMcAttrSubdir = 0x0020;
         constexpr uint16_t kMcAttrClosed = 0x0080;
+        constexpr uint16_t kMcAttrHidden = 0x2000;
         constexpr uint16_t kMcAttrExists = 0x8000;
+
+        constexpr uint32_t kMcFileInfoCreate = 0x01;
+        constexpr uint32_t kMcFileInfoModify = 0x02;
+        constexpr uint32_t kMcFileInfoAttr = 0x04;
+        constexpr uint32_t kMcFileInfoValidMask =
+            kMcFileInfoCreate | kMcFileInfoModify | kMcFileInfoAttr;
 
         struct SceMcStDateTime
         {
@@ -332,6 +346,199 @@ namespace ps2_stubs
             return std::chrono::system_clock::to_time_t(systemTime);
         }
 
+        std::filesystem::file_time_type timeTToFileTimeMc(std::time_t value)
+        {
+            const auto systemTime = std::chrono::system_clock::from_time_t(value);
+            return std::chrono::time_point_cast<std::filesystem::file_time_type::duration>(
+                systemTime - std::chrono::system_clock::now() + std::filesystem::file_time_type::clock::now());
+        }
+
+        bool readMcDateTime(const SceMcStDateTime &value, std::time_t &out)
+        {
+            if (value.Year < 1970u || value.Month < 1u || value.Month > 12u ||
+                value.Day < 1u || value.Day > 31u || value.Hour > 23u ||
+                value.Min > 59u || value.Sec > 60u)
+            {
+                return false;
+            }
+
+            std::tm tm{};
+            tm.tm_sec = value.Sec;
+            tm.tm_min = value.Min;
+            tm.tm_hour = value.Hour;
+            tm.tm_mday = value.Day;
+            tm.tm_mon = static_cast<int>(value.Month) - 1;
+            tm.tm_year = static_cast<int>(value.Year) - 1900;
+            tm.tm_isdst = -1;
+            out = std::mktime(&tm);
+            return out != static_cast<std::time_t>(-1);
+        }
+
+#ifdef _WIN32
+        std::time_t winFileTimeToTimeTMc(const FILETIME &value)
+        {
+            ULARGE_INTEGER ticks{};
+            ticks.LowPart = value.dwLowDateTime;
+            ticks.HighPart = value.dwHighDateTime;
+            constexpr uint64_t kWindowsToUnixEpoch100ns = 116444736000000000ULL;
+            if (ticks.QuadPart < kWindowsToUnixEpoch100ns)
+            {
+                return 0;
+            }
+            return static_cast<std::time_t>((ticks.QuadPart - kWindowsToUnixEpoch100ns) / 10000000ULL);
+        }
+
+        FILETIME timeTToWinFileTimeMc(std::time_t value)
+        {
+            constexpr uint64_t kWindowsToUnixEpoch100ns = 116444736000000000ULL;
+            ULARGE_INTEGER ticks{};
+            ticks.QuadPart = static_cast<uint64_t>(value) * 10000000ULL + kWindowsToUnixEpoch100ns;
+            FILETIME result{};
+            result.dwLowDateTime = ticks.LowPart;
+            result.dwHighDateTime = ticks.HighPart;
+            return result;
+        }
+#endif
+
+        void readHostMcMetadata(const std::filesystem::path &path,
+                                std::time_t fallbackTime,
+                                std::time_t &createdTime,
+                                std::time_t &modifiedTime,
+                                bool &writeable,
+                                bool &hidden)
+        {
+            createdTime = fallbackTime;
+            modifiedTime = fallbackTime;
+            writeable = true;
+            hidden = false;
+
+#ifdef _WIN32
+            WIN32_FILE_ATTRIBUTE_DATA data{};
+            if (GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &data))
+            {
+                createdTime = winFileTimeToTimeTMc(data.ftCreationTime);
+                modifiedTime = winFileTimeToTimeTMc(data.ftLastWriteTime);
+                writeable = (data.dwFileAttributes & FILE_ATTRIBUTE_READONLY) == 0;
+                hidden = (data.dwFileAttributes & FILE_ATTRIBUTE_HIDDEN) != 0;
+                return;
+            }
+#endif
+
+            std::error_code ec;
+            const auto status = std::filesystem::status(path, ec);
+            if (!ec)
+            {
+                const auto perms = status.permissions();
+                writeable = (perms & (std::filesystem::perms::owner_write |
+                                      std::filesystem::perms::group_write |
+                                      std::filesystem::perms::others_write)) != std::filesystem::perms::none;
+            }
+            ec.clear();
+            const auto lastWrite = std::filesystem::last_write_time(path, ec);
+            if (!ec)
+            {
+                modifiedTime = fileTimeToTimeTMc(lastWrite);
+                createdTime = modifiedTime;
+            }
+        }
+
+        bool setHostMcMetadata(const std::filesystem::path &path,
+                               const SceMcTblGetDir &info,
+                               uint32_t flags)
+        {
+            std::time_t createTime = 0;
+            std::time_t modifyTime = 0;
+            const bool setCreate = (flags & kMcFileInfoCreate) != 0u &&
+                                   readMcDateTime(info._Create, createTime);
+            const bool setModify = (flags & kMcFileInfoModify) != 0u &&
+                                   readMcDateTime(info._Modify, modifyTime);
+
+            if (((flags & kMcFileInfoCreate) != 0u && !setCreate) ||
+                ((flags & kMcFileInfoModify) != 0u && !setModify))
+            {
+                return false;
+            }
+
+#ifdef _WIN32
+            const DWORD openFlags = std::filesystem::is_directory(path)
+                                        ? FILE_FLAG_BACKUP_SEMANTICS
+                                        : FILE_ATTRIBUTE_NORMAL;
+            HANDLE handle = CreateFileW(path.c_str(),
+                                        FILE_WRITE_ATTRIBUTES,
+                                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                        nullptr,
+                                        OPEN_EXISTING,
+                                        openFlags,
+                                        nullptr);
+            if (handle == INVALID_HANDLE_VALUE)
+            {
+                return false;
+            }
+
+            const FILETIME createFileTime = timeTToWinFileTimeMc(createTime);
+            const FILETIME modifyFileTime = timeTToWinFileTimeMc(modifyTime);
+            const BOOL timeResult =
+                (!setCreate && !setModify) ||
+                SetFileTime(handle,
+                            setCreate ? &createFileTime : nullptr,
+                            nullptr,
+                            setModify ? &modifyFileTime : nullptr);
+            CloseHandle(handle);
+            if (!timeResult)
+            {
+                return false;
+            }
+#else
+            if (setModify)
+            {
+                std::error_code ec;
+                std::filesystem::last_write_time(path, timeTToFileTimeMc(modifyTime), ec);
+                if (ec)
+                {
+                    return false;
+                }
+            }
+#endif
+
+            if ((flags & kMcFileInfoAttr) != 0u)
+            {
+#ifdef _WIN32
+                DWORD attrs = GetFileAttributesW(path.c_str());
+                if (attrs == INVALID_FILE_ATTRIBUTES)
+                {
+                    return false;
+                }
+                if ((info.AttrFile & kMcAttrWriteable) != 0u)
+                    attrs &= ~FILE_ATTRIBUTE_READONLY;
+                else
+                    attrs |= FILE_ATTRIBUTE_READONLY;
+                if ((info.AttrFile & kMcAttrHidden) != 0u)
+                    attrs |= FILE_ATTRIBUTE_HIDDEN;
+                else
+                    attrs &= ~FILE_ATTRIBUTE_HIDDEN;
+                if (!SetFileAttributesW(path.c_str(), attrs))
+                {
+                    return false;
+                }
+#else
+                std::error_code ec;
+                const auto writePerms = std::filesystem::perms::owner_write |
+                                        std::filesystem::perms::group_write |
+                                        std::filesystem::perms::others_write;
+                const auto operation = (info.AttrFile & kMcAttrWriteable) != 0u
+                                           ? std::filesystem::perm_options::add
+                                           : std::filesystem::perm_options::remove;
+                std::filesystem::permissions(path, writePerms, operation, ec);
+                if (ec)
+                {
+                    return false;
+                }
+#endif
+            }
+
+            return true;
+        }
+
         void writeMcCString(uint8_t *rdram, uint32_t addr, const std::string &value)
         {
             if (addr == 0u)
@@ -370,16 +577,20 @@ namespace ps2_stubs
                                  const std::string &name,
                                  bool isDirectory,
                                  uint32_t sizeBytes,
-                                 std::time_t modifiedTime)
+                                 std::time_t createdTime,
+                                 std::time_t modifiedTime,
+                                 bool writeable,
+                                 bool hidden)
         {
             std::memset(&entry, 0, sizeof(entry));
-            writeMcDateTime(entry._Create, modifiedTime);
+            writeMcDateTime(entry._Create, createdTime);
             writeMcDateTime(entry._Modify, modifiedTime);
             entry.FileSizeByte = isDirectory ? 0u : sizeBytes;
             entry.AttrFile = static_cast<uint16_t>(kMcAttrReadable |
-                                                   kMcAttrWriteable |
+                                                   (writeable ? kMcAttrWriteable : 0u) |
                                                    (isDirectory ? kMcAttrSubdir : kMcAttrFile) |
                                                    kMcAttrClosed |
+                                                   (hidden ? kMcAttrHidden : 0u) |
                                                    kMcAttrExists);
             std::strncpy(entry.EntryName, name.c_str(), sizeof(entry.EntryName) - 1u);
             entry.EntryName[sizeof(entry.EntryName) - 1u] = '\0';
@@ -817,7 +1028,7 @@ namespace ps2_stubs
                                 return;
                             }
                             SceMcTblGetDir entry{};
-                            fillMcDirTableEntry(entry, name, true, 0u, now);
+                            fillMcDirTableEntry(entry, name, true, 0u, now, now, true, false);
                             entries.push_back(entry);
                         };
 
@@ -856,13 +1067,26 @@ namespace ps2_stubs
                             const uint32_t sizeBytes =
                                 isDirectory ? 0u : static_cast<uint32_t>(entry.file_size(entryEc));
                             entryEc.clear();
-                            const std::time_t modifiedTime = fileTimeToTimeTMc(entry.last_write_time(entryEc));
+                            const std::time_t fallbackTime = fileTimeToTimeTMc(entry.last_write_time(entryEc));
+                            std::time_t createdTime = entryEc ? now : fallbackTime;
+                            std::time_t modifiedTime = entryEc ? now : fallbackTime;
+                            bool writeable = true;
+                            bool hidden = false;
+                            readHostMcMetadata(entry.path(),
+                                               fallbackTime,
+                                               createdTime,
+                                               modifiedTime,
+                                               writeable,
+                                               hidden);
                             SceMcTblGetDir tableEntry{};
                             fillMcDirTableEntry(tableEntry,
                                                 name,
                                                 isDirectory,
                                                 sizeBytes,
-                                                entryEc ? now : modifiedTime);
+                                                createdTime,
+                                                modifiedTime,
+                                                writeable,
+                                                hidden);
                             entries.push_back(tableEntry);
                         }
 
@@ -1225,6 +1449,14 @@ namespace ps2_stubs
         const int32_t port = static_cast<int32_t>(getRegU32(ctx, 4));
         const int32_t slot = static_cast<int32_t>(getRegU32(ctx, 5));
         const std::string path = readPs2CStringBounded(rdram, getRegU32(ctx, 6), kMcMaxPathLen);
+        const uint32_t infoAddr = getRegU32(ctx, 7);
+        const uint32_t flags = getArgU32(ctx, 4) & kMcFileInfoValidMask; // $t0
+        SceMcTblGetDir info{};
+        const uint8_t *infoPtr = getMemPtr(rdram, infoAddr);
+        if (infoPtr)
+        {
+            std::memcpy(&info, infoPtr, sizeof(info));
+        }
 
         int32_t result = kMcResultNoEntry;
         {
@@ -1241,16 +1473,22 @@ namespace ps2_stubs
                     const std::filesystem::path hostPath =
                         guestMcPathToHostPath(port, normalizeGuestMcPathLocked(port, path));
                     std::error_code ec;
-                    if (std::filesystem::exists(hostPath, ec) && !ec)
+                    if (!infoPtr)
                     {
-                        result = kMcResultSucceed;
+                        result = kMcResultDeniedPermit;
+                    }
+                    else if (std::filesystem::exists(hostPath, ec) && !ec)
+                    {
+                        result = setHostMcMetadata(hostPath, info, flags)
+                                     ? kMcResultSucceed
+                                     : kMcResultDeniedPermit;
                     }
                 }
             }
 
             setMcCommandResultLocked(kMcCmdSetFileInfo, result);
         }
-        mcTrace("SetFileInfo -> %d", result);
+        mcTrace("SetFileInfo info=0x%08X flags=0x%X -> %d", infoAddr, flags, result);
         setReturnS32(ctx, 0);
     }
 

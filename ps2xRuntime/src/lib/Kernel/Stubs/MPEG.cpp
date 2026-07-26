@@ -33,6 +33,8 @@ namespace ps2_stubs
             std::vector<uint8_t> rgba;
         };
 
+#include "MPEG_parts/mpeg_pcm_audio.inc"
+
 #if PS2X_HAS_FFMPEG
         std::string ffmpegErrorString(int err)
         {
@@ -483,6 +485,7 @@ namespace ps2_stubs
             bool hasLastFrame = false;
             MpegDecodedFrame lastFrame;
             std::unique_ptr<MpegFfmpegDecoder> decoder;
+            std::unique_ptr<MpegPcmAudioStream> audioStream;
         };
 
         struct MpegStreamCallbackEvent
@@ -1119,20 +1122,31 @@ namespace ps2_stubs
                 else if (isAudioStreamId(streamId))
                 {
                     const size_t payloadStart = parsePesPayloadOffset(buffer.data(), packetEnd);
-                    if (payloadStart < packetEnd && payloadStart < playback.pssGuestAddrs.size())
+                    if (payloadStart < packetEnd)
                     {
-                        queueStreamCallbackEvent(
-                            mpegAddr,
-                            kMpegStrPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            static_cast<uint32_t>(packetEnd - payloadStart),
-                            callbackEvents);
-                        queueStreamCallbackEvent(
-                            mpegAddr,
-                            kMpegStrADPCM,
-                            playback.pssGuestAddrs[payloadStart],
-                            static_cast<uint32_t>(packetEnd - payloadStart),
-                            callbackEvents);
+                        if (!playback.audioStream)
+                        {
+                            playback.audioStream = std::make_unique<MpegPcmAudioStream>();
+                        }
+                        playback.audioStream->feedPssPayload(
+                            buffer.data() + payloadStart,
+                            packetEnd - payloadStart);
+
+                        if (payloadStart < playback.pssGuestAddrs.size())
+                        {
+                            queueStreamCallbackEvent(
+                                mpegAddr,
+                                kMpegStrPCM,
+                                playback.pssGuestAddrs[payloadStart],
+                                static_cast<uint32_t>(packetEnd - payloadStart),
+                                callbackEvents);
+                            queueStreamCallbackEvent(
+                                mpegAddr,
+                                kMpegStrADPCM,
+                                playback.pssGuestAddrs[payloadStart],
+                                static_cast<uint32_t>(packetEnd - payloadStart),
+                                callbackEvents);
+                        }
                     }
                 }
 
@@ -1147,6 +1161,10 @@ namespace ps2_stubs
             playback.streamEnded = true;
             playback.cdStreamGeneration = g_mpeg_stub_state.cdStreamGeneration;
             flushDecoderIfEnded(playback);
+            if (playback.audioStream)
+            {
+                playback.audioStream->finish();
+            }
         }
 
         void appendPssBytes(uint32_t mpegAddr,
@@ -2151,6 +2169,10 @@ namespace ps2_stubs
                 width = playback.width;
                 height = playback.height;
                 frameCount = playback.picturesServed;
+            }
+            if (playback.audioStream)
+            {
+                playback.audioStream->pump();
             }
         }
 
