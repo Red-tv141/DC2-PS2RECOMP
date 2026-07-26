@@ -335,6 +335,7 @@
     X(sceDeci2Open)                           \
     X(sceDeci2Poll)                           \
     X(sceDeci2ReqSend)                        \
+    X(sceDevctl)                              \
     X(sceDmaCallback)                         \
     X(sceDmaDebug)                            \
     X(sceDmaGetChan)                          \
