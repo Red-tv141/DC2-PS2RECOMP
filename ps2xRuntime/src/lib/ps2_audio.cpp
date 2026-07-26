@@ -202,6 +202,36 @@ void PS2AudioBackend::onSoundCommand(uint32_t sid, uint32_t rpcNum,
     }
 }
 
+namespace
+{
+    // G390: DC2's MODMIDI bank one-shots are keyed
+    // `0x01000000 | slot<<16 | vagIndex` by dc2G385PlaySfx.
+    bool g390IsBankSampleKey(uint32_t sampleKey)
+    {
+        return (sampleKey & 0xFF000000u) == 0x01000000u;
+    }
+
+    // G390 rollback: restore the pre-G390 4-voice cap, same-sample suppression
+    // and duration-based "this is BGM, stop everything" heuristic.
+    bool g390SfxVoicesEnabled()
+    {
+        static const bool enabled = []()
+        {
+            const char *value = std::getenv("DC2_G390_LEGACY_SFX");
+            return !(value != nullptr && value[0] != '\0' &&
+                     std::strcmp(value, "0") != 0 &&
+                     std::strcmp(value, "false") != 0 &&
+                     std::strcmp(value, "FALSE") != 0);
+        }();
+        return enabled;
+    }
+
+    // SPU2 has 24 hardware voices per core. Four was a bring-up placeholder and
+    // silently evicted still-playing effects during combat bursts.
+    constexpr int kG390MaxConcurrentSounds = 24;
+    constexpr int kG390LegacyMaxConcurrentSounds = 4;
+}
+
 void PS2AudioBackend::play(uint32_t sampleAddr, float pitch, float volume, uint32_t voiceIndex)
 {
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -232,7 +262,17 @@ void PS2AudioBackend::play(uint32_t sampleAddr, float pitch, float volume, uint3
     if (!sampleToPlay || sampleToPlay->pcm.empty())
         return;
 
-    const bool isBgm = (sampleToPlay->pcm.size() > static_cast<size_t>(sampleToPlay->sampleRate * 5));
+    // G390: a long DC2 bank SFX is NOT background music. Sequenced BGM has its
+    // own raylib AudioStream path (dc2_g385_game_audio.inc) and never reaches
+    // here, so the duration heuristic can now only misfire — a 5 s ambience
+    // would stop every other playing sound.
+    const bool isBgm =
+        !g390SfxVoicesEnabled()
+            ? (sampleToPlay->pcm.size() >
+               static_cast<size_t>(sampleToPlay->sampleRate * 5))
+            : (!g390IsBankSampleKey(sampleKey) &&
+               sampleToPlay->pcm.size() >
+                   static_cast<size_t>(sampleToPlay->sampleRate * 5));
     playDecodedSample(sampleKey, *sampleToPlay, pitch, volume, isBgm);
 }
 
@@ -274,10 +314,16 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
 
     pruneFinishedSounds();
 
-    for (const auto &t : m_impl->activeSounds)
+    // G390: on hardware every key-on takes its own SPU2 voice, so the same
+    // sample legitimately overlaps itself (footsteps, repeated hits). Only the
+    // legacy arm suppresses a retrigger.
+    if (!g390SfxVoicesEnabled() || !g390IsBankSampleKey(sampleKey))
     {
-        if (t.sampleKey == sampleKey && IsSoundPlaying(t.snd))
-            return;
+        for (const auto &t : m_impl->activeSounds)
+        {
+            if (t.sampleKey == sampleKey && IsSoundPlaying(t.snd))
+                return;
+        }
     }
 
     auto &sounds = m_impl->activeSounds;
@@ -296,7 +342,9 @@ void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sampl
         }
     }
 
-    constexpr int kMaxConcurrentSounds = 4;
+    const int kMaxConcurrentSounds = g390SfxVoicesEnabled()
+                                         ? kG390MaxConcurrentSounds
+                                         : kG390LegacyMaxConcurrentSounds;
     while (static_cast<int>(sounds.size()) >= kMaxConcurrentSounds)
     {
         StopSound(sounds.front().snd);
@@ -339,6 +387,18 @@ void PS2AudioBackend::stopAll()
 
 // DC2's MODMIDI path uses headerless PS-ADPCM bodies plus Sony .HD metadata.
 // Keep that game-specific parser/sampler out of the generic public audio header.
+// G387: bank bodies larger than the IOP staging window arrive as several SIF
+// DMA transfers; the capture below concatenates them (DC2_G387_NO_BD_CHUNKS=1).
+// G388: one uploaded bank can be bound to SEVERAL ports by repeated SetHD
+// commands naming the same IOP addresses (DC2_G388_NO_BANK_ALIAS=1).
+// G389: EZMIDI port volume is a 0..0x100 scale and attenuates SFX as well as
+// the sequenced stream on that port (DC2_G389_LEGACY_MIX=1).
+// G391: HD ADSR envelopes, VAG loop points, per-voice pan and an SPU2-style
+// reverb bus for one-shots (bring-up probe DC2_G391_HD_DUMP=1, mixer capture
+// DC2_G391_MIX_DUMP=<raw s16le path>).
+// G392: documented SPU reverb preset network, sequenced BGM mixed on the same
+// bus (DC2_G392_NO_BGM_BUS=1), SE volume/pan un-swapped (DC2_G392_LEGACY_SE_MIX=1). MSBuild does not
+// track `.inc` dependencies — this comment is edited on every `.inc` change.
 #include "ps2_audio_parts/dc2_g385_game_audio.inc"
 
 // DC2's EZBGM voice service reads standard WAV/BWF clips through the

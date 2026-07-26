@@ -1,11 +1,18 @@
 #include "Common.h"
 #include "Audio.h"
 
+// G391: DC2 configures SPU2 reverb through `SetReverb__6CSoundFiii@0x188940`,
+// which reaches this stub as libsd remote commands. Forward the mode and echo
+// volume to the G391 SFX mixer's reverb bus (defined in ps2_audio.cpp).
+void dc2G391SetReverb(uint32_t mode, uint32_t echoVolume, bool enabled);
+
 namespace ps2_stubs
 {
     namespace
     {
         constexpr uint32_t kLibSdCmdSetParam = 0x8010u;
+        constexpr uint32_t kLibSdCmdSetSwitch = 0x8070u;
+        constexpr uint32_t kLibSdCmdSetEffectAttr = 0x8130u;
         constexpr uint32_t kLibSdCmdBlockTrans = 0x80D0u;
         constexpr uint32_t kLibSdCmdBlockTransAlt = 0x80E0u;
         constexpr uint32_t kAudioPositionMask = 0x00FFFFFFu;
@@ -16,6 +23,10 @@ namespace ps2_stubs
             uint32_t currentBlockBase = 0u;
             uint32_t currentBlockSize = 0u;
             uint32_t currentPauseBase = 0u;
+            // G391 reverb state, per libsd core.
+            uint32_t reverbMode = 0u;
+            uint32_t reverbEchoVolume = 0u;
+            bool reverbEnabled = false;
         };
 
         std::mutex g_audio_stub_mutex;
@@ -56,6 +67,12 @@ namespace ps2_stubs
         const uint32_t arg5 = (arg5Reg != 0u) ? arg5Reg : arg5Stk;
         const uint32_t arg6 = (arg6Reg != 0u) ? arg6Reg : arg6Stk;
 
+        bool reverbChanged = false;
+        uint32_t reverbMode = 0u;
+        uint32_t reverbEchoVolume = 0u;
+        bool reverbEnabled = false;
+
+        {
         std::lock_guard<std::mutex> lock(g_audio_stub_mutex);
         g_audio_stub_state.initialized = true;
 
@@ -76,14 +93,50 @@ namespace ps2_stubs
         }
         else if (cmd == kLibSdCmdSetParam)
         {
-            (void)cmdArg0;
-            (void)cmdArg1;
+            // SD_P_EVOLL (core|0xb80) / SD_P_EVOLR (core|0xc80) carry the echo
+            // (reverb send) volume that `SetReverb` computed as `depth << 8`.
+            const uint32_t reg = cmdArg0 & 0xFF80u;
+            if (reg == 0x0B80u || reg == 0x0C80u)
+            {
+                g_audio_stub_state.reverbEchoVolume = cmdArg1 & 0xFFFFu;
+                reverbChanged = true;
+            }
         }
+        else if (cmd == kLibSdCmdSetEffectAttr)
+        {
+            // `sceSdSetEffectAttr(core, attr)` — attr.mode is `SD_REV_MODE_* |
+            // 0x100` (the 0x100 bit asks libsd to clear the work area).
+            if (cmdArg1 != 0u)
+            {
+                const uint32_t mode = FAST_READ32(cmdArg1 + 4u) & 0xFFu;
+                g_audio_stub_state.reverbMode = mode;
+                reverbChanged = true;
+            }
+        }
+        else if (cmd == kLibSdCmdSetSwitch)
+        {
+            // SD_C_EFFECT_ENABLE is core|2.
+            if ((cmdArg0 & 0xFFu) == 2u)
+            {
+                g_audio_stub_state.reverbEnabled = cmdArg1 != 0u;
+                reverbChanged = true;
+            }
+        }
+
+        reverbMode = g_audio_stub_state.reverbMode;
+        reverbEchoVolume = g_audio_stub_state.reverbEchoVolume;
+        reverbEnabled = g_audio_stub_state.reverbEnabled;
 
         // Some games only sample the low 24 bits of the reported SPU transfer head.
         // Returning the last configured transfer base keeps the ring-buffer math
         // stable without emulating SPU DMA progress.
         setReturnU32(ctx, g_audio_stub_state.currentBlockBase & kAudioPositionMask);
+        }
+
+        if (reverbChanged)
+        {
+            dc2G391SetReverb(reverbMode, reverbEchoVolume, reverbEnabled);
+        }
     }
 
     void sceSdRemoteInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

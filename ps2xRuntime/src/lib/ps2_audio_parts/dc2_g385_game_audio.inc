@@ -4,7 +4,15 @@ namespace
     {
         std::vector<uint8_t> header;
         std::vector<uint8_t> body;
+        // G386.5: a `.BD` body larger than the IOP staging window arrives as
+        // several consecutive SIF DMA transfers. Record where each captured
+        // chunk starts so the commit can select the chunk-aligned run that
+        // matches the size the guest's SetHD actually requested.
+        std::vector<size_t> chunkOffsets;
     };
+
+    // Guard against an unbounded pending body if a bank is never committed.
+    constexpr size_t kG385MaxPendingBodyBytes = 8u * 1024u * 1024u;
 
     struct G385MidiBank
     {
@@ -51,6 +59,14 @@ namespace
         uint8_t programVolume = 127u;
         uint8_t splitVolume = 127u;
         uint8_t sampleVolume = 127u;
+        // G391: the Sony `.HD` sample parameter carries the SPU2 envelope
+        // (ADSR1 at +18, ADSR2 at +20, little-endian — located by dumping live
+        // banks, `DC2_G391_HD_DUMP=1`) and a 0..127 pan at split +17 with the
+        // program-wide default at programParam +7 (0x40 = centre).
+        uint16_t adsr1 = 0x80FFu;
+        uint16_t adsr2 = 0x5FC0u;
+        uint8_t programPan = 64u;
+        uint8_t splitPan = 64u;
     };
 
     std::mutex g_g385BankMutex;
@@ -80,6 +96,92 @@ namespace
         static const bool enabled = []()
         {
             const char *value = std::getenv("DC2_G385_AUDIO_TRACE");
+            return value != nullptr && value[0] != '\0' &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "false") != 0 &&
+                   std::strcmp(value, "FALSE") != 0;
+        }();
+        return enabled;
+    }
+
+    // G387 rollback: restore the pre-G387 single-transfer `.BD` capture, which
+    // drops every continuation chunk of a split bank body.
+    bool g387BdChunksDisabled()
+    {
+        static const bool disabled = []()
+        {
+            const char *value = std::getenv("DC2_G387_NO_BD_CHUNKS");
+            return value != nullptr && value[0] != '\0' &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "false") != 0 &&
+                   std::strcmp(value, "FALSE") != 0;
+        }();
+        return disabled;
+    }
+
+    // G388 rollback: refuse to re-bind an already-committed bank to a second
+    // port, restoring the pre-G388 "one SetHD consumes the capture" behaviour.
+    bool g388BankAliasDisabled()
+    {
+        static const bool disabled = []()
+        {
+            const char *value = std::getenv("DC2_G388_NO_BANK_ALIAS");
+            return value != nullptr && value[0] != '\0' &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "false") != 0 &&
+                   std::strcmp(value, "FALSE") != 0;
+        }();
+        return disabled;
+    }
+
+    // G388: DC2 uploads one HD/BD pair and then issues SEVERAL SetHD commands
+    // that name the SAME IOP addresses and size, binding that one bank to more
+    // than one EZMIDI port (e.g. the SFX port and the battle-BGM port). The
+    // pending capture is consumed by the first commit, so remember the last
+    // committed bank keyed by its guest identity and re-bind it for the rest.
+    struct G385CommittedBankCache
+    {
+        std::vector<uint8_t> header;
+        std::vector<uint8_t> body;
+        uint32_t hdAddr = 0u;
+        uint32_t bdAddr = 0u;
+        uint32_t bodySize = 0u;
+        bool valid = false;
+    };
+
+    G385CommittedBankCache g_g385LastCommittedBank;
+
+    // G389: the guest's per-port volume reaches EZMIDI on a 0..0x100 scale.
+    // `sndSetPortVol__Fif@0x18D420` quantises its 0..1 float to `f * 127`, and
+    // `SetVol__6CSoundFii@0x18A2C0` then multiplies by 256/127 (2.015748)
+    // unless the value is already the 0x100 unity token. Both music streams and
+    // one-shot SFX on a port are attenuated by it.
+    constexpr float kG385PortVolumeUnity = 256.0f;
+    std::mutex g_g385PortVolumeMutex;
+    std::array<float, 16u> g_g385PortVolume = []()
+    {
+        std::array<float, 16u> volumes{};
+        volumes.fill(1.0f);
+        return volumes;
+    }();
+
+    float g385PortVolume(uint32_t port)
+    {
+        if (port >= g_g385PortVolume.size())
+        {
+            return 1.0f;
+        }
+        std::lock_guard<std::mutex> lock(g_g385PortVolumeMutex);
+        return g_g385PortVolume[port];
+    }
+
+    // G389 rollback: restore the pre-G389 mix (port volume divided by 127 below
+    // the unity token, and SFX ignoring the port volume entirely).
+    bool g389LegacyMixEnabled()
+    {
+        static const bool enabled = []()
+        {
+            const char *value = std::getenv("DC2_G389_LEGACY_MIX");
             return value != nullptr && value[0] != '\0' &&
                    std::strcmp(value, "0") != 0 &&
                    std::strcmp(value, "false") != 0 &&
@@ -134,6 +236,37 @@ namespace
     uint8_t g385ClampMidiVolume(uint8_t value)
     {
         return std::min<uint8_t>(value, 127u);
+    }
+
+    // G391 bring-up probe: dump the raw Sony `.HD` program/split/sample parameter
+    // bytes for the first few resolves so the ADSR fields can be located by
+    // observation instead of guessed from a struct layout we do not have.
+    bool g391HdDumpEnabled()
+    {
+        static const bool enabled = []()
+        {
+            const char *value = std::getenv("DC2_G391_HD_DUMP");
+            return value != nullptr && value[0] != '\0' &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "false") != 0 &&
+                   std::strcmp(value, "FALSE") != 0;
+        }();
+        return enabled;
+    }
+
+    void g391DumpHdBytes(const char *label, const std::vector<uint8_t> &hd,
+                         size_t offset, size_t count)
+    {
+        if (!g385RangeValid(hd, offset, count))
+        {
+            return;
+        }
+        std::fprintf(stderr, "[G391:hd] %s off=0x%zx bytes=", label, offset);
+        for (size_t i = 0u; i < count; ++i)
+        {
+            std::fprintf(stderr, "%02x", static_cast<unsigned>(hd[offset + i]));
+        }
+        std::fprintf(stderr, "\n");
     }
 
     bool g385ResolveSample(const G385MidiBank &bank,
@@ -193,6 +326,7 @@ namespace
             return false;
         }
         out.programVolume = hd[programParam + 6u];
+        out.programPan = hd[programParam + 7u];
 
         for (uint32_t splitIndex = 0u; splitIndex < splitCount; ++splitIndex)
         {
@@ -345,6 +479,31 @@ namespace
                 out.splitVolume = hd[split + 16u];
                 out.splitTranspose = static_cast<int8_t>(hd[split + 18u]);
                 out.splitDetune = static_cast<int8_t>(hd[split + 19u]);
+                out.splitPan = hd[split + 17u];
+                uint16_t adsr1 = 0u;
+                uint16_t adsr2 = 0u;
+                if (g385ReadU16(hd, sampleParam + 18u, adsr1) &&
+                    g385ReadU16(hd, sampleParam + 20u, adsr2))
+                {
+                    out.adsr1 = adsr1;
+                    out.adsr2 = adsr2;
+                }
+                if (g391HdDumpEnabled())
+                {
+                    static uint32_t dumpCount = 0u;
+                    if (dumpCount < 24u)
+                    {
+                        ++dumpCount;
+                        std::fprintf(stderr,
+                                     "[G391:hd] resolve program=%u key=%u vel=%u vag=%u "
+                                     "splitSize=%u\n",
+                                     program, key, velocity, vagIndex, splitSize);
+                        g391DumpHdBytes("programParam", hd, programParam, 36u);
+                        g391DumpHdBytes("split", hd, split, splitSize);
+                        g391DumpHdBytes("sampleParam", hd, sampleParam, 64u);
+                        g391DumpHdBytes("vagInfo", hd, vagInfo, 16u);
+                    }
+                }
                 return true;
             }
         }
@@ -671,6 +830,27 @@ namespace
         bool loops = false;
     };
 
+    std::vector<uint8_t> g385BuildVagp(const G385ResolvedSample &sample)
+    {
+        std::vector<uint8_t> vagp(48u + sample.vag.size(), 0u);
+        vagp[0] = 'V';
+        vagp[1] = 'A';
+        vagp[2] = 'G';
+        vagp[3] = 'p';
+        g385WriteBe32(vagp, 12u, static_cast<uint32_t>(sample.vag.size()));
+        g385WriteBe32(vagp, 16u, sample.sampleRate);
+        std::memcpy(vagp.data() + 48u, sample.vag.data(), sample.vag.size());
+        return vagp;
+    }
+}
+
+// G391: the live one-shot voice mixer (ADSR, VAG loop points, pan, reverb).
+// Reuses G385ResolvedSample / G385DecodedVag / g385BuildVagp above; its ADSR
+// state machine and loop-aware VAG decode are shared with the BGM renderer.
+#include "dc2_g391_sfx_mixer.inc"
+
+namespace
+{
     struct G385RenderInstrument
     {
         std::shared_ptr<G385DecodedVag> decoded;
@@ -678,6 +858,10 @@ namespace
         int8_t splitTranspose = 0;
         int16_t detuneCents = 0;
         float baseVolume = 1.0f;
+        // G391: per-program SPU2 envelope and HD pan.
+        uint16_t adsr1 = 0x80FFu;
+        uint16_t adsr2 = 0x5FC0u;
+        uint8_t hdPan = 64u;
     };
 
     struct G385RenderChannel
@@ -699,20 +883,10 @@ namespace
         uint8_t key = 60u;
         uint8_t velocity = 127u;
         bool releasing = false;
+        // G391: real per-program envelope. `releaseFrames` is only still used by
+        // the legacy arm (`DC2_G391_NO_ADSR=1`).
+        G391EnvState env{};
     };
-
-    std::vector<uint8_t> g385BuildVagp(const G385ResolvedSample &sample)
-    {
-        std::vector<uint8_t> vagp(48u + sample.vag.size(), 0u);
-        vagp[0] = 'V';
-        vagp[1] = 'A';
-        vagp[2] = 'G';
-        vagp[3] = 'p';
-        g385WriteBe32(vagp, 12u, static_cast<uint32_t>(sample.vag.size()));
-        g385WriteBe32(vagp, 16u, sample.sampleRate);
-        std::memcpy(vagp.data() + 48u, sample.vag.data(), sample.vag.size());
-        return vagp;
-    }
 
     std::shared_ptr<G385RenderInstrument> g385GetRenderInstrument(
         const G385MidiBank &bank, uint8_t program, uint8_t key, uint8_t velocity,
@@ -743,43 +917,12 @@ namespace
         }
         else
         {
-            const std::vector<uint8_t> vagp = g385BuildVagp(sample);
-            decoded = std::make_shared<G385DecodedVag>();
-            if (!ps2_vag::decode(vagp.data(),
-                                 static_cast<uint32_t>(vagp.size()),
-                                 decoded->pcm, decoded->sampleRate) ||
-                decoded->pcm.empty())
+            decoded = g391DecodeVagWithLoops(sample);
+            if (!decoded)
             {
                 zoneCache.emplace(zoneKey, nullptr);
                 return nullptr;
             }
-
-            decoded->playEnd = static_cast<uint32_t>(decoded->pcm.size());
-            uint32_t loopStart = 0u;
-            bool sawLoopStart = false;
-            for (size_t blockOffset = 0u;
-                 blockOffset + 16u <= sample.vag.size();
-                 blockOffset += 16u)
-            {
-                const uint8_t flags = sample.vag[blockOffset + 1u];
-                const uint32_t pcmFrame =
-                    static_cast<uint32_t>((blockOffset / 16u) * 28u);
-                if ((flags & 0x04u) != 0u && !sawLoopStart)
-                {
-                    loopStart = pcmFrame;
-                    sawLoopStart = true;
-                }
-                if ((flags & 0x01u) != 0u)
-                {
-                    decoded->playEnd = std::min<uint32_t>(
-                        decoded->playEnd, pcmFrame + 28u);
-                    decoded->loops =
-                        sawLoopStart && (flags & 0x02u) != 0u &&
-                        loopStart < decoded->playEnd;
-                    break;
-                }
-            }
-            decoded->loopStart = decoded->loops ? loopStart : 0u;
             vagCache.emplace(sample.vagIndex, decoded);
         }
 
@@ -794,6 +937,9 @@ namespace
             (static_cast<float>(g385ClampMidiVolume(sample.programVolume)) / 127.0f) *
             (static_cast<float>(g385ClampMidiVolume(sample.splitVolume)) / 127.0f) *
             (static_cast<float>(g385ClampMidiVolume(sample.sampleVolume)) / 127.0f);
+        instrument->adsr1 = sample.adsr1;
+        instrument->adsr2 = sample.adsr2;
+        instrument->hdPan = g385ClampMidiVolume(sample.splitPan);
         zoneCache.emplace(zoneKey, instrument);
         return instrument;
     }
@@ -825,6 +971,7 @@ namespace
 
         std::vector<float> mix(static_cast<size_t>(renderFrames) * 2u, 0.0f);
         std::array<G385RenderChannel, 16u> channels{};
+        std::array<bool, 16u> channelPanSeen{};
         std::vector<G385RenderVoice> voices;
         std::unordered_map<uint32_t, std::shared_ptr<G385RenderInstrument>> zoneCache;
         std::unordered_map<uint32_t, std::shared_ptr<G385DecodedVag>> vagCache;
@@ -869,6 +1016,7 @@ namespace
                         {
                             voice.releasing = true;
                             voice.releaseFrames = kReleaseFrames;
+                            voice.env.keyOff();
                         }
                     }
                     break;
@@ -880,6 +1028,7 @@ namespace
                     else if (event.data0 == 10u)
                     {
                         channel.pan = static_cast<uint8_t>(event.data1);
+                        channelPanSeen[event.channel] = true;
                     }
                     else if (event.data0 == 11u)
                     {
@@ -901,7 +1050,9 @@ namespace
                 const G385DecodedVag &decoded = *voice.instrument->decoded;
                 bool removeVoice =
                     decoded.pcm.empty() || decoded.playEnd == 0u ||
-                    (voice.releasing && voice.releaseFrames == 0u);
+                    (g391AdsrDisabled()
+                         ? (voice.releasing && voice.releaseFrames == 0u)
+                         : voice.env.finished());
 
                 if (!removeVoice && voice.sourcePosition >= decoded.playEnd)
                 {
@@ -957,26 +1108,42 @@ namespace
                 const float channelGain =
                     (static_cast<float>(channel.volume) / 127.0f) *
                     (static_cast<float>(channel.expression) / 127.0f);
+                // G391: the per-program SPU2 ADSR out of the `.HD` replaces the
+                // fixed 4 ms attack / 20 ms release placeholder, so percussive
+                // and sustained instruments no longer share one shape.
                 float envelopeGain = 1.0f;
-                if (voice.ageFrames < kAttackFrames)
+                if (g391AdsrDisabled())
                 {
-                    envelopeGain =
-                        static_cast<float>(voice.ageFrames) /
-                        static_cast<float>(kAttackFrames);
+                    if (voice.ageFrames < kAttackFrames)
+                    {
+                        envelopeGain = static_cast<float>(voice.ageFrames) /
+                                       static_cast<float>(kAttackFrames);
+                    }
+                    if (voice.releasing)
+                    {
+                        envelopeGain *= static_cast<float>(voice.releaseFrames) /
+                                        static_cast<float>(kReleaseFrames);
+                        --voice.releaseFrames;
+                    }
                 }
-                if (voice.releasing)
+                else
                 {
-                    envelopeGain *=
-                        static_cast<float>(voice.releaseFrames) /
-                        static_cast<float>(kReleaseFrames);
-                    --voice.releaseFrames;
+                    G391Adsr adsr{};
+                    adsr.adsr1 = voice.instrument->adsr1;
+                    adsr.adsr2 = voice.instrument->adsr2;
+                    envelopeGain = static_cast<float>(voice.env.tick(adsr)) /
+                                   static_cast<float>(kG391EnvMax);
                 }
                 const float gain =
                     voice.instrument->baseVolume *
                     (static_cast<float>(voice.velocity) / 127.0f) *
                     channelGain * envelopeGain;
+                const uint8_t effectivePan =
+                    (channelPanSeen[voice.channel] || g391AdsrDisabled())
+                        ? channel.pan
+                        : voice.instrument->hdPan;
                 const double panAngle =
-                    (static_cast<double>(channel.pan) / 127.0) * kHalfPi;
+                    (static_cast<double>(effectivePan) / 127.0) * kHalfPi;
                 mix[static_cast<size_t>(frame) * 2u + 0u] +=
                     sourceSample * gain *
                     static_cast<float>(std::cos(panAngle));
@@ -1003,20 +1170,35 @@ namespace
             }
         }
 
+        // G391: per-sequence peak normalisation (`0.95 / peak`) gave every track
+        // the same output level, so a quiet ambient cue came out as loud as a
+        // battle theme. Use ONE fixed bus gain for every sequence and take the
+        // rare overshoot with a soft knee instead of rescaling the whole track.
         float peak = 0.0f;
         for (float sample : mix)
         {
             peak = std::max(peak, std::abs(sample));
         }
-        const float scale = peak > 0.95f ? (0.95f / peak) : 1.0f;
+        const bool legacyNormalise = g391LegacyBgmNormaliseEnabled();
+        const float scale =
+            legacyNormalise ? (peak > 0.95f ? (0.95f / peak) : 1.0f)
+                            : kG391SequenceBusGain;
         auto pcm = std::make_shared<std::vector<int16_t>>();
         pcm->resize(mix.size());
         for (size_t sampleIndex = 0u; sampleIndex < mix.size(); ++sampleIndex)
         {
-            const float scaled = std::max(
-                -1.0f, std::min(1.0f, mix[sampleIndex] * scale));
+            const float value = mix[sampleIndex] * scale;
+            const float scaled =
+                legacyNormalise ? std::max(-1.0f, std::min(1.0f, value))
+                                : g391SoftLimit(value);
             (*pcm)[sampleIndex] =
                 static_cast<int16_t>(std::lround(scaled * 32767.0f));
+        }
+        if (g385GameAudioTrace())
+        {
+            std::fprintf(stderr,
+                         "[G391:bgm] mix peak=%.3f scale=%.3f legacyNorm=%u\n",
+                         peak, scale, legacyNormalise ? 1u : 0u);
         }
 
         out.renderedPcm = std::move(pcm);
@@ -1109,6 +1291,8 @@ namespace
 #if defined(PLATFORM_VITA)
         (void)port;
 #else
+        dc2G392BgmStop(port); // G392 bus source (no-op when the bus is off)
+
         G385MusicPlayback &playback = g_g385MusicPlayback[port];
         AudioStream stream{};
         bool unload = false;
@@ -1166,6 +1350,37 @@ namespace
             return;
         }
 
+        float portVolume = 1.0f;
+        {
+            std::lock_guard<std::mutex> lock(g_g385MusicPlayback[port].mutex);
+            portVolume = g_g385MusicPlayback[port].volume;
+        }
+
+        // G392: route the rendered sequence through the G391 mixer bus so it
+        // reaches the same reverb send as the SFX voices (and so there is one
+        // master output). The per-port AudioStream stays as the rollback arm.
+        if (dc2G392BgmStart(port, pcm, loopStartFrame, loopEndFrame, portVolume))
+        {
+            std::lock_guard<std::mutex> lock(g_g385MusicPlayback[port].mutex);
+            g_g385MusicPlayback[port].active = true;
+            g_g385MusicPlayback[port].loopStartFrame = loopStartFrame;
+            g_g385MusicPlayback[port].loopEndFrame = loopEndFrame;
+            g_g385MusicPlayback[port].cursorFrame = 0u;
+            if (g385GameAudioTrace())
+            {
+                std::fprintf(stderr,
+                             "[G385:bgm] start port=%u frames=%llu loop=%llu..%llu "
+                             "rate=%u volume=%.3f generation=%llu bus=1\n",
+                             port,
+                             static_cast<unsigned long long>(loopEndFrame),
+                             static_cast<unsigned long long>(loopStartFrame),
+                             static_cast<unsigned long long>(loopEndFrame),
+                             sampleRate, portVolume,
+                             static_cast<unsigned long long>(generation));
+            }
+            return;
+        }
+
         AudioStream stream = LoadAudioStream(sampleRate, 16u, 2u);
         if (!IsAudioStreamValid(stream))
         {
@@ -1210,9 +1425,18 @@ namespace
             return;
         }
 
-        const float divisor = rawVolume > 127u ? 256.0f : 127.0f;
+        // G389: one scale, always 0..0x100 (see kG385PortVolumeUnity). The old
+        // "<=127 means a 0..127 scale" heuristic doubled every sub-unity port
+        // volume and made the mapping discontinuous at 127→128.
+        const float divisor = g389LegacyMixEnabled()
+                                  ? (rawVolume > 127u ? 256.0f : 127.0f)
+                                  : kG385PortVolumeUnity;
         const float volume = std::max(
             0.0f, std::min(1.0f, static_cast<float>(rawVolume) / divisor));
+        {
+            std::lock_guard<std::mutex> lock(g_g385PortVolumeMutex);
+            g_g385PortVolume[port] = volume;
+        }
         G385MusicPlayback &playback = g_g385MusicPlayback[port];
         AudioStream stream{};
         bool loaded = false;
@@ -1222,6 +1446,7 @@ namespace
             stream = playback.stream;
             loaded = playback.loaded;
         }
+        dc2G392BgmSetVolume(port, volume);
 #if !defined(PLATFORM_VITA)
         if (loaded && IsAudioDeviceReady())
         {
@@ -1260,17 +1485,38 @@ void dc2G385CaptureIopDma(const uint8_t *data, uint32_t sizeBytes)
         return;
     }
 
-    if (!g_g385PendingBank.header.empty() && g_g385PendingBank.body.empty())
+    if (g387BdChunksDisabled())
     {
-        g_g385PendingBank.body.assign(data, data + sizeBytes);
+        if (!g_g385PendingBank.header.empty() && g_g385PendingBank.body.empty())
+        {
+            g_g385PendingBank.chunkOffsets.push_back(0u);
+            g_g385PendingBank.body.assign(data, data + sizeBytes);
+            if (g385GameAudioTrace())
+            {
+                std::fprintf(stderr, "[G385:bank] captured-bd size=0x%x\n", sizeBytes);
+            }
+        }
+        return;
+    }
+
+    if (!g_g385PendingBank.header.empty() &&
+        g_g385PendingBank.body.size() + sizeBytes <= kG385MaxPendingBodyBytes)
+    {
+        g_g385PendingBank.chunkOffsets.push_back(g_g385PendingBank.body.size());
+        g_g385PendingBank.body.insert(g_g385PendingBank.body.end(), data,
+                                      data + sizeBytes);
         if (g385GameAudioTrace())
         {
-            std::fprintf(stderr, "[G385:bank] captured-bd size=0x%x\n", sizeBytes);
+            std::fprintf(stderr,
+                         "[G385:bank] captured-bd size=0x%x chunk=%zu total=0x%zx\n",
+                         sizeBytes, g_g385PendingBank.chunkOffsets.size(),
+                         g_g385PendingBank.body.size());
         }
     }
 }
 
-void dc2G385CommitMidiBank(uint32_t port, uint32_t bodySize)
+void dc2G385CommitMidiBank(uint32_t port, uint32_t bodySize, uint32_t hdAddr,
+                           uint32_t bdAddr)
 {
     if (g385GameAudioDisabled() || port >= g_g385MidiBanks.size())
     {
@@ -1278,23 +1524,83 @@ void dc2G385CommitMidiBank(uint32_t port, uint32_t bodySize)
     }
 
     std::lock_guard<std::mutex> lock(g_g385BankMutex);
-    if (g_g385PendingBank.header.empty() ||
-        g_g385PendingBank.body.size() != bodySize)
+    // The pending body is the concatenation of every `.BD` transfer seen since
+    // the header. The guest tells us the true body size here, so accept the
+    // chunk-aligned run that ends at the newest chunk and totals exactly that
+    // many bytes; anything before it belonged to an earlier, abandoned upload.
+    size_t bodyStart = g_g385PendingBank.body.size();
+    bool matched = false;
+    if (!g_g385PendingBank.header.empty())
     {
+        for (size_t i = g_g385PendingBank.chunkOffsets.size(); i-- > 0;)
+        {
+            const size_t offset = g_g385PendingBank.chunkOffsets[i];
+            const size_t span = g_g385PendingBank.body.size() - offset;
+            if (span == bodySize)
+            {
+                bodyStart = offset;
+                matched = true;
+                break;
+            }
+            if (span > bodySize)
+            {
+                break;
+            }
+        }
+    }
+
+    if (!matched)
+    {
+        // G388: the guest is re-binding the bank it just uploaded to another
+        // port. Identity is the SetHD triple (HD address, BD address, size) —
+        // no capture is expected on the wire for these repeats.
+        const bool aliases = !g388BankAliasDisabled() &&
+                             g_g385LastCommittedBank.valid &&
+                             g_g385LastCommittedBank.hdAddr == hdAddr &&
+                             g_g385LastCommittedBank.bdAddr == bdAddr &&
+                             g_g385LastCommittedBank.bodySize == bodySize;
+        if (aliases)
+        {
+            G385MidiBank &alias = g_g385MidiBanks[port];
+            alias.header = g_g385LastCommittedBank.header;
+            alias.body = g_g385LastCommittedBank.body;
+            alias.generation = ++g_g385BankGeneration;
+            if (g385GameAudioTrace())
+            {
+                std::fprintf(stderr,
+                             "[G385:bank] commit-alias port=%u hd=0x%zx bd=0x%zx "
+                             "hdAddr=0x%x bdAddr=0x%x generation=%llu\n",
+                             port, alias.header.size(), alias.body.size(),
+                             hdAddr, bdAddr,
+                             static_cast<unsigned long long>(alias.generation));
+            }
+            return;
+        }
+
         if (g385GameAudioTrace())
         {
             std::fprintf(stderr,
-                         "[G385:bank] commit-miss port=%u requested=0x%x pending=0x%zx\n",
-                         port, bodySize, g_g385PendingBank.body.size());
+                         "[G385:bank] commit-miss port=%u requested=0x%x pending=0x%zx chunks=%zu\n",
+                         port, bodySize, g_g385PendingBank.body.size(),
+                         g_g385PendingBank.chunkOffsets.size());
         }
         return;
     }
 
     G385MidiBank &bank = g_g385MidiBanks[port];
     bank.header = std::move(g_g385PendingBank.header);
-    bank.body = std::move(g_g385PendingBank.body);
+    bank.body.assign(g_g385PendingBank.body.begin() +
+                         static_cast<std::ptrdiff_t>(bodyStart),
+                     g_g385PendingBank.body.end());
     bank.generation = ++g_g385BankGeneration;
     g_g385PendingBank = {};
+
+    g_g385LastCommittedBank.header = bank.header;
+    g_g385LastCommittedBank.body = bank.body;
+    g_g385LastCommittedBank.hdAddr = hdAddr;
+    g_g385LastCommittedBank.bdAddr = bdAddr;
+    g_g385LastCommittedBank.bodySize = bodySize;
+    g_g385LastCommittedBank.valid = true;
     if (g385GameAudioTrace())
     {
         std::fprintf(stderr,
@@ -1370,6 +1676,7 @@ void dc2G385HandleMidiCommand(uint32_t family, uint32_t port,
         break;
     case 0x0030u:
     {
+        dc2G392BgmRewind(port);
         G385MusicPlayback &playback = g_g385MusicPlayback[port];
         std::lock_guard<std::mutex> lock(playback.mutex);
         playback.cursorFrame = 0u;
@@ -1390,9 +1697,11 @@ void dc2G385HandleMidiCommand(uint32_t family, uint32_t port,
     }
 }
 
+// `channelPan` is the guest's `F9 01` pan (0..127); 0xFF means the port has not
+// sent one yet, in which case the HD split pan is used.
 void dc2G385PlaySfx(PS2AudioBackend *audioBackend, uint32_t soundSlot,
                     uint8_t program, uint8_t key, uint8_t velocity,
-                    uint8_t channelVolume)
+                    uint8_t channelVolume, uint8_t voiceId, uint8_t channelPan)
 {
     if (g385GameAudioDisabled() || audioBackend == nullptr ||
         soundSlot >= g_g385MidiBanks.size() || !IsAudioDeviceReady())
@@ -1410,20 +1719,31 @@ void dc2G385PlaySfx(PS2AudioBackend *audioBackend, uint32_t soundSlot,
         {
             if (g385GameAudioTrace())
             {
+                // G391: report what the bank on this slot actually holds. A
+                // residual miss is either "no bank here" (hd=0) or "this bank
+                // has no such program" (program > maxProgram) — the two need
+                // completely different follow-ups.
+                uint32_t programChunk = 0u;
+                uint32_t maxProgram = 0u;
+                if (bank.header.size() >= 80u)
+                {
+                    g385ReadU32(bank.header, 36u, programChunk);
+                    g385ReadU32(bank.header,
+                                static_cast<size_t>(programChunk) + 12u, maxProgram);
+                }
                 std::fprintf(stderr,
-                             "[G385:sfx] resolve-miss slot=%u program=%u key=%u vel=%u\n",
-                             soundSlot, program, key, velocity);
+                             "[G385:sfx] resolve-miss slot=%u program=%u key=%u vel=%u "
+                             "hd=0x%zx bd=0x%zx maxProgram=%u generation=%llu\n",
+                             soundSlot, program, key, velocity,
+                             bank.header.size(), bank.body.size(), maxProgram,
+                             static_cast<unsigned long long>(bankGeneration));
             }
             return;
         }
     }
 
-    const std::vector<uint8_t> vagp = g385BuildVagp(sample);
-
     const uint32_t sampleKey =
         0x01000000u | ((soundSlot & 0x0Fu) << 16u) | (sample.vagIndex & 0xFFFFu);
-    audioBackend->onVagTransferFromBuffer(
-        vagp.data(), static_cast<uint32_t>(vagp.size()), sampleKey);
 
     const float semitones =
         static_cast<float>(static_cast<int>(key) - static_cast<int>(sample.baseNote) +
@@ -1432,21 +1752,70 @@ void dc2G385PlaySfx(PS2AudioBackend *audioBackend, uint32_t soundSlot,
                            static_cast<int>(sample.splitDetune)) /
             100.0f;
     const float pitch = std::pow(2.0f, semitones / 12.0f);
+    // G389: a one-shot is attenuated by its port's volume exactly like the
+    // sequenced stream on that port (the menu/pause path lowers SE ports).
+    const float portVolume =
+        g389LegacyMixEnabled() ? 1.0f : g385PortVolume(soundSlot);
     const float volume =
+        portVolume *
         (static_cast<float>(g385ClampMidiVolume(sample.programVolume)) / 127.0f) *
         (static_cast<float>(g385ClampMidiVolume(sample.splitVolume)) / 127.0f) *
         (static_cast<float>(g385ClampMidiVolume(sample.sampleVolume)) / 127.0f) *
         (static_cast<float>(velocity) / 127.0f) *
         (static_cast<float>(g385ClampMidiVolume(channelVolume)) / 127.0f);
 
+    // G391: the split's own pan (HD split +17, 0x40 = centre) is the one-shot's
+    // position. `PS2AudioBackend::play` has no pan argument at all, which is
+    // why every one-shot used to be centred.
+    // G392: the guest's own per-SE pan (`F9 01`) wins over the HD default.
+    const float pan =
+        static_cast<float>(g385ClampMidiVolume(channelPan != 0xFFu ? channelPan
+                                                                  : sample.splitPan)) /
+        127.0f;
+    const float channelGain =
+        static_cast<float>(g385ClampMidiVolume(channelVolume)) / 127.0f;
+
     if (g385GameAudioTrace())
     {
         std::fprintf(stderr,
                      "[G385:sfx] play slot=%u program=%u key=%u vel=%u vag=%u "
-                     "rate=%u bytes=0x%zx pitch=%.3f volume=%.3f generation=%llu\n",
+                     "rate=%u bytes=0x%zx pitch=%.3f volume=%.3f portVol=%.3f "
+                     "pan=%.3f adsr=%04x/%04x id=%u generation=%llu\n",
                      soundSlot, program, key, velocity, sample.vagIndex,
                      sample.sampleRate, sample.vag.size(), pitch, volume,
+                     portVolume, pan, sample.adsr1, sample.adsr2, voiceId,
                      static_cast<unsigned long long>(bankGeneration));
     }
+
+    if (!g391LegacySfxPathEnabled())
+    {
+        dc2G391KeyOn(soundSlot, key, voiceId, sample, pitch, volume, pan,
+                     channelGain > 0.0f ? volume / channelGain : volume);
+        return;
+    }
+
+    const std::vector<uint8_t> vagp = g385BuildVagp(sample);
+    audioBackend->onVagTransferFromBuffer(
+        vagp.data(), static_cast<uint32_t>(vagp.size()), sampleKey);
     audioBackend->play(sampleKey, pitch, volume);
+}
+
+// G391: MODMSIN key-off / live parameter changes for a sounding one-shot.
+void dc2G385StopSfx(uint32_t soundSlot, uint8_t key, uint8_t voiceId)
+{
+    if (g385GameAudioDisabled() || g391LegacySfxPathEnabled())
+    {
+        return;
+    }
+    dc2G391KeyOff(soundSlot, key, voiceId);
+}
+
+void dc2G385SetSfxParam(uint32_t soundSlot, uint8_t key, uint8_t voiceId,
+                        uint8_t subtype, uint32_t value)
+{
+    if (g385GameAudioDisabled() || g391LegacySfxPathEnabled())
+    {
+        return;
+    }
+    dc2G391SetVoiceParam(soundSlot, key, voiceId, subtype, value);
 }

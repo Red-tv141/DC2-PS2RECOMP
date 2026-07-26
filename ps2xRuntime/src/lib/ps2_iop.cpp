@@ -12,7 +12,8 @@
 
 // G385 DC2 game-audio bank association. Implemented in ps2_audio.cpp through an
 // .inc to keep DC2-only structures out of the runtime's public headers.
-void dc2G385CommitMidiBank(uint32_t port, uint32_t bodySize);
+void dc2G385CommitMidiBank(uint32_t port, uint32_t bodySize, uint32_t hdAddr,
+                           uint32_t bdAddr);
 void dc2G385CommitMidiSequence(uint32_t port);
 void dc2G385HandleMidiCommand(uint32_t family, uint32_t port,
                               uint32_t arg0);
@@ -267,7 +268,7 @@ bool ps2_iop::handleEzMidiRpc(uint32_t sid, uint32_t rpcNum,
         port.dataSize = arg3;
         port.loaded = (arg1 != 0u) || (arg2 != 0u) || (arg3 != 0u);
         port.status = port.loaded ? kEzMidiStatusReady : kEzMidiStatusStopped;
-        dc2G385CommitMidiBank(static_cast<uint32_t>(portIndex), arg3);
+        dc2G385CommitMidiBank(static_cast<uint32_t>(portIndex), arg3, arg1, arg2);
         writeRpcWord(replyPtr, replyCapacity, 1u, port.iopAddrA);
         writeRpcWord(replyPtr, replyCapacity, 2u, port.iopAddrB);
         writeRpcWord(replyPtr, replyCapacity, 3u, port.dataSize);
