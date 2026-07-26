@@ -1,0 +1,608 @@
+# =============================================================================
+# Dark Cloud 2 (NTSC-U, SCUS_972.13) - FINAL ps2_recomp configuration
+#
+#   Generated 2026-07-26 (phase G380) by reverse-engineering the CURRENT WORKING
+#   `recomp/` tree, not by editing one of the historical configs. Every entry below
+#   was verified against what the shipped 7806-file generated tree actually contains.
+#
+#   Supersedes all three previous configs:
+#     ref/config_auto_recomp.toml              328 stubs - a STRICT SUBSET of this file
+#     ref/config_auto_recomp_F56baseline.toml  389 stubs + 11 skip - also a strict subset
+#     patch/DAC.toml                           390 stubs - effective ancestor of the live tree
+#   Set arithmetic, by ADDRESS:  auto  <  F56  <  DAC  <  live(this file).
+#   Adopting either of the first two would UN-STUB working functions and regress the port.
+#
+#   `patch/darkCloud2.patch` is NOT a config and NOT a game patch: it is a UTF-16 diff
+#   against the ps2xRuntime SOURCE (ps2_iop.h/.cpp, Kernel/Syscalls/RPC.cpp,
+#   game_overrides.cpp) adding DC2 ezMidi IOP-RPC support. Three of its four files were
+#   already merged into this fork; the `game_overrides.cpp` registration had been dropped
+#   during the PR port, leaving the whole ezMidi layer dead code (`handleEzMidiRpc` bails
+#   on `rpcSid == 0`). Restored in G380 - nothing about it belongs in this TOML.
+#
+#   Schema note - the loader (ps2xRecomp/src/lib/config_manager.cpp) reads ONLY:
+#     [general] input, output, ghidra_output, single_file_output, patch_syscalls,
+#               patch_cop0, patch_cache, low_memory_mode, output_worker_threads,
+#               giant_function_instruction_threshold, stubs[], skip[],
+#               external_call_target_manifests[]
+#     [patches].instructions[], [mmio], [jump_tables]
+#   Everything else (elf_hash, [ghidra_export], [triage_advisory], `nop =`, `patch =`)
+#   is IGNORED by the recompiler. Those sections in the old configs were documentation
+#   that read like configuration - do not re-add them.
+# =============================================================================
+
+[general]
+# Documentation only - not read by the recompiler. Re-run the enricher if it changes.
+elf_hash = "5c0bad0610323eaba6f06c8be8869de6"
+
+input = "./SCUS_972.13"
+output = "./output"
+ghidra_output = "./DAC.csv"
+single_file_output = false
+
+# Live settings - do not change without re-verifying the Graphic Test routes.
+#   patch_syscalls = false : DC2 reaches libkernel through the recompiled wrappers
+#                            listed below, not through raw `syscall` patching.
+#   patch_cop0     = true  : COP0 access is emulated by the runtime.
+#   patch_cache    = true  : cache instructions become no-ops.
+patch_syscalls = false
+patch_cop0 = true
+patch_cache = true
+
+# -----------------------------------------------------------------------------
+# stubs - 453 addresses: exactly the set the live tree redirects out of guest code.
+#
+# IMPORTANT - this list is not the whole story. `PS2Recompiler::isStubFunction` falls
+# through to `ps2_runtime_calls::isStubName`, which matches the 543-name PS2_STUB_LIST
+# and 122-name PS2_SYSCALL_LIST tables in `ps2xRuntime/include/ps2_call_list.h` (with an
+# optional leading-underscore alias). 400 of the 453 entries below would be stubbed even
+# if this array were empty - that is why the three historical configs, which differ by up
+# to 125 entries, all produced nearly the same output.
+#
+# They are listed anyway, explicitly and by ADDRESS, so that this file - not a header in
+# another subtree - is the single authoritative statement of the port's guest/host
+# boundary, and so a future edit to ps2_call_list.h cannot silently move a guest function
+# from "stubbed" to "recompiled".
+#
+# Annotations:
+#   (blank)             -> ps2_stubs::<name>
+#   [syscall]           -> ps2_syscalls::<name>
+#   !! DEAD             -> the name resolves in NEITHER table, so the recompiler emitted
+#                          `ps2_stubs::TODO_NAMED(...)`, which THROWS
+#                          "Unimplemented PS2 stub called" and ends the process.
+#   !! DEAD-OVERRIDDEN  -> same, but repaired at runtime by an explicit
+#                          `runtime.registerFunction()` in dc2_game_override_parts/.
+#
+#   As of G381 there are ZERO `!! DEAD` entries left: the 36 that still throw in the
+#   GENERATED tree are all repaired at runtime by
+#   `dc2_game_override_parts/g381_dead_stub_repairs.inc` (kill DC2_G381_NO_DEAD_STUBS=1,
+#   trace DC2_G381_TRACE=1, bind self-test DC2_G381_SELFTEST=1 -> "35/35 bound", the 36th
+#   being G380's sceDevctl). A regen re-emits the throwing bodies, but the overrides are
+#   registered by ADDRESS and therefore survive it. Semantics: HDD/host-fs calls answer
+#   -11 "no device" (a fake success walks the guest into an HDD install that is not there),
+#   cache/TLB/exception/callback calls answer 0, `sbrk` answers -1 (ENOMEM).
+# -----------------------------------------------------------------------------
+stubs = [
+  # --- host stub implementations (ps2_stubs::) ---
+  "_exit@0x001000B8",  # exit
+  "sceGsResetGraph@0x00102630",
+  "sceGsGetGParam@0x001027C0",
+  "sceGsResetPath@0x001027D0",
+  "sceGsSetDefDispEnv@0x00102838",
+  "sceGsPutDispEnv@0x00102AA8",
+  "sceGszbufaddr@0x00102B68",
+  "sceGsSetDefDrawEnv@0x00102C30",
+  "sceGsSetDefClear@0x00102E18",
+  "sceGsPutDrawEnv@0x00102F20",
+  "sceGsSetDefDBuff@0x00103008",
+  "sceGsSwapDBuff@0x001032A0",
+  "sceGsSyncV@0x00103300",
+  "sceGsSyncPath@0x00103398",
+  "sceGsSetDefLoadImage@0x001036B0",
+  "sceGsSetDefStoreImage@0x00103898",
+  "sceGsExecLoadImage@0x001039D8",
+  "sceGsExecStoreImage@0x00103B58",
+  "sceGsSyncVCallback@0x001041E8",
+  "memclr@0x00104288",
+  "sceDmaGetChan@0x001042C0",
+  "sceDmaReset@0x001042E8",
+  "sceDmaDebug@0x001043C8",
+  "sceDmaPutEnv@0x001043D8",
+  "sceDmaGetEnv@0x001045B0",
+  "sceDmaPutStallAddr@0x001045E8",
+  "sceDmaSend@0x00104610",
+  "sceDmaSendN@0x001046E8",
+  "sceDmaSendI@0x001047D0",
+  "sceDmaRecv@0x001048B8",
+  "sceDmaRecvN@0x00104980",
+  "sceDmaRecvI@0x00104A70",
+  "sceDmaSync@0x00104B60",
+  "sceDmaWatch@0x00104C28",
+  "sceDmaPause@0x00104CF8",
+  "sceDmaRestart@0x00104D40",
+  "sceGifPkInit@0x00106630",
+  "sceGifPkReset@0x00106640",
+  "sceGifPkTerminate@0x00106650",
+  "sceGifPkCnt@0x001066A8",
+  "sceGifPkRef@0x00106720",
+  "sceGifPkEnd@0x001067B8",
+  "sceGifPkReserve@0x00106830",
+  "sceGifPkOpenGifTag@0x00106848",
+  "sceGifPkCloseGifTag@0x00106860",
+  "sceGifPkAddGsData@0x00106908",
+  "sceGifPkAddGsAD@0x00106930",
+  "sceGifPkRefLoadImage@0x00106958",
+  "sceVif1PkInit@0x00106B18",
+  "sceVif1PkReset@0x00106B28",
+  "sceVif1PkTerminate@0x00106B38",
+  "sceVif1PkCnt@0x00106B90",
+  "sceVif1PkCall@0x00106BE8",
+  "sceVif1PkEnd@0x00106C58",
+  "sceVif1PkOpenDirectCode@0x00106CB0",
+  "sceVif1PkCloseDirectCode@0x00106D08",
+  "sceVif1PkOpenGifTag@0x00106D38",
+  "sceVif1PkCloseGifTag@0x00106D50",
+  "sceVif1PkReserve@0x00106DF8",
+  "sceVif1PkAlign@0x00106E10",
+  "sceVif1PkAddGsAD@0x00106E90",
+  "sceVu0ApplyMatrix@0x00106EC0",
+  "sceVu0MulMatrix@0x00106EF0",
+  "sceVu0OuterProduct@0x00106F38",
+  "sceVu0InnerProduct@0x00106F58",
+  "sceVu0Normalize@0x00106F80",
+  "sceVu0TransposeMatrix@0x00106FC0",
+  "sceVu0InversMatrix@0x00107008",
+  "sceVu0DivVector@0x00107078",
+  "sceVu0DivVectorXYZ@0x00107098",
+  "sceVu0InterVector@0x001070B8",
+  "sceVu0AddVector@0x001070E0",
+  "sceVu0SubVector@0x001070F8",
+  "sceVu0MulVector@0x00107110",
+  "sceVu0ScaleVector@0x00107128",
+  "sceVu0TransMatrix@0x00107140",
+  "sceVu0CopyVector@0x00107170",
+  "sceVu0CopyMatrix@0x00107180",
+  "sceVu0FTOI4Vector@0x001071A8",
+  "sceVu0FTOI0Vector@0x001071B8",
+  "sceVu0ITOF4Vector@0x001071C8",
+  "sceVu0ITOF0Vector@0x001071D8",
+  "sceVu0UnitMatrix@0x001071E8",
+  "_sceVu0ecossin@0x00107210",  # sceVu0ecossin
+  "sceVu0RotMatrixZ@0x00107288",
+  "sceVu0RotMatrixX@0x00107330",
+  "sceVu0RotMatrixY@0x001073D8",
+  "sceVu0RotMatrix@0x00107480",
+  "sceVu0ClampVector@0x001074D0",
+  "sceVu0CameraMatrix@0x001074F8",
+  "sceVu0NormalLightMatrix@0x001075A8",
+  "sceVu0LightColorMatrix@0x00107668",
+  "sceVu0ViewScreenMatrix@0x001076D0",
+  "sceVu0DropShadowMatrix@0x001077D8",
+  "sceVu0RotTransPersN@0x00107968",
+  "sceVu0RotTransPers@0x001079C0",
+  "sceVu0CopyVectorXYZ@0x00107A08",
+  "sceVu0InterVectorXYZ@0x00107A28",
+  "sceVu0ScaleVectorXYZ@0x00107A58",
+  "sceVu0ClipScreen@0x00107A70",
+  "sceVu0ClipScreen3@0x00107AB8",
+  "sceVu0ClipAll@0x00107B18",
+  "sceVpu0Reset@0x00107BA8",
+  "sceMpegDemuxPssRing@0x0010D4C8",
+  "sceMpegDemuxPss@0x0010D7C0",
+  "sceMpegAddStrCallback@0x0010D7E0",
+  "sceMpegInit@0x0010E048",
+  "sceMpegCreate@0x0010E0E8",
+  "sceMpegDelete@0x0010E2F0",
+  "sceMpegAddBs@0x0010E2F8",
+  "sceMpegGetPicture@0x0010E320",
+  "sceMpegGetPictureRAW8@0x0010E368",
+  "sceMpegGetPictureRAW8xy@0x0010E3B0",
+  "sceMpegSetDecodeMode@0x0010E400",
+  "sceMpegGetDecodeMode@0x0010E418",
+  "sceMpegIsEnd@0x0010E438",
+  "sceMpegIsRefBuffEmpty@0x0010E448",
+  "sceMpegReset@0x0010E458",
+  "sceMpegClearRefBuff@0x0010E4A8",
+  "sceMpegAddCallback@0x0010E500",
+  "sceMpegSetDefaultPtsGap@0x0010E5A0",
+  "sceMpegResetDefaultPtsGap@0x0010E5B8",
+  "sceMpegSetImageBuff@0x0010E5C8",
+  "sceMpegDispWidth@0x0010E5D8",
+  "sceMpegDispHeight@0x0010E5E8",
+  "sceMpegDispCenterOffX@0x0010E5F8",
+  "sceMpegDispCenterOffY@0x0010E608",
+  "sceSetBrokenLink@0x0010E618",
+  "sceSetPtm@0x0010E628",
+  "_sceMpegFlush@0x0010EB30",  # sceMpegFlush
+  "sceIpuStopDMA@0x0010F770",
+  "sceIpuRestartDMA@0x0010F858",
+  "sceIpuSync@0x0010F9A8",
+  "sceIpuInit@0x0010FA78",
+  "sceSifStopDma@0x001103B0",
+  "sceSifDmaStat@0x00110480",
+  "sceSifSetDma@0x001104A0",
+  "isceSifSetDma@0x001104B0",
+  "sceSifSetDChain@0x001104C0",
+  "isceSifSetDChain@0x001104D0",
+  "sceSifSetReg@0x001104E0",
+  "sceSifGetReg@0x001104F0",
+  "sceResetttyinit@0x00110560",
+  "write@0x001106A8",
+  "read@0x00110728",
+  "open@0x001107A0",
+  "close@0x001107C8",
+  "lseek@0x001107D8",
+  "fstat@0x00110898",
+  "getpid@0x001108B0",
+  "stat@0x001108E0",
+  "_sceSDC@0x00110930",  # sceSDC
+  "_sceIDC@0x00110A70",  # sceIDC
+  "sceDeci2Open@0x00111280",
+  "sceDeci2Close@0x001112C8",
+  "sceDeci2ReqSend@0x001112F0",
+  "sceDeci2Poll@0x00111320",
+  "sceDeci2ExRecv@0x00111348",
+  "sceDeci2ExSend@0x00111380",
+  "sceDeci2ExReqSend@0x001113B8",
+  "sceDeci2ExLock@0x001113E8",
+  "sceDeci2ExUnLock@0x00111410",
+  "sceTtyHandler@0x00111508",
+  "sceTtyWrite@0x001116A0",
+  "sceTtyRead@0x001117F0",
+  "sceTtyInit@0x001118C0",
+  "_printf@0x00111C98",  # printf
+  "scePrintf@0x00112298",
+  "sceSifGetSreg@0x00112328",
+  "sceSifSetSreg@0x00112340",
+  "sceSifGetDataTable@0x00112360",
+  "sceSifInitCmd@0x00112370",
+  "sceSifExitCmd@0x001125F0",
+  "sceSifSetCmdBuffer@0x00112628",
+  "sceSifSetSysCmdBuffer@0x00112640",
+  "sceSifAddCmdHandler@0x00112658",
+  "sceSifRemoveCmdHandler@0x00112688",
+  "_sceSifCmdIntrHdlr@0x00112868",  # sceSifCmdIntrHdlr
+  "sceSifWriteBackDCache@0x00112990",
+  "sceSifInitRpc@0x00112A40",
+  "sceSifExitRpc@0x00112BE0",
+  "_sceRpcFreePacket@0x00112CB0",  # sceRpcFreePacket
+  "_sceRpcGetFPacket@0x00112CD0",  # sceRpcGetFPacket
+  "_sceRpcGetFPacket2@0x00112D00",  # sceRpcGetFPacket2
+  "sceSifGetOtherData@0x00112E58",
+  "sceSifBindRpc@0x001130B0",
+  "sceSifCheckStatRpc@0x00113470",
+  "sceSifSetRpcQueue@0x001134B0",
+  "sceSifRegisterRpc@0x00113548",
+  "sceSifRemoveRpc@0x00113618",
+  "sceSifRemoveRpcQueue@0x001136B0",
+  "sceSifGetNextRequest@0x00113740",
+  "sceSifExecRequest@0x00113798",
+  "sceSifRpcLoop@0x00113960",
+  "_sceFsSemInit@0x00113EB8",  # sceFsSemInit
+  "_sceFsSigSema@0x00113F38",  # sceFsSigSema
+  "sceFsInit@0x00114008",
+  "sceFsReset@0x00114260",
+  "sceOpen@0x00114298",
+  "sceClose@0x00114520",
+  "sceLseek@0x001146A0",
+  "sceRead@0x001148D8",
+  "sceWrite@0x00114B48",
+  "sceIoctl@0x00114E08",
+  "sceSifInitIopHeap@0x00117038",
+  "sceSifAllocIopHeap@0x001170C0",
+  "sceSifAllocSysMemory@0x00117130",
+  "sceSifFreeSysMemory@0x001171B0",
+  "sceSifFreeIopHeap@0x00117228",
+  "sceSifLoadIopHeap@0x00117248",
+  "sceSifLoadFileReset@0x001174C8",
+  "sceSifGetIopAddr@0x00117EC8",
+  "sceSifSetIopAddr@0x00117FB8",
+  "sceSifResetIop@0x00118098",
+  "sceSifIsAliveIop@0x001181D8",
+  "sceSifSyncIop@0x00118200",
+  "sceSifRebootIop@0x00118238",
+  "sceSdRemoteInit@0x00119010",
+  "sceSdTransToIOP@0x001190B8",
+  "sceSdCallBack@0x00119140",
+  "sceSdRemote@0x00119150",
+  "__ieee754_rem_pio2f@0x0011B2E0",
+  "__kernel_cosf@0x0011C788",
+  "__kernel_sinf@0x0011D230",
+  "atan@0x0011D5D0",
+  "cos@0x0011DA28",
+  "fabs@0x0011DB30",
+  "floor@0x0011DB88",
+  "sin@0x0011E1C0",
+  "atan2@0x0011EA80",
+  "pow@0x0011EB98",
+  "sqrt@0x0011EFC8",
+  "sceCdDelayThread@0x0011F440",
+  "sceCdCallback@0x0011F4A8",
+  "sceCdInitEeCB@0x0011F660",
+  "sceCdSearchFile@0x0011FA08",
+  "sceCdNcmdDiskReady@0x0011FE78",
+  "sceCdSync@0x0011FF10",
+  "sceCdSyncS@0x0011FFB0",
+  "sceCdInit@0x00120190",
+  "sceCdDiskReady@0x00120470",
+  "sceCdMmode@0x00120668",
+  "sceCdRead@0x00120730",
+  "sceCdSeek@0x00120910",
+  "sceCdGetError@0x001209E0",
+  "sceCdBreak@0x00120A78",
+  "sceCdStInit@0x00120B30",
+  "sceCdStStart@0x00120B60",
+  "sceCdStSeekF@0x00120B98",
+  "sceCdStSeek@0x00120BC8",
+  "sceCdStStop@0x00120BF8",
+  "sceCdStRead@0x00120C30",
+  "sceCdStPause@0x00120DB8",
+  "sceCdStResume@0x00120E08",
+  "sceCdStStat@0x00120E60",
+  "sceCdStream@0x00120EA8",
+  "scePadInit@0x00121128",
+  "scePadInit2@0x00121268",
+  "scePadEnd@0x00121308",
+  "scePadPortOpen@0x00121388",
+  "scePadPortClose@0x00121570",
+  "scePadGetDmaStr@0x00121628",
+  "scePadGetFrameCount@0x00121688",
+  "scePadRead@0x001216D8",
+  "scePadGetState@0x00121758",
+  "scePadStateIntToStr@0x001217D0",
+  "scePadSetReqState@0x00121808",
+  "scePadGetReqState@0x00121870",
+  "scePadReqIntToStr@0x001218C0",
+  "scePadInfoAct@0x001218F8",
+  "scePadInfoComb@0x00121A18",
+  "scePadInfoMode@0x00121B38",
+  "scePadSetMainMode@0x00121C70",
+  "scePadSetActDirect@0x00121D28",
+  "scePadSetActAlign@0x00121DE8",
+  "scePadGetButtonMask@0x00121EC0",
+  "scePadSetButtonInfo@0x00121F78",
+  "scePadInfoPressMode@0x00122028",
+  "scePadEnterPressMode@0x00122088",
+  "scePadExitPressMode@0x001220E0",
+  "scePadSetVrefParam@0x00122138",
+  "scePadGetPortMax@0x00122208",
+  "scePadGetSlotMax@0x00122270",
+  "scePadGetModVersion@0x001222D8",
+  "scePadSetWarningLevel@0x00122340",
+  "sceMcInit@0x001223A8",
+  "sceMcEnd@0x00122560",
+  "sceMcChangeThreadPriority@0x001225D0",
+  "sceMcGetSlotMax@0x00122688",
+  "sceMcOpen@0x00122748",
+  "sceMcMkdir@0x00122880",
+  "sceMcClose@0x001228B8",
+  "sceMcSeek@0x00122970",
+  "mceIntrReadFixAlign@0x00122A48",
+  "sceMcRead@0x00122AD8",
+  "sceMcWrite@0x00122BF8",
+  "sceMcSync@0x00122DE8",
+  "mceGetInfoApdx@0x00122EC8",
+  "sceMcGetInfo@0x00122F20",
+  "sceMcGetDir@0x00123118",
+  "mceStorePwd@0x00123270",
+  "sceMcChdir@0x001232F8",
+  "sceMcFormat@0x00123448",
+  "sceMcDelete@0x00123510",
+  "sceMcFlush@0x00123638",
+  "sceMcSetFileInfo@0x001236F0",
+  "sceMcRename@0x001238C8",
+  "sceMcUnformat@0x00123A30",
+  "sceMcGetEntSpace@0x00123AF8",
+  "abs@0x00123EC8",
+  "_calloc_r@0x00123F28",  # calloc_r
+  "exit@0x00125438",
+  "fflush@0x001254E8",
+  "fprintf@0x00125848",
+  "_free_r@0x00125880",  # free_r
+  "_malloc_trim_r@0x00125BA0",  # malloc_trim_r
+  "malloc@0x001264A0",
+  "free@0x001264C8",
+  "malloc_extend_top@0x001264D8",
+  "_malloc_r@0x00126730",  # malloc_r
+  "_mbtowc_r@0x00126EA8",  # mbtowc_r
+  "memchr@0x00126EE8",
+  "memcmp@0x00126FC8",
+  "memcpy@0x00127060",
+  "memmove@0x00127110",
+  "memset@0x00127218",
+  "__malloc_lock@0x001272D8",
+  "__malloc_unlock@0x001272E0",
+  "_printf_r@0x00128308",  # printf_r
+  "printf@0x00128348",
+  "srand@0x00128398",
+  "rand@0x001283A8",
+  "sprintf@0x001288D0",
+  "strcasecmp@0x00128AB0",
+  "strcat@0x00128B68",
+  "strchr@0x00128C98",
+  "strcmp@0x00128E28",
+  "strcpy@0x00128F70",
+  "strlen@0x00129088",
+  "strncat@0x001291C0",
+  "strncmp@0x00129370",
+  "strncpy@0x00129528",
+  "strrchr@0x001296E8",
+  "strstr@0x00129738",
+  "vfprintf@0x0012AA90",
+  "vsprintf@0x0012C2B0",
+  "__divdi3@0x00286078",
+
+  # --- host syscall implementations (ps2_syscalls::) ---
+  "SetGsCrt@0x0010FCE0",  # [syscall] SetGsCrt
+  "AddIntcHandler2@0x0010FDD0",  # [syscall] AddIntcHandler2
+  "AddDmacHandler2@0x0010FE00",  # [syscall] AddDmacHandler2
+  "_EnableIntc@0x0010FE20",  # [syscall] EnableIntc
+  "_DisableIntc@0x0010FE30",  # [syscall] DisableIntc
+  "_EnableDmac@0x0010FE40",  # [syscall] EnableDmac
+  "_DisableDmac@0x0010FE50",  # [syscall] DisableDmac
+  "SetAlarm@0x0010FE60",  # [syscall] SetAlarm
+  "ReleaseAlarm@0x0010FE70",  # [syscall] ReleaseAlarm
+  "iSetAlarm@0x0010FEC0",  # [syscall] iSetAlarm
+  "CreateThread@0x0010FEE0",  # [syscall] CreateThread
+  "DeleteThread@0x0010FEF0",  # [syscall] DeleteThread
+  "StartThread@0x0010FF00",  # [syscall] StartThread
+  "ExitThread@0x0010FF10",  # [syscall] ExitThread
+  "ExitDeleteThread@0x0010FF20",  # [syscall] ExitDeleteThread
+  "TerminateThread@0x0010FF30",  # [syscall] TerminateThread
+  "iReleaseWaitThread@0x0010FFC0",  # [syscall] iReleaseWaitThread
+  "SleepThread@0x00110000",  # [syscall] SleepThread
+  "WakeupThread@0x00110010",  # [syscall] WakeupThread
+  "_iWakeupThread@0x00110020",  # [syscall] iWakeupThread
+  "CancelWakeupThread@0x00110030",  # [syscall] CancelWakeupThread
+  "iCancelWakeupThread@0x00110040",  # [syscall] iCancelWakeupThread
+  "SuspendThread@0x00110050",  # [syscall] SuspendThread
+  "ResumeThread@0x00110070",  # [syscall] ResumeThread
+  "EndOfHeap@0x001100C0",  # [syscall] EndOfHeap
+  "CreateSema@0x001100E0",  # [syscall] CreateSema
+  "DeleteSema@0x001100F0",  # [syscall] DeleteSema
+  "SignalSema@0x00110100",  # [syscall] SignalSema
+  "iSignalSema@0x00110110",  # [syscall] iSignalSema
+  "WaitSema@0x00110120",  # [syscall] WaitSema
+  "PollSema@0x00110130",  # [syscall] PollSema
+  "iPollSema@0x00110140",  # [syscall] iPollSema
+  "iReferSemaStatus@0x00110160",  # [syscall] iReferSemaStatus
+  "SetOsdConfigParam@0x00110180",  # [syscall] SetOsdConfigParam
+  "GetOsdConfigParam@0x00110190",  # [syscall] GetOsdConfigParam
+  "EnableCache@0x00110330",  # [syscall] EnableCache
+  "DisableCache@0x00110340",  # [syscall] DisableCache
+  "FlushCache@0x00110360",  # [syscall] FlushCache
+  "iFlushCache@0x00110390",  # [syscall] iFlushCache
+  "GsGetIMR@0x00110400",  # [syscall] GsGetIMR
+  "GsPutIMR@0x00110420",  # [syscall] GsPutIMR
+  "SetVSyncFlag@0x00110450",  # [syscall] SetVSyncFlag
+  "Deci2Call@0x00110510",  # [syscall] Deci2Call
+  "GetMemorySize@0x00110540",  # [syscall] GetMemorySize
+  "DisableIntc@0x00110BC0",  # [syscall] DisableIntc
+  "EnableIntc@0x00110C28",  # [syscall] EnableIntc
+  "DisableDmac@0x00110C90",  # [syscall] DisableDmac
+  "EnableDmac@0x00110CF8",  # [syscall] EnableDmac
+  "InitAlarm@0x00110E48",  # [syscall] InitAlarm
+  "InitThread@0x00110FF8",  # [syscall] InitThread
+  "iWakeupThread@0x001110D0",  # [syscall] iWakeupThread
+  "_sceSifSendCmd@0x001126B0",  # [syscall] sceSifSendCmd
+  "sceSifSendCmd@0x001127E8",  # [syscall] sceSifSendCmd
+  "_sceRpcGetPacket@0x00112C08",  # [syscall] sceRpcGetPacket
+  "sceSifCallRpc@0x00113280",  # [syscall] sceSifCallRpc
+  "_sceSifLoadModuleBuffer@0x00117500",  # [syscall] sceSifLoadModuleBuffer
+  "sceSifLoadModuleBuffer@0x00117AD0",  # [syscall] sceSifLoadModuleBuffer
+  "_sceSifLoadModule@0x00117B10",  # [syscall] sceSifLoadModule
+  "sceSifLoadModule@0x00117D38",  # [syscall] sceSifLoadModule
+  "_sceSifLoadElfPart@0x00117D78",  # [syscall] sceSifLoadElfPart
+  "sceSifLoadElfPart@0x00117E80",  # [syscall] sceSifLoadElfPart
+  "sceSifLoadElf@0x00117EA0",  # [syscall] sceSifLoadElf
+  "InitTLB@0x00118610",  # [syscall] InitTLB
+
+  # --- unresolved (TODO_NAMED) but REPAIRED by a runtime override ---
+  "sceSifUnloadModule@0x00117910",  # !! DEAD-OVERRIDDEN -> sif_module_return_zero_stub
+  "sceSifSearchModuleByName@0x001179A0",  # !! DEAD-OVERRIDDEN -> sif_module_return_zero_stub
+  "sceSifSearchModuleByAddress@0x00117A40",  # !! DEAD-OVERRIDDEN -> sif_module_return_zero_stub
+  "sceSifLoadStartModuleBuffer@0x00117AF0",  # !! DEAD-OVERRIDDEN -> sif_module_return_zero_stub
+  "sceSifLoadStartModule@0x00117D58",  # !! DEAD-OVERRIDDEN -> sif_module_return_zero_stub
+  "DIntr@0x00118BE0",  # !! DEAD-OVERRIDDEN -> g375_dintr_stub
+  "EIntr@0x00118C28",  # !! DEAD-OVERRIDDEN -> g375_eintr_stub
+
+  # --- unresolved (TODO_NAMED) and NOT overridden: calling these ends the process ---
+  "_ch3dmaCSC@0x0010C988",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "sbrk@0x001107E0",  # !! DEAD-OVERRIDDEN [G381] g381 sbrk -> -1 (ENOMEM)
+  "SyncDCache@0x001109D8",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "InvalidDCache@0x00110B18",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "QueryIntrContext@0x00110BB0",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "iSuspendThread@0x001111E8",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "scePowerOffHandler@0x00113F48",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "sceIoctl2@0x00115158",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceRemove@0x001154E0",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceMkdir@0x00115500",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceRmdir@0x001156B0",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceFormat@0x001156D0",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceAddDrv@0x00115940",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceDelDrv@0x00115A60",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceDopen@0x00115A80",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceDclose@0x00115B48",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "sceDread@0x00115CB0",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceGetstat@0x00115E08",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceChstat@0x00115FA8",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceRename@0x001161E8",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceChdir@0x001163D8",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceSync@0x001163F8",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "sceMount@0x00116590",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceUmount@0x00116800",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceLseek64@0x00116820",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceDevctl@0x00116A58",  # !! DEAD-OVERRIDDEN [G380] ps2_stubs::sceDevctl -> -11 (no HDD)
+  "sceSymlink@0x00116C90",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceReadlink@0x00116E70",  # !! DEAD-OVERRIDDEN [G381] g381 -> -11 (no device)
+  "sceSifStopModule@0x00117708",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "SetTLBEntry@0x00118580",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "GetTLBEntry@0x001185C0",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "_kTLBException@0x00118880",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "_kDebugException@0x00118AC0",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "CB_DelayTh@0x0011F418",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "sceCdPOffCallback@0x0011F8F0",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+  "sceMcUdCheckNewCard@0x001230A8",  # !! DEAD-OVERRIDDEN [G381] g381 -> 0 (no-op)
+]
+
+# -----------------------------------------------------------------------------
+# skip - intentionally EMPTY.
+#
+# `skip` and an UNRESOLVED `stubs` entry produce the identical artefact: a `TODO_NAMED`
+# wrapper that throws. Keeping this empty means exactly ONE place (the annotated block
+# above) records "this guest function does nothing", instead of the same facts being
+# split across two lists as in config_auto_recomp_F56baseline.toml, whose 11 skip
+# entries DAC.toml carried as stubs with identical effect.
+# -----------------------------------------------------------------------------
+skip = []
+
+# -----------------------------------------------------------------------------
+# [patches] - intentionally ABSENT.
+#
+# No instruction patch is active in any historical config either: F56baseline's
+# `nop = []` / `patch = []` sit under `[triage_advisory]`, which the recompiler never
+# reads, and its `[patches]` block is commented out. In particular the G361
+# `init__Fv@0x0015C160` repair is NOT a TOML nop - it is
+# `runtime.registerFunction(0x0015C160u, f55_boot_init_stub)` in
+# `dc2_game_override_parts/apply_phase9_stubs.inc`. Prefer runtime overrides over TOML
+# patches: an override survives a regen, a hand-edited generated file does not.
+# -----------------------------------------------------------------------------
+
+# =============================================================================
+# REGEN PROCEDURE - VERIFIED 2026-07-26 (G380)
+#
+#   ps2_recomp.exe config_dc2_final.toml
+#   python tools/fix_cop2_q_ps2_float.py recomp   # VU0 macro VDIV/VSQRT PS2 float (G372)
+#   python tools/fix_cop1_ps2_float.py  recomp    # COP1 div.s; the R5900 FPU is NOT IEEE (G371)
+#
+# This exact pipeline was run against a scratch output directory and diffed file-by-file
+# against the shipped `recomp/` tree:
+#
+#   guest/host boundary : EXACT   - 410 stub dispatches (same ps2_stubs::/ps2_syscalls::
+#                                   target symbol), 43 TODO_NAMED, 7353 recompiled bodies
+#   byte-level          : 7801 / 7807 files identical
+#   the 6 that differ   : 5 generated bodies carrying HAND-INSERTED opt-in diagnostic
+#                         probes (DC2_TRACE_G19, G198/DC2_G199_QW30, DC2_G221_CAMTRACE,
+#                         DC2_TRACE_G227) plus register_functions.cpp, where 11 identical
+#                         registrations merely sit in a different position. Re-apply the
+#                         probes by hand after a regen, or accept losing them.
+#
+# ---------------------------------------------------------------------------
+# DO NOT RUN tools/fix_cop2_destmask.py  (STALE - it now CORRUPTS the output)
+#
+# PS2_PROJECT_STATE.md listed it as mandatory. That is no longer true: the recompiler
+# emits correct COP2 partial dest-component masks today, and the script reverses them a
+# SECOND time. Measured: it rewrites 23 files / 137 masks, and 15 of those files are
+# byte-identical to the shipped tree BEFORE it runs. Example - `mgDistVectorXZ__FPf`
+# @0x130000, an `.xyz` write: correct (and what both the shipped tree and a fresh regen
+# contain) is `_mm_set_epi32(0, -1, -1, -1)`; the script turns it into
+# `_mm_set_epi32(-1, -1, -1, 0)`, i.e. it writes the W lane and drops X. It is retained
+# in tools/ only for historical reference (F51.8).
+# ---------------------------------------------------------------------------
+#
+# Verify a regen against the "Routes for Graphic Test" table in PS2_PROJECT_STATE.md.
+# The title-smoke gate is `frame_001500 PixelNonZero = 211650`.
+#
+# Do NOT hand-port generated files. If the output is wrong, fix this config or the
+# recompiler and regenerate - a hand-edit is lost on the next regen and has already cost
+# this project one 366-entry stub-flip incident.
+# =============================================================================

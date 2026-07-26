@@ -1,670 +1,254 @@
 # PS2 Recomp Project State — Dark Cloud 2
 
 > **General, durable, forward-useful knowledge only** — operating rules, workspace/build facts,
-> currently-open issues (as short facts, not phase narrative), and cross-cutting technical
-> knowledge likely needed again regardless of which phase is active (pad-input protocol, PCSX2 A/B
-> protocol, regen caveats, generalized "lessons learned"). **This file does NOT contain:** active/
-> next-phase status (`plans/ROADMAP.MD`), native-renderer architecture (`plans/arc-native-renderer.md`),
-> per-lever measurement tables, refuted-hypothesis lists, closed-arc digests, or any other
-> per-phase-specific detail — that all lives in `plans/phase-history.md` (grep it) or the specific
-> `plans/phase-GXX-fix-log.md`. **If you need to know what a specific lever does, what was tried
-> and refuted, or the history of a closed arc — check phase-history.md or the fix-log, don't expect
-> it here.** When an issue is resolved, remove it from "Known Issues" entirely (the fix-log is the
-> permanent record; do not maintain a "Resolved" index in this file). Last restructured 2026-07-18
-> (2nd pass): moved the Resolved index, Current Levers table, Refuted/Do-Not-Re-chase list,
-> Title-3D-arc digest, and single-investigation technical dumps (CDynamicAnime struct offsets,
-> dungeon/event state machines, front-end state machine, PCSX2 cutscene pause point, C++ exception
-> model, floor-select input) to `plans/phase-history.md`. 
+> currently-open issues (summarized), graphic test routes, and cross-cutting technical knowledge
+> likely needed again regardless of which phase is active (pad-input protocol, PCSX2 A/B protocol,
+> regen caveats, generalized "lessons learned").
+> Active/next goals live in [ROADMAP.MD](file:///d:/ps2r/dc2/plans/ROADMAP.MD).
+> Detailed historical phase narratives and closed perf-arc logs live in [phase-history.md](file:///d:/ps2r/dc2/plans/phase-history.md) or specific `plans/phase-GXX-fix-log.md` files.
+
+---
 
 ## Quick Rules
-- **NO PER-SCREEN FIXES (hard rule).** Do not patch a symptom by writing
-  game state per-frame/per-draw scoped to one screen (e.g. forcing `TitleProjection`/camera/renderinfo in
-  the title scope). Such writes leak through shared globals into CONCURRENT screens (the G93 title fix
-  mislocated the costume Max model — front-end title+costume share state, G79). Diagnose to the ROOT and
-  fix it at its source (the state machine / init / data path that is actually wrong), once, where the game
-  itself would set it — not as a scoped band-aid. If a scoped lever is needed to PROVE a diagnosis, gate it
-  opt-in (default-off) and never ship it as the fix.
+- **NO PER-SCREEN FIXES (hard rule).** Do not patch a symptom by writing game state per-frame/per-draw scoped to one screen (e.g. forcing `TitleProjection`/camera/renderinfo in the title scope). Such writes leak through shared globals into CONCURRENT screens. Diagnose to the ROOT and fix it at its source (the state machine / init / data path that is actually wrong), once, where the game itself would set it — not as a scoped band-aid. If a scoped lever is needed to PROVE a diagnosis, gate it opt-in (default-off) and never ship it as the fix.
 - Build with `cmake --build <build_dir>` only; no clean targets, no build-dir deletion.
 - Do NOT modify/create files in `runner/`, or modify standard headers. Split complex non-runner/override logic (e.g. `dc2_game_override.cpp`) into `.inc` files inside source subdirectories (e.g. `ps2xRuntime/src/`), never in the project root.
 - Do NOT use destructive git commands. Keep diagnostics env-gated, quiet by default.
 - Build via the **PowerShell tool**, not Bash `cmd /c` (silently no-ops → stale exe).
   Verify a change landed: `grep -c <marker> build64/Release/dc2_runner.exe`.
-- Renderer promotion requires direct normal-output review against available hardware references.
-  Internal oracles/counters do not prove downstream composition; MAP-2 left-cliff loss passed
-  G284's internal range census until `ref/dumps/map_2_zoom.png` was compared side-by-side in G287.
-- Write a `plans/phase-<ID>-fix-log.md` before ending each executable phase.
+- Renderer promotion requires direct normal-output review against available hardware references. Internal oracles/counters do not prove downstream composition.
+- Write a `plans/phase-<ID>-fix-log.md` before ending each executable phase — `plans/ROADMAP.MD` only ever gets a one-line "Active Phase" entry for the CURRENT phase.
 
-### G-series phase scoping
-A G phase may include discovery, but only bounded discovery tied to ONE foundation defect. Start
-each with: (1) the exact defect / rule-out question, (2) the smallest known repro, (3) the
-PCSX2-vs-runner comparison point if needed, (4) clear stop conditions. No new gameplay/route
-phases unless they reduce uncertainty for the active foundation defect. Write a
-`plans/phase-GXX-fix-log.md` before ending each executable phase — `plans/ROADMAP.MD` only ever
-gets a one-line "Active Phase" entry for the CURRENT phase, never a duplicated narrative. 
-
-### Standard phase checklist
+### Standard Phase Checklist
 - Use the local PS2Recomp skill at `D:/ps2r/dc2/skill/SKILL.md`. Obey this file.
 - Performance phases follow the "Aggressive performance policy" below: the opt-in arm may render incorrectly during bring-up, but the default path must remain clean; keep one architectural variable per arm, repair discovered parity failures in the same phase, never promote incorrect output.
-- Verify perf/render changes by FULL-FRAME DISTRIBUTION (multiple frames) + visual review, never a single golden sample alone (G150, G168, G174 all caught real bugs a single sample missed).
-- For anything touching threading/pipelining (MTGS worker, G157 pipeline, G144 band-replay), soak with `DC2_FRAME_DUMP_EVERY=1` (dense per-tick dumping) — the default 60-tick cadence is too coarse to catch transient (few-frame) races (G174).
-- When bisecting a perf lever (G144/G178/G150/G157/G172) on a NON-title route, remember the frame-dump filename is the HOST TICK, not the guest scriptFrame — disabling GPU/tile-bin levers can make the CPU path several× slower in wall-clock time, so a fixed `-Seconds` budget from a title-only harness may not reach the same guest state; increase it and cross-check via a state trace (e.g. `DC2_TRACE_F59`) (G223).
+- Verify perf/render changes by FULL-FRAME DISTRIBUTION (multiple frames) + visual review, never a single golden sample alone.
+- For anything touching threading/pipelining (MTGS worker, G157 pipeline, G144 band-replay), soak with `DC2_FRAME_DUMP_EVERY=1` (dense per-tick dumping).
+- When bisecting a perf lever on a NON-title route, remember the frame-dump filename is the HOST TICK, not the guest scriptFrame — disabling GPU/tile-bin levers can make the CPU path several× slower in wall-clock time; budget accordingly and cross-check via state trace (`DC2_TRACE_F59`).
 
-### Aggressive performance policy
-The remaining gap to 60 FPS requires architectural experiments, not more low-yield barrier
-micro-tuning. Performance phases may deliberately push an opt-in path until graphics diverge, then
-diagnose and repair that divergence inside the same phase/arc.
-- The current default path is the immutable control arm. Risk applies only to a new default-off
-  environment lever; never expose normal runs to an unfinished experiment.
-- Change one architectural mechanism at a time. A phase may accumulate parity fixes for that one
-  mechanism, but must not combine unrelated eligibility, ordering, depth, and timing experiments
-  in one A/B arm.
-- Do not stop at the first broken frame. Capture the earliest divergence, classify it as geometry,
-  texture/CLUT, color/blend, depth, ownership/readback, or presentation, and fix its root while
-  the phase remains active. The normal three-strike circuit breaker still applies.
-- Prefer same-run CPU shadow verification and exact dependency-boundary readback checks. Dense
-  multi-frame review is mandatory because single goldens missed G249/G254 temporal failures.
-- Measure performance throughout bring-up, but a timing result from incorrect output is not a win.
-  Promotion requires the full route matrix to recover models, depth, lighting, text, textures,
-  alpha cutouts, shared-page composition, and temporal stability.
-- If parity cannot be restored or the architecture is neutral after parity, remove the behavior
-  lever, retain only useful diagnostics, and document the rejected design in the phase fix log.
+### Aggressive Performance Policy
+The remaining gap to 60 FPS requires architectural experiments, not more low-yield barrier micro-tuning.
+- The current default path is the immutable control arm. Risk applies only to a new default-off environment lever; never expose normal runs to an unfinished experiment.
+- Change one architectural mechanism at a time. A phase may accumulate parity fixes for that one mechanism, but must not combine unrelated eligibility, ordering, depth, and timing experiments in one A/B arm.
+- Do not stop at the first broken frame. Capture the earliest divergence, classify it as geometry, texture/CLUT, color/blend, depth, ownership/readback, or presentation, and fix its root while the phase remains active.
+- Prefer same-run CPU shadow verification and exact dependency-boundary readback checks. Dense multi-frame review is mandatory.
+- Measure performance throughout bring-up, but a timing result from incorrect output is not a win. Promotion requires the full route matrix to recover models, depth, lighting, text, textures, alpha cutouts, shared-page composition, and temporal stability.
+- If parity cannot be restored or the architecture is neutral after parity, remove the behavior lever, retain useful diagnostics, and document in the phase fix log.
 
-## Game / Workspace
-- Title: Dark Cloud 2 (NTSC-U). Main ELF: `SCUS_972.13`. Partial recovered symbols.
-- PS2Recomp repo (LIVE): `D:/ps2r/dc2/PS2Recomp`
-- Game workspace: `D:/ps2r/dc2` · ISO: `D:/ps2r/dc2/Dark Cloud 2 (USA) (v2.00).iso`
-- Generated output: `D:/ps2r/dc2/recomp` · Build dir: `D:/ps2r/dc2/build64`
-- Runtime override (most fixes live here): `PS2Recomp/ps2xRuntime/src/dc2_game_override.cpp`
-- Runtime syscalls/stubs: `PS2Recomp/ps2xRuntime/src/lib/Kernel/{Syscalls,Stubs}/*.cpp`
-  (the LIVE defs; `*.inl` are /FORCE:MULTIPLE-ignored DEAD dups — do not edit those).
+---
+
+## Game / Workspace Overview
+
+- **Title**: Dark Cloud 2 (NTSC-U). Main ELF: `SCUS_972.13`. Partial recovered symbols.
+- **PS2Recomp repo (LIVE)**: `D:/ps2r/dc2/PS2Recomp`
+- **Game workspace**: `D:/ps2r/dc2` · **ISO**: `D:/ps2r/dc2/Dark Cloud 2 (USA) (v2.00).iso`
+- **Generated output**: `D:/ps2r/dc2/recomp` · **Build dir**: `D:/ps2r/dc2/build64`
+- **Runtime override (most fixes live here)**: `PS2Recomp/ps2xRuntime/src/dc2_game_override.cpp`
+- **Runtime syscalls/stubs**: `PS2Recomp/ps2xRuntime/src/lib/Kernel/{Syscalls,Stubs}/*.cpp` (`*.inl` are DEAD `/FORCE:MULTIPLE` dups — do not edit).
+
+---
 
 ## Build & Smoke
+
 ```powershell
 cmake --build D:\ps2r\dc2\build64 --config Release --target ps2_runtime -- /m:1
 cmake --build D:\ps2r\dc2\build64 --config Release --target dc2_runner -- /m:1 /p:BuildProjectReferences=false
 ```
-Known-benign link warnings only: `LNK4006` (getGameName) + `LNK4088` (/FORCE).
-Default title smoke (**G139 2026-07-06 golden: held-menu frame_001500 `PixelNonZero=211646`**;
-G138 measured ≈211650 pre-G139, pre-G138 forced-draw era was `≈633662-634384`; reproduce the old
-forced render with `DC2_G100_FORCE_DRAW=1 DC2_VU1_NO_FMSWAPFIX=1 DC2_VU1_NO_MACPIPE=1`, and the
-G139 beam shards with `DC2_VU1_NO_PAIRHAZ=1`):
+*Known-benign link warnings only: `LNK4006` (getGameName, `sceCdGetError`, …) + `LNK4088` (/FORCE).*
+*G375: the runtime now links FFmpeg. The first `cmake -S . -B build64` after G375 downloads a
+prebuilt MSVC FFmpeg (`n7.1-241205`) via `ExternalProject` into `build64/ThirdParty/`, and
+`ps2x_stage_ffmpeg_runtime_dlls(dc2_runner)` copies `av*/sw*` DLLs beside `dc2_runner.exe`.
+Build offline / without it: `-DPS2X_ENABLE_FFMPEG=OFF` (MPEG video falls back to stub frames).*
+*Note: After editing `recomp/`, build `dc2_game` target explicitly first (`cmake --build D:\ps2r\dc2\build64 --config Release --target dc2_game -- /m:1`).*
+
+Default title smoke test (**G139 golden: held-menu frame_001500 `PixelNonZero=211646`**):
 ```powershell
 powershell -ExecutionPolicy Bypass -File D:\ps2r\dc2\tools\run_30s_diagnose.ps1
 ```
 
-## Active Runner Command
-`D:/ps2r/dc2/build64/Release/dc2_runner.exe D:/ps2r/dc2/SCUS_972.13`
-(workspace `D:/ps2r/dc2`; smoke via `tools/run_30s_diagnose.ps1`.)
+---
 
-## 60fps Patch (perf-arc test accelerant, NOT default-on)
-Raw cheat-device code `20376C50 00000001` (32-bit write of `0x00000001` to guest address
-`0x00376C50`) is wired as an opt-in env-gated patch, reapplied every guest frame (matches a real
-cheat-device "extended" write surviving the game's own resets of the value): set
-`DC2_PATCH_60FPS=1` before launching `dc2_runner.exe`. Implementation:
-`dc2_apply_60fps_patch()` in `PS2Recomp/ps2xRuntime/src/dc2_game_override.cpp`, called from the
-per-frame `mgEndFrame` hook. Do all perf-arc timing comparisons with this patch consistently
-ON or OFF (not mixed) — the title loop is already unthrottled/60fps by default so the patch is a
-no-op there; use it on dungeon/town routes (native 30fps) for faster iteration. See "Routes for
-Graphic Test" below for which route to use it on.
+## Active Runner Command & Key Environment Flags
+
+**Active Command**: `D:/ps2r/dc2/build64/Release/dc2_runner.exe D:/ps2r/dc2/SCUS_972.13`
+
+### Common Environment Flags
+- `DC2_PATCH_60FPS=1`: Opt-in 60fps patch (`0x00376C50 = 1`) applied per frame via `mgEndFrame` hook. Accelerates dungeon/town routes (native 30fps).
+- `DC2_DEBUG_MENU=1`: Enables the debug menu (`DebugFlag@0x00376FB8`).
+- `DC2_PAD_INPUT='...'`: Scripted button inputs for deterministic tests.
+- `DC2_DUNGEON_PAD='...'`: Scripted dungeon analog/button inputs (F66).
+- `DC2_RSTICK='...'`: Scripted right-stick analog input (G49).
+- `DC2_NO_XINPUT=1`: Disables live XInput controller polling (G7).
+- `DC2_FRAME_DUMP=1`: Dumps frames to `captures/frame_NNNNNN.ppm` every 60 ticks.
+- `DC2_FRAME_DUMP_EVERY=1`: Dense per-tick frame dumping for soaking thread/pipeline changes.
+- `DC2_G384_MPEG_AUDIO_TRACE=1`: Bounded FMV ADS/PCM header, playback, and progress trace.
+- `DC2_G384_NO_MPEG_AUDIO=1`: Same-binary rollback for G384 host FMV PCM playback.
+- `DC2_G385_AUDIO_TRACE=1`: Bounded gameplay-audio DMA/RPC/bank/BGM/SFX/voice-open trace.
+- `DC2_G385_NO_GAME_AUDIO=1`: Same-binary rollback for G385 Sony HD/BD SFX and SQ BGM playback.
+- `DC2_G386_VOICE_TRACE=1`: Bounded EZBGM SID `0x12345` voice open/play/state/completion trace.
+- `DC2_G386_NO_VOICE=1`: Same-binary rollback for G386 WAV voice streaming.
+
+---
 
 ## Known Issues (ACTIVE)
 
-1. **Low performance due to an incomplete native renderer.**
-   - Native-renderer stack (G260-G298) is DEFAULT-ON; CPU-raster arc CLOSED at G259. Master rollback: `DC2_G26X_NO_NATIVE=1`.
-   - **Current Thread Pole**: GS worker TOTAL cost (~84.4 ms default vs 94.9 ms G310-killed). VU1 runs on a dedicated worker thread by default since G302 (`DC2_G297_NO_MTVU=1`) at ~68-73 ms with `gsStall=0`; EE is mostly idle.
-   - **Active Milestone 2 Status**: G310 logical atlas is DEFAULT-ON (`DC2_G310_LOGICAL=1`), decoupling the 512x512 CT32 logical atlas from physical producer layouts.
-   - **Closed G-Phase Archive**: Historical closed G-phases (G300–G330) and their detailed measurements are archived in [phase-history.md](file:///D:/ps2r/dc2/plans/phase-history.md) and their respective fix logs ([phase-G330-fix-log.md](file:///D:/ps2r/dc2/plans/phase-G330-fix-log.md), etc.). Do not duplicate closed-phase narrative here.
+1. **Low performance due to incomplete native renderer (CLOSED PERF ARC)**
+   - **Status**: Native-renderer stack (G260–G298) is DEFAULT-ON (~13.5 fps / ~74 ms MAP-0 floor). Total closure perf arc CLOSED at G352 (accept-floor). Master rollback: `DC2_G26X_NO_NATIVE=1`.
+   - **Current Thread Pole**: MAP-0 frame ~74 ms/13.5 fps. VU1 worker (~74, true wall ~66–68, MTVU default-on since G302) and GS worker (~68 incl 5ms collect-stall) are **co-balanced ~74 ms** (G344 re-profile); EE idle (~24% busy).
+   - **Milestone 3 Status (Pillar-4 Rearch)**: G310 logical atlas DEFAULT-ON (`DC2_G310_LOGICAL=1`). **G338 resident CT24-alpha view PROMOTED DEFAULT-ON at G352** (`DC2_G338_CT24_VIEW`; kill `DC2_G338_NO_CT24_VIEW=1`; bit-exact, GS worker −3.8 ms/f, frame −2.6% VU1-capped).
+   - **Arc Total-Closure Findings (G340–G352)**:
+     - G340 lazy-VRAM: NO-GO (0.0% skippable).
+     - G341 parallel-VIF DMA chain pre-decode: NO-GO (GS front-end pole is Path2 DIRECT = 53 ms 96% IMAGE upload bytes, not parallelizable geometry decode).
+     - G342 shader-side deswizzle / resident views: NO-GO (relocated readback row-exact to T8 consumer).
+     - G343 L2L exact consume-floor slice: NO-GO (readback-upload conservation, frame regressed +8%).
+     - G344 MTVU window-coalescing: NO-GO (handoff overhead is constant 0.64 ms/f; 93% of `collectMs` is VU1 wait stall).
+     - G349 persist-one-FBO & G351 surface-split: NO-GO (`uploadFb` gates on shared physical-page gens).
+   - **Post-arc presentation & stage fixes (G353–G368)**:
+     - G353 (WEAVE present): Interlace field bob removed (`DC2_G353_FIELD_BOB=1`).
+     - G358 / G359 (Sindain circle): MTGS readback sync (`g150_wait_idle()`, G358) + `BITBLTBUF.SBP` 14-bit block units (`sbp = img.vram_addr`, G359) FIXED Known Issue #2.
+     - G361 (Static inits): `mwInit` run from boot (`f55_boot_init_stub`) FIXED un-run `__sinit_*` root.
+     - G362 (Point sampling): `sampleExact` 12.4 integer UV reconstruction FIXED Items-menu cuts/notches.
+     - G363 (Spheda HUD): `GetFullPath` shim preserves `CurrentDir` prepend FIXED missing HUD textures.
+     - G364 (Distance fog): GS per-pixel FOG stage (`GS_REG_FOGCOL`, `PRIM.FGE`) applied in all draw paths.
+     - G368 (MAP-160 tear): DISPFB stride fallback fix (`candidate.fbw = displayFrame.fbw`) FIXED page-row band tearing; G365 sprite coverage rule promoted back default-ON.
+     - G383 (Minor residuals): `sceMcSetFileInfo` now honors `$a3` info + `$t0` flags; LoadImage `BITBLTBUF.DBP` now uses direct 256-byte block units. G194 DOF/TexAnime visual claims were not reproducible and are closed.
+   - Detailed specs & fix-logs: [arc-native-renderer.md](file:///d:/ps2r/dc2/plans/arc-native-renderer.md), [arc-total-closure.md](file:///d:/ps2r/dc2/plans/arc-total-closure.md), [phase-history.md](file:///d:/ps2r/dc2/plans/phase-history.md), and [phase-G352-fix-log.md](file:///d:/ps2r/dc2/plans/phase-G352-fix-log.md).
 
-2. Active pre-native-renderer graphical issues
-- **Sindain inventory circular viewport** shows colored noise instead of a live 3D character
-   portrait (`ref/dumps/inventory.png` vs `captures/g189_inventory.png`). Reachable via both debug
-   shortcut and normal gameplay. Dispatch lead: `MenuMainDraw__Fv@0x234290` → `menu_drawfunctbl`
-   (indexed by `MenuCommonInfo+0x54`) → per-page draw fn, not yet identified. Harness:
-   `tools/run_g189_inventory_ab.ps1` / `tools/run_g189b_present_ab.ps1`. **PARKED by user during
-   the performance arc (2026-07-15); regression route only, do not investigate or fix now.**
-3. **Interlace / field presentation jitter** — DISPFB/SMODE2/PMODE/CSR; presentation, not
-   geometry; compare PCSX2 deinterlacing first.
-4. **Memory-card save/load** — not implemented; blocks New Game/Load + long-form testing.
-5. **Audio absent** — no music/SFX/voice; event scripts can WAIT on sound completion and stall
-   (check `StreamOpenState`/voice/stream flags first). libsd/IOP path unimplemented. See Runtime
-   Gaps #1 below for the upstream IOP-subsystem fix reference.
-6. **FMV / movie playback** — IPU/MPEG/IOP; only prioritize if a movie wait blocks progression.
-7. **(RETEST after G186)** georama `DrawSub__8CEditMapFi` "null-vtable" crash
-   (`[dispatch:pc-zero] from=0x1b4340 ra=0x0`) — G186 showed this `ra=0x0` signature is the
-   F50.7 sentinel leak, NOT a null vtable; likely fixed by the G186 preempt-suppression, but
-   never explicitly retested. May be entangled with item 1 (same georama/EditMap family).
-8. **G193 instrumentation caveat (durable):** `DC2_TRACE_G58=1` re-registers `Draw__8mgCFrame
-   @0x137E10` with a canary calling the RAW recompiled body — bypassing `g67_frame_draw_probe`'s
-   distance-cull repair from the default table. G58-traced runs lack the G67 repair. Also:
-   wrappers around LONG recompiled bodies (EditInit, Initialize__6CScene) print their ".exit"
-   trace EARLY when back-edge preemption unwinds them mid-body (G186 mechanism) — treat exit
-   snapshots as mid-execution values.
-9. **G194 town DOF wedge** — dark triangular wedges from `DepthOfField@0x17E320`; bisect-proven
-   (`DC2_G194_SKIP_DOF=1` removes them) but final root (raster-semantics/pyramid-content level)
-   never found. Low priority.
-10. **G194 TexAnime L→L rect-width divergence** (`1×k` vs real HW's `64×k`+`64×(64-k)` wrap
-    pairs) — documented, unfixed, low priority.
-11. **Regen caveat (durable):** see Reusable Knowledge → "Recompiler regen caveat" (COP2 dest-mask
-    reapply + `ps2_recomp` stale cache + VU0 un-stub collisions) before any future regen.
-12. **DISPFB latch kept BY DESIGN (F52, not a bug):** the `f29_mgendframe_probe` DISPFB1/2 force-write
-    is a headless presentation-timing crutch for the half-rate title loop; do NOT diagnose a black
-    frame as a swap/buffering bug. Legacy mode behind `DC2_FORCE_DRAW_BUFFER_LATCH=1`.
-13. **Guest C heap must sit ABOVE guest `_end` (F58, RESOLVED, verify if `bad_alloc` reappears):**
-    check `[F58:setupheap]` non-zero.
-14. **G178 GPU depth parity** — `DC2_G242_GPU_DEPTH=1` persistent GPU-depth bridge is opt-in only
-    (`PS2_PROJECT_STATE.md`/`plans/arc-native-renderer.md` GPU stepping-stones): its dirty
-    ownership invariant fails on the title (G249), blocked on finding the missing CPU-write
-    barrier. Not on the critical path (native-renderer stack G260-G289 covers perf instead).
+2. **Audio subsystem restored (FIXED G384-G386)**
+   - G384 plays stereo PCM16LE embedded in PSS FMVs; the user verified `RUSH.PSS` against `ref/audio/fmv0.webm`.
+   - G385 parses Sony HD/BD VAG banks, plays MODMSIN SFX key-ons, and renders looped `SCEISequ` BGM through host audio.
+   - G386 handles EZBGM SID `0x12345`, indexes `SOUND.HD3`, reads requested WAV sectors from `SOUND.DAT`, plays them through host audio, and returns `0x1000` only while the clip is active.
+   - The supplied recording exercises `0010665.wav` and `0010670.wav`; the user verified the cutscenes now work and progress.
 
+3. **Georama `DrawSub__8CEditMapFi` vtable crash**
+   - `ra=0x0` signature is F50.7 sentinel leak, likely fixed by G186 preempt-suppression. Needs explicit retest post-G186.
+
+4. **G193 instrumentation caveat (durable)**
+   - `DC2_TRACE_G58=1` re-registers `Draw__8mgCFrame@0x137E10` bypassing `g67_frame_draw_probe` distance cull repair. Trace runs lack G67 repair. Long recompiled bodies print exit trace early on unwinding back-edge preemption.
+
+5. **DISPFB Latch (Kept by Design)**
+   - `f29_mgendframe_probe` DISPFB1/2 force-write is a presentation timing crutch for the half-rate title loop behind `DC2_FORCE_DRAW_BUFFER_LATCH=1`.
+
+6. **Guest C heap must sit ABOVE guest `_end` (F58)**
+   - Check `[F58:setupheap]` non-zero.
+
+7. **G178 GPU depth parity**
+   - `DC2_G242_GPU_DEPTH=1` persistent GPU-depth bridge is opt-in only.
+
+---
 
 ## Routes for Graphic Test
 
-**Rule for the upcoming perf arc: accuracy beats speed.** Any change to VU1 timing, the GS
-rasterizer (CPU or GPU path), tile-binning, MTGS/threading, or universal-Z/alpha-test semantics
-must be re-verified against the routes below before being called done — pixel-count golden alone
-is NOT sufficient (see "Golden pixel-count alone as a promotion gate" in ROADMAP's Refuted list).
-
-**The 60fps patch (`DC2_PATCH_60FPS=1`, see Build & Smoke) is a TEST ACCELERANT, not a target
-state.** The title loop already runs unthrottled/60fps by default — the patch is a no-op there.
-Dungeon/town routes (MAP-0 etc.) run at the game's native 30fps without it, so use the patch on
-those routes when you want faster wall-clock iteration; always spot-check at least one route with
-the patch OFF too, since it writes a live guest word every frame and must not be assumed neutral
-for a route that hasn't been checked.
-
-Each row: reference dump → exact input route → harness → which planned perf-lever changes should
-re-trigger a re-check of that route.
+Each row: reference dump → exact input route → harness → re-check triggers.
 
 | Reference (`ref/dumps/`) | Route (debug-menu unless noted) | Harness | Re-check when touching |
 |---|---|---|---|
-| `correct_light.{gs,png}` | Debug menu → Down×2 → Circle → Square → Left → Cross (dungeon-0 map/light view) | `tools/run_g237_capture.ps1`, `tools/run_g239...` A/B via `run_g237_vugs_ab.ps1` | **VU1 interpreter timing/scalar-pipeline changes — HIGHEST PRIORITY**, this route is what caught the G239 scalar-prestall bug |
-| `dungeon_1_cutscene.{gs,png}` | Debug menu → Down×2 → Right → Circle → Cross×2 (Rainbow Butterfly Wood entrance cutscene) | `tools/run_g240_capture.ps1` | Alpha-test (`AFAIL`)/blend/Z-write changes, G242 universal-Z GPU-depth bridge |
-| `map_2_zoom.{gs,png}` | Debug menu → Down@0 → Right@15/30 → Circle@43, then hold byte-swapped replay R2=`0x0002` from scriptFrame 212 (real zoom appears near dump tick 1200) | `tools/run_g221_map2_zoom.ps1`, `tools/run_g222_map2_kink.ps1` | CPU/GPU rasterizer texture-interpolation (STQ) changes — the G222 hyperbolic-vs-affine bug only showed on this route's large deep triangles |
-| `map_0.{gs,png}` | Debug menu → Down (~tick 15) → Circle (~tick 94) (town/MAP-0) | `tools/run_g194_map0.ps1` | VU1 Q-pipe/FDIV timing (G200), universal guest-Z (G203), any tile-bin/MTGS/GPU-raster lever — cheapest non-title 3D route, and the one that's genuinely 30fps without the patch (good for A/B'ing the patch itself) |
-| `map_4.{gs,png}` | Debug menu → Down → Right×4 → Circle (town/MAP-4) | `tools/run_g204_map4.ps1` | VIF1 DMA chain-tag walker (G217), shared-page-clear regressions (G220) |
-| `map_4_zoom.{gs,png}` | Recorded route: Down@0 → Right@15/30/43/59 → Circle@77, then hold byte-swapped replay R2=`0x0002` from scriptFrame 212 (real zoom near dump tick 1200) | `tools/run_g218_map4_zoom.ps1` | Same as `map_4`, plus zoom-mode composite/RTT changes; verify Max/HUD disappear or the route did not enter zoom |
-| `dungeon_0_cutscene.{gs,png}` | Debug menu → Down×2 → Circle → Cross×2 (dungeon-0 entrance cutscene, mid-cutscene frame) | `tools/run_g223_dungeon0_entrance.ps1` (default `-Sweep` covers this) | Cutscene camera/render path, DngStatus=2 draw scope |
-| `dungeon_0_cutscene_end.{gs,png}` | Same route, final shot ≈ frame_016020 (need `-Seconds`/sweep extended past the script default) | `tools/run_g223_dungeon0_entrance.ps1` with a longer `-Seconds` | Event-completion timing (G225), cutscene-to-freeroam handoff |
-| `dungeon_0_gameplay.{gs,png}` | Same route, after DngStatus 2→0 (free-roam begins) | `tools/run_g223_dungeon0_entrance.ps1` (extended) | Free-roam camera/lighting (G224), general dungeon 3D render |
-| `emptey_room.{gs,png}` | Debug menu → Down → Left → Circle×3 (empty room, Max falling — DA physics/pendant repro) | `tools/run_g226_emptyroom.ps1` | VU0 stub changes (`sceVu0*` family), DA/accessory physics — lower relevance to the GS/tile-bin perf arc unless it touches VU0 |
-| `Inventory.{gs,png}` | Town → Down → Circle (open menu) → Triangle×3 (inventory tabs, scriptFrame~172/198/232) | `tools/run_g189_inventory_ab.ps1` | Sprite-defer (G172)/pipelining (G157) levers — this route already has a KNOWN bug (G241, circular viewport noise); use it for regression-only checks on the rest of the menu, not as a pass/fail gate for G241 itself |
-| `ttle.{gs,png}` (title cavern) | Either the non-debug golden route (held New-Game menu) OR debug menu → Down×3 → Circle | `tools/run_g100_cap.ps1`; gross golden `PixelNonZero=211646+/-4` at `frame_001500`; **dense temporal gate from f60 onward** (G249) | Any VU1 MAC/flag-pipeline, clipper, draw-list/culling, deferred-order, depth-ownership, or presentation change. One golden frame is insufficient; G249 caught a G242 regression only through the multi-frame gate. |
+| `correct_light.{gs,png}` | Debug menu → Down×2 → Circle → Square → Left → Cross (dungeon-0 map/light) | `tools/run_g237_capture.ps1` | **VU1 scalar-pipeline timing** |
+| `dungeon_1_cutscene.{gs,png}` | Debug menu → Down×2 → Right → Circle → Cross×2 (Wood entrance) | `tools/run_g240_capture.ps1` | Alpha-test (`AFAIL`), blend, Z-write |
+| `map_2_zoom.{gs,png}` | Debug menu → Down@0 → Right@15/30 → Circle@43 + zoom replay | `tools/run_g221_map2_zoom.ps1` | Rasterizer texture-interpolation (STQ) |
+| `map_0.{gs,png}` | Debug menu → Down (~tick 15) → Circle (~tick 94) (town/MAP-0) | `tools/run_g194_map0.ps1` | Town geometry, Z, tile-bin/MTGS |
+| `map_4.{gs,png}` | Debug menu → Down → Right×4 → Circle (town/MAP-4) | `tools/run_g204_map4.ps1` | VIF1 DMA chain-tag walker, shared-page clear |
+| `map_4_zoom.{gs,png}` | Recorded route: Down@0 → Right@15/30/43/59 → Circle@77 | `tools/run_g218_map4_zoom.ps1` | Zoom-mode composite / RTT |
+| `dungeon_0_cutscene.{gs,png}` | Debug menu → Down×2 → Circle → Cross×2 (dungeon-0 entrance cutscene) | `tools/run_g223_dungeon0_entrance.ps1` | Cutscene camera/render path |
+| `dungeon_0_gameplay.{gs,png}` | Same route, post DngStatus 2→0 (free-roam) | `tools/run_g223_dungeon0_entrance.ps1` | Free-roam camera / lighting |
+| `emptey_room.{gs,png}` | Debug menu → Down → Left → Circle×3 (empty room, Max falling) | `tools/run_g226_emptyroom.ps1` | VU0 stubs, DA/accessory physics |
+| `items.{gs,png}` | Debug menu → Down → Circle → Triangle → Cross | `tools/run_g361_items.ps1` | Boot static-inits (`DC2_G361_NO_SINIT`), 2D UV |
+| `Inventory.{gs,png}` | Town → Down → Circle → Triangle×3 | `tools/run_g189_inventory_ab.ps1` | Sprite defer, pipelining |
+| `ttle.{gs,png}` | Held New-Game menu OR debug menu → Down×3 → Circle | `tools/run_g100_cap.ps1` | VU1 MAC/flags, culling, Z, presentation |
 
-**Suggested check order for a perf-arc change that touches VU1 timing/GS raster/threading broadly:**
-1. `ttle` golden pixel count (cheap, catches gross regressions).
-2. `correct_light` (VU1 scalar-timing canary).
-3. `dungeon_1_cutscene` (alpha-test/blend canary).
-4. `map_2_zoom` (texture-interpolation canary).
-5. `map_0` / `map_4` / `map_4_zoom` (general town/dungeon geometry + Z + chain-tag).
-6. `dungeon_0_cutscene` / `_cutscene_end` / `_gameplay` (general dungeon render + camera).
-7. `emptey_room`, `Inventory` (lower priority — VU0/known-broken respectively).
+---
 
-## Reusable Knowledge (verified this phase unless noted)
+## Reusable Technical Knowledge
 
-### Rendering fixes DONE (G5/G6/G8) — durable facts only; full narrative in `plans/phase-history.md`
-- **Split VIF1 IMAGE continuation (G6, FIXED):** VIF1 PATH2 IMAGE continuation qwords must be
-  forwarded verbatim (`ps2_vif1_interpreter.cpp`) — never re-wrap them in a second IMAGE tag.
-- **Debug-menu PSMT4HH font (G5, FIXED):** `tbp=0x1a00 tbw=8 psm=0x2c cbp=0x3fe0` is a packed
-  4-bit host-to-local stream (low nibble then high nibble); stop at the `TRXREG` rectangle, not
-  the oversized `0xD000` QWC request. Sampler honors GS `CLAMP`/`REGION_CLAMP`/`REGION_REPEAT`
-  (the debug font needs `CLAMP=0` repeat, its U coords exceed the declared 512 width).
-- **2D UI sprite sampling (G8):** DC2 menu/HUD/debug fonts are POINT-SAMPLED
-  (`[G8:sprite] tex1=0x201`, MMAG/MMIN=0) — never add bilinear to "fix" UI blur. `drawSprite`'s
-  FST sampling bias is 0.0 (left-edge), not +0.5. Residual UI softness vs a real PS2's upscaler
-  is a known cosmetic gap (would need an internal 2D supersample pass), not a bug to chase.
-- DC2 menu/HUD text+icons are PSMT8 palette textures uploaded via a CT32-aliased BITBLT
-  (`DPSM=PSMCT32`, `TBW=2×DBW`, CLUTs in CT32) and sampled as native T8 — do NOT re-touch
-  `GSMem`/`addrPSMT8`/`addrPSMCT32`/CLUT for text without re-reading the full G5/G6/G8 history.
+### 1. Rendering Fixes & Sprite Sampling (G5, G6, G8, G362)
+- **Split VIF1 IMAGE continuation (G6)**: VIF1 PATH2 IMAGE continuation qwords must be forwarded verbatim (`ps2_vif1_interpreter.cpp`) — never re-wrap in second IMAGE tag.
+- **Debug-menu PSMT4HH font (G5)**: Packed 4-bit stream; stop at `TRXREG` rectangle, not oversized QWC request. CLAMP repeat semantics.
+- **2D UI sprite point-sampling (G8, G362)**: DC2 UI text/icons are point-sampled (`tex1=0x201`, MMAG/MMIN=0). `drawSprite` FST bias is 0.0. `sampleExact` (G362) uses 12.4 fixed-point UV reconstruction (`lround(u*16)/16`) on `uMode` bit 12 to prevent float `floor()` rounding errors across atlas boundaries.
 
-### Pad input — the LIVE path and the ANALOG stick (F66)
-- **The live pad read is `read_pad_stub`** (registered at `0x0014A490`, overrides
-  `read_pad__FP10PAD_STATUS`) → `dc2_write_pad_status` (`dc2_game_override.cpp`). It
-  writes the button mask to `PAD_STATUS+0` and the four analog ints
-  (`+4`=LY,`+8`=LX,`+0xc`=RY,`+0x10`=RX). **`scePadRead` (Pad.cpp AND
-  ps2_stubs_misc.inl) is DEAD — the game never calls it** (`[F66:padcall]`=0); editing
-  it / `setPadOverrideState` is inert for input. `PAD_STATUS` = `CGamePad+0x04`
-  (`UpDate__8CGamePad@0x14a930` calls `read_pad(CGamePad+4)`), so `CGamePad+0xc`=LX,
-  `+0x8`=LY (`GetLX/GetLY`: `-0x80` centre, ±`0x32` deadzone).
-- **In-dungeon free-roam movement is the LEFT ANALOG STICK**, not the D-pad:
-  `RunScript__12CActionChara`→`Analog__11CPadControl(0x3d7b60, 4/5)`. A digital-only
-  injector navigates menus but never moves the player.
-- **Headless input clock dies in-dungeon:** `f40_drive_pad`'s `scriptFrame` comes from
-  the **mgEndFrame OVERRIDE** call count, but the dungeon calls mgEndFrame via a direct
-  `jal` that bypasses the hook → input stops at `scriptFrame≈697`. For in-game input,
-  drive from the **host present loop** (`ps2_runtime.cpp`), not mgEndFrame.
-- **`DC2_DUNGEON_PAD`** (F66): same `start..end:Alias[+Alias];…` syntax as
-  `DC2_PAD_INPUT`, evaluated by `f66_drive_dungeon_pad` off the present loop with a
-  counter that starts at free-roam entry; emits buttons + a deflected left stick
-  (Up `0x10`→ly`0x00`, Down→ly`0xFF`, Left→lx`0x00`, Right→lx`0xFF`).
-- Addresses: `MainChara` ptr @ **`0x003772C8`** (gp-0x7228, gp=`0x0037E4F0`), player
-  world pos @ `MainChara+0xe0`, vtable `0x3756f0`. `DebugPause` @ **`0x00377288`**
-  (gp-0x7268). Movement gate (`DngMainKey` exe `0x1d1d…`): `DAT_01e9f6e8==0 &&
-  DebugPause==0 && (BattleAreaScene+8 & 4)==0`. **G223 note: `DAT_01e9f6e8` is also
-  the sentinel `InitEyeCamera__FP12CActionChara@0x1D3D10` unconditionally sets to 1 near
-  its end — reading it as 0 throughout free-roam is proof InitEyeCamera never ran.**
+### 2. Pad Input Architecture (F66, G7, G49)
+- **Live pad read is `read_pad_stub`** (`0x0014A490`) → `dc2_write_pad_status`. Writes buttons to `PAD_STATUS+0` and analog axes (`+4`=LY, `+8`=LX, `+0xc`=RY, `+0x10`=RX). `scePadRead` is DEAD. `CGamePad+0xc`=LX, `+0x8`=LY (`-0x80` centre, ±`0x32` deadzone).
+- **Free-roam movement uses LEFT ANALOG STICK** (`Analog__11CPadControl@0x3d7b60`). Digital-only injector never moves player.
+- **Host Present Loop Driving**: Headless pad script must drive off host present loop (`ps2_runtime.cpp`), as dungeon bypasses mgEndFrame hook.
+- **XInput via raylib (G7)**: Polled by `g7_poll_live_pad()` in `ps2_pad.cpp`. Priority: `DC2_NO_XINPUT=1` → scripted `DC2_PAD_INPUT` → live gamepad/keyboard → default.
+- **Scripted Right-Stick (`DC2_RSTICK`, G49)**: Controls costume preview rotation in headless tests.
 
-### Real controller input — XInput via raylib (G7)
-- A connected host gamepad now drives the game live (buttons + both analog sticks).
-  Backend = raylib's gamepad layer (XInput on Windows via GLFW), exposed by the free
-  fn `dc2_poll_host_pad(allowKbd, mask, lx,ly,rx,ry)` in `src/lib/ps2_pad.cpp`
-  (active-high scePad mask + 0x80-centred axes, radial deadzone ~0.20; triggers also
-  assert L2/R2). Polled once per present frame by `g7_poll_live_pad()` (global scope in
-  `dc2_game_override.cpp`, called from the `ps2_runtime.cpp` present loop) → publishes
-  the snapshot `g_pad_live_*` consumed by `read_pad_stub`/`dc2_pad_mask`/
-  `dc2_write_pad_status`.
-- **Input source priority:** `DC2_NO_XINPUT=1` (off) → explicit `DC2_PAD_INPUT`
-  (scripted, deterministic tests — suppresses live) → connected gamepad or
-  `DC2_KEYBOARD=1` (live OWNS buttons + all four axes) → F40/F66 scripted default.
-- `run_30s_diagnose.ps1` now sets `DC2_PAD_INPUT` explicitly so a plugged pad can't
-  perturb golden smoke. Trace: `DC2_TRACE_PAD_INPUT` → `[G7:live]`.
-  cross-thread snapshot reads are unsynchronised scalars (≤1 frame stale, like F66).
-  Rumble not wired (raylib gamepad has no rumble API). See `plans/phase-G7-fix-log.md`.
-- **`DC2_RSTICK` (G49) — scripted RIGHT-STICK for headless tests.** `DC2_PAD_INPUT` only injects
-  the 16-bit button mask (both analog sticks stay centred), so it cannot rotate the Select-Costume
-  model preview (which turns with the RIGHT analog stick). `DC2_RSTICK` uses the same
-  `start..end:Dir[+Dir];...` range syntax, `Dir` ∈ {`RRight`,`RLeft`,`RUp`,`RDown`}; driven off the
-  F40 scriptFrame path, applied in `dc2_write_pad_status` when no live pad. Default centred (inert).
-  Harness `tools/run_g49_rstick.ps1`. (`f40_get_rstick_events`/`g_f40_rx,ry` in `dc2_game_override.cpp`.)
+### 3. Debug-Menu Dungeon Navigation & Harness
+- `DC2_DEBUG_MENU=1` writes `DebugFlag@0x00376FB8`. Navigate with `DC2_PAD_INPUT='90..99:DebugDown;130..139:DebugDown;170..179:DebugConfirm'`.
+- Frame dumps: `captures/frame_NNNNNN.ppm`. Filename is HOST TICK counter, NOT guest scriptFrame. Cross-check via `DC2_TRACE_F59=1`.
 
-### Debug-menu dungeon route
-`DC2_DEBUG_MENU=1` writes `DebugFlag@0x00376FB8` (gp-0x7538); navigate with
-`DC2_PAD_INPUT='90..99:DebugDown;130..139:DebugDown;170..179:DebugConfirm'` → reaches the
-floor-select treemap (`DngStatus=4`). Add `;260..266:Down;300..306:Down` to confirm a
-floor and reach the 3D draw. Frame capture: `DC2_FRAME_DUMP=1` → `captures/frame_NNNNNN.ppm`
-every 60 ticks (`ps2_frame_dump.cpp`). **The dump filename is the HOST PRESENT-LOOP `tick`
-counter, NOT the guest scriptFrame** (G223, 2026-07-11 correction) — cross-check which tick is
-post-transition via `DC2_TRACE_F59=1`'s `[F59:dump] tick=... DngStatus=...` line before trusting
-a sweep frame number, especially across different perf-lever configs (wall-clock/scriptFrame
-ratio is NOT constant — disabling G144/G178 can make the CPU path several× slower in real time).
-Harness: `tools/run_f56_dungeon3d.ps1` (older, coarse) or `tools/run_g223_dungeon0_entrance.ps1`
-(newer, includes the `DC2_TRACE_F56/F57/F59` state traces by default).
+### 4. EE Software `double` Math (G373)
+- R5900 FPU is single-precision only. Metrowerks implements `double` in software using 64-bit integer GPRs (`fptodp` @`0x002893C0`, `dpmul` @`0x00287FF8`, `dptofp` @`0x002887C8`).
+- Double-precision libm entry points (`sin` `0x0011E1C0`, `cos` `0x0011DA28`, `atan` `0x0011D5D0`, `atan2` `0x0011EA80`, `pow` `0x0011EB98`, `sqrt` `0x0011EFC8`, `fabs` `0x0011DB30`, `floor` `0x0011DB88`): args in `$a0`/`$a1`, result in `$v0`. Each is a full 64-bit IEEE double in one GPR.
+- Stubs using single-precision float ABI (`f12`/`f0`) return stale `$v0`, corrupting math without crashing (e.g. pot velocity flying along `x==z` diagonal). Use `ps2GetDoubleArg`/`ps2SetDoubleReturn`.
 
-### Recompiler regen caveat (before any future regen, e.g. with the trimmed toml)
-- Configs are inputs to a MANUAL `ps2_recomp` run, NOT referenced by the runtime build.
-  `ref/config_auto_recomp.toml` = trimmed v11 (54 stubs + 10 skips removed → recompile);
-  `ref/config_auto_recomp_F56baseline.toml` = v9, closest to the CURRENT working binary
-  (rollback insurance); `patch/config_auto_recomp.toml` = older v3.
-- `ps2_recomp.exe` build cache hard-references the stale path `d:/ps2r/PS2Recomp` — fix +
-  rebuild the recompiler before regenerating.
-- **After any regen, re-apply the F51.8 COP2 dest-mask reversal** (`tools/fix_cop2_destmask.py`)
-  to the regenerated files, or all dungeon 3D perspective transforms regress to degenerate.
-- Un-stubbing VU0 helpers (e.g. `sceVu0InversMatrix`) collides with runtime impls in
-  `Kernel/Stubs/VU.cpp` (/FORCE picks one) — validate the correct winner per function.
+### 5. EE Float Arithmetic & Saturation (G371, G372)
+- R5900 COP1 FPU has no Inf, no NaN, no denormals — saturates every result to `±0x7F7FFFFF`. `x/0` returns max finite value with operand signs; `sqrt` uses absolute value.
+- NaNs/Infs in guest state indicate host IEEE overflow. Clamped via FPU macros (`FPU_ADD_S`, `FPU_SUB`, `FPU_MUL`, `FPU_DIV_S`, `FPU_SQRT_S`).
+- COP2/VU0 FMAC ops are clamped by MAC-flag block. VU0 Q ops (`VDIV`/`VSQRT`/`VRSQRT`) and COP1 denormals are fixed via post-regen scripts.
 
-### PCSX2 A/B (DebugServer raw TCP)
-`127.0.0.1:21512`, newline-delimited JSON. cmds: status / evaluate{expression} /
-read_memory{address:int,size} / set_breakpoint{address} / resume / clear_breakpoints;
-poll `status.data.paused` after resume. Reusable: `tools/run_f56_pcsx2_ab.ps1`,
-`tools/run_f55_pcsx2_ab.ps1`. Convention: leave PCSX2 paused, breakpoints cleared.
+### 6. Boot & Static Initializers (`__sinit_*`, G361)
+- Metrowerks static initializers (`__sinit_<file>.cpp`) run via `.ctors` pointer table at `0x00374D80–0x00374E40` walked by `mwInit@0x00100190` called by `init__Fv@0x0015C160`.
+- Nop'd `init__Fv` skipped all static initializers. `f55_boot_init_stub` runs the ctor table once before `InitCDFile`. Index 5 (`__sinit_mainloop.cpp`) stays excluded; `DC2_G361_SINIT_ALL=1` is diagnostic only.
+- G382 closed the proposed missing User-Data/New-Game follow-up: `MainLoop@0x190CB0` calls `CSaveData::Initialize`, `InitSaveData@0x1908A0` repeats it, and TitleLoop's New Game return-5 branch calls `InitSaveData` again. At MapJump, index-5 A/B hashes are identical across the active-save/CUserDataManager pages.
+- Full index 5 is unsafe in this manual boot position: it changes surviving scene/villager placement seed state and moves deterministic MAP-0 from `(362.53,12.68,960.28)` to origin. Keep the narrow F50.4 MainScene-vtable repair; do not carry forward the false assumption that save initialization is missing.
+- Diagnostic rule: zero state on a global struct with valid positions indicates BSS zero from un-run static ctor.
+
+### 7. GS Transfers & BITBLTBUF (G383, G359, G358)
+- Block pointers in `BITBLTBUF.SBP`/`DBP` are 14-bit fields in 256-byte block units. Guest TBP0 is ALREADY in block units — pass directly, do NOT scale by `*8`.
+- MTGS readback contract: GS local→host readback (`sceGsExecStoreImage`) MUST call `g150_wait_idle()` before consuming bytes.
+
+### 8. Recompiler & Codegen Technical Rules
+- **`.inc` recompile trap (G359)**: MSBuild does not reliably rebuild when an included `.inc` changes. Always edit included `.cpp` (`GS.cpp`/`ps2_gs_gpu.cpp`) to force recompile.
+- **`DIRECT_JAL_ONLY_TARGET` (G223)**: Cannot be traced via `registerFunction`; wrap jal target instead.
+- **Back-edge preemption context safety (G186, G211, G212)**: Recompiled bodies unwound by preemption must suppress preemption during wrapper execution (`g_dc2PreemptSuppressDepth`).
+- **VU1 scalar prestall (G239)**: Lower scalar stalls happen BEFORE either half of instruction pair executes; decode lower word first.
+- **VU1 FDIV delay (G200)**: FDIV busy-stalls second DIV/SQRT/RSQRT until first result latches into Q.
+- **Stack argument decoding (G194, G374, G378)**: R5900 EE ABI passes first 8 integer args in `$a0–$a3` and `$t0–$t3`. Stack reads (`readStackU32(16)`) for 5th fixed arg are wrong; stack args start at `sp + 0` in 8-byte slots.
+- **Universal Z emulation (G203)**: Honor guest ZBUF/TEST universally, never whitelist per-screen.
+- **`vf0` initialization (G40)**: Pin `vu0_vf[0] = (0,0,0,1)` after context memset.
+- **VU1 Q latency (G87)**: Latches Q after fixed delay (7 cycles for DIV/SQRT, 13 for RSQRT).
+
+### 9. Off-EE-Thread Guest-Execution Lock (G377, G379)
+- **Invariant**: Any host thread that runs recompiled guest code (e.g. INTC/DMAC IRQs, VSync callbacks, Alarm threads) MUST hold `PS2Runtime::GuestExecutionScope`.
+- `m_guestExecutionMutex` is a recursive mutex and `g_guestExecutionDepths` is thread-local, so taking the scope defensively on a thread that already holds it is free. Blocking syscalls release the lock via `GuestExecutionReleaseScope` (release-on-wait).
+
+### 10. R5900 EABI Register & Stack Argument Layout (G374, G378)
+- R5900 EABI passes first 8 integer arguments in `$a0–$a3` and **`$t0–$t3`**.
+- There is NO 16-byte o32 stack save area. Stack arguments start at `sp + 0` in 8-byte slots.
+- Software `double` math lives in a single 64-bit GPR (`$a0`/`$v0`) — never split across two 32-bit slots.
+
+### 11. Recompiler Regeneration Procedure (G380, G381)
+- **Authoritative Config**: Use `config_dc2_final.toml` in repo root (453 stub entries, verified 99.9% byte-identical regen).
+- **Post-Regen Pipeline**:
+  1. `ps2_recomp.exe config_dc2_final.toml`
+  2. `python tools/fix_cop2_q_ps2_float.py recomp`
+  3. `python tools/fix_cop1_ps2_float.py recomp`
+- **STALE SCRIPT WARNING**: Do NOT run `tools/fix_cop2_destmask.py`. Modern `ps2_recomp.exe` emits correct dest masks; running `fix_cop2_destmask.py` corrupts the vector/clipper core.
+- **Dead Stubs**: 0 dead `TODO_NAMED` process-abort stubs remain (`g381_dead_stub_repairs.inc` registers 35 handlers by guest address).
+
+### 12. FMV/PSS Audio (G384)
+- DC2 PSS private-stream audio starts with a four-byte substream selector (`ff a0 00 00`), then Sony `SShd`/`SSbd` ADS data.
+- `RUSH.PSS` is codec 1 PCM16LE, 48 kHz stereo, with 0x200-byte planar blocks per channel. Deinterleave each channel block to LRLR samples before host playback.
+- `MPEG.cpp` now preserves guest callbacks while also streaming supported PCM through raylib. Kill with `DC2_G384_NO_MPEG_AUDIO=1`; trace with `DC2_G384_MPEG_AUDIO_TRACE=1`.
+
+### 13. Gameplay SFX and Sequenced BGM (G385)
+- DC2 SIF DMA sends Sony `.HD` metadata and `.BD` VAG bodies; EZMIDI `SetHD` associates the pair with a sound port.
+- `SE_Play@0x189C10` emits program/volume/key-on messages through MODMSIN. Its generated handlers were dead return-zero stubs; G385 resolves their program/key split against the captured bank and submits decoded VAG audio.
+- BGM `SetSq` payloads start with `SCEISequ` and use variable-delta MIDI-like channel events plus Sony loop markers. G385 renders the captured sequence against its HD/BD instruments and loops the PCM through one host stream per port.
+- Kill with `DC2_G385_NO_GAME_AUDIO=1`; trace with `DC2_G385_AUDIO_TRACE=1`.
+- Voice uses a separate `ezBgm@0x28AE20` RPC service (SID `0x12345`); G386 implements that path.
+
+### 14. Voice Streaming (G386)
+- Voice filenames such as `0010665.wav` resolve through 16-byte `SOUND.HD3` entries: name offset, byte size, `SOUND.DAT` sector offset, and sector count. Read only the referenced 2048-byte sectors; do not extract or scan the full 970 MB archive.
+- Exercised assets are standard RIFF/BWF PCM WAV: mono, 48 kHz, 16-bit. They are not VPK/VAG and do not use the G385 HD/BD decoder.
+- `StreamOpenFast@0x18AEF0` reaches `ezBgm@0x28AE20` SID `0x12345`. Captured command families cover open (`0x8020`), standby/mode/attribute, play (`0x50`), volume (`0x80`), state (`0x80b0`), level (`0x80e0`), stop, and close.
+- `sgCPlayVoice::Step@0x304730` requires state exactly `0x1000` while playing, then a non-playing value to complete. G386 derives that transition from decoded frame count/sample rate.
+- Repro: `tools/run_g386_voice.ps1`; add `-Control` for the same-binary `DC2_G386_NO_VOICE=1` arm.
+- Kill with `DC2_G386_NO_VOICE=1`; trace with `DC2_G386_VOICE_TRACE=1`.
+
+---
 
 
-## Learned Patterns (durable cross-phase wisdom)
-
-Full mechanism/evidence for any entry below: `plans/phase-history.md` "ARCHIVED
-PS2_PROJECT_STATE.md 'Learned Patterns' DETAIL as of 2026-07-14", or the phase's own fix-log.
-
-**Threading / diagnostics**
-- **G316:** when the worker runs thousands of packet windows per frame, a detailed timer per
-  packet or per window can manufacture the pole it is meant to measure. Keep root timing coarse;
-  sample one complete frame behind a cached arm, compare against armed-empty, and reconcile only
-  quantities with the same sampling denominator. A large outer Path-2 slice selects an ordering
-  mechanism investigation, not a safe micro-optimization or cross-path reorder.
-- **G315:** a perfect-deletion super-set that only touches the promotion gate is a premise failure,
-  not permission to prototype. Mandatory upload, fence, authority, fallback, and publication costs
-  are non-zero, and target-specific coverage is lower than whole-bucket credit. Stop before behavior,
-  retain the existing diagnostics, and re-rank the whole critical thread.
-- **G314:** an upload dependency drain is not an upload-node deletion ceiling. Split required
-  producer-wave preparation/execution from backend submit wait and guest publication, then trace
-  the first following consumer. On MAP-0, 80% of edges were structurally chainable while only
-  ~5.0 ms/f was removable wait and just one edge/f had existing resident authority. Edge coverage
-  is not payoff coverage; nonresident texture readers require a separate page-authority mechanism.
-- **G313:** never derive byte-writer cost by subtracting one timer from an inclusive transfer
-  bucket. Direct no-`DC2_PERF` boundaries measured the IMAGE writer at 2.1-2.7 ms/f while the
-  preceding dependency-range execution owned the large interval. Premise-gate the exact body
-  before building bulk or threaded paths; optimize the dependency/publication edge when it pays.
-- **G281:** removing one exact read-side publication does not pay when a later overlapping
-  writer still needs guest-authoritative physical pages: `mat(tex) -205` became
-  `mat(cpu) +205` exactly. Count total publication causes, not one bucket. A read view and a
-  write view are different ownership mechanisms; never "classifier-widen" a write whose
-  destination pages overlap several dirty FBOs without ordered fan-out/page authority.
-- **G281:** PS2 formats can share physical pages without sharing within-page geometry.
-  The safe CT32-to-T8 view begins with the real `AddressP8`, inverts CT32 word layout, selects
-  the exact byte lane, and applies the live CLUT. Do not carry CT32 64x32 tile equivalence into
-  T8/T4/Z. Also, retained shorthand said TRI_STRIP while the live shape was SPRITE: current
-  consumer-edge census outranks phase prose.
-- **G267:** a 2-D sampled page set cannot be safely collapsed to one min/max GS block interval
-  when that interval grants GPU residency permission. A narrow texture column spanning many page
-  rows made the generic range falsely include every intervening CT32 page column (`alias=0x1c`);
-  enumerating actual sampled pages found the one real alias (`0x146`, page `0x2920`). Use coarse
-  ranges for fail-closed barriers/census, exact page/address sets for admission.
-- **G267:** eliminating a named consumer drain does not imply less synchronization. The correct
-  TRISTRIP direct-bind prototype had to publish one aliased sibling and then publish the source at
-  its lifecycle boundary; total `mat(tex)` stayed at control cadence. Count the whole downstream
-  materialization graph after every ownership repair, and remove a behavior arm that only relabels
-  the work even when its final composition is correct.
-- **G265:** exactness work can erase an architectural win even when it fixes the right contract.
-  The first 8-bit alpha repair ran integer TFX arithmetic on every GPU fragment and collapsed the
-  matched frame-time gain to a 1.45% median. Keep exact post-TFX alpha, but branch the integer work
-  on the uniform alpha-test mode; the final 3x3 recovered an 8.59% median reduction. Rebenchmark
-  after every parity repair, and discard timings from any superseded executable.
-- **G265:** a short dense control can miss legitimate animated title states. Candidate `211640`
-  frames initially looked unique; an extended same-binary predecessor control reached the same
-  value in the same two intervals and the same edge/overlay pixels. Compare complete temporal
-  windows and inspect the presented frames; do not relax a gate merely because a difference is
-  small, and do not call a control-established timing phase a regression.
-- **G264:** GS page aliasing means a source upload rectangle is not generally a target-surface
-  rectangle. Map physical byte addresses through both CT32 layouts and retain an exact target-pixel
-  mask. Equal DBW, aligned bases, and row bounding boxes are unsafe assumptions; coalescing gaps can
-  overwrite dirty FBO pixels from stale VRAM. On patch failure, keep the newer VRAM upload and drop
-  residency without a readback.
-- **G260**: deferring a formerly-INLINE draw class silently drops every side-channel the inline
-  path performed — here the drawPrimitive-end `g178NoteVramWriteRect` page-generation bump, whose
-  absence froze GPU-cached textures of RTT pages into a persistent missing-body-parts dropout.
-  Before deferring/recording any draw class, enumerate what its inline path does BESIDES
-  rasterize (gen bumps, scope latches, presentation hints) and replicate them at the equivalent
-  execution point — scoped to what consumers actually key on: over-scoping the replicated bump
-  (all pages instead of RTT-family) churned the fb-snapshot generations and gave back an entire
-  measured win (459 ms vs 448 control).
-- **G260**: a faster wrong arm can masquerade as an architecture win — the pre-fix graph arm was
-  +15% purely from stale-texture cache hits (frozen generations skipped fb re-uploads/decodes).
-  Treat any perf delta measured before parity as an upper bound contaminated by skipped work.
-- **G260 (anon-namespace linkage, 3rd+4th instances)**: an `extern` declared INSIDE an anonymous
-  namespace (even inside a function body) binds to a new internal symbol — LNK2019 with an
-  `anonymous namespace` mangled name, or C2668 ambiguity once a matching global decl exists.
-  Cross-TU symbols in `ps2_gs_rasterizer.cpp` need a global-scope bridge/fwd-decl OUTSIDE the
-  file's large anonymous namespaces (which wrap most of its interior, including the G178 section).
-- **G258**: CPU `std::lround` and GPU interpolated `floor(x + 0.5)` can disagree at a mathematically
-  exact fixed-point half tie because raster interpolation arrives a few ULPs low. Stabilize the
-  conversion boundary narrowly and verify dense output; do not change the later integer sampler or
-  blend without first proving it diverges. Also, a subtarget shadow oracle does not prove final
-  consumer composition: inspect non-verification output, and completely remove shader-resource
-  probes that perturb graphics even when their runtime branch is false.
-- **G257**: a newly created level-0-only OpenGL texture is incomplete under the default mipmapped
-  min filter; even an explicit `texelFetch` then returns the incomplete-texture value `(0,0,0,1)`.
-  Set a non-mipmapped min filter before sampling. To distinguish source-sampler failure from an
-  image-store failure, independently prove scratch coverage, direct texture mutation, and
-  direct-vs-FBO readback agreement before changing shader arithmetic or synchronization.
-- **G223**: a symptom identical with two independent rendering backends disabled
-  (`DC2_G144_NO_TILEBIN=1` + `DC2_G178_NO_GPU=1`) is a cheap signal the bug is GUEST-CODE state, not
-  the render pipeline — A/B the big backend switches before building new GS-level probes.
-- **G223**: frame-dump filename is the HOST PRESENT-LOOP tick, not guest scriptFrame — not
-  comparable across runs with different perf levers; cross-check via `DC2_TRACE_F59`, and budget
-  much longer wall-clock time for any A/B that disables a major perf lever.
-- **G189**: `fprintf`/stderr tracing on a hot multi-threaded path can HIDE the bug it's meant to
-  catch (I/O cost shifts thread timing out of the starvation window). Use relaxed `std::atomic`
-  breadcrumbs on the hot path + a separate watchdog thread that only prints once staleness is
-  detected. If adding a trace makes a reproducible bug stop reproducing, that's itself a signal of
-  timing-sensitivity (contention/starvation), not a plain logic error.
-- **G189**: an unthrottled producer/consumer ping-pong between two threads can starve a THIRD
-  thread's access to a shared lock with zero deadlock (MTGS's per-frame EE↔GS-worker handoff
-  starved the present thread's `GS::m_stateMutex` acquisition on cheap/idle screens — classic lock
-  convoy). Soak-test any frame-pipelining change on an IDLE screen, not just content-heavy ones.
-- **G189 fix**: when rarely-written/read state shares a lock with a hot high-frequency-write path,
-  give it its OWN dedicated mutex instead of throttling the hot path (the host-presentation
-  snapshot didn't need `GS::m_stateMutex`'s protection against `writeRegister()`'s per-register
-  calls, it just happened to share the lock).
-- **G206**: an old per-draw instrumentation technique (VIF1-packet-qword-delta) can silently stop
-  discriminating once a later architectural change (G144/G157/G178 deferred pipeline) decouples
-  "call happened" from "effect landed synchronously" — re-validate any old probe against one
-  known-good/known-bad case under the CURRENT default pipeline before trusting it.
-
-**Recompiler / codegen**
-- **G221**: `cmake --build ... --target dc2_runner -- /m:1 /p:BuildProjectReferences=false` (this
-  file's own prescribed recipe) can SILENTLY skip recompiling/relinking after a `recomp/*.cpp` edit
-  (that dir builds into `dc2_game.lib`, a project reference the flag skips checking) — MSBuild still
-  prints success while linking a STALE lib. **After editing `recomp/`, build `dc2_game` as its own
-  explicit target FIRST** (look for a real "Compiling..." line) before building `dc2_runner`, and
-  drop `/p:BuildProjectReferences=false` that session. Distinct from (but can combine with) the
-  `runner/` shadow-duplicate trap (`ps2recomp_runner_glob_shadow_trap`, see memory).
-- **G223**: a `DIRECT_JAL_ONLY_TARGET` function can't be traced via `registerFunction` (bypasses
-  dispatch) AND may have a `runner/` shadow blocking a `recomp/` edit — check both before planning
-  an in-function probe; prefer reading state the function WRITES from an already-hookable caller.
-- **G211/G212**: the G57/G186 swallowed-resume bug class, generalized. Any wrapper that calls a
-  recompiled body/vtable slot DIRECTLY and afterwards mutates `ctx->pc`/`ctx->r[31]`/guest memory
-  breaks under back-edge preemption (~25% of recompiled bodies have a resume checkpoint) — output
-  never written (G211: `GetLWMatrix` all-zero ~25% of frames) or a swallowed resume (G186). Fix:
-  preempt-suppress the call window (`g_dc2PreemptSuppressDepth`), check `ctx->pc` before post-work,
-  or re-drive to completion (`f50_run_guest_call`, gold standard). AUDIT ANY NEW OVERRIDE against
-  this rule; full 133-wrapper audit: `plans/phase-G212-fix-log.md`.
-- **G239**: VU1 lower scalar stalls happen BEFORE either half of the instruction pair executes
-  (e.g. `MULq VF2.x,VF2,Q | WAITQ` observes the Q published by WAITQ; an upper-then-lower
-  interpreter feeds it stale Q instead). Same rule for WAITP and busy FDIV/EFU producers. Fixed
-  default-on in `ps2_vu1.cpp`; kill `DC2_VU1_NO_SCALAR_PRESTALL` / `DC2_VU1_NO_PPIPE`. Durable
-  rule: decode the LOWER word and model its stall/pipeline publication before reasoning about
-  what the paired upper reads.
-- **G200**: a single-slot "pending + delay" model of a pipelined unit DROPS results on
-  back-to-back ops — real VU1 FDIV busy-stalls the second DIV/SQRT/RSQRT until the first result
-  latches into Q. Fix: commit the in-flight pending value the moment a new producer issues. Kill
-  `DC2_VU1_NO_QSTALL`. Discriminator worth reusing: when the runner draws HW-marked-ADC=1
-  geometry, compare PER-VERTEX OUTPUT COORDS first — matching coords rules out matrix/EE-data
-  instantly and pins the divergence to gate-flag evaluation instead. Also documented-but-unfixed:
-  DC2's interpreter wrongly updates MAC flags on MINI/MAX and wrongly skips them on ACC-writing
-  ops — fix only against a concrete repro (G200 fix-log has the pair-by-pair audit).
-- **G194**: a runtime stub reading args 5+ from the o32 STACK is silently wrong on DC2 (EABI: args
-  5-7 in `$t0/$t1/$t2`) — `sceGsSetDefDBuff` seeded wrong Z format for months with no crash. Grep
-  stubs for `readStackU32(16` as the bug signature; fix via regs-first/stack-fallback decode.
-- **G203**: emulate Z like HW — honor guest ZBUF/TEST UNIVERSALLY, never whitelist per-screen. DC2
-  clears Z every frame via a full-screen sprite; the runner's `drawSprite` had no Z code so the
-  clear never populated VRAM Z, and each screen-scoped Z whitelist that papered over this leaked
-  into other screens (g202's town scope stomped the inventory's font staging). Fix: add guest Z to
-  `drawSprite` + honor guest Z universally. **"Wrong depth on ONE screen" is almost never a new Z
-  scope — it's a missing piece of universal GS emulation.**
-- **G242**: GPU depth must remain coherent with authoritative guest VRAM across mixed CPU/GPU flushes. Validate one common ZBUF configuration, upload/read back every touched row union, preserve PSMZ24 packing through ReadZ24/WriteZ24, invert guest/GL rows, and keep unsupported formats or alpha-write semantics on CPU replay.
-- **G240**: alpha-test failure controls framebuffer and Z writes INDEPENDENTLY per `AFAIL` mode
-  (KEEP/FB_ONLY/ZB_ONLY/RGB_ONLY) — classify the final fragment alpha once and gate both
-  sprite/triangle outputs from that result; don't let a color discard hide the decision from a
-  later unconditional Z store.
-- **G186**: an override calling a recompiled body directly around a register-sentinel/post-call
-  fixup breaks under back-edge preemption (sentinel leaks into the resumed chain, pc-zero recovery
-  restores PC but not `$sp` → stack corruption). See ROADMAP's Refuted list "Preempt pattern" /
-  "Recovery context" entries for the durable rule.
-- **G140**: a STALE BAND-AID can be the "missing feature" — the title's missing water pool was the
-  VU1 clipper force-broken by the old G64 "enable fix" (an IAND ORed the plane mask into what's
-  actually FCGET clip flags, emptying every Sutherland-Hodgman pass). When retiring a root fix's
-  band-aids, sweep OLD pc-scoped interpreter patches too — G64 predated its root fix (G138) by 70
-  phases. `plans/phase-G140-fix-log.md`.
-- **G139**: VU1 SAME-PAIR upper→lower VF hazard — a lower op can NEVER see its same-pair upper op's
-  result on real VU1 (~4-cycle FMAC latency); the interpreter's immediate-commit model broke a
-  store-then-clobber idiom (title tri packer) into "beam shard" garbage. Fix (default-on): snapshot
-  the upper's dest, expose the OLD value to execLower, overlay masked lanes after. Any "positions
-  garbage but ADC/fog fine" signature = look for this pattern.
-- **G138**: the VU1 LOWER-OPCODE TABLE was wrong (FMEQ/FMAND swapped) and MAC/STATUS flags were
-  read un-pipelined (real visibility ~4 pairs after the FMAC) — root of the entire title blue-void
-  line; a branch that disassembly "proves" unreachable yet HW visibly takes is a sign to distrust
-  the interpreter's opcode table/flag timing before the guest logic.
-- VU0/VU1 `vf0` is HW-hardwired `(x,y,z,w)=(0,0,0,1)` and recompiled COP2 macro ops read
-  `ctx->vu0_vf[0]` as that constant. The runtime `memset`s the context to zero and NOTHING writes vf0,
-  so it stayed `(0,0,0,0)` → every matrix INVERSE (`mgInversMatrix`: `Q=vf0.w/det`, then `vmulq`)
-  came out all-zero → skinned bone palettes zero → all skinned characters collapsed (G40). Plain
-  multiplies (`mgMulMatrix`) and the VIF1-DIRECT map path don't read vf0, so they masked it for 50+
-  phases. FIX: pin `vu0_vf[0]=(0,0,0,1)` after the context memset; re-assert after any context reset.
-- VU1 MAC flags were NEVER computed (G71): `m_state.mac` in `ps2_vu1.cpp` was only ever READ (FMAND/FMEQ/
-  FMOR) and never written, so every MAC-flag-gated VU1 branch evaluated against constant 0. Fix = compute
-  the 16-bit MAC after each FMAC op: nibbles O[15:12] U[11:8] S[7:4] Z[3:0]; lanes X/Y/Z/W=bit3/2/1/0 (same
-  as the F54 VU0 note); only DEST lanes flagged. When a VU program does FMEQ/FMAND `→ IBxx` and the branch
-  never flips, suspect the flag register isn't maintained. (Caveat: a flag-gated branch can still be
-  structurally never-taken for OTHER reasons — e.g. the title's `IBEQ VI10(208),VI7(0/1)` — so verify the
-  operands before assuming flags are the cause.) Kill-switch `DC2_NO_VU1_MAC`.
-- VU1 Q-register PIPELINE LATENCY was not modelled (G87): DIV/SQRT/RSQRT wrote `m_state.q` IMMEDIATELY, but
-  real VU1 latches Q after a fixed delay (DIV/SQRT 7 cycles, RSQRT 13). Microcode that reads Q (MULq/ADDq/SUBq)
-  before the latch, with NO WAITQ between, expects the PREVIOUS (pipelined) Q — the immediate model gave it the
-  fresh result. This silently broke the title rock point-light attenuation (`MULq @vu 0x1850` one instr after
-  `RSQRT @0x1840`) → point light ≈0 → neon-green rock. FIX: stage DIV/SQRT/RSQRT into `s_vuQPending`+`s_vuQDelay`
-  (7/13), tick the delay down one per instruction word in the run loop and commit to `m_state.q` at 0, WAITQ
-  commits immediately (`ps2_vu1.cpp`, both lower-op dispatch tables). Kill `DC2_VU1_NO_QLATENCY`. DURABLE: when a
-  VU program does `RSQRT/DIV … (no WAITQ) … MULq` at < latency distance, it wants the OLD Q — an immediate model
-  is wrong. The mixed use of `MULq|WAITQ` vs bare `MULq` in the same program is the tell.
-- VU1 sibling-bug audit vs PCSX2 (`D:\ps2r\pcsx2-master`; `plans/Possibles_bugs.md`): **STATUS** register had
-  the same gap (only FSSET wrote it) — FIXED (derive from MAC, coupled to `DC2_NO_VU1_MAC`). **Float clamp**
-  (`vuDouble`: denormal→signed0, inf/NaN→±0x7f7fffff) is missing and DC2 DOES hit it (costume VU1 ≈0.3% of
-  result lanes denormal/inf-NaN) yet renders fine; implemented opt-in `DC2_VU1_CLAMP`, no observed
-  regression, kept OFF pending broad testing. **VU0 macro/COP2** flags are NOT a runtime bug — the
-  recompiler emits MAC/STATUS/CLIP updates inline in generated code (`code_generator.cpp`; committed
-  `recomp/GetLWMatrix…` contain the writes). Only the hand-written VU1 interpreter lacked flag upkeep.
-- COP2 partial-dest dest-mask was lane-reversed (F51.8) — THE 50-phase dungeon-black cause.
-  In SIMD codegen tests use DISTINCT per-lane source values; symmetric/all-ones vectors hide
-  shuffle/mask defects. VU0 MAC nibble is X/Y/Z/W = bits 3/2/1/0, opposite `_mm_movemask_ps`
-  (bits 0/1/2/3) — reverse before building Z/S/U/O (F54).
-- VU outer-product (`VOPMULA/VOPMSUB`) rotates source pairing — NOT component-wise multiply;
-  `mgPlaneNormal` component-wise `A*B−B*A`≡0 is the decisive local invariant (F51.8).
-- `CFC2/CTC2` use architectural macro control indices (STATUS/MAC/CLIP=16/17/18, Q=22) — verify
-  numeric instruction fields against the HW register table, not enum order (F51.8).
-- After ANY regen, re-apply `tools/fix_cop2_destmask.py` or dungeon 3D transforms regress.
-- `registerFunction` overrides are consulted ONLY for indirect `jr $t9`/`jalr`. A direct
-  `jal <addr>` is a direct C++ call → bypasses dispatch; wrap the jal TARGET instead.
-- Auto-stub ctors (`setReturnS32(ctx,0)` for a `__ct__`) silently break virtual dispatch (null
-  vtable → `jr 0` pc-zero) AND non-virtual stack objects (garbage `this+0`, e.g. `mgCDrawPrim`
-  → black render). Repair in `dc2_game_override.cpp` from `ref/assembly.txt`; never patch the
-  generated callee. Stale committed `recomp/` can predate a toml stub-list edit — a fresh regen
-  emits real bodies (same symbol → no register/header edits).
-- Generated `jr $t9` tail-call can't return into a parent's mid-PC; if invoked via `jal`, the
-  dispatcher prints "Function at address 0xN not found". Override to skip the trailing `jr $t9`.
-- VS generator: a BARE `cmake --build build64` defaults to Debug `ALL_BUILD` → huge rebuild.
-  Always `--config Release --target <ps2_runtime|dc2_runner>`. Build via PowerShell tool, not
-  Bash `cmd /c` (silent no-op). Verify: `grep -c <marker> dc2_runner.exe`.
-
-**Depth Buffer**
-- A PS2 depth buffer viewed as RGB may show artificial color banding because the
-  integer depth value wraps between byte channels. Some games intentionally sample
-  a specific channel, often green, from packed depth data for fog/depth effects.
-  When debugging odd color gradients, fog, masks, or banding, verify whether the
-  source is depth-as-texture before treating it as a normal color texture bug.
-
-**Diagnosis**
-- A valid GS histogram (FRAME/ALPHA/CLAMP/ZBUF/TEST/scissor/XYOFFSET/color all expected) can't
-  rescue bad guest geometry — classify triangle coverage; bad XYZ comes from upstream (F53).
-- Near-null vtable dispatch (`bad=0x1`/small) can be a NULL `this`, not a garbage vtable — READ
-  the call's `a0`; if 0, chase why the pointer is 0. Don't trust the dispatch `trace=` tail as a
-  literal call stack (F50.4).
-- An un-run `__sinit_*` leaves a GLOBAL object's embedded vtable ptr null → its virtual init
-  silently no-ops. Fix by writing the vtable ptr the `__sinit` should have set (idempotent),
-  so the game's own Initialize runs. Suspect whenever a global's fields look fresh/zeroed (F50.4).
-- An auto-stubbed memory-pool init masquerades as a downstream ctor/vtable crash — first check
-  whether the ALLOCATOR returns 0 (probe placement-new return), not the ctor (F50.1).
-- "Bad geometry" can be uninitialized-data laundering — probe the FIRST producer's INPUTS before
-  suspecting arithmetic (F55). A probe firing 0 times is itself a finding (F50.11).
-- A host-side workaround (DISPFB rewrite, host fallback) can MASK a missing guest subsystem until
-  the one uncovered path fails — verify it's still needed on the current build before preserving.
-- Prove a host→guest write LANDS via the consumer's OWN address fn / passthrough readback, not a
-  linear scan (misses swizzled writes) or an assumed mapping (F50.10, F56).
-- A SILENT, marker-less process termination (clean raylib teardown, no crash/`_Exit` log) is a
-  guest `exit()`/`abort()` — log the `exit` stub's caller `ra`+`a0` and WALK the saved guest
-  return addresses up the stack to recover the abort/terminate/throw chain (F57). `a0=1` via
-  `abort@0x100EA8`←`terminate`←`__ThrowHandler` = an **uncaught C++ exception**; the bad_alloc
-  on the stack (`__dt__Q23std9bad_alloc@0x100560`) named it an OOM. Don't assume "never returns
-  1" means an infinite wait — the loop may be aborting first.
-- "X won't terminate" can be "X aborts before terminating" — verify the loop is still RUNNING
-  (per-frame loop-number probe that survives loop swaps) before theorising about a stuck wait
-  condition (F57: `loopNo` stayed 2, then the process exited).
-- An OOM (`operator new`→NULL→`bad_alloc`) is "bogus size" OR "exhaustion" OR "the heap was
-  never funded" — dump base/end/limit + per-block free/used at the failure, not just the size
-  (F58: `base=end=limit=0` revealed an EMPTY window, not a too-big request). A guest that
-  "mostly works" can have a dead `malloc` if its bulk data uses its own static pools — only a
-  checked `operator new` exposes it.
-- When the recompiled allocator (`malloc`/`_malloc_r`) is a runtime STUB routing to a host
-  allocator, the guest's newlib internals (`sbrk`/bins/`malloc_extend_top`) are DEAD CODE —
-  zero `sbrk` calls is the tell. Don't chase newlib arena logic; the heap is whatever the
-  host window (sized by `SetupHeap`) provides (F58).
-
-**GS / rendering**
-- For asynchronous native rendering, measure packet ownership before copying anything. G299 found
-  97% of MAP-0 packets were already readback-free but owned 293-517 KiB of vector data; deep copies
-  would move 9-15 MiB/frame. Transfer/recycle vector allocations instead. Completion also owns the
-  failure contract: retain the original command list for delayed CPU replay and publish VRAM,
-  snapshots, residency, and owner tokens only through an ordered completion commit.
-- G254: dependency-aware mixed-target CPU batching is not a viable current MAP-0 lever. The refined
-  census predicted 93-94/512 safe, but isolated crossing kept total drain cadence/performance flat
-  and produced large black regions; the triangle-widened arm caused a temporal Max dropout. Retain
-  only `DC2_G254_DEP_STAT=1`, preserve all barriers, and keep
-  `DC2_G252_GPU_RTT` off until single-target residency/readback ownership is proven.
-- G252 disjoint-row CPU replay of the five measured RTT sprite targets is **default-on since G259**
-  (kill `DC2_G252_NO_RTT_DEFER=1`): G259 revalidated it on current source at `1.957 -> 2.297 fps`
-  MAP-0 (+17.4%, outside variance), re-passed the G253 matrix (`199,229,440` texels `bad=0`), and
-  passed golden 211646 + an 896-frame dense title gate. All upload/FBP/local-copy drains are
-  preserved. `DC2_G252_GPU_RTT` remains unproven and off. Opt-in census: `DC2_G253_BARRIER_STAT=1`
-  (G252/G253/G259).
-- **G259 (CPU-raster arc close):** promoting a perf lever requires a matched current-source A/B
-  (multiple reps/arm to show the win is outside run-to-run variance — the G252 arm span was ±0.2%,
-  control ±1.5%, and the arms did not overlap), the full graphics route matrix with the same-run
-  `DC2_G248_VERIFY` texel oracle (`bad=0`), AND a dense per-tick title gate. Do NOT trust a
-  single-cadence dumped frame across runs: G259's apparent title "regression" (frames ~211546-574)
-  was stale Select-Costume frames a prior harness left behind because its sweep did not clear
-  `frame_*.ppm` — always clear the capture dir before a title gate and confirm the frame content is
-  actually the title cavern, not a leftover screen. Once profiling shows the frame is bound by
-  register dispatch + `XYZ2` + flush barriers (far above 16.67 ms), further narrow CPU fast paths are
-  not the primary route — that is the native-host-renderer objective.
-- The `fbp=0x139/0x13c/0x143/0x146/0x155` RTT sprite family is texture-sampling/fill-bound, not
-  dispatch-bound. Hoisting fixed-UV CT32/T8 sampler state plus per-draw CLUT/per-row texel-quad
-  caches cuts its current MAP-0 body `132.9->96.9 ms/f`; shipped default-on in G250 with strict
-  fallback and `DC2_G248_NO_FASTSPRITE=1` rollback. Re-run `DC2_G248_VERIFY=1` after any sampler,
-  CLUT, TEXA, swizzle, filter, wrap/clamp, target-page, or RTT-ordering change (G248/G250).
-- A host workaround keyed only by GS page/state can outlive its original route and corrupt a later
-  feature that aliases the same VRAM. G37's synthetic `fbp=0x139/tbp=0x2720` costume clear caused
-  MAP-4 zoom's deferred composite to sample zeros; retire redundant workarounds after their source
-  repair and verify the original route, rather than adding a second per-screen exception (G220).
-- T4HL/T4HH host-to-local IMAGE payloads are packed 4 bpp even though the destination nibble
-  aliases a CT32 word. Consume low nibble then high nibble and stop when `TRXREG` is full;
-  never infer transfer bpp from unpacked VRAM storage width (G5).
-- Apply GS `CLAMP` per sampled coordinate, including bilinear neighbors: repeat masks by
-  texture size, clamp uses the texture edge, region clamp uses MIN/MAX, and region repeat is
-  `(coord & MIN) | MAX` (G5).
-- For PCSX2 v9 `.gs` freezes, do not assume VRAM is the final 4MB of the state blob: 84 bytes
-  of GIF-path/Q state follow it. The packet stream also begins after a 0x2000-byte private
-  register snapshot (G5).
-- **G222 (2026-07-11): a CPU rasterizer that divides S/T by Q PER VERTEX then re-multiplies
-  PER PIXEL is mathematically AFFINE (the divide/multiply cancel exactly), not perspective-correct
-  — even though it "looks like" a per-pixel divide is happening.** Real GS/PS2 texture mapping is
-  hyperbolic: interpolate raw S/T/Q linearly across the triangle and divide ONCE per pixel
-  (`u=lerp(S)/lerp(Q)`). The error is invisible on small/dense/near-planar geometry (where per-
-  triangle Q barely varies) and only surfaces as visible kinking on large, deep triangles with high
-  Q spread (e.g. a big floor trifan). DURABLE: any custom rasterizer's texture-coordinate math
-  should be audited for this exact affine-disguised-as-perspective pattern if a similar "texture
-  seam bends at a triangle/quad edge on large geometry only" symptom appears elsewhere (GPU path
-  too — parity-match both sampler implementations).
-
-- **G317 (2026-07-21): queue readiness is not batching payoff.** On steady MAP-0, every admitted
-  Path-2 window already had queued work, yet explicit GIF/VIF/path/IMAGE fences reduced the safe
-  run to 2.39 packets on average and retaining the GS lock across runs was exactly neutral. Before
-  building a transaction layer, measure both semantic run length and the overhead it can actually
-  remove. Track IMAGE continuation across all paths; malformed classification must fail closed.
-
-- **G318 (2026-07-21): an external sampling phase needs both host permission and matching current
-  Release symbols.** A blocked profiler or a stale PDB is not evidence about a renderer leaf; keep
-  the default path unchanged, review normal composition as the control, and repair observability
-  before designing another Path-2 architecture arm.
-- **G320 (2026-07-22): an external leaf becomes a useful target only after caller and consumer
-  attribution.** Backend/readback/publication is large enough to investigate, but G305 proves that
-  same-flush `glReadPixels` cannot be removed by generic overlap; first establish the exact CPU
-  authority consumer and completion-ordered replay contract.
-
-- **G322 (2026-07-22): never add mandatory consumer costs into a perfect-deletion estimate.** The
-  whole generic non-skip color backend job is only about 1.96 ms/frame. Named color publications
-  and G278 depth materialization still occur at true consumers or the frame/presentation boundary,
-  so a frame-scoped owner must pay them. Separate diagnostic controls when their instrumentation
-  interacts, and require normal composed-output review even when renderer behavior is unchanged.
-
-- **G323 (2026-07-22): a large required producer job is not automatically a removable producer
-  job.** Split the whole successful-flush interval into exclusive scopes, discard failed flushes,
-  reconcile the sum, and compare timestamp-shape empty controls. G310 logical/T8 preparation is
-  about 9.4 ms/frame gross, but disabling it restores a larger legacy publication chain; merging it
-  synchronously merely moves time into submit. First prove hideable worker wait plus ordered
-  completion/failure replay before building a deferred producer-to-consumer transaction.
-
-**Runtime / threading / ABI**
-- DC2 `LoadFile__FPcPvPi@0x149320` aborts the WHOLE game (`0x118FB0(0)`→`_Exit`) on ANY failed
-  load → an empty/garbage filename is fatal. Find a `LoadFile2` caller via `*(ctx->sp+0x10)`.
-  Empty names come from uninitialised game data (e.g. `GetItemFilePath` returns "" for invalid
-  item id) (F50.5).
-- Cooperative thread-yield syscalls (`RotateThreadReadyQueue`, syscall 0x2B) MUST release the
-  guest-execution lock (`GuestExecutionReleaseScope`); a bare `std::this_thread::yield()` keeps
-  `m_guestExecutionMutex` and starves other guest threads (F50/F49.5). Never reacquire the guest
-  lock while holding `g_vsync_flag_mutex` (ABBA with the IRQ worker).
-- DC2 uses MIPS EABI for 5+-arg calls: 5th int arg in `$t0` (`$a4`), not the stack. Derive a
-  helper's ABI from the actual `recomp/<caller>.cpp` SET_GPR before the `jal` (F50.1).
-- libgcc-ps2 64-bit/FP helpers use single-register-per-64-bit EABI (read `$a0/$a1` as full 64
-  via `_mm_extract_epi64`, return `setReturnU64`); doubles are soft-float through GPRs. `$a2/$a3`
-  in stub dumps are caller leftovers.
-- LIVE syscall/stub defs are `Kernel/{Syscalls,Stubs}/*.cpp`; `*.inl` are /FORCE:MULTIPLE DEAD dups.
-- CGamePad `+0x45C==0` enables On/Down accessors (not the pressed-this-frame field).
 
 ## Game-Specific Bugs (original-game defects — clamp at the runtime boundary, never fix game-side)
 - **4HH/4HL oversized transfer** (`mgLoadTextureZ@0x145400`): size `(w*h*bpp)/16` = 8× too large.
@@ -689,11 +273,13 @@ PS2_PROJECT_STATE.md 'Learned Patterns' DETAIL as of 2026-07-14", or the phase's
   4-len reimplementation flipped the DA collision push-out → missing chest gem); any stub whose
   real body uses ESADD/dot-3 idioms can carry the same w-lane bug.
 - BIOS pseudo-files such as `rom0:ROMVER` should not be treated as normal host files; missing support can produce noisy fopen/fio errors, but do not prioritize it unless the game actually consumes the result or blocks on it.
-- **No real IOP execution / cooperative IOP scheduler** → blocks audio + audio-gated event stalls
-  (today masked by the host-side `DC2_DISABLE_EVENT_SKIP` event-skip). Fix reference: upstream PR
-  #135 (new IOP CPU/kernel/loader + cooperative scheduler). Needs a dedicated phase; also pulls
-  recomp-side midasm hooks → a regen. Full upstream-PR survey (2026-07-07, decision: "map only,
-  merge nothing" while GS/threading churns) archived in `plans/phase-history.md`.
+- **No real IOP execution / cooperative IOP scheduler** remains. G385 bypasses the absent
+  EZMIDI/MODMIDI modules for captured Sony HD/BD SFX and SQ BGM, and G386 bypasses EZBGM
+  for captured WAV voices and their completion state. The exercised audio routes are no
+  longer blocked by this gap. Current upstream main
+  has a `ps2xIOP` runtime, but the local fork predates that refactor; upstream PR #154 extends
+  SoundDriver RPC/status HLE without providing sample rendering. Integration needs a dedicated
+  phase and may pull recomp-side changes. G384 separately bypasses this for PCM embedded in FMVs.
 - **No cooperative thread scheduler ABBA-safe wait helper** → threading deadlock/starvation at
   thread hand-offs (F49.5/F50 class). Partial fix APPLIED (lightweight post-wake yields in
   SignalSema/SetEventFlag/WakeupThread/ReleaseWaitThread). Fix reference: upstream #120
@@ -703,8 +289,7 @@ PS2_PROJECT_STATE.md 'Learned Patterns' DETAIL as of 2026-07-14", or the phase's
   (DC2's skinned models use recompiler-inline COP2 macro ops, not VU0 micro-mode) but would surface
   as wrong physics/lighting on a VU0-micro route. Fix reference: upstream #120 (incomplete upstream,
   don't adopt yet).
-- **No IPU/MPEG movie decode** → FMV blocker; bypassed headless. Fix reference: #120 MPEG decoder
-  (ffmpeg-backed). Lowest priority.
+- **IPU/MPEG movie decode/output**: **FIXED (G375/G376/G384)** — FFmpeg-backed video plus host-streamed PSS PCM audio; `RUSH.PSS` video and sound verified against `ref/dumps/fmv.png` and `ref/audio/fmv0.webm`.
 - **GS VRAM addressing is bespoke per-fix, not consolidated** — not a defect (DC2's GS is correct,
   heavily validated G2-G52) but a maintenance divergence from upstream #132. Do NOT splice #132
   wholesale (would overwrite G3/G5 swizzle/CLUT/RTT/Z/costume fixes); mine only a specific proven
@@ -732,3 +317,19 @@ PS2_PROJECT_STATE.md 'Learned Patterns' DETAIL as of 2026-07-14", or the phase's
 - Do not merge a regenerated TOML until allocator-family routing is coherent. 
   Either all allocation entry points route to the runtime allocator, or the full newlib allocator path is intentionally recompiled and proven compatible. 
   Avoid half-runtime / half-recompiled allocation paths; they can cause silent alignment bugs, CLUT/menu texture corruption, heap metadata corruption, or non-deterministic crashes
+
+## Technical Symbols & Upstream PR Cross-Reference Index
+- **Boot C++ Runtime Inits**: `mwInit@0x00100190` walks `__initialize_cpp_rts` table (`0x00374D80–0x00374E40`).
+- **GS Display Stride**: `copyDisplaySource` fallback reads `candidate.fbw = displayFrame.fbw` (512 vs context 640).
+- **`ps2_stubs` & Memory Card Stubs**: Hand-written stubs (`sceMcGetInfo`, `sceMcGetDir`) in `Kernel/Stubs/` audited against R5900 EABI `$t0–$t3` integer arg layout.
+- **Float Saturation**: Host float division replaced with `copysignf(INFINITY, ...)` in `tools/fix_cop1_ps2_float.py`.
+- **Upstream PS2Recomp PR References**:
+  - **PR #135**: New IOP CPU/kernel/loader + cooperative scheduler.
+  - **PR #120**: Cooperative thread scheduler ABBA-safe wait helper (`waitWithGuestExecutionReleasedUntilUnlocked`).
+  - **PR #132**: GS VRAM addressing consolidation.
+  - **PR #128**: Recompiler indirect-jump (JR/JALR) fallback codegen + Rabbitizer formatting.
+- **Allocator Coherence**: `guestMalloc` / `memalign` / `free` / `realloc` / `calloc` family routing integrity.
+
+---
+
+*For full historical details of past phases, see [phase-history.md](file:///d:/ps2r/dc2/plans/phase-history.md).*
