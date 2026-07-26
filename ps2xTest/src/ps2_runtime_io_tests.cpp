@@ -467,6 +467,71 @@ void register_ps2_runtime_io_tests()
                      "sceMcGetDir file entries should carry the closed-file attribute");
         });
 
+        tc.Run("sceMcSetFileInfo applies EABI metadata arguments", [](TestCase &t)
+        {
+            TestContext test;
+
+            std::filesystem::create_directories(test.paths.mcRoot / "SAVEDATA");
+            const std::filesystem::path hostPath = test.paths.mcRoot / "SAVEDATA" / "meta.dat";
+            {
+                std::ofstream out(hostPath, std::ios::binary);
+                out << "metadata";
+            }
+
+            constexpr uint32_t pathAddr = GUEST_STRING_AREA_START + 0x780;
+            constexpr uint32_t infoAddr = GUEST_BUFFER_AREA_START + 0x1800;
+            constexpr uint32_t tableAddr = GUEST_MC_TABLE_ADDR + 0x400;
+            writeGuestString(test.rdram.data(), pathAddr, "/SAVEDATA/meta.dat");
+
+            SceMcTblGetDir info{};
+            info.create = {0, 5, 4, 3, 2, 1, 2019};
+            info.modify = {0, 10, 9, 8, 7, 6, 2020};
+            info.attrFile = 0x0011u; // readable file, deliberately not writeable
+            std::memcpy(test.rdram.data() + infoAddr, &info, sizeof(info));
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, pathAddr);
+            setRegU32(test.ctx, 7, infoAddr);
+            setRegU32(test.ctx, 8, 0x07u); // $t0: create, modify, attributes
+            ps2_stubs::sceMcSetFileInfo(test.rdram.data(), &test.ctx, nullptr);
+
+            int32_t cmd = 0;
+            t.Equals(syncMc(test.rdram, &cmd), 0, "sceMcSetFileInfo should apply valid metadata");
+            t.Equals(cmd, 0x0E, "sceMcSync should report SETFILEINFO as the last command");
+
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, pathAddr);
+            setRegU32(test.ctx, 7, 0u);
+            setRegU32(test.ctx, 8, 1u);
+            setRegU32(test.ctx, 9, tableAddr);
+            ps2_stubs::sceMcGetDir(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram, &cmd), 1, "sceMcGetDir should return the metadata target");
+
+            const auto *entry = reinterpret_cast<const SceMcTblGetDir *>(test.rdram.data() + tableAddr);
+#ifdef _WIN32
+            t.Equals(entry->create.year, static_cast<uint16_t>(2019), "creation year should come from info arg");
+            t.Equals(entry->create.month, static_cast<uint8_t>(1), "creation month should come from info arg");
+#endif
+            t.Equals(entry->modify.year, static_cast<uint16_t>(2020), "modification year should come from info arg");
+            t.Equals(entry->modify.month, static_cast<uint8_t>(6), "modification month should come from info arg");
+            t.IsFalse((entry->attrFile & 0x0002u) != 0u, "attribute flag should make the host file read-only");
+
+            info.attrFile |= 0x0002u;
+            std::memcpy(test.rdram.data() + infoAddr, &info, sizeof(info));
+            clearContext(test.ctx);
+            setRegU32(test.ctx, 4, 0u);
+            setRegU32(test.ctx, 5, 0u);
+            setRegU32(test.ctx, 6, pathAddr);
+            setRegU32(test.ctx, 7, infoAddr);
+            setRegU32(test.ctx, 8, 0x04u);
+            ps2_stubs::sceMcSetFileInfo(test.rdram.data(), &test.ctx, nullptr);
+            t.Equals(syncMc(test.rdram), 0, "sceMcSetFileInfo should restore writeable metadata");
+        });
+
         tc.Run("sceMcGetInfo reports formatted and unformatted states", [](TestCase &t)
         {
             TestContext test;
