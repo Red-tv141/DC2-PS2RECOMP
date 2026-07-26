@@ -10,6 +10,8 @@
 #include <chrono>
 #include <string>
 #include <vector>
+#include <thread>
+#include <functional>
 
 // G217: armed by the default-off exact head-object wrapper in dc2_game_override.cpp and
 // consumed by the matching scratchpad -> RAM DMA below.  Kept out of a shared header because

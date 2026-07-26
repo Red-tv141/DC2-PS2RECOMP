@@ -6,6 +6,7 @@
 #include <cstring>
 #include <cstdio>
 #include <set>
+#include <optional>
 #include <atomic>
 
 // F60 spin diagnostics (defined in ps2_runtime.cpp).
@@ -149,6 +150,20 @@ namespace ps2_syscalls
         return (s_cachedStackTop != 0u) ? s_cachedStackTop : (PS2_RAM_SIZE - 0x10u);
     }
 
+    // [G377] Guest interrupt handlers run on the interrupt worker thread and, since G375
+    // brought the FMV path up, they execute real guest code that kicks DMA
+    // (`vblankHandler@0x299800` -> `sceDmaSend` -> PS2Memory::processPendingTransfers).
+    // That raced the EE thread doing the same thing from mgEndFrame/sceGsSyncPath and tore
+    // `m_pendingGifTransfers` mid-iteration -> access violation inside GifArbiter::submit.
+    // Guest code must hold the guest-execution lock exactly like a guest thread does; a
+    // guest loop spinning on interrupt-produced state still makes progress because
+    // shouldPreemptGuestExecution() sees the waiter and yields the lock at a back edge.
+    static bool g377IrqGuestLockEnabled()
+    {
+        static const bool s_enabled = (std::getenv("DC2_G377_NO_IRQ_GUESTLOCK") == nullptr);
+        return s_enabled;
+    }
+
     static void dispatchIntcHandlersForCause(uint8_t *rdram, PS2Runtime *runtime, uint32_t cause)
     {
         if (!rdram || !runtime)
@@ -184,6 +199,12 @@ namespace ps2_syscalls
             }
             std::sort(handlers.begin(), handlers.end(), [](const IrqHandlerInfo &a, const IrqHandlerInfo &b)
                       { return a.order < b.order; });
+        }
+
+        std::optional<PS2Runtime::GuestExecutionScope> g377GuestLock; // [G377]
+        if (g377IrqGuestLockEnabled())
+        {
+            g377GuestLock.emplace(runtime);
         }
 
         for (const IrqHandlerInfo &info : handlers)
@@ -359,6 +380,12 @@ namespace ps2_syscalls
                       { return a.order < b.order; });
         }
 
+        std::optional<PS2Runtime::GuestExecutionScope> g377GuestLock; // [G377] see above
+        if (g377IrqGuestLockEnabled())
+        {
+            g377GuestLock.emplace(runtime);
+        }
+
         for (const IrqHandlerInfo &info : handlers)
         {
             if (!runtime->hasFunction(info.handler))
@@ -457,7 +484,26 @@ namespace ps2_syscalls
                 continue;
             }
 
-            for (int i = 0; i < ticksToProcess; ++i)
+            // [G377] Catch-up must advance the vsync COUNTER, not replay the whole
+            // interrupt round. Since the handlers now take the guest-execution lock, a
+            // busy EE thread can hold this worker off for several vblank periods; the old
+            // loop then fired up to kMaxCatchupTicks full rounds back-to-back, and the FMV
+            // frame pump (vblankHandler -> voBufIncCount) burst several movie frames in a
+            // few milliseconds — visible as the movie racing for its first seconds.
+            // Consume the backlog on the counter, dispatch handlers once per wake.
+            // Restore the old per-tick replay with DC2_G377_NO_IRQ_PACE=1.
+            static const bool s_g377PaceIrq = (std::getenv("DC2_G377_NO_IRQ_PACE") == nullptr);
+            int dispatchRounds = ticksToProcess;
+            if (s_g377PaceIrq && ticksToProcess > 1)
+            {
+                for (int i = 1; i < ticksToProcess; ++i)
+                {
+                    (void)signalVSyncFlag(rdram);
+                }
+                dispatchRounds = 1;
+            }
+
+            for (int i = 0; i < dispatchRounds; ++i)
             {
                 const auto t0 = clock::now();
                 const uint64_t tickValue = signalVSyncFlag(rdram);

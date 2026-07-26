@@ -372,12 +372,66 @@ namespace
     }
 }
 
+// [G377] single owner slot shared by every submitGifPacket entry (see the probe below).
+static std::atomic<uint32_t> &g377SubmitOwner()
+{
+    static std::atomic<uint32_t> s_owner{0};
+    return s_owner;
+}
+
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
     G146PerfScope g146Scope(g_g146GifSubmitNs);
 
     if (!data || sizeBytes < 16)
         return;
+
+    // [G377] intermittent access violation during FMV playback faulted inside
+    // GifArbiter::submit's source copy. Report (once per anomaly class) any submit whose
+    // source range escapes the guest RAM / scratchpad allocation, and any concurrent entry
+    // from a second thread. Pointer compares only — no getenv in this hot path (G268).
+    bool g377Release = false;
+    {
+        static std::atomic<uint32_t> s_g377Reports{0};
+        const uint32_t tid = static_cast<uint32_t>(
+            std::hash<std::thread::id>{}(std::this_thread::get_id()) & 0xFFFFFFFFu);
+        uint32_t expected = 0u;
+        const bool tookOwner = g377SubmitOwner().compare_exchange_strong(expected, tid,
+                                                                  std::memory_order_acq_rel,
+                                                                  std::memory_order_acquire);
+        if (!tookOwner && expected != tid && s_g377Reports.fetch_add(1u, std::memory_order_relaxed) < 16u)
+        {
+            std::fprintf(stderr, "[G377:submit] CONCURRENT entry tid=%08x other=%08x path=%d bytes=%u\n",
+                         tid, expected, static_cast<int>(pathId), sizeBytes);
+        }
+
+        const uint8_t *ramLo = m_rdram;
+        const uint8_t *ramHi = m_rdram ? (m_rdram + PS2_RAM_SIZE) : nullptr;
+        const uint8_t *spLo = m_scratchpad;
+        const uint8_t *spHi = m_scratchpad ? (m_scratchpad + PS2_SCRATCHPAD_SIZE) : nullptr;
+        const bool inRam = (ramLo && data >= ramLo && data < ramHi);
+        const bool inSp = (spLo && data >= spLo && data < spHi);
+        const bool ramOverrun = inRam && (static_cast<size_t>(ramHi - data) < sizeBytes);
+        const bool spOverrun = inSp && (static_cast<size_t>(spHi - data) < sizeBytes);
+        if ((ramOverrun || spOverrun) && s_g377Reports.fetch_add(1u, std::memory_order_relaxed) < 16u)
+        {
+            std::fprintf(stderr,
+                         "[G377:submit] OVERRUN path=%d bytes=%u region=%s avail=%zu tid=%08x\n",
+                         static_cast<int>(pathId), sizeBytes, ramOverrun ? "rdram" : "spr",
+                         ramOverrun ? static_cast<size_t>(ramHi - data) : static_cast<size_t>(spHi - data),
+                         tid);
+        }
+        g377Release = tookOwner;
+    }
+    struct G377OwnerRelease
+    {
+        bool &armed;
+        ~G377OwnerRelease()
+        {
+            if (armed)
+                g377SubmitOwner().store(0u, std::memory_order_release);
+        }
+    } g377Guard{g377Release};
 
     g138DumpSubmit(pathId, data, sizeBytes);
 
