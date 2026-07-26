@@ -546,7 +546,13 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
         static const bool g361Pos = dc2_env_flag_enabled("DC2_G361_POS");
         if (g361Pos && (n % 60u) == 0u)
         {
-            const uint32_t mainChara = dc2_read_u32(rdram, 0x003772C8u);
+            constexpr uint32_t kMainScene = 0x01DD8260u;
+            const int32_t charaId = static_cast<int32_t>(dc2_read_u32(rdram, kMainScene + 0x2E50u));
+            const uint32_t charaCount = dc2_read_u32(rdram, kMainScene + 0x40u);
+            const uint32_t mainChara =
+                (charaId >= 0 && static_cast<uint32_t>(charaId) < charaCount)
+                    ? dc2_read_u32(rdram, kMainScene + 0x78u + static_cast<uint32_t>(charaId) * 0x40u)
+                    : 0u;
             const uint32_t mapNo = dc2_read_u32(rdram, gpReg + 0xFFFF9EACu); // gp-0x6154
             float px = 0.f, py = 0.f, pz = 0.f;
             if (mainChara > 0x80000u && mainChara < 0x2000000u)
@@ -556,8 +562,9 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                 const uint32_t bz = dc2_read_u32(rdram, mainChara + 0xE8u);
                 std::memcpy(&px, &bx, 4); std::memcpy(&py, &by, 4); std::memcpy(&pz, &bz, 4);
             }
-            std::fprintf(stderr, "[G361:pos] n=%u sf=%u loop=%u mapNo=%u chara=0x%x pos=(%.2f,%.2f,%.2f)\n",
-                         n, scriptFrame, loopNo, mapNo, mainChara, px, py, pz);
+            std::fprintf(stderr,
+                         "[G361:pos] n=%u sf=%u loop=%u mapNo=%u id=%d count=%u chara=0x%x pos=(%.2f,%.2f,%.2f)\n",
+                         n, scriptFrame, loopNo, mapNo, charaId, charaCount, mainChara, px, py, pz);
         }
     }
     g_f40_frame_counter = scriptFrame;

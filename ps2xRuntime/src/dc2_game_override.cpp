@@ -422,10 +422,34 @@ std::atomic<uint32_t> g_dc2G217DirectPacketWrite{0u};
 // rebuild this TU on .inc-only edits (G359 stale-link trap), so this comment must
 // change with it. Now also carries [G361:pos] / [G361:mapjump] (DC2_G361_POS=1)
 // and the default exclusion of __sinit_mainloop.cpp (DC2_G361_SINIT_ALL=1 re-includes).
+// G382: force-recompile marker for the default-off MapJump init-footprint hash census
+// (DC2_G382_INIT_HASH / DC2_G382_INIT_FINE), used to identify index-5 state that
+// survives InitSaveData; also corrects G361 position tracing to walk MainScene slots.
+// G382 closure: index 5 remains excluded; SINIT_ALL is diagnostic, not promotion.
 // G376: F21 seed's mode-0 FMV-skip arm retired (DC2_G376_SEED_FMV_SKIP=1 restores).
 // G375b: also carries fmv_ipu.inc (real DIntr/EIntr for the movie DMA path +
 // DC2_G375_MOVIE_TRACE census probes,
 // kill switch DC2_G375_NO_INTR=1) — bump this marker on every .inc-only edit.
+// G381: carries g381_dead_stub_repairs.inc (non-throwing handlers for the 36 `!! DEAD`
+// TODO_NAMED stub addresses; kill switch DC2_G381_NO_DEAD_STUBS=1, trace DC2_G381_TRACE=1, selftest DC2_G381_SELFTEST=1).
+// G385: carries Sony HD/BD SFX + SQ BGM playback and focused RPC/DMA/MSIN/voice-open tracing
+// (kill DC2_G385_NO_GAME_AUDIO=1, trace DC2_G385_AUDIO_TRACE=1).
+// G391: carries the bank-SFX voice mixer (HD ADSR, VAG loop points, pan, SPU2
+// reverb) and the fixed BGM bus gain. Kill switches: DC2_G391_LEGACY_SFX_PATH=1,
+// DC2_G391_NO_ADSR=1, DC2_G391_NO_REVERB=1, DC2_G391_LEGACY_BGM_NORM=1.
+// G392: `F9 00` is the SE volume and `F9 01` the SE pan (they were swapped since
+// G385); BGM now shares the G391 mixer bus so it takes the reverb send, and the
+// reverb itself is the documented SPU preset network.
+// Kill: DC2_G392_LEGACY_SE_MIX=1, DC2_G392_NO_BGM_BUS=1.
+void dc2G385PlaySfx(PS2AudioBackend *audioBackend, uint32_t soundSlot,
+                    uint8_t program, uint8_t key, uint8_t velocity,
+                    uint8_t channelVolume, uint8_t voiceId, uint8_t channelPan);
+void dc2G385StopSfx(uint32_t soundSlot, uint8_t key, uint8_t voiceId);
+int dc2G391SelfTest();
+void dc2G385SetSfxParam(uint32_t soundSlot, uint8_t key, uint8_t voiceId,
+                        uint8_t subtype, uint32_t value);
+extern void StreamOpenFast__6CSoundFiPc_0x18aef0(
+    uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 namespace
 {
 #include "dc2_game_override_parts/common_state.inc"
@@ -450,6 +474,7 @@ namespace
 #include "dc2_game_override_parts/title_draw_runtime.inc"
 #include "dc2_game_override_parts/frame_end_and_core_helpers.inc"
 #include "dc2_game_override_parts/g363_spheda_probes.inc"
+// G390: MODMSIN key-on with velocity 0 is a key-off (DC2_G390_LEGACY_SFX=1).
 #include "dc2_game_override_parts/object_init_and_pad.inc"
 
 #include "dc2_game_override_parts/live_input_and_stubs.inc"
@@ -470,3 +495,4 @@ PS2_REGISTER_GAME_OVERRIDE(
     0u,
     0u,
     applyDC2EzMidiCompat)
+

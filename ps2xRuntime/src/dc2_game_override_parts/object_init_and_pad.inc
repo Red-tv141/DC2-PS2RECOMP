@@ -2598,6 +2598,14 @@ struct G67TexHit
 // calls applyDC2G375FmvOverrides().
 #include "dc2_game_override_parts/fmv_ipu.inc"
 
+// PHASE G381: non-throwing handlers for the 36 `!! DEAD` TODO_NAMED stub addresses
+// enumerated in config_dc2_final.toml. Must precede apply_phase9_stubs.inc, which calls
+// applyDC2G381DeadStubRepairs() last so these win over the unresolved name binds.
+#include "dc2_game_override_parts/g381_dead_stub_repairs.inc"
+
+// PHASE G385: gameplay audio RPC/DMA/MSIN reconnaissance.
+#include "dc2_game_override_parts/g385_game_audio.inc"
+
 #include "dc2_game_override_parts/apply_phase9_stubs.inc"
 
 // PHASE F9: DC2 ג€” Apply ezMidi audio-compat layer (sister-fork port).

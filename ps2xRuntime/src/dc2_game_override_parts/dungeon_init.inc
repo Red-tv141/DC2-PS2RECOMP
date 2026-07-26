@@ -168,13 +168,18 @@ static void f55_boot_init_stub(uint8_t *rdram, R5900Context *ctx, PS2Runtime *ru
             // placement. This initialiser is the one that also constructs
             // CUserDataManager / CQuestData / CEditData / CVillagerData; on hardware the
             // normal title -> New Game / save-load path overwrites those defaults, but
-            // this port has no memory-card load (Known Issue #4) and enters via the debug
-            // menu, so the ctor defaults survive where hardware would replace them. Until
-            // that user-data path exists, running it REGRESSES parity with
-            // ref/dumps/map_0.png; leaving it out keeps the pre-G361 (reference-matching)
-            // behaviour, which the F50.4 MainScene-vtable repair already covers.
-            // Set DC2_G361_SINIT_ALL=1 to include it (that is the arm to re-test once the
-            // user-data/New-Game path is implemented).
+            // this port's deterministic graphics route enters through the debug menu.
+            // G382 static analysis proved this is NOT a missing user-data/New-Game path:
+            // MainLoop@0x190CB0 calls CSaveData::Initialize before loop dispatch,
+            // InitSaveData@0x1908A0 repeats it, and TitleLoop's New Game branch calls
+            // InitSaveData again. A MapJump-time hash census also showed the active-save
+            // and CUserDataManager pages are identical with index 5 on/off. The surviving
+            // difference is scene/villager placement seed state; the corrected character
+            // probe measures MAP-0 at (362.53,12.68,960.28) with index 5 skipped versus
+            // origin with it run. Therefore running the monolithic early ctor here
+            // REGRESSES ref/dumps/map_0.png; leave it excluded. The required MainScene
+            // vtable remains covered by the narrow F50.4 source repair.
+            // DC2_G361_SINIT_ALL=1 is retained only as an explicit diagnostic A/B lever.
             constexpr uint32_t kCtorFirst = 0x00374D80u;
             constexpr uint32_t kCtorEnd = 0x00374E40u;
             constexpr uint32_t kSinitMainloop = 0x00373580u;
@@ -248,6 +253,40 @@ static void f55_boot_init_stub(uint8_t *rdram, R5900Context *ctx, PS2Runtime *ru
 static void g361_map_jump_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     static const bool on = dc2_env_flag_enabled("DC2_G361_POS");
+    static const bool g382Hash = dc2_env_flag_enabled("DC2_G382_INIT_HASH");
+    static const bool g382Fine = dc2_env_flag_enabled("DC2_G382_INIT_FINE");
+    static bool g382Dumped = false;
+    if (g382Hash && !g382Dumped)
+    {
+        g382Dumped = true;
+        auto hashRange = [rdram](uint32_t addr, uint32_t size) {
+            uint64_t hash = 1469598103934665603ull;
+            for (uint32_t i = 0; i < size; ++i)
+            {
+                hash ^= rdram[(addr + i) & 0x01FFFFFFu];
+                hash *= 1099511628211ull;
+            }
+            return hash;
+        };
+        auto dumpBlocks = [&hashRange](uint32_t first, uint32_t end, uint32_t blockSize) {
+            for (uint32_t addr = first; addr < end; addr += blockSize)
+                std::fprintf(stderr, "[G382:initHash] addr=0x%08x hash=%016llx\n",
+                             addr, static_cast<unsigned long long>(hashRange(addr, blockSize)));
+        };
+        // __sinit_mainloop touches the mainloop globals and the active-save backing
+        // objects in these two ranges. Compare same-route index-5 ON/OFF arms at
+        // MapJump to find state that survives MainLoop/InitSaveData initialization.
+        if (g382Fine)
+        {
+            dumpBlocks(0x01DDA000u, 0x01DDD000u, 0x40u);
+            dumpBlocks(0x01E67000u, 0x01E68000u, 0x40u);
+        }
+        else
+        {
+            dumpBlocks(0x003D8000u, 0x003E0000u, 0x1000u);
+            dumpBlocks(0x01DD8000u, 0x01E68000u, 0x1000u);
+        }
+    }
     if (on)
     {
         const uint32_t gp = getRegU32(ctx, 28);

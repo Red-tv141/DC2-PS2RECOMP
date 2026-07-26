@@ -275,6 +275,18 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     runtime.registerFunction(0x00117A40u, sif_module_return_zero_stub); // sceSifSearchModuleByAddress
     runtime.registerFunction(0x00117AF0u, sif_module_return_zero_stub); // sceSifLoadStartModuleBuffer
     runtime.registerFunction(0x00117D58u, sif_module_return_zero_stub); // sceSifLoadStartModule
+    // [G380] Same class, missed by the G7 sweep: `sceDevctl@0x00116A58` IS implemented
+    // (`ps2_stubs::sceDevctl`, Kernel/Stubs/FileIO.cpp — returns -11 "no HDD"), but the name is
+    // absent from `PS2_STUB_LIST` in `ps2_call_list.h`, so the recompiler could not resolve it
+    // and emitted the throwing `TODO_NAMED("sceDevctl")` body instead. Guest callers are
+    // `HddConectCheck__FPi@0x0031BA40` and `CheckInstallSpace__Fv@0x0031BE60`, reachable from
+    // `TitleInit`/`InitHDDMenu`/`HDDMenuLoop` — i.e. the HDD-install menu aborts the process.
+    // `X(sceDevctl)` has been added to `ps2_call_list.h` so a REGEN needs no override; this
+    // registration repairs the CURRENT generated tree. Rollback: DC2_G380_NO_DEVCTL=1.
+    if (std::getenv("DC2_G380_NO_DEVCTL") == nullptr)
+    {
+        runtime.registerFunction(0x00116A58u, ps2_stubs::sceDevctl); // sceDevctl
+    }
     // PHASE F41: title_mode_key_stub retired. Real TitleModeKey__Fv at 0x002A1220
     // now runs via register_functions.cpp. F40 pad injection drives confirm via R1.
     runtime.registerFunction(0x001B0780u, g224_getpoly_probe);       // G224: camera-poly query result (DngMainKey camera block reach + fail signal)
@@ -644,10 +656,19 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     // PHASE G375: FMV bring-up — real DIntr/EIntr (kill: DC2_G375_NO_INTR=1).
     applyDC2G375FmvOverrides(runtime);
 
+    // PHASE G381: close the TODO_NAMED abort class — non-throwing handlers for the 36
+    // `!! DEAD` stub addresses (config_dc2_final.toml). Registered LAST so they override
+    // the bindAddressHandler attempts above, which cannot resolve these names.
+    // Kill: DC2_G381_NO_DEAD_STUBS=1. Trace: DC2_G381_TRACE=1.
+    applyDC2G381DeadStubRepairs(runtime);
+
     // PHASE G186 (opt-in DC2_G186_SPTRACE=1): sp-desync probe on the edit loop/draw.
     if (g186_sptrace_enabled())
     {
         runtime.registerFunction(0x001AE3D0u, g186_editdraw_probe); // EditDraw__Fv
         runtime.registerFunction(0x001ABCF0u, g186_editloop_probe); // EditLoop__Fv
     }
+
+    // PHASE G385: trace the MSIN messages after the Phase-9 auto-stub bindings.
+    applyDC2G385AudioTrace(runtime);
 }
