@@ -24,6 +24,7 @@
 
 #include "ps2_gs_rasterizer_parts/g345_closure.inc"
 
+// G399: DC2_G399_SURFDUMP joins the raw-VRAM diag flag set in the part below.
 #include "ps2_gs_rasterizer_parts/rasterizer_gpu_alias_page_view.inc"
 
 
@@ -64,6 +65,10 @@
 // anonymous namespace opened in rasterizer_headers_and_diagnostics.inc has closed, because it
 // declares the externally-linked g_dc2PresentTick from ps2_runtime.cpp.
 #include "ps2_gs_rasterizer_parts/rasterizer_g369_scene_census.inc"
+
+// G400: in-frame fbp=0x139 stage probe (default-off: DC2_G400_STAGE=1). Must sit after the
+// anonymous namespace has closed for the same reason as the G369 census above.
+#include "ps2_gs_rasterizer_parts/rasterizer_g400_stage_probe.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_write_pixel.inc"
 

@@ -399,6 +399,8 @@ void PS2AudioBackend::stopAll()
 // G392: documented SPU reverb preset network, sequenced BGM mixed on the same
 // bus (DC2_G392_NO_BGM_BUS=1), SE volume/pan un-swapped (DC2_G392_LEGACY_SE_MIX=1). MSBuild does not
 // track `.inc` dependencies — this comment is edited on every `.inc` change.
+// G393: retail LIBSD.IRX reverb preset values live in the included mixer.
+// G394: cache event-rate BGM render state and suppress paired stale async stops.
 #include "ps2_audio_parts/dc2_g385_game_audio.inc"
 
 // DC2's EZBGM voice service reads standard WAV/BWF clips through the

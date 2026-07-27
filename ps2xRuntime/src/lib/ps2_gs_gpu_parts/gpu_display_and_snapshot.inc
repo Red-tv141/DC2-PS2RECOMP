@@ -282,6 +282,7 @@ void GS::latchHostPresentationFrame()
         ~G176LatchBump() { s_g176LatchGeneration.fetch_add(1ull, std::memory_order_release); }
     } g176Bump;
     (void)g176Bump;
+    static const bool s_g397PresentTrace = envFlagEnabled("DC2_G397_PRESENT_TRACE");
 
     // PHASE F30: latch state probe, retained only for explicit phase tracing.
     if (phaseDiagnosticsEnabled())
@@ -308,6 +309,20 @@ void GS::latchHostPresentationFrame()
 
     if (!m_privRegs || !m_vram || m_vramSize == 0u)
     {
+        if (s_g397PresentTrace)
+        {
+            static std::atomic<uint32_t> s_g397ResourceFailures{0u};
+            const uint32_t n = s_g397ResourceFailures.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 16u || (n % 120u) == 0u)
+            {
+                std::fprintf(stderr,
+                             "[G397:latch-fail] n=%u reason=resources priv=%u vram=%u size=%u\n",
+                             n,
+                             m_privRegs ? 1u : 0u,
+                             m_vram ? 1u : 0u,
+                             m_vramSize);
+            }
+        }
         m_hostPresentationFrame.clear();
         m_hostPresentationWidth = 0u;
         m_hostPresentationHeight = 0u;
@@ -393,6 +408,12 @@ void GS::latchHostPresentationFrame()
         }
     }
 
+    // G399 (diagnostic, default-off): report/dump the raw PSMCT32 contents of the dungeon
+    // render-target chain (0x139 scene RTT -> 0x068/0x000 post-process + composite) so the
+    // Dungeon 6 darkening can be attributed to the draw path INTO 0x139 versus the
+    // 0x139 -> 0x2720 readback/composite that consumes it.
+    g399ProbeSurfaces(m_vram, m_vramSize);
+
     uint32_t width1 = 0u;
     uint32_t height1 = 0u;
     uint32_t width2 = 0u;
@@ -402,6 +423,36 @@ void GS::latchHostPresentationFrame()
 
     const bool validCrt1 = pmode.enableCrt1 && hasDisplaySetup(m_privRegs->display1, displayFrame1);
     const bool validCrt2 = pmode.enableCrt2 && hasDisplaySetup(m_privRegs->display2, displayFrame2);
+    auto g397TraceFailure = [&](const char *reason)
+    {
+        if (!s_g397PresentTrace)
+            return;
+        static std::atomic<uint32_t> s_g397Failures{0u};
+        const uint32_t n = s_g397Failures.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n > 16u && (n % 120u) != 0u)
+            return;
+        std::fprintf(stderr,
+                     "[G397:latch-fail] n=%u reason=%s valid1=%u valid2=%u "
+                     "pmode=0x%llx smode2=0x%llx dispfb1=0x%llx display1=0x%llx "
+                     "dispfb2=0x%llx display2=0x%llx "
+                     "ctx0(fbp=0x%x fbw=%u psm=0x%x) ctx1(fbp=0x%x fbw=%u psm=0x%x)\n",
+                     n,
+                     reason,
+                     validCrt1 ? 1u : 0u,
+                     validCrt2 ? 1u : 0u,
+                     static_cast<unsigned long long>(m_privRegs->pmode),
+                     static_cast<unsigned long long>(m_privRegs->smode2),
+                     static_cast<unsigned long long>(m_privRegs->dispfb1),
+                     static_cast<unsigned long long>(m_privRegs->display1),
+                     static_cast<unsigned long long>(m_privRegs->dispfb2),
+                     static_cast<unsigned long long>(m_privRegs->display2),
+                     m_ctx[0].frame.fbp,
+                     m_ctx[0].frame.fbw,
+                     static_cast<uint32_t>(m_ctx[0].frame.psm),
+                     m_ctx[1].frame.fbp,
+                     m_ctx[1].frame.fbw,
+                     static_cast<uint32_t>(m_ctx[1].frame.psm));
+    };
 
     // G356: per-present timeline of BOTH display double-buffers' circle-region VRAM content
     // (block 0x0 and block 0xd00), + which fbp is displayed. Pins exactly when block-0's field
@@ -694,6 +745,7 @@ void GS::latchHostPresentationFrame()
 
     if (!validCrt1 && !validCrt2)
     {
+        g397TraceFailure("crt-invalid");
         m_hostPresentationFrame.clear();
         m_hostPresentationWidth = 0u;
         m_hostPresentationHeight = 0u;
@@ -948,6 +1000,7 @@ void GS::latchHostPresentationFrame()
     const GSDisplayReadOrigin &displayOrigin = validCrt1 ? displayOrigin1 : displayOrigin2;
     if (!copyDisplaySource(displayFrame, displayOrigin, width, height, true, false, selectedFrame, scratch, usedPreferred))
     {
+        g397TraceFailure("copy-failed");
         m_hostPresentationFrame.clear();
         m_hostPresentationWidth = 0u;
         m_hostPresentationHeight = 0u;
@@ -1049,4 +1102,3 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     }
     return true;
 }
-

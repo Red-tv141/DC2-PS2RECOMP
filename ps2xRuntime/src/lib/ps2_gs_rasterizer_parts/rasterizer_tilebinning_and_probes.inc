@@ -204,8 +204,61 @@ static std::atomic<uint64_t> g_g248SpriteCalls[kG248BucketCount]{};
 static std::atomic<uint64_t> g_g248SpritePixels[kG248BucketCount]{};
 static std::atomic<uint64_t> g_g248SpriteNs[kG248BucketCount]{};
 
+// G400 (DEFAULT OFF, diagnostic): drop fbp=0x139 out of the resident-target set, so the whole
+// Dungeon 6 alias family (0x139 + the post-process targets 0x13b/0x13c/0x14b that render inside
+// its VRAM footprint) shares ONE owner — the CPU/VRAM path. If the free-roam darkening is caused
+// by split ownership across that physical alias, this arm renders correctly (and slowly).
+// DC2_G400_NO_RESIDENT_139=1 is the single-target shorthand; DC2_G400_NO_RESIDENT="139,13c"
+// (hex, comma separated) drops an arbitrary subset, so the whole alias family can share one owner.
+static bool g400NoResident(uint32_t fbp)
+{
+    static const uint64_t s_mask = []() -> uint64_t {
+        uint64_t m = 0ull;
+        if (std::getenv("DC2_G400_NO_RESIDENT_139") != nullptr)
+            m |= 1ull << 0;
+        const char *e = std::getenv("DC2_G400_NO_RESIDENT");
+        if (e && *e)
+        {
+            const char *p = e;
+            while (*p)
+            {
+                char *end = nullptr;
+                const unsigned long v = std::strtoul(p, &end, 16);
+                if (end == p)
+                    break;
+                switch (v)
+                {
+                case 0x139u: m |= 1ull << 0; break;
+                case 0x13cu: m |= 1ull << 1; break;
+                case 0x143u: m |= 1ull << 2; break;
+                case 0x146u: m |= 1ull << 3; break;
+                case 0x155u: m |= 1ull << 4; break;
+                default: break;
+                }
+                p = end;
+                while (*p == ',' || *p == ' ')
+                    ++p;
+            }
+        }
+        return m;
+    }();
+    if (s_mask == 0ull)
+        return false;
+    switch (fbp)
+    {
+    case 0x139u: return (s_mask & (1ull << 0)) != 0ull;
+    case 0x13cu: return (s_mask & (1ull << 1)) != 0ull;
+    case 0x143u: return (s_mask & (1ull << 2)) != 0ull;
+    case 0x146u: return (s_mask & (1ull << 3)) != 0ull;
+    case 0x155u: return (s_mask & (1ull << 4)) != 0ull;
+    default: return false;
+    }
+}
+
 static int g248TargetIndex(uint32_t fbp)
 {
+    if (g400NoResident(fbp))
+        return -1;
     switch (fbp)
     {
     case 0x139u: return 0;

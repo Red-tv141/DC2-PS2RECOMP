@@ -1390,26 +1390,49 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         }
         break;
     }
+    // G397: 0x59..0x5f are reserved in the GIF A+D register namespace.
+    // Privileged PCRTC registers (DISPFB/DISPLAY/BGCOLOR) are MMIO-only and
+    // must never be writable through an A+D packet. The old host-private
+    // aliases let ordinary Dungeon 6 packet payloads poison presentation.
     case 0x59:
-        if (m_privRegs)
-            m_privRegs->dispfb1 = value;
-        break;
     case 0x5a:
-        if (m_privRegs)
-            m_privRegs->display1 = value;
-        break;
     case 0x5b:
-        if (m_privRegs)
-            m_privRegs->dispfb2 = value;
-        break;
     case 0x5c:
-        if (m_privRegs)
-            m_privRegs->display2 = value;
-        break;
+    case 0x5d:
+    case 0x5e:
     case 0x5f:
-        if (m_privRegs)
-            m_privRegs->bgcolor = value;
+    {
+        static const bool s_g397LegacyAliases =
+            (std::getenv("DC2_G397_LEGACY_RESERVED_DISPLAY") != nullptr);
+        static const bool s_g397Trace =
+            (std::getenv("DC2_G397_PRESENT_TRACE") != nullptr);
+        static std::atomic<uint32_t> s_g397ReservedWrites{0u};
+
+        if (s_g397LegacyAliases && m_privRegs)
+        {
+            switch (regAddr)
+            {
+            case 0x59: m_privRegs->dispfb1 = value; break;
+            case 0x5a: m_privRegs->display1 = value; break;
+            case 0x5b: m_privRegs->dispfb2 = value; break;
+            case 0x5c: m_privRegs->display2 = value; break;
+            case 0x5f: m_privRegs->bgcolor = value; break;
+            default: break;
+            }
+        }
+
+        const uint32_t n = s_g397ReservedWrites.fetch_add(1u, std::memory_order_relaxed);
+        if (s_g397Trace && n < 64u)
+        {
+            std::fprintf(stderr,
+                         "[G397:reserved-gs] n=%u reg=0x%x value=0x%llx action=%s\n",
+                         n + 1u,
+                         static_cast<unsigned>(regAddr),
+                         static_cast<unsigned long long>(value),
+                         s_g397LegacyAliases ? "legacy-alias" : "ignored");
+        }
         break;
+    }
     default:
         break;
     }

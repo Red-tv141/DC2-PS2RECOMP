@@ -653,7 +653,10 @@ static bool g289RawVramDiagOn()
         envFlagEnabled("DC2_G86_TEXDUMP") ||
         envFlagEnabled("DC2_G194_VRAM_DUMP") ||
         envFlagEnabled("DC2_G231_GEMDUMP") ||
-        envFlagEnabled("DC2_G232_RTTDUMP");
+        envFlagEnabled("DC2_G232_RTTDUMP") ||
+        // G399: the Dungeon 6 surface probe reads raw VRAM, so it needs the same
+        // "keep VRAM authoritative" treatment as the older dump levers.
+        envFlagEnabled("DC2_G399_SURFDUMP");
     return s_on;
 }
 static constexpr uint32_t kG289ZeroFbpToken = 0xfffffffdu;

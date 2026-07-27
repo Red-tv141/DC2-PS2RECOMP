@@ -4,6 +4,7 @@ void GSRasterizer::drawTriangle(GS *gs)
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const GSVertex &v2 = gs->m_vtxQueue[2];
     const auto &ctx = gs->activeContext();
+    g400NoteDrawTarget(gs->m_vram, ctx.frame.fbp);
 
     // G104: clip title-rock triangles after GS primitive assembly, not per VU vertex. G102's
     // VU-side replacement was non-local for strips/fans: one shared behind-camera vertex can need

@@ -3,6 +3,7 @@ void GSRasterizer::drawSprite(GS *gs)
     const GSVertex &v0 = gs->m_vtxQueue[0];
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const auto &ctx = gs->activeContext();
+    g400NoteDrawTarget(gs->m_vram, ctx.frame.fbp);
     G248SpriteScope g248Scope(ctx.frame.fbp, gs->m_prim.tme, gs->m_prim.abe);
     // G248 state census (DEFAULT OFF): print each distinct RTT-sprite state once.  Kept separate
     // from DC2_G248_STAT because stderr I/O would distort the timing discriminator above.
