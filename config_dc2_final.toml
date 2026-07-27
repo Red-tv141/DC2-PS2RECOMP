@@ -556,6 +556,28 @@ stubs = [
 skip = []
 
 # -----------------------------------------------------------------------------
+# Explicit jump tables.
+#
+# EventSelect__Fv@0x001923B0 has a nested seven-way computed jump through the
+# table at 0x00365080. Automatic inference historically emitted only its first
+# two targets, so selecting index 2 dispatched to the unregistered internal
+# label 0x001929C0 and terminated the runner. Keep the complete retail table
+# explicit so regeneration emits every local case and resumable label.
+# -----------------------------------------------------------------------------
+[jump_tables]
+[[jump_tables.table]]
+address = "0x00365080"
+entries = [
+  { index = 0, target = "0x00192998" },
+  { index = 1, target = "0x001929AC" },
+  { index = 2, target = "0x001929C0" },
+  { index = 3, target = "0x001929D4" },
+  { index = 4, target = "0x001929E8" },
+  { index = 5, target = "0x001929FC" },
+  { index = 6, target = "0x00192A10" },
+]
+
+# -----------------------------------------------------------------------------
 # [patches] - intentionally ABSENT.
 #
 # No instruction patch is active in any historical config either: F56baseline's

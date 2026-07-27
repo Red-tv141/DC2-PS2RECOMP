@@ -83,10 +83,39 @@ powershell -ExecutionPolicy Bypass -File D:\ps2r\dc2\tools\run_30s_diagnose.ps1
 - `DC2_FRAME_DUMP_EVERY=1`: Dense per-tick frame dumping for soaking thread/pipeline changes.
 - `DC2_G384_MPEG_AUDIO_TRACE=1`: Bounded FMV ADS/PCM header, playback, and progress trace.
 - `DC2_G384_NO_MPEG_AUDIO=1`: Same-binary rollback for G384 host FMV PCM playback.
+- `DC2_G393_PCM_ONLY=1`: Same-binary rollback for G393 Sony PSX-ADPCM PSS audio decoding.
+- `DC2_G393_MPEG_AUDIO_SELFTEST=1`: G393 PSX-ADPCM decoder/interleave self-test (expect 4/4).
 - `DC2_G385_AUDIO_TRACE=1`: Bounded gameplay-audio DMA/RPC/bank/BGM/SFX/voice-open trace.
 - `DC2_G385_NO_GAME_AUDIO=1`: Same-binary rollback for G385 Sony HD/BD SFX and SQ BGM playback.
 - `DC2_G386_VOICE_TRACE=1`: Bounded EZBGM SID `0x12345` voice open/play/state/completion trace.
 - `DC2_G386_NO_VOICE=1`: Same-binary rollback for G386 WAV voice streaming.
+- `DC2_G387_NO_BD_CHUNKS=1`: Same-binary rollback for G387 multi-transfer `.BD` bank reassembly.
+- `DC2_G388_NO_BANK_ALIAS=1`: Same-binary rollback for G388 multi-port re-bind of one `SetHD` bank.
+- `DC2_G389_LEGACY_MIX=1`: Same-binary rollback for the G389 port-volume scale/SFX attenuation.
+- `DC2_G390_LEGACY_SFX=1`: Same-binary rollback for the G390 SFX voice-allocation fixes.
+- `DC2_G391_LEGACY_SFX_PATH=1`: Rollback to the G390 fire-and-forget one-shot path (no G391 mixer).
+- `DC2_G391_NO_ADSR=1`: Rollback the HD ADSR envelope (SFX + BGM) to the fixed attack/release.
+- `DC2_G391_NO_REVERB=1`: Disable the G391 SPU2 reverb bus.
+- `DC2_G391_LEGACY_BGM_NORM=1`: Restore per-sequence BGM peak normalisation.
+- `DC2_G392_LEGACY_SE_MIX=1`: Restore the G385 reading of the SE stream (`F9 01` as volume).
+- `DC2_G392_NO_BGM_BUS=1`: Put sequenced BGM back on private per-port streams (no reverb send).
+- `DC2_G394_LEGACY_ASYNC_STOP=1`: Restore literal early zero-volume/Stop handling; reproduces
+  first-title silence before the attract FMV.
+- `DC2_G399_SURFDUMP=1`: G399 raw render-target probe. At each present latch, reads the dungeon
+  RTT chain straight out of VRAM as PSMCT32 512x416 and prints `[G399:surf] n=… fbp=… meanL/maxL/
+  meanA/nz`. `DC2_G399_EVERY=<n>` report interval (default 60), `DC2_G399_PPM=<n>` also write
+  `captures/g399_surf_<fbp>_<n>.ppm` (default 0 = stats only), `DC2_G399_FBPS=<hex,…>` surface list
+  (default `139,68,0`). Diagnostic only; also joins `g289RawVramDiagOn()` so VRAM stays
+  authoritative under the G178 GPU raster path.
+- `DC2_G400_NO_RESIDENT_139=1` / `DC2_G400_NO_RESIDENT=<hex,…>`: G400 ownership A/B. Drops the
+  named `fbp`(s) from the native renderer's resident-target set (`g248TargetIndex`), so the whole
+  Dungeon 6 physical-alias family shares the CPU/VRAM owner. Diagnostic; restores the `0x139`
+  alpha channel but does NOT fix the darkening.
+- `DC2_G400_STAGE=1`: G400 in-frame `0x139`/`0x068` sampling at FRAME-target transitions
+  (`DC2_G400_FROM`/`DC2_G400_TO`/`DC2_G400_TICKS`/`DC2_G400_STEP`). **Weak instrument** — hooks the
+  CPU draw entry points, which this route mostly bypasses (see G400 §5).
+- `DC2_G391_HD_DUMP=1` / `DC2_G391_MIX_DUMP=<path>`: Bounded Sony `.HD` parameter hexdump / raw
+  s16le 44.1 kHz stereo capture of the SFX mixer bus.
 
 ---
 
@@ -96,6 +125,7 @@ powershell -ExecutionPolicy Bypass -File D:\ps2r\dc2\tools\run_30s_diagnose.ps1
    - **Status**: Native-renderer stack (G260–G298) is DEFAULT-ON (~13.5 fps / ~74 ms MAP-0 floor). Total closure perf arc CLOSED at G352 (accept-floor). Master rollback: `DC2_G26X_NO_NATIVE=1`.
    - **Current Thread Pole**: MAP-0 frame ~74 ms/13.5 fps. VU1 worker (~74, true wall ~66–68, MTVU default-on since G302) and GS worker (~68 incl 5ms collect-stall) are **co-balanced ~74 ms** (G344 re-profile); EE idle (~24% busy).
    - **Milestone 3 Status (Pillar-4 Rearch)**: G310 logical atlas DEFAULT-ON (`DC2_G310_LOGICAL=1`). **G338 resident CT24-alpha view PROMOTED DEFAULT-ON at G352** (`DC2_G338_CT24_VIEW`; kill `DC2_G338_NO_CT24_VIEW=1`; bit-exact, GS worker −3.8 ms/f, frame −2.6% VU1-capped).
+   - **G178 GPU Depth Parity Stepping-Stone**: `DC2_G242_GPU_DEPTH=1` persistent GPU-depth bridge is opt-in only; native-renderer stack G260–G352 covers rendering performance and depth authority.
    - **Arc Total-Closure Findings (G340–G352)**:
      - G340 lazy-VRAM: NO-GO (0.0% skippable).
      - G341 parallel-VIF DMA chain pre-decode: NO-GO (GS front-end pole is Path2 DIRECT = 53 ms 96% IMAGE upload bytes, not parallelizable geometry decode).
@@ -112,34 +142,51 @@ powershell -ExecutionPolicy Bypass -File D:\ps2r\dc2\tools\run_30s_diagnose.ps1
      - G364 (Distance fog): GS per-pixel FOG stage (`GS_REG_FOGCOL`, `PRIM.FGE`) applied in all draw paths.
      - G368 (MAP-160 tear): DISPFB stride fallback fix (`candidate.fbw = displayFrame.fbw`) FIXED page-row band tearing; G365 sprite coverage rule promoted back default-ON.
      - G383 (Minor residuals): `sceMcSetFileInfo` now honors `$a3` info + `$t0` flags; LoadImage `BITBLTBUF.DBP` now uses direct 256-byte block units. G194 DOF/TexAnime visual claims were not reproducible and are closed.
+     - G396 (Georama retest): the documented floor-select route executes
+       `DrawSub__8CEditMapFi@0x001B4130` repeatedly with zero PC-zero, recovery, stack-desync,
+       or bad-dispatch events. The old `ra=0` issue is confirmed fixed by G186.
+     - G397 (Dungeon 6 long route): Established Zelmite Mine free-roam benchmark; proved map/train/HUD/lighting match HW, texture/CLUT uploads match 100%, GS draw states match. Added `tools/g397_draw_state.py`. **Its "ticks 1,740–7,620 are intro frames" claim is WRONG — corrected by G398.**
+     - G398 (Dungeon 6 onset): Break pinned to host tick **~1,770**, the FIRST free-roam frame after the `FLOOR EPISODE` banner clears — tick 1,750 is pixel-correct vs `ref/dumps/dungeon_6.png`. Guest state is identical across the transition and identical to PCSX2 (`DngStatus=0`, `lightScale=1.0`, `mapIdx=0`). What changes is that DC2 turns on its second render target: pre-break frames draw only `fbp=0x139`; free-roam frames add the `fbp=0x068`/`fbp=0x000` post-process + composite that reads `0x139` back as `tbp=0x2720 tpsm=PSMCT32`. GS command-stream parity with `ref/dumps/dungeon_6.gs` proven down to vertex colours (both `fbp=0x139` blend-volume passes `ALPHA=0x…62` subtract / `0x…68` add carry `RGBA=(1,1,1,64)` on HW and runner; composite sprites `0x503c005d`/`0x503c0061`). Refuted `DC2_G364_NO_FOG`, `DC2_G203_LEGACY_Z`, `DC2_G144_NO_TILEBIN`. Added `tools/run_g398_dungeon6.ps1` + `tools/g398_frame_census.py`.
+     - G399 (Dungeon 6 stage split): added the `DC2_G399_SURFDUMP` raw render-target probe
+       (`ps2_gs_gpu_parts/gpu_g399_surface_probe.inc`, default-off) and measured each stage
+       separately. **G398's either/or is wrong — both stages lose.** At the break latch the scene
+       RTT `fbp=0x139` itself drops meanL 39.2 -> 21.9 with meanA 178.8 -> 32.6, *and* the
+       `0x068`/`0x000` composite ratio falls 0.97 -> 0.13 with `0x068` maxL hard-capping at 97
+       while `0x139` still reaches 255. Structural find: DC2's free-roam post-process renders to
+       `fbp=0x13b/0x13c/0x14b` (blocks `0x2760`/`0x2780`/`0x2960`) and reads back
+       `tbp=0x2820/0x2920/0x2d20/0x2e20` — all **inside** the `0x139` footprint
+       (`0x2720`–`0x3420`), i.e. the G304 hard multi-owner physical-alias class, switched on by
+       exactly the frame that breaks. Refuted: GS `COLCLAMP=0` wrap (DC2 uses `COLCLAMP=1` here,
+       matching the runtime's unconditional clamp) and draw-ORDER divergence in the `0x139`
+       light-volume prologue. Added `tools/g399_draw_order.py`.
+     - G400 (Dungeon 6 ownership A/B): the `fbp=0x139` **alpha** collapse is rooted — it is the
+       residency split (`DC2_G400_NO_RESIDENT_139=1` restores meanA 29.9 → 160.3 vs 178.8
+       correct); excluding the other four resident targets as well changes nothing. But the
+       **luminance/darkening is NOT the native renderer**: `DC2_G26X_NO_NATIVE=1` (whole stack
+       off) is *darker* than the default (display meanL 1.83 vs 2.55; hardware 34.3), so no
+       residency/FBO/page-authority experiment can close it. **CORRECTS G399 §3.1**: at the break
+       latch `0x139` holds no scene at all (black + Max only), so present-latch `0x139` stats are
+       a latch-phase artifact and not a valid stage-1 oracle — only `0x068`/display numbers are
+       phase-safe. Refuted: G287 transient target `0x13b`, G338 CT24-alpha view, and any
+       composite-command-stream divergence (identical states/texture bases at full-frame scale).
+       Next: measure `0x139` at COMPOSITE time, then audit T8 decode/CLUT for the world's PSMT8
+       pages `0x3420`–`0x3660`.
+     - **TRAP (G400): `captures/g398_bad.gs` is TRUNCATED** (1,706 batches vs ~9,500 for a real
+       free-roam frame) and stops before the composite sprites — it reads as "the runner never
+       emits the composite". Use `captures/g398_bad2.gs` (27,765 batches) and always check the
+       total batch count before believing a "missing draw class" result.
+     - **TRAP (G399): `tools/g398_frame_census.py` had a shifted GS register map** — `DIMX` is
+       `0x44`, `DTHE` is `0x45`, `COLCLAMP` is `0x46`; it read `COLCLAMP` from `0x1F`, which is not
+       a GS register, so every census before G399 reported `colclamp=0` for every dump. Fixed. Do
+       not cite `colclamp`/`dimx`/`dthe` from any pre-G399 census output.
+     - **TRAP (G398): on this route compare arms by GUEST STATE (`[F59:dump] DngStatus=0` + settled free-roam), never by host tick.** Disabling a perf lever changes pacing several×; `DC2_G144_NO_TILEBIN=1` read as a "fix" at ticks 2,400/6,000 while still in the map screen / entrance cutscene, and renders mean L = 0.02 (fully black) once a 420 s soak actually reaches free-roam.
    - Detailed specs & fix-logs: [arc-native-renderer.md](file:///d:/ps2r/dc2/plans/arc-native-renderer.md), [arc-total-closure.md](file:///d:/ps2r/dc2/plans/arc-total-closure.md), [phase-history.md](file:///d:/ps2r/dc2/plans/phase-history.md), and [phase-G352-fix-log.md](file:///d:/ps2r/dc2/plans/phase-G352-fix-log.md).
-
-2. **Audio subsystem restored (FIXED G384-G386)**
-   - G384 plays stereo PCM16LE embedded in PSS FMVs; the user verified `RUSH.PSS` against `ref/audio/fmv0.webm`.
-   - G385 parses Sony HD/BD VAG banks, plays MODMSIN SFX key-ons, and renders looped `SCEISequ` BGM through host audio.
-   - G386 handles EZBGM SID `0x12345`, indexes `SOUND.HD3`, reads requested WAV sectors from `SOUND.DAT`, plays them through host audio, and returns `0x1000` only while the clip is active.
-   - The supplied recording exercises `0010665.wav` and `0010670.wav`; the user verified the cutscenes now work and progress.
-
-3. **Georama `DrawSub__8CEditMapFi` vtable crash**
-   - `ra=0x0` signature is F50.7 sentinel leak, likely fixed by G186 preempt-suppression. Needs explicit retest post-G186.
-
-4. **G193 instrumentation caveat (durable)**
-   - `DC2_TRACE_G58=1` re-registers `Draw__8mgCFrame@0x137E10` bypassing `g67_frame_draw_probe` distance cull repair. Trace runs lack G67 repair. Long recompiled bodies print exit trace early on unwinding back-edge preemption.
-
-5. **DISPFB Latch (Kept by Design)**
-   - `f29_mgendframe_probe` DISPFB1/2 force-write is a presentation timing crutch for the half-rate title loop behind `DC2_FORCE_DRAW_BUFFER_LATCH=1`.
-
-6. **Guest C heap must sit ABOVE guest `_end` (F58)**
-   - Check `[F58:setupheap]` non-zero.
-
-7. **G178 GPU depth parity**
-   - `DC2_G242_GPU_DEPTH=1` persistent GPU-depth bridge is opt-in only.
 
 ---
 
 ## Routes for Graphic Test
 
-Each row: reference dump → exact input route → harness → re-check triggers.
+Each row: reference dump → exact input route → harness → re-check triggers. exact input route → harness → re-check triggers.
 
 | Reference (`ref/dumps/`) | Route (debug-menu unless noted) | Harness | Re-check when touching |
 |---|---|---|---|
@@ -164,6 +211,7 @@ Each row: reference dump → exact input route → harness → re-check triggers
 - **Split VIF1 IMAGE continuation (G6)**: VIF1 PATH2 IMAGE continuation qwords must be forwarded verbatim (`ps2_vif1_interpreter.cpp`) — never re-wrap in second IMAGE tag.
 - **Debug-menu PSMT4HH font (G5)**: Packed 4-bit stream; stop at `TRXREG` rectangle, not oversized QWC request. CLAMP repeat semantics.
 - **2D UI sprite point-sampling (G8, G362)**: DC2 UI text/icons are point-sampled (`tex1=0x201`, MMAG/MMIN=0). `drawSprite` FST bias is 0.0. `sampleExact` (G362) uses 12.4 fixed-point UV reconstruction (`lround(u*16)/16`) on `uMode` bit 12 to prevent float `floor()` rounding errors across atlas boundaries.
+- **DISPFB Latch (Kept by Design)**: `f29_mgendframe_probe` DISPFB1/2 force-write is a presentation timing crutch for the half-rate title loop behind `DC2_FORCE_DRAW_BUFFER_LATCH=1`.
 
 ### 2. Pad Input Architecture (F66, G7, G49)
 - **Live pad read is `read_pad_stub`** (`0x0014A490`) → `dc2_write_pad_status`. Writes buttons to `PAD_STATUS+0` and analog axes (`+4`=LY, `+8`=LX, `+0xc`=RY, `+0x10`=RX). `scePadRead` is DEAD. `CGamePad+0xc`=LX, `+0x8`=LY (`-0x80` centre, ±`0x32` deadzone).
@@ -199,6 +247,15 @@ Each row: reference dump → exact input route → harness → re-check triggers
 
 ### 8. Recompiler & Codegen Technical Rules
 - **`.inc` recompile trap (G359)**: MSBuild does not reliably rebuild when an included `.inc` changes. Always edit included `.cpp` (`GS.cpp`/`ps2_gs_gpu.cpp`) to force recompile.
+- **Nested jump-table coverage (G395)**: `EventSelect__Fv@0x001923B0` uses the seven-entry
+  inner table at `0x00365080`. Automatic inference omitted targets 2-6 and crashed when selector
+  2 reached the valid internal label `0x001929C0`. Keep the full table explicit in
+  `config_dc2_final.toml`; never stub its internal labels as standalone functions.
+- **MSBuild SelectedFiles static-library trap (G395)**: building `dc2_game` with
+  `/p:SelectedFiles=...` repacks `dc2_game.lib` with only the selected object. Do not use this as
+  a normal incremental static-library build. Build the explicit Release target normally; if a
+  surgical object compile is unavoidable, repack and verify the complete object set before
+  linking the runner.
 - **`DIRECT_JAL_ONLY_TARGET` (G223)**: Cannot be traced via `registerFunction`; wrap jal target instead.
 - **Back-edge preemption context safety (G186, G211, G212)**: Recompiled bodies unwound by preemption must suppress preemption during wrapper execution (`g_dc2PreemptSuppressDepth`).
 - **VU1 scalar prestall (G239)**: Lower scalar stalls happen BEFORE either half of instruction pair executes; decode lower word first.
@@ -207,6 +264,8 @@ Each row: reference dump → exact input route → harness → re-check triggers
 - **Universal Z emulation (G203)**: Honor guest ZBUF/TEST universally, never whitelist per-screen.
 - **`vf0` initialization (G40)**: Pin `vu0_vf[0] = (0,0,0,1)` after context memset.
 - **VU1 Q latency (G87)**: Latches Q after fixed delay (7 cycles for DIV/SQRT, 13 for RSQRT).
+- **G193 instrumentation caveat**: `DC2_TRACE_G58=1` re-registers `Draw__8mgCFrame@0x137E10` bypassing `g67_frame_draw_probe` distance cull repair. Trace runs lack G67 repair. Long recompiled bodies print exit trace early on unwinding back-edge preemption.
+- **Guest C heap location (F58)**: Guest C heap MUST sit ABOVE guest `_end` (`[F58:setupheap]` non-zero).
 
 ### 9. Off-EE-Thread Guest-Execution Lock (G377, G379)
 - **Invariant**: Any host thread that runs recompiled guest code (e.g. INTC/DMAC IRQs, VSync callbacks, Alarm threads) MUST hold `PS2Runtime::GuestExecutionScope`.
@@ -226,10 +285,18 @@ Each row: reference dump → exact input route → harness → re-check triggers
 - **STALE SCRIPT WARNING**: Do NOT run `tools/fix_cop2_destmask.py`. Modern `ps2_recomp.exe` emits correct dest masks; running `fix_cop2_destmask.py` corrupts the vector/clipper core.
 - **Dead Stubs**: 0 dead `TODO_NAMED` process-abort stubs remain (`g381_dead_stub_repairs.inc` registers 35 handlers by guest address).
 
-### 12. FMV/PSS Audio (G384)
+### 12. FMV/PSS Audio (G384/G393)
 - DC2 PSS private-stream audio starts with a four-byte substream selector (`ff a0 00 00`), then Sony `SShd`/`SSbd` ADS data.
 - `RUSH.PSS` is codec 1 PCM16LE, 48 kHz stereo, with 0x200-byte planar blocks per channel. Deinterleave each channel block to LRLR samples before host playback.
-- `MPEG.cpp` now preserves guest callbacks while also streaming supported PCM through raylib. Kill with `DC2_G384_NO_MPEG_AUDIO=1`; trace with `DC2_G384_MPEG_AUDIO_TRACE=1`.
+- G393 implements the ADS/SS2 format rule used by FFmpeg: codec 1 is planar PCM16LE; every
+  non-1 codec value is planar-interleaved Sony PSX ADPCM with predictor history per channel.
+  A direct ISO census found all 53 retail DC2 PSS entries use codec 1 (48 kHz, stereo,
+  0x200-byte channel interleave), so PSX ADPCM is generic completeness rather than a changed
+  DC2 retail route. Kill only G393 ADPCM with `DC2_G393_PCM_ONLY=1`; decoder proof:
+  `DC2_G393_MPEG_AUDIO_SELFTEST=1` (4/4).
+- `MPEG.cpp` preserves guest callbacks while streaming supported PCM/ADPCM through raylib.
+  Kill all host FMV audio with `DC2_G384_NO_MPEG_AUDIO=1`; trace with
+  `DC2_G384_MPEG_AUDIO_TRACE=1`.
 
 ### 13. Gameplay SFX and Sequenced BGM (G385)
 - DC2 SIF DMA sends Sony `.HD` metadata and `.BD` VAG bodies; EZMIDI `SetHD` associates the pair with a sound port.
@@ -237,6 +304,65 @@ Each row: reference dump → exact input route → harness → re-check triggers
 - BGM `SetSq` payloads start with `SCEISequ` and use variable-delta MIDI-like channel events plus Sony loop markers. G385 renders the captured sequence against its HD/BD instruments and loops the PCM through one host stream per port.
 - Kill with `DC2_G385_NO_GAME_AUDIO=1`; trace with `DC2_G385_AUDIO_TRACE=1`.
 - Voice uses a separate `ezBgm@0x28AE20` RPC service (SID `0x12345`); G386 implements that path.
+- **A bank body is NOT one DMA transfer (G387).** Large `.BD` payloads arrive as several
+  consecutive transfers on the audio DMA descriptor. Concatenate them and let `SetHD`'s requested
+  `bodySize` select the chunk-aligned run; capturing only the first transfer silently loses the
+  whole bank and yields a BGM stream that plays perfect silence. Diagnostic:
+  `[G385:bank] commit-miss` with `requested` > `pending`. Kill `DC2_G387_NO_BD_CHUNKS=1`.
+- **Silent-BGM oracle:** `[G385:bgm] committed ... notes=N misses=N` (all notes missed) means the
+  bank at that port is missing/empty — look upstream at bank capture, never at the renderer.
+- **SFX voice allocation (G390).** A `FD 10` MODMSIN message with velocity 0 is a **key-off** — do
+  not play it (it was 98% of all `[G385:sfx] resolve-miss` lines). `PS2AudioBackend` allows 24
+  concurrent sounds (SPU2 per-core voices), lets a bank sample retrigger over itself, and never
+  applies the duration-based "this is BGM, stop everything" branch to bank samples (key
+  `0x01000000 | slot<<16 | vagIndex`). Kill `DC2_G390_LEGACY_SFX=1`.
+- **Audio volume scales (G389).** EZMIDI port volume (`ezMidi(port|0xb0, v)`) is **0..0x100**:
+  `sndSetPortVol__Fif@0x18D420` computes `f*127`, then `SetVol__6CSoundFii@0x18A2C0` multiplies by
+  `256/127` unless the value is the `0x100` unity token. Divide by 256, never 127. That port gain
+  attenuates SFX one-shots as well as the sequenced stream. Voice is a separate scale:
+  `sndStreamSetVol__Fff@0x190410` packs `f*32767` per channel into `ezBgm(port|0x80, L<<16|R)`.
+  Kill `DC2_G389_LEGACY_MIX=1`.
+- **One bank can serve several ports (G388).** `SetHD` carries `(hdAddr=arg1, bdAddr=arg2,
+  size=arg3)`; DC2 repeats the same triple for a second port (SFX port + battle-BGM port) without
+  re-uploading. The last commit is cached by that triple and re-bound (`commit-alias`).
+  `commit-miss pending=0x0` ⇒ unknown identity (G388 shape); `commit-miss pending>0 chunks>1` ⇒
+  capture gap (G387 shape). Kill `DC2_G388_NO_BANK_ALIAS=1`.
+- **A one-shot needs a VOICE, not a `Sound` (G391).** Envelope, loop, pan and key-off were four
+  symptoms of one cause: `PS2AudioBackend::play()` is fire-and-forget. DC2 bank SFX now run through
+  a 24-voice 44.1 kHz mixer (`ps2_audio_parts/dc2_g391_sfx_mixer.inc`).
+  - **Sony `.HD` sample parameter is 42 bytes**: `+0` vagIndex(u16), `+2/+4` velocity range,
+    `+11` baseNote, `+12` detune, `+16` volume, **`+18` ADSR1**, **`+20` ADSR2** (LE, SPU2
+    semantics). Pan is `split+17` and `programParam+7` (`0x40` = centre). Verify with
+    `DC2_G391_HD_DUMP=1`; reading ADSR one byte lower yields `Ar=0x7f` for everything (the tell).
+  - **MODMSIN hs message = `FD <sub> 00 <key> <id> <value> <extra>`**: sub `0x10` play
+    (`value` = velocity; `value == 0` is `SE_Stop`'s key-off), `0x00` SetVol, `0x01` SetPan,
+    `0x02` SetPitch (14-bit `value | extra<<7`). `F9 01 <v>` is the channel volume; **`F9 00 <v>`
+    is still unidentified and is NOT pan** (0..0x48, never 0x40).
+  - **Reverb is guest-driven**: `SetReverb__6CSoundFiii@0x188940` → `sceSdRemote` `0x8130`
+    (`mode|0x100` at attr+4), `0x8070` core|2 (enable), `0x8010` core|0xb80/0xc80 (echo volume =
+    `depth<<8`). Captured in `Kernel/Stubs/Audio.cpp`. The tail network is an approximation; the
+    routing is not. BGM does not pass through the mixer, so it takes no reverb send.
+  - **Never peak-normalise a rendered sequence** — relative track loudness is composed data. One
+    fixed bus gain (0.85) + soft knee.
+- **SE parameter stream order (G392, corrects G385/G391).** `sndSePlaySeID(id, seNo, prio, vol,
+  pan=0x40, pitch=0x2000, ...)` -> `sndSePlayPrKr` -> `sndSePlayPBPrKr@0x18F350` -> `SE_Play`,
+  which emits `F9 00 <vol>`, `F9 01 <pan>`, `F9 02 <pitch14>`, then the `FD 10` key-on. **`F9 01`
+  is the PAN, not the volume** — G385 had them swapped, so every bank SFX was scaled by its pan
+  (~0.5) and its real volume was dropped. Oracle: the `F9 01` stream is 0x40-heavy (66/131 exactly
+  centre); `F9 00` never hits 0x40. Kill `DC2_G392_LEGACY_SE_MIX=1`.
+- **BGM shares the SFX bus (G392).** Sequenced BGM is a source inside the G391 mixer (it renders at
+  44.1 kHz = bus rate), so it takes the same reverb send the hardware would give it and the whole
+  mix passes one soft limiter. Kill `DC2_G392_NO_BGM_BUS=1`.
+- **Cold-title BGM ordering (G394).** `TitleLoop@0x29FFA0` stops the old BGM before loading and
+  playing its replacement, but the older zero-volume/Stop pair can arrive after the new Play in
+  the host queue. Suppress only that paired stop inside the replacement's first 100 ms; a mute
+  which survives the window still applies. Roll back with `DC2_G394_LEGACY_ASYNC_STOP=1`.
+- **Reverb is the real SPU network (G392/G393).** Same/different-side IIR + 4-tap comb + 2 all-pass at
+  22050 Hz over a work area; `m*`/`d*` registers are addresses in 8-byte units (= 4 samples).
+  G393 recovered DC2's exact nine register sets and work-area spans from retail
+  `MODULES/LIBSD.IRX` `.data`: ROOM at file offset `0x4278`, then 0x44-byte records through PIPE
+  at `0x4498`. This corrected ROOM taps, the PS2 ECHO/DELAY layouts, and PIPE mapping. These are
+  exact preset inputs; the host floating-point network is still not claimed waveform bit-exact.
 
 ### 14. Voice Streaming (G386)
 - Voice filenames such as `0010665.wav` resolve through 16-byte `SOUND.HD3` entries: name offset, byte size, `SOUND.DAT` sector offset, and sector count. Read only the referenced 2048-byte sectors; do not extract or scan the full 970 MB archive.
@@ -273,13 +399,17 @@ Each row: reference dump → exact input route → harness → re-check triggers
   4-len reimplementation flipped the DA collision push-out → missing chest gem); any stub whose
   real body uses ESADD/dot-3 idioms can carry the same w-lane bug.
 - BIOS pseudo-files such as `rom0:ROMVER` should not be treated as normal host files; missing support can produce noisy fopen/fio errors, but do not prioritize it unless the game actually consumes the result or blocks on it.
-- **No real IOP execution / cooperative IOP scheduler** remains. G385 bypasses the absent
+- **No R3000A/IRX execution / cooperative IOP scheduler** remains as a general architecture gap.
+  G385 bypasses the absent
   EZMIDI/MODMIDI modules for captured Sony HD/BD SFX and SQ BGM, and G386 bypasses EZBGM
-  for captured WAV voices and their completion state. The exercised audio routes are no
-  longer blocked by this gap. Current upstream main
-  has a `ps2xIOP` runtime, but the local fork predates that refactor; upstream PR #154 extends
-  SoundDriver RPC/status HLE without providing sample rendering. Integration needs a dedicated
-  phase and may pull recomp-side changes. G384 separately bypasses this for PCM embedded in FMVs.
+  for captured WAV voices and their completion state. Current upstream `ps2xIOP` is itself HLE:
+  its README explicitly says it does not emulate the R3000A, load IRX files, or execute IRX
+  code. Upstream PR #154 parametrizes SoundDriver RPC/status HLE; it does not add guest IOP
+  execution or sample rendering. Therefore merging it cannot close this architectural gap.
+  All tracked Audio routes are nevertheless implemented: G384/G393 handle PSS audio, G385/G386
+  handle gameplay/voice protocols, G393 statically recovered retail libsd reverb tables, and
+  G394 protects replacement BGM from an older queued zero-volume/Stop pair.
+  Do not carry this general runtime limitation as an open Audio issue.
 - **No cooperative thread scheduler ABBA-safe wait helper** → threading deadlock/starvation at
   thread hand-offs (F49.5/F50 class). Partial fix APPLIED (lightweight post-wake yields in
   SignalSema/SetEventFlag/WakeupThread/ReleaseWaitThread). Fix reference: upstream #120
@@ -289,7 +419,9 @@ Each row: reference dump → exact input route → harness → re-check triggers
   (DC2's skinned models use recompiler-inline COP2 macro ops, not VU0 micro-mode) but would surface
   as wrong physics/lighting on a VU0-micro route. Fix reference: upstream #120 (incomplete upstream,
   don't adopt yet).
-- **IPU/MPEG movie decode/output**: **FIXED (G375/G376/G384)** — FFmpeg-backed video plus host-streamed PSS PCM audio; `RUSH.PSS` video and sound verified against `ref/dumps/fmv.png` and `ref/audio/fmv0.webm`.
+- **IPU/MPEG movie decode/output**: **FIXED (G375/G376/G384/G393)** — FFmpeg-backed video plus
+  host-streamed PSS PCM/PSX-ADPCM audio; `RUSH.PSS` video and sound verified against
+  `ref/dumps/fmv.png` and `ref/audio/fmv0.webm`.
 - **GS VRAM addressing is bespoke per-fix, not consolidated** — not a defect (DC2's GS is correct,
   heavily validated G2-G52) but a maintenance divergence from upstream #132. Do NOT splice #132
   wholesale (would overwrite G3/G5 swizzle/CLUT/RTT/Z/costume fixes); mine only a specific proven
@@ -324,7 +456,9 @@ Each row: reference dump → exact input route → harness → re-check triggers
 - **`ps2_stubs` & Memory Card Stubs**: Hand-written stubs (`sceMcGetInfo`, `sceMcGetDir`) in `Kernel/Stubs/` audited against R5900 EABI `$t0–$t3` integer arg layout.
 - **Float Saturation**: Host float division replaced with `copysignf(INFINITY, ...)` in `tools/fix_cop1_ps2_float.py`.
 - **Upstream PS2Recomp PR References**:
-  - **PR #135**: New IOP CPU/kernel/loader + cooperative scheduler.
+  - **PR #170**: `ps2xIOP` HLE refactor; explicitly no R3000A emulation or IRX loading/execution.
+  - **PR #154**: SoundDriver RPC/status HLE parametrization; no sample renderer or IRX execution.
+  - **PR #135**: Recompiler reachable-function generation; not an IOP CPU/scheduler.
   - **PR #120**: Cooperative thread scheduler ABBA-safe wait helper (`waitWithGuestExecutionReleasedUntilUnlocked`).
   - **PR #132**: GS VRAM addressing consolidation.
   - **PR #128**: Recompiler indirect-jump (JR/JALR) fallback codegen + Rabbitizer formatting.
