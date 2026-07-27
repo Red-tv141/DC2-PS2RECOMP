@@ -164,10 +164,18 @@
      mode-specific output signature. Input timing and dump-frame numbering may use different clocks.
    - Run internal CPU/GPU or texel oracles when available, then separately inspect normal downstream
      composition over multiple frames. Local oracle success does not prove temporal presentation.
+   - When a hardware/PCSX2 reference exists, record its path, exact route/tick, and expected landmarks
+     across the whole screen (including edges/background). Compare candidate, kill/control, and the
+     rebuilt final default at the same point; aggregate pixel counts alone are insufficient.
+   - Test both a fresh-process first eligible batch and a warmed long run. A special GPU branch that
+     accidentally inherits a prior texture/sampler/mode state can pass only after warm-up.
    - Compare candidate/control on the same binary with repeated interleaved steady windows. Split
      inclusive timers into body/wait/flush children before naming an optimization target.
-   - A new presentation regression blocks promotion. If its repair needs a new ownership mechanism,
-     leave the arm default-off, retain diagnostics, and record a focused follow-up instead of widening.
+   - If presentation regresses, hold the route/tick fixed and bisect candidate kill → stack master
+     kill → architecture-family kill → per-slice kills. A shipping-default regression blocks
+     promotion even when it predates the candidate. Repair a bounded state/edge fault in-phase; if
+     the repair needs a new ownership mechanism, default-disable/revert the culprit, retain focused
+     diagnostics, and record the follow-up instead of widening.
 
 5. Write game overrides following `examples/game-override-template.cpp`.
 

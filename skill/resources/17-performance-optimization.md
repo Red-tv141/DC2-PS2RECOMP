@@ -7,7 +7,7 @@
 
 ---
 
-## §1 Doctrine — The Three Laws
+## §1 Doctrine — The Four Laws
 
 1. **Correctness before speed.** Never optimize a subsystem with an open correctness bug in it.
    An optimization changes timing and code shape — it will smear the evidence you need for the bug.
@@ -18,6 +18,10 @@
 3. **Behavior-identical, verified.** After every optimization, re-run the golden baseline
    (e.g. the title-screen pixel metric, a `.gs` capture diff, the phase regression checks). An
    optimization that changes ANY output is a correctness change in disguise — revert or gate it.
+4. **Re-profile the current executable.** Every promoted phase changes the cost graph. Treat an
+   older phase's "next hotspot" as a stale hypothesis until the current Release binary reproduces
+   it. Measure event frequency and exclusive cost, then compute the maximum plausible payoff before
+   designing an architectural mechanism.
 
 Every performance change follows the same Verification Ladder as a fix (`10-agent-guardrails.md` §4):
 write → build → run → **compare output metric AND time metric** → record in `PS2_PROJECT_STATE.md`.
@@ -46,10 +50,89 @@ write → build → run → **compare output metric AND time metric** → record
   dependency barrier. Add child timers around the suspected body and each wait/flush before
   optimizing the caller. A real 155 ms "image upload" bucket contained <=10 ms of CT32 writing
   and ~145 ms of pending graph execution.
+- **Never NAME a residual.** Deriving a sub-term by subtraction (`bucket = parent − childA − childB`)
+  and then giving it a semantic name ("serial parse/register-replay") silently assigns it everything
+  the child scopes did NOT cover — including flush cascades, backend waits, and deswizzle nested
+  inside OTHER children. A residual is only an upper bound on "unmeasured"; before selecting it as
+  an optimization target, bracket the alleged body DIRECTLY with its own scope and reconcile
+  against the parent. (DC2 G333→G335: a "~40 ms serial parse/replay/build" residual drove an
+  arc-level decision; direct scopes later measured the real parse+build at ~13 ms — the other
+  ~35 ms was the upload-edge flush cascade nested inside an `image` child bucket.)
 - **Charge deferred work to its producer, not the call that happens to pay it.** The first later
   inline draw/line/upload can inherit the cost of earlier queued primitives. Pair timing with a
   steady-window coverage counter for the alleged payload. If the payload count is zero after the
   scene transition, its callsite timing is attribution noise, not an optimization target.
+- **Instrumentation inflates the absolute frame; use it for RELATIVE attribution only.** A run with
+  the full profiler/stat gates on can be ~2× the lean frame (measured: ~200 ms instrumented vs
+  ~90 ms lean on the same route), while a single event's own timer is unchanged (a ~230 µs composite
+  reads ~230 µs in both). Never compare an instrumented-run absolute against a lean-run target or a
+  promotion gate, and never quote instrumented frame ms as "the frame." Take the payoff A/B on the
+  leanest config that still distinguishes the arms, and use the heavy profiler only to attribute
+  shares. (A prior arc repeatedly re-derived pole absolutes from instrumented runs and had to add a
+  standing "profiler adds ~24 ms/f, relative attribution only" caveat.)
+- **A profiler-run bucket can be MOSTLY the profiler — hypothesis-test the instrument itself
+  before chasing the bucket.** Even a "cheap" per-event counter block (one relaxed atomic
+  fetch_add + a static tick, under a correctly cached master perf env) measured **~855 ns/event**
+  on a worker hot path; at ~15k events/frame that fabricated a ~12.6 ms/f "pole sub-term" which
+  survived TWO rounds of narrowing (an inclusive per-event timer split, then a dead-code
+  skip-branch that came back neutral) before a segment census re-run **with the master perf env
+  OFF** collapsed it to 25 ns/event (real path ~119 ns/event). The decisive, cheap move: re-run
+  the SAME fine-grained census with the coarse profiler env removed — if the bucket collapses,
+  it was self-cost. Corollaries: (a) attribute buckets only from instruments whose own per-event
+  cost you have bounded — per-flush/per-window scopes are fine, per-draw/per-call scopes are
+  suspect; (b) never design an architecture slice off a bucket that only exists under the
+  profiler env; (c) arm-vs-arm A/B under a constant instrument set remains valid — both arms pay
+  the self-cost. (DC2 G312: the "31 ms/f register-replay/draw-capture pole term" did not exist
+  lean; the real remaining term was a serial upload-deswizzle loop a third its size.)
+- **A census lever can DISABLE the mechanism it censuses — grep the lever's `On()` gates for
+  cross-disables before premise-gating anything measured under it.** Some "behavior-pure" census
+  flags keep themselves pure by turning OFF an optimization while armed (e.g. a coalescing lever
+  whose gate includes `!censusOn()`). A cost measured under such a census describes a world
+  WITHOUT the optimization: the bucket can be several times its lean size even though the census
+  adds no timing self-cost. This is sneakier than profiler self-cost — the number is a real cost,
+  just of the wrong binary. Decisive check: re-measure the target bucket with the minimal,
+  behavior-pure instrument set only. (DC2 G337: a "~16 ms/f Z round-trip" premise was measured
+  under a census env whose gate silently disabled the Z-readback coalescer; the lean class was
+  ~2–3 ms and the built mechanism landed neutral.)
+
+### Optimization Premise Gate
+
+Pass this gate before implementing a performance phase:
+
+0. **Attribute every bucket to its THREAD before ranking anything.** In a 2+-thread pipeline the
+   frame is max(threads), not sum(buckets): a table of real, correctly-measured costs still
+   mis-ranks the frame if all its rows live on a non-critical thread. Get each thread's
+   CPU-time/frame (`QueryThreadCycleTime`-class) plus its wall share; only buckets on the max()
+   thread — or the max() thread's *wait* slice — are frame-time levers. High onCPU% on the
+   critical thread also excludes condvar-based backpressure as an explanation for its hot
+   buckets. (DC2 G293/G294 spent two phases on worker-side readback costs whose true frame
+   ceiling was the EE thread's 3–8 ms wait slice; the actual pole — the VU1 interpreter at
+   72–74% of the frame — was absent from the table because no instrument attributed the
+   critical thread's own compute.)
+1. Profile the **current final executable** with the intended defaults, route, warm-up, and steady
+   window. Do not reuse a pre-fix profile as the phase premise.
+2. Split inclusive buckets until the candidate's exclusive cost is known. Record waits, drains,
+   readbacks, and publication separately.
+3. Compute a payoff ceiling: `events/frame × exclusive cost/event`. If even deleting the candidate
+   cannot meet the phase's payoff target, stop and re-rank the architecture.
+   - **A high event COUNT is not a cost until you multiply by per-event exclusive TIME.** A profile
+     line or internal counter that says "N per frame" (drains, composites, flushes, uploads) is a
+     frequency, not a bucket. Measure one event's synchronous time first. A real instance: a logical
+     "576 full recomposites / 1,024 waves" sounded like the dominant inefficiency, but each composite
+     was ~230 µs — well under 1.5 % of the frame — so its entire deletion ceiling was below target.
+     The count was scary; the time was nothing.
+   - **A delta/incremental replacement of a batched op must be censused for changed-fraction AND
+     round-trip count first.** Before building "refresh only what changed," histogram how many
+     sub-units actually change per refresh. If the source regenerates wholesale every frame there is
+     *no temporal coherence to exploit* (measured: ~107 of 128 pages changed every refresh, zero
+     no-ops), and the incremental path does the same work while fragmenting one batched
+     backend job into many synchronous `future.get()` round-trips — it is exact but *slower* (306 µs
+     vs a 230 µs single composite pass). When a whole surface rebuilds each frame, one batched pass
+     beats N per-unit updates. Incremental only pays with real coherence or a truly async transport.
+4. Count downstream consumers before building residency, async, or deferred-publication machinery.
+   A mechanism that moves work to another edge is not a win.
+5. Record the rejected premise in the phase log, including the build/defaults that invalidate the
+   old measurement. Diagnostics-only closure is a valid phase result.
 
 ---
 
@@ -59,7 +142,7 @@ Check these IN ORDER — the cheap wins come first. Confirm each with the profil
 
 | # | Hotspot | Symptom / check | Fix direction |
 |---|---------|-----------------|---------------|
-| 1 | **Leftover diagnostic logging** | `printf`/`fprintf`/`std::cout` in a per-frame, per-draw, per-call path; console I/O shows in profile | Delete or env-gate. Format+flush per call is brutally slow. An uncapped *counter* is fine; a per-hit *printf* is not. |
+| 1 | **Leftover diagnostic logging** | `printf`/`fprintf`/`std::cout` in a per-frame, per-draw, per-call path; console I/O shows in profile | Delete or env-gate. Format+flush per call is brutally slow. An uncapped *counter* is fine; a per-hit *printf* is not. **Also: DISABLED probes are not free at scale** — dozens of cached-bool-gated probe blocks accumulated over many debug phases in one hot loop still pay their pc/state compares and branches every iteration. Wrap the whole pile behind ONE master "any diagnostic active this run" flag (probe envs OR'd once at entry) with the legacy interleaved body kept byte-identical as the kill-switch arm; require new probes to register in the master list. DC2 G295: gating ~20 dormant probe regions in the VU1 interpreter loop (+ skipping a redundant save/restore) cut the interpreter ~28% and the frame −12%. |
 | 2 | **Per-call `getenv()` in env-gated diagnostics** | An env-gated probe (`if (envFlagEnabled("X_TRACE")) …`) sits in a per-vertex/per-draw/per-tag path WITHOUT a `static const bool` cache. Does NOT show as I/O — the µs-class `getenv` (env lock + linear scan on Windows CRT) hides inside the caller's inclusive time, and worker/replay threads SERIALIZE on the CRT env lock. Check: grep hot files for `getenv`/`envFlagEnabled` calls not feeding a `static const` initializer; census per-callsite ns (a cheap handler at 25 ns vs a sibling at 5,000 ns whose only extra feature is an uncached env check = the tell). | Read once into `static const bool` (magic statics are thread-safe); keep an opt-in lever that restores per-call reads as the same-binary A/B control. Real-world cost: ONE uncached line in a per-vertex kick path cost **41% of the whole frame** and masqueraded for four phases as an architectural "parse/dispatch" bucket (DC2 G268) — profile-bucket names lie; census per-descriptor/per-callsite before designing an architectural fix for a bucket. |
 | 3 | **Debug/unoptimized build** | You're not on `Release`; iterators/asserts in profile | Verify `CMAKE_BUILD_TYPE=Release` (Ninja: baked at configure; VS generator: `--config Release`). Never "fix" perf while accidentally profiling Debug. |
 | 4 | **Guest memory access macros** | `READ32`/`WRITE32`/`READ128` etc. dominate samples — every guest access masks + bounds-checks + MMIO-routes | Fast-path the common case (plain RDRAM range) before the MMIO check; keep the MMIO route for `0x10000000+`/`0x12000000` only. Behavior-identical by construction — still A/B it. |
@@ -169,8 +252,11 @@ reaching the measured EE-bound ceiling. The contracts that made it work:
 6. **GL threading:** create the persistent GPU thread's shared context with the
    release-before-share dance (release the main context, `wglCreateContext` + `wglShareLists` on
    the new thread, restore main) — `wglShareLists` fails `ERROR_BUSY` while either context is
-   current anywhere. Submit batches synchronously (blocking future) from whichever thread owns
-   the flush; the queue serializes context access.
+   current anywhere. Keep blocking submission as the correctness baseline until exclusive submit
+   time proves it can pay. Removing a `future.get()` is not an async design: the submitted batch
+   must own immutable storage until completion, and residency/depth/publication commit, rollback,
+   and presentation must remain ordered behind a completion fence. A reused/static front-end batch
+   or immediate post-submit commit makes a queue-only wrapper unsafe.
 7. **Soak detectors need a control arm.** A median-based chroma/brightness grid scan over a
    dense per-tick dump flags the game's OWN fade/lighting animation too — run the identical scan
    on a same-length default-path control and compare PROFILES: isolated few-tick bursts in
@@ -210,12 +296,54 @@ whole-batch CPU fallback. Use this protocol:
    older version.
 4. **An internal oracle does not prove final composition.** Batch-local CPU/GPU equality can pass
    while a downstream consumer sees the wrong temporal version. Gate promotion on normal composed
-   frame dumps/window output across transitions and multiple routes. If character parts, terrain,
-   shadows, or overlays disappear, keep the behavior default-off even when timing improves.
-5. **Bound repairs by architecture.** Repair a missing edge or narrow proof in-phase when evidence
-   identifies it. If correctness needs a new ownership/versioning mechanism, revert the unsafe
-   behavior or keep it opt-in, preserve diagnostic counters, name the exact consumer blocker, and
-   open a focused follow-up phase.
+   frame dumps/window output across transitions and multiple routes.
+5. **Make the presentation gate reference-backed.** When hardware/PCSX2 reference images exist,
+   record the exact reference path, route state marker, capture clock/tick, and a landmark checklist
+   covering the whole image — including left/right edges and background geometry, not only the
+   central subject. Capture the candidate, its kill/control, and the rebuilt final default at that
+   same point. Aggregate pixel counts, chroma grids, and local oracles are supporting evidence; they
+   can miss a large spatial composition defect.
+6. **Test fresh first-use state separately from warmed state.** Start a new process and verify the
+   first eligible GPU batch, then run the long oracle/soak. A special backend branch must submit
+   every texture, sampler-completeness, combine, wrap, and mode state it reads; it must not inherit
+   state from a prior draw. A batch-1-only failure is still a promotion blocker.
+7. **Bisect a presentation regression through the control hierarchy.** Hold route/tick/reference
+   fixed and test: candidate kill → native-stack master kill → architecture-family kill → individual
+   promoted-slice kills. This distinguishes a new regression from an older default-on defect exposed
+   by the current review. Either way, a defect in the shipping default blocks promotion. Re-test the
+   rebuilt default with no diagnostic kill flags after retiring the culprit.
+8. **Bound repairs by architecture.** Repair a missing state submission, edge, or narrow proof
+   in-phase when evidence identifies it. If correctness needs a new ownership/versioning mechanism,
+   revert the unsafe behavior or keep it explicit opt-in, preserve only diagnostics needed for the
+   named blocker, and open a focused follow-up phase.
+9. **Separate mechanism proof from payoff proof.** Fewer flushes, readbacks, fallbacks, or uploads
+   prove that the intended edge moved; they do not prove the frame became faster. Require both the
+   mechanism counter and a separated end-to-end frame-time result.
+10. **Use same-executable, reverse-order A/B.** Prefer cached default-off/kill switches in one binary,
+    use the same route and warm-up, collect at least three steady windows per arm, then reverse arm
+    order. Report ranges as well as means/medians. Overlapping arms or a sign change under reversed
+    order is inconclusive, not a win. Any downstream presentation regression blocks promotion even
+    if pooled timing improves.
+11. **Retire failed behavior safely.** Default-disable or revert correctness-invalid behavior.
+    Preserve an explicit opt-in only when it is required to reproduce or measure a named follow-up;
+    otherwise remove its flags, helpers, and behavior-only counters. Keep small cached diagnostics,
+    document the exact blocker and next mechanism, and prevent accidental re-promotion.
+12. **Validate a derived/incremental surface against a freshly-recomputed authoritative reference,
+    not against the path you are replacing.** When an incremental update maintains a surface a
+    batched recompute would otherwise produce, the exact oracle is: build the incremental result,
+    force a full recompute of the SAME inputs into a scratch target, read both back, compare every
+    pixel. Keep it self-contained (own scratch resource, own gate) so it neither perturbs the
+    shipping publication/materialize path nor depends on its side effects. If a prior phase already
+    proved the full recompute equal to the real downstream, this transitively certifies the
+    incremental one. `bad==0` over hundreds of millions of pixels is the promotion floor — it proves
+    two internal surfaces are equal, NOT that either is presented correctly, so it never replaces
+    normal-composition review.
+13. **Before building a scheduled mechanism, grep for it — a prior phase may have left it built and
+    disabled as substrate.** Residency/alias/wave/delta machinery is often committed default-off with
+    a kill or an `Initialized`/`On` gate as a stepping stone. Enabling and *measuring* existing
+    substrate (then closing it exactly with the premise gate) is far cheaper than re-deriving it, and
+    is what the phase actually asks for. Read the gate that disables it: it usually encodes the exact
+    reason the prior phase judged it not-yet-payable.
 
 ---
 
@@ -241,6 +369,11 @@ For every accepted optimization, one line in `PS2_PROJECT_STATE.md → Learned P
 `<hotspot> cost <N>% frame time, fixed with <what>, FPS <before> → <after>, baseline metric unchanged`.
 If it changed an output metric even slightly: it is NOT an optimization — reclassify as a behavior
 change and route it through the normal fix taxonomy.
+
+For every rejected optimization premise, record the current-binary profile, payoff ceiling,
+mechanism counters, reverse-order A/B distribution, normal-presentation evidence, prototype
+disposition, and focused next mechanism in the phase fix log. Never summarize an internal counter
+reduction as a performance win.
 
 Cross-refs: verification ladder `10-agent-guardrails.md` §4; lever/kill-switch doctrine
 `15-vu1-gs-debugging.md` §5; lock model `16-runtime-concurrency-threading.md`; SIMD note

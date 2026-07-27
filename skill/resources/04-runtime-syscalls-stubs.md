@@ -121,3 +121,78 @@ PS2_REGISTER_GAME_OVERRIDE(
 ## 6. Vectorization and SIMD Intrinsics
 PS2 math relies heavily on 128-bit vectorization.
 The runtime expects heavy use of SSE/AVX intrinsics (`_mm_add_epi32`, `_mm_mul_ps`) when manually replacing VU0/MMI geometry calculations. Do NOT write naive scalar loops for math-heavy stubs; it will destroy frame rates.
+
+### 6.1 SDK VU0-helper stubs: match the MICROCODE semantics, not the C signature (DC2 G233)
+
+When reimplementing a `sceVu0*` / libvu0-style helper as a runtime stub, derive the math from
+the original VU0 macro-op body (disassembly / `ref/assembly.txt`), never from what the C
+prototype "obviously means". The killer class is the **w lane**:
+
+- `sceVu0Normalize(out, in)` is a **3-component** normalize: `ESADD P, vf` sums **x²+y²+z²
+  only**, then `VMULq` scales all four lanes by `1/sqrt(P)`. A plausible 4-component
+  reimplementation is silently wrong for any input whose `w != 0` — and inputs routinely carry
+  `w=1` because they were produced by point subtraction (`P1 - P0` with both w=1... gives w=0,
+  but `point - vec` or a matrix-transformed point gives w=1).
+- Consequence example (DC2, missing chest gem, ~8 phases of triage): a capsule-collider
+  push-out normalized a radial vector with leftover w=1; `len4 = sqrt(len3²+1) > 1`
+  under-scaled the "unit" direction, so the push-OUT became a pull-IN — the physics chain
+  converged INSIDE/behind the collider. The symptom surfaced three layers away as a Z-culled
+  mesh.
+- Audit heuristic: grep the original body for `ESADD`/`VOPMULA`/dot-3 idioms; any stub whose
+  real body uses them must ignore w in the length/dot even though the memory operand is a vec4.
+  Also mind that real `VMULq` scales the w lane too — write all four output lanes.
+- A collision/constraint "push-out" that under-normalizes its direction becomes an
+  **attractor** (pull-in). Signature in the data: free vertices stably offset toward the
+  collider axis/backside, kinematically pinned vertices healthy, all struct constants
+  byte-identical to the reference emulator.
+
+#### 6.1b The stub's ABI is in the DISASSEMBLY, not in the C prototype (DC2 G373)
+
+The worst stub bug is not wrong math — it is reading or writing the **wrong registers**, because
+that fails completely silently.
+
+DC2's double-precision libm stubs were written as `float arg = ctx->f[12]; ctx->f[0] = sinf(arg);`
+— the obvious reading of `double sin(double)`. But the EE has no double precision: `double` is a
+software type in the 64-bit integer GPRs, so the real convention is **argument in `$a0`, result in
+`$v0`** (see `02-mips-r5900-isa.md`). The stub therefore never wrote `$v0`, and every caller
+consumed whatever `$v0` still held — the output of the soft-float conversion immediately before it,
+i.e. the *argument* rather than its sine. A thrown object's `(10·sin θ, 2.5, 10·cos θ)` became
+`(10θ, 2.5, 10θ)`. All eight double libm entries had it; the whole game's double math was wrong.
+
+Checklist for every hand-written stub:
+
+1. Open the guest body and read the **prologue**. Which registers does it actually consume — `$a0..`
+   or `$f12..`? Bit manipulation on `$a0` (`dsra32`, `and 0x7FFFFFFF`, clearing bit 63) means a
+   software float/double in a GPR, never an FPU register.
+2. Find the **return** path. Does the caller read `$v0` or `$f0`? A stub that writes only `f0`
+   when the caller reads `$v0` returns a stale register, and nothing anywhere reports it.
+3. Beware the half-fix: one of these stubs had already been "corrected" to read `$a0` — but as a
+   32-bit *float* and returning through a sign-extending 32-bit helper. A partial ABI guess looks
+   like due diligence and is still wrong.
+4. Mechanical sweep for an existing port: every generated file that is only a `ps2_stubs::` forwarder
+   is a stub whose ABI was chosen by hand. Diff each against its disassembly.
+
+**When a computed value is wrong but nothing crashes and no NaN appears, suspect the ABI before the
+math.**
+
+#### 6.1a Audit the WHOLE family at once — the same bug is never in only one stub (DC2 G372)
+
+G233 above ended with "AUDIT the other `sceVu0*` stubs". That audit sat undone for dozens of
+phases; when finally run against the disassembly it found the *identical* w-lane bug in
+`sceVu0InnerProduct` (a 4-lane dot where `vmul.xyz` + `vaddy.x` + `vaddz.x` is a **3**-lane dot).
+Dot products are more load-bearing than normalize — trajectory, projection, reflection, angle
+tests — and positions carry `w = 1.0`, so every position·position dot was off by a constant `+1`.
+**When you fix one stub in a family, diff the entire family in the same session.** A one-line
+follow-up note is not a fix.
+
+Two more failure shapes the same pass found, both worth checking for directly:
+
+- **Invented "missing argument" fallbacks.** `sceVu0ScaleVector` read the scale from `f12` and, if
+  it was `0.0f`, fell back to reinterpreting `$a2`'s raw bits as a float and then as an int. The
+  real body (`mfc1 t0,f12`) never reads `$a2`. `0.0` is a legitimate value — it is how you zero a
+  velocity — so this corrupted every `v * 0`. If a stub contains a heuristic for "the caller
+  probably meant something else", that heuristic is a bug: the ABI is in the disassembly.
+- **`TODO`/unimplemented stubs that leave their OUTPUT untouched.** A warn-and-return-`-1` stub
+  looks harmless in the log but hands the caller whatever was already in the destination buffer —
+  a stale matrix, not an identity. Grep the TODO stubs for ones with real callers
+  (`ref/functions/<addr>.md` → "Callers") and implement those; a stub with zero callers can stay.

@@ -33,6 +33,10 @@ Mix → host audio output (runtime: ps2_audio.cpp / ps2_audio_vag.cpp / ps2_iop_
 The runtime intercepts either (a) the EE-side library functions (stub level — easier), or
 (b) the RPC traffic itself (protocol level — needed when the game ships its own IOP driver).
 
+Do not assume every audible asset reaches SPU2 as VAG. Custom drivers may stream PCM/RIFF data
+from a sector-indexed disc archive and expose only open/play/state commands to the EE. Identify
+the requested filename, archive index, and payload magic before selecting a decoder.
+
 **First question, always: WHICH driver?** Grep the ISO/IOP module list for the game's sound IRX.
 - Standard `libsd`-family RPC → command codes are documented; runtime can interpret generically.
 - **Custom sound IRX** (very common in big titles) → RPC payload is a private protocol. Generic
@@ -76,6 +80,41 @@ often strip headers and store raw blocks + a separate table.
 
 ---
 
+## §3.5 Custom Voice Streams and Disc Archives
+
+For a private voice RPC, trace one guaranteed spoken-line route end to end:
+
+1. Wrap the real EE stream-open function and record the filename, port, return address, RPC SID,
+   command word, payload pointer, and reply word.
+2. Use the static export to decompile open/play/stop/close/state callers. Record the exact
+   playing value and termination condition used by the event script; do not invent status values.
+3. Search ISO directory entries and small index files before scanning a giant data archive.
+   Validate candidate entry fields against bounds, sector counts, adjacent names, and payload magic.
+4. Decode according to the payload (`RIFF`, `VAGp`, raw ADPCM), not its expected extension.
+5. For PCM, compute completion from decoded frame count / sample rate. Return the guest's playing
+   value only until that deadline, then its completed value, so polling cutscenes can advance.
+6. Keep a same-binary voice kill switch. A control that still traverses the scene proves handler
+   isolation, not that the new handler caused progression; combine it with playback/status traces
+   and user listening.
+
+Read only referenced sectors from large archives. Never extract a near-gigabyte container at
+runtime when a validated index provides byte size and sector offset.
+
+**A bank/sample payload is NOT one DMA transfer.** A body larger than the IOP staging window
+arrives as several consecutive transfers on the same DMA descriptor. If you capture only the
+first, the later "commit this bank of size N" call size-mismatches and the bank is silently
+dropped — the sequencer then runs normally and renders *perfect silence*, which reads as
+"audio works in some levels, not others" (it splits on payload size, not on level). Concatenate
+chunks, remember each chunk's offset, and let the guest-declared size select the chunk-aligned
+run. Whenever a captured buffer is short of a guest-declared size, first check whether the
+shortfall equals a transfer you ignored.
+
+**Silent-music oracle:** log resolved vs missed note-ons per rendered sequence. `misses == notes`
+means the instrument bank is missing or empty — look upstream at bank capture/commit, never at
+the mixer or the host stream (which will happily report "playing").
+
+---
+
 ## §4 The ENDX / Completion Contract (top recurring root cause)
 
 Games poll for "voice finished" to recycle voices and to gate script events:
@@ -91,6 +130,8 @@ allocator is exhausted (sound cuts out after N plays) or an event script parks f
 - KOFF → enter release; ENDX per hardware semantics (verify in ps2tek).
 - Reading ENDX clears it (read-acknowledge) in real HW — match what the game's polling loop
   expects (check the decompiled poll site in the static export before assuming).
+- Private stream RPCs may use an engine-specific state word instead of ENDX. Derive that exact
+  value from the guest poll site and clear it when decoded duration expires.
 
 ---
 

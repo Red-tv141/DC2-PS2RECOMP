@@ -69,6 +69,10 @@ cmake --build D:\ps2r\dc2\build64 --config Release --target dc2_runner -- /m:1 /
 - Build via the **PowerShell tool**, NOT Bash `cmd /c` (the latter silently no-ops → stale exe).
 - **Verify a change landed in the binary:** `grep -c <marker> build64/Release/dc2_runner.exe`.
 - Benign link warnings only: `LNK4006` (getGameName) + `LNK4088` (/FORCE). Anything else = real.
+- **SelectedFiles static-library trap (G395):** `/p:SelectedFiles=...` on the `dc2_game`
+  static-library target rebuilds the archive with only the selected object. It is not a safe
+  incremental library build. Prefer the normal explicit Release target. If a surgical compile
+  is unavoidable, repack all Release objects and verify the archive member count before linking.
 - **`build_rt.bat` / `build_runner.bat` wrapper trap (bit a session hard):** they redirect all build
   output to `build_out.txt` / `runner_out.txt` respectively and end with `echo BUILD_EXIT:%ERRORLEVEL%`.
   So the batch's OWN exit code is the `echo`'s (**always 0**) — a PowerShell `$LASTEXITCODE` after
@@ -100,7 +104,77 @@ powershell -ExecutionPolicy Bypass -File D:\ps2r\dc2\tools\run_30s_diagnose.ps1
 > headless test pattern here (the skill's "never redirect output" prohibition is about *build*
 > output, not these run logs).
 
-### Current DC2 operating snapshot (2026-07-16, post-G273 — see ROADMAP for live status)
+### Current DC2 operating snapshot (2026-07-18, post-G287 — see ROADMAP for live status; G288–G291 in ROADMAP only)
+
+**G343 durable lesson (2026-07-23):** a materialize READBACK can double as the FBO⇄VRAM snapshot
+publication. Eliding an "overwritten anyway" readback (exact, row-verified, visually identical)
+can still REGRESS the frame because the next GPU wave must re-establish the invalidated snapshot
+from VRAM (pack + upload of ~the same rows) — readback⇄upload conservation. Before eliding any
+publication edge, count BOTH sides of FBO⇄VRAM coherence: who reads the published bytes AND who
+depends on the snapshot staying valid. Census: `DC2_G343_CENSUS` (l2l per-shape TIME census with
+payer target `hit=`); lever kept default-off: `DC2_G343_L2L_EXACT`.
+
+**G291 durable lessons (2026-07-18):** (1) When a residency lever is neutral, attribute the
+relocation to NAMED consumer shapes (`[G279:mat]` cause + `[G266:texShape]` tuple census)
+before designing the next slice — G290's "synchronous transfers" framing was wrong in detail;
+the cost was ~89% tex-alias materializations with three exact shapes. (2) A read-triggered
+materialize can be exactly skipped for pages FULLY re-covered by noted uploads since the last
+wave render (VRAM >= FBO by construction; the round-trip is identity) — but the retire only
+pays if EVERY per-frame publishing consumer of the target is retired; one whole-window
+publisher collapses it (skip merely reorders who pays). (3) Early-capped bring-up prints
+(`n<=8`) are NOT evidence a mechanism is inert/active overall — add a periodic aggregate
+counter line before concluding.
+
+**G290 durable lessons (2026-07-18):** (1) `DC2_G290_PROBE=1` is the first per-batch drain-
+execution decomposition (prep/resolve/gpuOk/gpuFail/publish/replay/note + `[G290:gpufail]`
+failing-shape census) — use it before selecting any drain-side perf slice. (2) Eliminating a CPU
+replay bucket is NOT automatically a wall-time win: the admitting GPU wave pays synchronous
+Z-pack/fb-upload/submit that can equal the replay (G290 three arms neutral ~1.0%). Measure the
+wave's own transfer cost before promising the replay's cost as the payoff ceiling. (3) A real
+physical color/Z page alias can still be admissible when the batch structurally proves the
+aliased bytes (leading opaque clear + read-only ZMSK=1 depth → seeded Z window). (4) MAP-2
+tick-2100 hardware comparison is mandatory after ANY native-preparation change (G287/G289 rule,
+re-followed here).
+
+**G287 is default-on:** the recurring exact transient `fbp=0x13b`, `fbw=8` work-page batch now
+binds its decoded PSMT8+CLUT texture, carries TFX/TCC mode, and makes the level-0-only GL sampler
+complete from first use. Final exact oracle: 120/120 zero-error batches (25,559,040 pixels; earlier
+210/210). Corrected-default MAP-0 is 107.71 ms versus 169.24 ms with
+`DC2_G287_NO_TRANSIENT_TARGET=1` (−36.35% frame / +57.1% FPS). Diag
+`DC2_G287_STAT=1`; retained oracle `DC2_G286_VERIFY=1`.
+
+**G284 is retired/default-off:** direct comparison to `ref/dumps/map_2_zoom.png` found its
+upload-edge display-readback coalescing removed the continuous left cliff while its internal range
+counters passed. G287 kill reproduced the defect; `DC2_G284_NO_UPLOAD_COALESCE=1` alone restored
+the cliff. Keep the behavior explicit opt-in (`DC2_G284_UPLOAD_COALESCE=1`) until a later
+consumer/authority mechanism is proven. See `plans/phase-G287-fix-log.md`.
+
+**G280 is built/validated but DEFAULT-OFF (`DC2_G280_ALIAS_VIEW=1`; diag `DC2_G280_STAT` /
+`DC2_G280_VERIFY`):** the backend-native GPU physical-alias page surface/view (GPU→GPU CT32
+64x32 page-tile copies between target FBOs, contentGen versioning, overlay
+restore-before-publish) is exact — 2,328 copies `vfyBad=0`, zero failures — but enabling it
+REGRESSES MAP-0 (3v3 median 177.0 vs 158.9 ms; `mat(cpu) 0→1164`). **Durable lesson: a lever
+that keeps RTT targets dirty longer must first close EVERY same-frame VRAM consumer of those
+pages, or deferred materializations reappear multiplied at worse edges — CPU-vs-GPU resolve
+cost is irrelevant (closes the G267 question). Alias sets must be re-censused per binary
+(0x13c newly live vs G267's 0x146-only era). CT32 tile equivalence must NOT be extended to
+T8/T4/Z without a per-PSM within-page order proof.** Next: G281 T8 swizzle-view of the
+resident CT32 FBO for the censused `0x143←0x13c` consumer. `plans/phase-G280-fix-log.md`.
+
+**G278 is default-on:** compatible same-key G262 waves coalesce Z readback/publication within a
+drain while tracking exact dirty/whole row unions and stale rows. Final MAP-0 improved
+`193.19→174.10 ms` (`-9.88%` frame / `+10.97%` FPS), with `saved=1899 uploadSkip=2373 fail=0
+inv=0`; the full downstream route matrix passed. `plans/phase-G278-fix-log.md`.
+
+**G279 is diagnosis/closed; no behavior remains:** always re-profile after the preceding phase.
+Post-G278 backend submit was only `0.306 ms/submit`, about 17 submits or `~5.2 ms/frame`; the planned
+async-submit slice could not deliver a major win. `DC2_G279_PROFILE=1` instead pinned remaining
+materialization cost to G261/G276 color publication. A range-exact display prototype reduced G276
+flushes `1408→587`, but reverse-order A/B overlapped and one ordering regressed, so every behavior
+flag/helper was removed and only the diagnostic was retained. **G280 targets a backend-native GPU
+physical-alias page surface/view**, first the measured `0x139 + 0x146` CT32 family. Do not revive a
+queue-only `future.get()` removal or the G267 CPU publish/patch experiment.
+`plans/phase-G279-fix-log.md`.
 
 **G273 is default-on:** exact page enumeration for the sole measured aligned display tuple proves
 FBP 0x68 CT32 color pages 104..207 disjoint from ZBP 0xd0 Z24 pages 208+. This removes a false
@@ -176,7 +250,7 @@ archived in `plans/phase-history.md`; do not act on old snapshots of it.
   `ref/dumps/map_0.gs` / `map_0.png`.
 - Parked by user (regression-route only, do NOT investigate during perf phases): Sindain
   inventory circular-viewport noise. Other open residuals: Max foot shadow, G194 DOF wedge,
-  TexAnime L→L width, audio, memcard, FMV.
+  TexAnime L→L width, and memcard. Audio/FMVs are restored through G386.
 
 ---
 
@@ -235,6 +309,42 @@ No real Ghidra, no hands on the pad — tests drive input via env vars parsed in
   and `run_g221_map2_zoom.ps1` now do this by default. Real zoom appears near dump tick 1200 and
   removes Max/HUD; if they remain, the route did not validate zoom. Input `scriptFrame` is not the
   same clock as the `frame_NNNNNN` dump suffix.
+
+---
+
+## §5.5 DC2-Proven Audio Facts (G384-G394)
+
+- **FMV (G384):** DC2 PSS private audio begins with `ff a0 00 00`, then Sony `SShd`/`SSbd`.
+  `RUSH.PSS` uses 48 kHz stereo PCM16LE in planar 0x200-byte channel blocks. Host playback lives
+  in `MPEG.cpp`; trace `DC2_G384_MPEG_AUDIO_TRACE=1`, kill `DC2_G384_NO_MPEG_AUDIO=1`.
+- **FMV codec completion (G393):** ADS codec 1 is planar PCM16LE; every non-1 value is Sony
+  PSX ADPCM with per-channel predictor history. All 53 retail DC2 PSS entries census as codec 1,
+  so ADPCM closes generic format coverage without changing the retail route. Roll back with
+  `DC2_G393_PCM_ONLY=1`; self-test with `DC2_G393_MPEG_AUDIO_SELFTEST=1`.
+- **Gameplay SFX/BGM (G385):** SIF DMA carries Sony HD/BD banks; dead MODMSIN handlers provide
+  program/volume/key-on commands for VAG SFX. BGM payloads start `SCEISequ` and contain
+  MIDI-like events plus Sony loop markers. Trace `DC2_G385_AUDIO_TRACE=1`; kill
+  `DC2_G385_NO_GAME_AUDIO=1`.
+- **Cold-title BGM ordering (G394):** `TitleLoop@0x29FFA0` queues an old BGM zero-volume/Stop
+  before replacement Play, but host ordering can deliver that pair after Play and kill the new
+  generation before its first audible frame. Suppress only the paired stop inside the first
+  100 ms; surviving standalone mute still applies. Roll back with
+  `DC2_G394_LEGACY_ASYNC_STOP=1`; trace with `DC2_G385_AUDIO_TRACE=1`.
+- **Voices (G386):** `StreamOpenFast@0x18AEF0` calls `ezBgm@0x28AE20`, private RPC SID
+  `0x12345`. `SOUND.HD3` contains 16-byte entries `(nameOffset, sizeBytes, sectorOffset,
+  sectorCount)` into `SOUND.DAT`; exercised payloads (`0010665.wav`, `0010670.wav`) are standard
+  RIFF/BWF PCM, mono, 48 kHz, 16-bit. Do not route these through the HD/BD VAG decoder.
+- `sgCPlayVoice::Step@0x304730` treats exactly `0x1000` as playing and completes when state
+  clears. G386 derives the transition from decoded frame count/sample rate; permanent zero or
+  permanent `0x1000` is wrong.
+- Runtime implementation:
+  `PS2Recomp/ps2xRuntime/src/lib/ps2_audio_parts/dc2_g386_voice_audio.inc`; SID routing:
+  `PS2Recomp/ps2xRuntime/src/lib/ps2_iop.cpp`.
+- Deterministic replay: `tools/run_g386_voice.ps1`; `-Control` enables
+  `DC2_G386_NO_VOICE=1`. Trace with `DC2_G386_VOICE_TRACE=1`.
+- Verification: candidate opened/played both recorded clips and completed the first before the
+  bounded run ended; control produced zero G386 events while retaining both guest opens. The user
+  verified voices/cutscenes work and progress. See `plans/phase-G386-fix-log.md`.
 
 ---
 
@@ -446,6 +556,48 @@ Proven fixes and operating facts (some unconditional, some retired, others kill-
   Internal batch/oracle success does not prove final composition: G272 was faster but produced a
   head-only Max through the normal downstream path. G273 promoted only after dense title plus
   normal foliage/light/costume/dungeon and recorded real-zoom MAP2/MAP4 presentation all passed.
+- **Current-binary premise + retirement discipline (G279, durable):** re-profile after every
+  promoted phase, then bound the candidate with `events/frame × exclusive cost/event`. A large
+  internal counter reduction is mechanism evidence only. Require separated same-executable,
+  reverse-order end-to-end A/B plus normal composed-frame inspection. If arms overlap, order changes
+  the sign, or any presentation route regresses, remove the behavior path completely; keep only
+  cached default-off diagnostics, record the blocker, and open the smallest new ownership mechanism.
+- **Presentation-gate blindness + gen-sum slack conventions (G277, durable):** PixelNonZero (and
+  therefore the dense-title gate) CANNOT see a character dropout over an opaque scene — MAP-0's
+  count stayed 211650 while Max's body toggled on half the frames. Any display-color/residency
+  lever must gate on a dense MAP-0 body-presence/content-diff check (frame-to-frame changed-pixel
+  bbox, or a body-box non-grass classifier). Also: `g178BumpRectImpl`/`g178GenSumRect` both use a
+  +1 slack-page convention (write AND read side) — an "exact" gen window is only exact with a
+  slack-free aligned sum, and culled inline prims must not bump (clamped bbox ∩ scissor, G277).
+- **Reference-backed composition + first-use state (G287, durable):** an internal exact oracle can
+  prove the admitted batch and still miss a later temporal consumer; G284's range census passed
+  while MAP-2 lost the whole left cliff. Bind promotion to the exact reference route/tick and check
+  screen edges/background, then bisect candidate/stack/family/slice kills and re-test the rebuilt
+  default. Separately verify the first eligible batch in a fresh process: G286's special exact
+  branch inherited a stale texture/TFX/TCC state, and its first repaired batch stayed black until
+  the level-0-only GL texture's sampler completeness was set explicitly.
+- **Logical/physical framebuffer split + count-is-not-cost (G310/G311, durable):** G310 promoted a
+  persistent 512x512 CT32 logical atlas (display consumers bind one texture; publication-order
+  authority reconstructed by the G309 one-pass compositor) for **−11.29% frame** — the win came from
+  deleting the per-target readback/materialize/T8-publication chain, not from the composite itself.
+  G311 then tried to batch the "576 full composites / 1,024 waves" into page-delta updates and it was
+  a **premise-gate No-Go**: a high per-frame COUNT is not a cost lever until you measure per-event
+  exclusive TIME × changed-fraction. The composite was already **~230 µs** each, and the atlas has
+  **no page-level temporal coherence** (RTT/work sources regenerate every frame → ~107/128 pages
+  change every rebuild, `noop=0`), so the pre-built incremental page-delta path — though **bit-exact**
+  (`DC2_G311_VERIFY` bad=0 / 334.8M px) — fragmented one composite-shader pass into ~5-20 synchronous
+  `future.get()` round-trips and was **slower** (306 µs vs 230 µs), overlapping A/B. Kept default-off
+  substrate `DC2_G311_INCREMENTAL=1`. Durable rule: when the whole surface must be rebuilt every
+  frame, one composite pass beats N page copies; only revive incremental if the sources gain
+  coherence or async submit removes the per-round-trip cost. `plans/phase-G31{0,1}-fix-log.md`.
+- **DC2_PERF self-cost + lean draw path (G312, durable):** the G141 per-draw counter block costs
+  ~855 ns/draw under `DC2_PERF=1` (~12.6 ms/f of GS-worker in every `run_g304_prof.ps1` run);
+  without it the whole drawPrimitive entry→capture window is ~119 ns/draw. Never bucket-hunt
+  inside a `DC2_PERF` run (arm-vs-arm A/B stays valid); use `[G312:seg]` (`DC2_G312_STAT=1`)
+  without `DC2_PERF` for absolute prologue attribution. The drawPrimitive F31..G34 diagnostic
+  pile costs ~17 ns/draw — do not re-attempt a skip-branch lever. Fresh bounded GS-worker term:
+  serial per-pixel IMAGE deswizzle in `GS::processImageData` (~12 ms/f, ~3.9 MB/f) → G313.
+  `plans/phase-G312-fix-log.md`.
 
 ---
 
@@ -506,8 +658,11 @@ Proven fixes and operating facts (some unconditional, some retired, others kill-
 
 ## §8 Upstream PS2Recomp PR ↔ DC2 gap map
 
-The reviewed upstream PRs are a map of features DC2 lacks (`plans/pr_change.md`): #135 (real IOP
-CPU/scheduler → unblocks audio + audio-gated event stalls), #120/#137 (cooperative thread
+The reviewed upstream PRs are a map of features DC2 lacks (`plans/pr_change.md`): #170 refactors
+IOP HLE but explicitly does not emulate the R3000A or load/execute IRX; #154 parametrizes
+SoundDriver RPC/status HLE without sample rendering. G384-G394 already implement the tracked
+Audio routes, while general guest IOP execution remains absent. #135 concerns recompiler
+reachable-function generation, not an IOP CPU/scheduler. #120/#137 cover cooperative thread
 scheduler / ABBA-safe waits → menu→dungeon lock-starvation; VU0 micro-mode; MPEG), #132 (GS
 memory module — **do NOT splice**, would clobber G3/G5 swizzle fixes), #128 (JR/JALR fallback
 codegen — fold at next regen), #131 (more EE/IOP stubs — stub on demand instead). **Adopt

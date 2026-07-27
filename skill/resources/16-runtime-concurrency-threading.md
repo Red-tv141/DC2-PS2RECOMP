@@ -165,3 +165,38 @@ unwind path and is NOT yield-safe by default.** Two real instances in one port (
   (G193: EditInit/Initialize wrappers both printed early; the AssignCamera calls inside
   logged after the wrapper's own exit line).
 
+### §8.1 Third instance + symptom signature + project-wide audit method (G211/G212)
+
+**Symptom signature that routes HERE first:** a computation intermittently produces a
+ZERO/unwritten result (~5–25% of calls) while every input you can capture is byte-identical
+between good and bad calls. "Identical inputs, different output" is NOT a data bug — it is a
+yield unwinding the producer chain before the output store runs (G211: a joint-matrix getter
+returned an exact-zero world matrix ~25% of frames → a character part vanished/flickered;
+five triage phases were spent on data theories first). Confirm cheaply: a global no-preempt
+diagnostic env (if the runtime has one) making the symptom vanish is decisive — but global
+no-preempt is a DIAGNOSTIC, never the fix (it perturbs broader engine timing; measured own
+regressions).
+
+**Fix shape:** preempt-suppress the SHORT output-producing window (matrix/AABB getters and
+similar leaf computations whose caller consumes the result synchronously) — microseconds of
+suppressed preemption, registered as a default wrapper on the entry PC. If diagnostic probes
+can also claim that entry PC, each probe must reproduce the suppression internally (the
+wrapper that replaces the guard inherits the guard's obligation).
+
+**Audit method (run once per port, ~30 min, finds every instance of this class):**
+1. Enumerate every override/probe that calls a recompiled body (`*_0x<addr>(rdram…)`) or
+   emulates a call via `lookupFunction`.
+2. Scan generated bodies for the preemption checkpoint symbol; compute transitive reach a few
+   hops through the generated call graph (in one real port: ~25% of 7.8k bodies have one).
+3. Classify each risky wrapper by what happens AFTER the call:
+   - **tail-call only** → safe by construction;
+   - **post-call read-only (fprintf)** → diagnostic artifact only (see enter/exit rule above);
+   - **post-call MUTATOR** (writes `ctx->pc`/`ctx->r[31]`/guest memory, rewrites the callee's
+     output, or calls a second body) → a live bug unless it suppresses preemption or checks
+     `ctx->pc` first. The G212 audit found a second live instance this way (an `$ra=0`
+     sentinel + unconditional `ctx->pc = ra` stomp over a 3-checkpoint callee) that had not
+     yet fired visibly.
+4. A full resume-driving loop helper (`f50_run_guest_call`-style: re-dispatch `ctx->pc` until
+   completion) is the gold-standard shape for NEW synchronous guest calls — prefer it over
+   sentinels.
+
