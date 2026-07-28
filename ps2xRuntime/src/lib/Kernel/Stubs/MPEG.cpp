@@ -33,6 +33,7 @@ namespace ps2_stubs
             std::vector<uint8_t> rgba;
         };
 
+// G393: PCM16LE plus Sony PSX ADPCM for SShd/SSbd PSS audio.
 #include "MPEG_parts/mpeg_pcm_audio.inc"
 
 #if PS2X_HAS_FFMPEG

@@ -917,4 +917,3 @@ void PS2Runtime::clearLLBit(R5900Context *ctx)
     ctx->llbit = 0;
     ctx->lladdr = 0;
 }
-

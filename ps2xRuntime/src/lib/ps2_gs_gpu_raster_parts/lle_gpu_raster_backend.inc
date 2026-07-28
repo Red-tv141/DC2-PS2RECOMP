@@ -1110,7 +1110,8 @@ private:
         // 10 = G289 CT24 direct-owner source (force TEXA TA0=128),
         // 11 = G309 direct authoritative-page source selection,
         // 12 = G362 guarded fixed-point POINT fetch (see below),
-        // 13 = G364 PRIM.FGE (blend RGB towards uFogCol by the interpolated per-vertex F).
+        // 13 = G364 PRIM.FGE (blend RGB towards uFogCol by the interpolated per-vertex F),
+        // 14 = G406 accurate GS 12.4 UV rounding for axis-aligned point sprites.
         //
         // G362: `texture()` with GL_NEAREST decides the texel from floor() of an interpolated
         // float. The front-end shifts FST sprite UVs by -0.5 texel-per-pixel so a fragment's
@@ -1149,6 +1150,11 @@ private:
             "uniform int uLinear;\n"
             "uniform int uWrapU;\n"
             "uniform int uWrapV;\n"
+            "uniform vec2 uFbSize;\n"
+            "uniform int uUvOriginX;\n"
+            "uniform int uUvOriginY;\n"
+            "uniform int uUvRoundU;\n"
+            "uniform int uUvRoundV;\n"
             "int wrapCoord(int p, int n, int mode){\n"
             "    if (mode != 0) return clamp(p, 0, n - 1);\n"
             "    int r = p % n; return r < 0 ? r + n : r;\n"
@@ -1203,6 +1209,27 @@ private:
             "    p.y = wrapCoord(p.y, n.y, uWrapV);\n"
             "    return clamp(ivec4(floor(texelFetch(uTex, p, 0) * 255.0 + 0.5)), 0, 255);\n"
             "}\n"
+            "float g406RoundAxis(float value, int pixel, int origin, int flags){\n"
+            "    bool legacy = (flags & 4) != 0;\n"
+            "    bool halfBoundary = legacy || uLinear != 0;\n"
+            "    float boundary = halfBoundary ? floor(value * 2.0 + 0.5) * 0.5\n"
+            "                                  : floor(value + 0.5);\n"
+            "    float threshold = legacy ? 0.25 : (1.0 / 64.0);\n"
+            "    if (abs(value - boundary) > threshold) return value;\n"
+            "    bool down = ((flags & 2) != 0) && pixel != origin;\n"
+            "    bool up = ((flags & 1) != 0) || (((flags & 2) != 0) && pixel == origin);\n"
+            "    float downNudge = legacy ? 0.25 : (1.0 / 16.0);\n"
+            "    float upNudge = legacy ? 0.25 : 0.0;\n"
+            "    return down ? boundary - downNudge : (up ? boundary + upNudge : value);\n"
+            "}\n"
+            "vec2 g406RoundUv(vec2 uvTex){\n"
+            "    if ((uMode & 16384) == 0) return uvTex;\n"
+            "    int px = int(floor(gl_FragCoord.x));\n"
+            "    int py = int(floor(uFbSize.y - gl_FragCoord.y));\n"
+            "    vec2 rounded = vec2(g406RoundAxis(uvTex.x, px, uUvOriginX, uUvRoundU),\n"
+            "                        g406RoundAxis(uvTex.y, py, uUvOriginY, uUvRoundV));\n"
+            "    return uLinear != 0 ? trunc(rounded * 16.0) * (1.0 / 16.0) : rounded;\n"
+            "}\n"
             "ivec4 sampleExact(vec2 uvTex){\n"
             "    ivec2 f16 = clamp(ivec2(floor(uvTex * 16.0 + 0.5001)), ivec2(0), ivec2(65535));\n"
             "    if (uLinear == 0) return texel8(f16 / 16);\n"
@@ -1240,7 +1267,7 @@ private:
             "    if ((uMode & 512) != 0) {\n"
             "        ivec4 vc = clamp(ivec4(floor(vColor * 255.0 + 0.5)), 0, 255);\n"
             "        vec2 uv = vSTQ.xy / max(vSTQ.z, 1e-8);\n"
-            "        ivec4 tc = sampleExact(uv * vec2(textureSize(uTex, 0)));\n"
+            "        ivec4 tc = sampleExact(g406RoundUv(uv * vec2(textureSize(uTex, 0))));\n"
             "        if ((uMode & 1024) != 0) tc.a = 128;\n"
             "        ivec4 ec = combineExact(vc, tc);\n"
             "        if ((uMode & 64) != 0) {\n"
@@ -1264,7 +1291,7 @@ private:
             "        vec4 t;\n"
             "        if ((uMode & 2048) != 0) t = g309Linear(uv);\n"
             "        else if ((uMode & 4096) != 0)\n"
-            "            t = vec4(sampleExact(uv * vec2(textureSize(uTex, 0)))) * (1.0 / 255.0);\n"
+            "            t = vec4(sampleExact(g406RoundUv(uv * vec2(textureSize(uTex, 0))))) * (1.0 / 255.0);\n"
             "        else t = texture(uTex, uv);\n"
             "        if ((uMode & 1024) != 0) t.a = 128.0 / 255.0;\n"
             "        int tfx = (uMode >> 1) & 3;\n"
@@ -1340,6 +1367,10 @@ private:
         m_locLinear = m_f.glGetUniformLocation_(m_prog, "uLinear");
         m_locWrapU = m_f.glGetUniformLocation_(m_prog, "uWrapU");
         m_locWrapV = m_f.glGetUniformLocation_(m_prog, "uWrapV");
+        m_locUvOriginX = m_f.glGetUniformLocation_(m_prog, "uUvOriginX");
+        m_locUvOriginY = m_f.glGetUniformLocation_(m_prog, "uUvOriginY");
+        m_locUvRoundU = m_f.glGetUniformLocation_(m_prog, "uUvRoundU");
+        m_locUvRoundV = m_f.glGetUniformLocation_(m_prog, "uUvRoundV");
         const GLint locTex = m_f.glGetUniformLocation_(m_prog, "uTex");
         m_f.glUniform1i_(locTex, 0);
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Src1"), 1);
@@ -3146,11 +3177,15 @@ private:
                 if (g362PointGuard)
                     mode |= 4096;
             }
+            const bool g407AccurateUv =
+                ((d.uvRoundU | d.uvRoundV) & 8u) != 0u;
+            if (g407AccurateUv && (mode & 1) != 0 && (mode & 512) == 0)
+                mode |= 4096;
             if ((mode & 4096) != 0)
             {
-                // sampleExact()'s point branch wraps the texel index itself, so the wrap mode has
-                // to travel as a uniform (the GL sampler params above only bind filtered fetches).
-                m_f.glUniform1i_(m_locLinear, 0);
+                // Accurate UV uses exact 12.4 point/bilinear taps. The wrap mode travels as a
+                // uniform because integer taps do not use the GL sampler's addressing state.
+                m_f.glUniform1i_(m_locLinear, d.bilinear ? 1 : 0);
                 m_f.glUniform1i_(m_locWrapU, static_cast<GLint>(d.wrapU));
                 m_f.glUniform1i_(m_locWrapV, static_cast<GLint>(d.wrapV));
                 m_g362GuardDraws += 1u;
@@ -3166,6 +3201,14 @@ private:
             {
                 mode |= 8192;
                 m_f.glUniform1i_(m_locFogCol, static_cast<GLint>(d.fogCol & 0x00FFFFFFu));
+            }
+            if (d.uvRoundU != 0u || d.uvRoundV != 0u)
+            {
+                mode |= 16384;
+                m_f.glUniform1i_(m_locUvOriginX, static_cast<GLint>(d.uvOriginX));
+                m_f.glUniform1i_(m_locUvOriginY, static_cast<GLint>(d.uvOriginY));
+                m_f.glUniform1i_(m_locUvRoundU, static_cast<GLint>(d.uvRoundU));
+                m_f.glUniform1i_(m_locUvRoundV, static_cast<GLint>(d.uvRoundV));
             }
             if (g255RttAlpha && d.blend != 0u)
             {
@@ -3302,6 +3345,8 @@ private:
     GLint m_locWrapU = -1, m_locWrapV = -1;
     GLint m_locExactFbSize = -1, m_locExactMode = -1, m_locExactLinear = -1;
     GLint m_locExactWrapU = -1, m_locExactWrapV = -1;
+    GLint m_locUvOriginX = -1, m_locUvOriginY = -1;
+    GLint m_locUvRoundU = -1, m_locUvRoundV = -1;
     std::map<uint32_t, FboEntry> m_fbos;
     std::unordered_map<uint64_t, DepthEntry> m_depths;
     std::unordered_map<uint64_t, TexEntry> m_texCache;

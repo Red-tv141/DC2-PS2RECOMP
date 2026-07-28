@@ -28,10 +28,158 @@
                    (static_cast<uint32_t>(p[3]) << 24u);
         }
 
+        bool g393MpegPcmOnly()
+        {
+            static const bool enabled = [] {
+                const char *value = std::getenv("DC2_G393_PCM_ONLY");
+                return value && value[0] != '\0' && std::strcmp(value, "0") != 0;
+            }();
+            return enabled;
+        }
+
+        struct G393AdpcmHistory
+        {
+            int32_t previous = 0;
+            int32_t previous2 = 0;
+        };
+
+        int16_t g393ClampS16(int32_t value)
+        {
+            return static_cast<int16_t>(
+                std::clamp(value, -32768, 32767));
+        }
+
+        void g393DecodePsxAdpcmBlock(
+            const uint8_t *block,
+            G393AdpcmHistory &history,
+            std::array<int16_t, 28u> &samples)
+        {
+            static constexpr int kCoefficients[5][2] = {
+                {0, 0}, {60, 0}, {115, -52}, {98, -55}, {122, -60}};
+
+            uint32_t shift = block[0] & 0x0Fu;
+            uint32_t filter = (block[0] >> 4u) & 0x0Fu;
+            if (shift > 12u)
+            {
+                shift = 9u;
+            }
+            if (filter > 4u)
+            {
+                filter = 0u;
+            }
+
+            for (size_t sampleIndex = 0u; sampleIndex < samples.size(); ++sampleIndex)
+            {
+                const uint8_t packed = block[2u + sampleIndex / 2u];
+                uint32_t nibble = (sampleIndex & 1u) ? (packed >> 4u) : (packed & 0x0Fu);
+                const int32_t signedNibble =
+                    (nibble & 0x08u) ? static_cast<int32_t>(nibble) - 16
+                                     : static_cast<int32_t>(nibble);
+                const int32_t unpacked =
+                    signedNibble * static_cast<int32_t>(1u << (12u - shift));
+                const int32_t predicted =
+                    (history.previous * kCoefficients[filter][0] +
+                     history.previous2 * kCoefficients[filter][1] + 32) /
+                    64;
+                const int16_t decoded = g393ClampS16(unpacked + predicted);
+                history.previous2 = history.previous;
+                history.previous = decoded;
+                samples[sampleIndex] = decoded;
+            }
+        }
+
+        bool g393DecodePsxAdpcmInterleave(
+            const uint8_t *block,
+            uint32_t channels,
+            uint32_t interleaveBytesPerChannel,
+            std::array<G393AdpcmHistory, 2u> &history,
+            std::vector<int16_t> &pcm)
+        {
+            if (!block || channels == 0u || channels > history.size() ||
+                interleaveBytesPerChannel == 0u ||
+                (interleaveBytesPerChannel & 0x0Fu) != 0u)
+            {
+                return false;
+            }
+
+            const size_t blocksPerChannel = interleaveBytesPerChannel / 16u;
+            std::array<std::array<int16_t, 28u>, 2u> decoded{};
+            pcm.reserve(pcm.size() + blocksPerChannel * 28u * channels);
+            for (size_t blockIndex = 0u; blockIndex < blocksPerChannel; ++blockIndex)
+            {
+                for (uint32_t channel = 0u; channel < channels; ++channel)
+                {
+                    const uint8_t *channelBlock =
+                        block + static_cast<size_t>(channel) * interleaveBytesPerChannel +
+                        blockIndex * 16u;
+                    g393DecodePsxAdpcmBlock(channelBlock, history[channel], decoded[channel]);
+                }
+                for (size_t sample = 0u; sample < decoded[0].size(); ++sample)
+                {
+                    for (uint32_t channel = 0u; channel < channels; ++channel)
+                    {
+                        pcm.push_back(decoded[channel][sample]);
+                    }
+                }
+            }
+            return true;
+        }
+
+        void g393MaybeRunMpegAudioSelfTest()
+        {
+            static std::once_flag once;
+            std::call_once(once, [] {
+                const char *value = std::getenv("DC2_G393_MPEG_AUDIO_SELFTEST");
+                if (!value || value[0] == '\0' || std::strcmp(value, "0") == 0)
+                {
+                    return;
+                }
+
+                uint32_t passed = 0u;
+                uint32_t total = 0u;
+                auto check = [&](bool condition, const char *name) {
+                    ++total;
+                    if (condition)
+                    {
+                        ++passed;
+                    }
+                    else
+                    {
+                        std::cerr << "[G393:selftest] FAIL " << name << std::endl;
+                    }
+                };
+
+                std::array<uint8_t, 32u> stereo{};
+                stereo[0] = 0x0Cu;
+                stereo[16] = 0x0Cu;
+                std::fill(stereo.begin() + 2, stereo.begin() + 16, 0x11u);
+                std::fill(stereo.begin() + 18, stereo.end(), 0x22u);
+                std::array<G393AdpcmHistory, 2u> history{};
+                std::vector<int16_t> pcm;
+                check(g393DecodePsxAdpcmInterleave(
+                          stereo.data(), 2u, 16u, history, pcm),
+                      "stereo decode");
+                check(pcm.size() == 56u, "stereo frame count");
+                check(pcm.size() >= 2u && pcm[0] == 1 && pcm[1] == 2,
+                      "channel interleave");
+
+                std::array<uint8_t, 16u> predictor{};
+                predictor[0] = 0x1Cu;
+                std::array<int16_t, 28u> predicted{};
+                history[0].previous = 1;
+                history[0].previous2 = 0;
+                g393DecodePsxAdpcmBlock(predictor.data(), history[0], predicted);
+                check(predicted[0] == 1, "predictor history");
+
+                std::cerr << "[G393:selftest] passed=" << passed
+                          << "/" << total << std::endl;
+            });
+        }
+
         // PS2 PSS private-stream audio contains a Sony Audio Stream (SShd/SSbd)
-        // payload. PCM channels are stored in interleave-sized planar blocks rather
-        // than normal LRLR sample order, so feed the demuxed payload through this
-        // small streaming deinterleaver before handing it to raylib.
+        // payload. Codec 1 is planar PCM16LE; every other codec value is Sony
+        // PlayStation ADPCM, matching FFmpeg's ADS/SS2 demuxer. Both layouts group
+        // one interleave-sized run per channel rather than normal LRLR order.
         class MpegPcmAudioStream
         {
         public:
@@ -49,7 +197,10 @@
                 unload();
             }
 
-            MpegPcmAudioStream() = default;
+            MpegPcmAudioStream()
+            {
+                g393MaybeRunMpegAudioSelfTest();
+            }
             MpegPcmAudioStream(const MpegPcmAudioStream &) = delete;
             MpegPcmAudioStream &operator=(const MpegPcmAudioStream &) = delete;
 
@@ -234,13 +385,15 @@
                 m_interleaveBytesPerChannel = g384ReadLe32(m_headerBytes.data() + 0x14u);
                 m_bodyBytesExpected = g384ReadLe32(m_headerBytes.data() + ssbdOffset + 4u);
 
+                const bool pcm = m_codec == 1u;
+                const bool adpcm = !pcm && !g393MpegPcmOnly();
                 const bool valid =
-                    m_codec == 1u &&
+                    (pcm || adpcm) &&
                     (m_channels == 1u || m_channels == 2u) &&
                     m_sampleRate >= 8000u && m_sampleRate <= 192000u &&
-                    m_interleaveBytesPerChannel >= 2u &&
+                    m_interleaveBytesPerChannel >= (pcm ? 2u : 16u) &&
                     m_interleaveBytesPerChannel <= (1u << 20u) &&
-                    (m_interleaveBytesPerChannel & 1u) == 0u;
+                    (m_interleaveBytesPerChannel % (pcm ? 2u : 16u)) == 0u;
                 if (!valid)
                 {
                     markUnsupported("unsupported ADS format");
@@ -307,23 +460,39 @@
                     const uint8_t *block =
                         m_interleaveBytes.data() +
                         static_cast<std::ptrdiff_t>(m_interleaveReadBytes);
-                    const size_t frames =
-                        static_cast<size_t>(m_interleaveBytesPerChannel) / sizeof(int16_t);
-                    const size_t oldSize = m_pcm.size();
-                    m_pcm.resize(oldSize + frames * m_channels);
-                    int16_t *dst = m_pcm.data() + static_cast<std::ptrdiff_t>(oldSize);
-
-                    for (size_t frame = 0u; frame < frames; ++frame)
+                    size_t frames = 0u;
+                    if (m_codec == 1u)
                     {
-                        for (uint32_t channel = 0u; channel < m_channels; ++channel)
+                        frames =
+                            static_cast<size_t>(m_interleaveBytesPerChannel) / sizeof(int16_t);
+                        const size_t oldSize = m_pcm.size();
+                        m_pcm.resize(oldSize + frames * m_channels);
+                        int16_t *dst = m_pcm.data() + static_cast<std::ptrdiff_t>(oldSize);
+
+                        for (size_t frame = 0u; frame < frames; ++frame)
                         {
-                            const size_t src =
-                                static_cast<size_t>(channel) * m_interleaveBytesPerChannel +
-                                frame * sizeof(int16_t);
-                            const uint16_t bits =
-                                static_cast<uint16_t>(block[src]) |
-                                (static_cast<uint16_t>(block[src + 1u]) << 8u);
-                            *dst++ = static_cast<int16_t>(bits);
+                            for (uint32_t channel = 0u; channel < m_channels; ++channel)
+                            {
+                                const size_t src =
+                                    static_cast<size_t>(channel) * m_interleaveBytesPerChannel +
+                                    frame * sizeof(int16_t);
+                                const uint16_t bits =
+                                    static_cast<uint16_t>(block[src]) |
+                                    (static_cast<uint16_t>(block[src + 1u]) << 8u);
+                                *dst++ = static_cast<int16_t>(bits);
+                            }
+                        }
+                    }
+                    else
+                    {
+                        frames =
+                            (static_cast<size_t>(m_interleaveBytesPerChannel) / 16u) * 28u;
+                        if (!g393DecodePsxAdpcmInterleave(
+                                block, m_channels, m_interleaveBytesPerChannel,
+                                m_adpcmHistory, m_pcm))
+                        {
+                            markUnsupported("invalid ADPCM interleave");
+                            return;
                         }
                     }
 
@@ -414,6 +583,7 @@
             std::vector<uint8_t> m_headerBytes;
             std::vector<uint8_t> m_interleaveBytes;
             size_t m_interleaveReadBytes = 0u;
+            std::array<G393AdpcmHistory, 2u> m_adpcmHistory{};
             std::vector<int16_t> m_pcm;
             size_t m_pcmReadSamples = 0u;
             uint64_t m_decodedFrames = 0u;

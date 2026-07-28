@@ -781,4 +781,3 @@ bool PS2Runtime::syncCoreSubsystems()
     m_boundGSVram = gsVram;
     return true;
 }
-
