@@ -7,6 +7,7 @@
 #include "runtime/ps2_gs_psmt8.h"
 #include "runtime/ps2_gs_memory.h"
 #include "ps2_log.h"
+#include "ps2_syscalls.h"
 #include "ps2_gs_gpu_lle.h" // G178: private front-end<->backend interface (default-off lever)
 #include <atomic>
 #include <algorithm>
@@ -24,6 +25,7 @@
 #include <unordered_set>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <thread>
 #include <condition_variable>
 #include <functional>

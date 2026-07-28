@@ -50,6 +50,9 @@ struct G178Draw
     bool depthWrite = false;
     bool bilinear = false;
     uint8_t wrapU = 0, wrapV = 0; // 0 repeat, 1 clamp-to-edge
+    // G406: per-sprite GS 12.4 UV rounding state. Zero flags disable the path.
+    uint16_t uvOriginX = 0, uvOriginY = 0;
+    uint8_t uvRoundU = 0, uvRoundV = 0;
     uint16_t scX0 = 0, scY0 = 0, scX1 = 0, scY1 = 0; // GS scissor (inclusive, top-origin)
 };
 

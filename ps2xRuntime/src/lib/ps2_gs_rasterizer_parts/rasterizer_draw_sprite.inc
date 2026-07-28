@@ -4,6 +4,7 @@ void GSRasterizer::drawSprite(GS *gs)
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const auto &ctx = gs->activeContext();
     g400NoteDrawTarget(gs->m_vram, ctx.frame.fbp);
+    g401NoteCompositeDraw(gs->m_vram, ctx, gs->m_prim, v0, v1);
     G248SpriteScope g248Scope(ctx.frame.fbp, gs->m_prim.tme, gs->m_prim.abe);
     // G248 state census (DEFAULT OFF): print each distinct RTT-sprite state once.  Kept separate
     // from DC2_G248_STAT because stderr I/O would distort the timing discriminator above.
@@ -90,6 +91,12 @@ void GSRasterizer::drawSprite(GS *gs)
     const uint32_t sZbw  = ctx.frame.fbw;
     const bool sZ16 = (sZpsm == 0x2u || sZpsm == 0xAu || sZpsm == 0xBu);
     const bool sZ24 = (sZpsm == 0x1u);
+    const uint32_t sZFbp = ctx.frame.fbp;
+    const bool g403DisplayZ =
+        sZuni && g404SharedZScope(sZFbp, sZbw,
+                                  static_cast<uint32_t>(ctx.zbuf & 0x1FFu), sZpsm);
+    if (g403DisplayZ)
+        g403DisplayZPrepare(sZFbp);
     const bool sZActive = sZuni && !s_spriteZDisabled && sZte != 0u && gs->m_vram != nullptr &&
                           !(sZtst == 1u && sZmsk); // ALWAYS + no-write == no-op, fast-skip
     uint32_t sZi = 0u;
@@ -140,10 +147,11 @@ void GSRasterizer::drawSprite(GS *gs)
     }
     auto spriteZPass = [&](int px, int py) -> bool {
         if (!sZActive) return true;
-        const uint32_t zdst =
-            sZ16 ? GSMem::ReadZ16(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py))
-                 : (sZ24 ? GSMem::ReadZ24(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py))
-                         : GSMem::ReadZ32(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py)));
+        const uint32_t zdst = g403DisplayZ
+            ? g403DisplayZRead(px, py, sZFbp)
+            : (sZ16 ? GSMem::ReadZ16(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py))
+                    : (sZ24 ? GSMem::ReadZ24(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py))
+                            : GSMem::ReadZ32(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py))));
         switch (sZtst)
         {
         case 0:  return false;          // NEVER
@@ -154,7 +162,8 @@ void GSRasterizer::drawSprite(GS *gs)
     };
     auto spriteZStore = [&](int px, int py) {
         if (!sZWrite) return;
-        if (sZ16)      GSMem::WriteZ16(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py), sZi);
+        if (g403DisplayZ) g403DisplayZWrite(px, py, sZFbp, sZi);
+        else if (sZ16) GSMem::WriteZ16(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py), sZi);
         else if (sZ24) GSMem::WriteZ24(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py), sZi);
         else           GSMem::WriteZ32(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py), sZi);
     };
@@ -456,13 +465,20 @@ void GSRasterizer::drawSprite(GS *gs)
             }
         }
 
+        const G406UvRoundInfo g406Round =
+            g406SpriteUvRoundInfo(v0, v1, ofx, ofy, !tex1UsesLinearFilter(ctx.tex1),
+                                  gs->m_prim.tme != 0u, gs->m_prim.fst != 0u);
         float u0f, v0f, u1f, v1f;
         if (gs->m_prim.fst)
         {
-            u0f = static_cast<float>(v0.u >> 4);
-            v0f = static_cast<float>(v0.v >> 4);
-            u1f = static_cast<float>(v1.u >> 4);
-            v1f = static_cast<float>(v1.v >> 4);
+            u0f = g406Round.active ? static_cast<float>(v0.u) / 16.0f
+                                   : static_cast<float>(v0.u >> 4);
+            v0f = g406Round.active ? static_cast<float>(v0.v) / 16.0f
+                                   : static_cast<float>(v0.v >> 4);
+            u1f = g406Round.active ? static_cast<float>(v1.u) / 16.0f
+                                   : static_cast<float>(v1.u >> 4);
+            v1f = g406Round.active ? static_cast<float>(v1.v) / 16.0f
+                                   : static_cast<float>(v1.v >> 4);
         }
         else
         {
@@ -476,10 +492,30 @@ void GSRasterizer::drawSprite(GS *gs)
 
         float spriteW = static_cast<float>(spanX);
         float spriteH = static_cast<float>(spanY);
-        if (spriteW < 1.0f)
-            spriteW = 1.0f;
-        if (spriteH < 1.0f)
-            spriteH = 1.0f;
+        const bool g407SubpixelPhase =
+            g406Round.active && g407SpriteSubpixelPhaseEnabled();
+        const float g407RawX0 = v0.x - static_cast<float>(ofx);
+        const float g407RawY0 = v0.y - static_cast<float>(ofy);
+        const float g407RawSpanX = v1.x - v0.x;
+        const float g407RawSpanY = v1.y - v0.y;
+        if (g407SubpixelPhase && std::fabs(g407RawSpanX) >= (1.0f / 16.0f))
+            spriteW = g407RawSpanX;
+        if (g407SubpixelPhase && std::fabs(g407RawSpanY) >= (1.0f / 16.0f))
+            spriteH = g407RawSpanY;
+        if (g407SubpixelPhase)
+        {
+            if (std::fabs(spriteW) < 1.0f)
+                spriteW = spriteW < 0.0f ? -1.0f : 1.0f;
+            if (std::fabs(spriteH) < 1.0f)
+                spriteH = spriteH < 0.0f ? -1.0f : 1.0f;
+        }
+        else
+        {
+            if (spriteW < 1.0f)
+                spriteW = 1.0f;
+            if (spriteH < 1.0f)
+                spriteH = 1.0f;
+        }
 
         // G9: decisive one-shot diagnostic for the costume-screen black UI boxes
         // (textured T8 sprites from tbp=0x2720, CLUT cbp=0x3fdc rendering black).
@@ -667,19 +703,31 @@ void GSRasterizer::drawSprite(GS *gs)
         for (int y = drawY0; y <= drawY1; ++y)
         {
             g248QValid = false;
-            float ty = (static_cast<float>(y - unclippedY0) + s_uvBias) / spriteH;
+            const float sampleY0 =
+                g407SubpixelPhase ? g407RawY0 : static_cast<float>(unclippedY0);
+            float ty = (static_cast<float>(y) - sampleY0 + s_uvBias) / spriteH;
             float texVf = v0f + (v1f - v0f) * ty;
 
             for (int x = drawX0; x <= drawX1; ++x)
             {
-                float tx = (static_cast<float>(x - unclippedX0) + s_uvBias) / spriteW;
+                const float sampleX0 =
+                    g407SubpixelPhase ? g407RawX0 : static_cast<float>(unclippedX0);
+                float tx = (static_cast<float>(x) - sampleX0 + s_uvBias) / spriteW;
                 float texUf = u0f + (u1f - u0f) * tx;
                 uint32_t texel = 0xFFFF00FFu;
                 uint16_t g258SampleU = 0u, g258SampleV = 0u;
                 if (gs->m_prim.fst)
                 {
-                    const uint16_t sampleU = static_cast<uint16_t>(clampInt(static_cast<int>(std::lround(texUf * 16.0f)), 0, 0xFFFF));
-                    const uint16_t sampleV = static_cast<uint16_t>(clampInt(static_cast<int>(std::lround(texVf * 16.0f)), 0, 0xFFFF));
+                    uint16_t sampleU = g406Round.active
+                        ? g406RoundUvFixed(texUf, x, g406Round.originX,
+                                          g406Round.flagsU, g248Linear)
+                        : static_cast<uint16_t>(clampInt(
+                              static_cast<int>(std::lround(texUf * 16.0f)), 0, 0xFFFF));
+                    uint16_t sampleV = g406Round.active
+                        ? g406RoundUvFixed(texVf, y, g406Round.originY,
+                                          g406Round.flagsV, g248Linear)
+                        : static_cast<uint16_t>(clampInt(
+                              static_cast<int>(std::lround(texVf * 16.0f)), 0, 0xFFFF));
                     g258SampleU = sampleU;
                     g258SampleV = sampleV;
                     if (g248FastSampleSprite)

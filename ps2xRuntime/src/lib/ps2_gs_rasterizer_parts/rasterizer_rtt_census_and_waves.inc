@@ -411,6 +411,16 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         const bool zTests  = (zte != 0u) && (ztst != 1u); // NEVER/GEQUAL/GREATER all need Z
         if (!s_zTestDisabled && (zWrites || zTests))
         {
+            // G404: ZBP 0xd0 is one physical depth surface across display and RTT color targets.
+            // Its guest clear is mirrored outside aliased VRAM, so every user of that mirror must
+            // remain on CPU replay; an RTT GPU wave would upload stale physical page contents.
+            const uint32_t g403Zbp = static_cast<uint32_t>(ctx.zbuf & 0x1FFu);
+            const uint32_t g403Zpsm = static_cast<uint32_t>((ctx.zbuf >> 24) & 0xFu);
+            if (g404SharedZScope(ctx.frame.fbp, ctx.frame.fbw, g403Zbp, g403Zpsm))
+            {
+                g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+                return false;
+            }
             // G262: widened RTT-family entries take the same guestDepth derivation as G242, but
             // the flush executes it as a NON-PERSISTENT per-wave Z round-trip (no ownership).
             const bool g262Rtt = g262WideOn() && g248TargetIndex(ctx.frame.fbp) >= 0;

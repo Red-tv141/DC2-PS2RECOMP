@@ -104,6 +104,8 @@ static thread_local std::chrono::steady_clock::time_point t_g312Seg2aEnd{}, t_g3
 
 void GSRasterizer::drawPrimitive(GS *gs)
 {
+    g401NoteFrontDoor(this, gs, gs->m_vram, gs->m_vtxQueue[0],
+                      gs->m_prim, gs->activeContext());
     static const bool s_g141PerfOn = (std::getenv("DC2_PERF") != nullptr);
     static double s_g141Sum = 0.0;
     static uint32_t s_g141Win = 0u;
@@ -142,6 +144,10 @@ void GSRasterizer::drawPrimitive(GS *gs)
         g_g312SegStat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     const auto &ctx = gs->activeContext();
+    // G401 causal lever: the GS reserves undefined TEX0.PSM encodings. Do not let the
+    // software fallback reinterpret them as black texels and destructively blend them.
+    if (g401SkipReservedTexturePsm(gs->m_prim, ctx))
+        return;
     // G45: clear the costume model's PRIVATE Z buffer exactly once per costume frame, on the
     // fbp -> 0x139 transition (the first draw of each frame's model RTT pass). The old clear was
     // gated on the full-RTT black-sprite signature, which does NOT fire every frame in the

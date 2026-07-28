@@ -58,9 +58,16 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     uint32_t offset = 0;
     if (s_pendingImageBytes != 0u)
     {
-        if (looksLikePackedAdGifTag(data, sizeBytes))
+        // G401: continuation payload is opaque pixel data. It may coincidentally satisfy the old
+        // "PACKED A+D tag" heuristic (Dungeon 6 begins its 64 KiB chunks with
+        // 100e0c0e0f0c0c0d/180d0c0c150e0c0e), so never discard a live IMAGE transfer based on
+        // payload contents. VIF/arbiter ordering owns the continuation boundary.
+        static const bool g401LegacyPendingDrop =
+            envFlagEnabled("DC2_G401_LEGACY_PENDING_DROP");
+        static const bool g401GifTrace = envFlagEnabled("DC2_G401_GIF_TRACE");
+        if (g401LegacyPendingDrop && looksLikePackedAdGifTag(data, sizeBytes))
         {
-            if (t8UploadTraceEnabled() && f51PendingDropShouldLog())
+            if ((t8UploadTraceEnabled() && f51PendingDropShouldLog()) || g401GifTrace)
             {
                 uint64_t tagLo = 0u;
                 uint64_t tagHi = 0u;

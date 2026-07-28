@@ -626,6 +626,7 @@ namespace
             if (b.entries.empty())
                 continue;
             g272PrepareBatch(b);
+            g401NoteCompositeEntries(g_g144LastVram, b.entries);
             g_g144List.swap(b.entries);
             g_g144BlockFbp = b.fbp;
             g272SetDisplayBatch(b.fbp, g_g144List.front().ctx.frame.fbw);
@@ -713,6 +714,7 @@ namespace
             const auto g290Tp0 = g290Probe ? std::chrono::steady_clock::now()
                                            : std::chrono::steady_clock::time_point{};
             g272PrepareBatch(b);
+            g401NoteCompositeEntries(g_g144LastVram, b.entries);
             if (g290Probe)
                 g_g290PrepNs += static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(

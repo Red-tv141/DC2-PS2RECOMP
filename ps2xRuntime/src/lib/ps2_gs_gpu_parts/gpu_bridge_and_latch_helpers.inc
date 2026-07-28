@@ -1177,4 +1177,3 @@ GS::GS()
     GSMem::InitLookupTables();
     reset();
 }
-

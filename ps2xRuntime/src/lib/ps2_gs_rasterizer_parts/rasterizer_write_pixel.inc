@@ -1,3 +1,279 @@
+namespace
+{
+constexpr int kG407ScanX0 = 130;
+constexpr int kG407ScanX1 = 224;
+constexpr int kG407ScanY0 = 260;
+constexpr int kG407ScanY1 = 344;
+constexpr int kG407ScanW = kG407ScanX1 - kG407ScanX0 + 1;
+constexpr int kG407ScanH = kG407ScanY1 - kG407ScanY0 + 1;
+constexpr int kG407ScanPixels = kG407ScanW * kG407ScanH;
+constexpr int kG407ScanSlots = kG407ScanPixels * 2;
+constexpr int kG407ScanStages = 6;
+constexpr int kG407ScanSequence = 16;
+
+struct G407AutoScanState
+{
+    std::array<std::atomic<uint64_t>, kG407ScanSlots> final{};
+    std::array<std::atomic<uint64_t>, kG407ScanSlots * kG407ScanStages> stageFinal{};
+    std::array<std::atomic<uint64_t>, kG407ScanSlots * kG407ScanStages> stageSource{};
+    std::array<std::atomic<uint64_t>, kG407ScanSlots> sequenceCount{};
+    std::array<std::atomic<uint64_t>, kG407ScanSlots * kG407ScanSequence> sequenceFinal{};
+    std::array<std::atomic<uint64_t>, kG407ScanSlots * kG407ScanSequence> sequenceSource{};
+    std::array<std::atomic<uint64_t>, kG407ScanSlots * kG407ScanSequence> sequenceMeta{};
+    std::atomic<uint64_t> seenTick{0};
+    std::atomic<bool> dumped{false};
+};
+
+G407AutoScanState &g407AutoScanState()
+{
+    static G407AutoScanState state;
+    return state;
+}
+
+uint64_t g407PackTickPixel(uint64_t tick, uint32_t pixel)
+{
+    return ((tick & 0xFFFFFFFFull) << 32u) | static_cast<uint64_t>(pixel);
+}
+
+bool g407UnpackTickPixel(uint64_t packed, uint64_t tick, uint32_t &pixel)
+{
+    if ((packed >> 32u) != (tick & 0xFFFFFFFFull))
+        return false;
+    pixel = static_cast<uint32_t>(packed);
+    return true;
+}
+
+void g407AutoScanPrevious(uint64_t tick)
+{
+    G407AutoScanState &s = g407AutoScanState();
+    if (tick == 0u || s.dumped.load(std::memory_order_relaxed))
+        return;
+
+    struct Candidate
+    {
+        int score;
+        int slot;
+        int x;
+        int y;
+        int fb;
+        uint32_t pixel;
+    };
+    std::vector<Candidate> candidates;
+    candidates.reserve(64);
+
+    for (int fb = 0; fb < 2; ++fb)
+    {
+        bool mapCompositeSeen = false;
+        for (int i = 0; i < kG407ScanPixels; ++i)
+        {
+            uint32_t ignored = 0u;
+            const int stageSlot = (fb * kG407ScanPixels + i) * kG407ScanStages + 1;
+            if (g407UnpackTickPixel(
+                    s.stageFinal[stageSlot].load(std::memory_order_relaxed), tick, ignored))
+            {
+                mapCompositeSeen = true;
+                break;
+            }
+        }
+        if (!mapCompositeSeen)
+            continue;
+
+        for (int y = kG407ScanY0 + 2; y <= kG407ScanY1 - 2; ++y)
+        {
+            for (int x = kG407ScanX0 + 2; x <= 220; ++x)
+            {
+                const int local = (y - kG407ScanY0) * kG407ScanW + (x - kG407ScanX0);
+                const int slot = fb * kG407ScanPixels + local;
+                uint32_t pixel = 0u;
+                if (!g407UnpackTickPixel(
+                        s.final[slot].load(std::memory_order_relaxed), tick, pixel))
+                    continue;
+
+                std::array<int, 8> ng{}, nb{};
+                int n = 0;
+                for (const auto [dx, dy] :
+                     {std::pair<int, int>{-2, -2}, {-2, 0}, {-2, 2}, {0, -2},
+                      {0, 2}, {2, -2}, {2, 0}, {2, 2}})
+                {
+                    const int ni = (y + dy - kG407ScanY0) * kG407ScanW +
+                                   (x + dx - kG407ScanX0);
+                    uint32_t neighbor = 0u;
+                    if (!g407UnpackTickPixel(
+                            s.final[fb * kG407ScanPixels + ni].load(std::memory_order_relaxed),
+                            tick, neighbor))
+                    {
+                        n = 0;
+                        break;
+                    }
+                    ng[n] = static_cast<int>((neighbor >> 8u) & 0xFFu);
+                    nb[n] = static_cast<int>((neighbor >> 16u) & 0xFFu);
+                    ++n;
+                }
+                if (n != 8)
+                    continue;
+                std::sort(ng.begin(), ng.end());
+                std::sort(nb.begin(), nb.end());
+                const int medianG = (ng[3] + ng[4]) / 2;
+                const int medianB = (nb[3] + nb[4]) / 2;
+                const int g = static_cast<int>((pixel >> 8u) & 0xFFu);
+                const int b = static_cast<int>((pixel >> 16u) & 0xFFu);
+                const int score = (medianG - g) + (medianB - b);
+                if (medianG >= 160 && medianB >= 160 && g >= 100 && b >= 100 && score >= 30)
+                    candidates.push_back(Candidate{score, slot, x, y, fb, pixel});
+            }
+        }
+    }
+
+    if (candidates.size() < 5u)
+        return;
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate &a, const Candidate &b) { return a.score > b.score; });
+    if (s.dumped.exchange(true, std::memory_order_relaxed))
+        return;
+
+    const size_t count = std::min<size_t>(candidates.size(), 20u);
+    std::fprintf(stderr, "[G407:autoscan] tick=%llu candidates=%zu showing=%zu\n",
+                 static_cast<unsigned long long>(tick), candidates.size(), count);
+    for (size_t ci = 0; ci < count; ++ci)
+    {
+        const Candidate &c = candidates[ci];
+        std::fprintf(stderr,
+                     "[G407:dot] rank=%zu score=%d fbp=%s xy=(%d,%d) final=%08x\n",
+                     ci + 1u, c.score, c.fb ? "0x68" : "0x0", c.x, c.y, c.pixel);
+        const int local = c.slot - c.fb * kG407ScanPixels;
+        for (int stage = 0; stage < kG407ScanStages; ++stage)
+        {
+            const int si = (c.fb * kG407ScanPixels + local) * kG407ScanStages + stage;
+            uint32_t after = 0u, source = 0u;
+            if (g407UnpackTickPixel(
+                    s.stageFinal[si].load(std::memory_order_relaxed), tick, after))
+            {
+                (void)g407UnpackTickPixel(
+                    s.stageSource[si].load(std::memory_order_relaxed), tick, source);
+                std::fprintf(stderr,
+                             "[G407:stage] xy=(%d,%d) stage=%d src=%08x after=%08x\n",
+                             c.x, c.y, stage, source, after);
+            }
+        }
+        const uint64_t sequenceState =
+            s.sequenceCount[c.slot].load(std::memory_order_relaxed);
+        if ((sequenceState >> 32u) == (tick & 0xFFFFFFFFull))
+        {
+            const uint32_t sequenceCount =
+                std::min<uint32_t>(static_cast<uint32_t>(sequenceState),
+                                   kG407ScanSequence);
+            for (uint32_t seq = 0; seq < sequenceCount; ++seq)
+            {
+                const int qi = c.slot * kG407ScanSequence + static_cast<int>(seq);
+                uint32_t after = 0u, source = 0u, meta = 0u;
+                if (!g407UnpackTickPixel(
+                        s.sequenceFinal[qi].load(std::memory_order_relaxed), tick, after))
+                    continue;
+                (void)g407UnpackTickPixel(
+                    s.sequenceSource[qi].load(std::memory_order_relaxed), tick, source);
+                (void)g407UnpackTickPixel(
+                    s.sequenceMeta[qi].load(std::memory_order_relaxed), tick, meta);
+                std::fprintf(stderr,
+                             "[G407:sequence] xy=(%d,%d) n=%u prim=%u tme=%u abe=%u fst=%u "
+                             "tbp=0x%x src=%08x after=%08x\n",
+                             c.x, c.y, seq,
+                             (meta >> 16u) & 0x7u,
+                             (meta >> 19u) & 0x1u,
+                             (meta >> 20u) & 0x1u,
+                             (meta >> 21u) & 0x1u,
+                             meta & 0x3FFFu, source, after);
+            }
+        }
+    }
+}
+
+void g407AutoRecord(const GSContext &ctx,
+                    uint32_t primType,
+                    bool primTme,
+                    bool primAbe,
+                    bool primFst,
+                    int x,
+                    int y,
+                    uint32_t before,
+                    uint32_t pixel,
+                    uint8_t srcR,
+                    uint8_t srcG,
+                    uint8_t srcB,
+                    uint8_t srcA)
+{
+    static const bool enabled = envFlagEnabled("DC2_G407_AUTOSCAN");
+    if (!enabled ||
+        x < kG407ScanX0 || x > kG407ScanX1 ||
+        y < kG407ScanY0 || y > kG407ScanY1 ||
+        (ctx.frame.fbp != 0x0u && ctx.frame.fbp != 0x68u) ||
+        (before & 0x00FFFFFFu) == (pixel & 0x00FFFFFFu))
+        return;
+
+    const uint64_t tick = ps2_syscalls::GetCurrentVSyncTick();
+    G407AutoScanState &s = g407AutoScanState();
+    uint64_t seen = s.seenTick.load(std::memory_order_relaxed);
+    if (seen != tick &&
+        s.seenTick.compare_exchange_strong(seen, tick, std::memory_order_relaxed))
+    {
+        g407AutoScanPrevious(seen);
+    }
+
+    const int fb = ctx.frame.fbp == 0x68u ? 1 : 0;
+    const int local = (y - kG407ScanY0) * kG407ScanW + (x - kG407ScanX0);
+    const int slot = fb * kG407ScanPixels + local;
+    const uint64_t finalPacked = g407PackTickPixel(tick, pixel);
+    s.final[slot].store(finalPacked, std::memory_order_relaxed);
+
+    uint64_t sequenceState = s.sequenceCount[slot].load(std::memory_order_relaxed);
+    uint32_t sequenceCount = 0u;
+    if ((sequenceState >> 32u) == (tick & 0xFFFFFFFFull))
+        sequenceCount = static_cast<uint32_t>(sequenceState);
+    if (sequenceCount < kG407ScanSequence)
+    {
+        const int qi = slot * kG407ScanSequence + static_cast<int>(sequenceCount);
+        const uint32_t source = static_cast<uint32_t>(srcR) |
+                                (static_cast<uint32_t>(srcG) << 8u) |
+                                (static_cast<uint32_t>(srcB) << 16u) |
+                                (static_cast<uint32_t>(srcA) << 24u);
+        const uint32_t meta = (ctx.tex0.tbp0 & 0x3FFFu) |
+                              ((primType & 0x7u) << 16u) |
+                              (static_cast<uint32_t>(primTme) << 19u) |
+                              (static_cast<uint32_t>(primAbe) << 20u) |
+                              (static_cast<uint32_t>(primFst) << 21u);
+        s.sequenceFinal[qi].store(finalPacked, std::memory_order_relaxed);
+        s.sequenceSource[qi].store(
+            g407PackTickPixel(tick, source), std::memory_order_relaxed);
+        s.sequenceMeta[qi].store(
+            g407PackTickPixel(tick, meta), std::memory_order_relaxed);
+    }
+    s.sequenceCount[slot].store(
+        ((tick & 0xFFFFFFFFull) << 32u) |
+            static_cast<uint64_t>(sequenceCount + 1u),
+        std::memory_order_relaxed);
+
+    int stage = 5;
+    if (!primTme && srcR == 0x04u && srcG == 0x46u &&
+        srcB == 0x1eu && srcA == 0x80u)
+        stage = 0;
+    else if (primTme && ctx.tex0.tbp0 == 0x2f20u)
+        stage = 1;
+    else if (primTme && ctx.tex0.tbp0 == 0x28e0u)
+        stage = 2;
+    else if (primTme && ctx.tex0.tbp0 == 0x2720u)
+        stage = 3;
+    else if (!primTme && srcR == 0u && srcG == 0u && srcB == 0u)
+        stage = 4;
+
+    const int si = slot * kG407ScanStages + stage;
+    const uint32_t source = static_cast<uint32_t>(srcR) |
+                            (static_cast<uint32_t>(srcG) << 8u) |
+                            (static_cast<uint32_t>(srcB) << 16u) |
+                            (static_cast<uint32_t>(srcA) << 24u);
+    s.stageFinal[si].store(finalPacked, std::memory_order_relaxed);
+    s.stageSource[si].store(g407PackTickPixel(tick, source), std::memory_order_relaxed);
+}
+} // namespace
+
 void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a)
 {
     const auto &ctx = gs->activeContext();
@@ -400,24 +676,8 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
         uint8_t db = (existing >> 16) & 0xFF;
         uint8_t da = (existing >> 24) & 0xFF;
 
-        // G48: the costume model (fbp=0x139) renders into an RTT the runner CLEARS TO BLACK. PS2
-        // alpha-over (Cv=(Cs-Cd)*A>>7+Cd) against a black dest = Cs*A/128, which DARKENS or hides
-        // any sub-mesh whose source alpha < 128 when it is the FIRST fragment at a pixel. On real
-        // HW the opaque base mesh covers a pixel before the alpha-blended detail/hat/face decals
-        // land, so those blends meet real color, not black. The runner's head sub-meshes interleave
-        // (skin / hair / hat-decal / face decals) so decals frequently hit the still-black RTT first
-        // -> the hat (a decal page) vanished under the old "skip decal over black" heuristic, and
-        // face decals over black showed as dark dots. Reproduce HW: when the costume RTT dest is
-        // still black (uncovered), write the source color OPAQUELY (skip the blend) for ANY head
-        // mesh; subsequent fragments then blend over real color. Replaces the G45 NoDot decal-skip.
-        const bool g48OpaqueOverBlack =
-            (ctx.frame.fbp == 0x139u) && ((existing & 0x00FFFFFFu) == 0u);
-        if (g48OpaqueOverBlack)
-        {
-            r = srcR; g = srcG; b = srcB;
-        }
         // PABE disables alpha blending when the source alpha MSB is clear.
-        else if (!(gs->m_pabe && (a & 0x80u) == 0u))
+        if (!(gs->m_pabe && (a & 0x80u) == 0u))
         {
             uint64_t alphaReg = ctx.alpha;
             uint8_t asel = alphaReg & 3;
@@ -556,6 +816,81 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
                 static_cast<unsigned long long>(ctx.test),
                 static_cast<unsigned long long>(ctx.zbuf));
         }
+    }
+
+    // G407 diagnostic: ordered writers of one exact display pixel over a bounded VSync window.
+    // Format: DC2_G407_PIXEL=x,y,minTick,maxTick. Default-off and behavior-neutral.
+    {
+        struct G407PixelProbe
+        {
+            bool enabled = false;
+            int x = 0;
+            int y = 0;
+            uint64_t minTick = 0;
+            uint64_t maxTick = ~0ull;
+        };
+        static const G407PixelProbe s_probe = []() {
+            G407PixelProbe p;
+            const char *e = std::getenv("DC2_G407_PIXEL");
+            unsigned long long lo = 0, hi = ~0ull;
+            if (e && std::sscanf(e, "%d,%d,%llu,%llu", &p.x, &p.y, &lo, &hi) == 4)
+            {
+                p.enabled = true;
+                p.minTick = static_cast<uint64_t>(lo);
+                p.maxTick = static_cast<uint64_t>(hi);
+            }
+            return p;
+        }();
+        const uint64_t tick =
+            s_probe.enabled ? ps2_syscalls::GetCurrentVSyncTick() : 0u;
+        if (s_probe.enabled && x == s_probe.x && y == s_probe.y &&
+            tick >= s_probe.minTick && tick <= s_probe.maxTick &&
+            (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u))
+        {
+            uint32_t before = 0u;
+            std::memcpy(&before, gs->m_vram + off, 4);
+            // Alpha-only field-copy sprites are very frequent here and cannot create the
+            // visible speck. Suppressing them keeps the diagnostic replay timing-identical.
+            if ((before & 0x00FFFFFFu) != (pixel & 0x00FFFFFFu))
+            {
+                static std::atomic<uint32_t> s_n{0};
+                const uint32_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (n <= 4000u)
+                    std::fprintf(stderr,
+                        "[G407:px] n=%u tick=%llu xy=(%d,%d) fbp=0x%x prim=%u tme=%u abe=%u fst=%u "
+                        "tbp=0x%x tpsm=0x%x tex1=0x%llx src=%02x,%02x,%02x,%02x "
+                        "before=%08x final=%08x alpha=0x%llx test=0x%llx "
+                        "v0=(%.3f,%.3f uv=%.3f,%.3f) v1=(%.3f,%.3f uv=%.3f,%.3f)\n",
+                        n, static_cast<unsigned long long>(tick), x, y, ctx.frame.fbp,
+                        static_cast<uint32_t>(gs->m_prim.type),
+                        static_cast<uint32_t>(gs->m_prim.tme),
+                        static_cast<uint32_t>(gs->m_prim.abe),
+                        static_cast<uint32_t>(gs->m_prim.fst),
+                        ctx.tex0.tbp0, static_cast<uint32_t>(ctx.tex0.psm),
+                        static_cast<unsigned long long>(ctx.tex1),
+                        srcR, srcG, srcB, srcA, before, pixel,
+                        static_cast<unsigned long long>(ctx.alpha),
+                        static_cast<unsigned long long>(ctx.test),
+                        gs->m_vtxQueue[0].x - static_cast<float>(ctx.xyoffset.ofx >> 4),
+                        gs->m_vtxQueue[0].y - static_cast<float>(ctx.xyoffset.ofy >> 4),
+                        static_cast<double>(gs->m_vtxQueue[0].u) / 16.0,
+                        static_cast<double>(gs->m_vtxQueue[0].v) / 16.0,
+                        gs->m_vtxQueue[1].x - static_cast<float>(ctx.xyoffset.ofx >> 4),
+                        gs->m_vtxQueue[1].y - static_cast<float>(ctx.xyoffset.ofy >> 4),
+                        static_cast<double>(gs->m_vtxQueue[1].u) / 16.0,
+                        static_cast<double>(gs->m_vtxQueue[1].v) / 16.0);
+            }
+        }
+    }
+
+    {
+        uint32_t before = 0u;
+        std::memcpy(&before, gs->m_vram + off, 4);
+        g407AutoRecord(ctx,
+                       static_cast<uint32_t>(gs->m_prim.type),
+                       gs->m_prim.tme, gs->m_prim.abe, gs->m_prim.fst,
+                       x, y, before, pixel,
+                       srcR, srcG, srcB, srcA);
     }
 
     f50_12_log_framebuffer_commit(ctx, x, y, off, bytesPerPixel, pixel,

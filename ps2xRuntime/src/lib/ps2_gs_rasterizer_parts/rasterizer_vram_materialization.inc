@@ -3175,7 +3175,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             g178GenSumRect(ctx.tex0.cbp, 1, GS_PSM_CT32, 0, 0, 64, 32); // CLUT page(s)
         auto it = g_g178TexReg.find(st.texKey);
         const bool backendHas = g178_backend_has_tex(st.texKey);
-        if (it != g_g178TexReg.end() && backendHas && it->second.genSum == genNow)
+        static const bool s_g401Ct24Redecode =
+            envFlagEnabled("DC2_G401_CT24_REDECODE");
+        const bool g401ForceDecode =
+            s_g401Ct24Redecode && ctx.tex0.psm == GS_PSM_CT24;
+        if (!g401ForceDecode && it != g_g178TexReg.end() && backendHas &&
+            it->second.genSum == genNow)
         {
             g_g178TexHits.fetch_add(1u, std::memory_order_relaxed);
             continue;
@@ -3186,7 +3191,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         const uint64_t hashNow = g178HashPages(vram, vramSize, ctx.tex0.tbp0, ctx.tex0.tbw,
                                                ctx.tex0.psm, static_cast<uint32_t>(st.texW),
                                                static_cast<uint32_t>(st.texH), ctx.tex0.cbp);
-        if (it != g_g178TexReg.end() && backendHas && it->second.contentHash == hashNow)
+        if (!g401ForceDecode && it != g_g178TexReg.end() && backendHas &&
+            it->second.contentHash == hashNow)
         {
             it->second.genSum = genNow;
             g_g178TexHashHits.fetch_add(1u, std::memory_order_relaxed);
@@ -3198,6 +3204,37 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         up.h = st.texH;
         up.px.resize(static_cast<size_t>(st.texW) * st.texH);
         g178DecodeWhole(self, gs, vram, ctx, e.texa, e.texclut, st.texW, st.texH, up.px.data());
+        if (g401CompositeOn() && ctx.tex0.psm == GS_PSM_CT24 &&
+            ctx.tex0.tbp0 == 0x2720u)
+        {
+            extern std::atomic<uint64_t> g_dc2PresentTick;
+            const uint64_t tick = g_dc2PresentTick.load(std::memory_order_relaxed);
+            const uint64_t from = g400EnvU64("DC2_G401_FROM", 0ull);
+            const uint64_t to = g400EnvU64("DC2_G401_TO", from + 8ull);
+            if (tick >= from && tick <= to)
+            {
+                uint64_t sumA = 0u;
+                uint32_t minA = 255u, maxA = 0u;
+                for (uint32_t c : up.px)
+                {
+                    const uint32_t a = c >> 24u;
+                    sumA += a;
+                    minA = std::min(minA, a);
+                    maxA = std::max(maxA, a);
+                }
+                std::fprintf(stderr,
+                             "[G401:ct24-decode] tick=%llu tex=%dx%d ta0=%u aem=%u "
+                             "A=%.2f/%u/%u view=%llu fbo=%03x\n",
+                             static_cast<unsigned long long>(tick), st.texW, st.texH,
+                             static_cast<unsigned>(e.texa.ta0), e.texa.aem ? 1u : 0u,
+                             up.px.empty() ? 0.0 : static_cast<double>(sumA) / up.px.size(),
+                             minA, maxA,
+                             static_cast<unsigned long long>(
+                                 s_g281ViewKey.empty() ? 0u : s_g281ViewKey[i]),
+                             (g261HaveFboSrc && !s_g261FboSrc.empty())
+                                 ? s_g261FboSrc[i] : 0u);
+            }
+        }
         s_batch.texUploads.push_back(std::move(up));
         g_g178TexReg[st.texKey] = G178TexReg{genNow, hashNow, st.texW, st.texH};
         g_g178TexDecodes.fetch_add(1u, std::memory_order_relaxed);
@@ -3216,6 +3253,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         const int ofx = e.ctx.xyoffset.ofx >> 4;
         const int ofy = e.ctx.xyoffset.ofy >> 4;
         const int first = static_cast<int>(s_batch.verts.size());
+        G406UvRoundInfo g406Round;
         // G261 FBO-bound entry: normalize FST UVs against the PRODUCER target's full fbW x 512
         // space instead of the declared texture dims; the V axis is flipped after the push
         // (GS row y lives at GL row 511-y in the persistent FBO).
@@ -3255,6 +3293,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             const GSVertex &a = e.v[0];
             const GSVertex &b = e.v[1];
             GSVertex q0 = e.v[0], q1 = e.v[1];
+            g406Round = g406SpriteUvRoundInfo(
+                a, b, ofx, ofy, !st.bilinear, e.prim.tme != 0u, e.prim.fst != 0u);
             if (g255Rtt || g286Transient)
             {
                 // drawSprite first truncates screen positions, sorts the bounds, and expands a
@@ -3336,7 +3376,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 q0.y = static_cast<float>(sy0 + ofy);
                 q1.x = static_cast<float>(sx0 + std::max(1, sx1 - sx0) + ofx);
                 q1.y = static_cast<float>(sy0 + std::max(1, sy1 - sy0) + ofy);
-                if (e.prim.fst)
+                if (e.prim.fst && !g406Round.active)
                 {
                     // CPU FST sprites derive endpoints with integer `u >> 4` / `v >> 4` before
                     // interpolation. Preserve that truncation instead of feeding fractional 12.4
@@ -3347,15 +3387,52 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     q1.v = static_cast<uint16_t>((q1.v >> 4u) << 4u);
                 }
             }
-            float uvShiftU = 0.0f, uvShiftV = 0.0f;
+            float uvShiftU0 = 0.0f, uvShiftU1 = 0.0f;
+            float uvShiftV0 = 0.0f, uvShiftV1 = 0.0f;
             if (e.prim.tme && e.prim.fst)
             {
                 const float dxp = q1.x - q0.x; // positions are already pixel-unit floats (kick /16)
                 const float dyp = q1.y - q0.y;
-                if (dxp != 0.0f)
-                    uvShiftU = -0.5f * (static_cast<float>(q1.u) - static_cast<float>(q0.u)) / 16.0f / dxp;
-                if (dyp != 0.0f)
-                    uvShiftV = -0.5f * (static_cast<float>(q1.v) - static_cast<float>(q0.v)) / 16.0f / dyp;
+                const bool g407SubpixelPhase =
+                    g406Round.active && g407SpriteSubpixelPhaseEnabled();
+                const float rawX0 = a.x - static_cast<float>(ofx);
+                const float rawY0 = a.y - static_cast<float>(ofy);
+                const float rawX1 = b.x - static_cast<float>(ofx);
+                const float rawY1 = b.y - static_cast<float>(ofy);
+                const float rawDx = rawX1 - rawX0;
+                const float rawDy = rawY1 - rawY0;
+                if (g407SubpixelPhase && std::fabs(rawDx) >= (1.0f / 16.0f))
+                {
+                    const float step =
+                        (static_cast<float>(b.u) - static_cast<float>(a.u)) /
+                        16.0f / rawDx;
+                    uvShiftU0 =
+                        ((q0.x - static_cast<float>(ofx)) - rawX0 - 0.5f) * step;
+                    uvShiftU1 =
+                        ((q1.x - static_cast<float>(ofx)) - rawX1 - 0.5f) * step;
+                }
+                else if (dxp != 0.0f)
+                {
+                    uvShiftU0 = uvShiftU1 =
+                        -0.5f * (static_cast<float>(q1.u) - static_cast<float>(q0.u)) /
+                        16.0f / dxp;
+                }
+                if (g407SubpixelPhase && std::fabs(rawDy) >= (1.0f / 16.0f))
+                {
+                    const float step =
+                        (static_cast<float>(b.v) - static_cast<float>(a.v)) /
+                        16.0f / rawDy;
+                    uvShiftV0 =
+                        ((q0.y - static_cast<float>(ofy)) - rawY0 - 0.5f) * step;
+                    uvShiftV1 =
+                        ((q1.y - static_cast<float>(ofy)) - rawY1 - 0.5f) * step;
+                }
+                else if (dyp != 0.0f)
+                {
+                    uvShiftV0 = uvShiftV1 =
+                        -0.5f * (static_cast<float>(q1.v) - static_cast<float>(q0.v)) /
+                        16.0f / dyp;
+                }
             }
             // Two triangles covering the rect; UVs pair with the ORIGINAL corners (axis-aligned).
             GSVertex c00 = q0, c11 = q1, c10 = q0, c01 = q0;
@@ -3366,12 +3443,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             c00.z = c10.z = c11.z = c01.z = b.z;
             c00.fog = c10.fog = c11.fog = c01.fog = b.fog; // G364: sprite F is flat (2nd vertex)
             const bool tme = e.prim.tme, fst = e.prim.fst;
-            g178PushVertex(s_batch.verts, c00, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU, uvShiftV);
-            g178PushVertex(s_batch.verts, c10, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU, uvShiftV);
-            g178PushVertex(s_batch.verts, c11, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU, uvShiftV);
-            g178PushVertex(s_batch.verts, c00, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU, uvShiftV);
-            g178PushVertex(s_batch.verts, c11, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU, uvShiftV);
-            g178PushVertex(s_batch.verts, c01, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU, uvShiftV);
+            g178PushVertex(s_batch.verts, c00, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU0, uvShiftV0);
+            g178PushVertex(s_batch.verts, c10, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU1, uvShiftV0);
+            g178PushVertex(s_batch.verts, c11, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU1, uvShiftV1);
+            g178PushVertex(s_batch.verts, c00, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU0, uvShiftV0);
+            g178PushVertex(s_batch.verts, c11, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU1, uvShiftV1);
+            g178PushVertex(s_batch.verts, c01, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU0, uvShiftV1);
         }
         else
         {
@@ -3394,6 +3471,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             g178StateEqual(s_states[i], s_states[i - 1]) &&
             (!g261HaveFboSrc || s_g261FboSrc[i] == s_g261FboSrc[i - 1]) &&
             s_batch.draws.back().texKey == (g261Bound ? 0u : drawTexKey) &&
+            s_batch.draws.back().uvOriginX == g406Round.originX &&
+            s_batch.draws.back().uvOriginY == g406Round.originY &&
+            s_batch.draws.back().uvRoundU == g406Round.flagsU &&
+            s_batch.draws.back().uvRoundV == g406Round.flagsV &&
             s_batch.draws.back().firstVtx + s_batch.draws.back().vtxCount == first)
         {
             s_batch.draws.back().vtxCount += count;
@@ -3415,6 +3496,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             d.bilinear = st.bilinear;
             d.wrapU = st.wrapU;
             d.wrapV = st.wrapV;
+            d.uvOriginX = static_cast<uint16_t>(g406Round.originX);
+            d.uvOriginY = static_cast<uint16_t>(g406Round.originY);
+            d.uvRoundU = g406Round.flagsU;
+            d.uvRoundV = g406Round.flagsV;
             d.scX0 = st.scX0; d.scY0 = st.scY0; d.scX1 = st.scX1; d.scY1 = st.scY1;
             s_batch.draws.push_back(d);
         }

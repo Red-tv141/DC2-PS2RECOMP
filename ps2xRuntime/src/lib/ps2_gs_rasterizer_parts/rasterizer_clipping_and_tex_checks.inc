@@ -1,3 +1,179 @@
+struct G406UvRoundInfo
+{
+    // Active also means "preserve the incoming 12.4 endpoints". PCSX2's accurate-UV
+    // path keeps fractional sprite UVs even when neither axis needs a rounding nudge.
+    bool active = false;
+    int originX = 0;
+    int originY = 0;
+    uint8_t flagsU = 0;
+    uint8_t flagsV = 0;
+};
+
+enum : uint8_t
+{
+    G406_ROUND_UP = 1u,
+    G406_ROUND_DOWN = 2u,
+    G407_LEGACY_WIDE_NUDGE = 4u,
+    G407_ACCURATE_UV_ACTIVE = 8u,
+};
+
+bool g406AccurateUvEnabled()
+{
+    static const bool enabled = std::getenv("DC2_G406_NO_ACCURATE_UV") == nullptr;
+    return enabled;
+}
+
+bool g406PowerOfTwo(int value)
+{
+    return value > 0 && (value & (value - 1)) == 0;
+}
+
+struct G407AxisRoundInfo
+{
+    bool allow = false;
+    bool biasUp = false;
+    bool biasDown = false;
+};
+
+G407AxisRoundInfo g407AxisRoundInfo(int pos0, int pos1, int tex0, int tex1,
+                                   bool pointSampled)
+{
+    G407AxisRoundInfo out;
+    const int dp = pos1 - pos0;
+    const int dt = tex1 - tex0;
+    if (dp == 0)
+        return out;
+
+    // PCSX2 PR #14078 condition 1: an integral dT/dP whose first and last
+    // covered pixel centres both land on half-texel boundaries.
+    bool scaledAligned = false;
+    if ((dt % dp) == 0)
+    {
+        const int scale = dt / dp;
+        const int pos0Round = (pos0 + 0xF) & ~0xF;
+        const int pos1Round = pos1 & ~0xF;
+        const int tex0Round = tex0 + (pos0Round - pos0) * scale;
+        const int tex1Round = tex1 + (pos1Round - pos1) * scale;
+        scaledAligned = ((tex0Round | tex1Round) & 7) == 0;
+    }
+
+    // Condition 2: half-aligned endpoints and a small reduced denominator.
+    const int absDp = std::abs(dp);
+    const int absDt = std::abs(dt);
+    const int denominator =
+        absDp / std::gcd(std::max(absDp, 1), std::max(absDt, 1));
+    const bool alignedDenominator =
+        ((pos0 | pos1 | tex0 | tex1) & 7) == 0 && denominator < 32;
+
+    // Condition 3: point-sampled sprites sometimes carry a deliberate one-texel
+    // endpoint bias. Preserve PCSX2's direction/anchor interpretation.
+    if (pointSampled)
+    {
+        const bool anchor0 = ((pos0 | tex0) & 0xF) == 0;
+        const bool anchor1 = ((pos1 | tex1) & 0xF) == 0;
+        const bool dtUp = absDt > absDp && absDt <= absDp + 0x10;
+        const bool dtDown = absDt < absDp && absDt >= absDp - 0x10;
+        out.biasUp =
+            (anchor0 && dt > 0 && dtUp) || (anchor0 && dt < 0 && dtDown) ||
+            (anchor1 && dt > 0 && dtDown) || (anchor1 && dt < 0 && dtUp);
+        out.biasDown =
+            (anchor0 && dt > 0 && dtDown) || (anchor0 && dt < 0 && dtUp) ||
+            (anchor1 && dt > 0 && dtUp) || (anchor1 && dt < 0 && dtDown);
+    }
+    out.allow = scaledAligned || alignedDenominator || out.biasUp || out.biasDown;
+    return out;
+}
+
+G406UvRoundInfo g406SpriteUvRoundInfo(const GSVertex &v0, const GSVertex &v1,
+                                      int ofx, int ofy, bool pointSampled,
+                                      bool textured, bool fst)
+{
+    G406UvRoundInfo out;
+    if (!g406AccurateUvEnabled() || !textured || !fst)
+        return out;
+
+    const int x0 = static_cast<int>(std::lround((v0.x - static_cast<float>(ofx)) * 16.0f));
+    const int y0 = static_cast<int>(std::lround((v0.y - static_cast<float>(ofy)) * 16.0f));
+    const int x1 = static_cast<int>(std::lround((v1.x - static_cast<float>(ofx)) * 16.0f));
+    const int y1 = static_cast<int>(std::lround((v1.y - static_cast<float>(ofy)) * 16.0f));
+    const int u0 = static_cast<int>(v0.u), v0f = static_cast<int>(v0.v);
+    const int u1 = static_cast<int>(v1.u), v1f = static_cast<int>(v1.v);
+
+    const int dx = x1 - x0, dy = y1 - y0;
+    const int du = u1 - u0, dv = v1f - v0f;
+    const G407AxisRoundInfo axisU =
+        g407AxisRoundInfo(x0, x1, u0, u1, pointSampled);
+    const G407AxisRoundInfo axisV =
+        g407AxisRoundInfo(y0, y1, v0f, v1f, pointSampled);
+    static const bool legacyWideNudge =
+        std::getenv("DC2_G407_LEGACY_WIDE_UV_NUDGE") != nullptr;
+
+    // Preserve all fractional point-sprite endpoints. Rounding remains
+    // independently classified per axis through flagsU/flagsV.
+    out.active = true;
+    out.originX = (x0 >> 4) & 0xFFF;
+    out.originY = (y0 >> 4) & 0xFFF;
+    if (axisU.allow)
+    {
+        out.flagsU = (du < 0 || du == 0 || g406PowerOfTwo(std::abs(dx)))
+                         ? G406_ROUND_UP : G406_ROUND_DOWN;
+        out.flagsU = axisU.biasUp ? G406_ROUND_UP
+                                  : (axisU.biasDown ? G406_ROUND_DOWN : out.flagsU);
+        if (legacyWideNudge)
+            out.flagsU |= G407_LEGACY_WIDE_NUDGE;
+    }
+    if (axisV.allow)
+    {
+        out.flagsV = (dv < 0 || dv == 0 || g406PowerOfTwo(std::abs(dy)))
+                         ? G406_ROUND_UP : G406_ROUND_DOWN;
+        out.flagsV = axisV.biasUp ? G406_ROUND_UP
+                                  : (axisV.biasDown ? G406_ROUND_DOWN : out.flagsV);
+        if (legacyWideNudge)
+            out.flagsV |= G407_LEGACY_WIDE_NUDGE;
+    }
+    out.flagsU |= G407_ACCURATE_UV_ACTIVE;
+    out.flagsV |= G407_ACCURATE_UV_ACTIVE;
+    return out;
+}
+
+bool g407SpriteSubpixelPhaseEnabled()
+{
+    static const bool enabled =
+        std::getenv("DC2_G407_NO_SUBPIXEL_PHASE") == nullptr;
+    return enabled;
+}
+
+uint16_t g406RoundUvFixed(float value, int pixel, int origin, uint8_t flags,
+                         bool linear)
+{
+    const int fixed = clampInt(
+        linear ? static_cast<int>(std::floor(value * 16.0f))
+               : static_cast<int>(std::lround(value * 16.0f)),
+        0, 0xFFFF);
+    if ((flags & (G406_ROUND_UP | G406_ROUND_DOWN)) == 0u)
+        return static_cast<uint16_t>(fixed);
+
+    const bool legacyWide = (flags & G407_LEGACY_WIDE_NUDGE) != 0u;
+    const float boundary = (legacyWide || linear)
+        ? std::floor(value * 2.0f + 0.5f) * 0.5f
+        : std::floor(value + 0.5f);
+    const float threshold = legacyWide ? 0.25f : (1.0f / 64.0f);
+    if (std::fabs(value - boundary) > threshold)
+        return static_cast<uint16_t>(fixed);
+
+    const bool roundDown = (flags & G406_ROUND_DOWN) != 0u && pixel != origin;
+    const bool roundUp = (flags & G406_ROUND_UP) != 0u ||
+                         ((flags & G406_ROUND_DOWN) != 0u && pixel == origin);
+    const int boundaryFixed = static_cast<int>(std::lround(boundary * 16.0f));
+    // The local exact sampler quantizes to 12.4 before selecting a point texel.
+    // One 12.4 unit is the smallest representable nudge to either side.
+    const int downNudge = legacyWide ? 4 : 1;
+    const int upNudge = legacyWide ? 4 : 0;
+    const int adjusted = roundDown ? boundaryFixed - downNudge :
+                         (roundUp ? boundaryFixed + upNudge : fixed);
+    return static_cast<uint16_t>(clampInt(adjusted, 0, 0xFFFF));
+}
+
 void g50Record(uint32_t tbp, bool degen,
                    float x0, float y0, float x1, float y1, float x2, float y2)
     {
@@ -451,6 +627,53 @@ void g50Record(uint32_t tbp, bool degen,
             static_cast<uint32_t>(y) >= kG106TitleZH)
             return;
         g106TitleZBuf(fbp)[static_cast<uint32_t>(y) * kG106TitleZW + static_cast<uint32_t>(x)] = z;
+    }
+
+    constexpr uint32_t kG403DisplayZW = 512u;
+    constexpr uint32_t kG403DisplayZH = 512u;
+
+    bool g404SharedZScope(uint32_t fbp, uint32_t fbw, uint32_t zbpPage, uint32_t zpsm)
+    {
+        if (zbpPage != 0xD0u || zpsm != 0x1u || fbw != 8u)
+            return false;
+        // G404: the guest clears this physical ZBP while a display FBP is bound, then renders
+        // characters into RTT FBP 0x139 against the SAME ZBP. G403 mirrored only display draws,
+        // splitting one hardware surface into private-display and stale-physical owners.
+        static const bool s_legacyDisplayScope =
+            (std::getenv("DC2_G404_LEGACY_DISPLAY_Z_SCOPE") != nullptr);
+        return !s_legacyDisplayScope || fbp == 0u || fbp == 0x68u;
+    }
+
+    std::vector<uint32_t> &g403DisplayZBuf()
+    {
+        // ZBP, not color FBP, owns depth. All FBW=8 PSMZ24 draws at ZBP 0xd0 share this mirror.
+        // Keeping it outside aliased VRAM preserves loading/menu texture staging at block 0x1a00.
+        static std::vector<uint32_t> s_z(kG403DisplayZW * kG403DisplayZH, 0u);
+        return s_z;
+    }
+
+    void g403DisplayZPrepare(uint32_t)
+    {
+        // Guest mgSetPkClearScreen sprites authoritatively clear ZBP 0xd0 in packet order.
+        // Do not synthesize another clear here: FBP changes do not identify Z-surface lifetime.
+    }
+
+    uint32_t g403DisplayZRead(int x, int y, uint32_t)
+    {
+        if (x < 0 || y < 0 || x >= static_cast<int>(kG403DisplayZW) ||
+            y >= static_cast<int>(kG403DisplayZH))
+            return 0u;
+        return g403DisplayZBuf()[static_cast<size_t>(y) * kG403DisplayZW +
+                                 static_cast<size_t>(x)];
+    }
+
+    void g403DisplayZWrite(int x, int y, uint32_t, uint32_t z)
+    {
+        if (x < 0 || y < 0 || x >= static_cast<int>(kG403DisplayZW) ||
+            y >= static_cast<int>(kG403DisplayZH))
+            return;
+        g403DisplayZBuf()[static_cast<size_t>(y) * kG403DisplayZW +
+                          static_cast<size_t>(x)] = z;
     }
 
     uint32_t g106SkipTbp()

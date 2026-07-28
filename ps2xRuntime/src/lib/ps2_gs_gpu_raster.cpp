@@ -14,8 +14,8 @@
 // `extern` forward declarations at their call site (ps2_runtime.cpp), the same idiom already
 // used for g150_pipeline_enabled()/g150_mtgs_enabled().
 
-// G362: guarded fixed-point POINT fetch on the legacy shader path (uMode bit 12) --
-// see lle_gpu_raster_backend.inc. Touching this file forces MSBuild to recompile it after an
+// G362/G407: guarded exact POINT fetch plus point/linear hardware UV rounding -- see
+// lle_gpu_raster_backend.inc. Touching this file forces MSBuild to recompile it after an
 // .inc-only edit (the G359 stale-link trap).
 
 #include "ps2_gs_gpu_lle.h" // G178: private front-end<->backend interface (both build branches)

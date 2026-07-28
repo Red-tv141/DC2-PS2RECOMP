@@ -46,12 +46,16 @@
                 if (g_g144List.empty() || !g_g144LastGs)
                     return;
                 g219Sentinel(g_g144LastGs->m_vram, g_g144LastGs->m_vramSize, "flush-start");
+                g401NoteCompositeEntries(g_g144LastGs->m_vram, g_g144List);
+                g401NoteDisplayFlush(g_g144LastGs->m_vram, g_g144List, "pre");
                 // G178: whole-flush GPU attempt (default OFF, DC2_G178_GPU=1). On success the
                 // batch is already rendered AND read back into VRAM — skip the CPU replay
                 // entirely. On ANY unsupported entry it returns false having changed nothing,
                 // and the proven CPU band replay below runs for the whole flush.
                 if (g178TryFlushGpu(self, g_g144LastGs, g_g144LastGs->m_vram, g_g144LastGs->m_vramSize))
                 {
+                    g401NoteCompositeEntries(g_g144LastGs->m_vram, g_g144List, "post-gpu");
+                    g401NoteDisplayFlush(g_g144LastGs->m_vram, g_g144List, "post-gpu");
                     if (g290P)
                     {
                         ++g_g290GpuOk;
@@ -193,6 +197,8 @@
                 g261NoteCpuRttWrites(g_g144LastGs->m_vram);
                 g286NoteCpuTransientWrites(g_g144LastGs->m_vram);
                 g255CompareCpuVerify(g_g144LastGs->m_vram, g_g144LastGs->m_vramSize);
+                g401NoteCompositeEntries(g_g144LastGs->m_vram, g_g144List, "post-cpu");
+                g401NoteDisplayFlush(g_g144LastGs->m_vram, g_g144List, "post-cpu");
                 if (g290P)
                     g_g290NoteNs += static_cast<uint64_t>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -209,9 +215,13 @@
                 g162ResolvePendingT8Batch();
                 if (g_g144List.empty() || !g_g144LastGs)
                     return;
+                g401NoteCompositeEntries(g_g144LastGs->m_vram, g_g144List);
+                g401NoteDisplayFlush(g_g144LastGs->m_vram, g_g144List, "pre");
                 // G178: same whole-flush GPU attempt as the parallel closure above.
                 if (g178TryFlushGpu(self, g_g144LastGs, g_g144LastGs->m_vram, g_g144LastGs->m_vramSize))
                 {
+                    g401NoteCompositeEntries(g_g144LastGs->m_vram, g_g144List, "post-gpu");
+                    g401NoteDisplayFlush(g_g144LastGs->m_vram, g_g144List, "post-gpu");
                     g_g144List.clear();
                     return;
                 }
@@ -279,6 +289,8 @@
                 g261NoteCpuRttWrites(g_g144LastGs->m_vram);
                 g286NoteCpuTransientWrites(g_g144LastGs->m_vram);
                 g255CompareCpuVerify(g_g144LastGs->m_vram, g_g144LastGs->m_vramSize);
+                g401NoteCompositeEntries(g_g144LastGs->m_vram, g_g144List, "post-cpu");
+                g401NoteDisplayFlush(g_g144LastGs->m_vram, g_g144List, "post-cpu");
                 g_g144List.clear();
             };
         }

@@ -1125,6 +1125,10 @@ void GSRasterizer::drawTriangle(GS *gs)
     const uint32_t zpsm = static_cast<uint32_t>((ctx.zbuf >> 24) & 0xFu);
     const bool zmsk     = ((ctx.zbuf >> 32) & 0x1u) != 0u;
     const uint32_t zbw  = ctx.frame.fbw;
+    const bool g403DisplayZ =
+        g203Uni && g404SharedZScope(ctx.frame.fbp, zbw, zbpPage, zpsm);
+    if (g403DisplayZ)
+        g403DisplayZPrepare(ctx.frame.fbp);
     const bool g202TownZ = g202TownZScope(ctx.frame.fbp, zbpPage, zpsm);
     if (!g203Uni && g202TownZ && !t_g144InReplay)
         g202TownZClearIfNeeded(gs->m_vram, ctx.frame.fbp, ctx.zbuf, ctx.frame.fbw);
@@ -1517,7 +1521,9 @@ void GSRasterizer::drawTriangle(GS *gs)
                 zi = static_cast<uint32_t>(zf);
                 // G45: costume model (fbp=0x139) uses the private, non-aliasing Z buffer.
                 // G203: universal-Z reads the real VRAM Z for every target (private buffers retired).
-                if (!g203Uni && ctx.frame.fbp == 0x139u)
+                if (g403DisplayZ)
+                    zdst = g403DisplayZRead(x, y, ctx.frame.fbp);
+                else if (!g203Uni && ctx.frame.fbp == 0x139u)
                     zdst = costumeZRead(x, y);
                 else if (!g203Uni && g106TitleZ && g106TitleZPrivateEnabled())
                     zdst = g106TitleZRead(x, y, ctx.frame.fbp);
@@ -2215,7 +2221,9 @@ void GSRasterizer::drawTriangle(GS *gs)
                 // G45: costume model (fbp=0x139) writes its private, non-aliasing Z buffer so it
                 // neither corrupts nor is corrupted by the menu text VRAM it would otherwise alias.
                 // G203: universal-Z writes the real VRAM Z for every target (private buffers retired).
-                if (!g203Uni && ctx.frame.fbp == 0x139u)
+                if (g403DisplayZ)
+                    g403DisplayZWrite(x, y, ctx.frame.fbp, zi);
+                else if (!g203Uni && ctx.frame.fbp == 0x139u)
                     costumeZWrite(x, y, zi);
                 else if (!g203Uni && g106TitleZ && g106TitleZPrivateEnabled())
                     g106TitleZWrite(x, y, ctx.frame.fbp, zi);

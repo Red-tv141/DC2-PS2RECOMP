@@ -1,4 +1,4 @@
-// G368: G365 sprite coverage rule promoted back to default-on (kill DC2_G365_NO_SPRITE_EDGE=1).
+// G407: force MSBuild to consume accurate UV and ordered speck provenance .inc changes.
 #include "ps2_gs_rasterizer_parts/rasterizer_headers_and_diagnostics.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_g214_cap_trace.inc"
@@ -10,6 +10,10 @@
 
 #include "ps2_gs_rasterizer_parts/rasterizer_tilebinning_and_probes.inc"
 
+// G400/G401: raw surface sampling must be visible at command-graph execution time. G400's
+// draw-entry hook remains below; G401 calls the helper before the composite batch executes.
+#include "ps2_gs_rasterizer_parts/rasterizer_g400_stage_probe.inc"
+#include "ps2_gs_rasterizer_parts/rasterizer_g401_composite_probe.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_draw_prim_probe.inc"
 
@@ -66,10 +70,6 @@
 // declares the externally-linked g_dc2PresentTick from ps2_runtime.cpp.
 #include "ps2_gs_rasterizer_parts/rasterizer_g369_scene_census.inc"
 
-// G400: in-frame fbp=0x139 stage probe (default-off: DC2_G400_STAGE=1). Must sit after the
-// anonymous namespace has closed for the same reason as the G369 census above.
-#include "ps2_gs_rasterizer_parts/rasterizer_g400_stage_probe.inc"
-
 #include "ps2_gs_rasterizer_parts/rasterizer_write_pixel.inc"
 
 
@@ -80,5 +80,4 @@
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_draw_line.inc"
-// G360: item-grid gray-panel decode probe added in rasterizer_write_pixel.inc + draw_sprite.inc (force recompile v2).
-
+// G401: composite probe also hooks direct drawSprite execution (force recompile).
