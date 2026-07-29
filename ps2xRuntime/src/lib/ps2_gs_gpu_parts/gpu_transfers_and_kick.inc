@@ -76,11 +76,6 @@ void GS::performLocalToLocalTransfer()
                                          !envFlagEnabled("DC2_G145_NO_DIRTY_UPLOAD"))
                                       : s_g145EnvDirtyUpload) ||
                                  g260NrEnabled();
-    if (!g145DirtyUpload)
-        g144FlushPendingUpload();
-
-    if (!m_vram)
-        return;
 
     uint32_t sbp = m_bitbltbuf.sbp;
     uint8_t sbw = m_bitbltbuf.sbw;
@@ -100,6 +95,52 @@ void GS::performLocalToLocalTransfer()
     const uint32_t ssay = m_trxpos.ssay;
     const uint32_t dsax = m_trxpos.dsax;
     const uint32_t dsay = m_trxpos.dsay;
+
+    // G414 bring-up: a non-empty local-to-local transfer whose complete source and
+    // destination mappings are identical cannot change GS local memory. Retire it
+    // before any G144/G242 materialization, ownership publication, or VRAM-generation
+    // bump. Fail closed on every unlike field. The positive arm is opt-in until the
+    // same-binary A/B and graphics-route matrix pass.
+    static const bool s_g414SelfCopyOn =
+        envFlagEnabled("DC2_G414_L2L_SELF_COPY") &&
+        !envFlagEnabled("DC2_G414_NO_L2L_SELF_COPY");
+    static const bool s_g414StatOn = envFlagEnabled("DC2_G414_STAT");
+    const bool g414ExactSelfCopy =
+        m_vram != nullptr &&
+        rrw != 0u && rrh != 0u &&
+        sbp == dbp &&
+        sbw == dbw &&
+        spsm == dpsm &&
+        ssax == dsax &&
+        ssay == dsay;
+    if (s_g414SelfCopyOn && g414ExactSelfCopy)
+    {
+        static std::atomic<uint64_t> s_g414Skipped{0u};
+        static std::atomic<uint64_t> s_g414Pixels{0u};
+        const uint64_t skipped =
+            s_g414Skipped.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        const uint64_t pixelsAdded =
+            static_cast<uint64_t>(rrw) * static_cast<uint64_t>(rrh);
+        const uint64_t pixels =
+            s_g414Pixels.fetch_add(pixelsAdded, std::memory_order_relaxed) + pixelsAdded;
+        if (s_g414StatOn && (skipped == 1u || (skipped & 255u) == 0u))
+        {
+            std::fprintf(stderr,
+                         "[G414:selfcopy] skipped=%llu pixels=%llu bp=0x%x bw=%u psm=0x%x xy=(%u,%u) rr=(%u,%u)\n",
+                         static_cast<unsigned long long>(skipped),
+                         static_cast<unsigned long long>(pixels),
+                         sbp, static_cast<uint32_t>(sbw), static_cast<uint32_t>(spsm),
+                         ssax, ssay, rrw, rrh);
+        }
+        return;
+    }
+
+    if (!g145DirtyUpload)
+        g144FlushPendingUpload();
+
+    if (!m_vram)
+        return;
+
     const GSTransferTraversal traversal = decodeTransferTraversal(m_trxpos.dir);
     const bool formatAware = (spsm == dpsm) && supportsFormatAwareLocalCopy(spsm);
 
@@ -652,7 +693,6 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
     if (s_g313Census)
         g313StepT0 = std::chrono::steady_clock::now();
     if (g145DirtyUpload)
-    {
         g144FlushPendingUploadRange(m_bitbltbuf.dbp,
                                     m_bitbltbuf.dbw,
                                     m_bitbltbuf.dpsm,
@@ -660,7 +700,6 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
                                     m_trxpos.dsay,
                                     m_trxreg.rrw,
                                     m_trxreg.rrh);
-    }
     if (s_g313Census)
     {
         s_g313Seg.rangeNs += static_cast<uint64_t>(

@@ -3,3 +3,4 @@
 #include "ps2_runtime_parts/runtime_init_and_signals.inc"
 #include "ps2_runtime_parts/runtime_guest_heap.inc"
 #include "ps2_runtime_parts/runtime_dispatch_and_memory.inc"
+// G410: MTVU code-replay invalidation hook added (force recompile).

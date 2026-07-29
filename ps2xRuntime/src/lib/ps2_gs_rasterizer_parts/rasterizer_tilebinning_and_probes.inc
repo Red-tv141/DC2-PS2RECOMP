@@ -369,6 +369,29 @@ static bool g265DisplayZWaveOn()
     return on;
 }
 
+// G411: let the native wave backend own DC2's private shared ZBP=0xd0 surface.
+// G405 moved this depth surface out of aliased GS VRAM so display clears and RTT draws share one
+// owner without corrupting loading textures. The default bridge maps that private mirror to the
+// backend's existing ZBP-keyed depth texture; the pre-G411 CPU-only path remains the rollback.
+static bool g411SharedGpuDepthOn()
+{
+    static const bool on =
+        !envFlagEnabled("DC2_G411_NO_GPU_SHARED_Z") &&
+        !envFlagDisabled("DC2_G411_GPU_SHARED_Z") &&
+        !envFlagEnabled("DC2_G404_LEGACY_DISPLAY_Z_SCOPE") &&
+        !(envFlagEnabled("DC2_G242_GPU_DEPTH") &&
+          !envFlagEnabled("DC2_G242_NO_GPU_DEPTH"));
+    // G242 has a different cross-frame ownership contract. G411 deliberately rides the proven
+    // G262/G278 within-drain path until that persistent mode gains an explicit private-mirror tag.
+    return on && g261WaveOn();
+}
+
+static bool g411SharedGpuDepthStatOn()
+{
+    static const bool on = envFlagEnabled("DC2_G411_STAT");
+    return on;
+}
+
 static bool g265CensusOn()
 {
     static const bool on = envFlagEnabled("DC2_G265_CENSUS");

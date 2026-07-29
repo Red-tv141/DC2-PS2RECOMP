@@ -195,7 +195,12 @@ static inline void g329UpdateMacSelected(uint32_t &macReg, uint32_t &statusReg,
 #define DC2_G330_FORCEINLINE inline
 #endif
 
-static const bool s_g330FusedMacOn = (std::getenv("DC2_G330_FUSED_MAC") != nullptr);
+// G413: the fused classifier and G328's circular MAC delay line form one coupled VU hot-loop
+// profile. They are default-on together; keep one master rollback plus a component rollback for
+// field bisection. The former positive bring-up flag remains accepted implicitly.
+static const bool s_g330FusedMacOn =
+    (std::getenv("DC2_G413_NO_DUAL_POLE") == nullptr) &&
+    (std::getenv("DC2_G330_NO_FUSED_MAC") == nullptr);
 static const bool s_g330Verify = (std::getenv("DC2_G330_VERIFY") != nullptr);
 
 static DC2_G330_FORCEINLINE void vu1UpdateMac(uint32_t &macReg, uint32_t &statusReg,

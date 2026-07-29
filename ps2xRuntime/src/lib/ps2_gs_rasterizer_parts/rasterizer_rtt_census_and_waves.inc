@@ -418,8 +418,15 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
             const uint32_t g403Zpsm = static_cast<uint32_t>((ctx.zbuf >> 24) & 0xFu);
             if (g404SharedZScope(ctx.frame.fbp, ctx.frame.fbw, g403Zbp, g403Zpsm))
             {
-                g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
-                return false;
+                // G411: G405's private mirror is now an explicit native-depth owner. The backend
+                // already keys depth by (ZBP, ZPSM, FBW), independent of color FBP, so display
+                // clears and RTT draws can share the same GPU attachment without touching the
+                // aliased physical Z page. Control remains whole-flush CPU replay.
+                if (!g411SharedGpuDepthOn())
+                {
+                    g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+                    return false;
+                }
             }
             // G262: widened RTT-family entries take the same guestDepth derivation as G242, but
             // the flush executes it as a NON-PERSISTENT per-wave Z round-trip (no ownership).

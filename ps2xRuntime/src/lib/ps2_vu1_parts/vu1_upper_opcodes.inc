@@ -91,11 +91,14 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool s_macpipeOn     = g138_macpipe_enabled();
     const int  s_macpipeDepth  = s_macpipeOn ? g138_macpipe_depth() : 4;
     const bool s_pairhazOn     = g139_pairhaz_enabled();
-    // G328: the G138 implementation shifted DEPTH-1 MAC words plus DEPTH-1 STATUS words
-    // on every executed VU pair.  A circular physical layout is the same delay line with no
-    // bulk copies.  Opt-in while measured: DC2_G328_MAC_RING=1.  VERIFY keeps a shadow copy
-    // of the legacy shift register and aborts on the first visible/logical mismatch.
-    static const bool s_g328RingOn = (std::getenv("DC2_G328_MAC_RING") != nullptr);
+    // G328/G413: the G138 implementation shifted DEPTH-1 MAC words plus DEPTH-1 STATUS words
+    // on every executed VU pair. A circular physical layout is the same delay line with no
+    // bulk copies. G413 promotes it together with G330's fused classifier; either the master
+    // rollback or this component rollback restores the legacy shift register. VERIFY keeps a
+    // shadow copy and aborts on the first visible/logical mismatch.
+    static const bool s_g328RingOn =
+        (std::getenv("DC2_G413_NO_DUAL_POLE") == nullptr) &&
+        (std::getenv("DC2_G328_NO_MAC_RING") == nullptr);
     static const bool s_g328Verify = (std::getenv("DC2_G328_VERIFY") != nullptr);
     static const bool s_g328Stat = (std::getenv("DC2_G328_STAT") != nullptr);
     static std::atomic<uint64_t> s_g328Cycles{0u};
@@ -135,6 +138,39 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool g295Diag = s_g295ForceDiagLoop || s_g295AnyProbeEnv || g100ForceTitleDraw ||
                           s_g216CharExec || s_g106ParallelFlags || vu1_trace_enabled() ||
                           g32_vu_trace_enabled() || g137_trace_enabled();
+    // G410: the compiled path is deliberately excluded from diagnostic runs because several
+    // historical probes live inside execUpper or depend on its exact call boundary. Normal
+    // execution recognizes the compiled zero-work VNOP form directly from the fetched word;
+    // audit modes also consume the write-maintained sidecar to prove MPG invalidation coverage.
+    const bool g410CompiledRun =
+        g410CompiledRequested() && g410UpperDiagnosticsCompatible() && !g295Diag;
+    const bool g410VerifyRun = g410CompiledRun && g410VerifyOn();
+    const bool g410CountStats = g410CompiledRun && (g410StatOn() || g410VerifyRun);
+    G410CompiledUpper *const g410Pairs =
+        g410CompiledRun ? g410PreparePairs(vuCode, g410CountStats) : nullptr;
+    auto g410VerifyUpper = [&](uint32_t lowerWord, uint32_t upperWord) {
+        const VU1State before = m_state;
+        // Special2 function 0x2f with opcode low bits 0x3f is VNOP. Its register and
+        // destination fields are don't-care, so bits 10:0 fully identify the operation.
+        if ((upperWord & 0x7ffu) != 0x2ffu)
+            execUpper(upperWord);
+        const VU1State compiled = m_state;
+        m_state = before;
+        execUpper(upperWord);
+        if (!g410UpperStatesEqual(m_state, compiled))
+        {
+            ++s_g410Cache.verifyBad;
+            std::fprintf(stderr,
+                         "[G410:verify] mismatch pc=0x%x lower=%08x upper=%08x "
+                         "mac=%08x/%08x status=%08x/%08x clip=%08x/%08x\n",
+                         m_state.pc, lowerWord, upperWord,
+                         compiled.mac, m_state.mac, compiled.status, m_state.status,
+                         compiled.clip, m_state.clip);
+            std::abort();
+        }
+        ++s_g410Cache.verified;
+        m_state = compiled;
+    };
     uint32_t *const s_macPipeP     = s_vuMacPipe;
     uint32_t *const s_statusPipeP  = s_vuStatusPipe;
     uint32_t *const s_macVisP      = &s_vuMacVisible;
@@ -476,8 +512,18 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
 
         uint32_t lower, upper;
-        std::memcpy(&lower, vuCode + currentPc, 4);
-        std::memcpy(&upper, vuCode + currentPc + 4, 4);
+        G410CompiledUpper *g410Pair = nullptr;
+        if (g410CountStats)
+            g410Pair = &g410FetchPair(
+                g410Pairs, vuCode, currentPc, g410CountStats, g410VerifyRun,
+                lower, upper);
+        else
+        {
+            std::memcpy(&lower, vuCode + currentPc, 4);
+            std::memcpy(&upper, vuCode + currentPc + 4, 4);
+            if (g410Pairs != nullptr)
+                g410Pair = &g410Pairs[currentPc >> 3u];
+        }
         lastPc = currentPc;
         lastLower = lower;
         lastUpper = upper;
@@ -884,7 +930,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
         } // G295 diag region B end
 
-        bool eBit = (upper >> 30) & 1;
+        const bool eBit = g410Pair != nullptr
+            ? (g410Pair->pairFlags & G410_PAIR_E_BIT) != 0u
+            : ((upper >> 30u) & 1u) != 0u;
 
         // G27: LOI is signaled by the I-bit (bit 31 of the UPPER word). When set,
         // the LOWER 32 bits are a 32-bit float immediate loaded into the I register
@@ -893,7 +941,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         // programs never emit, so real LOI immediates (e.g. 0x457ff000 ~= 4093.0f)
         // were decoded as bogus lower ops (0x22/0x23), corrupting the model transform
         // and derailing the microprogram (runaway -> maxcycles, garbage GIF output).
-        bool iBit = (upper >> 31) & 1;
+        const bool iBit = g410Pair != nullptr
+            ? (g410Pair->pairFlags & G410_PAIR_I_BIT) != 0u
+            : ((upper >> 31u) & 1u) != 0u;
 
         // G87: advance the Q pipeline one cycle BEFORE this word executes. A pending DIV/SQRT/
         // RSQRT result becomes visible in m_state.q when its delay expires; a producer in THIS
@@ -913,10 +963,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         // observes an already-completed WAIT) after the parallel upper has consumed the value.
         if (!iBit && s_scalarPrestallOn)
         {
-            const uint8_t lowerOpHi239 = static_cast<uint8_t>((lower >> 25u) & 0x7fu);
-            if (lowerOpHi239 == 0x40u)
+            const uint8_t lowerS2239 = g410Pair != nullptr
+                ? g410Pair->lowerS2
+                : (((lower >> 25u) & 0x7fu) == 0x40u ? S2_FUNC(lower) : 0xffu);
+            if (lowerS2239 != 0xffu)
             {
-                const uint8_t lowerS2239 = S2_FUNC(lower);
                 const bool waitQ239 = lowerS2239 == 0x3bu;
                 const bool fdivProducer239 = lowerS2239 >= 0x38u && lowerS2239 <= 0x3au;
                 if (s_qlatOn && *s_qDelayP > 0 &&
@@ -991,7 +1042,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (iBit)
         {
             std::memcpy(&m_state.i, &lower, 4);
-            execUpper(upper);
+            if (g410VerifyRun)
+                g410VerifyUpper(lower, upper);
+            else if (!g410CompiledRun || g410Pair->upperKind != 0x6fu)
+                execUpper(upper);
         }
         else
         {
@@ -1004,20 +1058,31 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             float g139old[4], g139new[4];
             if (s_pairhazOn)
             {
-                const uint8_t g139op = (uint8_t)(upper & 0x3Fu);
                 uint32_t g139DstIdx = 0u;
-                if (g139op < 0x3Cu)
+                if (g410Pair != nullptr)
                 {
-                    g139DstIdx = (upper >> 6) & 0x1Fu;
-                    g139dst = m_state.vf[g139DstIdx];
+                    if (g410Pair->upperVfDest != 0xffu)
+                    {
+                        g139DstIdx = g410Pair->upperVfDest;
+                        g139dst = m_state.vf[g139DstIdx];
+                    }
                 }
                 else
                 {
-                    const uint8_t g139s2 = S2_FUNC(upper);
-                    if ((g139s2 >= 0x10u && g139s2 <= 0x17u) || g139s2 == 0x1Du)
+                    const uint8_t g139op = (uint8_t)(upper & 0x3Fu);
+                    if (g139op < 0x3Cu)
                     {
-                        g139DstIdx = (upper >> 16) & 0x1Fu;
+                        g139DstIdx = (upper >> 6) & 0x1Fu;
                         g139dst = m_state.vf[g139DstIdx];
+                    }
+                    else
+                    {
+                        const uint8_t g139s2 = S2_FUNC(upper);
+                        if ((g139s2 >= 0x10u && g139s2 <= 0x17u) || g139s2 == 0x1Du)
+                        {
+                            g139DstIdx = (upper >> 16) & 0x1Fu;
+                            g139dst = m_state.vf[g139DstIdx];
+                        }
                     }
                 }
                 // G295: every lower-slot VF access (read or write) names its register in the
@@ -1025,13 +1090,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 // the save/restore/overlay round-trip is the identity — skip it. A VI-indexed
                 // false positive just keeps the legacy swap. Kill: DC2_G295_NO_HAZSKIP=1.
                 if (g139dst != nullptr && !s_g295KeepHaz &&
-                    ((lower >> 11u) & 0x1Fu) != g139DstIdx &&
-                    ((lower >> 16u) & 0x1Fu) != g139DstIdx)
+                    (g410Pair != nullptr
+                         ? (g410Pair->lowerFs != g139DstIdx &&
+                            g410Pair->lowerFt != g139DstIdx)
+                         : (((lower >> 11u) & 0x1Fu) != g139DstIdx &&
+                            ((lower >> 16u) & 0x1Fu) != g139DstIdx)))
                     g139dst = nullptr;
                 if (g139dst)
                     std::memcpy(g139old, g139dst, 16);
             }
-            execUpper(upper);
+            if (g410VerifyRun)
+                g410VerifyUpper(lower, upper);
+            else if (!g410CompiledRun || g410Pair->upperKind != 0x6fu)
+                execUpper(upper);
             if (g139dst)
             {
                 std::memcpy(g139new, g139dst, 16);
@@ -1556,6 +1627,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         m_state.p = s_vuPPending;
         *s_pDelayP = 0;
     }
+
+    if (g410CompiledRun)
+        g410ReportMaybe();
 
     if (vu1_trace_enabled())
     {

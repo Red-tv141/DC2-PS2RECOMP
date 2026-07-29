@@ -17,6 +17,7 @@
 #include <vector>
 
 // G297 MTVU bridges (defined in ps2_runtime.cpp). No-ops unless DC2_G297_MTVU=1.
+extern bool g297MtvuActive();
 extern bool g297HasPendingKicks();
 extern void g297OnWindowHandoff();
 extern void g297CollectWindowPackets(std::vector<std::vector<uint8_t>> &out);
@@ -46,6 +47,9 @@ static uint64_t g156ThreadCpuNs() { return 0ull; }
 // G332: defined at global scope in ps2_gs_gpu_raster.cpp (lle_gpu_raster_backend.inc). Forward-
 // declared here at global scope so the anon-namespace g332ReportBoundary() resolves it externally.
 void g332_backend_snapshot(uint64_t nsOut[4], uint64_t cntOut[4]);
+
+// G412: depth-two frame ownership is default-on after the route/performance promotion.
+bool g412_cross_frame_enabled();
 
 namespace
 {
@@ -90,6 +94,12 @@ namespace
                 std::strcmp(value, "FALSE") == 0 ||
                 std::strcmp(value, "off") == 0 ||
                 std::strcmp(value, "OFF") == 0);
+    }
+
+    bool g412StatOn()
+    {
+        static const bool on = f50_12_env_flag("DC2_G412_STAT");
+        return on;
     }
 
     bool f50_12_trace_enabled()
@@ -749,13 +759,13 @@ namespace
             m_cvWork.notify_one();
         }
 
-        // G157 (DC2_G157_PIPELINE=1): non-blocking hand-off of the frame-boundary closure
-        // (G144 flush + present latch), bounded to kPipelineDepth frames "in flight". Unlike
+        // G157/G412: non-blocking hand-off of the frame-boundary closure (G144 flush + present
+        // latch), bounded to framePipelineDepth() frames "in flight". Unlike
         // frameDrain() this does NOT wait for the closure to finish — only for a free credit —
         // which is what lets the EE thread start producing the next frame while the worker is
-        // still finishing this one. The credit is released by the worker in worker() once it has
-        // actually RUN the closure (see there), which is also what makes waitRegisterSlot() below
-        // correct: gs_regs can't be overwritten for the next frame until this frame's latch read it.
+        // still finishing this one. The worker releases the credit only after running the closure.
+        // G157 depth one protects its live PCRTC read with waitRegisterSlot(); G412 depth two gives
+        // each closure an immutable PCRTC/vsync snapshot, so successor writes cannot change frame N.
         void enqueueFrameBoundary(std::function<void()> onComplete)
         {
             std::unique_lock<std::mutex> lk(m_mtx);
@@ -768,12 +778,28 @@ namespace
                     onComplete();
                 return;
             }
+            const int pipelineDepth = framePipelineDepth();
+            const bool g412Stat = g412StatOn() && g412_cross_frame_enabled();
+            const bool g412Blocked = g412Stat && m_pendingFrameMarkers >= pipelineDepth;
+            const auto g412T0 = g412Blocked ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
             g_g189EEStage.store(2, std::memory_order_relaxed);
-            m_cvFrameSlot.wait(lk, [&] { return m_stop || m_pendingFrameMarkers < kPipelineDepth; });
+            m_cvFrameSlot.wait(lk, [&] { return m_stop || m_pendingFrameMarkers < pipelineDepth; });
             g_g189EEStage.store(0, std::memory_order_relaxed);
             if (m_stop)
                 return;
+            if (g412Stat)
+            {
+                ++m_g412BoundaryCalls;
+                if (g412Blocked)
+                {
+                    ++m_g412BoundaryWaits;
+                    m_g412BoundaryWaitNs += g316ElapsedNs(g412T0);
+                }
+            }
             ++m_pendingFrameMarkers;
+            if (g412Stat)
+                m_g412MaxPending = std::max(m_g412MaxPending, m_pendingFrameMarkers);
             QueueItem item;
             item.isFrameBoundary = true;
             item.frameBoundaryFn = std::move(onComplete);
@@ -807,20 +833,32 @@ namespace
             return true;
         }
 
-        // G157: gate for GS-privileged-register writes (called from ps2_memory.cpp). Blocks only
-        // if the EE thread is about to overwrite a NEW frame's display registers while the worker
-        // hasn't yet confirmed it finished presenting the PREVIOUS frame — bounding how far ahead
-        // the EE can race relative to the one piece of frame state that bypasses this FIFO
-        // entirely (gs_regs is written directly, not via a GIF packet). No-op/instant in the
-        // common case (worker already caught up).
+        // G157/G412 gate for GS-privileged-register writes (called from ps2_memory.cpp). G157
+        // depth one protects the worker's live PCRTC read. G412's immutable boundary snapshot
+        // removes that lifetime dependency, while this depth-two gate still bounds direct register
+        // writes and producer lead to exactly one successor frame. Usually returns immediately.
         void waitRegisterSlot()
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (!m_started)
                 return;
+            const int pipelineDepth = framePipelineDepth();
+            const bool g412Stat = g412StatOn() && g412_cross_frame_enabled();
+            const bool g412Blocked = g412Stat && m_pendingFrameMarkers >= pipelineDepth;
+            const auto g412T0 = g412Blocked ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
             g_g189EEStage.store(3, std::memory_order_relaxed);
-            m_cvFrameSlot.wait(lk, [&] { return m_stop || m_pendingFrameMarkers < kPipelineDepth; });
+            m_cvFrameSlot.wait(lk, [&] { return m_stop || m_pendingFrameMarkers < pipelineDepth; });
             g_g189EEStage.store(0, std::memory_order_relaxed);
+            if (g412Stat)
+            {
+                ++m_g412RegisterCalls;
+                if (g412Blocked)
+                {
+                    ++m_g412RegisterWaits;
+                    m_g412RegisterWaitNs += g316ElapsedNs(g412T0);
+                }
+            }
         }
 
         // EE thread frame boundary (mgEndFrame): block until the worker has fully drained this frame's
@@ -891,7 +929,13 @@ namespace
 
     private:
         static constexpr size_t kMaxWindows = 8192;
-        static constexpr int kPipelineDepth = 1; // G157: max frames the EE may run ahead of the worker
+
+        static int framePipelineDepth()
+        {
+            // G157 owns one immutable frame marker. G412 adds exactly one successor-frame credit;
+            // this bounds both the MTGS queue and MTVU's side-channel batches.
+            return g412_cross_frame_enabled() ? 2 : 1;
+        }
 
         static void g317StampItem(QueueItem &item)
         {
@@ -1068,6 +1112,12 @@ namespace
                 QueueItem item = std::move(m_items.front());
                 m_items.pop_front();
                 item.g317HadQueuedSuccessor = !m_items.empty();
+                if (item.isFrameBoundary && g412StatOn() && g412_cross_frame_enabled())
+                {
+                    ++m_g412BoundaryPops;
+                    if (item.g317HadQueuedSuccessor)
+                        ++m_g412BoundaryPopsWithSuccessor;
+                }
                 m_busy = true;
                 m_cvSpace.notify_all(); // a window slot freed
                 lk.unlock();
@@ -1189,7 +1239,36 @@ namespace
 
                     lk.lock();
                     m_busy = false;
+                    // The closure consumed frame N's presentation state (immutable under G412).
+                    // Releasing this credit admits at most one successor beyond the current producer.
                     --m_pendingFrameMarkers;
+                    if (g412StatOn() && g412_cross_frame_enabled() &&
+                        (++m_g412CompletedBoundaries % 60u) == 0u)
+                    {
+                        std::fprintf(
+                            stderr,
+                            "[G412:pipeline] frames=60 depth=2 maxPending=%d "
+                            "markerWait=%llu/%llu %.2fms regWait=%llu/%llu %.2fms "
+                            "successor=%llu/%llu\n",
+                            m_g412MaxPending,
+                            static_cast<unsigned long long>(m_g412BoundaryWaits),
+                            static_cast<unsigned long long>(m_g412BoundaryCalls),
+                            static_cast<double>(m_g412BoundaryWaitNs) / 1.0e6,
+                            static_cast<unsigned long long>(m_g412RegisterWaits),
+                            static_cast<unsigned long long>(m_g412RegisterCalls),
+                            static_cast<double>(m_g412RegisterWaitNs) / 1.0e6,
+                            static_cast<unsigned long long>(m_g412BoundaryPopsWithSuccessor),
+                            static_cast<unsigned long long>(m_g412BoundaryPops));
+                        m_g412BoundaryCalls = 0u;
+                        m_g412BoundaryWaits = 0u;
+                        m_g412BoundaryWaitNs = 0u;
+                        m_g412RegisterCalls = 0u;
+                        m_g412RegisterWaits = 0u;
+                        m_g412RegisterWaitNs = 0u;
+                        m_g412BoundaryPops = 0u;
+                        m_g412BoundaryPopsWithSuccessor = 0u;
+                        m_g412MaxPending = 0;
+                    }
                     // Release the EE thread: it may now write the next frame's presentation
                     // registers (waitRegisterSlot()) and/or enqueue the next frame's own marker.
                     m_cvFrameSlot.notify_all();
@@ -1388,6 +1467,16 @@ namespace
         G317Path2ScanState m_g317Path2Scan{};
         uint64_t m_g317LastFenceEpoch = 0u;
         uint64_t m_g317RunPackets = 0u;
+        uint64_t m_g412BoundaryCalls = 0u;
+        uint64_t m_g412BoundaryWaits = 0u;
+        uint64_t m_g412BoundaryWaitNs = 0u;
+        uint64_t m_g412RegisterCalls = 0u;
+        uint64_t m_g412RegisterWaits = 0u;
+        uint64_t m_g412RegisterWaitNs = 0u;
+        uint64_t m_g412BoundaryPops = 0u;
+        uint64_t m_g412BoundaryPopsWithSuccessor = 0u;
+        uint64_t m_g412CompletedBoundaries = 0u;
+        int m_g412MaxPending = 0;
     };
 } // namespace
 
@@ -1421,6 +1510,18 @@ bool g150_pipeline_enabled()
     return on;
 }
 
+// G412: allow the EE/MTVU producer to own one complete successor frame while the GS worker
+// drains/publishes the current frame. Default-on after route/perf promotion; either rollback
+// variable restores G157's one-marker behavior.
+bool g412_cross_frame_enabled()
+{
+    static const bool on = g150_pipeline_enabled() &&
+                           g297MtvuActive() &&
+                           !f50_12_env_flag("DC2_G412_NO_CROSS_FRAME") &&
+                           !f50_12_env_disabled("DC2_G412_CROSS_FRAME");
+    return on;
+}
+
 // Called from ps2_memory.cpp's writeIORegister for the 6 presentation registers only. See
 // G150Mtgs::waitRegisterSlot.
 void g150_pipeline_wait_register_slot()
@@ -1434,10 +1535,10 @@ void g150_pipeline_wait_register_slot()
 // - MTGS on, pipelining off: first block until the GS worker has finished this frame's draws
 //   (frameDrain), then run the closure on THIS (EE) thread — reads live display registers + vsync
 //   exactly as the synchronous baseline, over complete VRAM (G150-v2, unchanged).
-// - MTGS on, pipelining on (DC2_G157_PIPELINE=1): hand the closure to the worker as a
+// - MTGS on, pipelining on: hand the closure to the worker as a
 //   frame-boundary marker and return immediately — the EE does NOT wait. The closure still runs
-//   with correct registers (gated by waitRegisterSlot()) and complete VRAM (FIFO ordering), just
-//   later and on the worker thread instead of here.
+//   with complete frame-N VRAM because of FIFO ordering. G157 depth one protects its live PCRTC
+//   read with waitRegisterSlot(); G412 depth two owns an immutable PCRTC/vsync snapshot instead.
 // G175: count of guest frame-boundary latches (mgEndFrame barrier). UploadFrame's present-thread
 // re-latch is only a boot fallback until the first boundary latch exists; after that the boundary
 // snapshot is the sole presentation source (the per-tick re-latch read VRAM mid-frame and caused

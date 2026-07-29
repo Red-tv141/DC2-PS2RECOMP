@@ -143,6 +143,7 @@
                 if (pos + copyBytes <= sizeBytes)
                 {
                     std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                    dc2_g410_vu_code_written(m_vu1Code, destAddr, copyBytes);
                     g297NoteVuWrite(true, destAddr, data + pos, copyBytes); // G301 MTVU ordered event
                 }
             }

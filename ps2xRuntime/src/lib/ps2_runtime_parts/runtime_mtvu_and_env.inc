@@ -68,6 +68,7 @@ bool (*g_f66_drive_dungeon_pad_hook)(uint32_t) = nullptr;
 extern thread_local std::vector<std::vector<uint8_t>> *g_g297KickCapture; // defined in ps2_vu1.cpp
 extern thread_local uint32_t g_g297KickTop;                              // defined in ps2_vu1.cpp
 extern bool g150_mtgs_enabled();                                          // defined in ps2_gif_arbiter.cpp
+extern void dc2_g410_vu_code_written(const uint8_t *codeBase, uint32_t offset, uint32_t sizeBytes);
 extern std::atomic<uint64_t> g_dc2PresentTick;  // global scope (defined in dc2_game_override.cpp); this
                                                 // .inc is included before runtime_dispatch_and_memory.inc's
                                                 // own extern, and it must NOT be declared inside the anon
@@ -480,7 +481,11 @@ private:
                     uint8_t *dst = w.isCode ? m_workerVuCode : m_workerVuData;
                     const uint32_t cap = w.isCode ? PS2_VU1_CODE_SIZE : PS2_VU1_DATA_SIZE;
                     if (w.off + w.len <= cap && run + w.len <= item->writeBytes.size())
+                    {
                         std::memcpy(dst + w.off, item->writeBytes.data() + run, w.len);
+                        if (w.isCode)
+                            dc2_g410_vu_code_written(m_workerVuCode, w.off, w.len);
+                    }
                     run += w.len;
                 }
             }
@@ -679,4 +684,3 @@ static uint32_t dc2Vu1CycleBudget()
     }();
     return budget;
 }
-

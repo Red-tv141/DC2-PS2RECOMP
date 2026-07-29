@@ -1557,7 +1557,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             // to rows 0..415 is safe to CONTINUE (the seeded rows 416..447 are re-established by
             // the partial upload below and row 416+ is never in the union); any wider pending
             // union publishes.
-            if (g290Seeded && p.rowHi > 415)
+            if (!p.privateMirror && g290Seeded && p.rowHi > 415)
                 mustPublish = true;
             const G144BlockRange dirty = g278PendingDepthRangeP(p);
             const G144BlockRange whole = g278PendingDepthWholeRangeP(p);
@@ -1587,7 +1587,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     g_g337AuditCrossKey.fetch_add(1u, std::memory_order_relaxed);
                 }
             }
-            if (!mustPublish && !(g337On && waveSkipsColorRb))
+            if (!mustPublish && !p.privateMirror &&
+                !(g337On && waveSkipsColorRb))
             {
                 const bool hit = !target.valid || g144RangeOverlaps(dirty, target);
                 if (hit)
@@ -1597,7 +1598,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         g_g337AuditTarget.fetch_add(1u, std::memory_order_relaxed);
                 }
             }
-            if (!mustPublish && s_g276Pend.active)
+            if (!mustPublish && !p.privateMirror && s_g276Pend.active)
             {
                 const G144BlockRange display = g277PendingDisplayRange();
                 mustPublish = !display.valid || g144RangeOverlaps(whole, display);
@@ -1614,9 +1615,14 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             }
             else
             {
-                candidate[s] = true;
-                slotDirty[s] = dirty;
-                anyCandidate = true;
+                // G411 private Z has no physical texture/CLUT read range. Same-key depth consumers
+                // continue through the backend attachment; all CPU consumers publish elsewhere.
+                if (!p.privateMirror)
+                {
+                    candidate[s] = true;
+                    slotDirty[s] = dirty;
+                    anyCandidate = true;
+                }
             }
         }
         // Pass 2: one walk over the recorded draws tests texture/CLUT reads against every
@@ -2135,6 +2141,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const std::vector<float> *depthUpload = nullptr;
     G242DepthState *depthState = nullptr;
     bool g262WaveDepth = false;
+    bool g411PrivateDepth = false;
     bool g278PendingSameKey = false;
     bool g278OwnerEligible = false;
     G144BlockRange g278ColorWrite = g144RangeForRect(
@@ -2152,6 +2159,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         }
         depthKey = g242DepthKey(guestZbpPage, guestZpsm, fbw);
         g262WaveDepth = !g242GpuDepthOn(); // classify admits guestDepth without G242 only via G262
+        g411PrivateDepth =
+            g262WaveDepth && g411SharedGpuDepthOn() &&
+            g404SharedZScope(fbp, fbw, guestZbpPage, guestZpsm);
         if (g262WaveDepth)
         {
             const G144BlockRange depthWrite = g144RangeForRect(
@@ -2166,6 +2176,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             g278OwnerEligible =
                 g278ColorWrite.valid && depthWrite.valid &&
                 !g144RangeOverlaps(g278ColorWrite, depthWrite);
+            // G411: color and the shared depth mirror are separate authorities. Their historical
+            // GS-page alias is intentionally absent, so deferring the Z publication cannot race
+            // an immediate color writeback.
+            if (g411PrivateDepth)
+                g278OwnerEligible = true;
         }
         // G337: VRAM staleness is a property of the pending owner, not of this wave's own
         // eligibility — a same-key wave must never upload stale VRAM Z over the resident rows,
@@ -2176,7 +2191,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             g278PendingSameKey =
                 g278DepthRbOn() && (g278OwnerEligible || g337ZAuthOn()) &&
                 pk.active && pk.key == depthKey && pk.vram == vram &&
-                pk.vramSize == vramSize;
+                pk.vramSize == vramSize &&
+                pk.privateMirror == g411PrivateDepth;
         }
         // G277 census: a cross-key Z wave re-reads VRAM Z for its own window upload — it is a real
         // consumer of the previous key's deferred readback (conservative lower bound: G274 may
@@ -2202,7 +2218,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             // re-upload is pure churn. Computed when the census OR the residency lever is active.
             uint64_t zGenNow = 0u;
             bool zGenValid = false;
-            if (g274ZTimeOn() || g274ZResidentOn())
+            if (!g411PrivateDepth && (g274ZTimeOn() || g274ZResidentOn()))
             {
                 zGenNow = g178GenSumRect(zbpBlock, fbw, GS_PSM_Z24, 0u, 0u,
                                          static_cast<uint32_t>(fbW), 512u);
@@ -2232,7 +2248,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     // is confined to rows 0..415 — the wider case published above), but its
                     // aliased rows 416..447 must be re-established to the post-clear state with
                     // a partial upload; the resident copy holds a previous batch's seed window.
-                    if (g290Seeded)
+                    if (g290Seeded && !g411PrivateDepth)
                         g290PartialSeed = true;
                 }
                 else if (g274ZResidentOn() && !fullInit && unchanged && !g282Tight &&
@@ -2290,10 +2306,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         const size_t dstRow = static_cast<size_t>(upHiZ - y) * fbW;
                         for (int x = 0; x < fbW; ++x)
                         {
-                            const uint32_t z = GSMem::ReadZ24(
-                                vram, zbpBlock, fbw,
-                                static_cast<uint32_t>(x),
-                                static_cast<uint32_t>(y));
+                            const uint32_t z = g411PrivateDepth
+                                ? g403DisplayZRead(x, y, fbp)
+                                : GSMem::ReadZ24(
+                                      vram, zbpBlock, fbw,
+                                      static_cast<uint32_t>(x),
+                                      static_cast<uint32_t>(y));
                             s_depthUpload[dstRow + x] =
                                 static_cast<float>(z) * kZToDepth;
                         }
@@ -2303,7 +2321,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     depthRows >= 8 ? g275ZSwizzleLanes() : 1;
                 GSRowPool::instance().run(upLoZ, upHiZ, swizzleLanes,
                                           packDepthRows);
-                if (g282Tight || g290Seeded)
+                if (!g411PrivateDepth && (g282Tight || g290Seeded))
                 {
                     // The batch's leading black CT32 clear writes physical blocks 313..319,
                     // which are this Z layout's y=416..447, x=64..511 pages. Seed the separate
@@ -2324,6 +2342,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 depthUpload = &s_depthUpload;
             }
             g_g262DepthWaves.fetch_add(1u, std::memory_order_relaxed);
+            if (g411PrivateDepth)
+            {
+                g_g411DepthBatches.fetch_add(1u, std::memory_order_relaxed);
+                if (depthUpload != nullptr)
+                    g_g411DepthUploadRows.fetch_add(
+                        static_cast<uint64_t>(depthRows), std::memory_order_relaxed);
+            }
             if (!g255Rtt && g265DisplayZWaveOn() && g265DisplayTarget(fbp))
                 g_g265DepthBatches.fetch_add(1u, std::memory_order_relaxed);
         }
@@ -3748,10 +3773,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         kDepthToZ;
                     if (scaled < 0.0) scaled = 0.0;
                     if (scaled > 16777215.0) scaled = 16777215.0;
-                    GSMem::WriteZ24(vram, zbpBlock, fbw,
-                                    static_cast<uint32_t>(x),
-                                    static_cast<uint32_t>(y),
-                                    static_cast<uint32_t>(scaled));
+                    if (g411PrivateDepth)
+                        g403DisplayZWrite(x, y, fbp, static_cast<uint32_t>(scaled));
+                    else
+                        GSMem::WriteZ24(vram, zbpBlock, fbw,
+                                        static_cast<uint32_t>(x),
+                                        static_cast<uint32_t>(y),
+                                        static_cast<uint32_t>(scaled));
                 }
             }
         };
@@ -3762,21 +3790,30 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // Publish the Z bytes exactly as an inline CPU Z writer would (the G260 ownership rule):
         // page write-generations for range/gen consumers, plus the coarse decoded-texture gen
         // (a Z page can alias texture/CLUT storage).
-        g178BumpRectImpl(zbpBlock, fbw, GS_PSM_Z24, 0u,
-                         static_cast<uint32_t>(depthRowLo), static_cast<uint32_t>(fbW),
-                         static_cast<uint32_t>(rbRows));
-        g149BumpVramGen();
+        if (!g411PrivateDepth)
+        {
+            g178BumpRectImpl(zbpBlock, fbw, GS_PSM_Z24, 0u,
+                             static_cast<uint32_t>(depthRowLo), static_cast<uint32_t>(fbW),
+                             static_cast<uint32_t>(rbRows));
+            g149BumpVramGen();
+        }
         if (g274ZTimeOn())
             g_g274ZRbNs.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                       std::chrono::steady_clock::now() - g274ZRbT0).count(),
                                   std::memory_order_relaxed);
-        if (g274ZTimeOn() || g274ZResidentOn())
+        if (!g411PrivateDepth && (g274ZTimeOn() || g274ZResidentOn()))
             // Baseline the whole-target Z gen AFTER our own writeback bump so the next same-key
             // upload can tell whether any OTHER writer touched VRAM Z in between. This readback
             // just synced GPU->VRAM, so the resident texture now equals VRAM at this gen.
             g_g274LastZGen[depthKey] = g178GenSumRect(zbpBlock, fbw, GS_PSM_Z24, 0u, 0u,
                                                       static_cast<uint32_t>(fbW), 512u);
         g_g262ZReadbacks.fetch_add(1u, std::memory_order_relaxed);
+        if (g411PrivateDepth)
+        {
+            g_g411DepthPublishes.fetch_add(1u, std::memory_order_relaxed);
+            g_g411DepthPublishRows.fetch_add(
+                static_cast<uint64_t>(rbRows), std::memory_order_relaxed);
+        }
         if (!g255Rtt && g265DisplayZWaveOn() && g265DisplayTarget(fbp))
             g_g265ZReadbacks.fetch_add(1u, std::memory_order_relaxed);
         if (g277CensusOn())
@@ -3802,7 +3839,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             const bool continuing = s_g278Pend.active;
             if (continuing &&
                 (s_g278Pend.key != depthKey || s_g278Pend.vram != vram ||
-                 s_g278Pend.vramSize != vramSize))
+                 s_g278Pend.vramSize != vramSize ||
+                 s_g278Pend.privateMirror != g411PrivateDepth))
             {
                 const uint64_t n =
                     g_g278InvariantFail.fetch_add(1u, std::memory_order_relaxed) + 1u;
@@ -3833,7 +3871,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             {
                 G278PendDepth &p = s_g278PendTab[s];
                 if (p.active && p.key == depthKey && p.vram == vram &&
-                    p.vramSize == vramSize)
+                    p.vramSize == vramSize &&
+                    p.privateMirror == g411PrivateDepth)
                 {
                     slotP = &p;
                     break;
@@ -3866,6 +3905,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 G278PendDepth &p = s_g278PendTab[s];
                 if (!p.active || &p == slotP)
                     continue;
+                if (g411PrivateDepth || p.privateMirror)
+                    continue; // private and physical owners have no storage overlap
                 const G144BlockRange wholeOther = g278PendingDepthWholeRangeP(p);
                 if (!wholeThis.valid || !wholeOther.valid ||
                     g144RangeOverlaps(wholeOther, wholeThis))
@@ -3884,6 +3925,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         if (!slotP->active)
         {
             slotP->active = true;
+            slotP->privateMirror = g411PrivateDepth;
             slotP->key = depthKey;
             slotP->vram = vram;
             slotP->vramSize = vramSize;

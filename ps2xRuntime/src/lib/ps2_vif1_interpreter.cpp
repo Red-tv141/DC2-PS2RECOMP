@@ -5,3 +5,4 @@
 #include "ps2_vif1_interpreter_parts/vif1_dma_and_parser.inc"
 #include "ps2_vif1_interpreter_parts/vif1_command_handlers.inc"
 #include "ps2_vif1_interpreter_parts/vif1_unpack_engine.inc"
+// G410: precise VIF MPG invalidation hook added (force recompile).

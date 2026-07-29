@@ -1,4 +1,4 @@
-// G407: force MSBuild to consume accurate UV and ordered speck provenance .inc changes.
+// G411 promoted: force MSBuild to consume default shared GPU-depth ownership .inc changes.
 #include "ps2_gs_rasterizer_parts/rasterizer_headers_and_diagnostics.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_g214_cap_trace.inc"

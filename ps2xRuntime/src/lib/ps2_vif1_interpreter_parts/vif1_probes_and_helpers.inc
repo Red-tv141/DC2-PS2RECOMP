@@ -19,6 +19,7 @@ std::atomic<uint64_t> g_g146Vif1Ns{0};
 // onto its PERSISTENT VU RAM in program order (fixes the G297 per-kick-snapshot cross-kick drop).
 // No-op unless MTVU is active; VIF1 still writes live RAM (EE shadow) as before. Defined in ps2_runtime.cpp.
 void g297NoteVuWrite(bool isCode, uint32_t off, const uint8_t *src, uint32_t bytes);
+void dc2_g410_vu_code_written(const uint8_t *codeBase, uint32_t offset, uint32_t sizeBytes);
 
 // G317: explicit GIF-order fence provenance for the default-off Path-2 census.
 // Values mirror g317_path2_fence_census.inc without changing a public header.

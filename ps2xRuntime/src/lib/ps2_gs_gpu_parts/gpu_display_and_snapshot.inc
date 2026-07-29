@@ -271,10 +271,66 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
     return false;
 }
 
+// G412: privileged PCRTC registers and the field phase are written on the EE thread, outside
+// the MTGS FIFO. A depth-two pipeline therefore carries an immutable boundary copy into the
+// worker's presentation latch. VRAM and draw/context state remain worker-owned and FIFO-ordered.
+namespace
+{
+    struct G412PresentationOverride
+    {
+        GSRegisters regs{};
+        uint64_t vsyncTick = 0ull;
+        bool active = false;
+    };
+
+    thread_local G412PresentationOverride s_g412PresentationOverride{};
+}
+
+uint64_t g412_capture_vsync_tick()
+{
+    return ps2_syscalls::GetCurrentVSyncTick();
+}
+
+void g412_latch_host_presentation_snapshot(GS *gs,
+                                           uint64_t pmode,
+                                           uint64_t smode2,
+                                           uint64_t dispfb1,
+                                           uint64_t display1,
+                                           uint64_t dispfb2,
+                                           uint64_t display2,
+                                           uint64_t bgcolor,
+                                           uint64_t vsyncTick)
+{
+    if (!gs)
+        return;
+
+    const G412PresentationOverride previous = s_g412PresentationOverride;
+    s_g412PresentationOverride = {};
+    s_g412PresentationOverride.regs.pmode = pmode;
+    s_g412PresentationOverride.regs.smode2 = smode2;
+    s_g412PresentationOverride.regs.dispfb1 = dispfb1;
+    s_g412PresentationOverride.regs.display1 = display1;
+    s_g412PresentationOverride.regs.dispfb2 = dispfb2;
+    s_g412PresentationOverride.regs.display2 = display2;
+    s_g412PresentationOverride.regs.bgcolor = bgcolor;
+    s_g412PresentationOverride.vsyncTick = vsyncTick;
+    s_g412PresentationOverride.active = true;
+
+    struct Restore
+    {
+        G412PresentationOverride previous;
+        ~Restore() { s_g412PresentationOverride = previous; }
+    } restore{previous};
+    (void)restore;
+    gs->latchHostPresentationFrame();
+}
+
 void GS::latchHostPresentationFrame()
 {
     // G189: dedicated mutex, not m_stateMutex — see s_g189HostPresentMutex's comment above.
     std::lock_guard<std::mutex> lock(s_g189HostPresentMutex);
+    const GSRegisters *const presentationRegs =
+        s_g412PresentationOverride.active ? &s_g412PresentationOverride.regs : m_privRegs;
     // Bump on EVERY exit path (success, dual-merge, clear-on-invalid) — any call can
     // change the snapshot. Destructs before the lock_guard releases s_g189HostPresentMutex.
     struct G176LatchBump
@@ -291,9 +347,9 @@ void GS::latchHostPresentationFrame()
         const uint32_t n = s_f30Latch.fetch_add(1, std::memory_order_relaxed) + 1u;
         if (n <= 6u || (n % 60u) == 0u)
         {
-            const uint64_t dispfb1 = m_privRegs ? m_privRegs->dispfb1 : 0ull;
-            const uint64_t dispfb2 = m_privRegs ? m_privRegs->dispfb2 : 0ull;
-            const uint64_t pmode   = m_privRegs ? m_privRegs->pmode   : 0ull;
+            const uint64_t dispfb1 = presentationRegs ? presentationRegs->dispfb1 : 0ull;
+            const uint64_t dispfb2 = presentationRegs ? presentationRegs->dispfb2 : 0ull;
+            const uint64_t pmode   = presentationRegs ? presentationRegs->pmode   : 0ull;
             std::fprintf(stderr,
                          "[F30:latch] n=%u pmode=0x%llx dispfb1=0x%llx dispfb2=0x%llx "
                          "ctx0.frame.fbp=0x%x fbw=%u psm=%u "
@@ -307,7 +363,7 @@ void GS::latchHostPresentationFrame()
         }
     }
 
-    if (!m_privRegs || !m_vram || m_vramSize == 0u)
+    if (!presentationRegs || !m_vram || m_vramSize == 0u)
     {
         if (s_g397PresentTrace)
         {
@@ -318,7 +374,7 @@ void GS::latchHostPresentationFrame()
                 std::fprintf(stderr,
                              "[G397:latch-fail] n=%u reason=resources priv=%u vram=%u size=%u\n",
                              n,
-                             m_privRegs ? 1u : 0u,
+                             presentationRegs ? 1u : 0u,
                              m_vram ? 1u : 0u,
                              m_vramSize);
             }
@@ -333,18 +389,21 @@ void GS::latchHostPresentationFrame()
         return;
     }
 
-    const GSPmodeState pmode = decodePmode(m_privRegs->pmode);
-    const GSSmode2State smode2 = decodeSMode2(m_privRegs->smode2);
+    const GSPmodeState pmode = decodePmode(presentationRegs->pmode);
+    const GSSmode2State smode2 = decodeSMode2(presentationRegs->smode2);
     // G353: interlaced FIELD output. By default weave it into a whole-frame present (no
     // per-field bob) to remove the one-line-per-frame screen shake; DC2_G353_FIELD_BOB=1
     // restores the legacy bob. See g353FieldBobEnabled() for the full rationale.
     const bool interlacedField = smode2.interlaced && !smode2.frameMode;
     const bool applyFieldMode = interlacedField && g353FieldBobEnabled();
-    const bool oddField = (ps2_syscalls::GetCurrentVSyncTick() & 1ull) != 0ull;
-    const GSFrameReg displayFrame1 = decodeDisplayFrame(m_privRegs->dispfb1);
-    const GSFrameReg displayFrame2 = decodeDisplayFrame(m_privRegs->dispfb2);
-    const GSDisplayReadOrigin displayOrigin1 = decodeDisplayReadOrigin(m_privRegs->dispfb1);
-    const GSDisplayReadOrigin displayOrigin2 = decodeDisplayReadOrigin(m_privRegs->dispfb2);
+    const uint64_t presentationVsyncTick = s_g412PresentationOverride.active
+                                               ? s_g412PresentationOverride.vsyncTick
+                                               : ps2_syscalls::GetCurrentVSyncTick();
+    const bool oddField = (presentationVsyncTick & 1ull) != 0ull;
+    const GSFrameReg displayFrame1 = decodeDisplayFrame(presentationRegs->dispfb1);
+    const GSFrameReg displayFrame2 = decodeDisplayFrame(presentationRegs->dispfb2);
+    const GSDisplayReadOrigin displayOrigin1 = decodeDisplayReadOrigin(presentationRegs->dispfb1);
+    const GSDisplayReadOrigin displayOrigin2 = decodeDisplayReadOrigin(presentationRegs->dispfb2);
 
     // G353 evidence trace (video-mode facts + per-field DBY, to confirm the bob is the sole
     // shake source and DBY is not alternating). Quiet unless DC2_PHASE_TRACE=1.
@@ -358,7 +417,7 @@ void GS::latchHostPresentationFrame()
                          "[G353:field] n=%u smode2=0x%llx int=%u ffmd=%u interlacedField=%u "
                          "bob=%u odd=%u dbY1=%u dbY2=%u\n",
                          n,
-                         static_cast<unsigned long long>(m_privRegs->smode2),
+                         static_cast<unsigned long long>(presentationRegs->smode2),
                          smode2.interlaced ? 1u : 0u,
                          smode2.frameMode ? 1u : 0u,
                          interlacedField ? 1u : 0u,
@@ -418,11 +477,11 @@ void GS::latchHostPresentationFrame()
     uint32_t height1 = 0u;
     uint32_t width2 = 0u;
     uint32_t height2 = 0u;
-    decodeDisplaySize(m_privRegs->display1, width1, height1);
-    decodeDisplaySize(m_privRegs->display2, width2, height2);
+    decodeDisplaySize(presentationRegs->display1, width1, height1);
+    decodeDisplaySize(presentationRegs->display2, width2, height2);
 
-    const bool validCrt1 = pmode.enableCrt1 && hasDisplaySetup(m_privRegs->display1, displayFrame1);
-    const bool validCrt2 = pmode.enableCrt2 && hasDisplaySetup(m_privRegs->display2, displayFrame2);
+    const bool validCrt1 = pmode.enableCrt1 && hasDisplaySetup(presentationRegs->display1, displayFrame1);
+    const bool validCrt2 = pmode.enableCrt2 && hasDisplaySetup(presentationRegs->display2, displayFrame2);
     auto g397TraceFailure = [&](const char *reason)
     {
         if (!s_g397PresentTrace)
@@ -440,12 +499,12 @@ void GS::latchHostPresentationFrame()
                      reason,
                      validCrt1 ? 1u : 0u,
                      validCrt2 ? 1u : 0u,
-                     static_cast<unsigned long long>(m_privRegs->pmode),
-                     static_cast<unsigned long long>(m_privRegs->smode2),
-                     static_cast<unsigned long long>(m_privRegs->dispfb1),
-                     static_cast<unsigned long long>(m_privRegs->display1),
-                     static_cast<unsigned long long>(m_privRegs->dispfb2),
-                     static_cast<unsigned long long>(m_privRegs->display2),
+                     static_cast<unsigned long long>(presentationRegs->pmode),
+                     static_cast<unsigned long long>(presentationRegs->smode2),
+                     static_cast<unsigned long long>(presentationRegs->dispfb1),
+                     static_cast<unsigned long long>(presentationRegs->display1),
+                     static_cast<unsigned long long>(presentationRegs->dispfb2),
+                     static_cast<unsigned long long>(presentationRegs->display2),
                      m_ctx[0].frame.fbp,
                      m_ctx[0].frame.fbw,
                      static_cast<uint32_t>(m_ctx[0].frame.psm),
@@ -494,8 +553,8 @@ void GS::latchHostPresentationFrame()
                          f50_12_latch_n,
                          validCrt1 ? 1u : 0u,
                          validCrt2 ? 1u : 0u,
-                         static_cast<unsigned long long>(m_privRegs->pmode),
-                         static_cast<unsigned long long>(m_privRegs->smode2),
+                         static_cast<unsigned long long>(presentationRegs->pmode),
+                         static_cast<unsigned long long>(presentationRegs->smode2),
                          displayFrame1.fbp, displayFrame1.fbw, static_cast<uint32_t>(displayFrame1.psm),
                          displayOrigin1.x, displayOrigin1.y, width1, height1,
                          displayFrame2.fbp, displayFrame2.fbw, static_cast<uint32_t>(displayFrame2.psm),
@@ -817,9 +876,9 @@ void GS::latchHostPresentationFrame()
             {
                 const uint32_t width = std::max(width1, width2);
                 const uint32_t height = std::max(height1, height2);
-                const uint8_t bgR = static_cast<uint8_t>(m_privRegs->bgcolor & 0xFFu);
-                const uint8_t bgG = static_cast<uint8_t>((m_privRegs->bgcolor >> 8) & 0xFFu);
-                const uint8_t bgB = static_cast<uint8_t>((m_privRegs->bgcolor >> 16) & 0xFFu);
+                const uint8_t bgR = static_cast<uint8_t>(presentationRegs->bgcolor & 0xFFu);
+                const uint8_t bgG = static_cast<uint8_t>((presentationRegs->bgcolor >> 8) & 0xFFu);
+                const uint8_t bgB = static_cast<uint8_t>((presentationRegs->bgcolor >> 16) & 0xFFu);
 
                 std::vector<uint8_t> merged(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
                 for (uint32_t y = 0; y < height; ++y)
@@ -895,9 +954,9 @@ void GS::latchHostPresentationFrame()
 
             const uint32_t width = std::max(width1, width2);
             const uint32_t height = std::max(height1, height2);
-            const uint8_t bgR = static_cast<uint8_t>(m_privRegs->bgcolor & 0xFFu);
-            const uint8_t bgG = static_cast<uint8_t>((m_privRegs->bgcolor >> 8) & 0xFFu);
-            const uint8_t bgB = static_cast<uint8_t>((m_privRegs->bgcolor >> 16) & 0xFFu);
+            const uint8_t bgR = static_cast<uint8_t>(presentationRegs->bgcolor & 0xFFu);
+            const uint8_t bgG = static_cast<uint8_t>((presentationRegs->bgcolor >> 8) & 0xFFu);
+            const uint8_t bgB = static_cast<uint8_t>((presentationRegs->bgcolor >> 16) & 0xFFu);
             const uint8_t bgA = pmode.alp;
 
             std::vector<uint8_t> merged(kHostFrameWidth * kHostFrameHeight * 4u, 0u);

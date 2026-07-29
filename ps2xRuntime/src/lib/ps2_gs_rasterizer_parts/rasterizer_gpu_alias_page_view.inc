@@ -525,6 +525,8 @@ struct G278PendDepth
 {
     bool active = false;
     bool display = false;
+    // G411: this owner materializes into G405's private shared-Z mirror, never aliased GS VRAM.
+    bool privateMirror = false;
     uint64_t key = 0u;
     uint8_t *vram = nullptr;
     uint32_t vramSize = 0u;
@@ -546,6 +548,8 @@ static G278PendDepth &s_g278Pend = s_g278PendTab[0]; // legacy single-slot alias
 static std::atomic<uint64_t> g_g278Deferred{0}, g_g278Flushes{0}, g_g278Saved{0},
     g_g278FlushRows{0}, g_g278UploadSkips{0}, g_g278FlushFail{0},
     g_g278InvariantFail{0}, g_g278StaleMarks{0}, g_g278Reinits{0};
+static std::atomic<uint64_t> g_g411DepthBatches{0}, g_g411DepthUploadRows{0},
+    g_g411DepthPublishes{0}, g_g411DepthPublishRows{0};
 static std::atomic<uint64_t> g_g278FlushByCause[9] = {};
 // G337 telemetry: boundary carries, cross-key slot evictions, cross-slot physical-overlap
 // flushes, widened (alias-family) deferrals, audit-forced publications by class.
@@ -1909,6 +1913,8 @@ static void g276FlushPendingDisplay(int cause)
     {
         G278PendDepth &pz = s_g278PendTab[s];
         if (!pz.active)
+            continue;
+        if (pz.privateMirror)
             continue;
         const G144BlockRange depthWhole = g278PendingDepthWholeRangeP(pz);
         if (!depthWhole.valid || !displayRange.valid ||
@@ -3336,7 +3342,9 @@ static bool g278StaleRowsOverlapP(const G278PendDepth &p, int lo, int hi)
 
 static void g278MarkStaleRowsForRangeP(G278PendDepth &p, const G144BlockRange &write)
 {
-    if (!p.active || !write.valid)
+    // G411 private depth has no guest-VRAM storage range. GS texture/upload writes to physical
+    // ZBP=0xd0 pages are unrelated staging traffic and cannot make the private mirror stale.
+    if (!p.active || p.privateMirror || !write.valid)
         return;
     const G144BlockRange whole = g278PendingDepthWholeRangeP(p);
     if (!whole.valid || !g144RangeOverlaps(whole, write))
@@ -3458,28 +3466,39 @@ static bool g278FlushPendSlot(G278PendDepth &slot, int cause)
                                 kDepthToZ;
                 if (scaled < 0.0) scaled = 0.0;
                 if (scaled > 16777215.0) scaled = 16777215.0;
-                GSMem::WriteZ24(p.vram, zbpBlock, p.fbw,
-                                static_cast<uint32_t>(x),
-                                static_cast<uint32_t>(y),
-                                static_cast<uint32_t>(scaled));
+                if (p.privateMirror)
+                    g403DisplayZWrite(x, y, 0u, static_cast<uint32_t>(scaled));
+                else
+                    GSMem::WriteZ24(p.vram, zbpBlock, p.fbw,
+                                    static_cast<uint32_t>(x),
+                                    static_cast<uint32_t>(y),
+                                    static_cast<uint32_t>(scaled));
             }
         }
     };
     GSRowPool::instance().run(p.rowLo, p.rowHi,
                               rows >= 8 ? g275ZSwizzleLanes() : 1,
                               unpackDepthRows);
-    g178BumpRectImpl(zbpBlock, p.fbw, GS_PSM_Z24, 0u,
-                     static_cast<uint32_t>(p.rowLo),
-                     static_cast<uint32_t>(p.fbW),
-                     static_cast<uint32_t>(rows));
-    g336NotePublishZ(zbpBlock, p.fbw, p.fbW, p.rowLo, p.rowHi); // G336: capture Z publish in-boundary
-    g149BumpVramGen();
+    if (!p.privateMirror)
+    {
+        g178BumpRectImpl(zbpBlock, p.fbw, GS_PSM_Z24, 0u,
+                         static_cast<uint32_t>(p.rowLo),
+                         static_cast<uint32_t>(p.fbW),
+                         static_cast<uint32_t>(rows));
+        g336NotePublishZ(zbpBlock, p.fbw, p.fbW, p.rowLo, p.rowHi);
+        g149BumpVramGen();
+    }
     if (g274ZTimeOn())
         g_g274ZRbNs.fetch_add(
             (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - t0).count(),
             std::memory_order_relaxed);
-    if (g278StaleRowsAny(p))
+    if (p.privateMirror)
+    {
+        // G274's equality stamp describes guest VRAM and is meaningless for the private mirror.
+        g_g274LastZGen.erase(p.key);
+    }
+    else if (g278StaleRowsAny(p))
     {
         // An out-of-union CPU write left other backend rows stale. Force the next use to perform
         // the backend contract's full initialization; a whole-gen equality stamp would otherwise
@@ -3493,6 +3512,29 @@ static bool g278FlushPendSlot(G278PendDepth &slot, int cause)
             g178GenSumRect(zbpBlock, p.fbw, GS_PSM_Z24, 0u, 0u,
                            static_cast<uint32_t>(p.fbW), 512u);
     g_g262ZReadbacks.fetch_add(1u, std::memory_order_relaxed);
+    if (p.privateMirror)
+    {
+        const uint64_t publishes =
+            g_g411DepthPublishes.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        g_g411DepthPublishRows.fetch_add(
+            static_cast<uint64_t>(rows), std::memory_order_relaxed);
+        if (g411SharedGpuDepthStatOn() &&
+            (publishes <= 8u || (publishes % 128u) == 0u))
+        {
+            std::fprintf(
+                stderr,
+                "[G411:depth] batches=%llu uploadRows=%llu publishes=%llu publishRows=%llu "
+                "last(cause=%d rows=%d..%d)\n",
+                static_cast<unsigned long long>(
+                    g_g411DepthBatches.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(
+                    g_g411DepthUploadRows.load(std::memory_order_relaxed)),
+                static_cast<unsigned long long>(publishes),
+                static_cast<unsigned long long>(
+                    g_g411DepthPublishRows.load(std::memory_order_relaxed)),
+                cause, p.rowLo, p.rowHi);
+        }
+    }
     if (p.display)
         g_g265ZReadbacks.fetch_add(1u, std::memory_order_relaxed);
 
@@ -3532,6 +3574,8 @@ static bool g278FlushPendingDepthForRanges(int cause,
         G278PendDepth &p = s_g278PendTab[s];
         if (!p.active)
             continue;
+        if (p.privateMirror)
+            continue; // private shared depth has no VRAM transfer consumer
         if (srcUnknown || dstUnknown)
         {
             ok = g278FlushPendSlot(p, cause) && ok;
@@ -3569,6 +3613,8 @@ static bool g278FlushPendingDepthForDisplayOwners(int cause)
         G278PendDepth &p = s_g278PendTab[s];
         if (!p.active)
             continue;
+        if (p.privateMirror)
+            continue; // display-color owners cannot consume the private Z mirror
         const G144BlockRange whole = g278PendingDepthWholeRangeP(p);
         if (!whole.valid)
         {
@@ -3654,12 +3700,18 @@ static bool g278FlushPendingDepthForInline(const GSPrimReg &prim,
     const bool depthReads = zte && ztst >= 2u;
     const bool depthWrites = !zmsk;
     G144BlockRange zr{};
+    uint64_t inlineDepthKey = 0u;
+    bool inlinePrivateDepth = false;
     if (depthReads || depthWrites)
     {
-        const uint32_t zbpBlock =
-            (static_cast<uint32_t>(ctx.zbuf) & 0x1FFu) << 5u;
+        const uint32_t zbpPage =
+            static_cast<uint32_t>(ctx.zbuf) & 0x1FFu;
+        const uint32_t zbpBlock = zbpPage << 5u;
         const uint32_t zpsm =
             static_cast<uint32_t>((ctx.zbuf >> 24u) & 0xFu);
+        inlineDepthKey = g242DepthKey(zbpPage, zpsm, ctx.frame.fbw);
+        inlinePrivateDepth =
+            g404SharedZScope(ctx.frame.fbp, ctx.frame.fbw, zbpPage, zpsm);
         zr = g144RangeForRect(zbpBlock, zpsm, ctx.frame.fbw, x, y, w, h);
     }
     G144BlockRange tex{}, clut{};
@@ -3687,6 +3739,14 @@ static bool g278FlushPendingDepthForInline(const GSPrimReg &prim,
         G278PendDepth &p = s_g278PendTab[s];
         if (!p.active)
             continue;
+        if (p.privateMirror)
+        {
+            // Physical color/texture/CLUT ranges cannot consume the private mirror. An inline CPU
+            // primitive using the same logical Z surface can, so publish at that semantic edge.
+            if (inlinePrivateDepth && p.key == inlineDepthKey)
+                ok = g278FlushPendSlot(p, 4) && ok;
+            continue;
+        }
         const G144BlockRange dirty = g278PendingDepthRangeP(p);
         const G144BlockRange whole = g278PendingDepthWholeRangeP(p);
         if (!dirty.valid || !whole.valid)
