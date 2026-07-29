@@ -59,6 +59,21 @@ namespace
         return disabled;
     }
 
+    // G394 rollback: apply an early post-start volume-zero/stop pair literally.
+    // DC2 can flush an older sndSqStop after its replacement Play command.
+    bool g394AsyncStopGuardDisabled()
+    {
+        static const bool disabled = []()
+        {
+            const char *value = std::getenv("DC2_G394_LEGACY_ASYNC_STOP");
+            return value != nullptr && value[0] != '\0' &&
+                   std::strcmp(value, "0") != 0 &&
+                   std::strcmp(value, "false") != 0 &&
+                   std::strcmp(value, "FALSE") != 0;
+        }();
+        return disabled;
+    }
+
     // G391 rollback: restore the pre-G391 per-sequence peak normalisation.
     bool g391LegacyBgmNormaliseEnabled()
     {
@@ -299,14 +314,15 @@ namespace
     // -------------------------------------------------------------- reverb --
     //
     // G392: the real SPU reverb network, not a generic Schroeder box.
+    // G393: the register sets below now come from DC2's retail LIBSD.IRX
+    // (.data file offsets 0x4278..0x44d7), including its PS2-only PIPE mode.
     //
     // The guest configures reverb through `SetReverb__6CSoundFiii@0x188940`
     // (`sceSdRemote` 0x8130 SetEffectAttr + core|2 enable + the 0xb80/0xc80 EVOL
     // writes), so mode and wet level are the guest's own values. What the port
-    // cannot see is the register set IOP-side libsd writes for that mode, so the
-    // coefficients below are the DOCUMENTED PSX/SPU preset registers (same
-    // reverb topology and register layout as an SPU2 core) mapped onto the libsd
-    // SD_REV_MODE families by name.
+    // G392 originally used documented PSX/SPU presets. G393 recovered the exact
+    // PS2 libsd values statically from the retail IRX, avoiding an architectural
+    // dependency on executing the IOP merely to observe this immutable table.
     //
     // Per psx-spx the network runs at 22050 Hz over a delay work area, and every
     // m*/d* register is an address in 8-byte units => four 16-bit samples.
@@ -339,8 +355,8 @@ namespace
         {"Room", 0x26C0, {
             0x007D, 0x005B, 0x6D80, 0x54B8, 0xBED0, 0x0000, 0x0000, 0xBA80,
             0x5800, 0x5300, 0x04D6, 0x0333, 0x03F0, 0x0227, 0x0374, 0x01EF,
-            0x0334, 0x01B5, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
-            0x0000, 0x0000, 0x01B4, 0x0136, 0x00B8, 0x005C, 0x8000, 0x8000}},
+            0x0336, 0x01B7, 0x0335, 0x01B6, 0x0334, 0x01B5, 0x0334, 0x01B5,
+            0x0334, 0x01B5, 0x01B4, 0x0136, 0x00B8, 0x005C, 0x8000, 0x8000}},
         {"Studio Small", 0x1F40, {
             0x0033, 0x0025, 0x70F0, 0x4FA8, 0xBCE0, 0x4410, 0xC0F0, 0x9C00,
             0x5280, 0x4EC0, 0x03E4, 0x031B, 0x03A4, 0x02AF, 0x0372, 0x0266,
@@ -361,7 +377,7 @@ namespace
             0x6000, 0x5C00, 0x15BA, 0x11BB, 0x14C2, 0x10BD, 0x11BC, 0x0DC1,
             0x11C0, 0x0DC3, 0x0DC0, 0x09C1, 0x0BC4, 0x07C1, 0x0A00, 0x06CD,
             0x09C2, 0x05C1, 0x05C0, 0x041A, 0x0274, 0x013A, 0x8000, 0x8000}},
-        {"Half Echo", 0x3C00, {
+        {"Pipe", 0x3C00, {
             0x0017, 0x0013, 0x70F0, 0x4FA8, 0xBCE0, 0x4510, 0xBEF0, 0x8500,
             0x5F80, 0x54C0, 0x0371, 0x02AF, 0x02E5, 0x01DF, 0x02B0, 0x01D7,
             0x0358, 0x026A, 0x01D6, 0x011E, 0x012D, 0x00B1, 0x011F, 0x0059,
@@ -371,20 +387,19 @@ namespace
             0x6000, 0x5400, 0x1ED6, 0x1A31, 0x1D14, 0x183B, 0x1BC2, 0x16B2,
             0x1A32, 0x15EF, 0x15EE, 0x1055, 0x1334, 0x0F2D, 0x11F6, 0x0C5D,
             0x1056, 0x0AE1, 0x0AE0, 0x07A2, 0x0464, 0x0232, 0x8000, 0x8000}},
-        {"Chaos Echo", 0x18040, {
-            0x0001, 0x0001, 0x7FFF, 0x7FFF, 0x0000, 0x0000, 0x0000, 0x8100,
-            0x0000, 0x0000, 0x1FFF, 0x0FFF, 0x1005, 0x0005, 0x0000, 0x0000,
-            0x1005, 0x0005, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
-            0x0000, 0x0000, 0x1004, 0x1002, 0x0004, 0x0002, 0x8000, 0x8000}},
+        {"Echo", 0x18040, {
+            0x0003, 0x0003, 0x7FFF, 0x7FFF, 0x0000, 0x0000, 0x0000, 0x8100,
+            0x0000, 0x0000, 0x1FFD, 0x0FFD, 0x1009, 0x0009, 0x0000, 0x0000,
+            0x1009, 0x0009, 0x1FFF, 0x1FFF, 0x1FFE, 0x1FFE, 0x1FFE, 0x1FFE,
+            0x1FFE, 0x1FFE, 0x1008, 0x1004, 0x0008, 0x0004, 0x8000, 0x8000}},
         {"Delay", 0x18040, {
-            0x0001, 0x0001, 0x7FFF, 0x7FFF, 0x0000, 0x0000, 0x0000, 0x0000,
-            0x0000, 0x0000, 0x1FFF, 0x0FFF, 0x1005, 0x0005, 0x0000, 0x0000,
-            0x1005, 0x0005, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
-            0x0000, 0x0000, 0x1004, 0x1002, 0x0004, 0x0002, 0x8000, 0x8000}},
+            0x0003, 0x0003, 0x7FFF, 0x7FFF, 0x0000, 0x0000, 0x0000, 0x0000,
+            0x0000, 0x0000, 0x1FFD, 0x0FFD, 0x1009, 0x0009, 0x0000, 0x0000,
+            0x1009, 0x0009, 0x1FFF, 0x1FFF, 0x1FFE, 0x1FFE, 0x1FFE, 0x1FFE,
+            0x1FFE, 0x1FFE, 0x1008, 0x1004, 0x0008, 0x0004, 0x8000, 0x8000}},
     };
 
-    // libsd SD_REV_MODE_* -> preset index. STUDIO_A/B/C are the small/medium/
-    // large studio rooms; PIPE has no PSX equivalent and borrows Chaos Echo.
+    // libsd SD_REV_MODE_* -> retail LIBSD.IRX table index.
     size_t g392PresetForMode(uint32_t mode)
     {
         switch (mode)
@@ -395,9 +410,9 @@ namespace
         case 4u: return 4u; // STUDIO_C -> Studio Large
         case 5u: return 5u; // HALL
         case 6u: return 7u; // SPACE    -> Space Echo
-        case 7u: return 6u; // ECHO     -> Half Echo
+        case 7u: return 8u; // ECHO
         case 8u: return 9u; // DELAY
-        case 9u: return 8u; // PIPE     -> Chaos Echo (approximation)
+        case 9u: return 6u; // PIPE
         default: return 0u; // OFF
         }
     }
@@ -596,6 +611,7 @@ namespace
         uint64_t loopEndFrame = 0u;
         float volume = 1.0f;
         bool active = false;
+        bool earlyMutePending = false;
     };
 
     bool g392BgmBusDisabled()
@@ -625,6 +641,8 @@ namespace
         uint64_t keyOffs = 0u;
         uint64_t steals = 0u;
         uint64_t loopedVoices = 0u;
+        uint64_t callbacks = 0u;
+        uint32_t tracedActiveBgm = 0u;
     };
 
     G391SfxMixer g_g391Mixer;
@@ -665,6 +683,20 @@ namespace
         G391SfxMixer &mixer = g_g391Mixer;
         std::lock_guard<std::mutex> lock(mixer.mutex);
         const bool reverbOn = mixer.reverb.active();
+        ++mixer.callbacks;
+        uint32_t activeBgm = 0u;
+        for (const G392BgmSource &source : mixer.bgm)
+        {
+            activeBgm += source.active ? 1u : 0u;
+        }
+        if (g385GameAudioTrace() && activeBgm != mixer.tracedActiveBgm)
+        {
+            std::fprintf(stderr,
+                         "[G394:mix] callback=%llu frames=%u active-bgm=%u\n",
+                         static_cast<unsigned long long>(mixer.callbacks), frames,
+                         activeBgm);
+            mixer.tracedActiveBgm = activeBgm;
+        }
 
         for (unsigned int frame = 0u; frame < frames; ++frame)
         {
@@ -750,6 +782,14 @@ namespace
                 if (source.cursorFrame >= source.loopEndFrame)
                 {
                     source.cursorFrame = source.loopStartFrame;
+                }
+                constexpr uint64_t kG394EarlyStopFrames =
+                    kG391OutputRate / 10u;
+                if (source.earlyMutePending &&
+                    source.cursorFrame >= kG394EarlyStopFrames)
+                {
+                    source.volume = 0.0f;
+                    source.earlyMutePending = false;
                 }
                 const size_t sampleIndex = static_cast<size_t>(source.cursorFrame) * 2u;
                 if (sampleIndex + 1u >= source.pcm->size())
@@ -881,49 +921,51 @@ void dc2G391KeyOn(uint32_t slot, uint8_t key, uint8_t id,
         return;
     }
 
-    std::lock_guard<std::mutex> lock(g_g391Mixer.mutex);
-    G391Voice *voice = g391AllocateVoice();
-    if (voice == nullptr)
     {
-        return;
-    }
-
-    *voice = G391Voice{};
-    voice->decoded = std::move(decoded);
-    voice->adsr.adsr1 = sample.adsr1;
-    voice->adsr.adsr2 = sample.adsr2;
-    voice->position = 0.0;
-    voice->step = static_cast<double>(voice->decoded->sampleRate) *
-                  static_cast<double>(pitch) / static_cast<double>(kG391OutputRate);
-    voice->gain = volume;
-    voice->baseGain = baseGain;
-    g391SetPan(*voice, pan);
-    voice->serial = ++g_g391Mixer.serial;
-    voice->slot = static_cast<uint8_t>(slot);
-    voice->key = key;
-    voice->id = id;
-    voice->active = true;
-    voice->released = false;
-    ++g_g391Mixer.keyOns;
-    if (voice->decoded->loops)
-    {
-        ++g_g391Mixer.loopedVoices;
-    }
-    if (g385GameAudioTrace() && (g_g391Mixer.keyOns % 32u) == 0u)
-    {
-        size_t sounding = 0u;
-        for (const G391Voice &active : g_g391Mixer.voices)
+        std::lock_guard<std::mutex> lock(g_g391Mixer.mutex);
+        G391Voice *voice = g391AllocateVoice();
+        if (voice == nullptr)
         {
-            sounding += active.active ? 1u : 0u;
+            return;
         }
-        std::fprintf(stderr,
-                     "[G391:mix] keyOns=%llu keyOffs=%llu steals=%llu looped=%llu "
-                     "sounding=%zu\n",
-                     static_cast<unsigned long long>(g_g391Mixer.keyOns),
-                     static_cast<unsigned long long>(g_g391Mixer.keyOffs),
-                     static_cast<unsigned long long>(g_g391Mixer.steals),
-                     static_cast<unsigned long long>(g_g391Mixer.loopedVoices),
-                     sounding);
+
+        *voice = G391Voice{};
+        voice->decoded = std::move(decoded);
+        voice->adsr.adsr1 = sample.adsr1;
+        voice->adsr.adsr2 = sample.adsr2;
+        voice->position = 0.0;
+        voice->step = static_cast<double>(voice->decoded->sampleRate) *
+                      static_cast<double>(pitch) / static_cast<double>(kG391OutputRate);
+        voice->gain = volume;
+        voice->baseGain = baseGain;
+        g391SetPan(*voice, pan);
+        voice->serial = ++g_g391Mixer.serial;
+        voice->slot = static_cast<uint8_t>(slot);
+        voice->key = key;
+        voice->id = id;
+        voice->active = true;
+        voice->released = false;
+        ++g_g391Mixer.keyOns;
+        if (voice->decoded->loops)
+        {
+            ++g_g391Mixer.loopedVoices;
+        }
+        if (g385GameAudioTrace() && (g_g391Mixer.keyOns % 32u) == 0u)
+        {
+            size_t sounding = 0u;
+            for (const G391Voice &active : g_g391Mixer.voices)
+            {
+                sounding += active.active ? 1u : 0u;
+            }
+            std::fprintf(stderr,
+                         "[G391:mix] keyOns=%llu keyOffs=%llu steals=%llu looped=%llu "
+                         "sounding=%zu\n",
+                         static_cast<unsigned long long>(g_g391Mixer.keyOns),
+                         static_cast<unsigned long long>(g_g391Mixer.keyOffs),
+                         static_cast<unsigned long long>(g_g391Mixer.steals),
+                         static_cast<unsigned long long>(g_g391Mixer.loopedVoices),
+                         sounding);
+        }
     }
 }
 
@@ -1150,7 +1192,14 @@ int dc2G391SelfTest()
                   std::strcmp(kG392ReverbPresets[g392PresetForMode(4u)].name,
                               "Studio Large") == 0 &&
                   std::strcmp(kG392ReverbPresets[g392PresetForMode(8u)].name,
-                              "Delay") == 0);
+                              "Delay") == 0 &&
+                  std::strcmp(kG392ReverbPresets[g392PresetForMode(9u)].name,
+                              "Pipe") == 0);
+        check("reverb retail libsd table",
+              kG392ReverbPresets[g392PresetForMode(1u)].reg[kDLSAME] == 0x0336u &&
+                  kG392ReverbPresets[g392PresetForMode(7u)].reg[kMLSAME] == 0x1FFDu &&
+                  kG392ReverbPresets[g392PresetForMode(8u)].reg[kDAPF1] == 0x0003u &&
+                  kG392ReverbPresets[g392PresetForMode(9u)].reg[kVWALL] == 0x8500u);
         // The work area must be big enough for the largest tap of each preset.
         bool tapsFit = true;
         for (uint32_t mode = 0u; mode <= 9u; ++mode)
@@ -1189,14 +1238,23 @@ bool dc2G392BgmStart(uint32_t port, std::shared_ptr<std::vector<int16_t>> pcm,
     {
         return false;
     }
-    std::lock_guard<std::mutex> lock(g_g391Mixer.mutex);
-    G392BgmSource &source = g_g391Mixer.bgm[port];
-    source.pcm = std::move(pcm);
-    source.cursorFrame = loopStartFrame < loopEndFrame ? 0u : 0u;
-    source.loopStartFrame = loopStartFrame;
-    source.loopEndFrame = loopEndFrame;
-    source.volume = volume;
-    source.active = true;
+    {
+        std::lock_guard<std::mutex> lock(g_g391Mixer.mutex);
+        G392BgmSource &source = g_g391Mixer.bgm[port];
+        source.pcm = std::move(pcm);
+        source.cursorFrame = 0u;
+        source.loopStartFrame = loopStartFrame;
+        source.loopEndFrame = loopEndFrame;
+        source.volume = volume;
+        source.active = true;
+        if (g385GameAudioTrace())
+        {
+            std::fprintf(stderr,
+                         "[G394:mix] source-start port=%u callbacks=%llu volume=%.3f\n",
+                         port, static_cast<unsigned long long>(g_g391Mixer.callbacks),
+                         volume);
+        }
+    }
     return true;
 }
 
@@ -1207,7 +1265,31 @@ void dc2G392BgmStop(uint32_t port)
         return;
     }
     std::lock_guard<std::mutex> lock(g_g391Mixer.mutex);
-    g_g391Mixer.bgm[port] = G392BgmSource{};
+    G392BgmSource &source = g_g391Mixer.bgm[port];
+    constexpr uint64_t kG394EarlyStopFrames = kG391OutputRate / 10u;
+    if (!g394AsyncStopGuardDisabled() && source.active &&
+        source.earlyMutePending &&
+        source.cursorFrame < kG394EarlyStopFrames)
+    {
+        if (g385GameAudioTrace())
+        {
+            std::fprintf(
+                stderr,
+                "[G394:mix] suppress-stale-stop port=%u cursor=%llu\n",
+                port, static_cast<unsigned long long>(source.cursorFrame));
+        }
+        source.earlyMutePending = false;
+        return;
+    }
+    if (g385GameAudioTrace() && source.active)
+    {
+        std::fprintf(stderr,
+                     "[G394:mix] source-stop port=%u callbacks=%llu cursor=%llu active=%d\n",
+                     port, static_cast<unsigned long long>(g_g391Mixer.callbacks),
+                     static_cast<unsigned long long>(source.cursorFrame),
+                     source.active ? 1 : 0);
+    }
+    source = G392BgmSource{};
 }
 
 void dc2G392BgmSetVolume(uint32_t port, float volume)
@@ -1217,7 +1299,23 @@ void dc2G392BgmSetVolume(uint32_t port, float volume)
         return;
     }
     std::lock_guard<std::mutex> lock(g_g391Mixer.mutex);
-    g_g391Mixer.bgm[port].volume = volume;
+    G392BgmSource &source = g_g391Mixer.bgm[port];
+    constexpr uint64_t kG394EarlyStopFrames = kG391OutputRate / 10u;
+    if (!g394AsyncStopGuardDisabled() && source.active &&
+        volume <= 0.0f && source.cursorFrame < kG394EarlyStopFrames)
+    {
+        source.earlyMutePending = true;
+        if (g385GameAudioTrace())
+        {
+            std::fprintf(
+                stderr,
+                "[G394:mix] defer-early-mute port=%u cursor=%llu\n",
+                port, static_cast<unsigned long long>(source.cursorFrame));
+        }
+        return;
+    }
+    source.earlyMutePending = false;
+    source.volume = volume;
 }
 
 void dc2G392BgmRewind(uint32_t port)

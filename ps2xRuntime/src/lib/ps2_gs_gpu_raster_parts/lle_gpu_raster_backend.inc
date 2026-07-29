@@ -1111,7 +1111,7 @@ private:
         // 11 = G309 direct authoritative-page source selection,
         // 12 = G362 guarded fixed-point POINT fetch (see below),
         // 13 = G364 PRIM.FGE (blend RGB towards uFogCol by the interpolated per-vertex F),
-        // 14 = G406 accurate GS 12.4 UV rounding for axis-aligned point sprites.
+        // 14 = G406 accurate GS 12.4 UV rounding for axis-aligned point sprites,
         //
         // G362: `texture()` with GL_NEAREST decides the texel from floor() of an interpolated
         // float. The front-end shifts FST sprite UVs by -0.5 texel-per-pixel so a fragment's

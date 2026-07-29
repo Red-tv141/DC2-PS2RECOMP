@@ -871,6 +871,8 @@ namespace
         uint8_t expression = 127u;
         uint8_t pan = 64u;
         uint16_t pitchBend = 8192u;
+        float gain = 1.0f;
+        double pitchRatio = 1.0;
     };
 
     struct G385RenderVoice
@@ -883,6 +885,10 @@ namespace
         uint8_t key = 60u;
         uint8_t velocity = 127u;
         bool releasing = false;
+        double sourceStep = 1.0;
+        float fixedGain = 1.0f;
+        float panLeft = 0.70710678f;
+        float panRight = 0.70710678f;
         // G391: real per-program envelope. `releaseFrames` is only still used by
         // the legacy arm (`DC2_G391_NO_ADSR=1`).
         G391EnvState env{};
@@ -978,6 +984,19 @@ namespace
         size_t eventIndex = 0u;
         uint32_t resolveMissCount = 0u;
 
+        // G394: pitch, pan and gain only change at MIDI events. The old inner
+        // sample loop recalculated pow/sin/cos and invariant gain products for
+        // every active voice at 44.1 kHz, making the first title sequence take
+        // nearly the full idle-to-FMV interval to render.
+        const auto updateVoicePan =
+            [&](G385RenderVoice &voice, uint8_t pan)
+        {
+            const double angle =
+                (static_cast<double>(pan) / 127.0) * kHalfPi;
+            voice.panLeft = static_cast<float>(std::cos(angle));
+            voice.panRight = static_cast<float>(std::sin(angle));
+        };
+
         for (uint64_t frame = 0u; frame < renderFrames; ++frame)
         {
             while (eventIndex < parsed.events.size() &&
@@ -1000,6 +1019,29 @@ namespace
                         voice.channel = event.channel;
                         voice.key = event.data0;
                         voice.velocity = static_cast<uint8_t>(event.data1);
+                        const float semitones =
+                            static_cast<float>(
+                                static_cast<int>(voice.key) -
+                                static_cast<int>(voice.instrument->baseNote) +
+                                static_cast<int>(
+                                    voice.instrument->splitTranspose)) +
+                            static_cast<float>(
+                                voice.instrument->detuneCents) /
+                                100.0f;
+                        voice.sourceStep =
+                            static_cast<double>(
+                                voice.instrument->decoded->sampleRate) *
+                            std::pow(2.0, semitones / 12.0f) /
+                            static_cast<double>(kOutputRate);
+                        voice.fixedGain =
+                            voice.instrument->baseVolume *
+                            (static_cast<float>(voice.velocity) / 127.0f);
+                        const uint8_t effectivePan =
+                            (channelPanSeen[event.channel] ||
+                             g391AdsrDisabled())
+                                ? channel.pan
+                                : voice.instrument->hdPan;
+                        updateVoicePan(voice, effectivePan);
                         voices.push_back(std::move(voice));
                     }
                     else
@@ -1024,15 +1066,28 @@ namespace
                     if (event.data0 == 7u)
                     {
                         channel.volume = static_cast<uint8_t>(event.data1);
+                        channel.gain =
+                            (static_cast<float>(channel.volume) / 127.0f) *
+                            (static_cast<float>(channel.expression) / 127.0f);
                     }
                     else if (event.data0 == 10u)
                     {
                         channel.pan = static_cast<uint8_t>(event.data1);
                         channelPanSeen[event.channel] = true;
+                        for (G385RenderVoice &voice : voices)
+                        {
+                            if (voice.channel == event.channel)
+                            {
+                                updateVoicePan(voice, channel.pan);
+                            }
+                        }
                     }
                     else if (event.data0 == 11u)
                     {
                         channel.expression = static_cast<uint8_t>(event.data1);
+                        channel.gain =
+                            (static_cast<float>(channel.volume) / 127.0f) *
+                            (static_cast<float>(channel.expression) / 127.0f);
                     }
                     break;
                 case G385MidiEventType::Program:
@@ -1040,6 +1095,12 @@ namespace
                     break;
                 case G385MidiEventType::PitchBend:
                     channel.pitchBend = event.data1;
+                    channel.pitchRatio = std::pow(
+                        2.0,
+                        (((static_cast<double>(channel.pitchBend) - 8192.0) /
+                          8192.0) *
+                         2.0) /
+                            12.0);
                     break;
                 }
             }
@@ -1105,9 +1166,6 @@ namespace
                     32768.0f;
 
                 const G385RenderChannel &channel = channels[voice.channel];
-                const float channelGain =
-                    (static_cast<float>(channel.volume) / 127.0f) *
-                    (static_cast<float>(channel.expression) / 127.0f);
                 // G391: the per-program SPU2 ADSR out of the `.HD` replaces the
                 // fixed 4 ms attack / 20 ms release placeholder, so percussive
                 // and sustained instruments no longer share one shape.
@@ -1135,36 +1193,13 @@ namespace
                                    static_cast<float>(kG391EnvMax);
                 }
                 const float gain =
-                    voice.instrument->baseVolume *
-                    (static_cast<float>(voice.velocity) / 127.0f) *
-                    channelGain * envelopeGain;
-                const uint8_t effectivePan =
-                    (channelPanSeen[voice.channel] || g391AdsrDisabled())
-                        ? channel.pan
-                        : voice.instrument->hdPan;
-                const double panAngle =
-                    (static_cast<double>(effectivePan) / 127.0) * kHalfPi;
+                    voice.fixedGain * channel.gain * envelopeGain;
                 mix[static_cast<size_t>(frame) * 2u + 0u] +=
-                    sourceSample * gain *
-                    static_cast<float>(std::cos(panAngle));
+                    sourceSample * gain * voice.panLeft;
                 mix[static_cast<size_t>(frame) * 2u + 1u] +=
-                    sourceSample * gain *
-                    static_cast<float>(std::sin(panAngle));
+                    sourceSample * gain * voice.panRight;
 
-                const float bendSemitones =
-                    (static_cast<float>(channel.pitchBend) - 8192.0f) /
-                    8192.0f * 2.0f;
-                const float semitones =
-                    static_cast<float>(
-                        static_cast<int>(voice.key) -
-                        static_cast<int>(voice.instrument->baseNote) +
-                        static_cast<int>(voice.instrument->splitTranspose)) +
-                    static_cast<float>(voice.instrument->detuneCents) / 100.0f +
-                    bendSemitones;
-                const double pitch = std::pow(2.0, semitones / 12.0f);
-                voice.sourcePosition +=
-                    static_cast<double>(decoded.sampleRate) * pitch /
-                    static_cast<double>(kOutputRate);
+                voice.sourcePosition += voice.sourceStep * channel.pitchRatio;
                 ++voice.ageFrames;
                 ++voiceIndex;
             }
@@ -1634,18 +1669,34 @@ void dc2G385CommitMidiSequence(uint32_t port)
     G385MidiSequence rendered{};
     rendered.source = std::move(g_g385PendingSequence);
     rendered.generation = ++g_g385SequenceGeneration;
+    const auto renderStarted = std::chrono::steady_clock::now();
     const bool renderedOk =
         g385RenderSequence(rendered.source, g_g385MidiBanks[port], rendered);
+    const auto renderElapsedMs =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - renderStarted)
+            .count();
     g_g385MidiSequences[port] = std::move(rendered);
 
     if (g385GameAudioTrace())
     {
         const G385MidiSequence &sequence = g_g385MidiSequences[port];
+        uint64_t firstAudibleFrame = 0u;
+        if (sequence.renderedPcm)
+        {
+            const auto firstAudible = std::find_if(
+                sequence.renderedPcm->begin(), sequence.renderedPcm->end(),
+                [](int16_t sample) { return sample != 0; });
+            firstAudibleFrame =
+                static_cast<uint64_t>(
+                    std::distance(sequence.renderedPcm->begin(), firstAudible)) /
+                2u;
+        }
         std::fprintf(
             stderr,
             "[G385:bgm] committed port=%u sq=0x%zx rendered=%u "
             "events=%u notes=%u misses=%u frames=%llu loop=%llu..%llu "
-            "generation=%llu\n",
+            "firstAudible=%llu renderMs=%lld generation=%llu\n",
             port, sequence.source.size(), renderedOk ? 1u : 0u,
             sequence.eventCount, sequence.noteCount,
             sequence.resolveMissCount,
@@ -1653,6 +1704,8 @@ void dc2G385CommitMidiSequence(uint32_t port)
                 sequence.renderedPcm ? sequence.renderedPcm->size() / 2u : 0u),
             static_cast<unsigned long long>(sequence.loopStartFrame),
             static_cast<unsigned long long>(sequence.loopEndFrame),
+            static_cast<unsigned long long>(firstAudibleFrame),
+            static_cast<long long>(renderElapsedMs),
             static_cast<unsigned long long>(sequence.generation));
     }
 }
