@@ -496,13 +496,41 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                              chosen.fbp, chosen.fbw, chosen.psm, afterDB);
             }
         }
-        // G150 MTGS: g150_frame_barrier first blocks until the GS worker has finished this frame's
-        // draws (frameDrain), then runs this closure on THIS (EE) thread: drain the trailing tile-bin
-        // tris (safe — worker idle, sole toucher of g_g144List) and latch the present frame, reading
-        // live display registers + vsync tick over complete VRAM exactly as the synchronous baseline.
-        // When MTGS is off, the barrier runs the closure inline and the flush is skipped here (already
-        // done on the EE thread above) → byte-identical to the pre-G150 path.
-        g150_frame_barrier([runtime, n] {
+        // G412: depth two lets the EE/MTVU producer finish one successor frame while the GS worker
+        // drains this one. PCRTC registers and field phase bypass the FIFO, so capture them now;
+        // VRAM/context remain worker-owned and are consumed only at this marker's FIFO position.
+        const bool g412CrossFrame = g412_cross_frame_enabled();
+        uint64_t g412Pmode = 0ull;
+        uint64_t g412Smode2 = 0ull;
+        uint64_t g412Dispfb1 = 0ull;
+        uint64_t g412Display1 = 0ull;
+        uint64_t g412Dispfb2 = 0ull;
+        uint64_t g412Display2 = 0ull;
+        uint64_t g412Bgcolor = 0ull;
+        uint64_t g412VsyncTick = 0ull;
+        if (g412CrossFrame)
+        {
+            const GSRegisters &regs = runtime->memory().gs();
+            g412Pmode = regs.pmode;
+            g412Smode2 = regs.smode2;
+            g412Dispfb1 = regs.dispfb1;
+            g412Display1 = regs.display1;
+            g412Dispfb2 = regs.dispfb2;
+            g412Display2 = regs.display2;
+            g412Bgcolor = regs.bgcolor;
+            g412VsyncTick = g412_capture_vsync_tick();
+        }
+
+        g150_frame_barrier([runtime, n,
+                            g412CrossFrame,
+                            g412Pmode,
+                            g412Smode2,
+                            g412Dispfb1,
+                            g412Display1,
+                            g412Dispfb2,
+                            g412Display2,
+                            g412Bgcolor,
+                            g412VsyncTick] {
             // G189 (diagnostic watchdog, DEFAULT OFF, DC2_G189_WATCHDOG=1): cheap atomic-only
             // breadcrumbs (no I/O in the hot path -- an earlier fprintf-based version of this
             // trace perturbed thread timing enough to hide the bug it was meant to catch) so a
@@ -514,7 +542,22 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
             if (g150_mtgs_enabled())
                 g144FlushPending();
             g189_set_closure_stage(2, n);
-            runtime->gs().latchHostPresentationFrame();
+            if (g412CrossFrame)
+            {
+                g412_latch_host_presentation_snapshot(&runtime->gs(),
+                                                       g412Pmode,
+                                                       g412Smode2,
+                                                       g412Dispfb1,
+                                                       g412Display1,
+                                                       g412Dispfb2,
+                                                       g412Display2,
+                                                       g412Bgcolor,
+                                                       g412VsyncTick);
+            }
+            else
+            {
+                runtime->gs().latchHostPresentationFrame();
+            }
             g189_set_closure_stage(3, n);
         });
         if (f29_should_log(n))

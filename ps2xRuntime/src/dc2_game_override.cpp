@@ -397,6 +397,18 @@ extern void g144FlushPending();
 extern bool g150_mtgs_enabled();
 extern void g150_frame_barrier(std::function<void()> latch);
 extern void g150_wait_idle();
+// G412: depth-two frame pipeline and immutable worker-side presentation latch.
+extern bool g412_cross_frame_enabled();
+extern uint64_t g412_capture_vsync_tick();
+extern void g412_latch_host_presentation_snapshot(GS *gs,
+                                                  uint64_t pmode,
+                                                  uint64_t smode2,
+                                                  uint64_t dispfb1,
+                                                  uint64_t display1,
+                                                  uint64_t dispfb2,
+                                                  uint64_t display2,
+                                                  uint64_t bgcolor,
+                                                  uint64_t vsyncTick);
 
 // G303: VU1-worker (MTVU) busy-time attribution — snapshotted per perf window in the G146 block
 // to place the VU1 worker on the same footing as GSimage/EE for pole attribution.
@@ -475,6 +487,7 @@ namespace
 #include "dc2_game_override_parts/dungeon_runtime.inc"
 
 #include "dc2_game_override_parts/title_draw_runtime.inc"
+// G412 force-recompile marker: frame_end captures immutable PCRTC state for depth-two MTGS.
 #include "dc2_game_override_parts/frame_end_and_core_helpers.inc"
 #include "dc2_game_override_parts/g363_spheda_probes.inc"
 // G390: MODMSIN key-on with velocity 0 is a key-off (DC2_G390_LEGACY_SFX=1).
