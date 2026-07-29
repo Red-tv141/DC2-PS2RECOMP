@@ -1,0 +1,279 @@
+{
+  "format": 1,
+  "restore": {
+    "D:\\ps2r\\dc2_Launcher\\tests\\DC2Launcher.Tests\\DC2Launcher.Tests.csproj": {}
+  },
+  "projects": {
+    "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.App\\DC2Launcher.App.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.App\\DC2Launcher.App.csproj",
+        "projectName": "DC2Launcher",
+        "projectPath": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.App\\DC2Launcher.App.csproj",
+        "packagesPath": "C:\\Users\\avipe\\.nuget\\packages\\",
+        "outputPath": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.App\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\avipe\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0-windows"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0-windows7.0": {
+            "targetAlias": "net8.0-windows",
+            "projectReferences": {
+              "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Core\\DC2Launcher.Core.csproj": {
+                "projectPath": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Core\\DC2Launcher.Core.csproj"
+              },
+              "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Infrastructure\\DC2Launcher.Infrastructure.csproj": {
+                "projectPath": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Infrastructure\\DC2Launcher.Infrastructure.csproj"
+              }
+            }
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        }
+      },
+      "frameworks": {
+        "net8.0-windows7.0": {
+          "targetAlias": "net8.0-windows",
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            },
+            "Microsoft.WindowsDesktop.App.WPF": {
+              "privateAssets": "none"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.101/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    },
+    "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Core\\DC2Launcher.Core.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Core\\DC2Launcher.Core.csproj",
+        "projectName": "DC2LauncherCore",
+        "projectPath": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Core\\DC2Launcher.Core.csproj",
+        "packagesPath": "C:\\Users\\avipe\\.nuget\\packages\\",
+        "outputPath": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Core\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\avipe\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0": {
+            "targetAlias": "net8.0",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        }
+      },
+      "frameworks": {
+        "net8.0": {
+          "targetAlias": "net8.0",
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.101/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    },
+    "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Infrastructure\\DC2Launcher.Infrastructure.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Infrastructure\\DC2Launcher.Infrastructure.csproj",
+        "projectName": "DC2LauncherInfrastructure",
+        "projectPath": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Infrastructure\\DC2Launcher.Infrastructure.csproj",
+        "packagesPath": "C:\\Users\\avipe\\.nuget\\packages\\",
+        "outputPath": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Infrastructure\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\avipe\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0": {
+            "targetAlias": "net8.0",
+            "projectReferences": {
+              "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Core\\DC2Launcher.Core.csproj": {
+                "projectPath": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Core\\DC2Launcher.Core.csproj"
+              }
+            }
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        }
+      },
+      "frameworks": {
+        "net8.0": {
+          "targetAlias": "net8.0",
+          "dependencies": {
+            "DiscUtils.Iso9660": {
+              "target": "Package",
+              "version": "[0.16.13, )"
+            },
+            "DiscUtils.Udf": {
+              "target": "Package",
+              "version": "[0.16.13, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.101/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    },
+    "D:\\ps2r\\dc2_Launcher\\tests\\DC2Launcher.Tests\\DC2Launcher.Tests.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "D:\\ps2r\\dc2_Launcher\\tests\\DC2Launcher.Tests\\DC2Launcher.Tests.csproj",
+        "projectName": "DC2Launcher.Tests",
+        "projectPath": "D:\\ps2r\\dc2_Launcher\\tests\\DC2Launcher.Tests\\DC2Launcher.Tests.csproj",
+        "packagesPath": "C:\\Users\\avipe\\.nuget\\packages\\",
+        "outputPath": "D:\\ps2r\\dc2_Launcher\\tests\\DC2Launcher.Tests\\obj\\",
+        "projectStyle": "PackageReference",
+        "configFilePaths": [
+          "C:\\Users\\avipe\\AppData\\Roaming\\NuGet\\NuGet.Config"
+        ],
+        "originalTargetFrameworks": [
+          "net8.0-windows"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net8.0-windows7.0": {
+            "targetAlias": "net8.0-windows",
+            "projectReferences": {
+              "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.App\\DC2Launcher.App.csproj": {
+                "projectPath": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.App\\DC2Launcher.App.csproj"
+              },
+              "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Core\\DC2Launcher.Core.csproj": {
+                "projectPath": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Core\\DC2Launcher.Core.csproj"
+              },
+              "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Infrastructure\\DC2Launcher.Infrastructure.csproj": {
+                "projectPath": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Infrastructure\\DC2Launcher.Infrastructure.csproj"
+              }
+            }
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        }
+      },
+      "frameworks": {
+        "net8.0-windows7.0": {
+          "targetAlias": "net8.0-windows",
+          "dependencies": {
+            "Microsoft.NET.Test.Sdk": {
+              "target": "Package",
+              "version": "[17.6.0, )"
+            },
+            "coverlet.collector": {
+              "include": "Runtime, Build, Native, ContentFiles, Analyzers, BuildTransitive",
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[6.0.0, )"
+            },
+            "xunit": {
+              "target": "Package",
+              "version": "[2.4.2, )"
+            },
+            "xunit.runner.visualstudio": {
+              "include": "Runtime, Build, Native, ContentFiles, Analyzers, BuildTransitive",
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[2.4.5, )"
+            }
+          },
+          "imports": [
+            "net461",
+            "net462",
+            "net47",
+            "net471",
+            "net472",
+            "net48",
+            "net481"
+          ],
+          "assetTargetFallback": true,
+          "warn": true,
+          "frameworkReferences": {
+            "Microsoft.NETCore.App": {
+              "privateAssets": "all"
+            },
+            "Microsoft.WindowsDesktop.App.WPF": {
+              "privateAssets": "none"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\8.0.101/PortableRuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}
