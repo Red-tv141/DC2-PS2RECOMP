@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cstdlib> // [G380] DC2_G380_NO_EZMIDI
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -179,6 +180,7 @@ namespace ps2_game_overrides
         ps2_syscalls::clearSoundDriverCompatLayout();
         ps2_syscalls::clearDtxCompatLayout();
         ps2_stubs::clearMpegCompatLayout();
+        runtime.iop().clearEzMidiCompatLayout(); // [G380] restored from patch/darkCloud2.patch
 
         std::vector<Descriptor> descriptors;
         {
@@ -307,7 +309,36 @@ namespace
         ps2_stubs::setMpegCompatLayout(layout);
     }
 
+    // [G380] Restored from `patch/darkCloud2.patch` — this registration was dropped during the
+    // fork's PR port while the ~300 lines of ezMidi RPC handling it arms (`ps2_iop.cpp`,
+    // `handleEzMidiRpc`) came across intact. `handleEzMidiRpc` bails on
+    // `m_ezMidiCompat.rpcSid == 0u`, so without this override every ezMidi RPC fell through
+    // unhandled and the whole ezMidi layer was dead code.
+    // Rollback: DC2_G380_NO_EZMIDI=1.
+    void applyDarkCloud2EzMidiCompat(PS2Runtime &runtime)
+    {
+        static const bool s_disabled = (std::getenv("DC2_G380_NO_EZMIDI") != nullptr);
+        if (s_disabled)
+        {
+            runtime.iop().clearEzMidiCompatLayout();
+            return;
+        }
+
+        PS2EzMidiCompatLayout layout{};
+        layout.rpcSid = 0x00012346u;
+        layout.reportedFreeIopBytes = 0x00200000u;
+        layout.defaultPortVolume = 0x00000100u;
+        layout.reportedVoiceCount = 0x00000020u;
+        runtime.iop().setEzMidiCompatLayout(layout);
+
+        // One line, always on: RUNTIME_LOG is compiled out in Release, and a silently
+        // unregistered override is exactly the failure this fix is repairing.
+        std::cerr << "[game_overrides] DC2 ezMidi compat armed: rpcSid=0x"
+                  << std::hex << layout.rpcSid << std::dec << std::endl;
+    }
+
     PS2_REGISTER_GAME_OVERRIDE("RECVX sound-driver compat", "slus_201.84", 0u, 0u, &applyRecvxSoundDriverCompat);
     PS2_REGISTER_GAME_OVERRIDE("RECVX DTX compat", "slus_201.84", 0u, 0u, &applyRecvxDtxCompat);
     PS2_REGISTER_GAME_OVERRIDE("RECVX MPEG compat", "slus_201.84", 0u, 0u, &applyRecvxMpegCompat);
+    PS2_REGISTER_GAME_OVERRIDE("Dark Cloud 2 ezMidi compat", "scus_972.13", 0u, 0u, &applyDarkCloud2EzMidiCompat);
 }
