@@ -406,6 +406,7 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     // gets cameras like the dungeon route does. Trace output stays gated by DC2_TRACE_G193;
     // the repair itself is default-ON (kill DC2_G193_NO_SCENEVT_FIX=1).
     runtime.registerFunction(0x001A9F40u, g193_edit_init_probe);            // EditInit (LoopInit[1] dispatch)
+    runtime.registerFunction(0x00190900u, g409_next_loop_probe);             // Dungeon 6 world-origin latch
     if (dc2_env_flag_enabled("DC2_TRACE_G193"))
     {
         runtime.registerFunction(0x00282EA0u, g193_scene_initialize_probe); // Initialize__6CScene (virtual dispatch)

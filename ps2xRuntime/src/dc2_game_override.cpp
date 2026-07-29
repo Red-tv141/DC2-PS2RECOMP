@@ -255,6 +255,7 @@ extern void GetCamera__6CSceneFi_0x2838c0(uint8_t* rdram, R5900Context* ctx, PS2
 // G193: town/edit-map camera diagnosis (scene->Initialize ordering vs EditInit's AssignCamera).
 extern void Initialize__6CSceneFv_0x282ea0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void EditInit__F13INIT_LOOP_ARG_0x1a9f40(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void NextLoop__Fi13INIT_LOOP_ARG_0x190900(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 // G59: title MDS texture-block return probe.
 extern void GetTextureBlockNo__11CMdsListSetFiPii_0x168fd0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void mgDraw__FP8mgCFrame_0x142f90(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -469,6 +470,8 @@ namespace
 //   DngTreeMode: lh a0,-0x70fc(gp) (DngTreeMapDraw)     -> gp-0x70fc = 0x003773F4 (half)
 // Quiet unless DC2_TRACE_F56. Bounded: logs on state change + every 60th
 // frame, capped, so the floor-select->3D transition is visible compactly.
+// G409: restore Dungeon 6's missing "s19" world-origin latch before town exit
+// event 100; rollback DC2_G409_LEGACY_DUNGEON_MAP_LATCH, trace DC2_TRACE_G409.
 #include "dc2_game_override_parts/dungeon_runtime.inc"
 
 #include "dc2_game_override_parts/title_draw_runtime.inc"
@@ -495,4 +498,3 @@ PS2_REGISTER_GAME_OVERRIDE(
     0u,
     0u,
     applyDC2EzMidiCompat)
-

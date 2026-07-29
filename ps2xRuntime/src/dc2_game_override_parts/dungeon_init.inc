@@ -99,6 +99,50 @@ static uint32_t f50_callg_u64a0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *r
     return f50_run_guest_call(rdram, ctx, runtime, addr);
 }
 
+// G409: the recorded direct Dungeon 6 route reaches NextLoop without the
+// world-origin publication normally made before dungeon entry. Town event 100
+// queries CScene::OldMapNo and therefore treats 0 as a town-centre return.
+// Hardware carries the "s19" origin (map 84). Resolve that original guest name
+// through SearchMapNo and publish it only when this route's latch is still empty.
+static void g409_next_loop_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    static const bool legacy = dc2_env_flag_enabled("DC2_G409_LEGACY_DUNGEON_MAP_LATCH");
+    static const bool trace = dc2_env_flag_enabled("DC2_TRACE_G409");
+    const uint32_t gp = getRegU32(ctx, 28);
+    const uint32_t loop = dc2_read_u32(rdram, gp + 0xFFFF8ADCu);
+    const uint32_t next = getRegU32(ctx, 4);
+    const uint32_t arg = getRegU32(ctx, 5);
+    const int32_t destination = arg ? (int32_t)dc2_read_u32(rdram, arg) : -1;
+    const uint32_t dungeon = dc2_read_u32(rdram, 0x01E9F6E4u);
+    uint32_t scene = 0u;
+    int32_t originMap = -1;
+    if (!legacy && loop == 2u && next == 1u && destination == 14 && dungeon == 6u)
+    {
+        scene = dc2_read_u32(rdram, gp + 0xFFFF8DACu);
+        if (scene && dc2_read_u32(rdram, scene + 0x2E60u) == 0u)
+        {
+            R5900Context callCtx = *ctx;
+            originMap = (int32_t)f50_callg(
+                rdram, &callCtx, runtime, 0x002D27F0u,
+                0x0036E000u, 0u, 0u, 0u); // "s19"
+            if (originMap >= 0)
+            {
+                callCtx = *ctx;
+                f50_callg(rdram, &callCtx, runtime, 0x00284B60u,
+                          scene, (uint32_t)originMap, 0u, 0u);
+            }
+        }
+    }
+    if (trace && loop == 2u && next == 1u)
+        std::fprintf(stderr,
+                     "[G409:origin] loop=%u next=%u dungeon=%u dest=%d scene=0x%x origin=%d now=%d old=%d legacy=%u\n",
+                     loop, next, dungeon, destination, scene, originMap,
+                     scene ? (int32_t)dc2_read_u32(rdram, scene + 0x2E60u) : -999,
+                     scene ? (int32_t)dc2_read_u32(rdram, scene + 0x2E68u) : -999,
+                     legacy ? 1u : 0u);
+    NextLoop__Fi13INIT_LOOP_ARG_0x190900(rdram, ctx, runtime);
+}
+
 static bool f55_trace_enabled();
 
 // F55: init__Fv@0x15C160 stays nop'd for its IOP-module-load loops, but its

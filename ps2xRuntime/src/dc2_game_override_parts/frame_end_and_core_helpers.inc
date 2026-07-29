@@ -482,8 +482,11 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                     static_cast<uint64_t>(chosen.fbp & 0x1ffu)
                     | (static_cast<uint64_t>(chosen.fbw & 0x3fu) << 9)
                     | (static_cast<uint64_t>(chosen.psm & 0x3fu) << 15);
-                runtime->gs().writeRegister(0x59u, baseEnc | 0x80000000000ull);
-                runtime->gs().writeRegister(0x5bu, baseEnc);
+                // G397: DISPFB1/2 are privileged PCRTC MMIO registers, not
+                // GIF A+D IDs. Keep this host presentation latch on the real
+                // privileged-register path so reserved packet IDs stay inert.
+                runtime->memory().write64(0x12000070u, baseEnc | 0x80000000000ull);
+                runtime->memory().write64(0x12000090u, baseEnc);
             }
             if (f29_should_log(n))
             {
