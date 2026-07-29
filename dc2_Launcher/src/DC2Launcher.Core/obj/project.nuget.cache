@@ -1,0 +1,13 @@
+{
+  "version": 2,
+  "dgSpecHash": "aEyXrJ0rOyXCsWWrpgP23OA0YRSA4wCKQuPCBJ5BXUstHu8Uz/icEQIz8MOLdEEdoJnjPqpNzVj4wdg675OUYw==",
+  "success": true,
+  "projectFilePath": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.Core\\DC2Launcher.Core.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\avipe\\.nuget\\packages\\microsoft.net.illink.tasks\\8.0.1\\microsoft.net.illink.tasks.8.0.1.nupkg.sha512",
+    "C:\\Users\\avipe\\.nuget\\packages\\microsoft.netcore.app.runtime.win-x64\\8.0.1\\microsoft.netcore.app.runtime.win-x64.8.0.1.nupkg.sha512",
+    "C:\\Users\\avipe\\.nuget\\packages\\microsoft.windowsdesktop.app.runtime.win-x64\\8.0.1\\microsoft.windowsdesktop.app.runtime.win-x64.8.0.1.nupkg.sha512",
+    "C:\\Users\\avipe\\.nuget\\packages\\microsoft.aspnetcore.app.runtime.win-x64\\8.0.1\\microsoft.aspnetcore.app.runtime.win-x64.8.0.1.nupkg.sha512"
+  ],
+  "logs": []
+}

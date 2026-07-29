@@ -1,0 +1,11 @@
+D:\ps2r\dc2_Launcher\src\DC2Launcher.Core\bin\Release\net8.0\DC2LauncherCore.deps.json
+D:\ps2r\dc2_Launcher\src\DC2Launcher.Core\bin\Release\net8.0\DC2LauncherCore.dll
+D:\ps2r\dc2_Launcher\src\DC2Launcher.Core\bin\Release\net8.0\DC2LauncherCore.pdb
+D:\ps2r\dc2_Launcher\src\DC2Launcher.Core\obj\Release\net8.0\DC2Launcher.Core.GeneratedMSBuildEditorConfig.editorconfig
+D:\ps2r\dc2_Launcher\src\DC2Launcher.Core\obj\Release\net8.0\DC2Launcher.Core.AssemblyInfoInputs.cache
+D:\ps2r\dc2_Launcher\src\DC2Launcher.Core\obj\Release\net8.0\DC2Launcher.Core.AssemblyInfo.cs
+D:\ps2r\dc2_Launcher\src\DC2Launcher.Core\obj\Release\net8.0\DC2Launcher.Core.csproj.CoreCompileInputs.cache
+D:\ps2r\dc2_Launcher\src\DC2Launcher.Core\obj\Release\net8.0\DC2LauncherCore.dll
+D:\ps2r\dc2_Launcher\src\DC2Launcher.Core\obj\Release\net8.0\refint\DC2LauncherCore.dll
+D:\ps2r\dc2_Launcher\src\DC2Launcher.Core\obj\Release\net8.0\DC2LauncherCore.pdb
+D:\ps2r\dc2_Launcher\src\DC2Launcher.Core\obj\Release\net8.0\ref\DC2LauncherCore.dll
