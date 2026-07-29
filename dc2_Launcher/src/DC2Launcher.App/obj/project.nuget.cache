@@ -1,0 +1,20 @@
+{
+  "version": 2,
+  "dgSpecHash": "JUR/LrJ2vfatLV0itwDPDuoJN4UcxQPaRGxkkl7VT0VKaTu2QiIjuBvg3UAd2uWZSfsPhDrPpbveukZg+SKRKg==",
+  "success": true,
+  "projectFilePath": "D:\\ps2r\\dc2_Launcher\\src\\DC2Launcher.App\\DC2Launcher.App.csproj",
+  "expectedPackageFiles": [
+    "C:\\Users\\avipe\\.nuget\\packages\\discutils.core\\0.16.13\\discutils.core.0.16.13.nupkg.sha512",
+    "C:\\Users\\avipe\\.nuget\\packages\\discutils.iso9660\\0.16.13\\discutils.iso9660.0.16.13.nupkg.sha512",
+    "C:\\Users\\avipe\\.nuget\\packages\\discutils.streams\\0.16.13\\discutils.streams.0.16.13.nupkg.sha512",
+    "C:\\Users\\avipe\\.nuget\\packages\\discutils.udf\\0.16.13\\discutils.udf.0.16.13.nupkg.sha512",
+    "C:\\Users\\avipe\\.nuget\\packages\\microsoft.net.illink.tasks\\8.0.1\\microsoft.net.illink.tasks.8.0.1.nupkg.sha512",
+    "C:\\Users\\avipe\\.nuget\\packages\\microsoft.netcore.platforms\\5.0.0\\microsoft.netcore.platforms.5.0.0.nupkg.sha512",
+    "C:\\Users\\avipe\\.nuget\\packages\\system.security.accesscontrol\\5.0.0\\system.security.accesscontrol.5.0.0.nupkg.sha512",
+    "C:\\Users\\avipe\\.nuget\\packages\\system.security.principal.windows\\5.0.0\\system.security.principal.windows.5.0.0.nupkg.sha512",
+    "C:\\Users\\avipe\\.nuget\\packages\\microsoft.netcore.app.runtime.win-x64\\8.0.1\\microsoft.netcore.app.runtime.win-x64.8.0.1.nupkg.sha512",
+    "C:\\Users\\avipe\\.nuget\\packages\\microsoft.windowsdesktop.app.runtime.win-x64\\8.0.1\\microsoft.windowsdesktop.app.runtime.win-x64.8.0.1.nupkg.sha512",
+    "C:\\Users\\avipe\\.nuget\\packages\\microsoft.aspnetcore.app.runtime.win-x64\\8.0.1\\microsoft.aspnetcore.app.runtime.win-x64.8.0.1.nupkg.sha512"
+  ],
+  "logs": []
+}

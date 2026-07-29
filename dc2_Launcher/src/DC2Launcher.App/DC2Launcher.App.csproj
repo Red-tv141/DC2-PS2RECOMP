@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <ProjectReference Include="..\DC2Launcher.Core\DC2Launcher.Core.csproj" />
+    <ProjectReference Include="..\DC2Launcher.Infrastructure\DC2Launcher.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <UseWPF>true</UseWPF>
+    <AssemblyName>DC2Launcher</AssemblyName>
+    <ApplicationIcon>dc2_launcher_icon.ico</ApplicationIcon>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Resource Include="dc2_launcher_icon.ico" />
+  </ItemGroup>
+
+</Project>
