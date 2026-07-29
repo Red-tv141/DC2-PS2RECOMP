@@ -1,0 +1,161 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v8.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v8.0": {
+      "DC2LauncherInfrastructure/1.0.0": {
+        "dependencies": {
+          "DC2LauncherCore": "1.0.0",
+          "DiscUtils.Iso9660": "0.16.13",
+          "DiscUtils.Udf": "0.16.13",
+          "Microsoft.NET.ILLink.Tasks": "8.0.1",
+          "DC2LauncherCore.Reference": "1.0.0.0"
+        },
+        "runtime": {
+          "DC2LauncherInfrastructure.dll": {}
+        }
+      },
+      "DiscUtils.Core/0.16.13": {
+        "dependencies": {
+          "DiscUtils.Streams": "0.16.13",
+          "System.Security.AccessControl": "5.0.0"
+        },
+        "runtime": {
+          "lib/net5.0/DiscUtils.Core.dll": {
+            "assemblyVersion": "0.16.0.0",
+            "fileVersion": "0.16.13.55129"
+          }
+        }
+      },
+      "DiscUtils.Iso9660/0.16.13": {
+        "dependencies": {
+          "DiscUtils.Core": "0.16.13"
+        },
+        "runtime": {
+          "lib/net5.0/DiscUtils.Iso9660.dll": {
+            "assemblyVersion": "0.16.0.0",
+            "fileVersion": "0.16.13.55129"
+          }
+        }
+      },
+      "DiscUtils.Streams/0.16.13": {
+        "runtime": {
+          "lib/net5.0/DiscUtils.Streams.dll": {
+            "assemblyVersion": "0.16.0.0",
+            "fileVersion": "0.16.13.55129"
+          }
+        }
+      },
+      "DiscUtils.Udf/0.16.13": {
+        "dependencies": {
+          "DiscUtils.Core": "0.16.13",
+          "DiscUtils.Iso9660": "0.16.13"
+        },
+        "runtime": {
+          "lib/net5.0/DiscUtils.Udf.dll": {
+            "assemblyVersion": "0.16.0.0",
+            "fileVersion": "0.16.13.55129"
+          }
+        }
+      },
+      "Microsoft.NET.ILLink.Tasks/8.0.1": {},
+      "Microsoft.NETCore.Platforms/5.0.0": {},
+      "System.Security.AccessControl/5.0.0": {
+        "dependencies": {
+          "Microsoft.NETCore.Platforms": "5.0.0",
+          "System.Security.Principal.Windows": "5.0.0"
+        }
+      },
+      "System.Security.Principal.Windows/5.0.0": {},
+      "DC2LauncherCore/1.0.0": {
+        "runtime": {
+          "DC2LauncherCore.dll": {}
+        }
+      },
+      "DC2LauncherCore.Reference/1.0.0.0": {
+        "runtime": {
+          "DC2LauncherCore.dll": {
+            "assemblyVersion": "1.0.0.0",
+            "fileVersion": "1.0.0.0"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "DC2LauncherInfrastructure/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "DiscUtils.Core/0.16.13": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-TU/Ns5RMa3060K7AsSDqG94/H7eaWaz1XoYuCUur40Mg+t0/ubtKqxCffkoiB1e/cFMGvHL0evFoY6uDL9Ocmw==",
+      "path": "discutils.core/0.16.13",
+      "hashPath": "discutils.core.0.16.13.nupkg.sha512"
+    },
+    "DiscUtils.Iso9660/0.16.13": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-hT0DbN+sIqg5Bu3/sCQUuKLwIrceF9BZvn7AeRe+f2iY0p4mgN9xEmXpFWQshnBBxN9r75364agBHDeb5owiUA==",
+      "path": "discutils.iso9660/0.16.13",
+      "hashPath": "discutils.iso9660.0.16.13.nupkg.sha512"
+    },
+    "DiscUtils.Streams/0.16.13": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-BSrywAX2mmvt6j00u6VQYQLtxc6jDniK2aP4p0q20bbTGXImtW4N26eUZYKfkW9aj6XLaqISFgtWfssKURixeA==",
+      "path": "discutils.streams/0.16.13",
+      "hashPath": "discutils.streams.0.16.13.nupkg.sha512"
+    },
+    "DiscUtils.Udf/0.16.13": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-wl8amQNP3N5VFB4wlLh76OXD2vGpFKuYb/RqqcwTPdE406mvQsLuxxPJB5E4orkjNDrpglLvi94WVr8FfWY2Uw==",
+      "path": "discutils.udf/0.16.13",
+      "hashPath": "discutils.udf.0.16.13.nupkg.sha512"
+    },
+    "Microsoft.NET.ILLink.Tasks/8.0.1": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-ADdJXuKNjwZDfBmybMnpvwd5CK3gp92WkWqqeQhW4W+q4MO3Qaa9QyW2DcFLAvCDMcCWxT5hRXqGdv13oon7nA==",
+      "path": "microsoft.net.illink.tasks/8.0.1",
+      "hashPath": "microsoft.net.illink.tasks.8.0.1.nupkg.sha512"
+    },
+    "Microsoft.NETCore.Platforms/5.0.0": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-VyPlqzH2wavqquTcYpkIIAQ6WdenuKoFN0BdYBbCWsclXacSOHNQn66Gt4z5NBqEYW0FAPm5rlvki9ZiCij5xQ==",
+      "path": "microsoft.netcore.platforms/5.0.0",
+      "hashPath": "microsoft.netcore.platforms.5.0.0.nupkg.sha512"
+    },
+    "System.Security.AccessControl/5.0.0": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-dagJ1mHZO3Ani8GH0PHpPEe/oYO+rVdbQjvjJkBRNQkX4t0r1iaeGn8+/ybkSLEan3/slM0t59SVdHzuHf2jmw==",
+      "path": "system.security.accesscontrol/5.0.0",
+      "hashPath": "system.security.accesscontrol.5.0.0.nupkg.sha512"
+    },
+    "System.Security.Principal.Windows/5.0.0": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-t0MGLukB5WAVU9bO3MGzvlGnyJPgUlcwerXn1kzBRjwLKixT96XV0Uza41W49gVd8zEMFu9vQEFlv0IOrytICA==",
+      "path": "system.security.principal.windows/5.0.0",
+      "hashPath": "system.security.principal.windows.5.0.0.nupkg.sha512"
+    },
+    "DC2LauncherCore/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "DC2LauncherCore.Reference/1.0.0.0": {
+      "type": "reference",
+      "serviceable": false,
+      "sha512": ""
+    }
+  }
+}
