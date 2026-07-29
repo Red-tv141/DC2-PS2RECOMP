@@ -3,6 +3,16 @@ void GSRasterizer::drawSprite(GS *gs)
     const GSVertex &v0 = gs->m_vtxQueue[0];
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const auto &ctx = gs->activeContext();
+    // G408 diagnostic: isolate the four offset CT32 character-RTT sprites which
+    // turn sparse source alpha into the visible Map 125 dark speckles.
+    static const bool s_g408SkipCharacterRttSprites =
+        std::getenv("DC2_G408_SKIP_CHARACTER_RTT_SPRITES") != nullptr;
+    if (s_g408SkipCharacterRttSprites &&
+        (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u) &&
+        gs->m_prim.tme && gs->m_prim.fst && gs->m_prim.abe &&
+        ctx.tex0.tbp0 == 0x2720u && ctx.tex0.psm == GS_PSM_CT32 &&
+        ctx.tex1 == 0x261u && (ctx.alpha & 0xFFu) == 0x44u)
+        return;
     g400NoteDrawTarget(gs->m_vram, ctx.frame.fbp);
     g401NoteCompositeDraw(gs->m_vram, ctx, gs->m_prim, v0, v1);
     G248SpriteScope g248Scope(ctx.frame.fbp, gs->m_prim.tme, gs->m_prim.abe);

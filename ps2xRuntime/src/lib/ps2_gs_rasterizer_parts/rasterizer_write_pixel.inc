@@ -845,7 +845,7 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
             s_probe.enabled ? ps2_syscalls::GetCurrentVSyncTick() : 0u;
         if (s_probe.enabled && x == s_probe.x && y == s_probe.y &&
             tick >= s_probe.minTick && tick <= s_probe.maxTick &&
-            (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u))
+            (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u || ctx.frame.fbp == 0x139u))
         {
             uint32_t before = 0u;
             std::memcpy(&before, gs->m_vram + off, 4);
@@ -860,7 +860,8 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
                         "[G407:px] n=%u tick=%llu xy=(%d,%d) fbp=0x%x prim=%u tme=%u abe=%u fst=%u "
                         "tbp=0x%x tpsm=0x%x tex1=0x%llx src=%02x,%02x,%02x,%02x "
                         "before=%08x final=%08x alpha=0x%llx test=0x%llx "
-                        "v0=(%.3f,%.3f uv=%.3f,%.3f) v1=(%.3f,%.3f uv=%.3f,%.3f)\n",
+                        "v0=(%.3f,%.3f uv=%.3f,%.3f) v1=(%.3f,%.3f uv=%.3f,%.3f) "
+                        "v2=(%.3f,%.3f uv=%.3f,%.3f)\n",
                         n, static_cast<unsigned long long>(tick), x, y, ctx.frame.fbp,
                         static_cast<uint32_t>(gs->m_prim.type),
                         static_cast<uint32_t>(gs->m_prim.tme),
@@ -878,7 +879,11 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
                         gs->m_vtxQueue[1].x - static_cast<float>(ctx.xyoffset.ofx >> 4),
                         gs->m_vtxQueue[1].y - static_cast<float>(ctx.xyoffset.ofy >> 4),
                         static_cast<double>(gs->m_vtxQueue[1].u) / 16.0,
-                        static_cast<double>(gs->m_vtxQueue[1].v) / 16.0);
+                        static_cast<double>(gs->m_vtxQueue[1].v) / 16.0,
+                        gs->m_vtxQueue[2].x - static_cast<float>(ctx.xyoffset.ofx >> 4),
+                        gs->m_vtxQueue[2].y - static_cast<float>(ctx.xyoffset.ofy >> 4),
+                        static_cast<double>(gs->m_vtxQueue[2].u) / 16.0,
+                        static_cast<double>(gs->m_vtxQueue[2].v) / 16.0);
             }
         }
     }
@@ -1031,6 +1036,25 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
         const float invQ = 1.0f / fabsQ(q);
         texUf = s * invQ * static_cast<float>(texW);
         texVf = t * invQ * static_cast<float>(texH);
+        // G408 diagnostic: PCSX2 SW converts S/Q and T/Q to signed 16.16
+        // texel coordinates before extracting bilinear integer/fraction fields.
+        static const bool s_g408FixedStq =
+            std::getenv("DC2_G408_PCSX2_FIXED_STQ") != nullptr;
+        if (s_g408FixedStq)
+        {
+            constexpr float kFixedScale = 65536.0f;
+            texUf = static_cast<float>(static_cast<int32_t>(texUf * kFixedScale)) / kFixedScale;
+            texVf = static_cast<float>(static_cast<int32_t>(texVf * kFixedScale)) / kFixedScale;
+        }
+        // G408 diagnostic: characterize the STQ sample phase independently of
+        // guest packets. Default-off; a nonzero value shifts all STQ texel-space
+        // coordinates before the ordinary point/linear sampler.
+        static const float s_g408StqBias = []() {
+            const char *e = std::getenv("DC2_G408_STQ_BIAS");
+            return (e && *e) ? static_cast<float>(std::atof(e)) : 0.0f;
+        }();
+        texUf += s_g408StqBias;
+        texVf += s_g408StqBias;
     }
 
     auto f50_12_log_pal_sample = [&](int sampleU, int sampleV, uint32_t idx, uint32_t color) {

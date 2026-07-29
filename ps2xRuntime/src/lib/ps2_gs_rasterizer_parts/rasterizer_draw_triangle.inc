@@ -4,6 +4,64 @@ void GSRasterizer::drawTriangle(GS *gs)
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const GSVertex &v2 = gs->m_vtxQueue[2];
     const auto &ctx = gs->activeContext();
+    // G408 diagnostic: snapshot the live CT32 RTT immediately before the display
+    // pass reinterprets the same 0x2720 storage as T8.
+    static const bool s_g408DumpRttBeforeT8 =
+        std::getenv("DC2_G408_DUMP_RTT_BEFORE_T8") != nullptr;
+    if (s_g408DumpRttBeforeT8 && gs->m_vram &&
+        (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u) &&
+        gs->m_prim.tme && !gs->m_prim.fst &&
+        ctx.tex0.tbp0 == 0x2720u && ctx.tex0.psm == GS_PSM_T8 &&
+        ctx.tex0.tbw == 4u && ctx.tex0.tw == 8u && ctx.tex0.th == 7u)
+    {
+        static std::atomic<uint32_t> s_g408Dumped{0};
+        if (s_g408Dumped.fetch_add(1u, std::memory_order_relaxed) == 0u)
+        {
+            FILE *rgb = std::fopen("captures/g408_rtt_before_t8.ppm", "wb");
+            FILE *alpha = std::fopen("captures/g408_rtt_before_t8_alpha.pgm", "wb");
+            FILE *indices = std::fopen("captures/g408_rtt_as_t8_indices.pgm", "wb");
+            FILE *decoded = std::fopen("captures/g408_rtt_as_t8_decoded.ppm", "wb");
+            if (rgb) std::fprintf(rgb, "P6\n512 416\n255\n");
+            if (alpha) std::fprintf(alpha, "P5\n512 416\n255\n");
+            if (indices) std::fprintf(indices, "P5\n256 128\n255\n");
+            if (decoded) std::fprintf(decoded, "P6\n256 128\n255\n");
+            for (uint32_t y = 0; y < 416u; ++y)
+            {
+                for (uint32_t x = 0; x < 512u; ++x)
+                {
+                    const uint32_t c = GSMem::ReadCT32(gs->m_vram, 0x2720u, 8u, x, y);
+                    const uint8_t px[3] = {
+                        static_cast<uint8_t>(c),
+                        static_cast<uint8_t>(c >> 8u),
+                        static_cast<uint8_t>(c >> 16u)};
+                    const uint8_t a = static_cast<uint8_t>(c >> 24u);
+                    if (rgb) std::fwrite(px, 1, sizeof(px), rgb);
+                    if (alpha) std::fwrite(&a, 1, 1, alpha);
+                }
+            }
+            for (uint32_t y = 0; y < 128u; ++y)
+            {
+                for (uint32_t x = 0; x < 256u; ++x)
+                {
+                    const uint8_t index = static_cast<uint8_t>(
+                        GSMem::ReadP8(gs->m_vram, ctx.tex0.tbp0, 2u, x, y));
+                    const uint32_t c = lookupCLUT(gs, index, ctx.tex0.cbp, ctx.tex0.cpsm,
+                                                  ctx.tex0.csm, ctx.tex0.csa, ctx.tex0.psm);
+                    const uint8_t px[3] = {
+                        static_cast<uint8_t>(c),
+                        static_cast<uint8_t>(c >> 8u),
+                        static_cast<uint8_t>(c >> 16u)};
+                    if (indices) std::fwrite(&index, 1, 1, indices);
+                    if (decoded) std::fwrite(px, 1, sizeof(px), decoded);
+                }
+            }
+            if (rgb) std::fclose(rgb);
+            if (alpha) std::fclose(alpha);
+            if (indices) std::fclose(indices);
+            if (decoded) std::fclose(decoded);
+            std::fprintf(stderr, "[G408:rtt] dumped live 0x2720 CT32 and T8 views before display pass\n");
+        }
+    }
     g400NoteDrawTarget(gs->m_vram, ctx.frame.fbp);
 
     // G104: clip title-rock triangles after GS primitive assembly, not per VU vertex. G102's
@@ -644,6 +702,46 @@ void GSRasterizer::drawTriangle(GS *gs)
     }
 
     float denom = (fy1 - fy2) * (fx0 - fx2) + (fx2 - fx1) * (fy0 - fy2);
+
+    // G408: DC2 builds the character shadow mask with paired, untextured
+    // add/subtract triangle fans. GS scan conversion evaluates these spans at
+    // integer scanline coordinates. The old half-pixel barycentric coverage
+    // left uncancelled RGB=1 edge samples; the later T8 alias exposed them as
+    // the diagonal Map 125 speckles.
+    static const bool s_g408ShadowCoverage =
+        std::getenv("DC2_G408_LEGACY_SHADOW_COVERAGE") == nullptr;
+    const uint8_t g408AlphaMode = static_cast<uint8_t>(ctx.alpha & 0xffu);
+    const bool g408ShadowVolume =
+        s_g408ShadowCoverage && ctx.frame.fbp == 0x139u &&
+        !gs->m_prim.tme && gs->m_prim.type == GS_PRIM_TRIFAN &&
+        (g408AlphaMode == 0x62u || g408AlphaMode == 0x68u) &&
+        static_cast<uint8_t>((ctx.alpha >> 32u) & 0xffu) == 0x80u;
+    int64_t g408Fx[3] = {};
+    int64_t g408Fy[3] = {};
+    const int g408Sign = denom >= 0.0f ? 1 : -1;
+    auto g408TopLeft = [&](int a, int b) {
+        int64_t dx = g408Fx[b] - g408Fx[a];
+        int64_t dy = g408Fy[b] - g408Fy[a];
+        if (g408Sign < 0)
+        {
+            dx = -dx;
+            dy = -dy;
+        }
+        return dy < 0 || (dy == 0 && dx > 0);
+    };
+    bool g408Tl[3] = {};
+    if (g408ShadowVolume)
+    {
+        g408Fx[0] = static_cast<int64_t>(std::llround(fx0 * 16.0f));
+        g408Fx[1] = static_cast<int64_t>(std::llround(fx1 * 16.0f));
+        g408Fx[2] = static_cast<int64_t>(std::llround(fx2 * 16.0f));
+        g408Fy[0] = static_cast<int64_t>(std::llround(fy0 * 16.0f));
+        g408Fy[1] = static_cast<int64_t>(std::llround(fy1 * 16.0f));
+        g408Fy[2] = static_cast<int64_t>(std::llround(fy2 * 16.0f));
+        g408Tl[0] = g408TopLeft(1, 2);
+        g408Tl[1] = g408TopLeft(2, 0);
+        g408Tl[2] = g408TopLeft(0, 1);
+    }
 
     // G219 (default-off, DC2_G219_SKYPX=1): triangle-level probe for the sky dome (tbp=0x2820)
     // on the display targets — logs every such triangle that reaches the raster stage with its
@@ -1497,13 +1595,43 @@ void GSRasterizer::drawTriangle(GS *gs)
         for (int x = xStart; x <= xEnd; ++x)
         {
             float px = static_cast<float>(x) + 0.5f;
+            // G408 diagnostic: PCSX2's GS software scanline setup evaluates triangle
+            // attributes at integer GS pixel centers (ceil(edge), integer scanline Y).
+            // Keep default behavior unchanged until the Map 125 A/B is decisive.
+            static const bool s_g408IntegerPixelCenter =
+                std::getenv("DC2_G408_INTEGER_PIXEL_CENTER") != nullptr;
+            if (s_g408IntegerPixelCenter || g408ShadowVolume)
+            {
+                px -= 0.5f;
+                py = static_cast<float>(y);
+            }
 
             float w0 = (((fy1 - fy2) * (px - fx2) + (fx2 - fx1) * (py - fy2)) * winding) * invAbsDenom;
             float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
             float w2 = 1.0f - w0 - w1;
 
-            if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+            if (g408ShadowVolume)
+            {
+                const int64_t sx = static_cast<int64_t>(x) * 16;
+                const int64_t sy = static_cast<int64_t>(y) * 16;
+                auto edge = [&](int a, int b) {
+                    const int64_t e =
+                        (g408Fx[b] - g408Fx[a]) * (sy - g408Fy[a]) -
+                        (g408Fy[b] - g408Fy[a]) * (sx - g408Fx[a]);
+                    return e * g408Sign;
+                };
+                const int64_t e0 = edge(1, 2);
+                const int64_t e1 = edge(2, 0);
+                const int64_t e2 = edge(0, 1);
+                if (e0 < 0 || (e0 == 0 && !g408Tl[0]) ||
+                    e1 < 0 || (e1 == 0 && !g408Tl[1]) ||
+                    e2 < 0 || (e2 == 0 && !g408Tl[2]))
+                    continue;
+            }
+            else if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+            {
                 continue;
+            }
             ++insideAcc;
             if (g232tri)
                 g_g232PxInside.fetch_add(1u, std::memory_order_relaxed);
@@ -1721,9 +1849,22 @@ void GSRasterizer::drawTriangle(GS *gs)
                     }
                     else
                     {
-                        is = v0.s * w0 + v1.s * w1 + v2.s * w2;
-                        it = v0.t * w0 + v1.t * w1 + v2.t * w2;
-                        iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
+                        float tw0 = w0, tw1 = w1, tw2 = w2;
+                        // G408 diagnostic: change only STQ interpolation position, leaving
+                        // coverage/depth/color at the established runtime pixel center.
+                        static const bool s_g408IntegerStqCenter =
+                            std::getenv("DC2_G408_INTEGER_STQ_CENTER") != nullptr;
+                        if (s_g408IntegerStqCenter)
+                        {
+                            const float tpx = static_cast<float>(x);
+                            const float tpy = static_cast<float>(y);
+                            tw0 = (((fy1 - fy2) * (tpx - fx2) + (fx2 - fx1) * (tpy - fy2)) * winding) * invAbsDenom;
+                            tw1 = (((fy2 - fy0) * (tpx - fx2) + (fx0 - fx2) * (tpy - fy2)) * winding) * invAbsDenom;
+                            tw2 = 1.0f - tw0 - tw1;
+                        }
+                        is = v0.s * tw0 + v1.s * tw1 + v2.s * tw2;
+                        it = v0.t * tw0 + v1.t * tw1 + v2.t * tw2;
+                        iq = v0.q * tw0 + v1.q * tw1 + v2.q * tw2;
                     }
                     iu = 0;
                     iv = 0;
