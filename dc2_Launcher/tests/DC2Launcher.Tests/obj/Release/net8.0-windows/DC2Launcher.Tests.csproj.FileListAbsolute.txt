@@ -111,3 +111,4 @@ D:\ps2r\dc2_Launcher\tests\DC2Launcher.Tests\obj\Release\net8.0-windows\refint\D
 D:\ps2r\dc2_Launcher\tests\DC2Launcher.Tests\obj\Release\net8.0-windows\DC2Launcher.Tests.pdb
 D:\ps2r\dc2_Launcher\tests\DC2Launcher.Tests\obj\Release\net8.0-windows\DC2Launcher.Tests.genruntimeconfig.cache
 D:\ps2r\dc2_Launcher\tests\DC2Launcher.Tests\obj\Release\net8.0-windows\ref\DC2Launcher.Tests.dll
+D:\ps2r\dc2_Launcher\tests\DC2Launcher.Tests\bin\Release\net8.0-windows\Launcher_OST.mp3
