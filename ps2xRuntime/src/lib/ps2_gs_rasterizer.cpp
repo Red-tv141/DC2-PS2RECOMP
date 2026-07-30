@@ -1,4 +1,8 @@
 // G411 promoted: force MSBuild to consume default shared GPU-depth ownership .inc changes.
+// G415: publishes the exact colour-readback row window to the GPU backend (see
+// rasterizer_vram_materialization.inc). Touching this file forces the .inc edit to be consumed.
+// G417: diagnostic-only CPU framebuffer-pack split lives in that same part.
+// G423: promotes G326's exact compiled mapping-plan cache; rollback DC2_G423_NO_PLAN_CACHE=1.
 #include "ps2_gs_rasterizer_parts/rasterizer_headers_and_diagnostics.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_g214_cap_trace.inc"
@@ -55,6 +59,23 @@
 
 // G343: arc#4 slice-1 — per-shape TIME census of the l2l consumer-floor edge (default-off)
 #include "ps2_gs_rasterizer_parts/g343_l2l_floor_census.inc"
+
+// G418: colour-readback VRAM unpack (CPU-copy component of the 0x13b readback edge) — the exact
+// table/paired/lane arm plus its profile and oracle. Included before vram_materialization.inc so
+// g418UnpackColorRows is visible at the publication site.
+#include "ps2_gs_rasterizer_parts/g418_readback_unpack.inc"
+
+// G419: the generalized within-process randomized A/B instrument (DC2_G419_AB) plus the exact CT32
+// upload fast pack. Included before vram_materialization.inc so g419AbTick/g419PackFbRows are
+// visible at the once-per-frame tick point and at the framebuffer staging pack.
+#include "ps2_gs_rasterizer_parts/g419_ab_instrument.inc"
+
+// G420: the two staging-pack residues G419 left untested — the exact zero-fill elision and the
+// row-pool lane count — plus the GSRowPool dispatch narrowing the lane-count mechanism turned out
+// to require. Included before vram_materialization.inc so g420PrepStaging/g420PackLaneCount are
+// visible at the framebuffer staging pack; rasterizer_row_pool.inc forward-declares
+// g420PoolNarrowArm because it is included far earlier in this TU.
+#include "ps2_gs_rasterizer_parts/g420_pack_residue.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_vram_materialization.inc"
 

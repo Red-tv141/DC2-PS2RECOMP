@@ -212,6 +212,10 @@ bool passesAlphaTest(uint64_t testReg, uint8_t alpha)
 // caller only (the guest thread inside a VU1 XGKICK) — dispatches never overlap. No allocation on
 // the hot path. Deadlock-safe: workers sleep on a generation counter; the barrier is a pending
 // countdown. Correct/exact ONLY when the lane job touches disjoint pixels + thread-local scratch.
+// G420: defined in g420_pack_residue.inc, which this TU includes much later. Selects the narrowed
+// dispatch below (and lets the G419 within-process instrument alternate it per frame).
+static bool g420PoolNarrowArm();
+
 class GSRowPool
 {
 public:
@@ -233,6 +237,19 @@ public:
         }
         const int total = y1 - y0 + 1;
         auto bound = [&](int i) { return y0 + static_cast<int>(static_cast<int64_t>(total) * i / lanes); };
+        // G420 narrowed dispatch. The legacy join waits for EVERY worker to wake, take the mutex,
+        // find no lane left and report, so a `lanes`-way split still pays an m_threads.size()-way
+        // convoy — which is why the lane count could never move G419's fixed ~0.085 ms dispatch.
+        // Narrowed, m_pending counts LANES (exactly lanes-1 of them are handed to workers) and each
+        // worker subtracts the number it took, so the join waits only for threads that did work.
+        // Surplus workers still wake, but nobody blocks on them.
+        //
+        // SAFETY: the legacy form is what guarantees no worker is still inside the lane loop when
+        // the next generation is armed (run returns only after all of them reported). The narrowed
+        // form gives that up, so the lane loop re-checks m_gen under the same mutex the dispatcher
+        // holds while it bumps m_gen and resets m_nextLane. A late worker therefore cannot steal a
+        // lane from the next generation or run it with stale y0/total/lanes/job.
+        const bool narrow = g420PoolNarrowArm();
 
         {
             std::lock_guard<std::mutex> lk(m_mtx);
@@ -240,8 +257,10 @@ public:
             m_y0 = y0;
             m_total = total;
             m_lanes = lanes;
+            m_narrow = narrow;
             m_nextLane.store(1, std::memory_order_relaxed);
-            m_pending = static_cast<int>(m_threads.size()); // every worker wakes and reports
+            m_pending = narrow ? (lanes - 1)                        // lanes actually handed out
+                               : static_cast<int>(m_threads.size()); // every worker reports
             ++m_gen;
         }
         m_cvWork.notify_all();
@@ -287,8 +306,16 @@ private:
             seen = m_gen;
             const std::function<void(int, int)> *job = m_job;
             const int y0 = m_y0, total = m_total, lanes = m_lanes;
+            const bool narrow = m_narrow;
+            int took = 0;
             for (;;)
             {
+                // G420: m_gen is read under the same mutex the dispatcher holds while it bumps the
+                // generation and resets m_nextLane, so a worker that is late out of the PREVIOUS
+                // generation cannot take a lane belonging to the next one. Inert for the legacy
+                // form (which cannot produce a late worker) and load-bearing for the narrowed one.
+                if (m_gen != seen)
+                    break;
                 const int lane = m_nextLane.fetch_add(1, std::memory_order_relaxed);
                 if (lane >= lanes)
                     break;
@@ -298,9 +325,19 @@ private:
                 if (job && b >= a)
                     (*job)(a, b);
                 lk.lock();
+                ++took;
             }
-            if (--m_pending == 0)
+            if (narrow)
+            {
+                // Exactly lanes-1 lanes exist and every one is taken by some worker, so the
+                // subtractions sum to the initial m_pending and the countdown always reaches 0.
+                if (took > 0 && (m_pending -= took) == 0)
+                    m_cvDone.notify_one();
+            }
+            else if (--m_pending == 0)
+            {
                 m_cvDone.notify_one();
+            }
         }
     }
 
@@ -309,6 +346,7 @@ private:
     std::condition_variable m_cvWork, m_cvDone;
     const std::function<void(int, int)> *m_job = nullptr;
     int m_y0 = 0, m_total = 0, m_lanes = 1, m_pending = 0;
+    bool m_narrow = false; // G420: join waits only for workers that took a lane
     std::atomic<int> m_nextLane{0};
     uint64_t m_gen = 0;
     bool m_stop = false;

@@ -1132,6 +1132,23 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
         case 0x7D: // legacy-unreachable XGKICK body; real dispatch is full function 0x6C.
         legacy_xgkick:
         {
+            // G425: attribute XGKICK time inside the VU1 worker (default OFF).
+            struct G425KickScope
+            {
+                bool on;
+                uint64_t t0;
+                ~G425KickScope()
+                {
+                    if (on)
+                    {
+                        s_g425.kickNs += g425NowNs() - t0;
+                        ++s_g425.kicks;
+                    }
+                }
+            } g425Kick{g425ProfileOn(), 0ull};
+            if (g425Kick.on)
+                g425Kick.t0 = g425NowNs();
+
             if (!vuData || dataSize < 16u)
                 return;
 
@@ -1531,6 +1548,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 }
             }
 
+            const uint64_t g425WalkT0 = g425Kick.on ? g425NowNs() : 0ull;
             uint32_t pktOff = addr;
             uint32_t totalBytes = 0u;
             bool done = false;
@@ -1569,6 +1587,12 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                 pktOff = wrapOffset(pktOff + pktSize);
                 if (eop)
                     done = true;
+            }
+
+            if (g425Kick.on)
+            {
+                s_g425.walkNs += g425NowNs() - g425WalkT0;
+                s_g425.kickBytes += totalBytes;
             }
 
             if (totalBytes == 0u)
@@ -2648,7 +2672,10 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                     }
                 }
                 vu1_dump_xgkick(addr, totalBytes, vuData + addr);
+                const uint64_t g425SubT0 = g425Kick.on ? g425NowNs() : 0ull;
                 g96Submit(vuData + addr, totalBytes);
+                if (g425Kick.on)
+                    s_g425.submitNs += g425NowNs() - g425SubT0;
             }
             else
             {

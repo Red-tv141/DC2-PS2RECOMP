@@ -9,6 +9,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     G141PerfScope g141Scope(s_g141PerfOn, &s_g141Sum, &s_g141Win, "vu1.run", 2000u);
     g141Scope.accumNs = &g_g141Vu1RunNs;
 
+    // G425: VU1-worker internal attribution (default OFF). One clock read per run() call.
+    const bool g425Prof = g425ProfileOn();
+    const uint64_t g425RunT0 = g425Prof ? g425NowNs() : 0ull;
+
     const uint32_t startPc = m_state.pc;
     uint32_t cycle = 0u;
     g141Scope.unitPtr = &cycle;
@@ -171,6 +175,211 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         ++s_g410Cache.verified;
         m_state = compiled;
     };
+    // G421: dynamic hot-loop census (default OFF; one cached master bool).
+    const bool g421On = g421CensusOn();
+    // G421: inline SIMD upper execution. Requires the G410 sidecar (for upperKind) and the
+    // unperturbed FMAC contract — every diagnostic that changes what an upper op writes keeps
+    // the legacy execUpper() path.
+    const bool g421FastUpperRun =
+        g421FastUpperRequested() && g410CompiledRun && !g410VerifyRun &&
+        s_g330FusedMacOn && !s_vu1MacDisabled && !s_g71clampcount && !s_vu1Clamp;
+    const bool g421VerifyRun = g421FastUpperRun && g421VerifyOn();
+    static std::atomic<uint64_t> s_g421Verified{0ull};
+    // Cold shadow-verify path (DC2_G421_VERIFY): run the fast path, restore, run the legacy
+    // decoder from the same pre-state, and compare every field execUpper can write. Returns
+    // false when the encoding is not covered, so the caller falls through to execUpper.
+    auto g421VerifyUpperSlow = [&](uint32_t upperWord, uint8_t upperKind) -> bool {
+        s_g421VerBefore = m_state;
+        if (!g421FastUpper(m_state, upperWord, upperKind))
+            return false;
+        s_g421VerFast = m_state;
+        m_state = s_g421VerBefore;
+        execUpper(upperWord);
+        const VU1State &fast = s_g421VerFast;
+        const bool bad = std::memcmp(fast.vf, m_state.vf, sizeof(fast.vf)) != 0 ||
+                         std::memcmp(fast.acc, m_state.acc, sizeof(fast.acc)) != 0 ||
+                         fast.mac != m_state.mac || fast.status != m_state.status ||
+                         fast.clip != m_state.clip;
+        if (bad)
+        {
+            std::fprintf(stderr,
+                         "[G421:verify] mismatch pc=0x%x upper=%08x kind=%02x "
+                         "mac=%08x/%08x status=%08x/%08x\n",
+                         m_state.pc, upperWord, (unsigned)upperKind,
+                         fast.mac, m_state.mac, fast.status, m_state.status);
+            std::abort();
+        }
+        if ((s_g421Verified.fetch_add(1ull, std::memory_order_relaxed) % 50000000ull) == 0ull)
+            std::fprintf(stderr, "[G421:verify] ok=%llu bad=0\n",
+                         (unsigned long long)s_g421Verified.load(std::memory_order_relaxed));
+        return true;
+    };
+    // G426: branchless fused upper FMAC dispatch. Sits in front of the G421 fast path and shares
+    // every one of its preconditions; kinds outside the FMAC family return false and fall through
+    // to G421 unchanged. The control table pointer is resolved ONCE per run() so the hot loop
+    // never pays the function-local-static guard.
+    const bool g426FusedRun = g421FastUpperRun && g426FusedRequested();
+    const bool g426VerifyRun = g426FusedRun && g426VerifyOn();
+    const G426Ctl *const g426Ctl = g426FusedRun ? g426CtlTable() : nullptr;
+    static std::atomic<uint64_t> s_g426Verified{0ull};
+    // Cold shadow-verify path (DC2_G426_VERIFY): run the fused path, restore, run the legacy
+    // decoder from the same pre-state, and compare every field execUpper can write. Returns
+    // false when the encoding is not an FMAC form, so the caller falls through to G421.
+    auto g426VerifyUpperSlow = [&](uint32_t upperWord, uint8_t upperKind) -> bool {
+        s_g426VerBefore = m_state;
+        if (!g426FastUpper(m_state, upperWord, upperKind, g426Ctl))
+            return false;
+        s_g426VerFast = m_state;
+        m_state = s_g426VerBefore;
+        execUpper(upperWord);
+        const VU1State &fast = s_g426VerFast;
+        const bool bad = std::memcmp(fast.vf, m_state.vf, sizeof(fast.vf)) != 0 ||
+                         std::memcmp(fast.acc, m_state.acc, sizeof(fast.acc)) != 0 ||
+                         fast.mac != m_state.mac || fast.status != m_state.status ||
+                         fast.clip != m_state.clip;
+        if (bad)
+        {
+            std::fprintf(stderr,
+                         "[G426:verify] mismatch pc=0x%x upper=%08x kind=%02x "
+                         "mac=%08x/%08x status=%08x/%08x\n",
+                         m_state.pc, upperWord, (unsigned)upperKind,
+                         fast.mac, m_state.mac, fast.status, m_state.status);
+            std::abort();
+        }
+        if ((s_g426Verified.fetch_add(1ull, std::memory_order_relaxed) % 50000000ull) == 0ull)
+            std::fprintf(stderr, "[G426:verify] ok=%llu bad=0\n",
+                         (unsigned long long)s_g426Verified.load(std::memory_order_relaxed));
+        return true;
+    };
+    // G422: inline lower-slot execution. Requires the G410 sidecar (for lowerKind) and that no
+    // probe living inside a covered execLower body is armed.
+    const bool g422FastLowerRun =
+        g422FastLowerRequested() && g410CompiledRun && !g410VerifyRun && g422LowerDiagFree();
+    const bool g422VerifyRun = g422FastLowerRun && g422VerifyOn();
+    static std::atomic<uint64_t> s_g422Verified{0ull};
+    // Cold shadow-verify path (DC2_G422_VERIFY): run the fast path, restore both the register
+    // state AND all 16 KB of VU data memory, re-run the legacy execLower from the same
+    // pre-state, and compare everything either path can write.
+    auto g422VerifyLowerSlow = [&](uint32_t lowerWord, uint32_t upperWord, uint8_t lowerKind) {
+        const bool touchesMem = g422KindStores(lowerKind);
+        s_g422VerBefore = m_state;
+        if (touchesMem && vuData != nullptr && dataSize <= PS2_VU1_DATA_SIZE)
+            std::memcpy(s_g422VerMemBefore, vuData, dataSize);
+        g422FastLower(m_state, lowerWord, lowerKind, vuData, dataSize);
+        s_g422VerFast = m_state;
+        if (touchesMem && vuData != nullptr && dataSize <= PS2_VU1_DATA_SIZE)
+        {
+            std::memcpy(s_g422VerMemFast, vuData, dataSize);
+            std::memcpy(vuData, s_g422VerMemBefore, dataSize);
+        }
+        m_state = s_g422VerBefore;
+        execLower(lowerWord, vuData, dataSize, gs, memory, upperWord);
+        const bool badState = !g422StatesEqual(s_g422VerFast, m_state);
+        const bool badMem = touchesMem && vuData != nullptr && dataSize <= PS2_VU1_DATA_SIZE &&
+                            std::memcmp(s_g422VerMemFast, vuData, dataSize) != 0;
+        if (badState || badMem)
+        {
+            std::fprintf(stderr,
+                         "[G422:verify] mismatch pc=0x%x lower=%08x kind=%u state=%d mem=%d "
+                         "pc=%08x/%08x\n",
+                         s_g422VerBefore.pc, lowerWord, (unsigned)lowerKind,
+                         (int)badState, (int)badMem, s_g422VerFast.pc, m_state.pc);
+            std::abort();
+        }
+        if ((s_g422Verified.fetch_add(1ull, std::memory_order_relaxed) % 50000000ull) == 0ull)
+            std::fprintf(stderr, "[G422:verify] ok=%llu bad=0\n",
+                         (unsigned long long)s_g422Verified.load(std::memory_order_relaxed));
+    };
+// Runs the lower slot. A macro for the same reason as DC2_G421_RUN_UPPER: when the lever is off
+// the control arm must keep the byte-identical legacy `execLower(...)` call, reached through one
+// loop-invariant, perfectly-predicted branch.
+#define DC2_G422_RUN_LOWER()                                                          \
+    do {                                                                              \
+        if (g422FastLowerRun)                                                         \
+        {                                                                             \
+            const uint8_t g422kind = g410Pair->lowerKind;                             \
+            if (g422kind != G422_LK_NONE)                                             \
+            {                                                                         \
+                if (g422VerifyRun)                                                    \
+                    g422VerifyLowerSlow(lower, upper, g422kind);                      \
+                else                                                                  \
+                    g422FastLower(m_state, lower, g422kind, vuData, dataSize);        \
+                break;                                                                \
+            }                                                                         \
+        }                                                                             \
+        execLower(lower, vuData, dataSize, gs, memory, upper);                        \
+    } while (0)
+// Runs the upper slot. A macro, not a lambda: the default (lever-off) path must keep the exact
+// legacy `execUpper(upper)` call shape with no extra frame, since it is the control arm. When
+// the lever is off this collapses to one loop-invariant, perfectly-predicted branch.
+#define DC2_G421_RUN_UPPER(upperWord, upperKind)                                      \
+    do {                                                                              \
+        if (g426FusedRun)                                                             \
+        {                                                                             \
+            if (g426VerifyRun)                                                        \
+            {                                                                         \
+                if (g426VerifyUpperSlow((upperWord), (upperKind))) break;             \
+            }                                                                         \
+            else if (g426FastUpper(m_state, (upperWord), (upperKind), g426Ctl))       \
+                break;                                                                \
+        }                                                                             \
+        if (g421FastUpperRun)                                                         \
+        {                                                                             \
+            if (g421VerifyRun)                                                        \
+            {                                                                         \
+                if (g421VerifyUpperSlow((upperWord), (upperKind))) break;             \
+            }                                                                         \
+            else if (g421FastUpper(m_state, (upperWord), (upperKind)))                \
+                break;                                                                \
+        }                                                                             \
+        execUpper(upperWord);                                                         \
+    } while (0)
+    // G425: lean per-pair bookkeeping. Three pieces of the loop body exist only to feed
+    // diagnostics that cannot fire on a normal run:
+    //   * lastPc / lastLower / lastUpper (3 stores/pair) feed the [G22:vu1stop] trace only,
+    //   * g72_vi1_before (1 load/pair) feeds G295 diag region D only,
+    //   * the G369 non-finite VF scan carries a function-local magic-static guard per pair,
+    // and a fourth, the VF0/VI0 hardware-invariant re-pin (5 stores/pair), is provably the
+    // identity on every pair whose two slots cannot name register 0 (G425_PF_TOUCHES_ZERO,
+    // decoded once into the G410 sidecar). None of this changes what any instruction computes.
+    // RESULT: NOT PROMOTED. The lever is exact (DC2_G425_VERIFY clean over a full MAP-0 run)
+    // and it does remove per-pair work, but the frame and VU1-worker effects both sit under the
+    // run-level noise floor of this machine (pooled 4v4 in both arm orders: 51.21 vs 51.73 ms,
+    // with the two batches disagreeing in sign). Per the "neutral after parity" rule it ships
+    // OPT-IN so the substrate survives for a later re-price (the G423 precedent), and the
+    // default path keeps the legacy bookkeeping byte-for-byte.
+    // Arm:    DC2_G425_LEAN_PAIR=1
+    // Verify: DC2_G425_VERIFY=1 asserts the VF0/VI0 invariant after every executed pair.
+    static const bool s_g425LeanOn = (std::getenv("DC2_G425_LEAN_PAIR") != nullptr) &&
+                                     (std::getenv("DC2_G425_NO_LEAN_PAIR") == nullptr);
+    static const bool s_g425VuNan = (std::getenv("DC2_G369_VUNAN") != nullptr);
+    static const bool s_g425Verify = (std::getenv("DC2_G425_VERIFY") != nullptr);
+    // G426: sidecar-resolved per-pair predicates. G426's first lever (branchless fused upper
+    // dispatch, DC2_G426_FUSED_UPPER) proved this loop is THROUGHPUT-bound, not
+    // misprediction-bound: ~20 extra SSE2 ops per executed upper cost 4.2 ms/f (~1 host cycle
+    // per op), so the only way to move it is to execute FEWER instructions per pair. This lever
+    // does exactly that by moving three per-pair decisions that are pure functions of the pair
+    // encoding into the G410 sidecar, which already caches and invalidates that encoding:
+    //   * the G239 scalar-prestall applicability test (G426_PF_PRESTALL),
+    //   * the G139 same-pair hazard applicability test (G426_PF_HAZ),
+    //   * G425's VF0/VI0 re-pin elision (G425_PF_TOUCHES_ZERO), promoted here from opt-in
+    //     because on its own it sat under the run-level noise floor, and the three together do
+    //     not.
+    // Nothing about what an instruction computes changes; each predicate is the same boolean the
+    // loop used to recompute. The G139 form is only equivalent while the G295 hazard-skip is
+    // active, so DC2_G295_NO_HAZSKIP=1 keeps the legacy chain.
+    // Kill: DC2_G426_NO_PREDECODE=1
+    static const bool s_g426PredecodeOn =
+        (std::getenv("DC2_G426_NO_PREDECODE") == nullptr);
+    // DC2_G426_VERIFY_PREDECODE=1 recomputes both predicates from the live instruction words on
+    // every executed pair and aborts on the first disagreement with the cached bits.
+    static const bool s_g426VerifyPredecode =
+        (std::getenv("DC2_G426_VERIFY_PREDECODE") != nullptr);
+    const bool g426Predecode = s_g426PredecodeOn && !g295Diag && !s_g295KeepHaz &&
+                               g410Pairs != nullptr;
+    const bool g425Lean = (s_g425LeanOn || g426Predecode) && !g295Diag && !s_g425VuNan &&
+                          g410Pairs != nullptr;
+
     uint32_t *const s_macPipeP     = s_vuMacPipe;
     uint32_t *const s_statusPipeP  = s_vuStatusPipe;
     uint32_t *const s_macVisP      = &s_vuMacVisible;
@@ -181,7 +390,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     for (; cycle < maxCycles; ++cycle)
     {
         const uint32_t currentPc = m_state.pc;
-        const int16_t g72_vi1_before = (int16_t)m_state.vi[1];
+        const int16_t g72_vi1_before = g425Lean ? (int16_t)0 : (int16_t)m_state.vi[1];
         // G295 diag region A (pre-fetch): G216 census, G100/G101/G102/G106/G108 title force
         // path, G75/G85/G87 probes. Interior indentation intentionally unchanged (see the
         // master-gate comment above the loop).
@@ -524,9 +733,17 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             if (g410Pairs != nullptr)
                 g410Pair = &g410Pairs[currentPc >> 3u];
         }
-        lastPc = currentPc;
-        lastLower = lower;
-        lastUpper = upper;
+        if (!g425Lean)
+        {
+            lastPc = currentPc;
+            lastLower = lower;
+            lastUpper = upper;
+        }
+
+        if (g421On)
+            g421NoteCycle(g410Pair != nullptr ? g410Pair->upperKind
+                                              : g410SelectUpperKind(upper),
+                          upper, lower);
 
         // G295 diag region B (post-fetch): G68/G69/G117/G132/G237/G70 censuses, VU1 XGKICK
         // trace, G32. Interior indentation intentionally unchanged.
@@ -961,7 +1178,25 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         // executing either half of the instruction pair. Publish an older scalar result here
         // when this lower op would stall FDIV/EFU; execLower then arms the new producer (or
         // observes an already-completed WAIT) after the parallel upper has consumed the value.
-        if (!iBit && s_scalarPrestallOn)
+        // G426: the sidecar already knows whether this pair's lower slot is a scalar-pipe
+        // producer or waiter. When it is not, the whole block below is provably a no-op, so the
+        // predicate replaces a sidecar byte load plus ten compares with one cached bit test.
+        if (s_g426VerifyPredecode && g426Predecode && !iBit)
+        {
+            const uint8_t liveS2 = ((lower >> 25u) & 0x7fu) == 0x40u ? S2_FUNC(lower) : 0xffu;
+            if (g426LowerIsScalarPipe(liveS2) !=
+                ((g410Pair->g425Flags & G426_PF_PRESTALL) != 0u))
+            {
+                std::fprintf(stderr,
+                             "[G426:verify] prestall mismatch pc=0x%x lower=%08x s2=%02x "
+                             "cached=%d\n",
+                             currentPc, lower, (unsigned)liveS2,
+                             (int)((g410Pair->g425Flags & G426_PF_PRESTALL) != 0u));
+                std::abort();
+            }
+        }
+        if (!iBit && s_scalarPrestallOn &&
+            (!g426Predecode || (g410Pair->g425Flags & G426_PF_PRESTALL) != 0u))
         {
             const uint8_t lowerS2239 = g410Pair != nullptr
                 ? g410Pair->lowerS2
@@ -1045,6 +1280,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             if (g410VerifyRun)
                 g410VerifyUpper(lower, upper);
             else if (!g410CompiledRun || g410Pair->upperKind != 0x6fu)
+                // G421: LOI pairs are 0.69% of executed pairs. Keeping them on the legacy
+                // decoder leaves exactly ONE inlined copy of the SIMD upper body in the hot
+                // loop; a second copy cost more in loop footprint than this share can repay.
                 execUpper(upper);
         }
         else
@@ -1056,7 +1294,42 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             // op of this pair can read the pre-upper value (see g139_pairhaz_enabled).
             float *g139dst = nullptr;
             float g139old[4], g139new[4];
-            if (s_pairhazOn)
+            if (s_pairhazOn && g426Predecode)
+            {
+                if (s_g426VerifyPredecode)
+                {
+                    uint32_t liveIdx = 0xffffffffu;
+                    const uint8_t liveOp = (uint8_t)(upper & 0x3Fu);
+                    if (liveOp < 0x3Cu)
+                        liveIdx = (upper >> 6) & 0x1Fu;
+                    else
+                    {
+                        const uint8_t liveS2 = S2_FUNC(upper);
+                        if ((liveS2 >= 0x10u && liveS2 <= 0x17u) || liveS2 == 0x1Du)
+                            liveIdx = (upper >> 16) & 0x1Fu;
+                    }
+                    const bool liveHaz =
+                        liveIdx != 0xffffffffu &&
+                        ((((lower >> 11u) & 0x1Fu) == liveIdx) ||
+                         (((lower >> 16u) & 0x1Fu) == liveIdx));
+                    if (liveHaz != ((g410Pair->g425Flags & G426_PF_HAZ) != 0u))
+                    {
+                        std::fprintf(stderr,
+                                     "[G426:verify] haz mismatch pc=0x%x upper=%08x lower=%08x "
+                                     "live=%d cached=%d\n",
+                                     currentPc, upper, lower, (int)liveHaz,
+                                     (int)((g410Pair->g425Flags & G426_PF_HAZ) != 0u));
+                        std::abort();
+                    }
+                }
+                // G426: hazard applicability is a property of the pair encoding, decoded once.
+                if ((g410Pair->g425Flags & G426_PF_HAZ) != 0u)
+                {
+                    g139dst = m_state.vf[g410Pair->upperVfDest];
+                    std::memcpy(g139old, g139dst, 16);
+                }
+            }
+            else if (s_pairhazOn)
             {
                 uint32_t g139DstIdx = 0u;
                 if (g410Pair != nullptr)
@@ -1097,12 +1370,16 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                             ((lower >> 16u) & 0x1Fu) != g139DstIdx)))
                     g139dst = nullptr;
                 if (g139dst)
+                {
                     std::memcpy(g139old, g139dst, 16);
+                }
             }
             if (g410VerifyRun)
                 g410VerifyUpper(lower, upper);
             else if (!g410CompiledRun || g410Pair->upperKind != 0x6fu)
-                execUpper(upper);
+            {
+                DC2_G421_RUN_UPPER(upper, g410Pair != nullptr ? g410Pair->upperKind : 0xffu);
+            }
             if (g139dst)
             {
                 std::memcpy(g139new, g139dst, 16);
@@ -1174,7 +1451,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                 }
             }
             } // G295 diag region C end
-            execLower(lower, vuData, dataSize, gs, memory, upper);
+            DC2_G422_RUN_LOWER();
             s_g106UseLowerFlagRead = false;
             if (g139dst)
             {
@@ -1191,8 +1468,9 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         // at the GS as every vertex arriving with NaN/Inf. VIF source data is clean, so the
         // poison is born inside VU1. Report the FIRST instruction pair after which any vf lane
         // becomes non-finite, with the pc and both opcode words, then keep counting.
+        if (!g425Lean)
         {
-            static const bool s_g369vu = (std::getenv("DC2_G369_VUNAN") != nullptr);
+            const bool s_g369vu = s_g425VuNan;
             if (s_g369vu)
             {
                 static thread_local bool s_wasClean = true;
@@ -1580,13 +1858,33 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 
         } // G295 diag region D end
 
-        // Enforce VF0 invariant
-        m_state.vf[0][0] = 0.0f;
-        m_state.vf[0][1] = 0.0f;
-        m_state.vf[0][2] = 0.0f;
-        m_state.vf[0][3] = 1.0f;
-        // Enforce VI0 invariant
-        m_state.vi[0] = 0;
+        // Enforce VF0/VI0 invariants. G425: skipped when this pair provably cannot name
+        // register 0 as a destination, which makes the re-pin the identity.
+        if (!g425Lean || (g410Pair->g425Flags & G425_PF_TOUCHES_ZERO) != 0u)
+        {
+            // Enforce VF0 invariant
+            m_state.vf[0][0] = 0.0f;
+            m_state.vf[0][1] = 0.0f;
+            m_state.vf[0][2] = 0.0f;
+            m_state.vf[0][3] = 1.0f;
+            // Enforce VI0 invariant
+            m_state.vi[0] = 0;
+        }
+        else if (s_g425Verify)
+        {
+            if (m_state.vf[0][0] != 0.0f || m_state.vf[0][1] != 0.0f ||
+                m_state.vf[0][2] != 0.0f || m_state.vf[0][3] != 1.0f ||
+                m_state.vi[0] != 0)
+            {
+                std::fprintf(stderr,
+                             "[G425:verify] VF0/VI0 invariant broken pc=0x%x lower=%08x "
+                             "upper=%08x vf0=(%g %g %g %g) vi0=%d\n",
+                             currentPc, lower, upper,
+                             m_state.vf[0][0], m_state.vf[0][1], m_state.vf[0][2],
+                             m_state.vf[0][3], (int)m_state.vi[0]);
+                std::abort();
+            }
+        }
 
         uint32_t sequentialPC = currentPc + 8;
         if (sequentialPC >= codeSize)
@@ -1628,8 +1926,23 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         *s_pDelayP = 0;
     }
 
+    if (g425Prof)
+    {
+        s_g425.runNs += g425NowNs() - g425RunT0;
+        ++s_g425.runs;
+        g425ReportMaybe();
+    }
+
     if (g410CompiledRun)
         g410ReportMaybe();
+
+    if (g421On)
+    {
+        ++s_g421.runs;
+        g421ReportMaybe();
+    }
+#undef DC2_G421_RUN_UPPER
+#undef DC2_G422_RUN_LOWER
 
     if (vu1_trace_enabled())
     {

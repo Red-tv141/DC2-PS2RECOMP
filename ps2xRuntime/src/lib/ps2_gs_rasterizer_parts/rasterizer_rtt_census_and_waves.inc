@@ -629,7 +629,9 @@ bool g242_backend_read_depth(uint64_t depthKey, int width, int height,
 // G305: one-slot move-owned async submit bridges (ps2_gs_gpu_raster.cpp), default-off.
 bool g178_backend_submit_async(G178Batch &batch);
 bool g178_backend_drain_async(bool &ok);
-
+// G415: publish the exact GL row window the front-end will consume out of the NEXT synchronous
+// submit's colour readback (ps2_gs_gpu_raster.cpp). Consumed-and-cleared by that submit.
+void g415_backend_set_color_window(int glY, int rows);
 namespace
 {
 struct G242DepthState

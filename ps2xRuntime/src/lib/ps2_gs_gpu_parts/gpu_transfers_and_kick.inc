@@ -96,11 +96,12 @@ void GS::performLocalToLocalTransfer()
     const uint32_t dsax = m_trxpos.dsax;
     const uint32_t dsay = m_trxpos.dsay;
 
-    // G414 bring-up: a non-empty local-to-local transfer whose complete source and
-    // destination mappings are identical cannot change GS local memory. Retire it
-    // before any G144/G242 materialization, ownership publication, or VRAM-generation
-    // bump. Fail closed on every unlike field. The positive arm is opt-in until the
-    // same-binary A/B and graphics-route matrix pass.
+    // G414 diagnostic (2026-07-29 NO-GO): a non-empty local-to-local transfer whose
+    // complete source and destination mappings are identical cannot change GS local
+    // memory. The opt-in arm retires it before G144/G242 materialization, ownership
+    // publication, or a VRAM-generation bump and fails closed on every unlike field.
+    // Keep default-off: its lean MAP-0 3x3 regressed 2.96% despite reducing the
+    // measured materialization slice (plans/phase-G414-fix-log.md).
     static const bool s_g414SelfCopyOn =
         envFlagEnabled("DC2_G414_L2L_SELF_COPY") &&
         !envFlagEnabled("DC2_G414_NO_L2L_SELF_COPY");
@@ -1018,6 +1019,44 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         g313T0 = std::chrono::steady_clock::now();
     }
 
+    // G424: hand the swizzled writer whole horizontal runs instead of one cross-TU call per pixel.
+    // Exact by construction (same PixelStorageTraits<psm>::Write calls, same arguments, same
+    // order); only the call boundary moves. Uncovered psm returns false and falls through to the
+    // untouched legacy tree below. See g424_fast_image_upload.inc.
+    bool g424Handled = false;
+    if (g424FastImageOn())
+    {
+        const G424ImageCtx g424Ctx{m_vram, data, sizeBytes, dbp, dbw, dpsm,
+                                   dsax, dsay, rrw, rrh, &m_hwregX, &m_hwregY};
+        if (g424VerifyOn() && g424VerifySampleNow())
+        {
+            // Oracle: run the fast arm, capture its result, rewind GS memory and the transfer
+            // cursor, let the legacy tree run from the identical pre-state, then compare.
+            g424VerifyBegin(m_vram, m_vramSize, m_hwregX, m_hwregY);
+            if (g424TryFastImageWrite(g424Ctx))
+                g424VerifyRewind(m_vram, m_vramSize, m_hwregX, m_hwregY);
+            else
+                s_g424VerPending = false;
+        }
+        else
+        {
+            g424Handled = g424TryFastImageWrite(g424Ctx);
+        }
+        if (g424StatOn())
+        {
+            const uint64_t n = g_g424Calls.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+            if (g424Handled)
+                g_g424Fast.fetch_add(1ull, std::memory_order_relaxed);
+            if ((n % 8192ull) == 0ull)
+                std::fprintf(stderr, "[G424:stat] imageCalls=%llu run=%llu legacy=%llu\n",
+                             (unsigned long long)n,
+                             (unsigned long long)g_g424Fast.load(std::memory_order_relaxed),
+                             (unsigned long long)(n - g_g424Fast.load(std::memory_order_relaxed)));
+        }
+    }
+    if (!g424Handled)
+    {
+
     if (dpsm == GS_PSM_T4HL || dpsm == GS_PSM_T4HH)
     {
         if (dpsm == GS_PSM_T4HH && dbp == 0x1A00u && envFlagEnabled("DC2_DUMP_FONT"))
@@ -1304,6 +1343,12 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
                 break;
         }
     }
+
+    } // G424: end of the legacy per-pixel writer tree
+
+    if (s_g424VerPending)
+        g424VerifyCompare(m_vram, m_vramSize, m_hwregX, m_hwregY,
+                          dpsm, dbp, dbw, rrw, rrh, sizeBytes);
 
     if (s_g313Census)
     {

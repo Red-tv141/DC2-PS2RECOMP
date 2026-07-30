@@ -28,6 +28,13 @@
 #include <unordered_set>
 #include <vector>
 
+// G419: shared arm register for the within-process randomized A/B instrument. Defined in
+// ps2_gs_gpu_parts/gpu_bridge_and_latch_helpers.inc; the tick lives in the GS front-end
+// (ps2_gs_rasterizer_parts/g419_ab_instrument.inc), which owns the contract. Declared at global
+// scope because the backend consumers below sit inside an anonymous namespace.
+extern std::atomic<uint32_t> g_g419AbArm;
+extern std::atomic<uint32_t> g_g419AbUsed;
+
 namespace
 {
 bool g158EnvFlag(const char *name)
@@ -62,6 +69,208 @@ bool g178DefaultOn()
 bool g299ProfileOn()
 {
     static const bool on = g158EnvFlag("DC2_G299_PROFILE");
+    return on;
+}
+
+// G415: per-fbp stage census for the G299 command-zero submit class (a batch that renders and
+// then reads its color target back synchronously). Splits the backend's measured work into
+// setup / draw-loop / colour-readback so the 2.25 ms per-occurrence cost can be attributed to a
+// real edge instead of guessed. Behaviour-pure, default-off.
+bool g415CensusOn()
+{
+    static const bool on = g158EnvFlag("DC2_G415_CENSUS");
+    return on;
+}
+
+// G415 counters for the narrowed colour readback (default-off print, behaviour-pure).
+bool g415StatOn()
+{
+    static const bool on = g158EnvFlag("DC2_G415_STAT");
+    return on;
+}
+
+// G415 FBO geometry recycling. `m_fbos` is keyed by target, so DC2's fbp=0x139 — written at both
+// fbw=8 (512-wide) and fbw=2 (128-wide) — destroys and reallocates a 512x512 RGBA8 colour texture
+// plus a 512x512 depth renderbuffer on every width flip. The recycled path parks the outgoing
+// geometry instead of deleting it and revives it on the flip back, re-establishing the identical
+// fresh-create post-state (attachments re-bound, texture parameters reset, colour+depth cleared).
+// No key, ownership, residency, FIFO order, or publication boundary changes.
+// G415 PROMOTED to default-ON (2026-07-30): lean MAP-0 3x3 measured 66.060 ms/frame against
+// 68.032 ms for its same-binary control with non-overlapping run-mean ranges (-1.972 ms / -2.90%),
+// matching the 2.09 ms/frame the stage census attributed to fbp=0x139 FBO churn. Revive reproduces
+// the fresh-create post-state exactly, so the change is bit-exact by construction.
+// Kill with DC2_G415_NO_FBO_RECYCLE=1 or DC2_G415_FBO_RECYCLE=0.
+bool g415FboRecycleOn()
+{
+    static const bool on = !g158EnvFlag("DC2_G415_NO_FBO_RECYCLE") &&
+                           !g158EnvDisabled("DC2_G415_FBO_RECYCLE");
+    return on;
+}
+
+// G415 fence attribution probe. Inserts a glFinish immediately BEFORE the colour readback so the
+// census can separate "drain of previously queued GL work" from "this readback's own transfer".
+// Diagnostic only: it adds a stall, so it must never run inside a timing arm.
+bool g415FenceProbeOn()
+{
+    static const bool on = g415CensusOn() && g158EnvFlag("DC2_G415_FENCE_PROBE");
+    return on;
+}
+
+// G415 narrowed colour readback. The front-end consumes only the batch's own GS row window
+// (rowLo..rowHi) out of a full-height readback buffer; every row outside it is copied out of the
+// FBO and then discarded. When the front-end publishes an exact window through
+// g415_backend_set_color_window(), read back only those GL rows into their existing offsets in
+// the same full-height buffer. No GS ownership, FIFO order, or publication boundary moves.
+// G419: is this backend lever the one the within-process A/B instrument is alternating? Cached, so
+// the shipping path costs one static-guard load per readback batch (once per frame) and no getenv.
+bool g419NarrowArmSelected()
+{
+    static const bool on = [] {
+        const char *value = std::getenv("DC2_G419_AB");
+        return value != nullptr &&
+               (std::strcmp(value, "narrow") == 0 || std::strcmp(value, "all") == 0);
+    }();
+    return on;
+}
+
+// G419 ballast repeats for THIS lever (DC2_G419_BALLAST). In ballast mode both buckets run the
+// control form and the candidate bucket re-reads the same rect N extra times, which is idempotent
+// (identical bytes into the same destination) and therefore measures only how much of a known added
+// cost at this exact site reaches the frame.
+int g419NarrowBallastReps()
+{
+    static const int n = [] {
+        const char *value = std::getenv("DC2_G419_BALLAST");
+        if (value == nullptr)
+            return 0;
+        int parsed = std::atoi(value);
+        return parsed < 0 ? 0 : (parsed > 16 ? 16 : parsed);
+    }();
+    if (n <= 0 || !g419NarrowArmSelected())
+        return 0;
+    return g_g419AbArm.load(std::memory_order_relaxed) != 0u ? n : 0;
+}
+
+// G419 PROMOTED to default-ON (2026-07-30). G415 built this arm, proved it exact, measured the row
+// saving at 0.127 ms/frame and shelved it as "below the timing floor". G418's within-process
+// randomized instrument lowered that floor, and G419's A/B over 6,000 MAP-0 frames measured
+// -0.332 ms/frame (blocked -0.429, se 0.145, t = -2.96, 8/10 windows favouring) - larger than the
+// transfer saving alone, see the fix log's open discrepancy.
+// Kill with DC2_G415_NO_NARROW_READBACK=1 or DC2_G415_NARROW_READBACK=0.
+bool g415NarrowReadbackOn()
+{
+    static const bool on = !g158EnvFlag("DC2_G415_NO_NARROW_READBACK") &&
+                           !g158EnvDisabled("DC2_G415_NARROW_READBACK");
+    if (!g419NarrowArmSelected())
+        return on;
+    // Instrument armed: the per-frame arm decides, and the consumer records which bucket actually
+    // ran so the tick can charge that frame period to it (see g419_ab_instrument.inc).
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    static const bool ballast = [] {
+        const char *value = std::getenv("DC2_G419_BALLAST");
+        return value != nullptr && std::atoi(value) > 0;
+    }();
+    return ballast ? false : (arm != 0u);
+}
+
+// G420 narrow-readback MECHANISM PROBE (DC2_G419_AB=narrowtouch, diagnostic only, default-off).
+//
+// G419 promoted the narrowed colour readback on a measured -0.332 ms/frame (blocked -0.429) that
+// is 3-4x its accounted mechanism: 96 rows x 1.32 us/row = 0.127 ms of hardware-rate transfer,
+// scaled by the site's measured 0.82 critical-path sensitivity, predicts about 0.104 ms. The
+// leading hypothesis is that the missing part is DESTINATION-side: the full read also WRITES those
+// 96 rows (196 KiB) into the readback buffer, through the driver's staging copy, and the consumer
+// then discards every one of them.
+//
+// This probe measures exactly that term. Both buckets run the promoted NARROW read; the candidate
+// bucket additionally writes 196 KiB - the same volume the full read's discarded rows carry - into
+// an inert scratch buffer. That adds the destination-side traffic WITHOUT adding any GL transfer,
+// any GL state, or any observable byte, so:
+//
+//     narrowtouch delta ~= (narrow delta) - (transfer term)   => the discrepancy is destination-side
+//     narrowtouch delta ~= 0                                   => it is NOT, and the mechanism is
+//                                                                 elsewhere (look at the GL side)
+//
+// Exact by construction: the scratch buffer is backend-private and is never read.
+bool g420NarrowTouchSelected()
+{
+    static const bool on = [] {
+        const char *value = std::getenv("DC2_G419_AB");
+        return value != nullptr && std::strcmp(value, "narrowtouch") == 0;
+    }();
+    return on;
+}
+
+// Returns true when THIS frame's bucket should perform the extra destination-side write. Must be
+// called unconditionally at the site: the instrument charges a frame period to the arm a consumer
+// reported, so a call skipped by a short-circuit drops the interval instead of charging it (G419).
+bool g420NarrowTouchArm()
+{
+    if (!g420NarrowTouchSelected())
+        return false;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    return arm != 0u;
+}
+
+// G420 narrow-readback SHAPE probe (DC2_G420_NARROW_ROWS=<n>, diagnostic only, default-off).
+//
+// With the destination-side hypothesis refuted (see g420NarrowTouchArm) and the forced-finish edge
+// split reproducing only 0.123 ms of the narrow lever's 0.33-0.43 ms payoff, one discriminator is
+// left: is the extra cost PROPORTIONAL to the rows read, or a STEP the full-height read pays for
+// covering the entire attachment (a driver full-surface resolve/staging path that a sub-rect read
+// avoids)?
+//
+// This widens the narrow read to exactly <n> rows. Any n >= the published window is EXACT: the read
+// still covers every row the consumer reads, into the same offsets of the same full-height buffer,
+// and rows outside the consumed window are discarded either way. n=511 vs the 512-row full read is
+// therefore the decisive pair — proportional predicts ~1/96th of the payoff, a step predicts nearly
+// all of it.
+int g420NarrowRowsOverride()
+{
+    static const int n = [] {
+        const char *value = std::getenv("DC2_G420_NARROW_ROWS");
+        if (value == nullptr)
+            return 0;
+        return std::max(0, std::min(4096, std::atoi(value)));
+    }();
+    return n;
+}
+
+// G417 framebuffer-upload edge attribution. Diagnostic only: the backend inserts a finish
+// immediately before and after glTexSubImage2D so prior deferred work, CPU submission, and upload
+// completion are measured separately. The finishes perturb scheduling, so this must never be armed
+// in a lean timing or correctness arm.
+bool g417ProfileOn()
+{
+    static const bool on = g158EnvFlag("DC2_G417_PROFILE");
+    return on;
+}
+
+// G418 colour-readback edge attribution. Splits the one readback batch per frame into the drain of
+// GL work queued by earlier skip-readback batches (a glFinish immediately before the readback) and
+// the readback's own transfer/completion. Diagnostic only: the finish is a deliberate stall, so it
+// must never be armed inside a timing arm. It is independent of DC2_G415_CENSUS so the split can be
+// taken without the nine-mark stage census riding along.
+bool g418ProfileOn()
+{
+    static const bool on = g158EnvFlag("DC2_G418_PROFILE");
+    return on;
+}
+
+// G418 early command kick. A skip-readback batch leaves its GL work queued and nothing in the frame
+// fences until the one colour-readback batch, which then pays that whole backlog as drain (G415
+// measured 1.119 ms drain + 0.850 ms transfer). Kicking each skip-readback batch lets the driver
+// start executing it while the front-end prepares the next batch, so the readback finds less
+// outstanding work. glFlush has no effect on results, ordering, ownership, or any GL state: it only
+// guarantees that already-issued commands complete in finite time.
+bool g418EarlyKickOn()
+{
+    // Bring-up state: opt-in arm with a same-binary kill switch so an armed run can be reversed
+    // without a rebuild.
+    static const bool on = g158EnvFlag("DC2_G418_EARLY_KICK") &&
+                           !g158EnvFlag("DC2_G418_NO_EARLY_KICK");
     return on;
 }
 
@@ -602,4 +811,3 @@ void g158StartDedicatedGpuThread()
                      static_cast<unsigned long>(GetLastError()));
     }
 }
-

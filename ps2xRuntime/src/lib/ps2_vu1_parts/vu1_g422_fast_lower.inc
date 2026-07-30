@@ -1,0 +1,658 @@
+// G422 - inline execution of the VU1 lower slot.
+//
+// PREMISE (current-binary, this phase, per the standing "attribute to the THREAD first" rule).
+// DC2_G303_INSTR=1 + DC2_G182_EE_STAT=1 on the shipped G421 binary, lean MAP-0:
+//     VU1 worker busyMs/f 61.6-64.3 | GS worker 58.8-61.7 | frame 64.7-68.0 | gsStall 0.0
+// The VU1 worker is still the pole, but only by ~2.5-3 ms, so this phase's payoff is capped by
+// the GS worker taking over — that cap is a property of the frame, not of the lever.
+//
+// SIZING (DC2_G421_CENSUS=1, MAP-0, 1.02 G pairs):
+//     lowerExec = 60.0% of pairs, lowerNop = 39.3%, iBit = 0.7%
+// i.e. execLower() is CALLED on 99.3% of ~1.63 M pairs/frame, and 39.3% of those calls do
+// nothing at all: the function's very first statement is `if (instr == 0 || instr == 0x8000033C)
+// return;`. That call is not free — it is a 6-argument call (three arguments spill to the stack
+// under the Windows x64 convention) into a non-inlined function. G410 already priced this exact
+// boundary at ~8.6 ns per skipped execUpper() call.
+//
+// MECHANISM. Predecode the lower word once, into the byte the G410 sidecar already carries per
+// pair, and execute the covered kinds inline in run():
+//   * NOP                                    -> the call disappears entirely (39.3% of pairs)
+//   * integer ALU  IADD/ISUB/IADDI/IAND/IOR/IADDIU/ISUBIU
+//   * VU-memory    LQ/SQ/ILW/ISW/LQI/SQI/LQD/SQD/ILWR/ISWR   (SQI 8.2% + LQI 6.8% of all pairs)
+//   * moves        MOVE/MR32/MTIR/MFIR
+//   * branches     B/BAL/JR/JALR/IBEQ/IBNE/IBLTZ/IBGTZ/IBLEZ/IBGEZ
+// Everything else (DIV/SQRT/RSQRT and the whole Q/P pipeline, XGKICK, WAITQ/WAITP, the EFU
+// group, the flag ops FCxx/FSxx/FMxx, RNEXT/RGET/RINIT/RXOR, MFP, XTOP/XITOP) keeps the legacy
+// execLower() path untouched, so no scalar-pipeline, flag-pipeline or GS-kick semantics move.
+//
+// EXACTNESS is by construction: each covered body below is a verbatim transcription of the
+// corresponding case in VU1Interpreter::execLower (vu1_dispatch_and_sync.inc), including the
+// address masking, the `addr + 16 <= dataSize` guard, the `!= 0` register-write guards, the
+// int16 truncations and the read-modify-write tmp[4] staging that makes a masked store exact
+// when it and is alias. The legacy `applyDest()` member is transcribed as its four conditional
+// lane stores. Nothing is re-ordered and no expression is re-associated.
+//
+// The covered handlers also contain PC-scoped diagnostic hooks (G31 LQI trace, G133 copy-packer
+// ADC skip inside SQI, G370 load/store/div watches, G63/G64 IAND gate). Every one of them is
+// env-gated and OFF by default; the fast path does not carry them, so arming any of those envs
+// (or anything that already trips the G295 master diagnostic gate) routes the whole slot back
+// through execLower().
+//
+// Status:   PROMOTED default-on.
+// Kill:     DC2_G422_NO_FAST_LOWER=1  (restores the legacy execLower path exactly)
+// Verify:   DC2_G422_VERIFY=1  (shadow-executes legacy execLower from the same pre-state and
+//                               compares the whole VU1State *and* all 16 KB of VU data memory)
+namespace
+{
+    // Dense kind space, so the dispatch below compiles to one jump table.
+    enum : uint8_t
+    {
+        G422_LK_NONE = 0u, // not covered -> execLower()
+        G422_LK_NOP,
+        G422_LK_LQ,
+        G422_LK_SQ,
+        G422_LK_ILW,
+        G422_LK_ISW,
+        G422_LK_IADDIU,
+        G422_LK_ISUBIU,
+        G422_LK_B,
+        G422_LK_BAL,
+        G422_LK_JR,
+        G422_LK_JALR,
+        G422_LK_IBEQ,
+        G422_LK_IBNE,
+        G422_LK_IBLTZ,
+        G422_LK_IBGTZ,
+        G422_LK_IBLEZ,
+        G422_LK_IBGEZ,
+        G422_LK_IADD,
+        G422_LK_ISUB,
+        G422_LK_IADDI,
+        G422_LK_IAND,
+        G422_LK_IOR,
+        G422_LK_MOVE,
+        G422_LK_MR32,
+        G422_LK_LQI,
+        G422_LK_SQI,
+        G422_LK_LQD,
+        G422_LK_SQD,
+        G422_LK_MTIR,
+        G422_LK_MFIR,
+        G422_LK_ILWR,
+        G422_LK_ISWR,
+        G422_LK_COUNT
+    };
+
+    // Pure function of the lower word. Called once per pair at G410 compile time (and by the
+    // G410 cache verifier, and by the census), never in the hot loop.
+    uint8_t g422DecodeLowerKind(uint32_t lower)
+    {
+        if (lower == 0x00000000u || lower == 0x8000033Cu)
+            return G422_LK_NOP;
+
+        switch ((lower >> 25u) & 0x7Fu)
+        {
+        case 0x00u: return G422_LK_LQ;
+        case 0x01u: return G422_LK_SQ;
+        case 0x04u: return G422_LK_ILW;
+        case 0x05u: return G422_LK_ISW;
+        case 0x08u: return G422_LK_IADDIU;
+        case 0x09u: return G422_LK_ISUBIU;
+        case 0x20u: return G422_LK_B;
+        case 0x21u: return G422_LK_BAL;
+        case 0x24u: return G422_LK_JR;
+        case 0x25u: return G422_LK_JALR;
+        case 0x28u: return G422_LK_IBEQ;
+        case 0x29u: return G422_LK_IBNE;
+        case 0x2Cu: return G422_LK_IBLTZ;
+        case 0x2Du: return G422_LK_IBGTZ;
+        case 0x2Eu: return G422_LK_IBLEZ;
+        case 0x2Fu: return G422_LK_IBGEZ;
+        case 0x40u:
+            switch (lower & 0x3Fu)
+            {
+            case 0x30u: return G422_LK_IADD;
+            case 0x31u: return G422_LK_ISUB;
+            case 0x32u: return G422_LK_IADDI;
+            case 0x34u: return G422_LK_IAND;
+            case 0x35u: return G422_LK_IOR;
+            case 0x3Cu:
+            case 0x3Du:
+            case 0x3Eu:
+            case 0x3Fu:
+                switch (S2_FUNC(lower))
+                {
+                case 0x30u: return G422_LK_MOVE;
+                case 0x31u: return G422_LK_MR32;
+                case 0x34u: return G422_LK_LQI;
+                case 0x35u: return G422_LK_SQI;
+                case 0x36u: return G422_LK_LQD;
+                case 0x37u: return G422_LK_SQD;
+                case 0x3Cu: return G422_LK_MTIR;
+                case 0x3Du: return G422_LK_MFIR;
+                case 0x3Eu: return G422_LK_ILWR;
+                case 0x3Fu: return G422_LK_ISWR;
+                default: return G422_LK_NONE;
+                }
+            default: return G422_LK_NONE;
+            }
+        default: return G422_LK_NONE;
+        }
+    }
+
+    // The kinds that write VU data memory. Only these need the (expensive) memory leg of the
+    // shadow verifier.
+    bool g422KindStores(uint8_t kind)
+    {
+        return kind == G422_LK_SQ || kind == G422_LK_ISW || kind == G422_LK_SQI ||
+               kind == G422_LK_SQD || kind == G422_LK_ISWR;
+    }
+
+    bool g422FastLowerRequested()
+    {
+        static const bool s_on = !f50_12_vu_env_flag("DC2_G422_NO_FAST_LOWER");
+        return s_on;
+    }
+
+    bool g422VerifyOn()
+    {
+        static const bool s_on = f50_12_vu_env_flag("DC2_G422_VERIFY");
+        return s_on;
+    }
+
+    // Every env that arms a probe living INSIDE one of the covered execLower bodies (or inside
+    // execLower's own prologue). Any of them keeps the whole lower slot on the legacy path.
+    // NOTE: DC2_TRACE_VU1 (which arms the G39 load trace) and DC2_TRACE_G32 already force
+    // g295Diag, which the caller requires to be false; they are listed for documentation.
+    bool g422LowerDiagFree()
+    {
+        static const bool s_free = []() -> bool {
+            static const char *const k[] = {
+                "DC2_TRACE_VU1",      // execLower prologue: G39 load trace arming
+                "DC2_TRACE_G31",      // LQI value trace
+                "DC2_TRACE_G32",      // execLower prologue: packing-loop trace
+                "DC2_G133_COPY_QSKIP",// execLower prologue capture + SQI ADC override
+                "DC2_G370_VUSTORE",   // SQ/SQI/SQD store watch
+                "DC2_G370_VULOAD",    // LQ/LQD load watch
+                "DC2_G63_GATE",       // IAND gate census
+                "DC2_G64_FORCE_ENABLE_FIX"}; // IAND gate repair
+            for (const char *n : k)
+                if (std::getenv(n) != nullptr)
+                    return false;
+            return true;
+        }();
+        return s_free;
+    }
+
+    // Verbatim transcription of VU1Interpreter::applyDest (vu1_core_execution.inc).
+    static DC2_G330_FORCEINLINE void g422ApplyDest(float *dst, const float *result, uint8_t dest)
+    {
+        if (dest & 0x8)
+            dst[0] = result[0];
+        if (dest & 0x4)
+            dst[1] = result[1];
+        if (dest & 0x2)
+            dst[2] = result[2];
+        if (dest & 0x1)
+            dst[3] = result[3];
+    }
+
+    // Executes one covered lower op. `kind` must not be G422_LK_NONE.
+    static DC2_G330_FORCEINLINE void g422FastLower(
+        VU1State &st, uint32_t instr, uint8_t kind, uint8_t *vuData, uint32_t dataSize)
+    {
+        switch (kind)
+        {
+        case G422_LK_NOP:
+            return;
+
+        case G422_LK_LQ:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
+            const int16_t imm = IMM11(instr);
+            uint32_t addr = ((uint32_t)(int32_t)(st.vi[is] + imm)) * 16u;
+            addr &= (dataSize - 1);
+            if (addr + 16 <= dataSize)
+            {
+                float tmp[4];
+                std::memcpy(tmp, vuData + addr, 16);
+                g422ApplyDest(st.vf[it], tmp, dest);
+            }
+            return;
+        }
+        case G422_LK_SQ:
+        {
+            const uint8_t is = LIS(instr);
+            const uint8_t it = LIT(instr);
+            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
+            const int16_t imm = IMM11(instr);
+            uint32_t addr = ((uint32_t)(int32_t)(st.vi[it] + imm)) * 16u;
+            addr &= (dataSize - 1);
+            if (addr + 16 <= dataSize)
+            {
+                float tmp[4];
+                std::memcpy(tmp, vuData + addr, 16);
+                if (dest & 0x8)
+                    tmp[0] = st.vf[is][0];
+                if (dest & 0x4)
+                    tmp[1] = st.vf[is][1];
+                if (dest & 0x2)
+                    tmp[2] = st.vf[is][2];
+                if (dest & 0x1)
+                    tmp[3] = st.vf[is][3];
+                std::memcpy(vuData + addr, tmp, 16);
+            }
+            return;
+        }
+        case G422_LK_ILW:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
+            const int16_t imm = IMM11(instr);
+            uint32_t addr = ((uint32_t)(int32_t)(st.vi[is] + imm)) * 16u;
+            addr &= (dataSize - 1);
+            if (addr + 16 <= dataSize)
+            {
+                int comp = 0;
+                if (dest & 0x8)
+                    comp = 0;
+                else if (dest & 0x4)
+                    comp = 1;
+                else if (dest & 0x2)
+                    comp = 2;
+                else
+                    comp = 3;
+                uint32_t v;
+                std::memcpy(&v, vuData + addr + comp * 4, 4);
+                if (it != 0)
+                    st.vi[it] = (int32_t)(int16_t)(v & 0xFFFF);
+            }
+            return;
+        }
+        case G422_LK_ISW:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
+            const int16_t imm = IMM11(instr);
+            uint32_t addr = ((uint32_t)(int32_t)(st.vi[is] + imm)) * 16u;
+            addr &= (dataSize - 1);
+            if (addr + 16 <= dataSize)
+            {
+                uint32_t val = (uint32_t)(uint16_t)(st.vi[it] & 0xFFFF);
+                if (dest & 0x8)
+                    std::memcpy(vuData + addr + 0, &val, 4);
+                if (dest & 0x4)
+                    std::memcpy(vuData + addr + 4, &val, 4);
+                if (dest & 0x2)
+                    std::memcpy(vuData + addr + 8, &val, 4);
+                if (dest & 0x1)
+                    std::memcpy(vuData + addr + 12, &val, 4);
+            }
+            return;
+        }
+        case G422_LK_IADDIU:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const int16_t imm = (int16_t)((int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800));
+            if (it != 0)
+                st.vi[it] = (int16_t)(st.vi[is] + imm);
+            return;
+        }
+        case G422_LK_ISUBIU:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const int16_t imm = (int16_t)((int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800));
+            if (it != 0)
+                st.vi[it] = (int16_t)(st.vi[is] - imm);
+            return;
+        }
+        case G422_LK_B:
+        {
+            const int16_t imm = IMM11(instr);
+            const uint32_t target = (st.pc + 8 + imm * 8) & 0x3FFF;
+            st.pc = target - 8;
+            return;
+        }
+        case G422_LK_BAL:
+        {
+            const uint8_t it = LIT(instr);
+            const int16_t imm = IMM11(instr);
+            const uint32_t target = (st.pc + 8 + imm * 8) & 0x3FFF;
+            if (it != 0)
+                st.vi[it] = (int32_t)((st.pc + 16) / 8);
+            st.pc = target - 8;
+            return;
+        }
+        case G422_LK_JR:
+        {
+            const uint8_t is = LIS(instr);
+            const uint32_t target = ((uint32_t)(uint16_t)st.vi[is] * 8u) & 0x3FFF;
+            st.pc = target - 8;
+            return;
+        }
+        case G422_LK_JALR:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint32_t target = ((uint32_t)(uint16_t)st.vi[is] * 8u) & 0x3FFF;
+            if (it != 0)
+                st.vi[it] = (int32_t)((st.pc + 16) / 8);
+            st.pc = target - 8;
+            return;
+        }
+        case G422_LK_IBEQ:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const int16_t imm = IMM11(instr);
+            if ((int16_t)st.vi[is] == (int16_t)st.vi[it])
+            {
+                const uint32_t target = (st.pc + 8 + imm * 8) & 0x3FFF;
+                st.pc = target - 8;
+            }
+            return;
+        }
+        case G422_LK_IBNE:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const int16_t imm = IMM11(instr);
+            if ((int16_t)st.vi[is] != (int16_t)st.vi[it])
+            {
+                const uint32_t target = (st.pc + 8 + imm * 8) & 0x3FFF;
+                st.pc = target - 8;
+            }
+            return;
+        }
+        case G422_LK_IBLTZ:
+        {
+            const uint8_t is = LIS(instr);
+            const int16_t imm = IMM11(instr);
+            if ((int16_t)st.vi[is] < 0)
+            {
+                const uint32_t target = (st.pc + 8 + imm * 8) & 0x3FFF;
+                st.pc = target - 8;
+            }
+            return;
+        }
+        case G422_LK_IBGTZ:
+        {
+            const uint8_t is = LIS(instr);
+            const int16_t imm = IMM11(instr);
+            if ((int16_t)st.vi[is] > 0)
+            {
+                const uint32_t target = (st.pc + 8 + imm * 8) & 0x3FFF;
+                st.pc = target - 8;
+            }
+            return;
+        }
+        case G422_LK_IBLEZ:
+        {
+            const uint8_t is = LIS(instr);
+            const int16_t imm = IMM11(instr);
+            if ((int16_t)st.vi[is] <= 0)
+            {
+                const uint32_t target = (st.pc + 8 + imm * 8) & 0x3FFF;
+                st.pc = target - 8;
+            }
+            return;
+        }
+        case G422_LK_IBGEZ:
+        {
+            const uint8_t is = LIS(instr);
+            const int16_t imm = IMM11(instr);
+            if ((int16_t)st.vi[is] >= 0)
+            {
+                const uint32_t target = (st.pc + 8 + imm * 8) & 0x3FFF;
+                st.pc = target - 8;
+            }
+            return;
+        }
+        case G422_LK_IADD:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t id = LID(instr);
+            if (id != 0)
+                st.vi[id] = (int16_t)(st.vi[is] + st.vi[it]);
+            return;
+        }
+        case G422_LK_ISUB:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t id = LID(instr);
+            if (id != 0)
+                st.vi[id] = (int16_t)(st.vi[is] - st.vi[it]);
+            return;
+        }
+        case G422_LK_IADDI:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const int16_t imm5 = (int16_t)((int32_t)((instr >> 6) & 0x1F) << 27 >> 27);
+            if (it != 0)
+                st.vi[it] = (int16_t)(st.vi[is] + imm5);
+            return;
+        }
+        case G422_LK_IAND:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t id = LID(instr);
+            if (id != 0)
+                st.vi[id] = st.vi[is] & st.vi[it];
+            return;
+        }
+        case G422_LK_IOR:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t id = LID(instr);
+            if (id != 0)
+                st.vi[id] = st.vi[is] | st.vi[it];
+            return;
+        }
+        case G422_LK_MOVE:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
+            float tmp[4];
+            std::memcpy(tmp, st.vf[is], 16);
+            g422ApplyDest(st.vf[it], tmp, dest);
+            return;
+        }
+        case G422_LK_MR32:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
+            const float tmp[4] = {st.vf[is][1], st.vf[is][2], st.vf[is][3], st.vf[is][0]};
+            g422ApplyDest(st.vf[it], tmp, dest);
+            return;
+        }
+        case G422_LK_LQI:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
+            uint32_t addr = ((uint32_t)(uint16_t)st.vi[is]) * 16u;
+            addr &= (dataSize - 1);
+            if (addr + 16 <= dataSize)
+            {
+                float tmp[4];
+                std::memcpy(tmp, vuData + addr, 16);
+                g422ApplyDest(st.vf[it], tmp, dest);
+            }
+            if (is != 0)
+                st.vi[is] = (int16_t)(st.vi[is] + 1);
+            return;
+        }
+        case G422_LK_SQI:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
+            uint32_t addr = ((uint32_t)(uint16_t)st.vi[it]) * 16u;
+            addr &= (dataSize - 1);
+            if (addr + 16 <= dataSize)
+            {
+                float tmp[4];
+                std::memcpy(tmp, vuData + addr, 16);
+                if (dest & 0x8)
+                    tmp[0] = st.vf[is][0];
+                if (dest & 0x4)
+                    tmp[1] = st.vf[is][1];
+                if (dest & 0x2)
+                    tmp[2] = st.vf[is][2];
+                if (dest & 0x1)
+                    tmp[3] = st.vf[is][3];
+                std::memcpy(vuData + addr, tmp, 16);
+            }
+            if (it != 0)
+                st.vi[it] = (int16_t)(st.vi[it] + 1);
+            return;
+        }
+        case G422_LK_LQD:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
+            if (is != 0)
+                st.vi[is] = (int16_t)(st.vi[is] - 1);
+            uint32_t addr = ((uint32_t)(uint16_t)st.vi[is]) * 16u;
+            addr &= (dataSize - 1);
+            if (addr + 16 <= dataSize)
+            {
+                float tmp[4];
+                std::memcpy(tmp, vuData + addr, 16);
+                g422ApplyDest(st.vf[it], tmp, dest);
+            }
+            return;
+        }
+        case G422_LK_SQD:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
+            if (it != 0)
+                st.vi[it] = (int16_t)(st.vi[it] - 1);
+            uint32_t addr = ((uint32_t)(uint16_t)st.vi[it]) * 16u;
+            addr &= (dataSize - 1);
+            if (addr + 16 <= dataSize)
+            {
+                float tmp[4];
+                std::memcpy(tmp, vuData + addr, 16);
+                if (dest & 0x8)
+                    tmp[0] = st.vf[is][0];
+                if (dest & 0x4)
+                    tmp[1] = st.vf[is][1];
+                if (dest & 0x2)
+                    tmp[2] = st.vf[is][2];
+                if (dest & 0x1)
+                    tmp[3] = st.vf[is][3];
+                std::memcpy(vuData + addr, tmp, 16);
+            }
+            return;
+        }
+        case G422_LK_MTIR:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const int comp = (instr >> 21) & 0x3;
+            uint32_t fval;
+            std::memcpy(&fval, &st.vf[is][comp], 4);
+            if (it != 0)
+                st.vi[it] = (int32_t)(int16_t)(fval & 0xFFFF);
+            return;
+        }
+        case G422_LK_MFIR:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
+            float result[4];
+            const int32_t val = (int32_t)(int16_t)(st.vi[is] & 0xFFFF);
+            std::memcpy(&result[0], &val, 4);
+            result[1] = result[0];
+            result[2] = result[0];
+            result[3] = result[0];
+            g422ApplyDest(st.vf[it], result, dest);
+            return;
+        }
+        case G422_LK_ILWR:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
+            if (it == 0)
+                return;
+            uint32_t addr = ((uint32_t)(uint16_t)st.vi[is]) * 16u;
+            addr &= (dataSize - 1);
+            if (addr + 16 <= dataSize)
+            {
+                uint32_t value = 0u;
+                if (dest & 0x8)
+                    std::memcpy(&value, vuData + addr + 0u, 4);
+                if (dest & 0x4)
+                    std::memcpy(&value, vuData + addr + 4u, 4);
+                if (dest & 0x2)
+                    std::memcpy(&value, vuData + addr + 8u, 4);
+                if (dest & 0x1)
+                    std::memcpy(&value, vuData + addr + 12u, 4);
+                st.vi[it] = (int32_t)(int16_t)(value & 0xFFFFu);
+            }
+            return;
+        }
+        case G422_LK_ISWR:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
+            uint32_t addr = ((uint32_t)(uint16_t)st.vi[is]) * 16u;
+            addr &= (dataSize - 1);
+            if (addr + 16 <= dataSize)
+            {
+                uint32_t value = (uint32_t)(uint16_t)(st.vi[it] & 0xFFFF);
+                if (dest & 0x8)
+                    std::memcpy(vuData + addr + 0u, &value, 4);
+                if (dest & 0x4)
+                    std::memcpy(vuData + addr + 4u, &value, 4);
+                if (dest & 0x2)
+                    std::memcpy(vuData + addr + 8u, &value, 4);
+                if (dest & 0x1)
+                    std::memcpy(vuData + addr + 12u, &value, 4);
+            }
+            return;
+        }
+        default:
+            return;
+        }
+    }
+
+    // Shadow-verify scratch. Thread-local on purpose: kept off run()'s stack frame, and the VU1
+    // interpreter can run on either the EE thread or the MTVU worker.
+    thread_local VU1State s_g422VerBefore{};
+    thread_local VU1State s_g422VerFast{};
+    thread_local uint8_t s_g422VerMemBefore[PS2_VU1_DATA_SIZE];
+    thread_local uint8_t s_g422VerMemFast[PS2_VU1_DATA_SIZE];
+
+    bool g422StatesEqual(const VU1State &a, const VU1State &b)
+    {
+        return std::memcmp(a.vf, b.vf, sizeof(a.vf)) == 0 &&
+               std::memcmp(a.vi, b.vi, sizeof(a.vi)) == 0 &&
+               std::memcmp(a.acc, b.acc, sizeof(a.acc)) == 0 &&
+               std::memcmp(&a.q, &b.q, sizeof(a.q)) == 0 &&
+               std::memcmp(&a.p, &b.p, sizeof(a.p)) == 0 &&
+               std::memcmp(&a.i, &b.i, sizeof(a.i)) == 0 &&
+               a.pc == b.pc && a.mac == b.mac && a.clip == b.clip && a.status == b.status &&
+               a.ebit == b.ebit && a.itop == b.itop && a.xitop == b.xitop;
+    }
+} // namespace

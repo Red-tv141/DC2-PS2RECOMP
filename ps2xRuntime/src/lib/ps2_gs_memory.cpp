@@ -1,6 +1,12 @@
 #include <array>
+#include <cstring>
 
 #include "runtime/ps2_gs_memory.h"
+
+// G424: the horizontal-run IMAGE upload writers at the bottom of this file live in an .inc.
+// MSBuild does not reliably rebuild a .cpp when only an included .inc changed (G359 trap), so this
+// marker comment must be touched whenever g424_image_run_writers.inc is edited.
+// g424_image_run_writers.inc revision: 1
 
 namespace GSMem
 {
@@ -362,4 +368,6 @@ namespace GSMem
     {
         return PixelStorageTraits<P4HH>::Read(PageTableC32, data, bp, bw, x, y);
     }
+
+#include "ps2_gs_memory_parts/g424_image_run_writers.inc"
 }

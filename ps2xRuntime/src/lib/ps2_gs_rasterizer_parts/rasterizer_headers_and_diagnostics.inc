@@ -290,6 +290,12 @@ std::atomic<int> g_g34_in_divsprite{0};
 extern uint32_t g_g364FogCol;
 thread_local uint32_t t_g364FogCol = 0u;
 
+// G419: shared arm register for the within-process randomized A/B instrument (defined in
+// ps2_gs_gpu_parts/gpu_bridge_and_latch_helpers.inc; see g419_ab_instrument.inc for the contract).
+// Declared here, at global scope, because the parts that use it are inside anonymous namespaces.
+extern std::atomic<uint32_t> g_g419AbArm;
+extern std::atomic<uint32_t> g_g419AbUsed;
+
 namespace
 {
 

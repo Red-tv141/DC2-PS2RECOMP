@@ -29,6 +29,17 @@ bool g_g37_seq_trace = (std::getenv("DC2_G37_SEQ") != nullptr);
 // include/runtime/ps2_gs_gpu.h (a public header = the 30h full rebuild). Written only from the
 // GS register path and read only from the rasterizer, both of which run on the GS thread.
 uint32_t g_g364FogCol = 0u;
+// G419: shared arm register for the within-process randomized A/B instrument (see
+// ps2_gs_rasterizer_parts/g419_ab_instrument.inc). One of the levers it adjudicates lives in the GL
+// backend (ps2_gs_gpu_raster.cpp) and the tick lives in the GS front-end (ps2_gs_rasterizer.cpp), so
+// the arm has to be a global — this TU is compiled in every build branch and already hosts the
+// cross-TU GS globals, which keeps the public headers untouched.
+//   g_g419AbArm  : 0 = control arm, 1 = candidate arm. Written only by the once-per-frame tick.
+//   g_g419AbUsed : bit0 set = a consumer ran the control form this interval, bit1 = the candidate
+//                  form. Written by consumers, cleared by the tick, which charges the interval to
+//                  whichever arm was actually observed. Both stay 0 unless DC2_G419_AB is set.
+std::atomic<uint32_t> g_g419AbArm{0u};
+std::atomic<uint32_t> g_g419AbUsed{0u};
 std::atomic<uint64_t> g_g146GsImageNs{0};
 std::atomic<uint64_t> g_g146GsLocalNs{0};
 std::atomic<uint64_t> g_g147GsGifPacketNs{0};

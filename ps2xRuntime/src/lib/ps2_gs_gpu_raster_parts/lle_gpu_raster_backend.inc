@@ -234,6 +234,25 @@ constexpr GLenum GL257_SHADER_IMAGE_STORE = 0x82A5;
 // textures (~1-4MB); the cap only matters on texture-heavy routes. LRU by last-used batch.
 constexpr size_t kG178TexCacheCapBytes = 256ull * 1024 * 1024;
 
+// G415 private .cpp-to-.cpp side channel for the colour-readback window of the NEXT synchronous
+// batch submit. G178Batch lives in the frozen ps2_gs_gpu_lle.h, so the window travels beside it
+// instead of inside it (the same idiom G242 used for depthKey). Only the synchronous submit path
+// publishes a window: the async path never reads colour back, and the front-end/GS-worker thread
+// is the sole writer, consumed by the worker under the queue mutex handoff.
+struct G415ColorWindow
+{
+    bool valid = false;
+    int glY = 0;   // first GL (bottom-first) row to read
+    int rows = 0;  // number of GL rows to read
+};
+G415ColorWindow g_g415PendWindow;
+
+// G415 aggregate counters for the narrowed colour readback ([G415:narrow] under DC2_G415_STAT=1).
+std::atomic<uint64_t> g_g415NarrowBatches{0};
+std::atomic<uint64_t> g_g415NarrowRows{0};
+std::atomic<uint64_t> g_g415FullBatches{0};
+std::atomic<uint64_t> g_g415FullRows{0};
+
 class G178Backend
 {
 public:
@@ -313,6 +332,9 @@ public:
     {
         if (!m_ready.load(std::memory_order_acquire) || m_asyncPending)
             return false;
+        // G415: an async packet is skip-readback by contract, so no colour window can apply.
+        // Consume any published window here so it can never leak onto a later submit.
+        g_g415PendWindow.valid = false;
         auto promise = std::make_shared<std::promise<bool>>();
         std::future<bool> fut = promise->get_future();
         {
@@ -702,6 +724,11 @@ private:
     {
         if (batch == nullptr || !m_ready.load(std::memory_order_acquire))
             return false;
+        // G415: consume the front-end's published colour-readback window for THIS submit only.
+        // Consume-and-clear on every submit so a window can never survive onto an unrelated job
+        // (readDepth() reaches this same path with a synthetic batch).
+        const G415ColorWindow g415Window = g_g415PendWindow;
+        g_g415PendWindow.valid = false;
         auto promise = std::make_shared<std::promise<bool>>();
         std::future<bool> fut = promise->get_future();
         {
@@ -710,6 +737,7 @@ private:
                 return false;
             QueueItem item;
             item.batch = batch;
+            item.g415Window = g415Window;
             item.depthKey = depthKey;
             item.depthUpload = depthUpload;
             item.depthY = depthY;
@@ -777,6 +805,8 @@ private:
         bool g309ForceDraw = false;
         uint32_t g309OutputFbp = kG309CompositeFbp;
         std::shared_ptr<std::promise<bool>> promise;
+        // G415 exact colour-readback window published by the front-end for this submit only.
+        G415ColorWindow g415Window;
         std::chrono::steady_clock::time_point g299Enqueue{};
         uint8_t g324Class = 0u; // 1=G310 T8 view, 2=G310 logical composite
         std::chrono::steady_clock::time_point g324Enqueue{};
@@ -791,6 +821,10 @@ private:
     {
         GLuint fbo = 0, colorTex = 0, depthRb = 0;
         int w = 0, h = 0;
+        // G415: one parked geometry per key. A target written at two widths (DC2's fbp=0x139 at
+        // fbw=8 and fbw=2) otherwise destroys and reallocates both attachments on every flip.
+        GLuint spareFbo = 0, spareColorTex = 0, spareDepthRb = 0;
+        int spareW = 0, spareH = 0;
     };
     struct DepthEntry
     {
@@ -881,6 +915,10 @@ private:
             }
             const auto g332WorkStart = g332Armed ? std::chrono::steady_clock::now()
                                                  : std::chrono::steady_clock::time_point{};
+            // G425 readback census keeps its own clock so it does not depend on G332 being armed.
+            static const bool s_g425RbOn = (std::getenv("DC2_G425_RBCENSUS") != nullptr);
+            const auto g425WorkStart = s_g425RbOn ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
             try
             {
                 if (item.g309PageMap != nullptr)
@@ -927,11 +965,64 @@ private:
                     ok = renderBatch(*item.batch, item.depthKey, item.depthUpload,
                                      item.depthY, item.depthRows,
                                      item.renderThenReadDepth ? item.depthReadback : nullptr,
-                                     item.depthReadY, item.depthReadRows);
+                                     item.depthReadY, item.depthReadRows,
+                                     item.g415Window);
             }
             catch (...)
             {
                 ok = false;
+            }
+            // G425: readback-redundancy ceiling census (default OFF, DC2_G425_RBCENSUS=1).
+            // Question: how much of the GS worker's blocking colour-readback time re-reads a
+            // window that NOTHING has mutated since the previous readback of the same window?
+            // The mutation clock is deliberately GLOBAL (any render/copy/write/composite item
+            // ticks it), so the answer is a strict LOWER bound on what a per-surface readback
+            // cache could recover — exactly the ceiling G420's rule demands before building one.
+            {
+                if (s_g425RbOn)
+                {
+                    static uint64_t s_mutSeq = 0ull;
+                    static std::unordered_map<uint64_t, uint64_t> s_lastSeq;
+                    static uint64_t s_reads = 0ull, s_redundant = 0ull;
+                    static uint64_t s_readNs = 0ull, s_redundantNs = 0ull;
+                    const bool isReadback = item.colorReadback != nullptr;
+                    if (!isReadback)
+                        ++s_mutSeq;
+                    else
+                    {
+                        const uint64_t key =
+                            ((uint64_t)item.colorFbp << 40) ^
+                            ((uint64_t)(uint32_t)item.colorY << 24) ^
+                            ((uint64_t)(uint32_t)item.colorRows << 12) ^
+                            (uint64_t)(uint32_t)item.colorTexW;
+                        const uint64_t ns = static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - g425WorkStart).count());
+                        ++s_reads;
+                        s_readNs += ns;
+                        auto it = s_lastSeq.find(key);
+                        if (it != s_lastSeq.end() && it->second == s_mutSeq)
+                        {
+                            ++s_redundant;
+                            s_redundantNs += ns;
+                        }
+                        if (it != s_lastSeq.end())
+                            it->second = s_mutSeq;
+                        else
+                            s_lastSeq.emplace(key, s_mutSeq);
+                        if ((s_reads % 2000ull) == 0ull)
+                            std::fprintf(stderr,
+                                "[G425:rb] reads=%llu ms=%.1f | redundant=%llu (%.1f%%) ms=%.1f "
+                                "(%.1f%% ofReadbackMs) distinctWindows=%zu\n",
+                                (unsigned long long)s_reads, s_readNs / 1e6,
+                                (unsigned long long)s_redundant,
+                                100.0 * (double)s_redundant / (double)s_reads,
+                                s_redundantNs / 1e6,
+                                100.0 * (double)s_redundantNs /
+                                    (double)(s_readNs ? s_readNs : 1ull),
+                                s_lastSeq.size());
+                    }
+                }
             }
             if (g332Armed)
             {
@@ -2122,7 +2213,9 @@ private:
         return pass;
     }
 
-    void destroyFbo(FboEntry &e)
+    // G415: destroy only the ACTIVE geometry, leaving any parked spare intact. The create path
+    // below uses this so parking survives the immediately following fresh allocation.
+    void destroyActiveFbo(FboEntry &e)
     {
         if (e.fbo != 0)
             m_f.glDeleteFramebuffers_(1, &e.fbo);
@@ -2130,6 +2223,32 @@ private:
             glDeleteTextures(1, &e.colorTex);
         if (e.depthRb != 0)
             m_e.glDeleteRenderbuffers_(1, &e.depthRb);
+        e.fbo = 0;
+        e.colorTex = 0;
+        e.depthRb = 0;
+        e.w = 0;
+        e.h = 0;
+    }
+
+    void destroySpareFbo(FboEntry &e)
+    {
+        if (e.spareFbo != 0)
+            m_f.glDeleteFramebuffers_(1, &e.spareFbo);
+        if (e.spareColorTex != 0)
+            glDeleteTextures(1, &e.spareColorTex);
+        if (e.spareDepthRb != 0)
+            m_e.glDeleteRenderbuffers_(1, &e.spareDepthRb);
+        e.spareFbo = 0;
+        e.spareColorTex = 0;
+        e.spareDepthRb = 0;
+        e.spareW = 0;
+        e.spareH = 0;
+    }
+
+    void destroyFbo(FboEntry &e)
+    {
+        destroyActiveFbo(e);
+        destroySpareFbo(e);
         e = FboEntry{};
     }
 
@@ -2201,7 +2320,64 @@ private:
         }
         if (e.fbo != 0 && e.w == w && e.h == h)
             return e;
-        destroyFbo(e);
+        // G415: recycle the parked geometry for this key instead of deleting and reallocating a
+        // colour texture + depth renderbuffer on every width flip. The revived FBO is put into the
+        // exact post-state a fresh create leaves behind: attachments re-bound, completeness
+        // re-checked, creation-time texture parameters restored, colour and depth cleared with the
+        // same current clear state. Fail-closed: anything unexpected drops both geometries and
+        // takes the original create path.
+        if (g415FboRecycleOn())
+        {
+            if (e.spareFbo != 0 && e.spareColorTex != 0 && e.spareDepthRb != 0 &&
+                e.spareW == w && e.spareH == h)
+            {
+                std::swap(e.fbo, e.spareFbo);
+                std::swap(e.colorTex, e.spareColorTex);
+                std::swap(e.depthRb, e.spareDepthRb);
+                std::swap(e.w, e.spareW);
+                std::swap(e.h, e.spareH);
+                glBindTexture(GL_TEXTURE_2D, e.colorTex);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                // A fresh GL texture starts at the GL_REPEAT default; sampling sites may have left
+                // CLAMP_TO_EDGE on the parked one.
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+                m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, e.fbo);
+                m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0,
+                                            GL_TEXTURE_2D, e.colorTex, 0);
+                m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
+                                               GL178_RENDERBUFFER, e.depthRb);
+                if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) ==
+                    GL158_FRAMEBUFFER_COMPLETE)
+                {
+                    glDisable(GL_SCISSOR_TEST);
+                    glDepthMask(GL_TRUE);
+                    glClearDepth(0.0);
+                    glClear(GL_DEPTH_BUFFER_BIT | GL_COLOR_BUFFER_BIT);
+                    ++m_g415FboRevives;
+                    return e;
+                }
+                destroyFbo(e);
+            }
+            else if (e.fbo != 0)
+            {
+                destroySpareFbo(e);
+                e.spareFbo = e.fbo;
+                e.spareColorTex = e.colorTex;
+                e.spareDepthRb = e.depthRb;
+                e.spareW = e.w;
+                e.spareH = e.h;
+                e.fbo = 0;
+                e.colorTex = 0;
+                e.depthRb = 0;
+                e.w = 0;
+                e.h = 0;
+                ++m_g415FboParks;
+            }
+        }
+        ++m_g415FboCreates;
+        destroyActiveFbo(e);
         glGenTextures(1, &e.colorTex);
         glBindTexture(GL_TEXTURE_2D, e.colorTex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
@@ -2797,13 +2973,179 @@ private:
         return true;
     }
 
+    // G415 stage census bookkeeping. Keyed by (fbp, skipReadback, guest-depth) so the G299
+    // command-zero family (readback, no guest depth) is directly comparable with the skip-readback
+    // families that share the same target. Periodic aggregate print, never an early-capped one.
+    // Stage marks written by renderBatch when the census is armed. kG415Marks-1 intervals:
+    // 0->1 texture uploads, 1->2 FBO ensure/bind, 2->3 framebuffer upload, 3->4 depth setup,
+    // 4->5 program/VBO/state, 5->6 draw loop, 6->7 pre-readback drain probe, 7->8 colour readback.
+    static constexpr int kG415Marks = 9;
+    struct G415Stage
+    {
+        uint64_t n = 0, draws = 0, rows = 0, winRows = 0, upRows = 0;
+        uint64_t ns[kG415Marks - 1]{};
+    };
+    void g415NoteStages(const G178Batch &b, uint64_t depthKey,
+                        const std::chrono::steady_clock::time_point *marks,
+                        int readRows, int winRows, int upRows)
+    {
+        const uint64_t key = (static_cast<uint64_t>(b.fbp) << 8) |
+                             (b.skipReadback ? 2u : 0u) | (depthKey != 0u ? 1u : 0u);
+        G415Stage &s = m_g415Stages[key];
+        ++s.n;
+        for (int i = 0; i + 1 < kG415Marks; ++i)
+            s.ns[i] += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    marks[i + 1] - marks[i]).count());
+        s.draws += b.draws.size();
+        s.rows += static_cast<uint64_t>(readRows);
+        s.winRows += static_cast<uint64_t>(winRows);
+        s.upRows += static_cast<uint64_t>(upRows);
+        if ((++m_g415Total % 600u) != 0u)
+            return;
+        static const char *const kNames[kG415Marks - 1] = {
+            "tex", "fbo", "up", "z", "state", "draw", "drain", "rb"};
+        std::fprintf(stderr, "[G415:stage] total=%llu",
+                     static_cast<unsigned long long>(m_g415Total));
+        for (const auto &kv : m_g415Stages)
+        {
+            const G415Stage &e = kv.second;
+            if (e.n == 0u)
+                continue;
+            std::fprintf(stderr, " fbp=0x%x/%s%s(n=%llu",
+                         static_cast<unsigned>(kv.first >> 8),
+                         (kv.first & 2u) ? "skip" : "read", (kv.first & 1u) ? "+z" : "",
+                         static_cast<unsigned long long>(e.n));
+            for (int i = 0; i + 1 < kG415Marks; ++i)
+                std::fprintf(stderr, " %s=%.3f", kNames[i],
+                             static_cast<double>(e.ns[i]) / 1.0e6 / e.n);
+            std::fprintf(stderr, " rows=%.1f win=%.1f upRows=%.1f draws=%.1f)",
+                         static_cast<double>(e.rows) / e.n,
+                         static_cast<double>(e.winRows) / e.n,
+                         static_cast<double>(e.upRows) / e.n,
+                         static_cast<double>(e.draws) / e.n);
+        }
+        std::fprintf(stderr, "\n");
+    }
+
+    // G417 diagnostic-only split of the framebuffer upload GL edge. `drainNs` is work queued
+    // before the upload, `submitNs` is the host call after that queue is empty, and `waitNs` is
+    // completion of this upload itself. Key by target and geometry because width-flipping 0x139
+    // and the narrow work targets have materially different byte counts.
+    struct G417UploadStage
+    {
+        uint64_t n = 0, bytes = 0;
+        uint64_t drainNs = 0, submitNs = 0, waitNs = 0;
+    };
+    void g417NoteUpload(const G178Batch &b, int rows, uint64_t drainNs,
+                        uint64_t submitNs, uint64_t waitNs)
+    {
+        const uint64_t key = (static_cast<uint64_t>(b.fbp) << 32) |
+                             (static_cast<uint64_t>(static_cast<uint32_t>(b.fbW)) << 16) |
+                             static_cast<uint32_t>(b.fbH);
+        G417UploadStage &s = m_g417Uploads[key];
+        ++s.n;
+        s.bytes += static_cast<uint64_t>(b.fbW) *
+                   static_cast<uint64_t>(rows) * sizeof(uint32_t);
+        s.drainNs += drainNs;
+        s.submitNs += submitNs;
+        s.waitNs += waitNs;
+        if ((++m_g417UploadTotal % 512u) != 0u)
+            return;
+        std::fprintf(stderr, "[G417:backend] total=%llu",
+                     static_cast<unsigned long long>(m_g417UploadTotal));
+        for (const auto &kv : m_g417Uploads)
+        {
+            const G417UploadStage &e = kv.second;
+            if (e.n == 0u)
+                continue;
+            std::fprintf(
+                stderr,
+                " fbp=0x%x/%ux%u(n=%llu KiB=%.1f drain=%.3f submit=%.3f wait=%.3f)",
+                static_cast<unsigned>(kv.first >> 32),
+                static_cast<unsigned>((kv.first >> 16) & 0xffffu),
+                static_cast<unsigned>(kv.first & 0xffffu),
+                static_cast<unsigned long long>(e.n),
+                static_cast<double>(e.bytes) / 1024.0 / e.n,
+                static_cast<double>(e.drainNs) / 1.0e6 / e.n,
+                static_cast<double>(e.submitNs) / 1.0e6 / e.n,
+                static_cast<double>(e.waitNs) / 1.0e6 / e.n);
+        }
+        std::fprintf(stderr, "\n");
+    }
+
+    // G418 diagnostic-only split of the colour-readback GL edge. `drainNs` is the glFinish that
+    // empties GL work queued by earlier skip-readback batches; `rbNs` is this readback's own
+    // transfer and completion once that queue is empty. `kickNs` is the cost of the early-kick
+    // glFlush on the skip-readback batches that produce that queue, so the drain saving and the
+    // kick cost are directly comparable inside one run. Keyed by target.
+    struct G418ReadEdge
+    {
+        uint64_t n = 0, rows = 0, drainNs = 0, rbNs = 0;
+        uint64_t kicks = 0, kickNs = 0;
+    };
+    void g418NoteReadEdge(uint32_t fbp, int rows, uint64_t drainNs, uint64_t rbNs)
+    {
+        G418ReadEdge &s = m_g418Edges[fbp];
+        ++s.n;
+        s.rows += static_cast<uint64_t>(rows);
+        s.drainNs += drainNs;
+        s.rbNs += rbNs;
+        g418ReportEdges();
+    }
+    void g418NoteKick(uint32_t fbp, uint64_t kickNs)
+    {
+        G418ReadEdge &s = m_g418Edges[fbp];
+        ++s.kicks;
+        s.kickNs += kickNs;
+        g418ReportEdges();
+    }
+    void g418ReportEdges()
+    {
+        if ((++m_g418Total % 600u) != 0u)
+            return;
+        std::fprintf(stderr, "[G418:edge] total=%llu",
+                     static_cast<unsigned long long>(m_g418Total));
+        for (const auto &kv : m_g418Edges)
+        {
+            const G418ReadEdge &e = kv.second;
+            std::fprintf(stderr, " fbp=0x%x(", static_cast<unsigned>(kv.first));
+            if (e.n != 0u)
+                std::fprintf(stderr, "rb=%llu rows=%.1f drain=%.3f xfer=%.3f",
+                             static_cast<unsigned long long>(e.n),
+                             static_cast<double>(e.rows) / e.n,
+                             static_cast<double>(e.drainNs) / 1.0e6 / e.n,
+                             static_cast<double>(e.rbNs) / 1.0e6 / e.n);
+            if (e.kicks != 0u)
+                std::fprintf(stderr, "%skick=%llu kickMs=%.4f",
+                             e.n != 0u ? " " : "",
+                             static_cast<unsigned long long>(e.kicks),
+                             static_cast<double>(e.kickNs) / 1.0e6 / e.kicks);
+            std::fprintf(stderr, ")");
+        }
+        std::fprintf(stderr, "\n");
+    }
+
     bool renderBatch(G178Batch &b, uint64_t depthKey, const std::vector<float> *depthUpload,
                      int depthY, int depthRows,
                      std::vector<float> *fusedDepthReadback = nullptr,
-                     int depthReadY = 0, int depthReadRows = 0)
+                     int depthReadY = 0, int depthReadRows = 0,
+                     const G415ColorWindow &g415Window = G415ColorWindow{})
     {
         if (!validateBatchInputs(b, depthKey, depthUpload, depthY, depthRows))
             return false;
+        // G415 stage census: attribute this batch's backend work to texture upload / FBO bind /
+        // framebuffer upload / depth setup / state / draw loop / drain / colour readback.
+        // Behaviour-pure, default-off (DC2_G415_CENSUS=1).
+        const bool g415Census = g415CensusOn();
+        std::chrono::steady_clock::time_point g415Marks[kG415Marks]{};
+        int g415Mark = 0;
+        const auto g415Note = [&] {
+            if (g415Census && g415Mark < kG415Marks)
+                g415Marks[g415Mark] = std::chrono::steady_clock::now();
+            ++g415Mark;
+        };
+        g415Note(); // 0: entry
         // Validate the fused read before uploads or draws: a rejected combined job must leave
         // persistent color/depth state untouched so the front-end can safely replay on the CPU.
         if (fusedDepthReadback != nullptr &&
@@ -2862,6 +3204,7 @@ private:
             b.readback.clear();
         else
             b.readback.resize(static_cast<size_t>(b.fbW) * b.fbH);
+        g415Note(); // 1: texture uploads + eviction + handle resolve + output alloc
 
         // G351: an explicit surface key (Owner-B sprite → sibling FBO) overrides the fbp key.
         FboEntry &fbo = ensureFbo(b.fboKey != 0u ? b.fboKey : b.fbp, b.fbW, b.fbH);
@@ -2869,13 +3212,36 @@ private:
             return false;
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, fbo.fbo);
         glViewport(0, 0, b.fbW, b.fbH);
+        g415Note(); // 2: FBO ensure/bind
 
+        const int g417UploadRowsThis = b.uploadFb ? b.fbH : 0;
         if (b.uploadFb)
         {
             glBindTexture(GL_TEXTURE_2D, fbo.colorTex);
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, b.fbW, b.fbH, GL_RGBA, GL_UNSIGNED_BYTE,
-                            b.fbPixels.data());
+            if (g417ProfileOn())
+            {
+                const auto drainT0 = std::chrono::steady_clock::now();
+                glFinish();
+                const auto submitT0 = std::chrono::steady_clock::now();
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, b.fbW, b.fbH,
+                                GL_RGBA, GL_UNSIGNED_BYTE, b.fbPixels.data());
+                const auto waitT0 = std::chrono::steady_clock::now();
+                glFinish();
+                const auto done = std::chrono::steady_clock::now();
+                const auto ns = [](const auto &a, const auto &z) {
+                    return static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(z - a).count());
+                };
+                g417NoteUpload(b, b.fbH, ns(drainT0, submitT0),
+                               ns(submitT0, waitT0), ns(waitT0, done));
+            }
+            else
+            {
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, b.fbW, b.fbH,
+                                GL_RGBA, GL_UNSIGNED_BYTE, b.fbPixels.data());
+            }
         }
+        g415Note(); // 3: framebuffer upload
 
         // G242: the real guest Z target owns one persistent texture keyed by ZBP/ZBW/ZPSM, not by
         // the alternating color FBP. The front-end uploads only when guest VRAM changed and reads
@@ -2895,7 +3261,8 @@ private:
             }
             m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
                                         GL_TEXTURE_2D, depth.tex, 0);
-            if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) != GL158_FRAMEBUFFER_COMPLETE)
+            if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) !=
+                GL158_FRAMEBUFFER_COMPLETE)
             {
                 m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
                                                GL178_RENDERBUFFER, fbo.depthRb);
@@ -2906,7 +3273,8 @@ private:
         {
             m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
                                            GL178_RENDERBUFFER, fbo.depthRb);
-            if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) != GL158_FRAMEBUFFER_COMPLETE)
+            if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) !=
+                GL158_FRAMEBUFFER_COMPLETE)
                 return false;
         }
         if (b.clearDepth && !guestDepth)
@@ -2916,6 +3284,7 @@ private:
             glClearDepth(0.0);
             glClear(GL_DEPTH_BUFFER_BIT);
         }
+        g415Note(); // 4: depth attach / clear
 
         m_f.glUseProgram_(m_prog);
         m_f.glBindVertexArray_(m_vao);
@@ -2996,6 +3365,7 @@ private:
             glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
             glDisable(GL_BLEND);
         }
+        g415Note(); // 5: program / VBO / uniform / exact-path state
         for (size_t drawIndex = 0; drawIndex < b.draws.size(); ++drawIndex)
         {
             const G178Draw &d = b.draws[drawIndex];
@@ -3282,8 +3652,153 @@ private:
         }
 
         glDisable(GL_SCISSOR_TEST);
+        g415Note(); // 6: draw loop (+ exact-path epilogue)
+        // G418 early kick: this batch leaves its GL work queued and never fences, so without a kick
+        // the frame's one readback batch pays the whole backlog as drain. glFlush only guarantees
+        // that already-issued commands finish in finite time - it changes no result, no GL state,
+        // no command order, and no ownership - so the arm is exact by construction.
+        const bool g418Profile = g418ProfileOn();
+        if (b.skipReadback && g418EarlyKickOn())
+        {
+            const auto kickT0 = g418Profile ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
+            glFlush();
+            if (g418Profile)
+                g418NoteKick(b.fbp,
+                             static_cast<uint64_t>(
+                                 std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - kickT0).count()));
+        }
+        // G415 fence attribution: drain everything already queued on this context BEFORE the
+        // readback, so the census can tell "waiting for prior GL work" apart from "this transfer".
+        // Diagnostic only (DC2_G415_CENSUS=1 + DC2_G415_FENCE_PROBE=1).
+        // G418 takes the same split without the nine-mark stage census riding along; only one of the
+        // two probes ever issues the finish.
+        uint64_t g418DrainNs = 0u;
+        std::chrono::steady_clock::time_point g418RbT0;
+        if (!b.skipReadback && (g415FenceProbeOn() || g418Profile))
+        {
+            const auto drainT0 = std::chrono::steady_clock::now();
+            glFinish();
+            g418RbT0 = std::chrono::steady_clock::now();
+            g418DrainNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    g418RbT0 - drainT0).count());
+        }
+        g415Note(); // 7: pre-readback drain probe
+        int g415ReadRows = 0;
         if (!b.skipReadback)
-            glReadPixels(0, 0, b.fbW, b.fbH, GL_RGBA, GL_UNSIGNED_BYTE, b.readback.data());
+        {
+            // G415: read only the GS row window this batch's caller actually consumes, into that
+            // window's existing offsets in the full-height buffer. Buffer row index == GL row, so
+            // the destination pointer offset is glY*fbW and every consumer index is unchanged.
+            // Any missing/odd window falls back to the full-height read (fail-closed).
+            // G419: evaluate the arm FIRST and unconditionally. Inside a short-circuiting && chain
+            // the instrument's consumer record would be skipped whenever an earlier term failed,
+            // and the tick would drop that frame period instead of charging it.
+            const bool narrowArm = g415NarrowReadbackOn();
+            // G420 mechanism probe: evaluated here, unconditionally, for the same short-circuit
+            // reason as narrowArm above.
+            const bool g420Touch = g420NarrowTouchArm();
+            const bool narrow =
+                narrowArm && g415Window.valid && g415Window.rows > 0 &&
+                g415Window.glY >= 0 && g415Window.rows <= b.fbH - g415Window.glY &&
+                b.readback.size() == static_cast<size_t>(b.fbW) * b.fbH;
+            // G420 shape probe: widen the read to a forced row count. Exact for any count >= the
+            // published window — the read still covers every consumed row at its existing offset,
+            // and rows outside the consumed window are discarded either way (see
+            // g420NarrowRowsOverride).
+            int narrowY = g415Window.glY;
+            int narrowRows = g415Window.rows;
+            if (narrow)
+            {
+                const int forced = std::min(g420NarrowRowsOverride(), b.fbH);
+                if (forced > narrowRows)
+                {
+                    narrowRows = forced;
+                    narrowY = std::max(0, std::min(narrowY, b.fbH - forced));
+                }
+            }
+            if (narrow)
+            {
+                glReadPixels(0, narrowY, b.fbW, narrowRows,
+                             GL_RGBA, GL_UNSIGNED_BYTE,
+                             b.readback.data() +
+                                 static_cast<size_t>(narrowY) * b.fbW);
+                g415ReadRows = narrowRows;
+                if (g415StatOn())
+                {
+                    g_g415NarrowBatches.fetch_add(1u, std::memory_order_relaxed);
+                    g_g415NarrowRows.fetch_add(static_cast<uint64_t>(narrowRows),
+                                               std::memory_order_relaxed);
+                }
+            }
+            else
+            {
+                glReadPixels(0, 0, b.fbW, b.fbH, GL_RGBA, GL_UNSIGNED_BYTE, b.readback.data());
+                g415ReadRows = b.fbH;
+                if (g415StatOn())
+                {
+                    g_g415FullBatches.fetch_add(1u, std::memory_order_relaxed);
+                    g_g415FullRows.fetch_add(static_cast<uint64_t>(b.fbH),
+                                             std::memory_order_relaxed);
+                }
+            }
+            // G419 ballast (diagnostic only, DC2_G419_BALLAST with DC2_G419_AB=narrow): re-read the
+            // SAME rect into the SAME destination N extra times. Byte-idempotent, so the measured
+            // frame-time delta divided by the known added transfer cost is this site's critical-path
+            // sensitivity - the multiplier a removed-row saving has to be scaled by.
+            for (int rep = g419NarrowBallastReps(); rep > 0; --rep)
+            {
+                if (narrow)
+                    glReadPixels(0, narrowY, b.fbW, narrowRows,
+                                 GL_RGBA, GL_UNSIGNED_BYTE,
+                                 b.readback.data() +
+                                     static_cast<size_t>(narrowY) * b.fbW);
+                else
+                    glReadPixels(0, 0, b.fbW, b.fbH, GL_RGBA, GL_UNSIGNED_BYTE,
+                                 b.readback.data());
+            }
+            // G420 mechanism probe (see g420NarrowTouchArm): add the DESTINATION-side write volume
+            // of the rows the full read would have produced and the consumer discards, into an
+            // inert backend-private scratch buffer. No GL call, no observable byte.
+            if (g420Touch && g415ReadRows > 0 && g415ReadRows < b.fbH)
+            {
+                const size_t words = static_cast<size_t>(b.fbW) *
+                                     static_cast<size_t>(b.fbH - g415ReadRows);
+                if (m_g420TouchScratch.size() < words)
+                    m_g420TouchScratch.resize(words);
+                std::memset(m_g420TouchScratch.data(), 0, words * sizeof(uint32_t));
+            }
+            if (g415StatOn() && (++m_g415StatN % 300u) == 0u)
+            {
+                const uint64_t nn = g_g415NarrowBatches.load(std::memory_order_relaxed);
+                const uint64_t nr = g_g415NarrowRows.load(std::memory_order_relaxed);
+                std::fprintf(stderr,
+                             "[G415:narrow] narrow=%llu rows=%llu avgRows=%.1f full=%llu "
+                             "fullRows=%llu fboCreate=%llu fboPark=%llu fboRevive=%llu\n",
+                             static_cast<unsigned long long>(nn),
+                             static_cast<unsigned long long>(nr),
+                             nn ? static_cast<double>(nr) / nn : 0.0,
+                             static_cast<unsigned long long>(
+                                 g_g415FullBatches.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(
+                                 g_g415FullRows.load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(m_g415FboCreates),
+                             static_cast<unsigned long long>(m_g415FboParks),
+                             static_cast<unsigned long long>(m_g415FboRevives));
+            }
+        }
+        g415Note(); // 8: colour readback
+        if (!b.skipReadback && g418Profile)
+            g418NoteReadEdge(b.fbp, g415ReadRows, g418DrainNs,
+                             static_cast<uint64_t>(
+                                 std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     std::chrono::steady_clock::now() - g418RbT0).count()));
+        if (g415Census && g415Mark == kG415Marks)
+            g415NoteStages(b, depthKey, g415Marks, g415ReadRows,
+                           g415Window.valid ? g415Window.rows : 0,
+                           g417UploadRowsThis);
         if (fusedDepthReadback != nullptr)
         {
             fusedDepthReadback->resize(static_cast<size_t>(b.fbW) * depthReadRows);
@@ -3311,8 +3826,12 @@ private:
             m_g257ImageAfter.clear();
         }
         if (guestDepth)
+        {
+            // Keep the upload-safe post-state: a later glTexSubImage2D on a guest depth texture
+            // must not target storage still attached to the bound FBO.
             m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
                                            GL178_RENDERBUFFER, fbo.depthRb);
+        }
         // G362 census (default OFF, DC2_G362_CENSUS=1): how much of the textured legacy path is
         // actually served by the guarded fetch. Periodic aggregate, not an early-capped print.
         {
@@ -3393,6 +3912,23 @@ private:
     uint64_t m_g324Count[3]{};
     uint64_t m_g324QueueNs[3]{};
     uint64_t m_g324WorkNs[3]{};
+    // G415: worker-thread-only stage census state (see g415NoteStages).
+    std::map<uint64_t, G415Stage> m_g415Stages;
+    uint64_t m_g415Total = 0u;
+    uint64_t m_g415StatN = 0u;
+    // G417 diagnostic-only framebuffer-upload split (worker thread only).
+    std::map<uint64_t, G417UploadStage> m_g417Uploads;
+    uint64_t m_g417UploadTotal = 0u;
+    // G418 diagnostic-only colour-readback drain/transfer split (worker thread only).
+    std::map<uint32_t, G418ReadEdge> m_g418Edges;
+    uint64_t m_g418Total = 0u;
+    // G415 FBO geometry recycling counters (worker thread only).
+    uint64_t m_g415FboCreates = 0u;
+    uint64_t m_g415FboParks = 0u;
+    uint64_t m_g415FboRevives = 0u;
+    // G420 narrow-readback mechanism probe: inert destination-side write target (worker thread
+    // only, allocated only when DC2_G419_AB=narrowtouch is armed).
+    std::vector<uint32_t> m_g420TouchScratch;
 };
 } // namespace
 

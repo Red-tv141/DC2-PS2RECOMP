@@ -1952,7 +1952,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     if (s_batch.uploadFb)
     {
         g_g178FbUploads.fetch_add(1u, std::memory_order_relaxed);
-        s_batch.fbPixels.assign(static_cast<size_t>(fbW) * kFbH, 0u);
+        // G417 diagnostic-only CPU split. Keep the allocation/zero, metadata/setup, and joined
+        // CT32 row pack separate so the backend GL edge is not blamed for front-end preparation.
+        static const bool s_g417Profile = envFlagEnabled("DC2_G417_PROFILE");
+        const auto g417PrepT0 = s_g417Profile ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
         // Upload the union of this batch's window and everything previously covered, so the
         // covered-row invariant stays true after a single upload.
         const int upLo = snap.valid ? std::min(rowLo, snap.rowLo) : rowLo;
@@ -1976,23 +1980,48 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 return 8;
             return std::max(1, std::min(16, std::atoi(value)));
         }();
-        const auto packFbRows = [&](int laneLo, int laneHi) {
-            for (int y = laneLo; y <= laneHi; ++y)
-            {
-                const size_t dstRow = static_cast<size_t>(kFbH - 1 - y) * fbW;
-                for (int x = 0; x < fbW; ++x)
-                {
-                    const uint32_t off = GSPSMCT32::addrPSMCT32(
-                        fbBlock, fbw, static_cast<uint32_t>(x),
-                        static_cast<uint32_t>(y));
-                    uint32_t px = 0;
-                    if (off + 4u <= vramSize)
-                        std::memcpy(&px, vram + off, 4);
-                    s_batch.fbPixels[dstRow + x] = px;
-                }
-            }
-        };
         const int packRows = upHi >= upLoEff ? (upHi - upLoEff + 1) : 0;
+        // G420: the pack overwrites EVERY staging element of guest rows [upLoEff,upHi], so zeroing
+        // that span is pure churn — 1 MiB per 512-wide upload, of which 81-88% is packed over.
+        // Zero only the complement. Exact by construction: each element is still written exactly
+        // once, and the complement keeps the same zero value it had. The arm is evaluated
+        // unconditionally so the instrument's consumer record is never skipped (G419).
+        const bool g420ZeroSkip = g419AbArmFor(kG420LeverZero, g420ZeroSkipOn());
+        const bool s_g420Profile = g419ProfileOn();
+        const auto g417ZeroT0 = (s_g417Profile || s_g420Profile)
+                                    ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+        uint64_t g420ZeroFilled = 0u;
+        g420PrepStaging(s_batch.fbPixels, fbW, kFbH, upLoEff, upHi, g420ZeroSkip, &g420ZeroFilled);
+        const auto g417ZeroT1 = (s_g417Profile || s_g420Profile)
+                                    ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+        if (s_g420Profile)
+            g420NoteZero(fbp, fbw, static_cast<uint64_t>(fbW) * kFbH, g420ZeroFilled,
+                         static_cast<uint64_t>(
+                             std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 g417ZeroT1 - g417ZeroT0).count()));
+        // G419: the CT32 staging pack is the mirror image of G418's readback unpack, so the same
+        // exact one-page addrPSMCT32 decomposition applies with paired 8-byte LOADS instead of
+        // stores. `g419PackLegacy` selects the original serial per-pixel path verbatim as the
+        // control arm; the arm may come from the within-process instrument (DC2_G419_AB=pack).
+        const bool g419PackFast = g419AbArmFor(kG419LeverPack, g419FastPackOn());
+        // Both front-end levers act at this one call site, so one ballast probe measures the site's
+        // critical-path sensitivity for either of them.
+        const int g419PackBallast = std::max(g419AbBallastReps(kG419LeverPack),
+                                            g419AbBallastReps(kG419LeverLanes));
+        const auto packFbRows = [&](int laneLo, int laneHi) {
+            g419PackFbRows(s_batch.fbPixels.data(), s_batch.fbPixels.size(),
+                           vram, vramSize, fbBlock, fbw, fbW, kFbH,
+                           laneLo, laneHi, !g419PackFast);
+            // Ballast (diagnostic): repeat the control form N extra times. Packing the same rows out
+            // of read-only VRAM into the same staging words is idempotent, so this adds a KNOWN cost
+            // at this exact site without changing any result.
+            for (int rep = 0; rep < g419PackBallast; ++rep)
+                g419PackFbRows(s_batch.fbPixels.data(), s_batch.fbPixels.size(),
+                               vram, vramSize, fbBlock, fbw, fbW, kFbH,
+                               laneLo, laneHi, true);
+        };
         // G347 census: the REAL rows this uploadFb packs into VRAM (post-G290 upLoEff redraw-skip),
         // vs the window rows famUp counts at the gate. If pack << window, the "560 up rows/f"
         // scoping slice-2 is a census-window artifact and the upload is already minimized (G290).
@@ -2031,9 +2060,76 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                  : 0.0,
                              fbp, fbw, packRows);
         }
-        const int packLanes =
-            s_g298ParFbPack && packRows >= 8 ? s_g298FbPackLanes : 1;
+        // G419: G298's row gate lets 4k-16k-pixel packs pay a fixed ~0.085 ms row-pool dispatch that
+        // is several times their entire loop. Re-gate on pixels (see g419PackLanes).
+        // G420 re-adjudicates the lane COUNT on top of G419's pixel gate. Called unconditionally
+        // (consumer-charged attribution) and clamped by g419PackLanes' result, so it can only ever
+        // narrow a split the pixel gate already approved.
+        const int packLanes = g420PackLaneCount(g419PackLanes(
+            packRows, fbW, s_g298ParFbPack && packRows >= 8 ? s_g298FbPackLanes : 1));
+        const auto g417PrepT2 = s_g417Profile ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
+        // G419: behaviour-pure isolated pack timer. Unlike DC2_G417_PROFILE this arms nothing in the
+        // GL backend, so it inserts no finish and can be read alongside an otherwise normal run.
+        const bool s_g419Profile = g419ProfileOn();
+        const auto g419PackT0 = s_g419Profile ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
         GSRowPool::instance().run(upLoEff, upHi, packLanes, packFbRows);
+        if (s_g419Profile && packRows > 0)
+            g419NotePack(fbp, fbw, packRows,
+                         static_cast<uint64_t>(
+                             std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                 std::chrono::steady_clock::now() - g419PackT0).count()));
+        if (s_g417Profile)
+        {
+            const auto g417PrepT3 = std::chrono::steady_clock::now();
+            struct G417PrepStage
+            {
+                uint64_t n = 0, rows = 0, bytes = 0;
+                uint64_t zeroNs = 0, setupNs = 0, packNs = 0;
+            };
+            static std::map<uint64_t, G417PrepStage> s_g417Prep;
+            static uint64_t s_g417PrepTotal = 0u;
+            const uint64_t key = (static_cast<uint64_t>(fbp) << 32) |
+                                 (static_cast<uint64_t>(fbW) << 16) |
+                                 static_cast<uint32_t>(kFbH);
+            G417PrepStage &st = s_g417Prep[key];
+            const auto ns = [](const auto &a, const auto &z) {
+                return static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(z - a).count());
+            };
+            ++st.n;
+            st.rows += static_cast<uint64_t>(packRows);
+            st.bytes += static_cast<uint64_t>(s_batch.fbPixels.size()) * sizeof(uint32_t);
+            st.zeroNs += ns(g417ZeroT0, g417ZeroT1);
+            st.setupNs += ns(g417PrepT0, g417ZeroT0) +
+                          ns(g417ZeroT1, g417PrepT2);
+            st.packNs += ns(g417PrepT2, g417PrepT3);
+            if ((++s_g417PrepTotal % 512u) == 0u)
+            {
+                std::fprintf(stderr, "[G417:prep] total=%llu",
+                             static_cast<unsigned long long>(s_g417PrepTotal));
+                for (const auto &kv : s_g417Prep)
+                {
+                    const G417PrepStage &e = kv.second;
+                    if (e.n == 0u)
+                        continue;
+                    std::fprintf(
+                        stderr,
+                        " fbp=0x%x/%ux%u(n=%llu rows=%.1f KiB=%.1f zero=%.3f setup=%.3f pack=%.3f)",
+                        static_cast<unsigned>(kv.first >> 32),
+                        static_cast<unsigned>((kv.first >> 16) & 0xffffu),
+                        static_cast<unsigned>(kv.first & 0xffffu),
+                        static_cast<unsigned long long>(e.n),
+                        static_cast<double>(e.rows) / e.n,
+                        static_cast<double>(e.bytes) / 1024.0 / e.n,
+                        static_cast<double>(e.zeroNs) / 1.0e6 / e.n,
+                        static_cast<double>(e.setupNs) / 1.0e6 / e.n,
+                        static_cast<double>(e.packNs) / 1.0e6 / e.n);
+                }
+                std::fprintf(stderr, "\n");
+            }
+        }
 
         // G347 shadow oracle (census, DC2_G347_SHADOW=1, default-off, PERTURBING GPU readback):
         // read the 0x139 FBO rows this uploadFb is about to overwrite and compare to the just-
@@ -2055,7 +2151,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 for (int y = upLoEff; y <= upHi; ++y)
                 {
                     const size_t fboRow = static_cast<size_t>(upHi - y) * fbW;
-                    const size_t vramRow = static_cast<size_t>(kFbH - 1 - y) * fbW;
+                    const size_t vramRow =
+                        static_cast<size_t>(kFbH - 1 - y) * fbW;
                     for (int x = 0; x < fbW; ++x)
                     {
                         ++totPix;
@@ -2082,14 +2179,17 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // Exact same-run oracle for bring-up: independently reread every packed CT32 pixel using
         // the serial address path after the joined dispatch. This is diagnostic-only because it
         // deliberately repeats the staging work.
+        // G419 reuses this oracle for the exact CT32 fast pack (DC2_G419_VERIFY is an alias), and the
+        // s_g298ParFbPack gate is dropped so a single-lane fast pack is checked too.
         static const bool s_g298Verify =
-            envFlagEnabled("DC2_G298_VERIFY_FBPACK");
-        if (s_g298ParFbPack && s_g298Verify && packRows > 0)
+            envFlagEnabled("DC2_G298_VERIFY_FBPACK") || envFlagEnabled("DC2_G419_VERIFY");
+        if (s_g298Verify && packRows > 0)
         {
             uint64_t bad = 0u;
             for (int y = upLoEff; y <= upHi; ++y)
             {
-                const size_t dstRow = static_cast<size_t>(kFbH - 1 - y) * fbW;
+                const size_t dstRow =
+                    static_cast<size_t>(kFbH - 1 - y) * fbW;
                 for (int x = 0; x < fbW; ++x)
                 {
                     const uint32_t off = GSPSMCT32::addrPSMCT32(
@@ -2113,11 +2213,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             if (bad != 0u || n <= 8u || (n % 256u) == 0u)
                 std::fprintf(stderr,
                              "[G298:verify] packs=%llu pixels=%llu bad=%llu "
-                             "last(rows=%d lanes=%d bad=%llu)\n",
+                             "last(fbp=0x%x fbw=%u rows=%d lanes=%d fast=%d bad=%llu)\n",
                              static_cast<unsigned long long>(n),
                              static_cast<unsigned long long>(totalPixels),
                              static_cast<unsigned long long>(totalBad),
-                             packRows, packLanes,
+                             fbp, fbw, packRows, packLanes, g419PackFast ? 1 : 0,
                              static_cast<unsigned long long>(bad));
         }
         snap.rowLo = upLo;
@@ -2126,7 +2226,14 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     else
     {
         g_g178FbUploadSkips.fetch_add(1u, std::memory_order_relaxed);
-        s_batch.fbPixels.clear();
+        // G420: the zero-fill elision needs a live buffer to elide against, and clear() drops
+        // size() to 0 so the next uploadFb would value-initialise the whole thing again. Nothing
+        // outside uploadFb reads fbPixels (every backend use is gated on b.uploadFb, and
+        // validateBatchInputs only size-checks it when uploadFb), so retaining stale bytes here is
+        // inert. Retain only when the elision is armable this run, so an instrument arm can never
+        // measure "candidate had a warm buffer, control did not".
+        if (!g420RetainStagingOn())
+            s_batch.fbPixels.clear();
     }
 
     // G242: keep guest Z resident across GPU flushes. Upload the full validated 512-row target only
@@ -3624,6 +3731,14 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 g275FuseReadback ? 1 : 0, g286Transient ? 1 : 0, g282Tight ? 1 : 0,
                 s_g281ViewSrc.empty() ? 0 : 1);
     }
+    // G415: every consumer of s_batch.readback reads exactly GS rows rowLo..rowHi — the VRAM pack
+    // loop below and both g255StageGpuVerify oracles use the same window and the same
+    // (kFbH-1-y)*fbW indexing. Publish that window (GL rows are bottom-first, so buffer row index
+    // == GL row) so the backend can read back only those rows into their existing offsets in the
+    // same full-height buffer. Rows outside the window were already copied out of the FBO and
+    // discarded. Published unconditionally: the backend honours it only when its arm is on, and
+    // the census needs the window even in the control arm.
+    g415_backend_set_color_window(kFbH - 1 - rowHi, rowHi - rowLo + 1);
     bool submitted;
     if (g305Async)
     {
@@ -3964,17 +4079,36 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             g_g276ColorRbFullRows.fetch_add(static_cast<uint64_t>(kFbH),
                                             std::memory_order_relaxed);
         }
-        for (int y = rowLo; y <= rowHi; ++y)
+        // G418: the CPU-copy component of the colour-readback edge. `legacy` is the original serial
+        // per-pixel address loop, kept byte-identical as the control arm; the fast arm is the exact
+        // one-page address table with paired stores over disjoint guest rows.
         {
-            const size_t srcRow = static_cast<size_t>(kFbH - 1 - y) * fbW;
-            for (int x = 0; x < fbW; ++x)
-            {
-                const uint32_t off = GSPSMCT32::addrPSMCT32(fbBlock, fbw,
-                                                            static_cast<uint32_t>(x),
-                                                            static_cast<uint32_t>(y));
-                if (off + 4u <= vramSize)
-                    std::memcpy(vram + off, &s_batch.readback[srcRow + x], 4);
-            }
+            // G419: the ONE fixed per-frame sample point of the generalized instrument. Exactly one
+            // colour-readback unpack happens per frame, so the interval between consecutive ticks is
+            // a frame period sampled at a fixed point in the frame. Inert unless DC2_G419_AB is set;
+            // the frame counter itself is unconditional so every G419 census can normalise per frame.
+            g419NoteFrameTick();
+            g419AbTick();
+            const bool g418Profile = g418ProfileOn();
+            const int g418Ballast = g418AltBallast();
+            const bool g418Pick = g418AlternatePick(g418FastUnpackOn());
+            const bool g418Fast = g418Ballast > 0 ? false : g418Pick;
+            const auto g418T0 = g418Profile ? std::chrono::steady_clock::now()
+                                            : std::chrono::steady_clock::time_point{};
+            g418UnpackColorRows(vram, vramSize, s_batch.readback, fbBlock, fbw, fbW, kFbH,
+                                rowLo, rowHi, !g418Fast);
+            if (g418Ballast > 0 && g418Pick)
+                for (int i = 0; i < g418Ballast; ++i)
+                    g418UnpackColorRows(vram, vramSize, s_batch.readback, fbBlock, fbw, fbW,
+                                        kFbH, rowLo, rowHi, true);
+            if (g418Profile)
+                g418NoteUnpack(fbp, rowHi - rowLo + 1, fbW,
+                               static_cast<uint64_t>(
+                                   std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                       std::chrono::steady_clock::now() - g418T0).count()));
+            if (g418VerifyOn())
+                g418VerifyUnpack(vram, vramSize, s_batch.readback, fbBlock, fbw, fbW, kFbH,
+                                 rowLo, rowHi);
         }
         // The color and depth backends are distinct even when their GS storage aliases. The
         // admitted write windows are disjoint, so this cannot overwrite pending dirty Z rows;

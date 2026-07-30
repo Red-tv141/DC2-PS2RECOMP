@@ -22,9 +22,46 @@ namespace
         uint8_t lowerFt = 0u;
         uint8_t pairFlags = 0u;
         uint8_t lowerS2 = 0xffu;
-        uint8_t reserved0 = 0u;
-        uint8_t reserved1 = 0u;
+        uint8_t lowerKind = 0u; // G422: G422_LK_* (0 = not covered -> execLower)
+        uint8_t g425Flags = 0u; // G425: see G425_PF_*
     };
+
+    // G425: set when EITHER slot of this pair can name VF0 or VI0 as a destination. The run
+    // loop re-pins VF0=(0,0,0,1) and VI0=0 after every pair to enforce the hardware invariant;
+    // when no writer of this pair can reach register 0 that re-pin is provably the identity and
+    // its five stores are skippable. Conservative by construction: any lower slot the G422
+    // decoder does not cover, and any upper encoding whose VF destination is not one of the
+    // known forms, sets the bit.
+    constexpr uint8_t G425_PF_TOUCHES_ZERO = 0x01u;
+
+    // G426: two more per-pair predicates the run loop used to RECOMPUTE on every executed pair,
+    // although both are pure functions of the same 64-bit pair source this sidecar already
+    // caches and invalidates.
+    //   * G426_PF_PRESTALL - the lower slot is a scalar-pipe producer or waiter (FDIV/EFU/WAITQ/
+    //     WAITP), i.e. the only case in which the G239 scalar-prestall block can publish
+    //     anything. Clear on ~every pair of the transform loop, where the block otherwise costs
+    //     a sidecar load plus ten compares per pair to decide to do nothing.
+    //   * G426_PF_HAZ - the G139 same-pair hazard actually applies: the upper slot has a VF
+    //     destination AND the lower slot names that register in fs or ft. The run loop used to
+    //     re-derive the index and run both compares per pair; the answer never changes for a
+    //     given pair encoding.
+    constexpr uint8_t G426_PF_PRESTALL = 0x02u;
+    constexpr uint8_t G426_PF_HAZ = 0x04u;
+
+    // The G239 scalar-prestall set: WAITQ, DIV/SQRT/RSQRT, WAITP and the EFU producers.
+    inline bool g426LowerIsScalarPipe(uint8_t lowerS2)
+    {
+        if (lowerS2 == 0xffu)
+            return false;
+        if (lowerS2 == 0x3bu || lowerS2 == 0x7bu)
+            return true;                                   // WAITQ / WAITP
+        if (lowerS2 >= 0x38u && lowerS2 <= 0x3au)
+            return true;                                   // DIV / SQRT / RSQRT
+        return lowerS2 == 0x70u || lowerS2 == 0x71u ||
+               lowerS2 == 0x72u || lowerS2 == 0x73u ||
+               lowerS2 == 0x76u || lowerS2 == 0x78u ||
+               lowerS2 == 0x79u || lowerS2 == 0x7au;        // EFU producers
+    }
     static_assert(sizeof(G410CompiledUpper) == 8u);
 
     constexpr uint8_t G410_PAIR_E_BIT = 0x01u;
@@ -104,6 +141,9 @@ namespace
             pair.pairFlags |= G410_PAIR_I_BIT;
         if (((lower >> 25u) & 0x7fu) == 0x40u)
             pair.lowerS2 = S2_FUNC(lower);
+        // G422: predecode the lower slot's inline-execution kind here, so the hot loop never
+        // decodes it. The cache verifier's whole-struct memcmp covers this field too.
+        pair.lowerKind = g422DecodeLowerKind(lower);
 
         const uint8_t upperOp = static_cast<uint8_t>(upper & 0x3fu);
         if (upperOp < 0x3cu)
@@ -114,6 +154,93 @@ namespace
             if ((upperS2 >= 0x10u && upperS2 <= 0x17u) ||
                 upperS2 == 0x1du)
                 pair.upperVfDest = FT(upper);
+        }
+        // G425: can either slot write VF0 or VI0?
+        bool touchesZero = false;
+        // Upper slot VF destination. `upperVfDest` above is the G139 hazard field and does NOT
+        // cover MOVE/MR32 (special2 0x30/0x31), which also write VF[ft], so recompute here.
+        {
+            uint32_t upperDst = 0xffffffffu;
+            if (upperOp < 0x3cu)
+                upperDst = FD(upper);
+            else
+            {
+                const uint8_t s2 = S2_FUNC(upper);
+                if ((s2 >= 0x10u && s2 <= 0x17u) || s2 == 0x1du ||
+                    s2 == 0x30u || s2 == 0x31u)
+                    upperDst = FT(upper);
+            }
+            if (upperDst == 0u)
+                touchesZero = true;
+            if (pair.upperKind == 0xffu)
+                touchesZero = true; // legacy execUpper decoder: be conservative
+        }
+        switch (pair.lowerKind)
+        {
+        case G422_LK_NOP:
+        case G422_LK_SQ:
+        case G422_LK_ISW:
+        case G422_LK_ISWR:
+        case G422_LK_B:
+        case G422_LK_JR:
+        case G422_LK_IBEQ:
+        case G422_LK_IBNE:
+        case G422_LK_IBLTZ:
+        case G422_LK_IBGTZ:
+        case G422_LK_IBLEZ:
+        case G422_LK_IBGEZ:
+            break; // no register-0 destination possible
+        case G422_LK_LQ:
+        case G422_LK_MFIR:
+        case G422_LK_MOVE:
+        case G422_LK_MR32:
+        case G422_LK_ILW:
+        case G422_LK_ILWR:
+        case G422_LK_IADDIU:
+        case G422_LK_ISUBIU:
+        case G422_LK_MTIR:
+        case G422_LK_BAL:
+        case G422_LK_JALR:
+            if (FT(lower) == 0u)
+                touchesZero = true;
+            break;
+        // The post-increment/decrement forms write VF[ft] (LQI/LQD) or only VI (SQI/SQD), and
+        // in every case bump the pointer register named by fs/it. Keep both fields in scope.
+        case G422_LK_LQI:
+        case G422_LK_LQD:
+            if (FT(lower) == 0u || FS(lower) == 0u)
+                touchesZero = true;
+            break;
+        case G422_LK_SQI:
+        case G422_LK_SQD:
+            if (FT(lower) == 0u)
+                touchesZero = true;
+            break;
+        case G422_LK_IADD:
+        case G422_LK_ISUB:
+        case G422_LK_IADDI:
+        case G422_LK_IAND:
+        case G422_LK_IOR:
+            if (((lower >> 6u) & 0x1fu) == 0u)
+                touchesZero = true;
+            break;
+        default:
+            touchesZero = true; // G422_LK_NONE and anything new: legacy execLower
+            break;
+        }
+        if ((pair.pairFlags & G410_PAIR_I_BIT) != 0u)
+            touchesZero = true; // LOI: the lower word is an immediate, not an instruction
+        if (touchesZero)
+            pair.g425Flags |= G425_PF_TOUCHES_ZERO;
+        // G426: an LOI pair's lower word is a float immediate, so neither predicate applies
+        // (the run loop already gates both on !iBit / the LOI branch).
+        if ((pair.pairFlags & G410_PAIR_I_BIT) == 0u)
+        {
+            if (g426LowerIsScalarPipe(pair.lowerS2))
+                pair.g425Flags |= G426_PF_PRESTALL;
+            if (pair.upperVfDest != 0xffu &&
+                (pair.lowerFs == pair.upperVfDest || pair.lowerFt == pair.upperVfDest))
+                pair.g425Flags |= G426_PF_HAZ;
         }
         return pair;
     }

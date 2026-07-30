@@ -18,6 +18,16 @@ bool g178_backend_drain_async(bool &ok)
     return G178Backend::instance().drainAsync(ok);
 }
 
+// G415 private .cpp-to-.cpp side channel. Publishes the exact GL row window that the front-end
+// will consume out of the NEXT synchronous submit's colour readback. Consumed-and-cleared by that
+// submit, so an unpublished submit keeps the previous full-height behaviour.
+void g415_backend_set_color_window(int glY, int rows)
+{
+    g_g415PendWindow.valid = rows > 0 && glY >= 0;
+    g_g415PendWindow.glY = glY;
+    g_g415PendWindow.rows = rows;
+}
+
 // G242 private .cpp-to-.cpp side channel; intentionally not added to a header.
 bool g242_backend_submit_depth(G178Batch &batch, uint64_t depthKey,
                                const std::vector<float> *depthUpload,
@@ -182,4 +192,3 @@ void g178StartPersistentBackend()
     if (G178Backend::instance().ready())
         std::fprintf(stderr, "[G178:backend] persistent LLE GPU raster backend started\n");
 }
-

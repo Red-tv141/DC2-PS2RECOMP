@@ -17,6 +17,20 @@
 // G362/G407: guarded exact POINT fetch plus point/linear hardware UV rounding -- see
 // lle_gpu_raster_backend.inc. Touching this file forces MSBuild to recompile it after an
 // .inc-only edit (the G359 stale-link trap).
+//
+// G415: command-zero submit stage census (DC2_G415_CENSUS=1) plus the narrowed colour-readback
+// window (DC2_G415_NARROW_READBACK=1 / DC2_G415_NO_NARROW_READBACK=1) live in the same parts.
+// G417: diagnostic-only upload attribution also lives in the same parts.
+// G418: colour-readback drain/transfer attribution (DC2_G418_PROFILE=1) and the early command kick
+// (DC2_G418_EARLY_KICK=1 / DC2_G418_NO_EARLY_KICK=1) live in the same parts.
+// G419: the narrowed colour readback is now switchable per frame by the within-process A/B
+// instrument (DC2_G419_AB=narrow) and carries an idempotent re-read ballast (DC2_G419_BALLAST).
+// G420: DC2_G419_AB=narrowtouch adds the full read's DESTINATION-side write volume to the narrow
+// arm, into an inert backend-private scratch buffer, to close G419's unaccounted narrow-readback
+// payoff. Diagnostic only; no GL call and no observable byte change.
+// G420: DC2_G420_NARROW_ROWS=<n> widens the narrow read to n rows (exact for any n >= the published
+// window) to separate a per-row cost from a full-attachment driver step.
+// The instrument contract lives in ps2_gs_rasterizer_parts/g419_ab_instrument.inc.
 
 #include "ps2_gs_gpu_lle.h" // G178: private front-end<->backend interface (both build branches)
 
@@ -26,6 +40,7 @@
 #include "ps2_gs_gpu_raster_parts/persistent_t8_decoder.inc"
 #include "ps2_gs_gpu_raster_parts/lle_gpu_raster_backend.inc"
 #include "ps2_gs_gpu_raster_parts/gpu_raster_bridge_and_stubs.inc"
+// G425: readback-redundancy ceiling census added in lle_gpu_raster_backend.inc (force recompile v1).
 #else // !(_WIN32 && !PLATFORM_VITA)
 
 bool g158_gpu_raster_enabled() { return false; }
@@ -45,6 +60,7 @@ bool g242_backend_submit_depth(G178Batch &, uint64_t, const std::vector<float> *
 bool g275_backend_submit_depth_readback(G178Batch &, uint64_t, const std::vector<float> *,
                                         int, int, int, int, std::vector<float> &) { return false; }
 bool g242_backend_read_depth(uint64_t, int, int, int, int, std::vector<float> &) { return false; }
+void g415_backend_set_color_window(int, int) {}
 bool g178_backend_has_tex(uint64_t) { return false; }
 bool g178_backend_read_color(uint32_t, int, int, int, int, std::vector<uint32_t> &) { return false; }
 bool g178_backend_write_color(uint32_t, int, int, int, int, const std::vector<uint32_t> &) { return false; }

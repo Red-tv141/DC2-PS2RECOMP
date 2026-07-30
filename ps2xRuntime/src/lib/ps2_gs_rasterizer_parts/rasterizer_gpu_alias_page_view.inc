@@ -112,13 +112,13 @@ static std::atomic<uint64_t> g_g310MatPages[8]{};
 static std::atomic<uint64_t> g_g310T8Candidates{0}, g_g310T8Views{0},
     g_g310T8BuildFail{0}, g_g310T8RejShape{0}, g_g310T8RejPage{0},
     g_g310T8RejClut{0};
-// G326: one default-off persistent cache for descriptor-derived frontend products. The renderer's
-// existing builders remain the cold path and the verifier oracle; no authority or ordering state
-// is cached here. These gates are process-constant and disappear to one predictable branch when
-// the arm is absent.
+// G326/G423: persistent cache for descriptor-derived frontend products. G423 promoted the existing
+// exact cache after the current renderer made it worth ~12 ms/frame. The renderer's builders remain
+// the cold path and verifier oracle; no authority or ordering state is cached here. Kill the whole
+// cache with DC2_G423_NO_PLAN_CACHE=1.
 static bool g326PlanCacheOn()
 {
-    static const bool v = envFlagEnabled("DC2_G326_PLAN_CACHE");
+    static const bool v = !envFlagEnabled("DC2_G423_NO_PLAN_CACHE");
     return v;
 }
 static bool g326VerifyOn()
