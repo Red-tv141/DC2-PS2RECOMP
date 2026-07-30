@@ -21,6 +21,7 @@ public class MainViewModel : ViewModelBase
     private readonly IValidationService _validationService;
     private readonly IIsoExtractor _isoExtractor;
     private readonly IModScannerService _modScanner;
+    private readonly IAudioService? _audioService;
     private readonly PathResolver _pathResolver;
 
     private LauncherSettings _settings;
@@ -29,6 +30,7 @@ public class MainViewModel : ViewModelBase
     private bool _isExtracting;
     private double _extractionProgress;
     private CancellationTokenSource? _extractionCts;
+    private string _activeTab = "Home";
 
     public MainViewModel(
         ILauncherEnvironment environment,
@@ -37,7 +39,8 @@ public class MainViewModel : ViewModelBase
         IProcessLauncher processLauncher,
         IValidationService validationService,
         IIsoExtractor isoExtractor,
-        IModScannerService? modScanner = null)
+        IModScannerService? modScanner = null,
+        IAudioService? audioService = null)
     {
         _environment = environment ?? throw new ArgumentNullException(nameof(environment));
         _settingsService = settingsService ?? throw new ArgumentNullException(nameof(settingsService));
@@ -46,9 +49,11 @@ public class MainViewModel : ViewModelBase
         _validationService = validationService ?? throw new ArgumentNullException(nameof(validationService));
         _isoExtractor = isoExtractor ?? throw new ArgumentNullException(nameof(isoExtractor));
         _modScanner = modScanner ?? new ModScannerService(new FileLoggerService(environment));
+        _audioService = audioService;
         _pathResolver = new PathResolver(_environment);
 
         _settings = _settingsService.LoadSettings();
+        ControllerVM = new ControllerViewModel(_environment);
 
         ResolutionModes = new ObservableCollection<string>
         {
@@ -59,6 +64,18 @@ public class MainViewModel : ViewModelBase
             "3840x2160",
             "Custom"
         };
+
+        // Navigation Commands
+        SelectHomeCommand = new RelayCommand(() => ActiveTab = "Home");
+        SelectControlsCommand = new RelayCommand(() => ActiveTab = "Controls");
+        SelectSettingsCommand = new RelayCommand(() => ActiveTab = "Settings");
+        SelectModsCommand = new RelayCommand(() => ActiveTab = "Mods");
+        SelectDiagnosticsCommand = new RelayCommand(() => ActiveTab = "Diagnostics");
+        ExitCommand = new RelayCommand(() =>
+        {
+            StopAudio();
+            System.Windows.Application.Current?.Shutdown();
+        });
 
         BrowseIsoCommand = new RelayCommand(BrowseIso, () => CanModifySettings);
         ExtractIsoCommand = new RelayCommand(async () => await ExtractIsoAsync(), () => CanExtract);
@@ -80,221 +97,32 @@ public class MainViewModel : ViewModelBase
         PlayCommand = new RelayCommand(Play, () => CanPlay);
 
         ValidateCurrentSettings();
+        StartBackgroundAudio();
     }
 
-    public ObservableCollection<string> ResolutionModes { get; }
+    public ControllerViewModel ControllerVM { get; }
 
-    public bool SkipIntro
+    public string ActiveTab
     {
-        get => _settings.Game.SkipIntro;
+        get => _activeTab;
         set
         {
-            if (_settings.Game.SkipIntro != value && CanModifySettings)
+            if (SetProperty(ref _activeTab, value))
             {
-                _settings.Game.SkipIntro = value;
-                OnPropertyChanged();
-                SaveSettings();
+                OnPropertyChanged(nameof(IsHomeTabActive));
+                OnPropertyChanged(nameof(IsControlsTabActive));
+                OnPropertyChanged(nameof(IsSettingsTabActive));
+                OnPropertyChanged(nameof(IsModsTabActive));
+                OnPropertyChanged(nameof(IsDiagnosticsTabActive));
             }
         }
     }
 
-    public bool Enable60Fps
-    {
-        get => _settings.Game.Enable60Fps;
-        set
-        {
-            if (_settings.Game.Enable60Fps != value && CanModifySettings)
-            {
-                _settings.Game.Enable60Fps = value;
-                OnPropertyChanged();
-                SaveSettings();
-            }
-        }
-    }
-
-    public bool EnableDebugMenu
-    {
-        get => _settings.Game.EnableDebugMenu;
-        set
-        {
-            if (_settings.Game.EnableDebugMenu != value && CanModifySettings)
-            {
-                _settings.Game.EnableDebugMenu = value;
-                OnPropertyChanged();
-                SaveSettings();
-            }
-        }
-    }
-
-    public string SelectedResolutionMode
-    {
-        get => _settings.Game.Resolution.Mode;
-        set
-        {
-            if (_settings.Game.Resolution.Mode != value && CanModifySettings)
-            {
-                _settings.Game.Resolution.Mode = value;
-                OnPropertyChanged();
-                OnPropertyChanged(nameof(IsCustomResolutionSelected));
-                SaveSettings();
-            }
-        }
-    }
-
-    public bool IsCustomResolutionSelected => string.Equals(SelectedResolutionMode, "Custom", StringComparison.OrdinalIgnoreCase);
-
-    public string CustomResolutionWidth
-    {
-        get => _settings.Game.Resolution.Width?.ToString() ?? string.Empty;
-        set
-        {
-            if (CanModifySettings)
-            {
-                if (int.TryParse(value, out var parsed) && parsed > 0)
-                {
-                    _settings.Game.Resolution.Width = parsed;
-                }
-                else if (string.IsNullOrWhiteSpace(value))
-                {
-                    _settings.Game.Resolution.Width = null;
-                }
-                OnPropertyChanged();
-                OnPropertyChanged(nameof(CustomWidth));
-                SaveSettings();
-            }
-        }
-    }
-
-    public string CustomResolutionHeight
-    {
-        get => _settings.Game.Resolution.Height?.ToString() ?? string.Empty;
-        set
-        {
-            if (CanModifySettings)
-            {
-                if (int.TryParse(value, out var parsed) && parsed > 0)
-                {
-                    _settings.Game.Resolution.Height = parsed;
-                }
-                else if (string.IsNullOrWhiteSpace(value))
-                {
-                    _settings.Game.Resolution.Height = null;
-                }
-                OnPropertyChanged();
-                OnPropertyChanged(nameof(CustomHeight));
-                SaveSettings();
-            }
-        }
-    }
-
-    public string CustomWidth
-    {
-        get => CustomResolutionWidth;
-        set => CustomResolutionWidth = value;
-    }
-
-    public string CustomHeight
-    {
-        get => CustomResolutionHeight;
-        set => CustomResolutionHeight = value;
-    }
-
-    public bool Fullscreen
-    {
-        get => _settings.Game.Resolution.Fullscreen;
-        set
-        {
-            if (_settings.Game.Resolution.Fullscreen != value && CanModifySettings)
-            {
-                _settings.Game.Resolution.Fullscreen = value;
-                OnPropertyChanged();
-                SaveSettings();
-            }
-        }
-    }
-
-    public bool EnableModsFolder
-    {
-        get => _settings.Mods.Enabled;
-        set
-        {
-            if (_settings.Mods.Enabled != value && CanModifySettings)
-            {
-                _settings.Mods.Enabled = value;
-                OnPropertyChanged();
-                SaveSettings();
-
-                if (value)
-                {
-                    ScanModsAndSaveManifest();
-                }
-            }
-        }
-    }
-
-    public string MemoryCard1Path
-    {
-        get => _settings.Paths.MemoryCard1;
-        set
-        {
-            if (_settings.Paths.MemoryCard1 != value && CanModifySettings)
-            {
-                _settings.Paths.MemoryCard1 = value;
-                OnPropertyChanged();
-                SaveSettings();
-            }
-        }
-    }
-
-    public string MemoryCard2Path
-    {
-        get => _settings.Paths.MemoryCard2;
-        set
-        {
-            if (_settings.Paths.MemoryCard2 != value && CanModifySettings)
-            {
-                _settings.Paths.MemoryCard2 = value;
-                OnPropertyChanged();
-                SaveSettings();
-            }
-        }
-    }
-
-    public string IsoFileName => _settings.Paths.Iso;
-
-    public string IsoPathInput
-    {
-        get => _settings.Paths.Iso;
-        set
-        {
-            if (_settings.Paths.Iso != value && CanModifySettings)
-            {
-                var relative = _pathResolver.MakeRelativeIfUnderRoot(value);
-                _settings.Paths.Iso = relative;
-                OnPropertyChanged();
-                OnPropertyChanged(nameof(IsoFileName));
-                SaveSettings();
-            }
-        }
-    }
-
-    public string DataStatusText
-    {
-        get
-        {
-            var isPopulated = _isoExtractor.IsDataPopulated(_settings.Paths.Data);
-            if (isPopulated)
-            {
-                var state = _isoExtractor.GetExtractionState();
-                if (state != null)
-                {
-                    return $"Extracted ({state.ExtractedTimestampUtc.ToLocalTime():yyyy-MM-dd HH:mm}) — ELF Verified";
-                }
-                return "Ready — SCUS_972.13 Verified";
-            }
-            return "Not Extracted (DATA folder or SCUS_972.13 missing)";
-        }
-    }
+    public bool IsHomeTabActive => ActiveTab == "Home";
+    public bool IsControlsTabActive => ActiveTab == "Controls";
+    public bool IsSettingsTabActive => ActiveTab == "Settings";
+    public bool IsModsTabActive => ActiveTab == "Mods";
+    public bool IsDiagnosticsTabActive => ActiveTab == "Diagnostics";
 
     public string StatusMessage
     {
@@ -324,7 +152,7 @@ public class MainViewModel : ViewModelBase
             if (SetProperty(ref _isExtracting, value))
             {
                 OnPropertyChanged(nameof(CanExtract));
-                OnPropertyChanged(nameof(CanPlay));
+                OnPropertyChanged(nameof(CanModifySettings));
             }
         }
     }
@@ -335,9 +163,232 @@ public class MainViewModel : ViewModelBase
         set => SetProperty(ref _extractionProgress, value);
     }
 
+    public string IsoPath
+    {
+        get => _settings.Paths.Iso;
+        set
+        {
+            if (_settings.Paths.Iso != value)
+            {
+                _settings.Paths.Iso = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(IsoFileName));
+                OnPropertyChanged(nameof(CanExtract));
+                SaveSettings();
+            }
+        }
+    }
+
+    public string IsoFileName
+    {
+        get
+        {
+            if (string.IsNullOrWhiteSpace(_settings.Paths.Iso))
+                return "No ISO selected (Click Extract ISO to choose)";
+            return Path.GetFileName(_settings.Paths.Iso);
+        }
+    }
+
+    public string DataStatusText
+    {
+        get
+        {
+            var dataDir = _pathResolver.Resolve(_settings.Paths.Data);
+            if (_fileSystemService.DirectoryExists(dataDir))
+            {
+                var state = _isoExtractor.GetExtractionState();
+                if (state != null && state.Success)
+                {
+                    var elfName = string.IsNullOrWhiteSpace(state.DetectedElfPath) ? "SCUS_972.13" : Path.GetFileName(state.DetectedElfPath);
+                    return $"Extracted ({state.ExtractedTimestampUtc.ToLocalTime():yyyy-MM-dd HH:mm}) — {elfName} Verified";
+                }
+                return "Extracted DATA/ folder present";
+            }
+            return "Not Extracted (ISO Required)";
+        }
+    }
+
+    public ObservableCollection<string> ResolutionModes { get; }
+
+    public string SelectedResolutionMode
+    {
+        get => _settings.Game.Resolution.Mode;
+        set
+        {
+            if (_settings.Game.Resolution.Mode != value)
+            {
+                _settings.Game.Resolution.Mode = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(IsCustomResolutionSelected));
+                SaveSettings();
+            }
+        }
+    }
+
+    public bool IsCustomResolutionSelected => SelectedResolutionMode == "Custom";
+
+    public int CustomResolutionWidth
+    {
+        get => _settings.Game.Resolution.Width ?? 1920;
+        set
+        {
+            if (_settings.Game.Resolution.Width != value)
+            {
+                _settings.Game.Resolution.Width = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(CustomWidth));
+                SaveSettings();
+            }
+        }
+    }
+
+    public int CustomResolutionHeight
+    {
+        get => _settings.Game.Resolution.Height ?? 1080;
+        set
+        {
+            if (_settings.Game.Resolution.Height != value)
+            {
+                _settings.Game.Resolution.Height = value;
+                OnPropertyChanged();
+                OnPropertyChanged(nameof(CustomHeight));
+                SaveSettings();
+            }
+        }
+    }
+
+    public string? CustomWidth
+    {
+        get => CustomResolutionWidth.ToString();
+        set
+        {
+            if (int.TryParse(value, out var parsed))
+            {
+                CustomResolutionWidth = parsed;
+            }
+        }
+    }
+
+    public string? CustomHeight
+    {
+        get => CustomResolutionHeight.ToString();
+        set
+        {
+            if (int.TryParse(value, out var parsed))
+            {
+                CustomResolutionHeight = parsed;
+            }
+        }
+    }
+
+    public bool Enable60Fps
+    {
+        get => _settings.Game.Enable60Fps;
+        set
+        {
+            if (_settings.Game.Enable60Fps != value)
+            {
+                _settings.Game.Enable60Fps = value;
+                OnPropertyChanged();
+                SaveSettings();
+            }
+        }
+    }
+
+    public bool EnableDebugMenu
+    {
+        get => _settings.Game.EnableDebugMenu;
+        set
+        {
+            if (_settings.Game.EnableDebugMenu != value)
+            {
+                _settings.Game.EnableDebugMenu = value;
+                OnPropertyChanged();
+                SaveSettings();
+            }
+        }
+    }
+
+    public bool SkipIntro
+    {
+        get => _settings.Game.SkipIntro;
+        set
+        {
+            if (_settings.Game.SkipIntro != value)
+            {
+                _settings.Game.SkipIntro = value;
+                OnPropertyChanged();
+                SaveSettings();
+            }
+        }
+    }
+
+    public bool Fullscreen
+    {
+        get => _settings.Game.Resolution.Fullscreen;
+        set
+        {
+            if (_settings.Game.Resolution.Fullscreen != value)
+            {
+                _settings.Game.Resolution.Fullscreen = value;
+                OnPropertyChanged();
+                SaveSettings();
+            }
+        }
+    }
+
+    public bool EnableModsFolder
+    {
+        get => _settings.Mods.Enabled;
+        set
+        {
+            if (_settings.Mods.Enabled != value)
+            {
+                _settings.Mods.Enabled = value;
+                OnPropertyChanged();
+                SaveSettings();
+            }
+        }
+    }
+
+    public string MemoryCard1Path
+    {
+        get => _settings.Paths.MemoryCard1;
+        set
+        {
+            if (_settings.Paths.MemoryCard1 != value)
+            {
+                _settings.Paths.MemoryCard1 = value;
+                OnPropertyChanged();
+                SaveSettings();
+            }
+        }
+    }
+
+    public string MemoryCard2Path
+    {
+        get => _settings.Paths.MemoryCard2;
+        set
+        {
+            if (_settings.Paths.MemoryCard2 != value)
+            {
+                _settings.Paths.MemoryCard2 = value;
+                OnPropertyChanged();
+                SaveSettings();
+            }
+        }
+    }
+
     public bool CanModifySettings => !IsBusy && !IsExtracting;
-    public bool CanExtract => !IsExtracting && !IsBusy;
-    public bool CanPlay => !IsExtracting && !IsBusy;
+    public bool CanExtract => !IsBusy && !IsExtracting && !string.IsNullOrWhiteSpace(_settings.Paths.Iso);
+    public bool CanPlay => !IsBusy && !IsExtracting;
+
+    public ICommand SelectHomeCommand { get; }
+    public ICommand SelectControlsCommand { get; }
+    public ICommand SelectSettingsCommand { get; }
+    public ICommand SelectModsCommand { get; }
+    public ICommand SelectDiagnosticsCommand { get; }
+    public ICommand ExitCommand { get; }
 
     public ICommand BrowseIsoCommand { get; }
     public ICommand ExtractIsoCommand { get; }
@@ -358,102 +409,106 @@ public class MainViewModel : ViewModelBase
     public ICommand DryRunLaunchCommand { get; }
     public ICommand PlayCommand { get; }
 
-    private void BrowseIso()
+    public void StopAudio()
     {
+        _audioService?.Stop();
+    }
+
+    private void StartBackgroundAudio()
+    {
+        var candidates = new[]
+        {
+            _pathResolver.Resolve("Launcher_OST.mp3"),
+            Path.Combine(AppContext.BaseDirectory, "Launcher_OST.mp3"),
+            Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "Launcher_OST.mp3"),
+        };
+
+        // Also check the directory where the actual exe lives (single-file publish)
         try
         {
-            var dialog = new Microsoft.Win32.OpenFileDialog
+            var exePath = System.Diagnostics.Process.GetCurrentProcess().MainModule?.FileName;
+            if (!string.IsNullOrEmpty(exePath))
             {
-                Title = "Select Dark Cloud 2 ISO Image",
-                Filter = "PS2 ISO Image (*.iso)|*.iso|All Files (*.*)|*.*"
-            };
-
-            var resolvedCurrent = _pathResolver.Resolve(_settings.Paths.Iso);
-            if (_fileSystemService.FileExists(resolvedCurrent))
-            {
-                dialog.InitialDirectory = Path.GetDirectoryName(resolvedCurrent);
-                dialog.FileName = Path.GetFileName(resolvedCurrent);
-            }
-            else
-            {
-                dialog.InitialDirectory = _environment.LauncherRoot;
-            }
-
-            if (dialog.ShowDialog() == true)
-            {
-                IsoPathInput = dialog.FileName;
-                StatusMessage = $"Selected ISO Image: {dialog.FileName}";
+                var exeDir = Path.GetDirectoryName(exePath);
+                if (!string.IsNullOrEmpty(exeDir))
+                {
+                    candidates = candidates.Append(Path.Combine(exeDir, "Launcher_OST.mp3")).ToArray();
+                }
             }
         }
-        catch (Exception ex)
+        catch { /* ignore */ }
+
+        foreach (var path in candidates)
         {
-            StatusMessage = $"Error selecting ISO file: {ex.Message}";
+            if (File.Exists(path))
+            {
+                _audioService?.PlayLooping(path);
+                return;
+            }
+        }
+    }
+
+    private void BrowseIso()
+    {
+        var dialog = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = "Select Dark Cloud 2 ISO Disc Image",
+            Filter = "ISO Files (*.iso)|*.iso|All Files (*.*)|*.*",
+            CheckFileExists = true
+        };
+
+        if (dialog.ShowDialog() == true)
+        {
+            IsoPath = dialog.FileName;
         }
     }
 
     private async Task ExtractIsoAsync()
     {
-        if (IsExtracting) return;
-
-        var isoPath = _pathResolver.Resolve(_settings.Paths.Iso);
-        var dataPath = _pathResolver.Resolve(_settings.Paths.Data);
-
-        if (!_fileSystemService.FileExists(isoPath))
+        var resolvedIso = _pathResolver.Resolve(_settings.Paths.Iso);
+        if (string.IsNullOrWhiteSpace(resolvedIso) || !_fileSystemService.FileExists(resolvedIso))
         {
-            try
+            BrowseIso();
+            resolvedIso = _pathResolver.Resolve(_settings.Paths.Iso);
+            if (string.IsNullOrWhiteSpace(resolvedIso) || !_fileSystemService.FileExists(resolvedIso))
             {
-                var dialog = new Microsoft.Win32.OpenFileDialog
-                {
-                    Title = "Select Dark Cloud 2 ISO Image to Extract",
-                    Filter = "PS2 ISO Image (*.iso)|*.iso|All Files (*.*)|*.*",
-                    InitialDirectory = _environment.LauncherRoot
-                };
-
-                if (dialog.ShowDialog() == true)
-                {
-                    IsoPathInput = dialog.FileName;
-                    isoPath = _pathResolver.Resolve(_settings.Paths.Iso);
-                }
-                else
-                {
-                    StatusMessage = "ISO Extraction cancelled: No ISO file selected.";
-                    return;
-                }
-            }
-            catch (Exception ex)
-            {
-                StatusMessage = $"Failed to open ISO file selector: {ex.Message}";
+                StatusMessage = "Extraction Cancelled — No ISO selected.";
                 return;
             }
         }
 
-        IsExtracting = true;
-        IsBusy = true;
-        ExtractionProgress = 0;
-        _extractionCts = new CancellationTokenSource();
-
         try
         {
-            var success = await _isoExtractor.ExtractIsoAsync(
-                isoPath,
-                dataPath,
-                (percent, message) =>
-                {
-                    ExtractionProgress = percent;
-                    StatusMessage = $"[{percent:F1}%] {message}";
-                },
-                _extractionCts.Token);
+            IsExtracting = true;
+            ExtractionProgress = 0;
+            StatusMessage = "Extracting ISO files to DATA/ directory...";
+            _extractionCts = new CancellationTokenSource();
 
+            var resolvedData = _pathResolver.Resolve(_settings.Paths.Data);
+            Action<double, string> progressCallback = (val, msg) => ExtractionProgress = val;
+
+            var success = await _isoExtractor.ExtractIsoAsync(resolvedIso, resolvedData, progressCallback, _extractionCts.Token);
             if (success)
             {
+                StatusMessage = "ISO Extraction Completed Successfully! DATA/ ready.";
                 OnPropertyChanged(nameof(DataStatusText));
-                StatusMessage = "ISO Extraction finished cleanly! DATA folder and SCUS_972.13 verified.";
             }
+            else
+            {
+                StatusMessage = "Extraction incomplete or cancelled.";
+            }
+        }
+        catch (OperationCanceledException)
+        {
+            StatusMessage = "Extraction process was cancelled.";
+        }
+        catch (Exception ex)
+        {
+            StatusMessage = $"Extraction Failed: {ex.Message}";
         }
         finally
         {
             IsExtracting = false;
-            IsBusy = false;
             _extractionCts?.Dispose();
             _extractionCts = null;
         }
@@ -461,110 +516,75 @@ public class MainViewModel : ViewModelBase
 
     private void CancelExtraction()
     {
-        if (IsExtracting && _extractionCts != null)
-        {
-            StatusMessage = "Cancelling ISO extraction...";
-            _extractionCts.Cancel();
-        }
+        _extractionCts?.Cancel();
     }
 
     private void OpenDataFolder()
     {
-        var dataPath = _pathResolver.Resolve(_settings.Paths.Data);
-        _fileSystemService.CreateDirectory(dataPath);
-        _fileSystemService.OpenFolderInExplorer(dataPath);
+        var path = _pathResolver.Resolve(_settings.Paths.Data);
+        _fileSystemService.CreateDirectory(path);
+        _fileSystemService.OpenFolderInExplorer(path);
+        StatusMessage = $"Opened DATA directory: {path}";
     }
 
     private void OpenModsFolder()
     {
-        var modsPath = _pathResolver.Resolve(_settings.Paths.Mods);
-        _fileSystemService.CreateDirectory(modsPath);
-        ScanModsAndSaveManifest();
-        _fileSystemService.OpenFolderInExplorer(modsPath);
-    }
-
-    private void ScanModsAndSaveManifest()
-    {
-        var modsPath = _pathResolver.Resolve(_settings.Paths.Mods);
-        _fileSystemService.CreateDirectory(modsPath);
-
-        var scanResult = _modScanner.ScanModsDirectory(modsPath);
-        var manifestPath = Path.Combine(_environment.LauncherRoot, "Config", "mods_manifest.json");
-        _modScanner.SaveManifest(manifestPath, scanResult);
-
-        if (scanResult.Warnings.Count > 0)
-        {
-            StatusMessage = $"Mods Scanned: Discovered {scanResult.ModFiles.Count} mod file(s) with {scanResult.Warnings.Count} warning(s):\n• " +
-                            string.Join("\n• ", scanResult.Warnings);
-        }
-        else
-        {
-            StatusMessage = $"Mods Scanned: Discovered {scanResult.ModFiles.Count} mod file(s). Manifest saved to Config\\mods_manifest.json.";
-        }
+        var path = _pathResolver.Resolve(_settings.Paths.Mods);
+        _fileSystemService.CreateDirectory(path);
+        _fileSystemService.OpenFolderInExplorer(path);
+        StatusMessage = $"Opened Mods directory: {path}";
     }
 
     private void OpenLogsFolder()
     {
-        var logsPath = Path.Combine(_environment.LauncherRoot, "Logs");
-        _fileSystemService.CreateDirectory(logsPath);
-        _fileSystemService.OpenFolderInExplorer(logsPath);
-        StatusMessage = $"Opened logs directory: {logsPath}";
+        var path = _pathResolver.Resolve("Logs");
+        _fileSystemService.CreateDirectory(path);
+        _fileSystemService.OpenFolderInExplorer(path);
+        StatusMessage = $"Opened logs directory: {path}";
     }
 
     private void BrowseMemCard1()
     {
-        try
+        var dialog = new Microsoft.Win32.OpenFolderDialog
         {
-            var dialog = new Microsoft.Win32.OpenFolderDialog
-            {
-                Title = "Select Memory Card 1 Save Directory",
-                InitialDirectory = _pathResolver.Resolve(_settings.Paths.MemoryCard1)
-            };
+            Title = "Select Memory Card Slot 1 Directory",
+            InitialDirectory = _pathResolver.Resolve(MemoryCard1Path)
+        };
 
-            if (dialog.ShowDialog() == true)
-            {
-                MemoryCard1Path = dialog.FolderName;
-            }
-        }
-        catch (Exception ex)
+        if (dialog.ShowDialog() == true)
         {
-            StatusMessage = $"Error selecting Memory Card 1 directory: {ex.Message}";
+            MemoryCard1Path = _pathResolver.MakeRelativeIfUnderRoot(dialog.FolderName);
         }
     }
 
     private void BrowseMemCard2()
     {
-        try
+        var dialog = new Microsoft.Win32.OpenFolderDialog
         {
-            var dialog = new Microsoft.Win32.OpenFolderDialog
-            {
-                Title = "Select Memory Card 2 Save Directory",
-                InitialDirectory = _pathResolver.Resolve(_settings.Paths.MemoryCard2)
-            };
+            Title = "Select Memory Card Slot 2 Directory",
+            InitialDirectory = _pathResolver.Resolve(MemoryCard2Path)
+        };
 
-            if (dialog.ShowDialog() == true)
-            {
-                MemoryCard2Path = dialog.FolderName;
-            }
-        }
-        catch (Exception ex)
+        if (dialog.ShowDialog() == true)
         {
-            StatusMessage = $"Error selecting Memory Card 2 directory: {ex.Message}";
+            MemoryCard2Path = _pathResolver.MakeRelativeIfUnderRoot(dialog.FolderName);
         }
     }
 
     private void OpenMemCard1Folder()
     {
-        var dir = _pathResolver.Resolve(_settings.Paths.MemoryCard1);
-        _fileSystemService.CreateDirectory(dir);
-        _fileSystemService.OpenFolderInExplorer(dir);
+        var path = _pathResolver.Resolve(MemoryCard1Path);
+        _fileSystemService.CreateDirectory(path);
+        _fileSystemService.OpenFolderInExplorer(path);
+        StatusMessage = $"Opened Memory Card 1 directory: {path}";
     }
 
     private void OpenMemCard2Folder()
     {
-        var dir = _pathResolver.Resolve(_settings.Paths.MemoryCard2);
-        _fileSystemService.CreateDirectory(dir);
-        _fileSystemService.OpenFolderInExplorer(dir);
+        var path = _pathResolver.Resolve(MemoryCard2Path);
+        _fileSystemService.CreateDirectory(path);
+        _fileSystemService.OpenFolderInExplorer(path);
+        StatusMessage = $"Opened Memory Card 2 directory: {path}";
     }
 
     private void ResetMemCard1()
@@ -581,20 +601,7 @@ public class MainViewModel : ViewModelBase
 
     private void CustomizeController()
     {
-        try
-        {
-            var vm = new ControllerViewModel(_environment);
-            var window = new ControllerWindow(vm)
-            {
-                Owner = System.Windows.Application.Current.MainWindow
-            };
-            window.ShowDialog();
-            StatusMessage = "Controller configuration saved to Config\\controller.json.";
-        }
-        catch (Exception ex)
-        {
-            StatusMessage = $"Error opening controller configuration dialog: {ex.Message}";
-        }
+        ActiveTab = "Controls";
     }
 
     private void ValidateLaunch()
@@ -626,13 +633,15 @@ public class MainViewModel : ViewModelBase
 
         try
         {
+            StopAudio();
             IsBusy = true;
             StatusMessage = "Launching Dark Cloud 2 runner...";
 
             var success = _processLauncher.LaunchGame(_settings, out var errorMessage);
             if (success)
             {
-                StatusMessage = "Game Launched Successfully! Runner process active.";
+                System.Windows.Application.Current?.Shutdown();
+                return;
             }
             else
             {

@@ -3,51 +3,99 @@
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
         xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+        xmlns:viewModels="clr-namespace:DC2Launcher.App.ViewModels"
         mc:Ignorable="d"
-        Title="Dark Cloud 2 Standalone Windows Launcher" 
-        Height="620" Width="820" MinHeight="550" MinWidth="750"
+        Title="Dark Cloud 2 Recompiled Launcher" 
+        Height="640" Width="880" MinHeight="580" MinWidth="780"
         WindowStartupLocation="CenterScreen"
         Icon="dc2_launcher_icon.ico"
-        Background="#1E1E2E" Foreground="#CDD6F4">
+        Background="#14100E" Foreground="#F4E8D1"
+        KeyDown="Window_KeyDown">
 
     <Window.Resources>
         <BooleanToVisibilityConverter x:Key="BoolToVisConverter"/>
 
-        <!-- Custom Dark Theme Styles -->
-        <Style TargetType="GroupBox">
-            <Setter Property="Foreground" Value="#89B4FA"/>
-            <Setter Property="BorderBrush" Value="#45475A"/>
+        <!-- Dark Cloud 2 Manual Theme - Standard Menu Button -->
+        <Style x:Key="MenuButtonStyle" TargetType="Button">
+            <Setter Property="Background" Value="#231B17"/>
+            <Setter Property="Foreground" Value="#C5B499"/>
+            <Setter Property="BorderBrush" Value="#3D2D24"/>
             <Setter Property="BorderThickness" Value="1"/>
-            <Setter Property="Margin" Value="0,0,0,12"/>
-            <Setter Property="Padding" Value="12"/>
+            <Setter Property="FontSize" Value="15"/>
             <Setter Property="FontWeight" Value="SemiBold"/>
+            <Setter Property="Padding" Value="16,9"/>
+            <Setter Property="HorizontalContentAlignment" Value="Left"/>
+            <Setter Property="Margin" Value="0,3"/>
+            <Setter Property="Cursor" Value="Hand"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="border" Background="{TemplateBinding Background}" 
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="6" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="{TemplateBinding HorizontalContentAlignment}" 
+                                              VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#382A20"/>
+                                <Setter Property="Foreground" Value="#F5C542"/>
+                                <Setter Property="BorderBrush" Value="#8C6339"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter Property="Background" Value="#1A130F"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.4"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
         </Style>
 
-        <Style TargetType="CheckBox">
-            <Setter Property="Foreground" Value="#CDD6F4"/>
-            <Setter Property="Margin" Value="0,4"/>
-            <Setter Property="VerticalContentAlignment" Value="Center"/>
+        <!-- Dark Cloud 2 Title Menu Style - Primary Big Start Button -->
+        <Style x:Key="PrimaryMenuButtonStyle" TargetType="Button" BasedOn="{StaticResource MenuButtonStyle}">
+            <Setter Property="Background" Value="#F5A623"/>
+            <Setter Property="Foreground" Value="#120E0A"/>
+            <Setter Property="BorderBrush" Value="#FFC86B"/>
+            <Setter Property="BorderThickness" Value="1"/>
+            <Setter Property="FontSize" Value="18"/>
+            <Setter Property="FontWeight" Value="Bold"/>
+            <Setter Property="Padding" Value="20,11"/>
+            <Setter Property="Margin" Value="0,0,0,10"/>
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border x:Name="border" Background="{TemplateBinding Background}" 
+                                BorderBrush="{TemplateBinding BorderBrush}"
+                                BorderThickness="{TemplateBinding BorderThickness}"
+                                CornerRadius="8" Padding="{TemplateBinding Padding}">
+                            <ContentPresenter HorizontalAlignment="Center" VerticalAlignment="Center"/>
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter Property="Background" Value="#FFB733"/>
+                                <Setter Property="BorderBrush" Value="#FFE099"/>
+                            </Trigger>
+                            <Trigger Property="IsPressed" Value="True">
+                                <Setter Property="Background" Value="#D48B17"/>
+                            </Trigger>
+                            <Trigger Property="IsEnabled" Value="False">
+                                <Setter Property="Opacity" Value="0.4"/>
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
         </Style>
 
-        <Style TargetType="TextBox">
-            <Setter Property="Background" Value="#313244"/>
-            <Setter Property="Foreground" Value="#CDD6F4"/>
-            <Setter Property="BorderBrush" Value="#45475A"/>
-            <Setter Property="Padding" Value="6,4"/>
-            <Setter Property="VerticalContentAlignment" Value="Center"/>
-        </Style>
-
-        <Style TargetType="ComboBox">
-            <Setter Property="Background" Value="#313244"/>
-            <Setter Property="Foreground" Value="#11111B"/>
-            <Setter Property="BorderBrush" Value="#45475A"/>
-            <Setter Property="Padding" Value="6,4"/>
-        </Style>
-
+        <!-- Standard Action Button Style -->
         <Style TargetType="Button">
-            <Setter Property="Background" Value="#45475A"/>
-            <Setter Property="Foreground" Value="#CDD6F4"/>
-            <Setter Property="BorderBrush" Value="#585B70"/>
+            <Setter Property="Background" Value="#342820"/>
+            <Setter Property="Foreground" Value="#F4E8D1"/>
+            <Setter Property="BorderBrush" Value="#5C4536"/>
             <Setter Property="Padding" Value="12,6"/>
             <Setter Property="Margin" Value="4,0"/>
             <Setter Property="Cursor" Value="Hand"/>
@@ -63,10 +111,11 @@
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True">
-                                <Setter Property="Background" Value="#585B70"/>
+                                <Setter Property="Background" Value="#4A392D"/>
+                                <Setter Property="BorderBrush" Value="#8C6339"/>
                             </Trigger>
                             <Trigger Property="IsPressed" Value="True">
-                                <Setter Property="Background" Value="#313244"/>
+                                <Setter Property="Background" Value="#231B17"/>
                             </Trigger>
                             <Trigger Property="IsEnabled" Value="False">
                                 <Setter Property="Opacity" Value="0.4"/>
@@ -76,224 +125,351 @@
                 </Setter.Value>
             </Setter>
         </Style>
+
+        <!-- Workshop Parchment Card Style -->
+        <Style x:Key="CardStyle" TargetType="Border">
+            <Setter Property="Background" Value="#1E1A17"/>
+            <Setter Property="CornerRadius" Value="8"/>
+            <Setter Property="Padding" Value="16"/>
+            <Setter Property="Margin" Value="0,0,0,12"/>
+            <Setter Property="BorderBrush" Value="#3D3025"/>
+            <Setter Property="BorderThickness" Value="1"/>
+        </Style>
+
+        <!-- Manual Polaroid Photo Frame Style -->
+        <Style x:Key="PolaroidCardStyle" TargetType="Border">
+            <Setter Property="Background" Value="#F6F3EB"/>
+            <Setter Property="CornerRadius" Value="6"/>
+            <Setter Property="Padding" Value="14"/>
+            <Setter Property="Margin" Value="0,0,0,14"/>
+            <Setter Property="BorderBrush" Value="#D9D2C5"/>
+            <Setter Property="BorderThickness" Value="1"/>
+        </Style>
+
+        <Style TargetType="CheckBox">
+            <Setter Property="Foreground" Value="#F4E8D1"/>
+            <Setter Property="Margin" Value="0,6"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+            <Setter Property="FontSize" Value="14"/>
+        </Style>
+
+        <Style TargetType="TextBox">
+            <Setter Property="Background" Value="#2A221C"/>
+            <Setter Property="Foreground" Value="#F4E8D1"/>
+            <Setter Property="BorderBrush" Value="#4A382A"/>
+            <Setter Property="Padding" Value="6,4"/>
+            <Setter Property="VerticalContentAlignment" Value="Center"/>
+        </Style>
+
+        <Style TargetType="ComboBox">
+            <Setter Property="Background" Value="#2A221C"/>
+            <Setter Property="Foreground" Value="#14100E"/>
+            <Setter Property="BorderBrush" Value="#4A382A"/>
+            <Setter Property="Padding" Value="6,4"/>
+        </Style>
     </Window.Resources>
 
-    <Grid Margin="16">
-        <Grid.RowDefinitions>
-            <RowDefinition Height="Auto"/>
-            <RowDefinition Height="*"/>
-            <RowDefinition Height="Auto"/>
-        </Grid.RowDefinitions>
+    <Grid>
+        <Grid.ColumnDefinitions>
+            <ColumnDefinition Width="240"/>
+            <ColumnDefinition Width="*"/>
+        </Grid.ColumnDefinitions>
 
-        <!-- Header -->
-        <Border Grid.Row="0" Background="#181825" CornerRadius="6" Padding="14,10" Margin="0,0,0,12">
-            <Grid>
-                <Grid.ColumnDefinitions>
-                    <ColumnDefinition Width="*"/>
-                    <ColumnDefinition Width="Auto"/>
-                </Grid.ColumnDefinitions>
-                <StackPanel Grid.Column="0">
-                    <TextBlock Text="Dark Cloud 2 Standalone Windows Launcher" FontSize="18" FontWeight="Bold" Foreground="#89B4FA"/>
-                    <TextBlock Text="Recompilation Project Companion &amp; Asset Extraction Engine" FontSize="12" Foreground="#A6ADC8"/>
-                </StackPanel>
-                <StackPanel Grid.Column="1" VerticalAlignment="Center" HorizontalAlignment="Right">
-                    <Border Background="#313244" CornerRadius="4" Padding="8,4">
-                        <TextBlock Text="C# / .NET 8 WPF" FontSize="11" Foreground="#89B4FA" FontWeight="Bold"/>
-                    </Border>
-                </StackPanel>
-            </Grid>
-        </Border>
-
-        <!-- Scrollable Main Options -->
-        <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
-            <StackPanel Margin="0,0,4,0">
-                
-                <!-- Section 1: Game Files & ISO Status -->
-                <GroupBox Header="Game Files &amp; Disc Extraction">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-                        <Grid.RowDefinitions>
-                            <RowDefinition Height="Auto"/>
-                            <RowDefinition Height="Auto"/>
-                        </Grid.RowDefinitions>
-
-                        <StackPanel Grid.Row="0" Grid.Column="0" VerticalAlignment="Center">
-                            <TextBlock Text="{Binding IsoFileName, StringFormat='ISO File: {0}'}" 
-                                       ToolTip="{Binding IsoFileName}" TextTrimming="CharacterEllipsis" Margin="0,2"/>
-                            <TextBlock Text="{Binding DataStatusText, StringFormat='DATA Status: {0}'}" 
-                                       Foreground="#FAB387" Margin="0,2" FontWeight="SemiBold"/>
-                        </StackPanel>
-
-                        <StackPanel Grid.Row="0" Grid.Column="1" Orientation="Horizontal" VerticalAlignment="Center">
-                            <Button Content="Browse ISO..." Command="{Binding BrowseIsoCommand}" IsEnabled="{Binding CanModifySettings}" TabIndex="1"
-                                    ToolTip="Choose ISO file location using Windows file picker"/>
-                            <Button Content="Extract ISO" Command="{Binding ExtractIsoCommand}" IsEnabled="{Binding CanExtract}" TabIndex="2"
-                                    ToolTip="Known Supported: Extract game disc files cleanly into DATA directory using DiscUtils"/>
-                            <Button Content="Cancel Extraction" Command="{Binding CancelExtractionCommand}" IsEnabled="{Binding IsExtracting}" TabIndex="3"
-                                    ToolTip="Cancel active ISO extraction operation"/>
-                            <Button Content="Open DATA" Command="{Binding OpenDataFolderCommand}" TabIndex="4"
-                                    ToolTip="Open extracted DATA directory in Windows Explorer"/>
-                        </StackPanel>
-
-                        <!-- Extraction Progress Bar -->
-                        <Grid Grid.Row="1" Grid.ColumnSpan="2" Margin="0,10,0,2" Visibility="{Binding IsExtracting, Converter={StaticResource BoolToVisConverter}}">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*"/>
-                                <ColumnDefinition Width="Auto"/>
-                            </Grid.ColumnDefinitions>
-                            <ProgressBar Height="16" Value="{Binding ExtractionProgress}" Minimum="0" Maximum="100" 
-                                         Foreground="#A6E3A1" Background="#313244" BorderThickness="0"/>
-                            <TextBlock Grid.Column="1" Text="{Binding ExtractionProgress, StringFormat='{}{0:F0}%'}" Foreground="#A6E3A1" 
-                                       FontWeight="Bold" Margin="8,0,0,0" VerticalAlignment="Center"/>
-                        </Grid>
-                    </Grid>
-                </GroupBox>
-
-                <!-- Section 2: Recomp Game Options & Graphics -->
-                <GroupBox Header="Game Options &amp; Graphics">
-                    <StackPanel>
-                        <CheckBox Content="Skip Intro [Awaiting Recomp Hook]" IsChecked="{Binding SkipIntro}" IsEnabled="{Binding CanModifySettings}" TabIndex="5"
-                                  ToolTip="Proposed Recomp Integration: Emits DC2_SKIP_INTRO=1 to child process environment (Requires recomp integration)"/>
-                        
-                        <CheckBox Content="Enable 60 FPS [Known Supported]" IsChecked="{Binding Enable60Fps}" IsEnabled="{Binding CanModifySettings}" TabIndex="6"
-                                  ToolTip="Known Supported: Emits DC2_PATCH_60FPS=1 to child process environment"/>
-                        
-                        <CheckBox Content="Enable Debug Menu [Known Supported]" IsChecked="{Binding EnableDebugMenu}" IsEnabled="{Binding CanModifySettings}" TabIndex="7"
-                                  ToolTip="Known Supported: Emits DC2_DEBUG_MENU=1 to child process environment"/>
-                        
-                        <Grid Margin="0,8,0,4">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="Auto"/>
-                                <ColumnDefinition Width="180"/>
-                                <ColumnDefinition Width="*"/>
-                            </Grid.ColumnDefinitions>
-                            <Label Content="Resolution Mode [Awaiting Recomp Hook]:" Target="{Binding ElementName=ComboResMode}" VerticalAlignment="Center" Margin="0,0,8,0" Foreground="#CDD6F4"/>
-                            <ComboBox x:Name="ComboResMode" Grid.Column="1" ItemsSource="{Binding ResolutionModes}" SelectedItem="{Binding SelectedResolutionMode}" 
-                                      IsEnabled="{Binding CanModifySettings}" TabIndex="8" ToolTip="Emits DC2_RESOLUTION_WIDTH and DC2_RESOLUTION_HEIGHT"/>
-
-                            <!-- Custom Resolution Width & Height TextBoxes -->
-                            <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="12,0,0,0" 
-                                        Visibility="{Binding IsCustomResolutionSelected, Converter={StaticResource BoolToVisConverter}}">
-                                <Label Content="Width:" Target="{Binding ElementName=TxtWidth}" VerticalAlignment="Center" Foreground="#CDD6F4"/>
-                                <TextBox x:Name="TxtWidth" Width="60" Text="{Binding CustomResolutionWidth, UpdateSourceTrigger=PropertyChanged}" 
-                                         IsEnabled="{Binding CanModifySettings}" TabIndex="9" Margin="4,0,8,0"/>
-                                
-                                <Label Content="Height:" Target="{Binding ElementName=TxtHeight}" VerticalAlignment="Center" Foreground="#CDD6F4"/>
-                                <TextBox x:Name="TxtHeight" Width="60" Text="{Binding CustomResolutionHeight, UpdateSourceTrigger=PropertyChanged}" 
-                                         IsEnabled="{Binding CanModifySettings}" TabIndex="10" Margin="4,0"/>
-                            </StackPanel>
-                        </Grid>
-
-                        <CheckBox Content="Fullscreen Mode [Awaiting Recomp Hook]" IsChecked="{Binding Fullscreen}" IsEnabled="{Binding CanModifySettings}" TabIndex="11"
-                                  ToolTip="Proposed Recomp Integration: Emits DC2_FULLSCREEN=1 to child process environment"/>
-                    </StackPanel>
-                </GroupBox>
-
-                <!-- Section 3: Memory Cards & Save Folders -->
-                <GroupBox Header="Memory Cards &amp; Save Folders">
-                    <Grid>
-                        <Grid.ColumnDefinitions>
-                            <ColumnDefinition Width="Auto"/>
-                            <ColumnDefinition Width="*"/>
-                            <ColumnDefinition Width="Auto"/>
-                        </Grid.ColumnDefinitions>
-                        <Grid.RowDefinitions>
-                            <RowDefinition Height="Auto"/>
-                            <RowDefinition Height="Auto"/>
-                        </Grid.RowDefinitions>
-
-                        <!-- Slot 1 -->
-                        <Label Grid.Row="0" Grid.Column="0" Content="Memory Card 1 [Awaiting Hook]:" Target="{Binding ElementName=TxtMem1}" VerticalAlignment="Center" Margin="0,4" Foreground="#CDD6F4"/>
-                        <TextBox x:Name="TxtMem1" Grid.Row="0" Grid.Column="1" Text="{Binding MemoryCard1Path, UpdateSourceTrigger=PropertyChanged}" 
-                                 IsEnabled="{Binding CanModifySettings}" TabIndex="12" Margin="6,4"/>
-                        <StackPanel Grid.Row="0" Grid.Column="2" Orientation="Horizontal">
-                            <Button Content="Browse..." Command="{Binding BrowseMemCard1Command}" IsEnabled="{Binding CanModifySettings}" TabIndex="13"/>
-                            <Button Content="Open Folder" Command="{Binding OpenMemCard1FolderCommand}" TabIndex="14"/>
-                            <Button Content="Reset" Command="{Binding ResetMemCard1Command}" IsEnabled="{Binding CanModifySettings}" TabIndex="15"/>
-                        </StackPanel>
-
-                        <!-- Slot 2 -->
-                        <Label Grid.Row="1" Grid.Column="0" Content="Memory Card 2 [Awaiting Hook]:" Target="{Binding ElementName=TxtMem2}" VerticalAlignment="Center" Margin="0,4" Foreground="#CDD6F4"/>
-                        <TextBox x:Name="TxtMem2" Grid.Row="1" Grid.Column="1" Text="{Binding MemoryCard2Path, UpdateSourceTrigger=PropertyChanged}" 
-                                 IsEnabled="{Binding CanModifySettings}" TabIndex="16" Margin="6,4"/>
-                        <StackPanel Grid.Row="1" Grid.Column="2" Orientation="Horizontal">
-                            <Button Content="Browse..." Command="{Binding BrowseMemCard2Command}" IsEnabled="{Binding CanModifySettings}" TabIndex="17"/>
-                            <Button Content="Open Folder" Command="{Binding OpenMemCard2FolderCommand}" TabIndex="18"/>
-                            <Button Content="Reset" Command="{Binding ResetMemCard2Command}" IsEnabled="{Binding CanModifySettings}" TabIndex="19"/>
-                        </StackPanel>
-                    </Grid>
-                </GroupBox>
-
-                <!-- Section 4: Custom Mods & Controller -->
-                <GroupBox Header="Mods Folder &amp; Controller Customization">
-                    <StackPanel>
-                        <Grid Margin="0,2">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*"/>
-                                <ColumnDefinition Width="Auto"/>
-                            </Grid.ColumnDefinitions>
-                            <CheckBox Content="Enable Mods Folder Override [Awaiting Recomp Hook]" IsChecked="{Binding EnableModsFolder}" IsEnabled="{Binding CanModifySettings}" TabIndex="20"
-                                      ToolTip="Proposed Recomp Integration: Emits DC2_MODS_ENABLED=1, DC2_MODS_DIR, and DC2_DATA_DIR (Scans Mods folder for overrides)"/>
-                            <Button Grid.Column="1" Content="Open Mods Folder" Command="{Binding OpenModsFolderCommand}" TabIndex="21"
-                                    ToolTip="Open Mods override directory in Windows Explorer"/>
-                        </Grid>
-
-                        <Grid Margin="0,8,0,2">
-                            <Grid.ColumnDefinitions>
-                                <ColumnDefinition Width="*"/>
-                                <ColumnDefinition Width="Auto"/>
-                            </Grid.ColumnDefinitions>
-                            <StackPanel VerticalAlignment="Center">
-                                <TextBlock Text="Controller Customization &amp; Key Rebind Profiles [Awaiting Recomp Hook]" FontWeight="SemiBold" Foreground="#89B4FA"/>
-                                <TextBlock Text="Configure keyboard keys &amp; Xbox/XInput controller buttons for all 24 PS2 controls" FontSize="11" Foreground="#A6ADC8"/>
-                            </StackPanel>
-                            <Button Grid.Column="1" Content="Customize Controller..." Command="{Binding CustomizeControllerCommand}" IsEnabled="{Binding CanModifySettings}" TabIndex="22"
-                                    Background="#313244" BorderBrush="#89B4FA" Foreground="#89B4FA" FontWeight="Bold"/>
-                        </Grid>
-                    </StackPanel>
-                </GroupBox>
-
-            </StackPanel>
-        </ScrollViewer>
-
-        <!-- Footer Actions & Diagnostic Area -->
-        <Border Grid.Row="2" Background="#181825" CornerRadius="6" Padding="12" Margin="0,10,0,0">
+        <!-- Left Menu Sidebar (Aged Leather & Wood Workshop Journal Style) -->
+        <Border Grid.Column="0" Background="#1B1512" BorderBrush="#2D211B" BorderThickness="0,0,1,0" Padding="16,24">
             <Grid>
                 <Grid.RowDefinitions>
                     <RowDefinition Height="Auto"/>
+                    <RowDefinition Height="*"/>
                     <RowDefinition Height="Auto"/>
                 </Grid.RowDefinitions>
 
-                <Grid Grid.Row="0">
-                    <Grid.ColumnDefinitions>
-                        <ColumnDefinition Width="*"/>
-                        <ColumnDefinition Width="Auto"/>
-                    </Grid.ColumnDefinitions>
+                <!-- Header Logo & Title -->
+                <StackPanel Grid.Row="0" Margin="0,0,0,16">
+                    <TextBlock Text="DARK CLOUD 2" FontSize="20" FontWeight="Black" Foreground="#F5A623" TextAlignment="Left"/>
+                    <TextBlock Text="- RECOMPILED -" FontSize="13" FontWeight="Bold" Foreground="#3B9EFF" TextAlignment="Left" Margin="0,-2,0,0"/>
+                </StackPanel>
 
-                    <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center">
-                        <Button Content="Validate Launch" Command="{Binding ValidateLaunchCommand}" TabIndex="23"
-                                ToolTip="Run pre-flight validation check on runner executable, ELF file, and settings"/>
-                        <Button Content="Dry Run / Diagnostics" Command="{Binding DryRunLaunchCommand}" IsEnabled="{Binding CanModifySettings}" TabIndex="24"
-                                ToolTip="Display exact process launch arguments and environment variables without starting game"/>
-                        <Button Content="Open Logs" Command="{Binding OpenLogsFolderCommand}" TabIndex="25"
-                                ToolTip="Open launcher log directory in Windows Explorer"/>
-                    </StackPanel>
+                <!-- Middle Menu Options (Start Game at balanced position) -->
+                <StackPanel Grid.Row="1" VerticalAlignment="Top" Margin="0,12,0,0">
+                    <Button Content="Start Game" Command="{Binding PlayCommand}" 
+                            Style="{StaticResource PrimaryMenuButtonStyle}" Margin="0,0,0,20"/>
 
-                    <!-- Big Play Button -->
-                    <Button Grid.Column="1" Content="PLAY GAME" Command="{Binding PlayCommand}" IsEnabled="{Binding CanPlay}" TabIndex="26"
-                            Background="#A6E3A1" Foreground="#11111B" BorderBrush="#A6E3A1" 
-                            FontWeight="Bold" FontSize="15" Padding="24,8"/>
-                </Grid>
+                    <Button Content="Extract ISO" Command="{Binding SelectHomeCommand}" 
+                            Style="{StaticResource MenuButtonStyle}"/>
 
-                <!-- Status Message Display Box -->
-                <Border Grid.Row="1" Background="#11111B" CornerRadius="4" Padding="10,6" Margin="0,10,0,0">
-                    <TextBlock Text="{Binding StatusMessage}" Foreground="#CDD6F4" FontSize="12" TextWrapping="Wrap" 
-                               MaxHeight="60" VerticalAlignment="Center"/>
-                </Border>
+                    <Button Content="Controls" Command="{Binding SelectControlsCommand}" 
+                            Style="{StaticResource MenuButtonStyle}"/>
+
+                    <Button Content="Settings" Command="{Binding SelectSettingsCommand}" 
+                            Style="{StaticResource MenuButtonStyle}"/>
+
+                    <Button Content="Mods" Command="{Binding SelectModsCommand}" 
+                            Style="{StaticResource MenuButtonStyle}"/>
+                </StackPanel>
+
+                <!-- Bottom Options: Exit & Footer -->
+                <StackPanel Grid.Row="2">
+                    <!-- Exit button slightly above Standalone Windows Launcher tag -->
+                    <Button Content="Exit" Command="{Binding ExitCommand}" 
+                            Style="{StaticResource MenuButtonStyle}" Margin="0,0,0,12"/>
+
+                    <!-- Footer Tag -->
+                    <TextBlock Text="Standalone Windows Launcher v1.0" FontSize="10" Foreground="#8C7A6B" HorizontalAlignment="Center"/>
+                </StackPanel>
             </Grid>
         </Border>
+
+        <!-- Right Content Panel (Dark Cloud 2 Workshop Area) -->
+        <Grid Grid.Column="1" Margin="20,20,20,16">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <!-- Active View Containers -->
+            <Grid Grid.Row="0">
+                
+                <!-- EXTRACT ISO / GAME FILES VIEW -->
+                <ScrollViewer VerticalScrollBarVisibility="Auto" 
+                              Visibility="{Binding IsHomeTabActive, Converter={StaticResource BoolToVisConverter}}">
+                    <StackPanel>
+                        <!-- Polaroid Photo Card Status Banner -->
+                        <Border Style="{StaticResource PolaroidCardStyle}">
+                            <StackPanel>
+                                <TextBlock Text="Game Files &amp; Disc Extraction" FontSize="20" FontWeight="Bold" Foreground="#2A1E17"/>
+                                <TextBlock Text="{Binding DataStatusText}" FontSize="13" Foreground="#594639" Margin="0,4,0,12"/>
+
+                                <!-- Extraction Progress Bar -->
+                                <Grid Margin="0,4,0,8" Visibility="{Binding IsExtracting, Converter={StaticResource BoolToVisConverter}}">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <ProgressBar Height="16" Value="{Binding ExtractionProgress}" Minimum="0" Maximum="100" 
+                                                 Foreground="#F5A623" Background="#D9D2C5" BorderThickness="0"/>
+                                    <TextBlock Grid.Column="1" Text="{Binding ExtractionProgress, StringFormat='{}{0:F0}%'}" Foreground="#D48B17" 
+                                               FontWeight="Bold" Margin="8,0,0,0" VerticalAlignment="Center"/>
+                                </Grid>
+
+                                <StackPanel Orientation="Horizontal" Margin="0,4,0,0" Visibility="{Binding IsExtracting, Converter={StaticResource BoolToVisConverter}}">
+                                    <Button Content="Cancel Extraction" Command="{Binding CancelExtractionCommand}" 
+                                            IsEnabled="{Binding IsExtracting}"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- ISO Files Card -->
+                        <Border Style="{StaticResource CardStyle}">
+                            <StackPanel>
+                                <TextBlock Text="Game Disc / ISO Image Location" FontSize="16" FontWeight="SemiBold" Foreground="#F5A623" Margin="0,0,0,8"/>
+                                <TextBlock Text="{Binding IsoFileName, StringFormat='ISO Path: {0}'}" 
+                                           ToolTip="{Binding IsoFileName}" TextTrimming="CharacterEllipsis" Foreground="#F4E8D1" Margin="0,0,0,12"/>
+
+                                <StackPanel Orientation="Horizontal">
+                                    <Button Content="Browse ISO..." Command="{Binding BrowseIsoCommand}" IsEnabled="{Binding CanModifySettings}" Margin="0,0,8,0"/>
+                                    <Button Content="Extract ISO Files" Command="{Binding ExtractIsoCommand}" IsEnabled="{Binding CanExtract}" Margin="0,0,8,0"/>
+                                    <Button Content="Open DATA Directory" Command="{Binding OpenDataFolderCommand}"/>
+                                </StackPanel>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+
+                <!-- CONTROLS CUSTOMIZATION VIEW (Inline Right Side Panel - Properly Scoped DataContext) -->
+                <ScrollViewer VerticalScrollBarVisibility="Auto" 
+                              Visibility="{Binding IsControlsTabActive, Converter={StaticResource BoolToVisConverter}}">
+                    <Grid DataContext="{Binding ControllerVM}">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="Auto"/>
+                            <RowDefinition Height="*"/>
+                        </Grid.RowDefinitions>
+
+                        <!-- Header & Title -->
+                        <TextBlock Grid.Row="0" Text="Controller &amp; Key Rebind Profiles" FontSize="20" FontWeight="Bold" Foreground="#F5A623" Margin="0,0,0,10"/>
+
+                        <!-- Top Options Bar: Stick Dead Zones & Actions -->
+                        <Border Grid.Row="1" Style="{StaticResource CardStyle}" Padding="12">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+
+                                <!-- Left Stick -->
+                                <StackPanel Grid.Column="0" Margin="0,0,12,0">
+                                    <TextBlock Text="{Binding LeftStickDeadZone, StringFormat='Left Stick Dead Zone: {0:F0}%'}" FontSize="12" Foreground="#F4E8D1"/>
+                                    <Slider Minimum="0" Maximum="50" Value="{Binding LeftStickDeadZone}" TickFrequency="5" IsSnapToTickEnabled="True" Margin="0,2,0,0"/>
+                                </StackPanel>
+
+                                <!-- Right Stick -->
+                                <StackPanel Grid.Column="1" Margin="0,0,12,0">
+                                    <TextBlock Text="{Binding RightStickDeadZone, StringFormat='Right Stick Dead Zone: {0:F0}%'}" FontSize="12" Foreground="#F4E8D1"/>
+                                    <Slider Minimum="0" Maximum="50" Value="{Binding RightStickDeadZone}" TickFrequency="5" IsSnapToTickEnabled="True" Margin="0,2,0,0"/>
+                                </StackPanel>
+
+                                <!-- Action Buttons -->
+                                <StackPanel Grid.Column="2" Orientation="Horizontal" VerticalAlignment="Center">
+                                    <Button Content="Save Mappings" Command="{Binding SaveAndCloseCommand}" 
+                                            Background="#F5A623" Foreground="#120E0A" FontWeight="Bold" Padding="14,6" Margin="0,0,6,0"/>
+                                    <Button Content="Reset Defaults" Command="{Binding ResetDefaultsCommand}" 
+                                            Background="#2A221C" Foreground="#E06C75" BorderBrush="#4A382A" Padding="10,6"/>
+                                </StackPanel>
+                            </Grid>
+                        </Border>
+
+                        <!-- 2-Column Compact Control Bindings Grid -->
+                        <Border Grid.Row="2" Style="{StaticResource CardStyle}" Padding="8">
+                            <ItemsControl ItemsSource="{Binding ButtonBindings}">
+                                <ItemsControl.ItemsPanel>
+                                    <ItemsPanelTemplate>
+                                        <UniformGrid Columns="2"/>
+                                    </ItemsPanelTemplate>
+                                </ItemsControl.ItemsPanel>
+                                <ItemsControl.ItemTemplate>
+                                    <DataTemplate DataType="{x:Type viewModels:ButtonBindingItemViewModel}">
+                                        <Border BorderBrush="#3D3025" BorderThickness="1" CornerRadius="6" Background="#161210" Padding="8,5" Margin="3">
+                                            <Grid>
+                                                <Grid.ColumnDefinitions>
+                                                    <ColumnDefinition Width="*" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                    <ColumnDefinition Width="Auto" />
+                                                </Grid.ColumnDefinitions>
+
+                                                <TextBlock Grid.Column="0" Text="{Binding DisplayName}" VerticalAlignment="Center" FontWeight="SemiBold" Foreground="#F4E8D1" FontSize="11" TextTrimming="CharacterEllipsis" />
+                                                <TextBlock Grid.Column="1" Text="{Binding BoundKey}" VerticalAlignment="Center" Foreground="#F5C542" FontWeight="Bold" FontSize="11" Margin="6,0" />
+                                                <Button Grid.Column="2" Content="Rebind" Command="{Binding RebindCommand}" Width="52" Height="22" FontSize="11" Padding="0" />
+                                            </Grid>
+                                        </Border>
+                                    </DataTemplate>
+                                </ItemsControl.ItemTemplate>
+                            </ItemsControl>
+                        </Border>
+
+                        <!-- Input Capture Overlay Modal (Inline) -->
+                        <Grid Grid.RowSpan="3" Background="#DD14100E" Visibility="{Binding IsCapturingInput, Converter={StaticResource BoolToVisConverter}}">
+                            <Border Background="#1E1A17" BorderBrush="#F5A623" BorderThickness="2" CornerRadius="8" Padding="20" Width="340" Height="180" HorizontalAlignment="Center" VerticalAlignment="Center">
+                                <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
+                                    <TextBlock Text="Press Key or Controller Button" FontSize="15" FontWeight="Bold" Foreground="#F5A623" HorizontalAlignment="Center" Margin="0,0,0,6" />
+                                    <TextBlock Text="{Binding CapturingButtonName}" FontSize="13" Foreground="#3B9EFF" HorizontalAlignment="Center" Margin="0,0,0,10" />
+
+                                    <TextBlock Text="{Binding CaptureTimeoutSeconds, StringFormat='Timing out in {0} seconds...'}" Foreground="#F4E8D1" FontSize="12" HorizontalAlignment="Center" Margin="0,0,0,12" />
+
+                                    <Button Content="Cancel Rebind" Command="{Binding CancelRebindCommand}" Width="100" Height="24" FontSize="11" Background="#2A221C" Foreground="#F4E8D1" HorizontalAlignment="Center" />
+                                </StackPanel>
+                            </Border>
+                        </Grid>
+                    </Grid>
+                </ScrollViewer>
+
+                <!-- SETTINGS VIEW -->
+                <ScrollViewer VerticalScrollBarVisibility="Auto" 
+                              Visibility="{Binding IsSettingsTabActive, Converter={StaticResource BoolToVisConverter}}">
+                    <StackPanel>
+                        <TextBlock Text="Settings" FontSize="20" FontWeight="Bold" Foreground="#F5A623" Margin="0,0,0,14"/>
+
+                        <!-- Graphics Options Card -->
+                        <Border Style="{StaticResource CardStyle}">
+                            <StackPanel>
+                                <TextBlock Text="Graphics &amp; Gameplay Options" FontSize="16" FontWeight="SemiBold" Foreground="#F5A623" Margin="0,0,0,10"/>
+                                
+                                <CheckBox Content="Enable 60 FPS Patch [Known Supported]" IsChecked="{Binding Enable60Fps}" IsEnabled="{Binding CanModifySettings}"/>
+                                <CheckBox Content="Enable Debug Menu [Known Supported]" IsChecked="{Binding EnableDebugMenu}" IsEnabled="{Binding CanModifySettings}"/>
+                                <CheckBox Content="Skip Game Intro [Awaiting Recomp Hook]" IsChecked="{Binding SkipIntro}" IsEnabled="{Binding CanModifySettings}"/>
+                                <CheckBox Content="Fullscreen Mode [Awaiting Recomp Hook]" IsChecked="{Binding Fullscreen}" IsEnabled="{Binding CanModifySettings}"/>
+
+                                <!-- Resolution Mode -->
+                                <Grid Margin="0,12,0,4">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="180"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Label Content="Resolution Mode:" Target="{Binding ElementName=ComboResModeSettings}" VerticalAlignment="Center" Margin="0,0,8,0" Foreground="#F4E8D1"/>
+                                    <ComboBox x:Name="ComboResModeSettings" Grid.Column="1" ItemsSource="{Binding ResolutionModes}" SelectedItem="{Binding SelectedResolutionMode}" 
+                                              IsEnabled="{Binding CanModifySettings}"/>
+
+                                    <StackPanel Grid.Column="2" Orientation="Horizontal" Margin="12,0,0,0" 
+                                                Visibility="{Binding IsCustomResolutionSelected, Converter={StaticResource BoolToVisConverter}}">
+                                        <Label Content="Width:" Target="{Binding ElementName=TxtWidthSettings}" VerticalAlignment="Center" Foreground="#F4E8D1"/>
+                                        <TextBox x:Name="TxtWidthSettings" Width="60" Text="{Binding CustomResolutionWidth, UpdateSourceTrigger=PropertyChanged}" 
+                                                 IsEnabled="{Binding CanModifySettings}" Margin="4,0,8,0"/>
+                                        
+                                        <Label Content="Height:" Target="{Binding ElementName=TxtHeightSettings}" VerticalAlignment="Center" Foreground="#CDD6F4"/>
+                                        <TextBox x:Name="TxtHeightSettings" Width="60" Text="{Binding CustomResolutionHeight, UpdateSourceTrigger=PropertyChanged}" 
+                                                 IsEnabled="{Binding CanModifySettings}"/>
+                                    </StackPanel>
+                                </Grid>
+                            </StackPanel>
+                        </Border>
+
+                        <!-- Memory Cards Card -->
+                        <Border Style="{StaticResource CardStyle}">
+                            <StackPanel>
+                                <TextBlock Text="Memory Cards &amp; Save Locations" FontSize="16" FontWeight="SemiBold" Foreground="#F5A623" Margin="0,0,0,10"/>
+
+                                <Grid Margin="0,4">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Label Grid.Column="0" Content="Slot 1:" Target="{Binding ElementName=TxtMem1Settings}" VerticalAlignment="Center" Foreground="#F4E8D1"/>
+                                    <TextBox x:Name="TxtMem1Settings" Grid.Column="1" Text="{Binding MemoryCard1Path, UpdateSourceTrigger=PropertyChanged}" 
+                                             IsEnabled="{Binding CanModifySettings}" Margin="6,0"/>
+                                    <StackPanel Grid.Column="2" Orientation="Horizontal">
+                                        <Button Content="Browse..." Command="{Binding BrowseMemCard1Command}" IsEnabled="{Binding CanModifySettings}"/>
+                                        <Button Content="Open" Command="{Binding OpenMemCard1FolderCommand}"/>
+                                        <Button Content="Reset" Command="{Binding ResetMemCard1Command}" IsEnabled="{Binding CanModifySettings}"/>
+                                    </StackPanel>
+                                </Grid>
+
+                                <Grid Margin="0,8,0,0">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto"/>
+                                        <ColumnDefinition Width="*"/>
+                                        <ColumnDefinition Width="Auto"/>
+                                    </Grid.ColumnDefinitions>
+                                    <Label Grid.Column="0" Content="Slot 2:" Target="{Binding ElementName=TxtMem2Settings}" VerticalAlignment="Center" Foreground="#F4E8D1"/>
+                                    <TextBox x:Name="TxtMem2Settings" Grid.Column="1" Text="{Binding MemoryCard2Path, UpdateSourceTrigger=PropertyChanged}" 
+                                             IsEnabled="{Binding CanModifySettings}" Margin="6,0"/>
+                                    <StackPanel Grid.Column="2" Orientation="Horizontal">
+                                        <Button Content="Browse..." Command="{Binding BrowseMemCard2Command}" IsEnabled="{Binding CanModifySettings}"/>
+                                        <Button Content="Open" Command="{Binding OpenMemCard2FolderCommand}"/>
+                                        <Button Content="Reset" Command="{Binding ResetMemCard2Command}" IsEnabled="{Binding CanModifySettings}"/>
+                                    </StackPanel>
+                                </Grid>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+
+                <!-- MODS VIEW -->
+                <ScrollViewer VerticalScrollBarVisibility="Auto" 
+                              Visibility="{Binding IsModsTabActive, Converter={StaticResource BoolToVisConverter}}">
+                    <StackPanel>
+                        <TextBlock Text="Mods Management" FontSize="20" FontWeight="Bold" Foreground="#F5A623" Margin="0,0,0,14"/>
+
+                        <Border Style="{StaticResource CardStyle}">
+                            <StackPanel>
+                                <CheckBox Content="Enable Mods Folder Override [Awaiting Recomp Hook]" IsChecked="{Binding EnableModsFolder}" IsEnabled="{Binding CanModifySettings}"/>
+                                <TextBlock Text="When enabled, files inside the Mods/ directory take priority over extracted DATA/ files." 
+                                           FontSize="12" Foreground="#C5B499" Margin="0,4,0,12"/>
+
+                                <Button Content="Open Mods Folder" Command="{Binding OpenModsFolderCommand}" HorizontalAlignment="Left" Padding="16,8"/>
+                            </StackPanel>
+                        </Border>
+                    </StackPanel>
+                </ScrollViewer>
+
+            </Grid>
+
+            <!-- Bottom Status Bar -->
+            <Border Grid.Row="1" Background="#1B1512" BorderBrush="#2D211B" BorderThickness="1" CornerRadius="6" Padding="12,8" Margin="0,12,0,0">
+                <TextBlock Text="{Binding StatusMessage}" Foreground="#F4E8D1" FontSize="12" TextWrapping="Wrap" MaxHeight="60"/>
+            </Border>
+        </Grid>
     </Grid>
 </Window>
