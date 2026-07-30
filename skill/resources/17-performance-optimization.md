@@ -95,6 +95,57 @@ write → build → run → **compare output metric AND time metric** → record
   under a census env whose gate silently disabled the Z-readback coalescer; the lean class was
   ~2–3 ms and the built mechanism landed neutral.)
 
+- **When a candidate is worth less than the run-to-run noise, change the EXPERIMENT, not the target.**
+  Separate-process A/B carries a per-process offset (thermal state, allocator/page layout, driver
+  warm-up) that on a real title was ±1.5 ms on a ~67 ms frame. Five alternating-order pairs then
+  reported *opposite signs for two arms of the same mechanism* — which is how a genuinely exact win
+  gets retired as "inseparable". The fix is a **within-process A/B**: find a work item that happens
+  exactly ONCE per frame, and use the interval between consecutive occurrences as a frame period
+  sampled at a fixed phase. Switch the arm inside one process, bucket each period by the arm that
+  produced it, and hundreds of interleaved samples per run collapse the process-level term. Three
+  nuisances must be removed before the number means anything:
+  1. **Warm-up bias** — whichever arm owns the first block inherits the route's load-in. Skip a
+     warm-up prefix (~120 frames) before accumulating.
+  2. **Parity aliasing** — fixed "N frames A, N frames B" alternation aliases with any workload period
+     that is a multiple of 2N. Measured: at N=60 the arm looked 0.79 ms *slower*, and swapping which
+     parity got which arm flipped the sign. Always ship an **invert control**, or better, assign the
+     arm **per frame from a fixed LCG** — randomisation cannot alias and makes the SEs meaningful.
+  3. **Drift inside the run** — both arm means climb together, so a pooled SE overstates the error.
+     Also report a **blocked estimator**: difference consecutive periodic prints, take per-window
+     deltas, average those. (Real case: pooled se 0.120 ms vs blocked se 0.077 ms, t = −3.2.)
+- **A refactor at the shared dispatch site is a change to the CONTROL ARM — and the A/B cannot
+  see it.** When you add a fast path beside an existing one, both arms still flow through the
+  site you edited, so any wrapper you introduce there is paid by *both* and silently inflates the
+  measured win. Real case: wrapping an interpreter's `execUpper` call in a `[&]` lambda that did
+  not inline gave the lever-OFF path a lambda frame *plus* the original call (2 calls where the
+  pre-phase binary had 1); the control went 67 → 74 ms and the A/B read **−9.8%** for a lever
+  worth **−8.4%**. Two siblings of the same mistake in one phase: an inlined per-event census
+  histogram cost ~2 ms/frame on the default path (fix: `noinline` hook, so the loop carries only
+  a cached-bool test and a never-taken call), and a *second* inlined copy of the fast-path body
+  at a site worth 0.69% of executions cost more in hot-loop instruction footprint than that share
+  could repay (fix: leave rare sites on the legacy path — more inlining is not better).
+  **Protocol:** after editing any shared hot path, re-measure the **control arm alone** against
+  the pre-phase absolute before trusting the delta; if the control moved, fix that first. Prefer
+  a local `do{…}while(0)` macro over a lambda/helper at hot dispatch sites so the legacy call
+  shape stays byte-identical, and delete census counters from the loop once their values are
+  recorded. (DC2 G421.)
+- **An interpreter's call boundary has a price you may have already paid for — look it up before
+  designing.** If an earlier phase won by *skipping* a dispatch for some share of events, divide
+  its gain by the events it skipped to get ns-per-call, then multiply by the events that still
+  pay it. Real case: a prior phase bought 8.9% of a worker thread by skipping the call for the
+  49.5% no-op share ⇒ ~8.6 ns/call ⇒ inlining the *remaining* 0.82 M calls/frame had a ~7 ms
+  (~10.5%) ceiling, known before a line was written, and it landed at −8.4%. This is the payoff
+  ceiling of §2's premise gate computed from an already-measured constant instead of a new probe.
+- **Measure the site's critical-path sensitivity with BALLAST before believing any payoff.** Removed
+  work is not payoff (a candidate can sit behind slack, or its thread may not be the pole). Cheap
+  direct test: run BOTH buckets on the unoptimized path and have one bucket repeat it N extra times —
+  choose a repetition that is **idempotent** (rewriting identical bytes) so output cannot change. The
+  measured delta divided by the known added cost is the fraction of work at that site that reaches the
+  frame. Multiply an isolated saving by that ratio to get an honest prediction, and compare the
+  prediction to the end-to-end result: if they match, the work did not reappear elsewhere. (Real case:
+  +1.852 ms of ballast moved the frame +1.717 ms ⇒ 0.93 sensitivity; a 0.344 ms saving then predicted
+  −0.32 ms and measured −0.31 ms.) A low ratio retires the candidate for the cost of one run.
+
 ### Optimization Premise Gate
 
 Pass this gate before implementing a performance phase:
@@ -108,7 +159,26 @@ Pass this gate before implementing a performance phase:
    buckets. (DC2 G293/G294 spent two phases on worker-side readback costs whose true frame
    ceiling was the EE thread's 3–8 ms wait slice; the actual pole — the VU1 interpreter at
    72–74% of the frame — was absent from the table because no instrument attributed the
-   critical thread's own compute.)
+   critical thread's own compute.) **This decays — re-run it EVERY phase, not once per arc.**
+   A later arc on the same title spent *seven consecutive phases* grinding 0.1–0.7 ms slices out
+   of the GS front end (one of which promoted nothing at all) because the thread table was
+   inherited from an older profile. One 60-second re-run showed the *other* worker sitting at
+   ~98% of the frame (65.2 ms busy vs a 66.2 ms frame), and the first lever aimed there was worth
+   −8.4%. Corollary: re-run it again **after** a big win — the same phase moved the poles to
+   ~62 vs ~59 ms, close enough that the next slice on the old pole may buy nothing. (DC2
+   G414–G421.)
+   - **0a. Audit what each thread counter actually COVERS before ranking with it.** A worker
+     "busy" counter that brackets only one branch of the worker loop silently under-reports that
+     thread. In a later phase the GS worker's headline field covered only the packet-window branch
+     and excluded the frame-boundary closure and apply branches — it read 44–46 ms while the
+     all-branch census read **50–53 ms**, which inverted the pole ranking against a VU1 worker at
+     45–49 ms. Read the accumulator's definition (and its own comment) before you trust it, and
+     prefer the census that explicitly sums *every* branch. (DC2 G424.)
+   - **0b. Subtract each thread's WAIT-ON-PEER slice before calling its busy time "work."** After a
+     win on one thread its counter can stay flat while its *content* changes from compute to idle
+     hand-off waiting. Same phase: the GS worker's total held at ~50 ms but ~8 ms of it became
+     "waiting for VU1", so its real work was ~42 ms and the pole had genuinely moved. Ranking on
+     the un-decomposed total would have aimed the next phase at the wrong thread. (DC2 G424.)
 1. Profile the **current final executable** with the intended defaults, route, warm-up, and steady
    window. Do not reuse a pre-fix profile as the phase premise.
 2. Split inclusive buckets until the candidate's exclusive cost is known. Record waits, drains,
@@ -133,6 +203,28 @@ Pass this gate before implementing a performance phase:
    A mechanism that moves work to another edge is not a win.
 5. Record the rejected premise in the phase log, including the build/defaults that invalidate the
    old measurement. Diagnostics-only closure is a valid phase result.
+6. **Power the A/B before you believe a null.** One run per arm, judged from the last few windows a
+   harness prints, cannot resolve a lever smaller than the run-to-run offset noise (±1.5 ms in a
+   real case). A phase measured its lever "flat" (51.54 vs 51.60 ms) on that basis and nearly
+   discarded it; pooling **every** steady window across **4 runs per arm in both arm orders** gave
+   −2.45 ms with *no overlap* between the arms' per-run means. Report per-run means so overlap is
+   visible, alternate arm order to defeat drift, and treat a null as a result only when the pooled
+   confidence interval actually excludes the effect you care about. (DC2 G424.)
+
+### Before designing an algorithm, check the CALL BOUNDARY
+
+A per-element loop that calls a small helper defined in **another translation unit** pays a real
+call — and blocks loop-invariant hoisting in the caller — unless the build enables LTO/LTCG. Verify
+this from the build flags, not from intuition: a Release preset of `/O2 /Ob2 /DNDEBUG` has **no
+`/GL`**, so nothing is inlined across TUs. A real case: a swizzled VRAM upload made ~930k cross-TU
+calls per frame; moving the *loop* into the TU that owned the lookup tables — issuing the identical
+calls with identical arguments in identical order — gave **2.97×** on the hot format with zero
+semantic change, and it was exact by construction because no addressing math was rewritten.
+
+When a fast path re-issues the same leaf calls, the only genuinely new logic is the loop/run
+**decomposition** — so point the oracle at that: replay both arms from an identical pre-state and
+compare the whole destination buffer plus any resumable cursor, aborting on the first mismatch.
+(DC2 G424: 4 MiB of GS memory + the transfer cursor, 40,000+ comparisons, zero mismatches.)
 
 ---
 
@@ -147,7 +239,7 @@ Check these IN ORDER — the cheap wins come first. Confirm each with the profil
 | 3 | **Debug/unoptimized build** | You're not on `Release`; iterators/asserts in profile | Verify `CMAKE_BUILD_TYPE=Release` (Ninja: baked at configure; VS generator: `--config Release`). Never "fix" perf while accidentally profiling Debug. |
 | 4 | **Guest memory access macros** | `READ32`/`WRITE32`/`READ128` etc. dominate samples — every guest access masks + bounds-checks + MMIO-routes | Fast-path the common case (plain RDRAM range) before the MMIO check; keep the MMIO route for `0x10000000+`/`0x12000000` only. Behavior-identical by construction — still A/B it. |
 | 5 | **Function-pointer dispatch lookup** | The indirect-call resolver (address → handler map) hot in profile | Cache lookups; use a flat table indexed by (addr − code_base)/4 rather than a hash map, if the runtime doesn't already. |
-| 6 | **VU1 interpreter inner loop** | `ps2_vu1.cpp` dominates; heavy per-instruction decode | Decode-once/cache per microprogram; keep flag/Q-latency semantics EXACTLY (the correctness rows in `15-vu1-gs-debugging.md` §2 are non-negotiable — re-run distinct-lane tests after). |
+| 6 | **VU1 interpreter inner loop** | `ps2_vu1.cpp` dominates; heavy per-instruction decode | Decode-once/cache per microprogram; keep flag/Q-latency semantics EXACTLY (the correctness rows in `15-vu1-gs-debugging.md` §2 are non-negotiable — re-run distinct-lane tests after). **Then inline the operation itself.** Census the dynamic mix first (pairs/run × runs/frame ⇒ ns/pair; a predecoded step much over ~15-30 host cycles means the *step* is the target, not the guest workload). If the hot slots leave the loop through a non-inlined `execUpper`/`execLower` with a wide jump table, execute the dominant families **inline in registers** from a descriptor table indexed by the existing predecode, and fall back for cross-lane/flag-only ops — a families-based table hits ~98% of executions with no cliff. See §3.3 for the bit-exactness rules that make the SIMD form provably identical. (DC2 G421: −8.4% frame, 600 M shadow-verified ops, `bad=0`.) |
 | 7 | **GS software rasterizer** | `ps2_gs_rasterizer.cpp` per-pixel loop dominates (usually the #1 cost) | FIRST hoist per-triangle invariants out of the per-pixel path (sampler setup, CLUT decode → memoize per-triangle, swizzle-address base, alpha/blend decode) + scanline-narrow the bbox scan; THEN parallelize across disjoint pixels — see **§3.1** (the biggest lever). Do NOT change rounding/blend/sample semantics (verify vs `.gs` capture + same-run per-pixel A/B). |
 | 8 | **Guest-execution lock contention / sleeps** | Cores idle, FPS low, threads ping-ponging | See `16-runtime-concurrency-threading.md` — wrong wait granularity (e.g. a 200 µs sleep in a hot yield) caps FPS. Tune wait sites, keep the release-on-wait rule intact. |
 | 9 | **Scalar loops in math-heavy stubs/overrides** | Your own handwritten override shows hot | Vectorize with SSE intrinsics (`04-runtime-syscalls-stubs.md` §6). Test with DISTINCT per-lane values after (`10-agent-guardrails.md` §2.1) — vectorizing is exactly where lane bugs are born. |
@@ -338,7 +430,33 @@ whole-batch CPU fallback. Use this protocol:
     incremental one. `bad==0` over hundreds of millions of pixels is the promotion floor — it proves
     two internal surfaces are equal, NOT that either is presented correctly, so it never replaces
     normal-composition review.
-13. **Before building a scheduled mechanism, grep for it — a prior phase may have left it built and
+13. **A GS swizzle address function usually factors into ONE page-sized table — that is a free exact
+    win on every bulk pack/unpack loop.** Check the function's algebra rather than micro-optimising it:
+    if its only dependence on the high bits of x/y is a linear page step, then
+    `addr(x,y) = rowBase(y) + pageStep(x) + tbl[y & (pageH-1)][x & (pageW-1)]`, and you can build `tbl`
+    by calling the original function over one page — so the table IS the function, not an
+    approximation. Then look for horizontal adjacency in the column table: if two neighbouring pixels
+    from an even x land one word apart, an even-width row packs as double-width stores. Finally,
+    distinct `(x,y)` mapping to distinct words means disjoint ROWS own disjoint memory, so row lanes
+    are exact by construction. (Real case: 0.463 → 0.119 ms/frame, bit-exact over 218 M pixels; the
+    table+pairing alone was 80% of it, lanes the rest.) Mirror-image loops often diverge — one
+    direction may already be parallelised while the other is still scalar; audit both.
+14. **Scalar-lane float loops vectorize BIT-EXACTLY under the right compiler contract — check the
+    contract, then it is a free exact win.** On MSVC `/O2` with no `/arch:AVX2`-class FMA and
+    default `/fp:precise`, SSE2 is identical to the scalar lane loop it replaces, so no tolerance
+    argument is needed: `addps/subps/mulps` are per-lane IEEE-754 single with the same rounding,
+    and no FMA contraction is possible (a multiply-add stays two roundings). Operand order is the
+    subtlety — `_mm_max_ps(a,b)` is `a > b ? a : b` and `_mm_min_ps(a,b)` is `a < b ? a : b`, so
+    they match a legacy ternary only if written in the same order (this also preserves its NaN
+    and signed-zero behaviour); `_mm_cvttps_epi32` matches what MSVC x64 emits for
+    `(int32_t)(float)` (`cvttss2si`), including the 0x80000000 out-of-range result; and
+    `_mm_cvtepi32_ps` is exact for every int32. A **masked bit-select store**
+    (`or(and(mask,new), andnot(mask,old))`) is value-identical to a chain of conditional per-lane
+    stores, because masked-off lanes are rewritten with their own bits. **Verify anyway**: run the
+    fast path, restore state, re-run the legacy path from the same pre-state, and compare every
+    field the operation can write, aborting on the first mismatch. Record the toolchain contract
+    in the phase's Stale-When — changing the FP model or arch flags silently invalidates it.
+15. **Before building a scheduled mechanism, grep for it — a prior phase may have left it built and
     disabled as substrate.** Residency/alias/wave/delta machinery is often committed default-off with
     a kill or an `Initialized`/`On` gate as a stepping stone. Enabling and *measuring* existing
     substrate (then closing it exactly with the premise gate) is far cheaper than re-deriving it, and
@@ -349,8 +467,6 @@ whole-batch CPU fallback. Use this protocol:
 
 ## §4 What NOT to Do
 
-- **No speculative micro-optimizations** in generated `runner/*.cpp` — you can't edit those files
-  anyway (Prohibition #2), and the compiler already optimizes them.
 - **No "optimization" that skips guest work** (dropping draws, skipping VU programs, frame-skipping)
   as a default. If used as a stopgap, it's a band-aid: env-gate it, default OFF, document in the
   state file with its removal condition.

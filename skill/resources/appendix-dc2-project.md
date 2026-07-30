@@ -351,6 +351,28 @@ No real Ghidra, no hands on the pad — tests drive input via env vars parsed in
 ## §6 DC2-Proven Graphics Facts (instances of `15-vu1-gs-debugging.md`)
 
 Proven fixes and operating facts (some unconditional, some retired, others kill-switch gated):
+- **Map 125 shadow-edge residue fixed (G408, 2026-07-29):** treat a textured alias pass as
+  a consumer until the source bytes are proven clean. Here, the visible T8 pass
+  (`TBP=0x2720`) reads the same live memory as shadow target `FBP=0x139`
+  (`0x139 << 5 = 0x2720`). Paired untextured `TRIFAN` shadow volumes use add/subtract
+  `ALPHA=...68/...62`, `FIX=0x80`, and source RGB `(1,1,1)`. Inclusive half-pixel
+  barycentric coverage left uncancelled RGB=1 shared-edge samples; T8/CLUT decode merely
+  exposed them as the diagonal dark trail beside Max. Fix only this exact class with integer
+  GS sample positions plus 12.4 fixed-point top-left half-open edge ownership. Roll back with
+  `DC2_G408_LEGACY_SHADOW_COVERAGE=1`.
+  - Use `tools/run_g407_render.ps1`; pass `-G408Rollback` for the same-binary causal arm.
+    Compare against `ref/dumps/map_125.{gs,png}`. The existing `.gs` dump is sufficient and
+    includes a clean reference screenshot; do not request a new dump unless that artifact is
+    missing or corrupt.
+  - Preserve the claim boundary: full G406 rollback and G407 legacy-wide UV arms retain the
+    same Map 125 dots. Therefore G406 is innocent **of this defect**, and G407 did **not**
+    improve these dots. G407's debug-text/HUD correction remains valid.
+  - Before changing STQ, bilinear sampling, or CLUT decode for an aliased texture artifact,
+    dump/trace the producer target first. If the bad byte already exists in the RTT, repair
+    producer ordering, blending, or coverage rather than the downstream sampler.
+  - See `plans/phase-G408-fix-log.md`; final release A/B artifacts are
+    `captures/g407_g408_release_{candidate,rollback}` and
+    `captures/g408_release_verified_ab.png`.
 - **Scene-camera chain (G193, the town flat-blue root):** every loop-init (TitleInit /
   InitDungeonMain / EditInit / sgInitGyoRace) does `scene->Initialize()` via the CScene vtable
   (`*(scene+0x10548)`, `__vt__6CScene=0x375FE0`, slot +8 = `Initialize__6CSceneFv@0x282EA0`)
@@ -425,6 +447,13 @@ Proven fixes and operating facts (some unconditional, some retired, others kill-
   PS2-far (`0`) on display-target transitions. Kill `DC2_G202_NO_TOWN_Z=1`, trace
   `DC2_G202_TOWN_Z_STAT=1`. Do not key this on GS state alone; loading/transition frames bind
   the same fbp/zbuf shape.
+- **One ZBP has one owner across color FBPs (G405):** DC2 clears PSMZ24 `ZBP=0xd0` while display
+  FBP 0/0x68 is bound, then renders the character RTT at `FBP=0x139` against that same depth
+  surface. A private mirror scoped only to display FBP splits one hardware buffer into cleared and
+  stale owners, so Max disappears before the final `ZTST=ALWAYS` composite. Key the mirror by
+  `(ZBP=0xd0, PSMZ24, FBW=8)`, route every color target through it, and reject those entries from
+  GPU waves unless the GPU shares the same cross-target owner. Rollback:
+  `DC2_G404_LEGACY_DISPLAY_Z_SCOPE=1`. Reference: `ref/dumps/background.{gs,png}`.
 - **VU1 same-pair upper→lower VF hazard fixed** (G139): a lower op never sees its same-pair
   upper's result on real VU1; the immediate-commit model broke the tri packer's
   store-then-clobber idiom (`SUB VF24.xyz,VF17,VF16 | SQ VF24`) → every tri's middle vertex
