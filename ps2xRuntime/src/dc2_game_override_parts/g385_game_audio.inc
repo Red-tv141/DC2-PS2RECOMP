@@ -190,8 +190,93 @@ static void g385_msin_puthsmsg_trace(uint8_t *rdram, R5900Context *ctx,
     setReturnS32(ctx, 0);
 }
 
+// G450: name the guest caller of every BGM start/stop edge. The EZMIDI RPC log
+// gives the ordered command stream but not who issued it, so the "BGM does not
+// stop at the right time" class cannot be attributed from it alone. Each wrapper
+// logs (args, ra) and then chains the real recompiled body, so behaviour is
+// unchanged. Default-off; DC2_G450_BGM_TRACE=1.
+static bool g450_bgm_trace_enabled()
+{
+    static const bool enabled = dc2_env_flag_enabled("DC2_G450_BGM_TRACE");
+    return enabled;
+}
+
+static void g450_bgm_edge_log(const char *name, R5900Context *ctx, int argc)
+{
+    if (!g450_bgm_trace_enabled())
+    {
+        return;
+    }
+    std::fprintf(stderr, "[G450:bgm] %s ra=0x%08x", name, getRegU32(ctx, 31));
+    for (int i = 0; i < argc && i < 4; ++i)
+    {
+        std::fprintf(stderr, " a%d=0x%08x", i, getRegU32(ctx, 4 + i));
+    }
+    std::fprintf(stderr, "\n");
+}
+
+#define DC2_G450_BGM_WRAP(fnName, label, argc, target)                    \
+    static void fnName(uint8_t *rdram, R5900Context *ctx,                 \
+                       PS2Runtime *runtime)                               \
+    {                                                                     \
+        g450_bgm_edge_log(label, ctx, argc);                              \
+        target(rdram, ctx, runtime);                                      \
+    }
+
+DC2_G450_BGM_WRAP(g450_playbgm_trace, "PlayBGM", 3,
+                  PlayBGM__6CSceneFiif_0x2a6110)
+DC2_G450_BGM_WRAP(g450_stopbgm_trace, "StopBGM", 2,
+                  StopBGM__6CSceneFi_0x2a6280)
+DC2_G450_BGM_WRAP(g450_stopenvbgm_trace, "StopEnvBGM", 1,
+                  StopEnvBGM__6CSceneFv_0x2a67c0)
+DC2_G450_BGM_WRAP(g450_playenvbgm_trace, "PlayEnvBGM", 2,
+                  PlayEnvBGM__6CSceneFif_0x2a6690)
+DC2_G450_BGM_WRAP(g450_sndsestop_trace, "sndSeStop", 3,
+                  sndSeStop__FUiii_0x18e830)
+DC2_G450_BGM_WRAP(g450_sndsqplay_trace, "sndSqPlay", 3,
+                  sndSqPlay__Fiii_0x18f660)
+DC2_G450_BGM_WRAP(g450_sndsqstop_trace, "sndSqStop", 2,
+                  sndSqStop__Fii_0x18f6c0)
+DC2_G450_BGM_WRAP(g450_sndseplayv_trace, "sndSePlayV", 4,
+                  sndSePlayV__FUiiii_0x18e080)
+DC2_G450_BGM_WRAP(g450_playenvbgm_v_trace, "PlayEnvBgm(v)", 1,
+                  PlayEnvBgm__6CSceneFv_0x2a6840)
+// NOTE: do NOT wrap TitleModeInit@0x2A1020 here — G94 already registers a probe
+// at that address in apply_phase9_stubs.inc, and a second registerFunction call
+// silently discards the earlier one.
+
+static void g450_searchsnddataid_trace(uint8_t *rdram, R5900Context *ctx,
+                                       PS2Runtime *runtime)
+{
+    const uint32_t a0 = getRegU32(ctx, 4);
+    const uint32_t a1 = getRegU32(ctx, 5);
+    SearchSndDataID__6CSceneFi_0x2a6c30(rdram, ctx, runtime);
+    if (g450_bgm_trace_enabled())
+    {
+        std::fprintf(stderr,
+                     "[G450:bgm] SearchSndDataID a0=0x%08x id=0x%08x -> 0x%08x\n",
+                     a0, a1, getRegU32(ctx, 2));
+    }
+}
+
+#undef DC2_G450_BGM_WRAP
+
 static void applyDC2G385AudioTrace(PS2Runtime &runtime)
 {
+    if (g450_bgm_trace_enabled())
+    {
+        runtime.registerFunction(0x002A6110u, g450_playbgm_trace);
+        runtime.registerFunction(0x002A6280u, g450_stopbgm_trace);
+        runtime.registerFunction(0x002A67C0u, g450_stopenvbgm_trace);
+        runtime.registerFunction(0x002A6690u, g450_playenvbgm_trace);
+        runtime.registerFunction(0x0018E830u, g450_sndsestop_trace);
+        runtime.registerFunction(0x0018F660u, g450_sndsqplay_trace);
+        runtime.registerFunction(0x0018F6C0u, g450_sndsqstop_trace);
+        runtime.registerFunction(0x0018E080u, g450_sndseplayv_trace);
+        runtime.registerFunction(0x002A6840u, g450_playenvbgm_v_trace);
+        runtime.registerFunction(0x002A6C30u, g450_searchsnddataid_trace);
+    }
+
     if (g385_game_audio_disabled() && !g385_audio_trace_enabled())
     {
         return;

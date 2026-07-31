@@ -539,8 +539,20 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
             // per g150_frame_barrier). See plans/phase-G189-fix-log.md.
             extern void g189_set_closure_stage(int stage, uint32_t n);
             g189_set_closure_stage(1, n);
+            // G440: the closure the GS worker runs at every frame boundary was the whole
+            // ~5.4 ms/f serial residue G439 could not attribute. Split it: this half is the
+            // trailing tile-bin flush, the other is the present latch.
+            extern bool g440_latch_prof_on();
+            extern void g440_note_flush_ns(uint64_t ns);
+            const bool g440Prof = g440_latch_prof_on();
+            const auto g440FlushT0 = g440Prof ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
             if (g150_mtgs_enabled())
                 g144FlushPending();
+            if (g440Prof)
+                g440_note_flush_ns(static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - g440FlushT0).count()));
             g189_set_closure_stage(2, n);
             if (g412CrossFrame)
             {

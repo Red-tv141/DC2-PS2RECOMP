@@ -296,6 +296,28 @@ static void g154_observe_frame(uint8_t *rdram,
                          static_cast<double>(frameCount - s_lastG144FrameCount) / w,
                          static_cast<unsigned>(s_watches.size()));
 
+            // G434: per-window workload invariant for the drawPrimitive deletion probe. Same
+            // window and denominator as [G154:perf], so kicks/f is directly comparable arm to arm.
+            {
+                static const bool s_g434Inv = (std::getenv("DC2_G434_INV") != nullptr);
+                if (s_g434Inv)
+                {
+                    static uint64_t s_lastKicks = 0ull, s_lastDrawKicks = 0ull, s_lastL2l = 0ull;
+                    const uint64_t kicks = ::g_g434Kicks.load(std::memory_order_relaxed);
+                    const uint64_t draws = ::g_g434DrawKicks.load(std::memory_order_relaxed);
+                    const uint64_t l2l = ::g_g434L2lEdges.load(std::memory_order_relaxed);
+                    std::fprintf(stderr,
+                                 "[G434:inv] kicks/f=%.1f drawKicks/f=%.1f l2lEdges/f=%.1f window=%u\n",
+                                 static_cast<double>(kicks - s_lastKicks) / w,
+                                 static_cast<double>(draws - s_lastDrawKicks) / w,
+                                 static_cast<double>(l2l - s_lastL2l) / w,
+                                 s_windowFrames);
+                    s_lastKicks = kicks;
+                    s_lastDrawKicks = draws;
+                    s_lastL2l = l2l;
+                }
+            }
+
             s_windowStart = now;
             s_windowFrames = 0u;
             s_lastG144MidNs = midNs;

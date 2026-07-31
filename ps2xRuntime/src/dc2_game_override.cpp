@@ -1,3 +1,4 @@
+// G434 probe: force-recompile marker for [G434:inv] kick workload invariant.
 // PHASE9: DC2 ג€” Game override: binds all 173 missing stub addresses to their handlers.
 // Without this file the recomp wrappers call TODO_NAMED() (returns -1) instead of the
 // actual stub, because the recompiler generated the wrappers before the stubs were added
@@ -148,6 +149,9 @@ extern std::atomic<uint64_t> g_g147GsGifPacketNs;
 extern std::atomic<uint64_t> g_g147GsGifPacketCount;
 extern std::atomic<uint64_t> g_g147DrawPrimitiveNs;
 extern std::atomic<uint64_t> g_g147DrawPrimitiveCount;
+extern std::atomic<uint64_t> g_g434L2lEdges;
+extern std::atomic<uint64_t> g_g434Kicks;
+extern std::atomic<uint64_t> g_g434DrawKicks;
 extern std::atomic<uint64_t> g_g147GifTags;
 extern std::atomic<uint64_t> g_g147PackedRegs;
 extern std::atomic<uint64_t> g_g147ReglistRegs;
@@ -463,6 +467,18 @@ void dc2G385SetSfxParam(uint32_t soundSlot, uint8_t key, uint8_t voiceId,
                         uint8_t subtype, uint32_t value);
 extern void StreamOpenFast__6CSoundFiPc_0x18aef0(
     uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+// G450: BGM start/stop edge attribution (DC2_G450_BGM_TRACE=1). Wrappers chain
+// straight into these bodies, so registering them changes no behaviour.
+extern void PlayBGM__6CSceneFiif_0x2a6110(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void StopBGM__6CSceneFi_0x2a6280(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void StopEnvBGM__6CSceneFv_0x2a67c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void PlayEnvBGM__6CSceneFif_0x2a6690(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void sndSeStop__FUiii_0x18e830(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void sndSqPlay__Fiii_0x18f660(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void sndSqStop__Fii_0x18f6c0(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void sndSePlayV__FUiiii_0x18e080(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void PlayEnvBgm__6CSceneFv_0x2a6840(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+extern void SearchSndDataID__6CSceneFi_0x2a6c30(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 namespace
 {
 #include "dc2_game_override_parts/common_state.inc"
