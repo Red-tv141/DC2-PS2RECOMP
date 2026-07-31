@@ -16,6 +16,13 @@
 #include <thread>
 #include <vector>
 
+// G438 derivative-probe arm selector (defined in ps2_gs_rasterizer_parts/g419_ab_instrument.inc).
+// -1 = this probe is not the selected DC2_G419_AB lever, 0 = control frame, 1 = candidate frame.
+extern int g438SlowArm(int which);
+
+// G439 window-coalescing ceiling probe arm selector (same file, same contract as g438SlowArm).
+extern int g439CoalesceArm();
+
 // G297 MTVU bridges (defined in ps2_runtime.cpp). No-ops unless DC2_G297_MTVU=1.
 extern bool g297MtvuActive();
 extern bool g297HasPendingKicks();
@@ -50,6 +57,15 @@ void g332_backend_snapshot(uint64_t nsOut[4], uint64_t cntOut[4]);
 
 // G412: depth-two frame ownership is default-on after the route/performance promotion.
 bool g412_cross_frame_enabled();
+
+// G446: host PC sampler for THIS thread's pole (default-off, DC2_G446_GSPROF=1). Splits
+// [G332:gsw] frontMs/f, which no phase has ever attributed from the inside.
+#include "ps2_gif_arbiter_parts/g446_gsworker_pcsample.inc"
+
+// G447: GS-worker blocking-EDGE census (default-off, DC2_G447_EDGE=1). G446 proved the pole thread
+// is ~half blocked inside its own window branch but a PC sampler cannot name the edge that entered
+// the wait. This one puts a wall clock on each of them.
+#include "ps2_gif_arbiter_parts/g447_edge_census.inc"
 
 namespace
 {
@@ -715,6 +731,12 @@ namespace
     struct QueueItem
     {
         std::vector<GifArbiterPacket> packets; // a draw window; unused when isFrameBoundary/isApply
+        // G439: cumulative end offsets into `packets`, one per original drain() window that this
+        // queue item carries. Empty (the shipping default) means "one window, whole vector". When
+        // non-empty the worker replays each segment through processWindow separately, so a
+        // coalesced item is BIT-IDENTICAL to the sequence of items it replaced — same packets, same
+        // per-window path sort, same MTVU kick batch per segment, same order.
+        std::vector<size_t> segEnds;
         std::function<void()> frameBoundaryFn; // set when isFrameBoundary or isApply
         bool isFrameBoundary = false;
         bool isApply = false; // G177: plain in-order closure, no frame-marker accounting
@@ -735,7 +757,7 @@ namespace
         // EE thread: hand one drain() window (already path-sorted-equivalent when 1 packet) to the
         // GS worker, FIFO. In-frame backpressure caps queued windows so one slow frame can't blow up.
         void enqueueWindow(const GifArbiter::ProcessPacketFn &fn, std::vector<GifArbiterPacket> &&pkts,
-                           bool force = false)
+                           bool force = false, std::vector<size_t> &&segEnds = {})
         {
             // G297: `force` materializes a window even with no arbiter packets, because its real
             // content (VU1 XGKICK Path1) arrives via the side-channel batch in processWindow. Keeps
@@ -754,6 +776,7 @@ namespace
                 return;
             QueueItem item;
             item.packets = std::move(pkts);
+            item.segEnds = std::move(segEnds);
             g317StampItem(item);
             m_items.push_back(std::move(item));
             m_cvWork.notify_one();
@@ -1093,6 +1116,12 @@ namespace
 
         void worker()
         {
+            // G446: arm the host PC sampler on this thread (no-op unless DC2_G446_GSPROF=1).
+            g446RegisterGsWorkerThread(&g_g189WorkerStage);
+            // G447: mark this thread so the blocking-edge census pools ONLY the GS worker (the EE
+            // thread reaches several of the same backend entry points at the frame barrier).
+            g447MarkGsWorkerThread();
+
             // G159 (default OFF, DC2_G158_GPURASTER=1; needs DC2_G150_MTGS=1 to run this thread
             // at all): empirical GL-context-sharing probe, run once before the worker's normal
             // GS-drain loop starts. Isolated from real rendering -- see
@@ -1234,6 +1263,9 @@ namespace
                         m_g316LeafSample = ((++m_g316BoundaryN % 30u) == 0u);
                     }
                     g332ReportBoundary();
+                    // G447: blocking-edge split of the window span (no-op unless DC2_G447_EDGE=1).
+                    g447ReportBoundary(static_cast<unsigned long long>(
+                        g_g151WorkerBusyNs.load(std::memory_order_relaxed)));
                     g341ReportBoundary(); // G341: VIF-content census delta print (no-op unless armed)
                     g317ReportFrame();
 
@@ -1290,7 +1322,27 @@ namespace
                 try
                 {
                     g317ObserveItemFence(item);
-                    processWindow(item.packets, item.g317HadQueuedSuccessor);
+                    if (item.segEnds.empty())
+                    {
+                        processWindow(item.packets, item.g317HadQueuedSuccessor);
+                    }
+                    else
+                    {
+                        // G439: replay each coalesced drain window in its original order. Each
+                        // segment gets its own MTVU kick-batch pop and its own path sort, so the
+                        // GS-visible packet stream is byte-identical to the un-coalesced one.
+                        size_t begin = 0u;
+                        std::vector<GifArbiterPacket> seg;
+                        for (const size_t end : item.segEnds)
+                        {
+                            seg.clear();
+                            seg.reserve(end - begin);
+                            for (size_t i = begin; i < end; ++i)
+                                seg.push_back(std::move(item.packets[i]));
+                            begin = end;
+                            processWindow(seg, item.g317HadQueuedSuccessor);
+                        }
+                    }
                 }
                 catch (const std::exception &e)
                 {
@@ -1299,6 +1351,29 @@ namespace
                 catch (...)
                 {
                     std::fprintf(stderr, "[G150:mtgs] GS worker unknown exception\n");
+                }
+
+                // G431: GS-worker derivative arm — the mirror of DC2_G303_VU1_SLOW_US. Inject a fixed
+                // busy-spin per processed window to slow ONLY the GS worker, so the frame's
+                // sensitivity to this thread can be measured instead of read off an occupancy timer
+                // (G429 doctrine). Default 0 (no perturbation); the spin sits INSIDE the busy
+                // interval so [G332:gsw]/[G303:vu1w] report the injected cost too.
+                static const long long s_g431GsSlowUs = []() {
+                    const char *v = std::getenv("DC2_G431_GS_SLOW_US");
+                    return v ? std::atoll(v) : 0LL;
+                }();
+                // G438: with DC2_G419_AB=gsslow the spin runs on CANDIDATE frames only (paired
+                // within-process estimate; see the vu1slow twin in runtime_mtvu_and_env.inc).
+                {
+                    const int g438Arm = g438SlowArm(1);
+                    const long long spinUs = s_g431GsSlowUs > 0 ? s_g431GsSlowUs : 3LL;
+                    const bool doSpin = (g438Arm >= 0) ? (g438Arm == 1) : (s_g431GsSlowUs > 0);
+                    if (doSpin)
+                    {
+                        const auto spinUntil = std::chrono::steady_clock::now() +
+                                               std::chrono::microseconds(spinUs);
+                        while (std::chrono::steady_clock::now() < spinUntil) { /* busy-spin, GS worker only */ }
+                    }
                 }
 
                 const auto g151T1 = std::chrono::steady_clock::now();
@@ -1312,7 +1387,21 @@ namespace
                 g_g151WindowCount.fetch_add(1u, std::memory_order_relaxed);
                 g_g151PktCount.fetch_add(static_cast<uint64_t>(g151NPkt), std::memory_order_relaxed);
 
-                lk.lock();
+                // G447 edge 6: re-acquiring the arbiter mutex at the tail of a window. This runs
+                // ~1560x/frame against an EE thread that holds the same mutex to enqueue, so it is
+                // a candidate for the RtlEnterCriticalSection rows the G446 sampler saw.
+                if (g447EdgeOn())
+                {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    lk.lock();
+                    g447NoteWait(6, static_cast<unsigned long long>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0).count()));
+                }
+                else
+                {
+                    lk.lock();
+                }
                 m_busy = false;
                 if (m_items.empty())
                     m_cvIdle.notify_all();
@@ -1335,7 +1424,16 @@ namespace
                 const auto g316MergeT0 = g316Sample ? std::chrono::steady_clock::now()
                                                      : std::chrono::steady_clock::time_point{};
                 std::vector<std::vector<uint8_t>> g297pk;
+                // G447 edge 5: the MTVU Path1 merge. It back-pressures per kick when VU1 has not
+                // caught up, so it is the second candidate for the pole thread's kernel wait.
+                const bool g447On = g447EdgeOn();
+                const auto g447CollectT0 = g447On ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
                 g297CollectWindowPackets(g297pk);
+                if (g447On)
+                    g447NoteWait(5, static_cast<unsigned long long>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - g447CollectT0).count()));
                 for (auto &pk : g297pk)
                 {
                     GifArbiterPacket p;
@@ -1487,12 +1585,115 @@ bool g150_mtgs_enabled()
     return on;
 }
 
+// =============================================================================================
+// G439 — WINDOW-COUNT COALESCING (DC2_G439_COALESCE=<N>, default off).
+//
+// The premise this exists to price. G434 deleted *every named block of work* resident on the GS
+// worker — all primitive submission plus the entire 22.7 ms/f GL backend — and bought 2.83 ms/f.
+// G438 then measured the frame absorbing ~96% of every microsecond added PER WINDOW (sensitivity
+// 0.96 over 1,596 windows/frame). Those two facts can only be reconciled if what the thread
+// transmits to the frame is the serialized handoff CHAIN itself, not the work inside a window.
+// The only way to test that is to change the number of windows while holding the work constant.
+//
+// The probe merges N consecutive drain() windows into ONE queue item: the arbiter's packets and
+// the MTVU kick batch simply keep accumulating until the Nth drain, which materialises them as a
+// single window. Workload invariants (read on BOTH arms — see G435: a probe with no invariant
+// prices nothing): kicks/frame is exactly conserved (every MSCAL still enqueues a kick and every
+// kick still runs on the VU1 worker), and packets/frame is exactly conserved (no packet is
+// dropped or duplicated). Only `windows/f` moves, by ~N x.
+//
+// TWO FORMS, and the difference between them is the whole finding of this phase.
+//
+//  * DC2_G439_UNSAFE_MERGE=1 — the naive form: concatenate the packets and let processWindow sort
+//    the union. This is a CEILING PROBE with knowingly incorrect output, because the per-window
+//    path sort now spans what were separate windows and a PATH3 packet from drain i+1 can sort
+//    ahead of a PATH1 packet from drain i. It is CONFOUNDED as a measurement of the handoff chain:
+//    it changes the GS-visible draw ORDER as well as the window count, and the reordering alone
+//    cost +28 ms/f (see the fix log). Kept only as the record of that result.
+//  * default (order-preserving) — the item carries `segEnds`, so the worker replays each original
+//    drain window separately: same packets, same per-window sort, same MTVU kick batch per window.
+//    BIT-EXACT by construction; the ONLY thing that changes is how many times the EE and the GS
+//    worker hand off through the queue mutex / condition variable / deque.
+//
+// Workload invariants, read on BOTH arms (G435: a probe with no invariant prices nothing):
+// kicks/frame and packets/frame are exactly conserved; only `windows/f` moves.
+//
+// EE-thread-only state. When disarmed every function below is one cached-int compare.
+// =============================================================================================
+static std::vector<GifArbiterPacket> s_g439Pend;      // packets accumulated across deferred drains
+static std::vector<size_t> s_g439PendSegs;            // per-drain cumulative end offsets
+static GifArbiter::ProcessPacketFn s_g439PendFn;      // the process fn the deferred drains carried
+static int s_g439PendDrains = 0;                      // deferred drain() calls not yet materialised
+static uint64_t s_g439Materialised = 0u;              // census: windows this probe actually emitted
+static uint64_t s_g439Deferred = 0u;                  // census: drain() calls it swallowed
+
+// The confounded single-sort form. Default off; see the comment block above.
+static bool g439UnsafeMerge()
+{
+    static const bool on = (std::getenv("DC2_G439_UNSAFE_MERGE") != nullptr);
+    return on;
+}
+
+// DC2_G439_COALESCE=<N>. N <= 1 disables. Clamped: a very deep merge would blow the arbiter's
+// backpressure model rather than measure anything.
+static int g439CoalesceN()
+{
+    static const int n = [] {
+        const char *v = std::getenv("DC2_G439_COALESCE");
+        if (v == nullptr || v[0] == '\0')
+            return 1;
+        return std::max(1, std::min(64, std::atoi(v)));
+    }();
+    return n;
+}
+
+// The merge factor in force for THIS frame. Under DC2_G419_AB=coalesce the probe runs on candidate
+// frames only (blocked hold=16), so the control arm is the untouched shipping path.
+static int g439ActiveN()
+{
+    const int n = g439CoalesceN();
+    if (n <= 1)
+        return 1;
+    const int arm = g439CoalesceArm();
+    if (arm < 0)
+        return n; // probe not under the A/B instrument: always on
+    return arm == 1 ? n : 1;
+}
+
+// Emit whatever the probe is holding as one window. Called at the Nth deferred drain, and at every
+// EE-side ordering edge that must not have windows floating behind it (frame boundary, wait-idle,
+// ordered apply). No-op — one int compare — when nothing is pending.
+static void g439MaterialisePending()
+{
+    if (s_g439PendDrains == 0)
+        return;
+    s_g439PendDrains = 0;
+    ++s_g439Materialised;
+    if (g439UnsafeMerge())
+        g297OnWindowHandoff(); // one batch for the one merged window (see drain())
+    // The unsafe form discards the segment boundaries, which is exactly what makes it a ceiling
+    // probe rather than a lever: one sort now spans several drains.
+    std::vector<size_t> segs;
+    if (!g439UnsafeMerge())
+        segs = std::move(s_g439PendSegs);
+    G150Mtgs::instance().enqueueWindow(s_g439PendFn, std::move(s_g439Pend), /*force=*/true,
+                                       std::move(segs));
+    s_g439Pend.clear();
+    s_g439PendSegs.clear();
+    static const bool s_stat = (std::getenv("DC2_G439_STAT") != nullptr);
+    if (s_stat && (s_g439Materialised % 6000u) == 0u)
+        std::fprintf(stderr, "[G439:coal] n=%d materialised=%llu deferredDrains=%llu\n",
+                     g439CoalesceN(), (unsigned long long)s_g439Materialised,
+                     (unsigned long long)s_g439Deferred);
+}
+
 // G177: ordered-closure hand-off for FIFO-bypass register writes (see G150Mtgs::enqueueApply).
 // Returns false when MTGS is off or the worker isn't running — caller applies inline.
 bool g150_enqueue_apply(std::function<void()> fn)
 {
     if (!g150_mtgs_enabled())
         return false;
+    g439MaterialisePending(); // an ordered side-effect must not overtake deferred draw windows
     return G150Mtgs::instance().enqueueApply(std::move(fn));
 }
 
@@ -1563,6 +1764,8 @@ void g150_frame_barrier(std::function<void()> latch)
     s_g175FrameBoundaryCount.fetch_add(1u, std::memory_order_relaxed);
     if (g150_mtgs_enabled())
     {
+        // G439: this frame's last draws must be queued ahead of its boundary marker.
+        g439MaterialisePending();
         if (g150_pipeline_enabled())
         {
             G150Mtgs::instance().enqueueFrameBoundary(std::move(latch));
@@ -1577,7 +1780,12 @@ void g150_frame_barrier(std::function<void()> latch)
 void g150_wait_idle()
 {
     if (g150_mtgs_enabled())
+    {
+        // G439: "idle" must mean the deferred windows have been drawn too, or a readback would
+        // consume VRAM that is missing this frame's last N-1 drains.
+        g439MaterialisePending();
         G150Mtgs::instance().waitIdle();
+    }
 }
 
 void g150_shutdown()
@@ -1703,6 +1911,36 @@ void GifArbiter::drain()
         // has empty m_queue but pending kicks → still materialize the window (force) so its batch is
         // consumed and lockstep holds. No-op unless MTVU is active (haveKicks stays false).
         const bool haveKicks = g297HasPendingKicks();
+        // G439 ceiling probe: hold this window back and merge it into the next one(s). Kicks stay
+        // in the MTVU EE-side batch (m_curBatch) because g297OnWindowHandoff() is deferred with
+        // them, so the batch:window lockstep is preserved across the merge.
+        const int g439N = g439ActiveN();
+        if (g439N > 1)
+        {
+            if (!m_queue.empty() || haveKicks)
+            {
+                for (GifArbiterPacket &p : m_queue)
+                    s_g439Pend.push_back(std::move(p));
+                m_queue.clear();
+                // Order-preserving form: seal this drain's MTVU kick batch NOW and record the
+                // segment boundary, so the worker pops exactly one batch per original window. The
+                // unsafe form defers the seal so its single merged window pops a single batch.
+                if (!g439UnsafeMerge())
+                {
+                    g297OnWindowHandoff();
+                    s_g439PendSegs.push_back(s_g439Pend.size());
+                }
+                s_g439PendFn = m_processFn;
+                ++s_g439Deferred;
+                if (++s_g439PendDrains >= g439N)
+                    g439MaterialisePending();
+            }
+            return;
+        }
+        // Probe off (or a control frame under the A/B): flush anything the candidate block left
+        // pending FIRST, so FIFO order across the arm change is preserved, then behave exactly as
+        // the shipping path.
+        g439MaterialisePending();
         if (!m_queue.empty() || haveKicks)
         {
             g297OnWindowHandoff();

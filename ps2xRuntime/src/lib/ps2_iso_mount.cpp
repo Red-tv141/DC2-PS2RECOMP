@@ -1,8 +1,10 @@
 #include "ps2_iso_mount.h"
 #include <iostream>
 #include <cstring>
+#include <cstdlib>
 #include <algorithm>
 #include <cctype>
+#include <filesystem>
 
 // ---- constants ---------------------------------------------------------------
 
@@ -48,6 +50,7 @@ bool Ps2IsoMount::isOpen() const { return m_open; }
 bool Ps2IsoMount::readSector(uint32_t lba, uint32_t count, void* dst) const
 {
     if (!m_open) return false;
+    if (m_folderMode) return readSectorFolder(lba, count, dst);
     m_file.seekg(static_cast<std::streamoff>(lba) * SECTOR_SIZE, std::ios::beg);
     if (!m_file) return false;
     m_file.read(static_cast<char*>(dst),
@@ -60,8 +63,17 @@ bool Ps2IsoMount::open(const std::string& iso_path)
     // F55: idempotent. A second open() on the already-mounted singleton used to
     // fail on the open ifstream (failbit) while leaving m_open=true, poisoning
     // every later readSector(). Keep the existing mount instead.
-    if (m_open && m_file.is_open())
+    if (m_open && (m_folderMode || m_file.is_open()))
         return true;
+
+    // G449: a DIRECTORY means the extracted disc tree. Decide before touching ifstream —
+    // opening a directory as a file "succeeds" on some runtimes and then fails every read.
+    {
+        std::error_code ec;
+        if (std::filesystem::is_directory(iso_path, ec) && !ec)
+            return openFolder(iso_path);
+    }
+
     m_file.clear();
     m_file.open(iso_path, std::ios::binary);
     if (!m_file)
@@ -475,4 +487,210 @@ Ps2IsoMount& getGlobalIsoMount()
 {
     static Ps2IsoMount s_iso;
     return s_iso;
+}
+
+// ---- G449 folder mode -------------------------------------------------------
+//
+// Mount an EXTRACTED disc tree (the launcher's DATA folder) behind the identical
+// findFile/readSector surface the ISO path exposes. The whole runtime addresses disc
+// content by LBA -- sceCdRead/sceCdStRead take absolute LBNs, and the DATA.HD2 archive
+// index resolves entries as (DATA.DAT's LBA) + (byte offset within DATA.DAT). So the
+// folder cannot simply serve files by name: it must present a SECTOR ADDRESS SPACE.
+//
+// Each file therefore gets a contiguous, sector-aligned synthetic LBA range, allocated in
+// a stable order (sorted by path, so the layout is identical on every run and across
+// machines). readSector then maps a sector back to (file, byte offset). Because each file
+// is contiguous, base+offset arithmetic inside DATA.DAT lands exactly where it does on the
+// real disc, and no caller changes at all.
+//
+// Reads past a file's end (the last sector of a non-sector-multiple file, which the guest
+// requests routinely) zero-fill, matching how the real medium reads a padded final sector.
+
+static constexpr uint32_t kFolderLbaBase = 32; // clear of the PVD/AVDP region (16, 256 are ISO's)
+
+bool Ps2IsoMount::openFolder(const std::string& dir)
+{
+    std::error_code ec;
+    std::vector<std::filesystem::path> files;
+    for (auto it = std::filesystem::recursive_directory_iterator(
+             dir, std::filesystem::directory_options::skip_permission_denied, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
+    {
+        if (it->is_regular_file(ec) && !ec)
+            files.push_back(it->path());
+    }
+    if (files.empty())
+    {
+        std::cerr << "[DATA] No files under folder: " << dir << std::endl;
+        return false;
+    }
+
+    // Deterministic layout: identical synthetic LBAs on every run and every machine.
+    std::sort(files.begin(), files.end());
+
+    const std::filesystem::path root(dir);
+    uint32_t nextLba = kFolderLbaBase;
+    m_extents.clear();
+    m_extents.reserve(files.size());
+    m_iso9660Files.clear();
+    m_rootEntries.clear();
+
+    for (const auto& f : files)
+    {
+        const uintmax_t sz = std::filesystem::file_size(f, ec);
+        if (ec) { ec.clear(); continue; }
+
+        const uint32_t sectors =
+            static_cast<uint32_t>((static_cast<uint64_t>(sz) + SECTOR_SIZE - 1) / SECTOR_SIZE);
+
+        FolderExtent ex;
+        ex.lba = nextLba;
+        ex.sectors = (sectors > 0u) ? sectors : 1u; // a 0-byte file still owns one sector
+        ex.size = static_cast<uint64_t>(sz);
+        ex.path = f.string();
+        m_extents.push_back(ex);
+
+        // Key form must match the ISO path exactly: "/DATA.HD2", "/MOVIE/RUSH.PSS".
+        // findFile() upper-cases its argument, so store upper-cased keys here too.
+        std::string rel = std::filesystem::relative(f, root, ec).generic_string();
+        if (ec) { ec.clear(); rel = f.filename().generic_string(); }
+        const std::string key = toUpper("/" + rel);
+
+        IsoFileInfo info{};
+        info.lba = ex.lba;
+        info.size = static_cast<uint32_t>(std::min<uint64_t>(ex.size, 0xFFFFFFFFull));
+        info.is_dir = false;
+        m_iso9660Files[key] = info;
+
+        if (rel.find('/') == std::string::npos)
+            m_rootEntries.push_back(toUpper(rel));
+
+        nextLba += ex.sectors;
+    }
+
+    // Directory entries, so a findFile() on a folder answers is_dir like ISO9660 does.
+    for (auto it = std::filesystem::recursive_directory_iterator(
+             dir, std::filesystem::directory_options::skip_permission_denied, ec);
+         !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
+    {
+        if (!it->is_directory(ec) || ec) continue;
+        std::string rel = std::filesystem::relative(it->path(), root, ec).generic_string();
+        if (ec) { ec.clear(); continue; }
+        IsoFileInfo info{};
+        info.lba = 0; info.size = 0; info.is_dir = true;
+        m_iso9660Files[toUpper("/" + rel)] = info;
+        if (rel.find('/') == std::string::npos)
+            m_rootEntries.push_back(toUpper(rel));
+    }
+
+    if (m_extents.empty())
+    {
+        std::cerr << "[DATA] No readable files under folder: " << dir << std::endl;
+        return false;
+    }
+
+    m_folderMode = true;
+    m_udfPresent = false;
+    m_open = true;
+    std::cout << "[DATA] Mounted folder: " << dir
+              << "  files=" << m_extents.size()
+              << "  sectors=" << (nextLba - kFolderLbaBase) << std::endl;
+    return true;
+}
+
+const Ps2IsoMount::FolderExtent* Ps2IsoMount::extentForSector(uint32_t lba) const
+{
+    // m_extents is sorted by lba and non-overlapping by construction.
+    auto it = std::upper_bound(m_extents.begin(), m_extents.end(), lba,
+                               [](uint32_t v, const FolderExtent& e) { return v < e.lba; });
+    if (it == m_extents.begin()) return nullptr;
+    --it;
+    if (lba < it->lba || lba >= it->lba + it->sectors) return nullptr;
+    return &(*it);
+}
+
+std::ifstream* Ps2IsoMount::streamFor(const FolderExtent& ex) const
+{
+    auto it = m_folderStreams.find(ex.path);
+    if (it != m_folderStreams.end())
+        return it->second.get();
+    auto s = std::make_unique<std::ifstream>(ex.path, std::ios::binary);
+    if (!*s) return nullptr;
+    std::ifstream* raw = s.get();
+    m_folderStreams.emplace(ex.path, std::move(s));
+    return raw;
+}
+
+bool Ps2IsoMount::readSectorFolder(uint32_t lba, uint32_t count, void* dst) const
+{
+    // Unlike the ISO path (one ifstream, single-threaded by assumption), folder mode keeps
+    // a per-file handle cache that several guest threads can reach, so serialise it.
+    std::lock_guard<std::mutex> lk(m_folderMutex);
+
+    uint8_t* out = static_cast<uint8_t*>(dst);
+    for (uint32_t i = 0; i < count; ++i, out += SECTOR_SIZE)
+    {
+        const FolderExtent* ex = extentForSector(lba + i);
+        if (ex == nullptr)
+        {
+            // Gap or out-of-range sector: the real medium would return padding here.
+            std::memset(out, 0, SECTOR_SIZE);
+            continue;
+        }
+        std::ifstream* s = streamFor(*ex);
+        if (s == nullptr)
+            return false;
+
+        const uint64_t off = static_cast<uint64_t>(lba + i - ex->lba) * SECTOR_SIZE;
+        uint64_t avail = (off < ex->size) ? (ex->size - off) : 0ull;
+        if (avail > SECTOR_SIZE) avail = SECTOR_SIZE;
+
+        if (avail < SECTOR_SIZE)
+            std::memset(out + avail, 0, SECTOR_SIZE - static_cast<size_t>(avail));
+        if (avail == 0)
+            continue;
+
+        s->clear();
+        s->seekg(static_cast<std::streamoff>(off), std::ios::beg);
+        if (!*s) return false;
+        s->read(reinterpret_cast<char*>(out), static_cast<std::streamsize>(avail));
+        if (!(s->good() || s->eof())) return false;
+    }
+    return true;
+}
+
+// ---- G449 single data-source resolution rule --------------------------------
+
+bool dc2OpenGameDataSource()
+{
+    Ps2IsoMount& mount = getGlobalIsoMount();
+    if (mount.isOpen())
+        return true;
+
+    if (const char* dataDir = std::getenv("DC2_DATA_DIR"))
+    {
+        if (*dataDir && mount.open(dataDir))
+            return true;
+        std::cerr << "[data] DC2_DATA_DIR set but not mountable: " << dataDir << std::endl;
+    }
+    if (const char* isoPath = std::getenv("DC2_ISO_PATH"))
+    {
+        if (*isoPath && mount.open(isoPath))
+            return true;
+        std::cerr << "[data] DC2_ISO_PATH set but not mountable: " << isoPath << std::endl;
+    }
+
+    // Legacy candidates, so every existing harness and script keeps working untouched.
+    const char* candidates[] = {
+        "DATA",
+        "D:/ps2r/dc2/Dark Cloud 2 (USA) (v2.00).iso",
+        "Dark Cloud 2 (USA) (v2.00).iso",
+    };
+    for (const char* p : candidates)
+    {
+        if (mount.open(p))
+            return true;
+    }
+    std::cerr << "[data] no game data source opened (set DC2_DATA_DIR or DC2_ISO_PATH)\n";
+    return false;
 }

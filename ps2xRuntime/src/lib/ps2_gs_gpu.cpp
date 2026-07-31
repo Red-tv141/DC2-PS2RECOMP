@@ -2,7 +2,16 @@
 // G412: force-recompile marker for immutable depth-two frame-boundary presentation snapshots.
 // G399: DC2_G399_SURFDUMP raw render-target surface probe (diagnostic, default-off).
 // G414 diagnostic: force-recompile marker for default-off exact GS l2l self-copy retirement.
+// G434 probe: force-recompile marker for DC2_G434_NO_DRAW (front-thread draw deletion ceiling).
+// G440: present-latch component profile (DC2_G440_LATCH=1, behaviour-pure). Must precede the
+// helpers/display parts so both can use G440LatchScope.
+// g440_latch_profile.inc revision: 3 (merge loop restored to the vectorisable three-pass form)
+#include "ps2_gs_gpu_parts/g440_latch_profile.inc"
 #include "ps2_gs_gpu_parts/gpu_bridge_and_latch_helpers.inc"
+// G432: TRXDIR cost census (DC2_G432_CENSUS=1, behaviour-pure). Must precede
+// gpu_gif_and_registers.inc (the TRXDIR dispatch site) and gpu_transfers_and_kick.inc.
+// g432_trxdir_census.inc revision: 2 (added dir=2 internal stage split)
+#include "ps2_gs_gpu_parts/g432_trxdir_census.inc"
 #include "ps2_gs_gpu_parts/gpu_g399_surface_probe.inc"
 #include "ps2_gs_gpu_parts/gpu_display_and_snapshot.inc"
 #include "ps2_gs_gpu_parts/gpu_gif_and_registers.inc"
@@ -12,3 +21,5 @@
 // g424_fast_image_upload.inc revision: 4 (G359 .inc rebuild marker — touch on every edit)
 #include "ps2_gs_gpu_parts/g424_fast_image_upload.inc"
 #include "ps2_gs_gpu_parts/gpu_transfers_and_kick.inc"
+// G446: env-read census hook in envFlagEnabled (force recompile v1).
+// G446: cache DC2_DUMP_FONT at the T4HH upload site (force recompile v2).

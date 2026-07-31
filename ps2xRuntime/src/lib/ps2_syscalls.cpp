@@ -443,18 +443,8 @@ namespace ps2_syscalls
     static std::once_flag g_isoMountOpened;
     static void ensureIsoOpen()
     {
-        std::call_once(g_isoMountOpened, []() {
-            const char *isoCandidates[] = {
-                "D:/ps2r/dc2/Dark Cloud 2 (USA) (v2.00).iso",
-                "Dark Cloud 2 (USA) (v2.00).iso",
-            };
-            for (const char *p : isoCandidates)
-            {
-                if (getGlobalIsoMount().open(p))
-                    return;
-            }
-            std::cerr << "[data] ISO mount: no candidate path opened\n";
-        });
+        // G449: one data-source resolution rule for every site (ps2_iso_mount.h).
+        std::call_once(g_isoMountOpened, []() { (void)dc2OpenGameDataSource(); });
     }
 
     bool isoFindFileForFio(const char *path, uint32_t *lbaOut, uint32_t *sizeOut)

@@ -1,3 +1,8 @@
+// G433: blocking colour-readback ceiling probe in lle_gpu_raster_backend.inc
+// (DC2_G433_NO_RB=1 skips only glReadPixels; DC2_G433_RBSTAT=1 times it). Content edit here
+// forces MSBuild to consume the .inc.
+// G431: T8 resident-view GL storage reuse in lle_gpu_raster_backend.inc — measured NEUTRAL,
+// opt-in only (DC2_G431_VIEW_REUSE=1). Content edit here forces MSBuild to consume the .inc.
 // G158a: GPU-raster infrastructure prototype (default-off, DC2_G158_GPURASTER=1).
 //
 // Scope (deliberate, see plans/phase-G158-fix-log.md): prove the FBO + shader + readback
@@ -36,11 +41,31 @@
 
 #if defined(_WIN32) && !defined(PLATFORM_VITA)
 
+// G445: within-process A/B arm selector for the G418 early command kick. Defined at global scope in
+// ps2_gs_rasterizer_parts/g419_ab_instrument.inc; declared here (outside the parts' anonymous
+// namespace) so the backend site links against the real cross-TU symbol.
+int g445KickArm();
+int g445KickAllArm();
+
+// G447: GS-worker blocking-edge census. Defined at global scope in ps2_gif_arbiter.cpp
+// (g447_edge_census.inc); declared here — outside the parts' anonymous namespace — so the
+// backend's fut.get() sites link against the real cross-TU symbols (the G445 lesson).
+bool g447EdgeOn();
+bool g447OnGsWorker();
+void g447NoteWait(int edge, unsigned long long ns);
+// G447 spin-then-block lever arm (DC2_G419_AB=spinwait); defined in g419_ab_instrument.inc.
+int g447SpinArm();
+int g447WorkerSpinArm();
+
 #include "ps2_gs_gpu_raster_parts/gpu_raster_infrastructure.inc"
 #include "ps2_gs_gpu_raster_parts/persistent_t8_decoder.inc"
+#include "ps2_gs_gpu_raster_parts/g433_pbo_readback.inc"
 #include "ps2_gs_gpu_raster_parts/lle_gpu_raster_backend.inc"
 #include "ps2_gs_gpu_raster_parts/gpu_raster_bridge_and_stubs.inc"
 // G425: readback-redundancy ceiling census added in lle_gpu_raster_backend.inc (force recompile v1).
+// G445: DC2_G419_AB=earlykick arm selector wired into the early-kick site (force recompile v2).
+// G447: spin-then-block backend round trip + edge census hooks (force recompile v2, PROMOTED).
+// G445: early kick PROMOTED default-ON + DC2_G445_KICK_ALL extension probe (force recompile v3).
 #else // !(_WIN32 && !PLATFORM_VITA)
 
 bool g158_gpu_raster_enabled() { return false; }

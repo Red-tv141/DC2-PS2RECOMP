@@ -286,15 +286,8 @@ namespace ps2_stubs
     {
         if (!getGlobalIsoMount().isOpen())
         {
-            const char *isoCandidates[] = {
-                "D:/ps2r/dc2/Dark Cloud 2 (USA) (v2.00).iso",
-                "Dark Cloud 2 (USA) (v2.00).iso",
-            };
-            for (const char *p : isoCandidates)
-            {
-                if (getGlobalIsoMount().open(p))
-                    break;
-            }
+            // G449: one data-source resolution rule for every site (ps2_iso_mount.h).
+            (void)dc2OpenGameDataSource();
         }
         if (!getGlobalIsoMount().isOpen())
             return false;

@@ -1,8 +1,13 @@
 #include "runtime/ps2_pad.h"
 #include "ps2_host_backend.h"
 #include <cstring>
+#include <cstdio>
+#include <cstdlib>
+#include <fstream>
 #include <iostream>
+#include <iterator>
 #include <cmath>
+#include <string>
 #include <utility>
 
 namespace
@@ -40,6 +45,11 @@ namespace
         return kNoGamepad;
     }
 }
+
+// G449: launcher controller remapping (DC2_CONTROLLER_CONFIG). Included here because it
+// needs the scePad bit constants and firstAvailableGamepad() above, and because raylib's
+// input API is only reachable from this TU. Entirely inert when the flag is unset.
+#include "ps2_pad_parts/g449_controller_config.inc"
 
 bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t size)
 {
@@ -166,6 +176,13 @@ extern "C" bool dc2_poll_host_pad(bool allowKeyboard, uint16_t *outMask,
                                   uint8_t *outLX, uint8_t *outLY,
                                   uint8_t *outRX, uint8_t *outRY)
 {
+    // G449: a launcher controller config replaces the built-in mapping wholesale. It is
+    // consulted FIRST and before the "no pad and no keyboard" early-out below, because a
+    // config can bind every control to the keyboard — in which case there is live input to
+    // report even with no gamepad attached, and the built-in path would have refused it.
+    if (g449PollConfiguredPad(outMask, outLX, outLY, outRX, outRY))
+        return true;
+
     const int gamepad = firstAvailableGamepad();
     const bool padConnected = (gamepad != kNoGamepad);
     if (!padConnected && !allowKeyboard)

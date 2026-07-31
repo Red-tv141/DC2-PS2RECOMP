@@ -1,8 +1,23 @@
+// G434: DC2_G434_NO_L2LPIN l2l-pin deletion ceiling probe in rasterizer_draw_sprite.inc —
+// content edit here forces MSBuild to consume it.
+// G431: T8 resident-view rebuild redundancy census (DC2_G431_T8CENSUS=1) in
+// rasterizer_vram_materialization.inc — content edit here forces the .inc to be consumed.
 // G411 promoted: force MSBuild to consume default shared GPU-depth ownership .inc changes.
 // G415: publishes the exact colour-readback row window to the GPU backend (see
 // rasterizer_vram_materialization.inc). Touching this file forces the .inc edit to be consumed.
 // G417: diagnostic-only CPU framebuffer-pack split lives in that same part.
 // G423: promotes G326's exact compiled mapping-plan cache; rollback DC2_G423_NO_PLAN_CACHE=1.
+// G429: opt-in ceiling probe DC2_G429_NO_UPLOAD_EDGE=1 in rasterizer_draw_sprite.inc (default-off,
+// knowingly incorrect) prices the upload-forced deferred-graph execute.
+// G432: local->local flush-edge split census (DC2_G432_CENSUS=1) in rasterizer_draw_sprite.inc —
+// content edit here forces the .inc to be consumed. (rev 3: per-stage lap timers + the exact G418
+// unpack at the SECOND publication site, g261Materialize; rollback DC2_G432_NO_MAT_UNPACK=1,
+// A/B gate DC2_G419_AB=matunpack)
+// G447: host core-count probe. Defined at global scope in ps2_gif_arbiter.cpp
+// (g447_edge_census.inc), which is the TU that already pulls in <windows.h>. Declared here outside
+// the parts' anonymous namespaces so DC2_G447_HOSTCHECK links against the real cross-TU symbol.
+void g447HostShape(int *logicalOut, int *physicalOut);
+
 #include "ps2_gs_rasterizer_parts/rasterizer_headers_and_diagnostics.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_g214_cap_trace.inc"
@@ -102,3 +117,11 @@
 
 #include "ps2_gs_rasterizer_parts/rasterizer_draw_line.inc"
 // G401: composite probe also hooks direct drawSprite execution (force recompile).
+// G438: DC2_G419_AB=vu1slow|gsslow derivative probes + DC2_G438_HOLD block-held arms (force recompile v3, DC2_G447_HOSTCHECK).
+// G439: DC2_G419_AB=coalesce window-count ceiling probe, g439CoalesceArm() (force recompile v2).
+// G447: DC2_G419_AB=spinwait lever + kG447LeverSpinWait in g419_ab_instrument.inc (force recompile v1).
+// G444: DC2_G444_ASYNC=1 ceiling probe — admits G310 flushes to the G305 async slot (force recompile v1).
+// G445: DC2_G419_AB=earlykick behaviour lever, g445KickArm() (force recompile v1).
+// G445: DC2_G419_AB=kickall extension probe, g445KickAllArm() (force recompile v2).
+// G446: cache g294OwnerTokenRequested / g283AuthorityRequested (per-page getenv on the pole thread) (force recompile v1).
+// G446: cache DC2_DUMP_FONT in the per-texel T4HH sampler (force recompile v2).
