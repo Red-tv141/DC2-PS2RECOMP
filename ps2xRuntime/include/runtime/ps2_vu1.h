@@ -6,7 +6,18 @@
 class GS;
 class PS2Memory;
 
-struct VU1State
+// G437: the VU1 register file MUST be cache-line aligned.
+//
+// The G421/G422/G426/G428 fast paths access `vf[n]` and `acc` as 16-byte SSE vectors
+// (`_mm_loadu_ps` / `_mm_storeu_ps`). Without an explicit alignment this struct has alignof 4 and
+// lands wherever its owner (`PS2Runtime::m_vu1`, a stack local in main) puts it — measured at
+// `base % 64 == 52`, so EVERY vector access was 4-byte misaligned, one VU register in four
+// straddled a 64-byte cache line, and `acc` (offset 576) straddled one on every single access.
+// A line-splitting store cannot store-to-load forward, so each dependent FMAC in an
+// MULA->MADDA->MADDA->MADD chain paid a store-buffer drain (~15-20 cycles) instead of ~5-cycle
+// forwarding. alignas(64) makes vf[n] (16n) and acc (576 = 9*64) split-free for all n.
+// Purely an address change: no field, size-in-fields, order or value semantics move.
+struct alignas(64) VU1State
 {
     float vf[32][4];
     int32_t vi[16];
