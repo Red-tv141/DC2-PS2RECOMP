@@ -190,8 +190,21 @@ namespace ps2_stubs
             return s_strictSlot ? (slot == 0) : true;
         }
 
+// G449: DC2_MEMCARD1_DIR / DC2_MEMCARD2_DIR. Shared with Path.h's getConfiguredMcRoot()
+// so both routes to card storage resolve identically — see the file's header comment.
+#include "../Helpers/g449_memcard_dirs.inc"
+
         std::filesystem::path getMcRootPath(int32_t port)
         {
+            // A configured folder is authoritative for its slot and is used verbatim: the
+            // per-port derivation below (mc0 -> mc1 by string surgery) must NOT be applied
+            // to it, or slot 2's explicit folder would be rewritten into a sibling.
+            {
+                std::filesystem::path overridden;
+                if (g449MemoryCardDirOverride(static_cast<int>(port), overridden))
+                    return overridden;
+            }
+
             const PS2Runtime::IoPaths &paths = PS2Runtime::getIoPaths();
             std::filesystem::path root = paths.mcRoot;
             if (root.empty())

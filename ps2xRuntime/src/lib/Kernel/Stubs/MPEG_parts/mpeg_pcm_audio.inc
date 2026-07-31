@@ -306,6 +306,10 @@
 
                 if (!m_streamStarted && m_submittedFrames != 0u)
                 {
+                    // G450: the movie owns the output from here. Retire any BGM
+                    // that is only still sounding because G394 suppressed its
+                    // Stop — the guest will never issue that Stop again.
+                    ::dc2G450RetireSuppressedBgm();
                     PlayAudioStream(m_stream);
                     m_streamStarted = true;
                     if (g384MpegAudioTraceEnabled())

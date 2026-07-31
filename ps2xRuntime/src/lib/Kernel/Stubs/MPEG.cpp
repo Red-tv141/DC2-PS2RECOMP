@@ -22,6 +22,11 @@ extern "C"
 
 #include "Syscalls/Helpers/State.h"
 
+// G450: defined in the DC2 gameplay-audio mixer TU (dc2_g391_sfx_mixer.inc).
+// FMV audio starting is a change of audio OWNER, and a BGM that only still
+// sounds because G394 suppressed its Stop must not bleed into the movie.
+void dc2G450RetireSuppressedBgm();
+
 namespace ps2_stubs
 {
     namespace

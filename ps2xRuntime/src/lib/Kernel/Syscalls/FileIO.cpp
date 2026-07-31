@@ -37,22 +37,13 @@ namespace ps2_syscalls
         static std::unordered_map<int, IsoFdEntry> g_isoFds;
         static std::mutex g_isoFdMutex;
 
-        // Lazy ISO mount. DC2-specific path; later phases should make this configurable.
+        // Lazy data mount. G449: the source is chosen by ONE rule for every call site
+        // (DC2_DATA_DIR -> DC2_ISO_PATH -> legacy candidates, see ps2_iso_mount.h). An
+        // extracted DATA folder mounts exactly like a disc image, so nothing below cares.
         static std::once_flag g_isoMountOpened;
         static void ensureIsoOpen()
         {
-            std::call_once(g_isoMountOpened, []() {
-                const char *isoCandidates[] = {
-                    "D:/ps2r/dc2/Dark Cloud 2 (USA) (v2.00).iso",
-                    "Dark Cloud 2 (USA) (v2.00).iso",
-                };
-                for (const char *p : isoCandidates)
-                {
-                    if (getGlobalIsoMount().open(p))
-                        return;
-                }
-                std::cerr << "[data] ISO mount: no candidate path opened\n";
-            });
+            std::call_once(g_isoMountOpened, []() { (void)dc2OpenGameDataSource(); });
         }
 
         static bool isoFindFileForFio(const char *path, uint32_t *lbaOut, uint32_t *sizeOut)
