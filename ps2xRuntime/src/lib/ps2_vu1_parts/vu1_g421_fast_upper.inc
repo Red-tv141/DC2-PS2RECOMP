@@ -55,7 +55,9 @@ namespace
         G421UpperDesc e[0x80] = {};
     };
 
-    G421DescTable g421BuildDescTable()
+    // G436: constexpr, so the table below is a link-time constant with NO initialisation guard.
+    // The body is unchanged; only the evaluation time moves.
+    constexpr G421DescTable g421BuildDescTable()
     {
         G421DescTable t;
         auto set = [&t](unsigned kind, uint8_t cls, uint8_t op, uint8_t src, uint8_t bc) {
@@ -129,10 +131,25 @@ namespace
         return t;
     }
 
+    // G436: the SAME table, constant-initialised. `g421Desc()` used to wrap a function-local
+    // `static const` whose thread-safe-initialisation guard makes the accessor un-inlinable, so
+    // every covered upper (50.3% of ~1.65 M pairs/frame) paid a real `call g421Desc` — plus the
+    // caller-saved spills that a call forces in this very register-hungry loop. Verified in the
+    // /FAsc listing of the shipped Release binary: `call ?g421Desc@...` sat directly on the
+    // fast-upper path with `mov QWORD PTR $T7[rbp-464], rax` spilling the G430 stamp around it.
+    constexpr G421DescTable g421DescTableConst = g421BuildDescTable();
+
+    // The out-of-line accessor is retained as the A/B CONTROL ARM (DC2_G436_LEGACY_ADDR=1) and
+    // for the cold census callers. `noinline` pins the legacy call shape so the two arms differ
+    // by exactly the thing under test.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
     const G421UpperDesc *g421Desc()
     {
-        static const G421DescTable s_table = g421BuildDescTable();
-        return s_table.e;
+        return g421DescTableConst.e;
     }
 
     // dest bit3 = x (lane 0) ... bit0 = w (lane 3), matching applyDest().
@@ -141,7 +158,7 @@ namespace
         alignas(16) uint32_t m[16][4] = {};
     };
 
-    G421MaskTable g421BuildMaskTable()
+    constexpr G421MaskTable g421BuildMaskTable()
     {
         G421MaskTable t;
         for (unsigned d = 0u; d < 16u; ++d)
@@ -150,10 +167,17 @@ namespace
         return t;
     }
 
+    // G436: same table, constant-initialised (see g421DescTableConst).
+    constexpr G421MaskTable g421MaskTableConst = g421BuildMaskTable();
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
     const uint32_t (*g421MaskRows())[4]
     {
-        static const G421MaskTable s_table = g421BuildMaskTable();
-        return s_table.m;
+        return g421MaskTableConst.m;
     }
 
     // Same classifier as g329MakeMacSimd, fed from a register instead of a memory operand.
@@ -188,6 +212,69 @@ namespace
         _mm_storeu_ps(dst, _mm_or_ps(_mm_and_ps(mask, value), _mm_andnot_ps(mask, old)));
     }
 
+    // G428 - dest-shape specialised destination write.
+    //
+    // The G421 bit-select above costs FIVE SSE2 ops on every covered upper (mask-table load,
+    // destination load, and, andnot, or, store) regardless of the dest mask, and G426 priced this
+    // loop at ~1 host cycle per SSE2 op. The G428 census over lean MAP-0 measured the actual dest
+    // distribution of the 45%-of-cycles FMAC population:
+    //     0xF = 65.8%   0x1 = 22.2%   0xE = 4.0%   0xD = 3.8%   0xC = 2.5%   0x4 = 1.3%
+    //     0x8 = 0.4%    0x2 = 0.0%
+    // i.e. 65.8% write all four lanes and a further 23.9% write exactly one. A full-dest write is
+    // one unmasked store (the read-modify-write is provably the identity), and a single-lane write
+    // is one shuffle plus one 4-byte store. Only the 10.3% genuinely-partial remainder needs the
+    // mask table and the bit-select, and it is now the only path that loads either.
+    //
+    // EXACTNESS. dest==0xF: applyDest() assigns all four lanes, so storing all four lanes is the
+    // same write. Single lane L: `_mm_store_ss` writes exactly the 4 bytes of dst[L] with the low
+    // lane of the shuffled vector, which is r[L] — the same value applyDest() assigns, and no
+    // other byte of the destination is touched. dest==0 writes nothing on either path (the mask is
+    // all-zero, so the bit-select rewrites the destination with its own bits).
+    static const bool s_g428DestStore = (std::getenv("DC2_G428_NO_DEST_STORE") == nullptr);
+
+    // G436: `leanTab` selects the constant-initialised mask table over the out-of-line accessor.
+    // Same 16 bytes either way; only how the address is formed changes.
+    static DC2_G330_FORCEINLINE const uint32_t *g436MaskRow(bool leanTab, uint8_t dest)
+    {
+        return leanTab ? g421MaskTableConst.m[dest] : g421MaskRows()[dest];
+    }
+
+    static DC2_G330_FORCEINLINE void g428StoreDest(float *dst, __m128 value, uint8_t dest,
+                                                   bool leanTab)
+    {
+        if (!s_g428DestStore)
+        {
+            // Control arm: the G421 shape, byte-identical to the pre-G428 default.
+            g421StoreMasked(
+                dst, value,
+                _mm_load_ps(reinterpret_cast<const float *>(g436MaskRow(leanTab, dest))));
+            return;
+        }
+        switch (dest)
+        {
+        case 0xFu:
+            _mm_storeu_ps(dst, value);
+            return;
+        case 0x8u:
+            _mm_store_ss(dst + 0, value);
+            return;
+        case 0x4u:
+            _mm_store_ss(dst + 1, _mm_shuffle_ps(value, value, _MM_SHUFFLE(1, 1, 1, 1)));
+            return;
+        case 0x2u:
+            _mm_store_ss(dst + 2, _mm_shuffle_ps(value, value, _MM_SHUFFLE(2, 2, 2, 2)));
+            return;
+        case 0x1u:
+            _mm_store_ss(dst + 3, _mm_shuffle_ps(value, value, _MM_SHUFFLE(3, 3, 3, 3)));
+            return;
+        default:
+            g421StoreMasked(
+                dst, value,
+                _mm_load_ps(reinterpret_cast<const float *>(g436MaskRow(leanTab, dest))));
+            return;
+        }
+    }
+
     // PROMOTED default-on. The former positive bring-up flag DC2_G421_FAST_UPPER is now a
     // harmless no-op, the same retirement G410 gave DC2_G410_VU_COMPILED.
     bool g421FastUpperRequested()
@@ -210,15 +297,164 @@ namespace
 
     // Executes the upper slot in registers. Returns false when the encoding is not covered, in
     // which case the caller must run the legacy execUpper().
-    static DC2_G330_FORCEINLINE bool g421FastUpper(VU1State &st, uint32_t upper, uint8_t kind)
+    // G428: classify a parked delay-line entry. Only reached at a consumer pair (2.06% of pairs
+    // on lean MAP-0) and at run() exit, so its ~10 SSE2 ops are paid ~20x less often.
+    static inline uint32_t g428ResolveSlot(int slot)
     {
-        const G421UpperDesc d = g421Desc()[kind];
+        if (s_g428Kind[slot] == G428_MK_PENDING)
+            return g421MakeMacReg(_mm_load_ps(s_g428PendVec[slot]), s_g428PendDest[slot]);
+        if (s_g428Kind[slot] == G428_MK_EAGER)
+            return s_vuMacPipe[slot];
+        // CARRY: this pair wrote no MAC, so the visible value is whatever the newest non-CARRY
+        // entry that has already left the window produced.
+        if (s_g428PreKind == G428_MK_PENDING)
+            return g421MakeMacReg(_mm_load_ps(s_g428PreVec), s_g428PreDest);
+        return s_g428PreMac;
+    }
+
+    // G430: record an inline FMAC result in the stamped history. Called only from the FMAC path
+    // (45% of pairs), never from the loop body.
+    // G436: `hb` is the run()-hoisted address of the thread's history block. Passing nullptr
+    // re-derives it here, which is the DC2_G436_LEGACY_ADDR control arm (one TLS materialisation
+    // per push instead of one per run()).
+    static DC2_G330_FORCEINLINE void g430PushPending(G430HistBlock *hb, int64_t stamp, __m128 r,
+                                                     uint8_t dest)
+    {
+        G430HistBlock &H = hb ? *hb : s_g430HB;
+        const int slot = H.head;
+        _mm_store_ps(H.vec[slot], r);
+        H.stamp[slot] = stamp;
+        H.dest[slot] = dest;
+        H.kind[slot] = G428_MK_PENDING;
+        H.head = (slot + 1 < G430_HIST) ? slot + 1 : 0;
+    }
+
+    // G430: record an already-classified MAC (a writer outside the inline FMAC path, e.g. the
+    // legacy execUpper on an encoding G421 does not cover). Rare by construction.
+    static inline void g430PushEager(int64_t stamp, uint32_t mac)
+    {
+        G430HistBlock &H = s_g430HB;
+        const int slot = H.head;
+        H.stamp[slot] = stamp;
+        H.mac[slot] = mac;
+        H.kind[slot] = G428_MK_EAGER;
+        H.head = (slot + 1 < G430_HIST) ? slot + 1 : 0;
+    }
+
+    // G430: the architectural MAC as of pair `target` = the newest recorded writer with a stamp
+    // at or before it. Reached only at a flag-reading pair (2.06%) and at run() exit.
+    static inline uint32_t g430ResolveAt(int64_t target)
+    {
+        G430HistBlock &H = s_g430HB;
+        int best = -1;
+        int64_t bestStamp = INT64_MIN;
+        for (int i = 0; i < G430_HIST; ++i)
+        {
+            const int64_t s = H.stamp[i];
+            if (s <= target && s > bestStamp)
+            {
+                bestStamp = s;
+                best = i;
+            }
+        }
+        if (best < 0)
+            return 0u; // no writer has ever executed: the legacy pipe reads its zero init
+        if (H.kind[best] == G428_MK_PENDING)
+            return g421MakeMacReg(_mm_load_ps(H.vec[best]), H.dest[best]);
+        return H.mac[best];
+    }
+
+    // Convert the delay line OUT of the deferred representation: classify every parked entry and
+    // propagate the carried value through the CARRY slots, oldest first, so `s_vuMacPipe` again
+    // holds exactly what the eager path would have written on every one of the last DEPTH pairs.
+    static void g428MaterializePipe(int depth, int head)
+    {
+        uint32_t carry = (s_g428PreKind == G428_MK_PENDING)
+            ? g421MakeMacReg(_mm_load_ps(s_g428PreVec), s_g428PreDest)
+            : s_g428PreMac;
+        for (int age = depth - 1; age >= 0; --age)
+        {
+            const int slot = (head + age < depth) ? head + age : head + age - depth;
+            if (s_g428Kind[slot] == G428_MK_PENDING)
+                carry = g421MakeMacReg(_mm_load_ps(s_g428PendVec[slot]), s_g428PendDest[slot]);
+            else if (s_g428Kind[slot] == G428_MK_EAGER)
+                carry = s_vuMacPipe[slot];
+            s_vuMacPipe[slot] = carry;
+        }
+    }
+
+    // G442 - DENORMAL census on the VU1 FMAC path (default OFF: DC2_G442_DENORM=1).
+    //
+    // PREMISE. G441 priced the pole at ~26 ns/pair (~100 host cycles) against an executed SSE2 mix
+    // worth ~12, and G436/G437 closed instruction count, footprint, addressing and data placement.
+    // One latency class the arc has never checked is the x86 DENORMAL ASSIST: nothing in this tree
+    // touches MXCSR (no FTZ, no DAZ), so a subnormal operand or result on `addps`/`mulps` traps to
+    // microcode for tens to ~200 cycles. The PS2 VU has no subnormals at all — it flushes them —
+    // so any subnormal seen here is a host-representation artefact, and its cost is pure loss.
+    // This census answers "do they occur, and on what share of FMACs" before any lever is built.
+    //
+    // Counts LANES (not pairs): a subnormal in either source and a subnormal in the result.
+    //
+    // RESULT (lean MAP-0, 620 M FMACs): srcFmac 5.56%, srcLane 2.55%, dstFmac 2.56%, dstLane 1.20%.
+    // Subnormals are real but the assist is cheap on this host: DC2_G442_FTZ=1 (FTZ|DAZ on the VU1
+    // worker) is worth only ~0.4 ms/f, so the vein is priced out. The hook itself is compiled out —
+    // see the DC2_G442_DENORM_CENSUS note at its call site.
+#ifndef DC2_G442_DENORM_CENSUS
+#define DC2_G442_DENORM_CENSUS 0
+#endif
+#if DC2_G442_DENORM_CENSUS
+    static const bool s_g442Census = (std::getenv("DC2_G442_DENORM") != nullptr);
+    thread_local uint64_t s_g442Fmacs = 0ull;
+    thread_local uint64_t s_g442SrcLanes = 0ull;
+    thread_local uint64_t s_g442DstLanes = 0ull;
+    thread_local uint64_t s_g442SrcFmacs = 0ull;
+    thread_local uint64_t s_g442DstFmacs = 0ull;
+
+    // lanes whose value is subnormal: biased exponent 0 and mantissa non-zero.
+    static inline uint32_t g442SubMask(__m128 v)
+    {
+        const __m128i bits = _mm_castps_si128(v);
+        const __m128i absBits = _mm_and_si128(bits, _mm_set1_epi32(0x7FFFFFFF));
+        const __m128i expBits = _mm_and_si128(bits, _mm_set1_epi32(0x7F800000));
+        const __m128i isZero = _mm_cmpeq_epi32(absBits, _mm_setzero_si128());
+        const __m128i expZero = _mm_cmpeq_epi32(expBits, _mm_setzero_si128());
+        return (uint32_t)_mm_movemask_ps(
+            _mm_castsi128_ps(_mm_andnot_si128(isZero, expZero)));
+    }
+
+    static inline void g442NoteFmac(__m128 vs, __m128 b, __m128 r)
+    {
+        const uint32_t s = g442SubMask(vs) | g442SubMask(b);
+        const uint32_t d = g442SubMask(r);
+        ++s_g442Fmacs;
+        if (s) { s_g442SrcLanes += (uint64_t)_mm_popcnt_u32(s); ++s_g442SrcFmacs; }
+        if (d) { s_g442DstLanes += (uint64_t)_mm_popcnt_u32(d); ++s_g442DstFmacs; }
+        if ((s_g442Fmacs % 20000000ull) == 0ull)
+            std::fprintf(stderr,
+                         "[G442:denorm] fmacs=%llu | srcFmac=%.4f%% srcLane=%.4f%% "
+                         "dstFmac=%.4f%% dstLane=%.4f%%\n",
+                         (unsigned long long)s_g442Fmacs,
+                         100.0 * (double)s_g442SrcFmacs / (double)s_g442Fmacs,
+                         100.0 * (double)s_g442SrcLanes / (4.0 * (double)s_g442Fmacs),
+                         100.0 * (double)s_g442DstFmacs / (double)s_g442Fmacs,
+                         100.0 * (double)s_g442DstLanes / (4.0 * (double)s_g442Fmacs));
+    }
+#endif // DC2_G442_DENORM_CENSUS
+
+    static DC2_G330_FORCEINLINE bool g421FastUpper(VU1State &st, uint32_t upper, uint8_t kind,
+                                                   bool g428Defer, bool g428Shadow = false,
+                                                   bool g430Hist = false, int64_t g430Stamp = 0,
+                                                   G430HistBlock *g436Hb = nullptr)
+    {
+        // G436: a non-null history block also means "lean addressing" — the run() hoist is armed,
+        // so the constant-initialised tables are used instead of the out-of-line accessors.
+        const bool g436Lean = g436Hb != nullptr;
+        const G421UpperDesc d = g436Lean ? g421DescTableConst.e[kind] : g421Desc()[kind];
         if (d.cls == 0u)
             return false;
 
         const __m128 vs = _mm_loadu_ps(st.vf[FS(upper)]);
         const uint8_t dest = DEST(upper);
-        const __m128 mask = _mm_load_ps(reinterpret_cast<const float *>(g421MaskRows()[dest]));
 
         if (d.cls >= 3u)
         {
@@ -251,7 +487,7 @@ namespace
                 break;
             }
             // None of these five update MAC/STATUS, and all write VF[ft].
-            g421StoreMasked(st.vf[FT(upper)], r, mask);
+            g428StoreDest(st.vf[FT(upper)], r, dest, g436Lean);
             return true;
         }
 
@@ -287,10 +523,51 @@ namespace
         default: r = _mm_min_ps(vs, b); break;
         }
 
-        const uint32_t mac = g421MakeMacReg(r, dest);
-        st.mac = mac;
-        g329UpdateStatus(st.status, mac);
-        g421StoreMasked(d.cls == 1u ? st.vf[FD(upper)] : st.acc, r, mask);
+#if DC2_G442_DENORM_CENSUS
+        // Compile-time OFF, but MEASURED CHEAP: with the runtime `if (s_g442Census)` present and
+        // the flag unset the frame moved +0.08 ms against the same control (two order-balanced
+        // A/Bs, 47.74 vs 47.27 candidate means). It is compiled out only because it has already
+        // answered its question. Re-arm with /D DC2_G442_DENORM_CENSUS=1; never ship it on.
+        if (s_g442Census)
+            g442NoteFmac(vs, b, r);
+#endif
+
+        if (g430Hist)
+        {
+            // G430: record (stamp, result, dest). No head advance, no tag, no carry: the consumer
+            // finds this entry by stamp.
+            g430PushPending(g436Hb, g430Stamp, r, dest);
+            if (g428Shadow)
+            {
+                const uint32_t mac = g421MakeMacReg(r, dest);
+                st.mac = mac;
+                g329UpdateStatus(st.status, mac);
+            }
+        }
+        else if (g428Defer)
+        {
+            // Park the unclassified result in the delay-line slot this pair owns (the head was
+            // advanced before the pair executed, so this IS the entry the push will publish).
+            const int slot = s_g328MacPipeHead;
+            _mm_store_ps(s_g428PendVec[slot], r);
+            s_g428PendDest[slot] = dest;
+            s_g428Claim = G428_MK_PENDING;
+            if (g428Shadow)
+            {
+                // DC2_G428_VERIFY: keep the legacy eager classification running alongside, so
+                // the delay line carries the ground-truth value the resolver must reproduce.
+                const uint32_t mac = g421MakeMacReg(r, dest);
+                st.mac = mac;
+                g329UpdateStatus(st.status, mac);
+            }
+        }
+        else
+        {
+            const uint32_t mac = g421MakeMacReg(r, dest);
+            st.mac = mac;
+            g329UpdateStatus(st.status, mac);
+        }
+        g428StoreDest(d.cls == 1u ? st.vf[FD(upper)] : st.acc, r, dest, g436Lean);
         return true;
     }
 } // namespace

@@ -136,8 +136,22 @@ void GS::performLocalToLocalTransfer()
         return;
     }
 
+    // G432: the l2l call is not one thing — census each blocking stage apart from the pixel body.
+    const bool g432L2lArmed = g432CensusOn();
+    const uint64_t g432L2lPx = static_cast<uint64_t>(rrw) * rrh;
+
     if (!g145DirtyUpload)
-        g144FlushPendingUpload();
+    {
+        if (g432L2lArmed)
+        {
+            G432Scope sc(&s_g432LFlush, g432L2lPx);
+            g144FlushPendingUpload();
+        }
+        else
+        {
+            g144FlushPendingUpload();
+        }
+    }
 
     if (!m_vram)
         return;
@@ -152,29 +166,63 @@ void GS::performLocalToLocalTransfer()
 
     if (g145DirtyUpload)
     {
-        g144FlushPendingLocalTransferRange(sbp, sbw, spsm, ssax, ssay,
-                                           dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        if (g432L2lArmed)
+        {
+            G432Scope sc(&s_g432LFlush, g432L2lPx);
+            g144FlushPendingLocalTransferRange(sbp, sbw, spsm, ssax, ssay,
+                                               dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        }
+        else
+        {
+            g144FlushPendingLocalTransferRange(sbp, sbw, spsm, ssax, ssay,
+                                               dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        }
     }
 
     // G242: the range/full G144 barrier above must run first so every deferred draw
     // that can feed this copy has reached its GPU depth surface before we read VRAM.
-    g242PrepareVramReadRect(m_vram, sbp, sbw, spsm, ssax, ssay, rrw, rrh);
-
-    const bool g289GpuCopy =
-        g289TryGpuLocalCopy(m_vram, m_vramSize,
-                            sbp, sbw, spsm, ssax, ssay,
-                            dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
-
-    g149BumpVramGen(); // VRAM about to change: invalidate the de-swizzle texture cache
-    // G178/G242: notify only after pending draws and source depth have been resolved.
-    // The hook materializes an overlapping GPU-owned destination before the CPU copy writes it.
+    if (g432L2lArmed)
     {
-        extern void g178NoteVramWriteRect(uint8_t *, uint32_t, uint32_t, uint32_t,
-                                          uint32_t, uint32_t, uint32_t, uint32_t);
-        g178NoteVramWriteRect(m_vram, dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        G432Scope sc(&s_g432LPrep, g432L2lPx);
+        g242PrepareVramReadRect(m_vram, sbp, sbw, spsm, ssax, ssay, rrw, rrh);
+    }
+    else
+    {
+        g242PrepareVramReadRect(m_vram, sbp, sbw, spsm, ssax, ssay, rrw, rrh);
+    }
+
+    bool g289GpuCopy;
+    if (g432L2lArmed)
+    {
+        G432Scope sc(&s_g432LGpu, g432L2lPx);
+        g289GpuCopy = g289TryGpuLocalCopy(m_vram, m_vramSize,
+                                          sbp, sbw, spsm, ssax, ssay,
+                                          dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+    }
+    else
+    {
+        g289GpuCopy = g289TryGpuLocalCopy(m_vram, m_vramSize,
+                                          sbp, sbw, spsm, ssax, ssay,
+                                          dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+    }
+
+    {
+        G432Scope sc(g432L2lArmed ? &s_g432LHook : nullptr, g432L2lPx);
+        g149BumpVramGen(); // VRAM about to change: invalidate the de-swizzle texture cache
+        // G178/G242: notify only after pending draws and source depth have been resolved.
+        // The hook materializes an overlapping GPU-owned destination before the CPU copy writes it.
+        {
+            extern void g178NoteVramWriteRect(uint8_t *, uint32_t, uint32_t, uint32_t,
+                                              uint32_t, uint32_t, uint32_t, uint32_t);
+            g178NoteVramWriteRect(m_vram, dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        }
     }
     if (g289GpuCopy)
+    {
+        if (g432L2lArmed)
+            ++s_g432LGpuTaken;
         return; // exact logical write is versioned in fbp=0x13b's FBO
+    }
 
     PS2_IF_AGRESSIVE_LOGS({
         if ((spsm == GS_PSM_T4 || dpsm == GS_PSM_T4) &&
@@ -233,6 +281,13 @@ void GS::performLocalToLocalTransfer()
                                 ? std::chrono::steady_clock::now()
                                 : std::chrono::steady_clock::time_point{};
 
+    // G432: charge the pixel body to one of three shape buckets (page memcpy / format-aware
+    // per-pixel / raw linear per-pixel). Scope closes at the end of the if/else chain below.
+    {
+    G432Scope g432Body(g432L2lArmed
+                           ? &s_g432LBody[g285UsePageCopy ? 0 : (formatAware ? 1 : 2)]
+                           : nullptr,
+                       g432L2lPx);
     if (g285UsePageCopy)
     {
         // Keep each copy at one physical GS page. Besides mirroring the proof boundary, this
@@ -300,6 +355,7 @@ void GS::performLocalToLocalTransfer()
             }
         }
     }
+    } // G432 body scope
 
     if (s_g285StatOn)
     {
@@ -566,10 +622,30 @@ void GS::vertexKick(bool drawing)
         }
     }
 
+    // G434 workload invariant: a ceiling probe that deletes draw submission is only admissible if
+    // both arms provably completed the same kicks. Behind the same cached master bool as the
+    // report, so the default path pays one predicted branch, not two atomics per vertex.
+    extern std::atomic<uint64_t> g_g434Kicks, g_g434DrawKicks;
+    static const bool s_g434Inv = envFlagEnabled("DC2_G434_INV");
+    if (s_g434Inv)
+    {
+        g_g434Kicks.fetch_add(1u, std::memory_order_relaxed);
+        if (drawing)
+            g_g434DrawKicks.fetch_add(1u, std::memory_order_relaxed);
+    }
+
     if (drawing)
     {
-        G147CountedPerfScope g147DrawScope(g_g147DrawPrimitiveNs, g_g147DrawPrimitiveCount);
-        m_rasterizer.drawPrimitive(this);
+        // G434 CEILING PROBE (DC2_G434_NO_DRAW=1, default-off, knowingly WRONG output):
+        // skip the entire front-thread primitive submission — deferral, tile-binning, GPU
+        // batching and CPU raster all vanish, while GIF parse, register replay, transfers and
+        // the vertex queue keep running identically. Prices "what if drawPrimitive cost zero".
+        static const bool s_g434NoDraw = envFlagEnabled("DC2_G434_NO_DRAW");
+        if (!s_g434NoDraw)
+        {
+            G147CountedPerfScope g147DrawScope(g_g147DrawPrimitiveNs, g_g147DrawPrimitiveCount);
+            m_rasterizer.drawPrimitive(this);
+        }
     }
 
     switch (m_prim.type)
@@ -1059,7 +1135,10 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 
     if (dpsm == GS_PSM_T4HL || dpsm == GS_PSM_T4HH)
     {
-        if (dpsm == GS_PSM_T4HH && dbp == 0x1A00u && envFlagEnabled("DC2_DUMP_FONT"))
+        // G446: read once (G268 idiom) — same literal, same defect class as the per-texel site in
+        // rasterizer_write_pixel.inc; this one is per upload rather than per texel.
+        static const bool s_g5DumpFontUp = envFlagEnabled("DC2_DUMP_FONT");
+        if (dpsm == GS_PSM_T4HH && dbp == 0x1A00u && s_g5DumpFontUp)
         {
             static uint32_t s_g5SourceBytes = 0u;
             const uint32_t sourceBytes = (rrw * rrh + 1u) / 2u;
@@ -1612,7 +1691,25 @@ void GS::performLocalToHostToBuffer()
     // source.  Keep the historical default-off path byte-for-byte unchanged.
     if (g242GuestDepthEnabled())
         g144FlushPendingUpload();
-    g242PrepareVramReadRect(m_vram, sbp, sbw, spsm, ssax, ssay, rrw, rrh);
+    {
+        // G432: the barrier is a blocking GPU->VRAM materialisation; time it apart from the gather.
+        const uint64_t g432Px = static_cast<uint64_t>(rrw) * rrh;
+        if (g432CensusOn())
+        {
+            G432Scope sc(&s_g432Prep, g432Px);
+            g242PrepareVramReadRect(m_vram, sbp, sbw, spsm, ssax, ssay, rrw, rrh);
+        }
+        else
+        {
+            g242PrepareVramReadRect(m_vram, sbp, sbw, spsm, ssax, ssay, rrw, rrh);
+        }
+    }
+
+    // G432: charge the whole per-pixel gather below to the PSM-class bucket. Scope ends at the
+    // close of the function body's gather region (see the matching brace before the G358 dump).
+    const bool g432Armed = g432CensusOn();
+    G432Scope g432Gather(g432Armed ? &s_g432Gather[g432PsmClass(spsm)] : nullptr,
+                         static_cast<uint64_t>(rrw) * rrh);
 
     if (bpp == 4)
     {

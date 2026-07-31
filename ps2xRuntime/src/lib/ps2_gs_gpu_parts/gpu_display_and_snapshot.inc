@@ -137,6 +137,7 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
     {
         return false;
     }
+    G440LatchScope g440Copy(kG440SlotCopy);
 
     static const bool s_g289PresentationAudit =
         !envFlagEnabled("DC2_G289_NO_GPU_LOCAL_COPY") &&
@@ -148,7 +149,10 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
             sourceOriginX, sourceOriginY, width, height,
             useLocalMemoryLayout, frameBaseIsPages);
 
-    outPixels.assign(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
+    {
+        G440LatchScope g440Assign(kG440SlotAssign);
+        g440PrepareHostBuffer(outPixels, width, height);
+    }
 
     const uint32_t baseBytes = frameBaseIsPages ? (frame.fbp * 8192u) : (frame.fbp * 256u);
     const uint32_t basePtr = frameBaseIsPages ? GSInternal::framePageBaseToBlock(frame.fbp) : frame.fbp;
@@ -161,6 +165,67 @@ bool GS::copyFrameToHostRgbaUnlocked(const GSFrameReg &frame,
         const uint32_t srcPixelBytes = (frame.psm == GS_PSM_CT24) ? 3u : 4u;
         if (useLocalMemoryLayout)
         {
+            // G440: run-based PSMCT32 deswizzle. addrPSMCT32 factorises exactly into
+            //   page(y>>5, x>>6) + blockTable32[(y>>3)&3][(x>>3)&7] + columnTable32[y&7][x&7]*4,
+            // so within one output row the block base is constant across each aligned group of 8
+            // pixels and the 8 in-block word offsets are a fixed function of y&7. Those 8 offsets
+            // are four CONTIGUOUS word pairs (columnTable32 rows are {a,a+1,b,b+1,...}), so a
+            // group of 8 source pixels is four 8-byte loads instead of eight addrPSMCT32 calls
+            // and 32 byte copies. Bit-identical: same source bytes, same destination bytes.
+            // Rollback: DC2_G440_LEGACY_LATCH=1.
+            if (g440FastLatchEnabled() && width != 0u && height != 0u &&
+                ((sourceOriginX & 7u) == 0u) && ((width & 7u) == 0u))
+            {
+                // Conservative bound: the highest page this rectangle can touch must be fully
+                // resident. addrPSMCT32 never leaves the 8 KiB page it selects, so "last page
+                // fully inside VRAM" covers every read the loop makes, in any order.
+                const uint64_t lastPage =
+                    static_cast<uint64_t>(basePtr >> 5u) +
+                    static_cast<uint64_t>((sourceOriginY + height - 1u) >> 5u) *
+                        static_cast<uint64_t>(fbwBlocks ? fbwBlocks : 1u) +
+                    static_cast<uint64_t>((sourceOriginX + width - 1u) >> 6u);
+                // +2, not +1: blockId can reach 62, and its (blockId>>5)<<13 term spills one page.
+                if ((lastPage + 2ull) * 8192ull <= static_cast<uint64_t>(m_vramSize))
+                {
+                    const bool keepAlpha = preserveAlpha && frame.psm != GS_PSM_CT24;
+                    for (uint32_t y = 0; y < height; ++y)
+                    {
+                        const uint32_t srcY = sourceOriginY + y;
+                        const uint8_t *const colRow = GSPSMCT32::columnTable32[srcY & 7u];
+                        // Four contiguous word-pair byte offsets inside the block.
+                        const uint32_t pairOff[4] = {
+                            static_cast<uint32_t>(colRow[0]) * 4u,
+                            static_cast<uint32_t>(colRow[2]) * 4u,
+                            static_cast<uint32_t>(colRow[4]) * 4u,
+                            static_cast<uint32_t>(colRow[6]) * 4u};
+                        uint32_t *dstRow = reinterpret_cast<uint32_t *>(
+                            outPixels.data() + (static_cast<size_t>(y) * kHostFrameWidth * 4u));
+                        for (uint32_t x = 0; x < width; x += 8u)
+                        {
+                            const uint32_t srcX = sourceOriginX + x;
+                            const uint32_t blockBase =
+                                GSPSMCT32::addrPSMCT32(basePtr, fbwBlocks, srcX, srcY) - pairOff[0];
+                            uint32_t *dst = dstRow + x;
+                            for (int p = 0; p < 4; ++p)
+                            {
+                                uint32_t two[2];
+                                std::memcpy(two, m_vram + blockBase + pairOff[p], 8u);
+                                if (keepAlpha)
+                                {
+                                    dst[p * 2 + 0] = two[0];
+                                    dst[p * 2 + 1] = two[1];
+                                }
+                                else
+                                {
+                                    dst[p * 2 + 0] = two[0] | 0xFF000000u;
+                                    dst[p * 2 + 1] = two[1] | 0xFF000000u;
+                                }
+                            }
+                        }
+                    }
+                    return true;
+                }
+            }
             for (uint32_t y = 0; y < height; ++y)
             {
                 uint8_t *dstRow = outPixels.data() + (y * kHostFrameWidth * 4u);
@@ -329,6 +394,17 @@ void GS::latchHostPresentationFrame()
 {
     // G189: dedicated mutex, not m_stateMutex — see s_g189HostPresentMutex's comment above.
     std::lock_guard<std::mutex> lock(s_g189HostPresentMutex);
+    // G440 (diagnostic, DC2_G440_LATCH=1): this whole function is the frame-boundary closure the
+    // GS worker runs after every window of the frame — measured at 5.4-5.8 ms/f, i.e. the entire
+    // "serial residue" G439 could not attribute. Declared BEFORE the total scope so the report
+    // (destroyed last) sees this call's contribution.
+    struct G440Rep
+    {
+        const char *path = "none";
+        uint32_t w = 0u, h = 0u;
+        ~G440Rep() { g440LatchReport(path, w, h); }
+    } g440Rep;
+    G440LatchScope g440Total(kG440SlotTotal);
     const GSRegisters *const presentationRegs =
         s_g412PresentationOverride.active ? &s_g412PresentationOverride.regs : m_privRegs;
     // Bump on EVERY exit path (success, dual-merge, clear-on-invalid) — any call can
@@ -672,7 +748,8 @@ void GS::latchHostPresentationFrame()
             }
         }
 
-        if (!usedPreferred && countNonBlackPixels(scratch, width, height) == 0u)
+        // G440: `== 0` test only — use the early-exit predicate, not the full-buffer count.
+        if (!usedPreferred && !hasNonBlackPixel(scratch, width, height))
         {
             for (int contextIndex = 0; contextIndex < 2; ++contextIndex)
             {
@@ -819,8 +896,13 @@ void GS::latchHostPresentationFrame()
     {
         GSFrameReg selectedFrame1{};
         GSFrameReg selectedFrame2{};
-        std::vector<uint8_t> rc1;
-        std::vector<uint8_t> rc2;
+        // G440: the latch ran once per frame and allocated ~2.6 MB of fresh 640x512 RGBA here
+        // every time (two display reads), so the assign(total, 0) that follows was paying page
+        // faults on cold pages, not a memset. Reusing one buffer per thread keeps the pages warm
+        // and lets g440PrepareHostBuffer clear only the margin. thread_local, not static: the
+        // present thread can also reach this function (runtime_host_display.inc).
+        static thread_local std::vector<uint8_t> rc1;
+        static thread_local std::vector<uint8_t> rc2;
         bool usedPreferred1 = false;
         bool usedPreferred2 = false;
 
@@ -958,8 +1040,88 @@ void GS::latchHostPresentationFrame()
             const uint8_t bgG = static_cast<uint8_t>((presentationRegs->bgcolor >> 8) & 0xFFu);
             const uint8_t bgB = static_cast<uint8_t>((presentationRegs->bgcolor >> 16) & 0xFFu);
             const uint8_t bgA = pmode.alp;
+            g440Rep.path = "dual";
+            g440Rep.w = width;
+            g440Rep.h = height;
+            G440LatchScope g440Merge(kG440SlotMerge);
 
-            std::vector<uint8_t> merged(kHostFrameWidth * kHostFrameHeight * 4u, 0u);
+            // G440: reused across latches (see rc1/rc2) — the old form allocated and zeroed a
+            // fresh 1.31 MB vector here every frame.
+            static thread_local std::vector<uint8_t> merged;
+            if (g440FastLatchEnabled())
+            {
+                // G440 fused dual-CRT merge. The legacy form made FOUR full passes over the
+                // 512x415 rectangle (background fill, CRT2 byte-copy, CRT1 blend, alpha=255) and
+                // touched 1.31 MB of freshly-allocated memory before any of them. This makes one
+                // pass per row and drops the alpha bookkeeping entirely: the legacy pass order
+                // ends with an unconditional alpha=255 over the whole [0,width)x[0,height)
+                // rectangle, so every alpha the earlier passes computed there was dead. Whatever
+                // is outside that rectangle stays zero, exactly as before. Bit-identical output.
+                g440PrepareHostBuffer(merged, width, height);
+                const uint32_t bgWord = static_cast<uint32_t>(bgR) |
+                                        (static_cast<uint32_t>(bgG) << 8) |
+                                        (static_cast<uint32_t>(bgB) << 16) |
+                                        0xFF000000u;
+                const bool useRc2 = !pmode.slbg;
+                const bool mmod = pmode.mmod;
+                const uint32_t alp = static_cast<uint32_t>(pmode.alp);
+                // Three straight-line sub-loops per row, not one branchy one: the first two are
+                // trivially auto-vectorised (a masked 32-bit copy and a 32-bit fill), and folding
+                // them into the blend loop measured +0.24 ms/f because it destroyed that.
+                for (uint32_t y = 0; y < height; ++y)
+                {
+                    const size_t rowOff = static_cast<size_t>(y) * kHostFrameWidth * 4u;
+                    uint32_t *const dst = reinterpret_cast<uint32_t *>(merged.data() + rowOff);
+                    const uint32_t rc2W = (useRc2 && y < height2) ? width2 : 0u;
+                    if (rc2W != 0u)
+                    {
+                        const uint32_t *const src2 =
+                            reinterpret_cast<const uint32_t *>(rc2.data() + rowOff);
+                        for (uint32_t x = 0; x < rc2W; ++x)
+                            dst[x] = src2[x] | 0xFF000000u;
+                    }
+                    for (uint32_t x = rc2W; x < width; ++x)
+                        dst[x] = bgWord;
+
+                    if (y < height1)
+                    {
+                        const uint32_t *const s1 =
+                            reinterpret_cast<const uint32_t *>(rc1.data() + rowOff);
+                        for (uint32_t x = 0; x < width1; ++x)
+                        {
+                            const uint32_t s = s1[x];
+                            const uint32_t factor =
+                                mmod ? alp : std::min<uint32_t>(255u, (s >> 24) * 2u);
+                            // factor 255 => blendPresentationChannel returns src exactly;
+                            // factor 0 => it returns dst unchanged. Both collapse to one store
+                            // (or none) instead of three byte read-modify-writes.
+                            if (factor == 255u)
+                            {
+                                dst[x] = s | 0xFF000000u;
+                            }
+                            else if (factor != 0u)
+                            {
+                                const uint32_t d = dst[x];
+                                dst[x] = 0xFF000000u |
+                                         static_cast<uint32_t>(blendPresentationChannel(
+                                             static_cast<uint8_t>(s & 0xFFu),
+                                             static_cast<uint8_t>(d & 0xFFu), factor)) |
+                                         (static_cast<uint32_t>(blendPresentationChannel(
+                                              static_cast<uint8_t>((s >> 8) & 0xFFu),
+                                              static_cast<uint8_t>((d >> 8) & 0xFFu), factor))
+                                          << 8) |
+                                         (static_cast<uint32_t>(blendPresentationChannel(
+                                              static_cast<uint8_t>((s >> 16) & 0xFFu),
+                                              static_cast<uint8_t>((d >> 16) & 0xFFu), factor))
+                                          << 16);
+                            }
+                        }
+                    }
+                }
+            }
+            else
+            {
+            merged.assign(static_cast<size_t>(kHostFrameWidth) * kHostFrameHeight * 4u, 0u);
             for (uint32_t y = 0; y < height; ++y)
             {
                 uint8_t *dstRow = merged.data() + (y * kHostFrameWidth * 4u);
@@ -1021,6 +1183,7 @@ void GS::latchHostPresentationFrame()
                     row[x * 4u + 3u] = 255u;
                 }
             }
+            }
 
             if (applyFieldMode)
             {
@@ -1054,8 +1217,11 @@ void GS::latchHostPresentationFrame()
     const uint32_t height = validCrt1 ? height1 : height2;
 
     GSFrameReg selectedFrame = displayFrame;
-    std::vector<uint8_t> scratch;
+    static thread_local std::vector<uint8_t> scratch; // G440: reused, see rc1/rc2 above
     bool usedPreferred = false;
+    g440Rep.path = "single";
+    g440Rep.w = width;
+    g440Rep.h = height;
     const GSDisplayReadOrigin &displayOrigin = validCrt1 ? displayOrigin1 : displayOrigin2;
     if (!copyDisplaySource(displayFrame, displayOrigin, width, height, true, false, selectedFrame, scratch, usedPreferred))
     {

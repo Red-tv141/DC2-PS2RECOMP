@@ -206,6 +206,11 @@ static const bool s_g330Verify = (std::getenv("DC2_G330_VERIFY") != nullptr);
 static DC2_G330_FORCEINLINE void vu1UpdateMac(uint32_t &macReg, uint32_t &statusReg,
                                               float *result, uint8_t dest)
 {
+    // G428: this is the single funnel for every EAGER MAC write (legacy execUpper and the
+    // lower-slot FMAC helpers). Tag the pair in flight so the delay-line push records a real
+    // classified value for it rather than a deferred vector. One store, and only on the ~2% of
+    // pairs that do not go through the inline upper.
+    s_g428Claim = G428_MK_EAGER;
     if (s_g330FusedMacOn && !s_vu1MacDisabled && !s_g71clampcount && !s_vu1Clamp)
     {
         const uint32_t statusBefore = statusReg;

@@ -46,6 +46,11 @@ std::atomic<uint64_t> g_g147GsGifPacketNs{0};
 std::atomic<uint64_t> g_g147GsGifPacketCount{0};
 std::atomic<uint64_t> g_g147DrawPrimitiveNs{0};
 std::atomic<uint64_t> g_g147DrawPrimitiveCount{0};
+// G434 ceiling probe: workload invariants for the "delete the front-thread draw submission"
+// arm. Counted on EVERY arm (two relaxed increments per kick), so both arms can be proven to
+// have run the same number of kicks / drawing kicks before their frames are compared.
+std::atomic<uint64_t> g_g434Kicks{0};
+std::atomic<uint64_t> g_g434DrawKicks{0};
 std::atomic<uint64_t> g_g147GifTags{0};
 std::atomic<uint64_t> g_g147PackedRegs{0};
 std::atomic<uint64_t> g_g147ReglistRegs{0};
@@ -73,6 +78,10 @@ void g289_prepare_presentation_read(uint8_t *vram,
                                     uint32_t fbp, uint32_t fbw, uint32_t psm,
                                     uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                                     bool useLocalMemoryLayout, bool frameBaseIsPages);
+
+// G446 env-read census (defined at global scope in ps2_gif_arbiter.cpp; no-op unless
+// DC2_G446_ENVCENSUS=1) — names the getenv caller a PC sampler cannot.
+void g446NoteEnvRead(const char *name);
 
 namespace
 {
@@ -160,6 +169,47 @@ namespace
     static constexpr uint32_t kHostFrameWidth = 640u;
     static constexpr uint32_t kHostFrameHeight = 512u;
 
+    // G440: master gate for the exact present-latch fast paths (run-based PSMCT32 deswizzle,
+    // margin-only host-buffer clear, fused dual-CRT merge). Default ON; DC2_G440_LEGACY_LATCH=1
+    // restores the pre-G440 per-pixel forms as the A/B control arm.
+    inline bool g440FastLatchEnabled()
+    {
+        static const bool on = (std::getenv("DC2_G440_LEGACY_LATCH") == nullptr);
+        return on;
+    }
+
+    // G440: size a 640x512 host-frame buffer and zero ONLY the margin outside the
+    // [0,width)x[0,height) rectangle the caller is about to overwrite in full. Exact — the union
+    // of "margin zeroed" and "rectangle written" is byte-for-byte the buffer that
+    // assign(total, 0) + the same writes produced. Falls back to the full clear whenever the
+    // buffer is not already the right size (first use, or after a swap) or the rectangle is not
+    // a subset of the host frame.
+    inline void g440PrepareHostBuffer(std::vector<uint8_t> &buf, uint32_t width, uint32_t height)
+    {
+        const size_t total = static_cast<size_t>(kHostFrameWidth) * kHostFrameHeight * 4u;
+        if (!g440FastLatchEnabled() || buf.size() != total ||
+            width == 0u || height == 0u ||
+            width > kHostFrameWidth || height > kHostFrameHeight)
+        {
+            buf.assign(total, 0u);
+            return;
+        }
+        uint8_t *const data = buf.data();
+        const size_t rowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+        if (width < kHostFrameWidth)
+        {
+            const size_t tailBytes = static_cast<size_t>(kHostFrameWidth - width) * 4u;
+            for (uint32_t y = 0; y < height; ++y)
+                std::memset(data + static_cast<size_t>(y) * rowBytes + static_cast<size_t>(width) * 4u,
+                            0, tailBytes);
+        }
+        if (height < kHostFrameHeight)
+        {
+            std::memset(data + static_cast<size_t>(height) * rowBytes, 0,
+                        static_cast<size_t>(kHostFrameHeight - height) * rowBytes);
+        }
+    }
+
     uint16_t encodeFramePixelPSMCT16(uint8_t r, uint8_t g, uint8_t b, uint8_t a)
     {
         return static_cast<uint16_t>(((r >> 3) & 0x1Fu) |
@@ -195,6 +245,7 @@ namespace
 
     bool envFlagEnabled(const char *name)
     {
+        ::g446NoteEnvRead(name);
         const char *value = std::getenv(name);
         return value != nullptr &&
                value[0] != '\0' &&
@@ -663,6 +714,7 @@ namespace
         {
             return;
         }
+        G440LatchScope g440(kG440SlotAlpha);
 
         const std::vector<uint8_t> source = pixels;
         for (uint32_t y = 0; y < height; ++y)
@@ -685,6 +737,7 @@ namespace
         {
             return;
         }
+        G440LatchScope g440(kG440SlotAlpha);
 
         for (uint32_t y = 0; y < height; ++y)
         {
@@ -702,8 +755,33 @@ namespace
         return GSInternal::clampU8(static_cast<int>(dst) + ((delta * static_cast<int>(factor)) / 255));
     }
 
+    // G440: every hot-path use of countNonBlackPixels is an `== 0` / `!= 0` test — the COUNT is
+    // only ever printed by default-off traces. The count form always walks the whole 512x415
+    // buffer (2 scans per present latch, 0.47 ms/f measured); this form stops at the first
+    // non-black pixel, which on any non-blank frame is a few rows in. Bit-identical decision,
+    // identical black-pixel predicate (r|g|b != 0), reads a strict prefix of the same bytes.
+    bool hasNonBlackPixel(const std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
+    {
+        G440LatchScope g440(kG440SlotNonBlack);
+        if (pixels.empty())
+            return false;
+        for (uint32_t y = 0; y < height; ++y)
+        {
+            const uint8_t *row = pixels.data() + (y * kHostFrameWidth * 4u);
+            for (uint32_t x = 0; x < width; ++x)
+            {
+                if (row[x * 4u + 0u] != 0u || row[x * 4u + 1u] != 0u || row[x * 4u + 2u] != 0u)
+                {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
     uint32_t countNonBlackPixels(const std::vector<uint8_t> &pixels, uint32_t width, uint32_t height)
     {
+        G440LatchScope g440(kG440SlotNonBlack);
         uint32_t count = 0u;
         for (uint32_t y = 0; y < height; ++y)
         {

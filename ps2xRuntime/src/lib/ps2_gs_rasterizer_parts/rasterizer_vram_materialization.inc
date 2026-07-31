@@ -865,6 +865,16 @@ static void g261PrepareInline(const GSContext &ctx, const GSPrimReg &prim,
 static bool g305AsyncOn() { static const bool v = envFlagEnabled("DC2_G305_ASYNC"); return v; }
 static bool g305StatOn()  { static const bool v = envFlagEnabled("DC2_G305_STAT");  return v; }
 
+// G444 CEILING PROBE (default-off, DC2_G444_ASYNC=1). G305's async break excludes every G310 flush
+// (`!g310On()`), which on this route is every flush — so the mechanism has never been priced. G444
+// measured the GS worker at 45.0 ms/f = front 23.0 + backend 22.0 fully SERIALIZED across the
+// front/GL-thread boundary, so the overlap this probe buys is bounded above by ~20 ms/f. The probe
+// changes only WHICH gate admits a flush to the existing move-owned one-slot path; submission,
+// drain, ordering and the delayed-failure fallback are byte-unchanged. Output correctness under
+// G310's completion-ordered freeze is exactly what is being tested — treat a pass as a lever and a
+// fail as a priced ceiling. Never default-on without the full route matrix.
+static bool g444AsyncOn() { static const bool v = envFlagEnabled("DC2_G444_ASYNC"); return v; }
+
 static bool g_g305PendActive = false;               // a packet is in flight + its fallback retained
 static std::vector<G144Entry> g_g305PendList;       // retained fallback authority for the in-flight batch
 static GS *g_g305PendGs = nullptr;
@@ -2622,6 +2632,67 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                             e.ctx.tex0.cbp, e.ctx.tex0.cpsm, e.ctx.tex0.csm,
                             e.ctx.tex0.csa, e.ctx.tex0.psm);
                     uint64_t bad = 0u;
+                    // G431 (census only, DC2_G431_T8CENSUS=1): the resident T8 view is rebuilt
+                    // once per FLUSH because s_g310BuiltViews is per-flush state, but the view is
+                    // a pure function of (producer FBO contents, byte map, CLUT). Count how many
+                    // of these ~0.18 ms blocking backend round-trips would be skippable if the
+                    // set survived the flush boundary: same viewKey, no producer write to that
+                    // target since the last build, and byte-identical map+CLUT. Ceiling first —
+                    // do not build the cache until this says the redundancy is real.
+                    {
+                        static const bool s_g431T8Census = envFlagEnabled("DC2_G431_T8CENSUS");
+                        if (s_g431T8Census)
+                        {
+                            struct G431T8Rec { uint64_t prodN, mapHash, clutHash; int srcTi; };
+                            static std::unordered_map<uint64_t, G431T8Rec> s_seen;
+                            static uint64_t s_red = 0u, s_nec = 0u, s_reasonProd = 0u,
+                                            s_reasonMap = 0u, s_reasonClut = 0u, s_reasonNew = 0u;
+                            const auto fnv = [](const uint32_t *p, size_t n) {
+                                uint64_t h = 1469598103934665603ull;
+                                for (size_t k = 0; k < n; ++k)
+                                { h ^= p[k]; h *= 1099511628211ull; }
+                                return h;
+                            };
+                            // Page-granular producer signature: the whole-target write counter
+                            // bumps on any write anywhere in the target, so it can never show a
+                            // redundant rebuild. g_g310TargetPageGen is per 64x32 page.
+                            const auto &pageGen =
+                                g_g310TargetPageGen[static_cast<size_t>(srcTi)];
+                            uint64_t prodN = 1469598103934665603ull;
+                            for (size_t pg = 0; pg < pageGen.size(); ++pg)
+                            { prodN ^= pageGen[pg]; prodN *= 1099511628211ull; }
+                            const uint64_t mh = fnv(s_g310Map.data(), s_g310Map.size());
+                            const uint64_t ch = fnv(s_g310Clut.data(), s_g310Clut.size());
+                            auto it = s_seen.find(viewKey);
+                            if (it == s_seen.end())
+                            { ++s_nec; ++s_reasonNew; }
+                            else if (it->second.srcTi == srcTi && it->second.prodN == prodN &&
+                                     it->second.mapHash == mh && it->second.clutHash == ch)
+                                ++s_red;
+                            else
+                            {
+                                ++s_nec;
+                                if (it->second.prodN != prodN) ++s_reasonProd;
+                                else if (it->second.mapHash != mh) ++s_reasonMap;
+                                else if (it->second.clutHash != ch) ++s_reasonClut;
+                            }
+                            s_seen[viewKey] = G431T8Rec{prodN, mh, ch, srcTi};
+                            if (((s_red + s_nec) % 2000ull) == 0ull)
+                                std::fprintf(stderr,
+                                             "[G431:t8census] builds=%llu redundant=%llu (%.1f%%) "
+                                             "necessary=%llu why(new=%llu prod=%llu map=%llu clut=%llu) keys=%zu\n",
+                                             (unsigned long long)(s_red + s_nec),
+                                             (unsigned long long)s_red,
+                                             100.0 * (double)s_red /
+                                                 (double)std::max<uint64_t>(1u, s_red + s_nec),
+                                             (unsigned long long)s_nec,
+                                             (unsigned long long)s_reasonNew,
+                                             (unsigned long long)s_reasonProd,
+                                             (unsigned long long)s_reasonMap,
+                                             (unsigned long long)s_reasonClut,
+                                             s_seen.size());
+                        }
+                    }
                     const auto g324BackendT0 = g_g324ActiveDiag != nullptr
                         ? std::chrono::steady_clock::now()
                         : std::chrono::steady_clock::time_point{};
@@ -3703,10 +3774,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g_g178FbSnap.clear();
         return false;
     }
+    // G444: `|| g444AsyncOn()` relaxes ONLY the G310 exclusion (and only when the probe is armed);
+    // every other eligibility term is unchanged, so a non-armed run takes the identical decision.
     const bool g305Async =
-        g305AsyncOn() && !g_g305ForceSync && s_batch.skipReadback && !guestDepth &&
+        (g305AsyncOn() || g444AsyncOn()) && !g_g305ForceSync && s_batch.skipReadback && !guestDepth &&
         !g275FuseReadback && !g262WaveDepth && !g286Transient && !g282Tight &&
-        !(g255Rtt && g255VerifyOn()) && !g310On();
+        !(g255Rtt && g255VerifyOn()) && (!g310On() || g444AsyncOn());
     // G324 premise only: this is the existing G305 pure-epilogue contract with G310 admitted as
     // the missing completion-ordered state family. No submission behavior changes here.
     const bool g324TxnEligible =

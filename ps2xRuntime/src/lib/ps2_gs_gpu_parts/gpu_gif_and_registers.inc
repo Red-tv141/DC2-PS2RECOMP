@@ -1310,14 +1310,31 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
                              m_trxreg.rrw, m_trxreg.rrh);
         }
 
+        // G432: split the addr=0x53 A+D bucket by the transfer it actually dispatches. The dir=1
+        // gather charges itself from inside performLocalToHostToBuffer (prep vs pixel loop).
         if (m_trxdir == 2 && m_vram)
         {
-            performLocalToLocalTransfer();
+            if (g432CensusOn())
+            {
+                G432Scope sc(&s_g432L2L,
+                             static_cast<uint64_t>(m_trxreg.rrw) * m_trxreg.rrh);
+                performLocalToLocalTransfer();
+            }
+            else
+            {
+                performLocalToLocalTransfer();
+            }
         }
         else if (m_trxdir == 1 && m_vram)
         {
             performLocalToHostToBuffer();
         }
+        else if (g432CensusOn())
+        {
+            ++s_g432Other.n;
+        }
+        if (g432CensusOn())
+            g432Report();
         break;
     }
     case GS_REG_HWREG:

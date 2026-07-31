@@ -1453,7 +1453,15 @@ void g144FlushPendingUploadRange(uint32_t dbp,
         G314EdgeScope g314Edge;
         if (g260HasPending())
         {
+            // G429 CEILING PROBE (opt-in, DEFAULT-OFF, KNOWINGLY INCORRECT OUTPUT).
+            // The upload-forced graph flush is the largest single GS-worker item on lean MAP-0
+            // ([G146:g144] upload=21-23 ms/f over ~10 executes/frame). Before designing a
+            // texture-version mechanism that would legitimately break this edge, price the
+            // ceiling: suppress the WAR/WAW execute entirely and read the frame. This arm
+            // renders wrong (pending draws sample post-upload bytes) and must never be promoted.
+            static const bool s_g429NoUploadEdge = envFlagEnabled("DC2_G429_NO_UPLOAD_EDGE");
             const bool needsExecute =
+                !s_g429NoUploadEdge &&
                 g260VramEventNeedsExecute(G144BlockRange{}, dst, false, dstUnknown);
             if (needsExecute)
             {
@@ -1530,6 +1538,66 @@ void g144FlushPendingUploadRange(uint32_t dbp,
     g144FlushPendingUpload();
 }
 
+// ===== G432: local->local flush-edge split (behaviour-pure, DC2_G432_CENSUS=1) =====
+// The G432 TRXDIR census measured the dir=2 (local->local) A+D write at ~4.6 calls/frame and found
+// 94% of its cost inside this flush, not in the pixel copy. G429's law says an inclusive timer
+// around a FLUSH measures the work it DRAINS, so the flush total alone cannot say whether there is
+// anything to win here. This split separates:
+//   mat  : g289MaterializeForRanges — the ownership pin (GPU->VRAM round-trips)
+//   exec : g260ExecuteAll — the deferred native-renderer command graph, i.e. CONSERVED draw work
+//   n    : exec / skip (needsExecute said no) / idle (nothing pending at all)
+// A large `exec` is not a lever. A large `mat`, or a large residue (flushTotal - mat - exec), is.
+static bool g432L2lEdgeCensusOn()
+{
+    static const bool v = envFlagEnabled("DC2_G432_CENSUS");
+    return v;
+}
+static uint64_t g_g432EdgeMatNs = 0, g_g432EdgeExecNs = 0;
+static uint64_t g_g432EdgeExecN = 0, g_g432EdgeSkipN = 0, g_g432EdgeIdleN = 0;
+static uint64_t g_g432EdgeReports = 0;
+// Post-execute publication stages, in call order.
+static uint64_t g_g432EdgeStageNs[8] = {};
+static const char *const kG432EdgeStageNames[8] = {
+    "g266note", "g278depth", "g285cons", "g261mat",
+    "g278disp", "g272mat", "g277cen", "g276disp"};
+// Sequential lap timer: one clock read per stage boundary, charged to the caller's slot.
+struct G432EdgeStage
+{
+    bool on;
+    std::chrono::steady_clock::time_point t;
+    explicit G432EdgeStage(bool armed) : on(armed)
+    {
+        if (on)
+            t = std::chrono::steady_clock::now();
+    }
+    void lap(uint64_t &slot)
+    {
+        if (!on)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        slot += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - t).count());
+        t = now;
+    }
+};
+static void g432ReportL2lEdge()
+{
+    if ((++g_g432EdgeReports % 600u) != 0u)
+        return;
+    std::fprintf(stderr,
+                 "[G432:l2ledge] edges=%llu matMs=%.1f execMs=%.1f exec=%llu skip=%llu idle=%llu",
+                 static_cast<unsigned long long>(g_g432EdgeReports),
+                 static_cast<double>(g_g432EdgeMatNs) / 1.0e6,
+                 static_cast<double>(g_g432EdgeExecNs) / 1.0e6,
+                 static_cast<unsigned long long>(g_g432EdgeExecN),
+                 static_cast<unsigned long long>(g_g432EdgeSkipN),
+                 static_cast<unsigned long long>(g_g432EdgeIdleN));
+    for (int i = 0; i < 8; ++i)
+        std::fprintf(stderr, " %s=%.1f", kG432EdgeStageNames[i],
+                     static_cast<double>(g_g432EdgeStageNs[i]) / 1.0e6);
+    std::fprintf(stderr, "\n");
+}
+
 void g144FlushPendingLocalTransferRange(uint32_t sbp,
                                         uint8_t sbw,
                                         uint8_t spsm,
@@ -1543,6 +1611,24 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
                                         uint32_t rrw,
                                         uint32_t rrh)
 {
+    // G434 workload invariant: count every l2l edge on BOTH arms of the deletion probe below.
+    {
+        extern std::atomic<uint64_t> g_g434L2lEdges;
+        static const bool s_g434Inv = (std::getenv("DC2_G434_INV") != nullptr);
+        if (s_g434Inv)
+            g_g434L2lEdges.fetch_add(1u, std::memory_order_relaxed);
+    }
+    // G434 CEILING PROBE (DC2_G434_NO_L2LPIN=1, default-off, knowingly WRONG output): delete the
+    // ENTIRE local→local dependency-pin edge — g289/g261/g272 materialization, g285 consume,
+    // g278 depth flush, g276 display publication and the g260 graph drain. G432 attributed
+    // ~5.3 ms/f (g261MaterializeForRanges) + ~2.3 ms/f (g285PrepareL2lConsume) of GS FRONT-thread
+    // time here. Prices "what if the whole pin cost were zero". The pixel copy itself is done by
+    // the caller and is unaffected.
+    {
+        static const bool s_g434NoL2lPin = (std::getenv("DC2_G434_NO_L2LPIN") != nullptr);
+        if (s_g434NoL2lPin)
+            return;
+    }
     // G260: a local→local copy READS its source (must observe pending target writes → RAW) and
     // WRITES its destination (WAR/WAW against pending reads and writes). Same fail-closed range
     // logic as the upload edge.
@@ -1567,7 +1653,20 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
                              g343SrcRows, g343DstRows, g343FcRows, g343Unknown, g343HitFbp);
             g343T0 = std::chrono::steady_clock::now();
         }
+        // G432: the l2l TRXDIR bucket is 94% "flush", and the flush is this function. Split it
+        // once more so the conserved graph-drain (g260ExecuteAll) is separated from the pin cost
+        // around it. Behaviour-pure, armed by DC2_G432_CENSUS.
+        const bool g432On = g432L2lEdgeCensusOn();
+        std::chrono::steady_clock::time_point g432T0;
+        if (g432On)
+            g432T0 = std::chrono::steady_clock::now();
         g289MaterializeForRanges(src, dst, srcUnknown, dstUnknown, 8);
+        if (g432On)
+        {
+            g_g432EdgeMatNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - g432T0).count());
+        }
         if (g343On)
             g343MatNs += static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1579,26 +1678,49 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
                 g178CensusScan();
                 G146PerfScope g146FlushScope(g_g146G144FlushUploadNs, g_g146G144FlushUploadCount);
                 static const bool s_seqUpload260 = (std::getenv("DC2_G144_SEQUPLOAD") != nullptr);
-                g260ExecuteAll(kG260LocalCopy, !s_seqUpload260);
+                if (g432On)
+                {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    g260ExecuteAll(kG260LocalCopy, !s_seqUpload260);
+                    g_g432EdgeExecNs += static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            std::chrono::steady_clock::now() - t0).count());
+                    ++g_g432EdgeExecN;
+                }
+                else
+                {
+                    g260ExecuteAll(kG260LocalCopy, !s_seqUpload260);
+                }
             }
             else
             {
                 ++g_g260UploadSkips;
+                if (g432On)
+                    ++g_g432EdgeSkipN;
             }
+        }
+        else if (g432On)
+        {
+            ++g_g432EdgeIdleN;
         }
         // G261: the local→local copy READS src (must observe wave-rendered pixels) and WRITES
         // dst — both must see real VRAM bytes for any GPU-resident RTT row they touch.
+        G432EdgeStage g432s(g432On);
         g266NoteLocalCopy(sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
                           src, dst, srcUnknown, dstUnknown);
+        g432s.lap(g_g432EdgeStageNs[0]);
         if (g343On)
             g343T0 = std::chrono::steady_clock::now();
         (void)g278FlushPendingDepthForRanges(
             8, src, dst, srcUnknown, dstUnknown);
+        g432s.lap(g_g432EdgeStageNs[1]);
         const uint32_t g285Consumed = g285PrepareL2lConsume(
             sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
             src, dst, srcUnknown, dstUnknown);
+        g432s.lap(g_g432EdgeStageNs[2]);
         g261MaterializeForRanges(src, dst, srcUnknown, dstUnknown, kG261MatLocal,
                                  g285Consumed);
+        g432s.lap(g_g432EdgeStageNs[3]);
         if (g343On)
         {
             g343MatNs += static_cast<uint64_t>(
@@ -1607,13 +1729,17 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
             g343T0 = std::chrono::steady_clock::now();
         }
         (void)g278FlushPendingDepthForDisplayOwners(8);
+        g432s.lap(g_g432EdgeStageNs[4]);
         g272MaterializeForRanges(src, dst, srcUnknown, dstUnknown, 8);
+        g432s.lap(g_g432EdgeStageNs[5]);
         g277CensusRangeEdge(8, src, dst, srcUnknown, dstUnknown);
+        g432s.lap(g_g432EdgeStageNs[6]);
         // G276/G284: publish deferred display readbacks before this l2l edge — unless G284 proves the
         // copy src+dst are both disjoint from the pending display rows (then keep it coalesced).
         if (!g289CanDeferLocalCopy(sbp, sbw, spsm, ssax, ssay,
                                     dbp, dbw, dpsm, dsax, dsay, rrw, rrh))
             g276FlushPendingDisplayForRanges(8, src, dst, srcUnknown, dstUnknown);
+        g432s.lap(g_g432EdgeStageNs[7]);
         if (g343On)
         {
             const uint64_t g343PubNs = static_cast<uint64_t>(
@@ -1623,6 +1749,8 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
                         rrw, rrh, g343SrcRows, g343DstRows, g343FcRows,
                         g343Unknown, g343HitFbp, g343MatNs, g343PubNs);
         }
+        if (g432On)
+            g432ReportL2lEdge();
         return;
     }
     if (g_g144List.empty())

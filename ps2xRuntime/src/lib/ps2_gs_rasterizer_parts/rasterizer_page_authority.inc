@@ -11,11 +11,15 @@
 // hold exactly, so the measured G282 batch can keep the five targets resident without a stale peer.
 // The mechanism is authority-off inert: g283NoteTargetPages/g283PageEpoch short-circuit and the
 // fan-out keeps G282's single-owner fail-close.
+// G446: cached for the same reason as g294OwnerTokenRequested (see there) — process-constant env.
 static bool g283AuthorityRequested()
 {
-    if (envFlagEnabled("DC2_G283_NO_AUTHORITY") || envFlagDisabled("DC2_G283_AUTHORITY"))
-        return false;
-    return envFlagEnabled("DC2_G283_AUTHORITY");
+    static const bool s_on = []() {
+        if (envFlagEnabled("DC2_G283_NO_AUTHORITY") || envFlagDisabled("DC2_G283_AUTHORITY"))
+            return false;
+        return envFlagEnabled("DC2_G283_AUTHORITY");
+    }();
+    return s_on;
 }
 static bool g283AuthorityOn()
 {

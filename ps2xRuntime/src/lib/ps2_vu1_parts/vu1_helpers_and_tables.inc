@@ -263,6 +263,87 @@ namespace
     // modulo the configured depth reproduces the old shift-register order.  The feature is
     // process-constant, so a thread never changes representation while work is in flight.
     thread_local int s_g328MacPipeHead = 0;
+    // ---- G428: deferred MAC classification --------------------------------------------------
+    // The G329/G330 flag classifier runs ~10 SSE2 ops on EVERY inline FMAC (45% of executed
+    // pairs on lean MAP-0), and G426 priced this loop at ~1 host cycle per SSE2 op. Its product,
+    // however, is consumed by only 2.06% of pairs, and only through the G138 delay line. So the
+    // pipeline entry stores the RESULT VECTOR instead of the classified flags, and the classifier
+    // runs at the consumer.
+    //
+    // Each delay-line slot is tagged: CARRY (this pair wrote no MAC), EAGER (a non-inline writer
+    // updated m_state.mac, whose value is in s_vuMacPipe as before), or PENDING (an inline FMAC
+    // whose result vector + dest mask are parked here, unclassified). `pre*` holds the newest
+    // non-CARRY entry that has already fallen out of the window, so a CARRY read still resolves.
+    //
+    // STATUS is NOT maintained while this is engaged: its sticky bits accumulate over every FMAC
+    // ever executed and cannot be rebuilt lazily. That is sound only because STATUS has exactly
+    // three consumers (FSEQ/FSAND/FSOR) and the lever is gated on the G410 cache proving that the
+    // whole 16 KB code store decodes to ZERO of them (`statusReaderSlots == 0`).
+    constexpr uint8_t G428_MK_CARRY = 0u;
+    constexpr uint8_t G428_MK_PENDING = 1u;
+    constexpr uint8_t G428_MK_EAGER = 2u;
+    alignas(16) thread_local float s_g428PendVec[8][4] = {};
+    thread_local uint8_t s_g428PendDest[8] = {};
+    // Start EAGER so any entry produced before the lever engaged resolves out of s_vuMacPipe.
+    thread_local uint8_t s_g428Kind[8] = {2u, 2u, 2u, 2u, 2u, 2u, 2u, 2u};
+    // What the pair currently in flight did to the MAC. Written by the inline upper (PENDING) or
+    // by vu1UpdateMac (EAGER); consumed and cleared by the delay-line push at the end of the pair.
+    thread_local uint8_t s_g428Claim = 0u;
+    alignas(16) thread_local float s_g428PreVec[4] = {};
+    thread_local uint8_t s_g428PreDest = 0u;
+    thread_local uint8_t s_g428PreKind = G428_MK_EAGER;
+    thread_local uint32_t s_g428PreMac = 0u;
+    // Whether the delay line is currently in the deferred representation. The gate is not
+    // process-constant (it is re-evaluated per run() against the live code store), so every
+    // transition has to convert the ring between representations before the first pair runs.
+    thread_local bool s_g428Armed = false;
+
+    // ---- G430: STAMPED MAC HISTORY ----------------------------------------------------------
+    // G428 left the delay line as a per-PAIR ring: every executed pair advanced a head, read the
+    // outgoing tag, maintained a CARRY fallback and pushed a new tag, whether or not it touched
+    // the MAC. A DC2_G430_SKIP=1 ceiling probe priced that whole per-pair machinery at ~8 ms off
+    // the VU1 worker and ~9 ms off the frame at an unchanged workload (kicks/f identical).
+    //
+    // Only an upper FMAC can change the architectural MAC, so "the MAC visible at pair N" is
+    // simply the result of the newest FMAC at pair <= N-DEPTH. Recording (pairStamp, result
+    // vector, dest) at the FMAC itself and searching for it at the consumer expresses the same
+    // delay line with ZERO work on the ~55% of pairs that write no MAC and on the ~98% that read
+    // none. Stamps are `g430Base + cycle`, so the loop pays no counter of its own.
+    //
+    // RING SIZE. The entries newer than the target T = N-DEPTH are pairs T+1..N, at most DEPTH of
+    // them, so a ring of DEPTH+1 always still holds one entry with stamp <= T. Size 8 covers every
+    // depth up to 7; the lever is gated off above that.
+    constexpr int G430_HIST = 8;
+    // G436: the six history fields are ONE thread_local object instead of six separate ones.
+    // MSVC materialises a thread_local's address as `mov r, _tls_index` + `mov r, gs:[88]` +
+    // an indexed load, and it does NOT common that sequence across statements: the five stores
+    // g430PushPending makes each carried their own copy, so the push cost ~28 instructions with
+    // five dependent TLS loads on 45% of ~1.65 M pairs/frame. With one object the pair loop
+    // hoists a single base pointer per run() and every field is a constant displacement off it.
+    // Layout order is the old declaration order; every field keeps its type, extent and initial
+    // value, so nothing about what is stored or read changes.
+    struct G430HistBlock
+    {
+        alignas(16) float vec[G430_HIST][4];
+        int64_t stamp[G430_HIST];
+        uint32_t mac[G430_HIST];
+        uint8_t dest[G430_HIST];
+        // G428_MK_PENDING = parked vector; G428_MK_EAGER = already-classified value in `mac`.
+        uint8_t kind[G430_HIST];
+        int head;
+    };
+    thread_local G430HistBlock s_g430HB = {
+        {},
+        {-1, -1, -1, -1, -1, -1, -1, -1},
+        {},
+        {},
+        {2u, 2u, 2u, 2u, 2u, 2u, 2u, 2u},
+        0,
+    };
+    // Pairs executed by this thread before the current run(); stamps are this plus `cycle`.
+    thread_local int64_t s_g430PairBase = 0;
+    // Whether the history representation is currently the live one.
+    thread_local bool s_g430HistArmed = false;
     thread_local uint32_t s_g328VerifyMacPipe[8] = {};
     thread_local uint32_t s_g328VerifyStatusPipe[8] = {};
     // G139: same-pair upper->lower VF hazard (default ON, kill DC2_VU1_NO_PAIRHAZ). Real VU1

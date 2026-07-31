@@ -48,6 +48,45 @@ namespace
     constexpr uint8_t G426_PF_PRESTALL = 0x02u;
     constexpr uint8_t G426_PF_HAZ = 0x04u;
 
+    // G427: the lower slot READS the pipelined MAC/STATUS snapshot. The G138/G328 delay line
+    // publishes `s_vuMacVisible`/`s_vuStatusVisible` on every executed pair, but the only
+    // consumers of those two words are six lower-slot opcodes (FSEQ/FSAND/FSOR and
+    // FMEQ/FMAND/FMOR, plus FCGET in the legacy DC2_VU1_NO_FMSWAPFIX mapping). On every other
+    // pair the publication is two loads and two stores whose result nothing can observe, so the
+    // delay line only has to ADVANCE (a register index) and RECORD (the newest entry).
+    constexpr uint8_t G427_PF_FLAGREAD = 0x08u;
+
+    // G428: the STICKY subset of the above - FSEQ/FSAND/FSOR read `s_vuStatusVisible`, whose
+    // sticky bits accumulate over every FMAC ever executed and therefore cannot be reconstructed
+    // lazily. FMEQ/FMAND/FMOR read only `s_vuMacVisible`, which is a per-pair snapshot.
+    constexpr uint8_t G428_PF_STATUSREAD = 0x10u;
+
+    inline bool g428LowerReadsStatus(uint32_t lower)
+    {
+        const uint8_t opHi = static_cast<uint8_t>((lower >> 25u) & 0x7fu);
+        return opHi == 0x14u || opHi == 0x16u || opHi == 0x17u; // FSEQ / FSAND / FSOR
+    }
+
+    // The complete set of lower opcodes that read s_vuMacVisible / s_vuStatusVisible; see the
+    // `switch (opHi)` in execLower. FCAND/FCOR (0x12/0x13) read m_state.clip, not the delay line.
+    inline bool g427LowerReadsFlags(uint32_t lower)
+    {
+        const uint8_t opHi = static_cast<uint8_t>((lower >> 25u) & 0x7fu);
+        switch (opHi)
+        {
+        case 0x14u: // FSEQ
+        case 0x16u: // FSAND
+        case 0x17u: // FSOR
+        case 0x18u: // FMEQ
+        case 0x1au: // FMAND
+        case 0x1bu: // FMOR
+        case 0x1cu: // FCGET (reads MAC only under DC2_VU1_NO_FMSWAPFIX; kept unconditionally)
+            return true;
+        default:
+            return false;
+        }
+    }
+
     // The G239 scalar-prestall set: WAITQ, DIV/SQRT/RSQRT, WAITP and the EFU producers.
     inline bool g426LowerIsScalarPipe(uint8_t lowerS2)
     {
@@ -80,6 +119,12 @@ namespace
         uint64_t invalidations = 0u;
         uint64_t invalidatedPairs = 0u;
         uint64_t lastReportOps = 0u;
+        // G428: how many slots of the WHOLE code store decode to a lower slot that can read the
+        // MAC / STATUS delay line. A deferred-classification lever needs STATUS to be provably
+        // dead, and STATUS can only be read by executing an FSEQ/FSAND/FSOR pair, so a zero here
+        // over the entire (precisely invalidated) code store is a sound static gate.
+        uint32_t statusReaderSlots = 0u;
+        uint32_t macReaderSlots = 0u;
     };
 
     thread_local G410CompiledCache s_g410Cache;
@@ -241,6 +286,11 @@ namespace
             if (pair.upperVfDest != 0xffu &&
                 (pair.lowerFs == pair.upperVfDest || pair.lowerFt == pair.upperVfDest))
                 pair.g425Flags |= G426_PF_HAZ;
+            // G427: does this pair's lower slot consume the MAC/STATUS delay line?
+            if (g427LowerReadsFlags(lower))
+                pair.g425Flags |= G427_PF_FLAGREAD;
+            if (g428LowerReadsStatus(lower))
+                pair.g425Flags |= G428_PF_STATUSREAD;
         }
         return pair;
     }
@@ -251,6 +301,16 @@ namespace
         uint64_t source = 0u;
         std::memcpy(&source, codeBase + index * sizeof(source), sizeof(source));
         const G410CompiledUpper pair = g410DecodePair(source);
+        // G428: keep the whole-code-store reader tallies exact across precise invalidation.
+        const uint8_t oldFlags = s_g410Cache.uppers[index].g425Flags;
+        if ((oldFlags & G428_PF_STATUSREAD) != 0u)
+            --s_g410Cache.statusReaderSlots;
+        if ((oldFlags & G427_PF_FLAGREAD) != 0u)
+            --s_g410Cache.macReaderSlots;
+        if ((pair.g425Flags & G428_PF_STATUSREAD) != 0u)
+            ++s_g410Cache.statusReaderSlots;
+        if ((pair.g425Flags & G427_PF_FLAGREAD) != 0u)
+            ++s_g410Cache.macReaderSlots;
         s_g410Cache.sources[index] = source;
         s_g410Cache.uppers[index] = pair;
         if (countStats)
@@ -266,6 +326,10 @@ namespace
         if (s_g410Cache.codeBase != codeBase)
         {
             s_g410Cache.codeBase = codeBase;
+            s_g410Cache.statusReaderSlots = 0u;
+            s_g410Cache.macReaderSlots = 0u;
+            for (size_t index = 0u; index < s_g410Cache.uppers.size(); ++index)
+                s_g410Cache.uppers[index].g425Flags = 0u;
             for (size_t index = 0u; index < s_g410Cache.uppers.size(); ++index)
                 g410CompilePairSlow(index, codeBase, countStats);
         }
@@ -356,7 +420,7 @@ namespace
         std::fprintf(stderr,
                      "[G410:jit] ops=%llu hit=%llu compile=%llu hitPct=%.3f "
                      "upperFallback=%llu invalidations=%llu invalidatedPairs=%llu "
-                     "verified=%llu bad=%llu\n",
+                     "verified=%llu bad=%llu statusReaderSlots=%u macReaderSlots=%u\n",
                      static_cast<unsigned long long>(ops),
                      static_cast<unsigned long long>(s_g410Cache.hits),
                      static_cast<unsigned long long>(s_g410Cache.compiles),
@@ -365,7 +429,9 @@ namespace
                      static_cast<unsigned long long>(s_g410Cache.invalidations),
                      static_cast<unsigned long long>(s_g410Cache.invalidatedPairs),
                      static_cast<unsigned long long>(s_g410Cache.verified),
-                     static_cast<unsigned long long>(s_g410Cache.verifyBad));
+                     static_cast<unsigned long long>(s_g410Cache.verifyBad),
+                     s_g410Cache.statusReaderSlots,
+                     s_g410Cache.macReaderSlots);
     }
 } // namespace
 

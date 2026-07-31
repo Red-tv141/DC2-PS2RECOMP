@@ -81,17 +81,81 @@ enum G419Lever
     // buffer. It adds the full read's destination-side memory traffic WITHOUT its GL transfer, so
     // it measures the leading hypothesis for G419's unaccounted narrow-readback payoff directly.
     kG420LeverNTouch = 9,
+    // G432: the exact G418 colour-readback unpack applied at the SECOND publication site
+    // (g261Materialize, rasterizer_gpu_alias_page_view.inc). Sub-millisecond, so the within-process
+    // randomized A/B is its only admissible gate. The site references this id by value because it is
+    // compiled earlier in this TU than this enum (see kG432MatUnpackLeverId there).
+    kG432LeverMatUnpack = 10,
+    // G438: the two DERIVATIVE PROBES moved inside the within-process instrument. They are not
+    // behaviour levers and can never be promoted — the candidate arm deliberately WASTES time on
+    // one thread. The point is that G433's replication rule (the RUN is the unit, and the run-level
+    // frame mean moves 44.8–48.6 ms) makes a cross-run derivative spin unusable on a quiet day:
+    // G438 block A read VU1 +1.96 / GS −2.45 and block B read VU1 −0.83 / GS −0.27, i.e. both
+    // probes disagreed with themselves in SIGN. Alternating the spin per FRAME inside one process
+    // differences the drift away exactly as it does for a sub-ms behaviour lever, and turns the
+    // pole ranking into a paired t statistic instead of a difference of two noisy run means.
+    kG438LeverVu1Slow = 11, // spin DC2_G303_VU1_SLOW_US per kick on candidate frames only
+    kG438LeverGsSlow = 12,  // spin DC2_G431_GS_SLOW_US per window on candidate frames only
+    // G439: the WINDOW-COUNT ceiling probe. G434 priced every named block of work on the GS worker
+    // at 2.83 ms/f while G438 measured the frame absorbing ~96% of any microsecond added PER WINDOW,
+    // so what the thread transmits is the 1,596-windows/frame handoff chain, not the work inside it.
+    // The candidate arm merges DC2_G439_COALESCE consecutive drain() windows into one queue item:
+    // window count drops ~N x while kicks/frame and packets/frame are exactly conserved (the
+    // workload invariant). Knowingly INCORRECT output — processWindow's stable path sort now spans
+    // what were separate windows — so this is a ceiling probe and can never be promoted.
+    kG439LeverCoalesce = 13,
+    // G445: the G418 early command kick (one glFlush per skip-readback render batch), moved into the
+    // within-process instrument. It is a real BEHAVIOUR lever and exact by construction — glFlush
+    // changes no result, no GL state, no command order and no ownership — but its only prior gate was
+    // a cross-run block taken while VU1 bound the frame, i.e. the G444 expiry law applies to it. On
+    // this host the run-level frame mean drifts ~1.4x within a session (46.6 -> 33.3 on the base arm
+    // in one G445 block), which is several times the lever, so a cross-run A/B cannot gate it.
+    // Thread-level (it changes when the GL backend starts executing queued work, and the effect lands
+    // on the NEXT batch's drain), so it inherits the block hold like the two spins and coalesce.
+    kG445LeverEarlyKick = 14,
+    // G445 extension probe: the same kick applied to the backend items G418 never covered — the
+    // GPU->GPU alias copies and the decode/composite/upload class ("copy" and "other" in
+    // [G332:gsw]). Those leave GL work queued and never fence either, so on the same argument they
+    // should also be contributing to the readback's drain. Separate lever id because it is a second
+    // architectural decision (WHICH items are kicked), not a re-measurement of the first.
+    kG445LeverKickAll = 15,
+    // G447: spin-then-block on the GL backend round trip. G447's edge census proved 100% of the
+    // pole thread's 16.7 ms/f of blocked time is these ~74 promise/future round trips per frame, and
+    // that the GL worker's own work only accounts for ~13 of it. Thread-level (it changes when the
+    // GS worker resumes after a handoff), so it inherits the block hold.
+    kG447LeverSpinWait = 16,
+    // G447: the SUBMIT half of the same round trip — the GL backend worker spins on a submit
+    // sequence counter before sleeping, so a queued item does not wait for that thread to be
+    // scheduled back on. Separate id: it is a different thread burning the CPU.
+    kG447LeverWSpin = 17,
+    // G447 PROMOTION GATE: both halves of the round trip alternated together, i.e. exactly the
+    // shipped default against exactly the double rollback. The two levers act on DIFFERENT threads
+    // and each carries a CPU-burn cost, so only a combined arm answers "does the promoted pair pay".
+    kG447LeverSpinBoth = 18,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
 // a phase must keep one architectural variable per arm, and a shared arm register cannot attribute
 // two levers from one period series.
+// G447 HOST CHECK (DC2_G447_HOSTCHECK=1). One flag that turns a run on an UNFAMILIAR MACHINE into a
+// copy-pasteable verdict on the two promoted G447 spins — the arc's only host-shaped levers, since
+// they buy wall time by burning CPU on an otherwise-blocked thread. It selects the combined
+// `spinboth` arm (the promotion gate: exactly the shipped default against exactly the full
+// rollback), reports the host's core count, and prints a plain verdict beside every `[G419:ab]`
+// window. An explicit DC2_G419_AB still wins, so this can never silently hijack another phase's A/B.
+static bool g447HostCheckOn()
+{
+    static const bool on = (std::getenv("DC2_G447_HOSTCHECK") != nullptr);
+    return on;
+}
+
 static int g419AbLever()
 {
     static const int lever = [] {
         const char *value = std::getenv("DC2_G419_AB");
         if (value == nullptr || value[0] == '\0')
-            return static_cast<int>(kG419LeverNone);
+            return g447HostCheckOn() ? static_cast<int>(kG447LeverSpinBoth)
+                                     : static_cast<int>(kG419LeverNone);
         if (std::strcmp(value, "narrow") == 0)
             return static_cast<int>(kG419LeverNarrow);
         if (std::strcmp(value, "pack") == 0)
@@ -110,9 +174,29 @@ static int g419AbLever()
             return static_cast<int>(kG420LeverAll);
         if (std::strcmp(value, "narrowtouch") == 0)
             return static_cast<int>(kG420LeverNTouch);
+        if (std::strcmp(value, "matunpack") == 0)
+            return static_cast<int>(kG432LeverMatUnpack);
+        if (std::strcmp(value, "vu1slow") == 0)
+            return static_cast<int>(kG438LeverVu1Slow);
+        if (std::strcmp(value, "gsslow") == 0)
+            return static_cast<int>(kG438LeverGsSlow);
+        if (std::strcmp(value, "coalesce") == 0)
+            return static_cast<int>(kG439LeverCoalesce);
+        if (std::strcmp(value, "earlykick") == 0)
+            return static_cast<int>(kG445LeverEarlyKick);
+        if (std::strcmp(value, "kickall") == 0)
+            return static_cast<int>(kG445LeverKickAll);
+        if (std::strcmp(value, "spinwait") == 0)
+            return static_cast<int>(kG447LeverSpinWait);
+        if (std::strcmp(value, "wspin") == 0)
+            return static_cast<int>(kG447LeverWSpin);
+        if (std::strcmp(value, "spinboth") == 0)
+            return static_cast<int>(kG447LeverSpinBoth);
         std::fprintf(stderr,
                      "[G419:ab] unknown DC2_G419_AB='%s' (expected "
-                     "narrow|pack|lanes|all|zero|packlanes|pool|all420|narrowtouch)\n", value);
+                     "narrow|pack|lanes|all|zero|packlanes|pool|all420|narrowtouch|matunpack|"
+                     "vu1slow|gsslow|coalesce|earlykick|kickall|spinwait|wspin|spinboth)\n",
+                     value);
         return static_cast<int>(kG419LeverNone);
     }();
     return lever;
@@ -131,6 +215,15 @@ static const char *g419AbLeverName(int lever)
     case kG420LeverPool: return "pool";
     case kG420LeverAll: return "all420";
     case kG420LeverNTouch: return "narrowtouch";
+    case kG432LeverMatUnpack: return "matunpack";
+    case kG438LeverVu1Slow: return "vu1slow";
+    case kG438LeverGsSlow: return "gsslow";
+    case kG439LeverCoalesce: return "coalesce";
+    case kG445LeverEarlyKick: return "earlykick";
+    case kG445LeverKickAll: return "kickall";
+    case kG447LeverSpinWait: return "spinwait";
+    case kG447LeverWSpin: return "wspin";
+    case kG447LeverSpinBoth: return "spinboth";
     default: return "none";
     }
 }
@@ -206,6 +299,165 @@ static bool g419AbArmFor(int lever, bool defaultOn)
     return arm != 0u;
 }
 
+// G438: the derivative probes' arm selector, callable from the VU1-worker and GS-worker TUs (the
+// rest of this instrument is static to the rasterizer TU). `which` is 0 for the VU1 spin, 1 for the
+// GS spin. Returns -1 when that probe is not the selected lever (the caller then falls back to the
+// legacy always-on DC2_G303_VU1_SLOW_US / DC2_G431_GS_SLOW_US behaviour), 0 on a control frame and
+// 1 on a candidate frame.
+//
+// The `used` bit must reach the tick, but the spin sites run per-KICK and per-WINDOW (~1250 and
+// ~1580 times/frame), and an unconditional atomic RMW on a line shared with the EE thread would be
+// a per-call cross-core cost paid by BOTH arms — i.e. it would inflate the very baseline the probe
+// is dividing by. The arm only changes once per frame, so a thread-local memo turns it into one
+// atomic per thread per frame.
+// G438: how many consecutive frames one arm is held for. 1 (the default, and the only value the
+// G419/G420/G432 behaviour levers ever use) reproduces the original per-frame alternation exactly.
+// DC2_G438_HOLD sets it; the derivative probes default to 16.
+static uint64_t g438ArmHoldFrames()
+{
+    static const uint64_t n = [] {
+        const char *value = std::getenv("DC2_G438_HOLD");
+        if (value != nullptr && value[0] != '\0')
+            return static_cast<uint64_t>(std::max(1, std::min(600, std::atoi(value))));
+        const int sel = g419AbLever();
+        // G439's coalesce probe is a thread-level lever like the two spins (it changes the handoff
+        // rate between the EE and the GS worker), so it inherits the block hold for the same
+        // pipelined-runtime reason — see the g419AbTick comment on DC2_G438_HOLD.
+        return (sel == kG438LeverVu1Slow || sel == kG438LeverGsSlow ||
+                sel == kG439LeverCoalesce || sel == kG445LeverEarlyKick ||
+                sel == kG445LeverKickAll || sel == kG447LeverSpinWait || sel == kG447LeverWSpin ||
+                sel == kG447LeverSpinBoth)
+                   ? 16ull
+                   : 1ull;
+    }();
+    return n;
+}
+
+// Bumped once per frame by g419AbTick. The memo keys on this, NOT on the arm value: the LCG draws
+// the same arm on consecutive frames about half the time, and keying on the value would then leave
+// `used` clear and the tick would drop that frame as unattributable.
+static std::atomic<uint64_t> s_g438TickSeq{0ull};
+
+bool g438SlowLeverSelected(int which);
+int g438SlowArm(int which)
+{
+    const int want = (which == 0) ? static_cast<int>(kG438LeverVu1Slow)
+                                  : static_cast<int>(kG438LeverGsSlow);
+    if (g419AbLever() != want)
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+bool g438SlowLeverSelected(int which)
+{
+    const int want = (which == 0) ? static_cast<int>(kG438LeverVu1Slow)
+                                  : static_cast<int>(kG438LeverGsSlow);
+    return g419AbLever() == want;
+}
+
+// G439: the window-coalescing ceiling probe's arm selector, called from ps2_gif_arbiter.cpp on the
+// EE thread. Same contract and same per-frame memo as g438SlowArm: -1 when the probe is not the
+// selected lever (the site then honours the always-on DC2_G439_COALESCE value), 0 on a control
+// frame, 1 on a candidate frame. The call site is GifArbiter::drain(), ~1,600 times per frame, so
+// the `used` bit must not be an unconditional cross-core RMW.
+int g439CoalesceArm()
+{
+    if (g419AbLever() != static_cast<int>(kG439LeverCoalesce))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G445: the G418 early-command-kick arm selector, called from the GL backend worker TU
+// (lle_gpu_raster_backend.inc). Same contract and same per-frame memo as g438SlowArm: -1 when the
+// probe is not the selected lever (the site then honours the always-on DC2_G418_EARLY_KICK value),
+// 0 on a control frame, 1 on a candidate frame. The site runs once per skip-readback render batch
+// (~33/frame), so the `used` bit must not be an unconditional cross-core RMW.
+int g445KickArm()
+{
+    if (g419AbLever() != static_cast<int>(kG445LeverEarlyKick))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G447 spin-then-block arm selector. Same contract and same per-frame memo as g445KickArm; the site
+// is every synchronous backend entry point on the GS worker (~74 items/frame).
+int g447SpinArm()
+{
+    const int sel447 = g419AbLever();
+    if (sel447 != static_cast<int>(kG447LeverSpinWait) &&
+        sel447 != static_cast<int>(kG447LeverSpinBoth))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G447 worker-side spin arm selector. Same contract and same per-frame memo as g447SpinArm; the
+// site is the GL backend worker's pre-sleep path (~74 sleeps/frame).
+int g447WorkerSpinArm()
+{
+    const int sel447w = g419AbLever();
+    if (sel447w != static_cast<int>(kG447LeverWSpin) &&
+        sel447w != static_cast<int>(kG447LeverSpinBoth))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G445 extension probe arm selector. Same contract and same per-frame memo as g445KickArm; the site
+// is the GL backend worker loop, once per copy/composite/upload item (~33/frame).
+int g445KickAllArm()
+{
+    if (g419AbLever() != static_cast<int>(kG445LeverKickAll))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
 // How many extra idempotent repetitions this frame's site should perform (ballast mode only).
 static int g419AbBallastReps(int lever)
 {
@@ -243,11 +495,18 @@ static void g419AbTick()
     static uint64_t s_winN[2]{};
     static double s_blkSum = 0.0, s_blkSq = 0.0;
     static uint64_t s_blkN = 0u, s_blkFav = 0u, s_dropped = 0u;
+    // G438: frames whose interval spans an arm CHANGE. See g438ArmHoldFrames below.
+    static bool s_skipNext = false;
+    static uint64_t s_transition = 0u;
 
     const auto now = std::chrono::steady_clock::now();
     const uint32_t used = g_g419AbUsed.exchange(0u, std::memory_order_relaxed);
     const uint64_t idx = s_frame++;
-    if (s_haveLast && idx >= g419AbWarmFrames())
+    const bool skipThis = s_skipNext;
+    s_skipNext = false;
+    if (skipThis)
+        ++s_transition;
+    if (s_haveLast && !skipThis && idx >= g419AbWarmFrames())
     {
         const double ms = std::chrono::duration<double, std::milli>(now - s_last).count();
         // An interval with no consumer (used==0) or with both arms observed (used==3) cannot be
@@ -270,8 +529,26 @@ static void g419AbTick()
     s_last = now;
     s_haveLast = true;
 
-    s_lcg = s_lcg * 6364136223846793005ull + 1442695040888963407ull;
-    g_g419AbArm.store(((s_lcg >> 33u) & 1ull) != 0ull ? 1u : 0u, std::memory_order_relaxed);
+    // G438: hold the arm for a block of frames instead of redrawing every frame. A per-frame draw
+    // is right for a lever whose whole cost lands inside the frame that ran it, but this runtime
+    // pipelines frames across threads (G412 one-successor cross-frame pipelining), so work injected
+    // on a candidate frame partly lands in the NEXT frame period. With alternation every frame that
+    // successor is a control frame half the time, which drains the measured difference towards zero:
+    // the vu1slow probe read +0.21 ms for 6.25 ms/f of injected spin (sensitivity 0.03) against
+    // 0.44-0.98 from the cross-run form of the same probe. Holding the arm for N frames confines
+    // the smear to the ONE boundary frame per block, which is then dropped outright.
+    const uint64_t hold = g438ArmHoldFrames();
+    if (hold <= 1u || (idx % hold) == 0u)
+    {
+        s_lcg = s_lcg * 6364136223846793005ull + 1442695040888963407ull;
+        const uint32_t next = ((s_lcg >> 33u) & 1ull) != 0ull ? 1u : 0u;
+        if (hold > 1u && next != g_g419AbArm.load(std::memory_order_relaxed))
+            s_skipNext = true;
+        g_g419AbArm.store(next, std::memory_order_relaxed);
+    }
+    // Publish the frame identity AFTER the arm, so a worker that observes the new seq also observes
+    // the arm that belongs to it.
+    s_g438TickSeq.fetch_add(1ull, std::memory_order_relaxed);
 
     const uint64_t window = g419AbWindow();
     if (idx == 0u || (idx % window) != 0u)
@@ -314,20 +591,51 @@ static void g419AbTick()
         blkT = blkSe > 0.0 ? blkMean / blkSe : 0.0;
     }
     std::fprintf(stderr,
-                 "[G419:ab] lever=%s ballast=%d frames=%llu drop=%llu "
+                 "[G419:ab] lever=%s ballast=%d hold=%llu frames=%llu drop=%llu trans=%llu "
                  "cand(n=%llu ms=%.3f se=%.3f) ctrl(n=%llu ms=%.3f se=%.3f) "
                  "delta=%.3f (%.2f%%) seDelta=%.3f "
                  "blocked(w=%llu mean=%.3f se=%.3f t=%.2f fav=%llu)\n",
                  g419AbLeverName(g419AbLever()),
                  g419AbBallast(),
+                 static_cast<unsigned long long>(g438ArmHoldFrames()),
                  static_cast<unsigned long long>(idx),
                  static_cast<unsigned long long>(s_dropped),
+                 static_cast<unsigned long long>(s_transition),
                  static_cast<unsigned long long>(s_n[0]), c, sc,
                  static_cast<unsigned long long>(s_n[1]), k, sk,
                  c - k, k != 0.0 ? 100.0 * (c - k) / k : 0.0,
                  std::sqrt(sc * sc + sk * sk),
                  static_cast<unsigned long long>(s_blkN), blkMean, blkSe, blkT,
                  static_cast<unsigned long long>(s_blkFav));
+
+    // G447 host check: turn the paired statistic into a verdict a reader who has never seen this
+    // instrument can act on, and flag the two ways the run can measure NOTHING.
+    if (g447HostCheckOn() && g419AbLever() == static_cast<int>(kG447LeverSpinBoth))
+    {
+        int logical = 0, physical = 0;
+        g447HostShape(&logical, &physical);
+        // G443: DC2 is a locked-30 title. A run whose work drops below 33.33 ms/f reads ~33.3 with
+        // se ~0.01 on BOTH arms — that is the cap, not a result.
+        const bool capped = (c > 33.0 && c < 33.8 && k > 33.0 && k < 33.8 && sc < 0.03 && sk < 0.03);
+        const char *verdict;
+        if (capped)
+            verdict = "INVALID-FRAME-CAP: rerun with DC2_PATCH_60FPS=1 on BOTH arms (G443)";
+        else if (s_blkN < 3u)
+            verdict = "INCONCLUSIVE: too few windows, run longer (want w>=4)";
+        else if (blkT <= -3.0 && s_blkFav * 2u >= s_blkN * 2u - 2u)
+            verdict = "KEEP DEFAULT: the spins pay on this host";
+        else if (blkT >= 3.0)
+            verdict = "ROLL BACK: set DC2_G447_NO_SPIN=1 and DC2_G447_NO_WSPIN=1 on this host";
+        else
+            verdict = "NEUTRAL: no effect either way on this host; default is harmless";
+        std::fprintf(stderr,
+                     "[G447:host] cpus=%d logical / %d physical | runtime uses 4 busy threads + %d "
+                     "spinners | spinMs/f=%.3f se=%.3f t=%.2f windows=%llu favouring=%llu | "
+                     "reference host (6 physical/12 logical): -1.14 ms/f t=-7.19 4/4 | %s\n",
+                     logical, physical, 2, blkMean, blkSe, blkT,
+                     static_cast<unsigned long long>(s_blkN),
+                     static_cast<unsigned long long>(s_blkFav), verdict);
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

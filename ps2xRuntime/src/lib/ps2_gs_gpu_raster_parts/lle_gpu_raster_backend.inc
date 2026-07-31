@@ -33,6 +33,118 @@ bool g332BackendArmed()
     static const bool on = g332BackendCensusOn() || g158EnvFlag("DC2_G332_EMPTY");
     return on;
 }
+// G447 (diagnosis only, default OFF, DC2_G447_EDGE=1): time the GS worker's blocking wait at EVERY
+// backend entry point, classified by item type. G332 above times the same work from INSIDE the GL
+// worker; this times it from the caller's side, so the difference is the promise/future round-trip
+// and the queue latency. Counted only on the GS worker thread — the EE thread reaches several of
+// these at the frame barrier and must not be pooled in.
+struct G447WaitScope
+{
+    std::chrono::steady_clock::time_point t0;
+    int edge;
+    bool on;
+    explicit G447WaitScope(int e)
+        : edge(e), on(g447EdgeOn() && g447OnGsWorker())
+    {
+        if (on)
+            t0 = std::chrono::steady_clock::now();
+    }
+    ~G447WaitScope()
+    {
+        if (on)
+            g447NoteWait(edge, static_cast<unsigned long long>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0).count()));
+    }
+};
+
+// G447 LEVER — spin-then-block on the backend round trip (default OFF, DC2_G447_SPIN_US=<us>, or
+// the paired within-process arm DC2_G419_AB=spinwait).
+//
+// G447's edge census measured the GS worker (the pole, sensitivity 0.98) blocked 16.7 ms/f, ALL of
+// it in these round trips, over ~74 backend items/frame — while [G332:gsw] times the GL worker's own
+// work at only 13.0-13.7 ms/f. The ~2.7 ms/f difference is the promise/future handoff: the caller
+// sleeps, the kernel must schedule it back on when set_value lands, and the item is typically only
+// ~130-200 us of GL work. Spinning on a plain release/acquire flag for a bounded budget removes the
+// caller-side wake for every item that completes inside the budget.
+//
+// Exactness: the result still comes from the future and the GL command stream is untouched. The only
+// change is HOW the caller waits. The cost is CPU burn on a thread that is otherwise blocked — which
+// is why it is measured, not assumed.
+// PROMOTED default-ON (G447): DC2_G419_AB=spinwait measured −1.23…−1.56 ms/f standalone
+// (t = −4.9…−8.7, 4/4 windows favouring) and −0.44 ms/f marginal over the worker-side spin. The win
+// saturates by 120 us of budget, which is the tell that what it removes is one thread wake, not
+// work. Rollback: DC2_G447_NO_SPIN=1. Budget override: DC2_G447_SPIN_US=<us>.
+long long g447SpinBudgetUs()
+{
+    static const long long us = [] {
+        const char *v = std::getenv("DC2_G447_SPIN_US");
+        const long long n = (v != nullptr) ? std::atoll(v) : 0LL;
+        return (n > 0LL && n <= 5000LL) ? n : 400LL;
+    }();
+    return us;
+}
+
+bool g447SpinActive()
+{
+    const int arm = g447SpinArm(); // -1 unless DC2_G419_AB=spinwait
+    if (arm >= 0)
+        return arm == 1;
+    static const bool off = (std::getenv("DC2_G447_NO_SPIN") != nullptr);
+    return !off;
+}
+
+// The SUBMIT direction of the same round trip: the GL worker is asleep when an item is queued, so
+// the item does not start until the kernel schedules that thread. Separate lever id because it is a
+// separate architectural decision (which thread burns CPU to avoid a wake), measured separately.
+long long g447WorkerSpinBudgetUs()
+{
+    static const long long us = [] {
+        const char *v = std::getenv("DC2_G447_WSPIN_US");
+        const long long n = (v != nullptr) ? std::atoll(v) : 0LL;
+        return (n > 0LL && n <= 20000LL) ? n : 0LL;
+    }();
+    return us > 0LL ? us : 400LL;
+}
+
+// PROMOTED default-ON (G447): −0.88…−0.95 ms/f standalone (t = −4.55, 4/4 favouring) and −0.55 ms/f
+// marginal over the caller-side spin. Unlike the caller spin this one needs the FULL budget — at
+// 150 us its marginal value collapses to −0.20 (t = −0.97), because the mean gap between backend
+// items on this route is ~430 us. Rollback: DC2_G447_NO_WSPIN=1.
+bool g447WorkerSpinActive()
+{
+    const int arm = g447WorkerSpinArm(); // -1 unless DC2_G419_AB=wspin
+    if (arm >= 0)
+        return arm == 1;
+    static const bool off = (std::getenv("DC2_G447_NO_WSPIN") != nullptr);
+    return !off;
+}
+
+bool g447WaitFuture(std::future<bool> &fut, std::atomic<uint32_t> &done)
+{
+    if (g447SpinActive())
+    {
+        static const long long budgetUs =
+            g447SpinBudgetUs() > 0LL ? g447SpinBudgetUs() : 400LL; // A/B default
+        const auto until = std::chrono::steady_clock::now() +
+                           std::chrono::microseconds(budgetUs);
+        while (done.load(std::memory_order_acquire) == 0u)
+        {
+            if (std::chrono::steady_clock::now() >= until)
+                break;
+            YieldProcessor();
+        }
+    }
+    try
+    {
+        return fut.get();
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
 // NOTE: this whole .inc is inside the anonymous namespace opened in persistent_t8_decoder.inc
 // (closed at the end of this file). The cross-TU accessor g332_backend_snapshot() is therefore
 // defined AFTER that close (see bottom of file) so it keeps external linkage.
@@ -351,6 +463,7 @@ public:
         }
         m_asyncFut = std::move(fut);
         m_asyncPending = true;
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
         return true;
     }
@@ -416,6 +529,7 @@ public:
             return false;
         auto promise = std::make_shared<std::promise<bool>>();
         std::future<bool> fut = promise->get_future();
+        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -429,17 +543,13 @@ public:
             item.colorY = glY;
             item.colorRows = rows;
             item.promise = promise;
+            item.doneFlag = &g447Done;
             m_queue.push_back(std::move(item));
         }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
-        try
-        {
-            return fut.get();
-        }
-        catch (...)
-        {
-            return false;
-        }
+        G447WaitScope g447Scope(1);
+        return g447WaitFuture(fut, g447Done);
     }
 
     bool writeColor(uint32_t fbp, int texWidth, int texHeight,
@@ -454,6 +564,7 @@ public:
             return false;
         auto promise = std::make_shared<std::promise<bool>>();
         std::future<bool> fut = promise->get_future();
+        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -468,17 +579,13 @@ public:
             item.colorY = glY;
             item.colorRows = rows;
             item.promise = promise;
+            item.doneFlag = &g447Done;
             m_queue.push_back(std::move(item));
         }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
-        try
-        {
-            return fut.get();
-        }
-        catch (...)
-        {
-            return false;
-        }
+        G447WaitScope g447Scope(2);
+        return g447WaitFuture(fut, g447Done);
     }
 
     // G280: synchronous GPU->GPU page-tile copies between two persistent target FBOs (alias
@@ -490,6 +597,7 @@ public:
             return false;
         auto promise = std::make_shared<std::promise<bool>>();
         std::future<bool> fut = promise->get_future();
+        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -499,17 +607,13 @@ public:
             item.copySrcFbp = srcFbp;
             item.copyRects = &rects6;
             item.promise = promise;
+            item.doneFlag = &g447Done;
             m_queue.push_back(std::move(item));
         }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
-        try
-        {
-            return fut.get();
-        }
-        catch (...)
-        {
-            return false;
-        }
+        G447WaitScope g447Scope(3);
+        return g447WaitFuture(fut, g447Done);
     }
 
     // G289: same synchronous bit-exact color copy as G280, but the one measured work target may
@@ -522,6 +626,7 @@ public:
             return false;
         auto promise = std::make_shared<std::promise<bool>>();
         std::future<bool> fut = promise->get_future();
+        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -534,17 +639,13 @@ public:
             item.colorTexW = dstW;
             item.colorTexH = dstH;
             item.promise = promise;
+            item.doneFlag = &g447Done;
             m_queue.push_back(std::move(item));
         }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
-        try
-        {
-            return fut.get();
-        }
-        catch (...)
-        {
-            return false;
-        }
+        G447WaitScope g447Scope(3);
+        return g447WaitFuture(fut, g447Done);
     }
 
     // G281: synchronously build/update one decoded RGBA texture directly from a resident CT32
@@ -562,6 +663,7 @@ public:
             return false;
         auto promise = std::make_shared<std::promise<bool>>();
         std::future<bool> fut = promise->get_future();
+        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -582,17 +684,13 @@ public:
                 item.g324Enqueue = std::chrono::steady_clock::now();
             }
             item.promise = promise;
+            item.doneFlag = &g447Done;
             m_queue.push_back(std::move(item));
         }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
-        try
-        {
-            return fut.get();
-        }
-        catch (...)
-        {
-            return false;
-        }
+        G447WaitScope g447Scope(4);
+        return g447WaitFuture(fut, g447Done);
     }
 
     // G338: build/update one resident CT24-alpha view texture from a resident CT32 target FBO.
@@ -607,6 +705,7 @@ public:
             return false;
         auto promise = std::make_shared<std::promise<bool>>();
         std::future<bool> fut = promise->get_future();
+        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -628,17 +727,13 @@ public:
                 item.g324Enqueue = std::chrono::steady_clock::now();
             }
             item.promise = promise;
+            item.doneFlag = &g447Done;
             m_queue.push_back(std::move(item));
         }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
-        try
-        {
-            return fut.get();
-        }
-        catch (...)
-        {
-            return false;
-        }
+        G447WaitScope g447Scope(4);
+        return g447WaitFuture(fut, g447Done);
     }
 
     // G309: synchronously prepare five live target FBOs plus the measured 8x16 authority map.
@@ -654,6 +749,7 @@ public:
             return false;
         auto promise = std::make_shared<std::promise<bool>>();
         std::future<bool> fut = promise->get_future();
+        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -663,17 +759,13 @@ public:
             item.g309BasePixels = &basePixels;
             item.g309Readback = readback ? &out : nullptr;
             item.promise = promise;
+            item.doneFlag = &g447Done;
             m_queue.push_back(std::move(item));
         }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
-        try
-        {
-            return fut.get();
-        }
-        catch (...)
-        {
-            return false;
-        }
+        G447WaitScope g447Scope(4);
+        return g447WaitFuture(fut, g447Done);
     }
 
     // G310: use G309's exact atlas compositor once to populate the persistent logical FBO.
@@ -687,6 +779,7 @@ public:
             return false;
         auto promise = std::make_shared<std::promise<bool>>();
         std::future<bool> fut = promise->get_future();
+        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -702,17 +795,13 @@ public:
                 item.g324Enqueue = std::chrono::steady_clock::now();
             }
             item.promise = promise;
+            item.doneFlag = &g447Done;
             m_queue.push_back(std::move(item));
         }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
-        try
-        {
-            return fut.get();
-        }
-        catch (...)
-        {
-            return false;
-        }
+        G447WaitScope g447Scope(4);
+        return g447WaitFuture(fut, g447Done);
     }
 
 private:
@@ -731,6 +820,7 @@ private:
         g_g415PendWindow.valid = false;
         auto promise = std::make_shared<std::promise<bool>>();
         std::future<bool> fut = promise->get_future();
+        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -747,19 +837,15 @@ private:
             item.depthReadRows = depthReadRows;
             item.renderThenReadDepth = renderThenReadDepth;
             item.promise = promise;
+            item.doneFlag = &g447Done;
             if (g299ProfileOn())
                 item.g299Enqueue = std::chrono::steady_clock::now();
             m_queue.push_back(std::move(item));
         }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
-        try
-        {
-            return fut.get();
-        }
-        catch (...)
-        {
-            return false;
-        }
+        G447WaitScope g447Scope(0);
+        return g447WaitFuture(fut, g447Done);
     }
 
     struct QueueItem
@@ -805,6 +891,11 @@ private:
         bool g309ForceDraw = false;
         uint32_t g309OutputFbp = kG309CompositeFbp;
         std::shared_ptr<std::promise<bool>> promise;
+        // G447: optional caller-owned completion flag, stored (release) by the worker IMMEDIATELY
+        // BEFORE promise->set_value so a spinning caller can never observe completion earlier than
+        // the promise is satisfied — the caller's stack frame therefore always outlives this store.
+        // Null for the async (G305) path, whose caller does not stay on its frame.
+        std::atomic<uint32_t> *doneFlag = nullptr;
         // G415 exact colour-readback window published by the front-end for this submit only.
         G415ColorWindow g415Window;
         std::chrono::steady_clock::time_point g299Enqueue{};
@@ -878,6 +969,24 @@ private:
         {
             QueueItem item;
             {
+                // G447 (second half of the round trip, DC2_G419_AB=wspin / DC2_G447_WSPIN_US): the
+                // caller-side spin removes the GS worker's wake, but the SUBMIT direction has the
+                // same latency — this thread is asleep when the item is queued and the kernel must
+                // schedule it back on. Spin on a submit sequence counter for a bounded budget before
+                // falling into the condition variable. Purely a hint: the cv predicate below is
+                // still the authority, so the queue discipline and ordering are unchanged.
+                if (g447WorkerSpinActive())
+                {
+                    const uint64_t seen = m_submitSeq.load(std::memory_order_acquire);
+                    const auto until = std::chrono::steady_clock::now() +
+                                       std::chrono::microseconds(g447WorkerSpinBudgetUs());
+                    while (m_submitSeq.load(std::memory_order_acquire) == seen)
+                    {
+                        if (std::chrono::steady_clock::now() >= until)
+                            break;
+                        YieldProcessor();
+                    }
+                }
                 std::unique_lock<std::mutex> lk(m_mtx);
                 m_cvWork.wait(lk, [&] { return m_stop || !m_queue.empty(); });
                 if (m_stop && m_queue.empty())
@@ -1024,6 +1133,19 @@ private:
                     }
                 }
             }
+            // G445 extension probe: G418's kick covers only the skip-readback RENDER batches. The
+            // alias copies and the decode/composite/upload class leave GL work queued and never
+            // fence either, so they feed the same readback drain. Kick them on the same exactness
+            // argument as G418 (glFlush changes no result, no GL state, no command order, no
+            // ownership). Never kick a readback item: it has already fenced by construction.
+            {
+                const bool g445Kickable =
+                    item.g309PageMap != nullptr || item.g281Map != nullptr ||
+                    item.g338Ct24View || item.colorWrite != nullptr ||
+                    item.copyRects != nullptr;
+                if (g445Kickable && g445KickAllActive())
+                    glFlush();
+            }
             if (g332Armed)
             {
                 const uint64_t workNs = static_cast<uint64_t>(
@@ -1122,6 +1244,11 @@ private:
                     std::fprintf(stderr, "\n");
                 }
             }
+            // G447: publish completion to a spinning caller BEFORE satisfying the promise (see the
+            // lifetime argument on QueueItem::doneFlag). Exact: the caller still takes its result
+            // from the future, so nothing about the value or its ordering changes.
+            if (item.doneFlag != nullptr)
+                item.doneFlag->store(1u, std::memory_order_release);
             item.promise->set_value(ok);
         }
 
@@ -2450,7 +2577,38 @@ private:
         out.resize(static_cast<size_t>(w) * rows);
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, it->second.fbo);
         glDisable(GL_SCISSOR_TEST);
-        glReadPixels(0, glY, w, rows, GL_RGBA, GL_UNSIGNED_BYTE, out.data());
+        // ===== G433 ceiling probe (default OFF) =====================================================
+        // DC2_G433_NO_RB=1 skips ONLY the glReadPixels call. Everything else on both arms is
+        // identical: the front thread still queues the job, still blocks on the promise, still
+        // resizes the buffer and still runs the full g418 unpack over the same pixel count. So the
+        // arms are workload-invariant by construction (same rows, same Mpx — asserted by the
+        // counters below), and the frame delta is the exact price of the blocking readback,
+        // i.e. the ceiling of any asynchronous-publication scheme. Output is KNOWINGLY WRONG on the
+        // probe arm (stale/garbage rows are published into guest VRAM) — measurement only.
+        static const bool s_g433NoRb = (std::getenv("DC2_G433_NO_RB") != nullptr);
+        static const bool s_g433Stat = (std::getenv("DC2_G433_RBSTAT") != nullptr);
+        const auto t0 = s_g433Stat ? std::chrono::steady_clock::now()
+                                   : std::chrono::steady_clock::time_point{};
+        if (!s_g433NoRb)
+            g433DoReadPixels(m_f, glY, w, rows, out.data());
+        if (s_g433Stat)
+        {
+            static uint64_t s_n = 0ull, s_px = 0ull, s_ns = 0ull;
+            s_ns += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0).count());
+            ++s_n;
+            s_px += static_cast<uint64_t>(w) * static_cast<uint64_t>(rows);
+            if ((s_n % 512u) == 0u)
+                std::fprintf(stderr,
+                             "[G433:rb] norb=%d pbo=%d n=%llu ms=%.1f Mpx=%.2f usPerRead=%.1f "
+                             "nsPerPx=%.2f\n",
+                             s_g433NoRb ? 1 : 0, g433PboOn() ? 1 : 0,
+                             static_cast<unsigned long long>(s_n),
+                             (double)s_ns / 1.0e6, (double)s_px / 1.0e6,
+                             (double)s_ns / 1.0e3 / (double)s_n,
+                             s_px ? (double)s_ns / (double)s_px : 0.0);
+        }
         return true;
     }
 
@@ -2715,29 +2873,63 @@ private:
         if (m_g281MapTex == 0u || m_g281ClutTex == 0u || m_g281Fbo == 0u)
             return fail("objects");
 
+        // G431: this job runs ~8.7 times per frame on MAP-0 and the GS front thread BLOCKS on it
+        // (0.18 ms per job, measured by [G324:census] t8Wall). Three of those milliseconds were
+        // pure GL storage churn: glTexImage2D REALLOCATES the texture every build even though the
+        // map/CLUT/destination geometry is identical build after build (the G415 lesson, applied
+        // to the T8 view path). Reuse the allocation with glTexSubImage2D and set the immutable
+        // sampler state only when the object is first created. Pixel content, filtering, wrap and
+        // draw order are unchanged, so the produced view is bit-identical.
+        //
+        // MEASURED NEUTRAL (G431): pooled 2v2 lean MAP-0, both orders — 48.65 ON vs 48.89 OFF,
+        // arms fully overlapping. The blocking cost is the worker round-trip itself (~0.05 ms
+        // wall vs 0.005 ms CPU), not the storage churn. Kept OPT-IN (DC2_G431_VIEW_REUSE=1) as
+        // an exact instrument; do not quote it as a win.
+        static const bool s_g431NoReuse = !g158EnvFlag("DC2_G431_VIEW_REUSE");
+        static GLuint s_g431MapId = 0u, s_g431ClutId = 0u;
+        static int s_g431MapW = -1, s_g431MapH = -1;
+
         m_f.glActiveTexture_(GL158_TEXTURE0 + 1u);
         glBindTexture(GL_TEXTURE_2D, m_g281MapTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, texW, texH, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, mapRgba.data());
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        if (s_g431NoReuse || m_g281MapTex != s_g431MapId ||
+            texW != s_g431MapW || texH != s_g431MapH)
+        {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, texW, texH, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, mapRgba.data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                            static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                            static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            s_g431MapId = m_g281MapTex;
+            s_g431MapW = texW;
+            s_g431MapH = texH;
+        }
+        else
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, texW, texH,
+                            GL_RGBA, GL_UNSIGNED_BYTE, mapRgba.data());
 
         m_f.glActiveTexture_(GL158_TEXTURE0 + 2u);
         glBindTexture(GL_TEXTURE_2D, m_g281ClutTex);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, 256, 1, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, clutRgba.data());
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        if (s_g431NoReuse || m_g281ClutTex != s_g431ClutId)
+        {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, 256, 1, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, clutRgba.data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                            static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                            static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            s_g431ClutId = m_g281ClutTex;
+        }
+        else
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1,
+                            GL_RGBA, GL_UNSIGNED_BYTE, clutRgba.data());
 
         TexEntry &out = m_texCache[texKey];
+        bool g431OutFresh = false;
         if (out.id == 0u)
         {
             glGenTextures(1, &out.id);
@@ -2746,19 +2938,25 @@ private:
                 dropOutput();
                 return fail("output");
             }
+            g431OutFresh = true;
         }
         else
             m_texBytes -= static_cast<size_t>(out.w) * out.h * 4u;
         m_f.glActiveTexture_(GL158_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, out.id);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, texW, texH, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        // The destination is fully rewritten by the full-viewport draw below, so when the
+        // existing allocation already has these exact dimensions nothing needs re-specifying.
+        if (s_g431NoReuse || g431OutFresh || out.w != texW || out.h != texH)
+        {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, texW, texH, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                            static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                            static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        }
         out.w = texW;
         out.h = texH;
         out.lastUse = m_batchCounter + 1u;
@@ -3658,7 +3856,7 @@ private:
         // that already-issued commands finish in finite time - it changes no result, no GL state,
         // no command order, and no ownership - so the arm is exact by construction.
         const bool g418Profile = g418ProfileOn();
-        if (b.skipReadback && g418EarlyKickOn())
+        if (b.skipReadback && g445EarlyKickActive())
         {
             const auto kickT0 = g418Profile ? std::chrono::steady_clock::now()
                                             : std::chrono::steady_clock::time_point{};
@@ -3885,6 +4083,8 @@ private:
     std::thread m_thread;
     std::mutex m_mtx;
     std::condition_variable m_cvWork;
+    // G447: monotone submit counter — a lock-free hint the worker spins on before sleeping.
+    std::atomic<uint64_t> m_submitSeq{0ull};
     std::condition_variable m_cvReady;
     std::deque<QueueItem> m_queue;
     bool m_stop = false;

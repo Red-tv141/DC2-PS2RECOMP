@@ -59,8 +59,25 @@ namespace
         return disabled;
     }
 
-    // G394 rollback: apply an early post-start volume-zero/stop pair literally.
-    // DC2 can flush an older sndSqStop after its replacement Play command.
+    // G394's early-stop deferral, kept default-ON but no longer a permanent leak.
+    //
+    // G394 reads a `SetPortVolume(port, 0)` + `Stop(port)` pair arriving within
+    // 100 ms of a Play as a stale stop and drops both, keeping the source alive.
+    // G450's caller attribution (`DC2_G450_BGM_TRACE=1`) showed what that pair
+    // really is: `TitleInit@0x29F1F0` calls `LoadSound@0x2A6D70` — which
+    // auto-plays the env BGM through `PlayEnvBgm@0x2A6840` — at `0x29FD54`, then
+    // `StopEnvBGM@0x2A67C0` at `0x29FD5C`, two guest instructions later. The
+    // sequence that survives is what is heard at the title, because the guest's
+    // own restart (`TitleModeInit@0x2A1020`, whose first instruction is an
+    // unconditional `PlayEnvBgm`) is SKIPPED on the boot path: `TitleInit`
+    // branches at `0x29FE90` on `gp-0x7ba0`, set from `gp-0x7530 > 0` at
+    // `0x29F2E4`, into the memory-card-check arm that leaves at `0x29FED4`.
+    // Obeying the Stop therefore leaves the title silent (measured: 62 s of
+    // exactly zero mixer output), so the deferral stays until that root is
+    // fixed — but it now EXPIRES at the next BGM start (see dc2G392BgmStart)
+    // instead of keeping the source alive forever, which is what produced
+    // `active-bgm=2` and the user-reported "audio doesn't stop" symptom.
+    // `DC2_G394_LEGACY_ASYNC_STOP=1` still obeys every Stop literally.
     bool g394AsyncStopGuardDisabled()
     {
         static const bool disabled = []()
@@ -612,6 +629,9 @@ namespace
         float volume = 1.0f;
         bool active = false;
         bool earlyMutePending = false;
+        // G450: this source only survives because its Stop was suppressed. The
+        // deferral must EXPIRE — see dc2G392BgmStart.
+        bool stopSuppressed = false;
     };
 
     bool g392BgmBusDisabled()
@@ -1230,6 +1250,46 @@ bool dc2G392BgmBusEnabled()
     return !g392BgmBusDisabled();
 }
 
+// G450: a suppressed Stop is a DEFERRAL, not a veto. The guest already asked
+// that source to end; the only reason it still sounds is that G394 could not
+// tell a real stop from a stale one that early, and the title BGM currently
+// DEPENDS on it surviving (see g394AsyncStopGuardDisabled). But the guest never
+// asks twice — `StopEnvBGM@0x2A67C0` no-ops once `scene+0xa484` is -1 — so
+// nothing downstream can ever retire it. The deferral therefore expires the
+// moment a NEW audio owner takes over: another BGM start, or FMV audio.
+// `skipPort` is the port being started (which must not retire itself).
+static void g450RetireSuppressedBgmLocked(uint32_t skipPort, const char *reason)
+{
+    for (size_t other = 0u; other < g_g391Mixer.bgm.size(); ++other)
+    {
+        G392BgmSource &stale = g_g391Mixer.bgm[other];
+        if (!stale.active || !stale.stopSuppressed ||
+            other == static_cast<size_t>(skipPort))
+        {
+            continue;
+        }
+        if (g385GameAudioTrace())
+        {
+            std::fprintf(stderr,
+                         "[G450:mix] retire-suppressed-stop port=%zu cursor=%llu "
+                         "reason=%s\n",
+                         other,
+                         static_cast<unsigned long long>(stale.cursorFrame),
+                         reason);
+        }
+        stale = G392BgmSource{};
+    }
+}
+
+// Called when FMV audio starts: the movie owns the output from here, so a BGM
+// that is only still sounding because its Stop was suppressed must not bleed
+// into it. Harmless when nothing is suppressed.
+void dc2G450RetireSuppressedBgm()
+{
+    std::lock_guard<std::mutex> lock(g_g391Mixer.mutex);
+    g450RetireSuppressedBgmLocked(0xFFFFFFFFu, "fmv-audio-start");
+}
+
 bool dc2G392BgmStart(uint32_t port, std::shared_ptr<std::vector<int16_t>> pcm,
                      uint64_t loopStartFrame, uint64_t loopEndFrame, float volume)
 {
@@ -1240,6 +1300,14 @@ bool dc2G392BgmStart(uint32_t port, std::shared_ptr<std::vector<int16_t>> pcm,
     }
     {
         std::lock_guard<std::mutex> lock(g_g391Mixer.mutex);
+        // G450: a suppressed Stop is a DEFERRAL, not a veto. The guest already
+        // asked for this source to end; the only reason it is still sounding is
+        // that G394 could not tell a real stop from a stale one that early. Once
+        // ANY port starts a new BGM the question is settled — the game has moved
+        // on — so every still-suppressed source is retired here. Without this the
+        // suppression never re-armed and two sequences sounded at once
+        // (`active-bgm=2`) for the rest of the session.
+        g450RetireSuppressedBgmLocked(port, "bgm-start");
         G392BgmSource &source = g_g391Mixer.bgm[port];
         source.pcm = std::move(pcm);
         source.cursorFrame = 0u;
@@ -1279,6 +1347,7 @@ void dc2G392BgmStop(uint32_t port)
                 port, static_cast<unsigned long long>(source.cursorFrame));
         }
         source.earlyMutePending = false;
+        source.stopSuppressed = true;
         return;
     }
     if (g385GameAudioTrace() && source.active)
@@ -1335,6 +1404,36 @@ void dc2G391StopAllVoices()
     {
         voice.active = false;
         voice.decoded.reset();
+    }
+}
+
+// G450: the guest's BULK stop had no host effect. `sndSeAllStop@0x18D7C0` (22
+// call sites: every scene exit, map jump, menu init, title exit) reaches
+// `SeAllStop_Sub@0x18D750` -> `Stop__6CSound@0x18A280`, which is literally
+// `ezMidi(port + 0x20, 0)` — an EZMIDI Stop. The host handled that Stop for the
+// BGM source only, so any SFX voice sounding on the port kept playing into the
+// next scene (a looping VAG never ended at all). Voices carry `slot` in the same
+// EZMIDI/bank port space `dc2G385PlaySfx` is called with, so a port stop maps
+// exactly. A guest Stop is immediate on hardware, so drop the voice rather than
+// releasing it into its ADSR tail.
+void dc2G391StopSlotVoices(uint32_t slot)
+{
+    std::lock_guard<std::mutex> lock(g_g391Mixer.mutex);
+    size_t stopped = 0u;
+    for (G391Voice &voice : g_g391Mixer.voices)
+    {
+        if (!voice.active || voice.slot != slot)
+        {
+            continue;
+        }
+        voice.active = false;
+        voice.decoded.reset();
+        ++stopped;
+    }
+    if (stopped != 0u && g385GameAudioTrace())
+    {
+        std::fprintf(stderr, "[G450:mix] stop-slot-voices slot=%u stopped=%zu\n",
+                     slot, stopped);
     }
 }
 

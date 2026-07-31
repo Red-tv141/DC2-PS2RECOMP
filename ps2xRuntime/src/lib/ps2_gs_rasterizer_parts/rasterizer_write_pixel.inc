@@ -1177,7 +1177,13 @@ uint32_t GSRasterizer::sampleTexture(GS *gs, float s, float t, float q, uint16_t
         {
             // G5: one-shot decode of DC2's 4HH debug-font atlas. This separates
             // VRAM/CLUT extraction defects from coordinate wrapping defects.
-            if (tex.psm == GS_PSM_T4HH && tex.tbp0 == 0x1A00u && envFlagEnabled("DC2_DUMP_FONT"))
+            // G446: this is the PER-TEXEL texture sampler, and `psm==T4HH && tbp0==0x1A00` is TRUE
+            // for every texel of DC2's debug-font/UI atlas on lean MAP-0 — so the third term ran a
+            // live getenv() ~1,500 times per frame on the GS worker, the thread whose span IS the
+            // frame. The G446 env census attributed 100% of all env reads on this route to this one
+            // literal. Read once (G268 idiom); the dump itself is unchanged and still one-shot.
+            static const bool s_g5DumpFont = envFlagEnabled("DC2_DUMP_FONT");
+            if (tex.psm == GS_PSM_T4HH && tex.tbp0 == 0x1A00u && s_g5DumpFont)
             {
                 static std::atomic<uint32_t> s_dumped4hh{0};
                 if (s_dumped4hh.fetch_add(1u, std::memory_order_relaxed) == 0u)

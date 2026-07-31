@@ -1677,6 +1677,48 @@ static void g264FlushMirrorsAtFlush()
 static bool g305AsyncOn();
 static void g305DrainPending();
 
+// ===== G432: the SECOND colour-readback unpack site =====
+// G418 replaced the serial per-pixel `addrPSMCT32` + 4-byte-memcpy publication loop with an exact
+// one-page offset table + paired 8-byte stores (+ optional row lanes) and promoted it — but only at
+// the G144 batch publication site in rasterizer_vram_materialization.inc. `g261Materialize` runs the
+// IDENTICAL loop shape on the resident-RTT publication path, and the G432 census measured that path
+// as the largest single block on the GS front thread (the local->local TRXDIR edge alone spends
+// ~5.3 ms/f in g261MaterializeForRanges and ~2.3 ms/f in g285PrepareL2lConsume, both of which end
+// here). This part forwards that site to the same proven helper.
+//
+// EXACTNESS. The legacy loop indexes its source as `srcRow = (511 - y - glY) * fbW` with
+// `glY = 512 - 1 - dirtyHi`, i.e. `(dirtyHi - y) * fbW`. g418UnpackColorRows computes
+// `(fbH - 1 - y) * fbW`, so passing `fbH = dirtyHi + 1` reproduces the same index for every y in
+// [dirtyLo, dirtyHi]. Everything else (address table, paired stores, clipping fallback) is the
+// G418 mechanism unchanged, already oracle-verified at 109,051,904 pixels with bad=0.
+//
+// Declared here because g418_readback_unpack.inc is included later in this TU.
+static void g418UnpackColorRows(uint8_t *vram, uint32_t vramSize,
+                                const std::vector<uint32_t> &src,
+                                uint32_t fbBlock, uint32_t fbw, int fbW, int fbH,
+                                int rowLo, int rowHi, bool legacy);
+
+// DC2_G432_NO_MAT_UNPACK=1 restores the serial per-pixel publication loop (rollback arm).
+static bool g432MatUnpackOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G432_NO_MAT_UNPACK");
+    return on;
+}
+
+// Sub-millisecond lever ⇒ the within-process randomized A/B (DC2_G419_AB=matunpack) is its only
+// admissible gate. g419_ab_instrument.inc is compiled later in this TU, so both the selector and its
+// lever id are referenced by forward declaration / by value.
+static constexpr int kG432MatUnpackLeverId = 10; // == kG419Lever::kG432LeverMatUnpack
+static bool g419AbArmFor(int lever, bool defaultOn);
+
+// Behaviour-pure timing of this publication loop only (DC2_G432_CENSUS=1).
+static bool g432MatCensusOn()
+{
+    static const bool on = envFlagEnabled("DC2_G432_CENSUS");
+    return on;
+}
+static uint64_t g_g432MatUnpackNs = 0, g_g432MatUnpackN = 0, g_g432MatUnpackPx = 0;
+
 static void g261Materialize(int ti, int cause)
 {
     g324NoteObserver(1u); // direct resident-FBO/guest-authority consumer
@@ -1781,19 +1823,35 @@ static void g261Materialize(int ti, int cause)
         ok = readOk && s_g261Px.size() == static_cast<size_t>(r.fbW) * rows;
         if (ok)
         {
-            for (int y = r.dirtyLo; y <= r.dirtyHi; ++y)
+            // G432: exact G418 unpack (table + paired stores) at this second publication site.
+            // `fbH = r.dirtyHi + 1` reproduces the legacy `(511 - y - glY)` source row index.
+            const bool g432MatCensus = g432MatCensusOn();
+            const auto g432T0 = g432MatCensus ? std::chrono::steady_clock::now()
+                                              : std::chrono::steady_clock::time_point{};
+            const bool g432Fast =
+                g419AbArmFor(kG432MatUnpackLeverId, g432MatUnpackOn());
+            g418UnpackColorRows(vram, g_g261VramSize, s_g261Px, fbBlock, r.fbw, r.fbW,
+                                r.dirtyHi + 1, r.dirtyLo, r.dirtyHi,
+                                /*legacy=*/!g432Fast);
+            if (g432MatCensus)
             {
-                // s_g261Px rows are GL window rows starting at glY (bottom-first):
-                // GS row y ↔ GL row (511-y) ↔ buffer row (511-y-glY).
-                const size_t srcRow = static_cast<size_t>(511 - y - glY) * r.fbW;
-                for (int x = 0; x < r.fbW; ++x)
-                {
-                    const uint32_t off = GSPSMCT32::addrPSMCT32(fbBlock, r.fbw,
-                                                                static_cast<uint32_t>(x),
-                                                                static_cast<uint32_t>(y));
-                    if (off + 4u <= g_g261VramSize)
-                        std::memcpy(vram + off, &s_g261Px[srcRow + x], 4);
-                }
+                g_g432MatUnpackNs += static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - g432T0).count());
+                ++g_g432MatUnpackN;
+                g_g432MatUnpackPx += static_cast<uint64_t>(rows) *
+                                     static_cast<uint64_t>(r.fbW);
+                if ((g_g432MatUnpackN % 2000u) == 0u)
+                    std::fprintf(stderr,
+                                 "[G432:matunpack] fast=%d n=%llu ms=%.1f Mpx=%.1f nsPerPx=%.2f\n",
+                                 g432MatUnpackOn() ? 1 : 0,
+                                 static_cast<unsigned long long>(g_g432MatUnpackN),
+                                 static_cast<double>(g_g432MatUnpackNs) / 1.0e6,
+                                 static_cast<double>(g_g432MatUnpackPx) / 1.0e6,
+                                 g_g432MatUnpackPx
+                                     ? static_cast<double>(g_g432MatUnpackNs) /
+                                           static_cast<double>(g_g432MatUnpackPx)
+                                     : 0.0);
             }
             g178BumpRectImpl(fbBlock, r.fbw, GS_PSM_CT32, 0u,
                              static_cast<uint32_t>(r.dirtyLo),
@@ -3952,9 +4010,20 @@ static bool g309Requested()
 // authoritative-owner token. Requesting it implies the whole G280/G281/G282/G283 view+fanout+epoch
 // stack so a same-binary A/B needs one behavior lever. Declared free here (env-only, no gate deps)
 // so the request chains below and g283AuthorityRequested can all reference it.
+// G446: this predicate is consulted from g283AuthorityOn(), which the T8 map resolver and the
+// target-page authority call PER PAGE / PER DRAW on the GS worker — and it did three uncached
+// getenv() calls per invocation. The G446 host PC sampler measured getenv at 1.40% of ALL GS-worker
+// samples with the worker at 98% occupancy and the frame equal to its span (gsslow 0.98), i.e. the
+// pole thread was spending ~0.5 ms/f inside the Windows CRT environment lock. This is the exact
+// G268 defect, recurring at a site G268 never swept. Caching is exact: DC2_* levers are
+// process-constant in every harness (the whole tree's `static const bool` idiom assumes it) and
+// envFlagEnabled/envFlagDisabled have no other side effect.
 static bool g294OwnerTokenRequested()
 {
-    if (envFlagEnabled("DC2_G294_NO_OWNER_TOKEN") || envFlagDisabled("DC2_G294_OWNER_TOKEN"))
-        return false;
-    return envFlagEnabled("DC2_G294_OWNER_TOKEN");
+    static const bool s_on = []() {
+        if (envFlagEnabled("DC2_G294_NO_OWNER_TOKEN") || envFlagDisabled("DC2_G294_OWNER_TOKEN"))
+            return false;
+        return envFlagEnabled("DC2_G294_OWNER_TOKEN");
+    }();
+    return s_on;
 }

@@ -89,6 +89,8 @@ bool g310_backend_build_logical_composite(
 // read a per-frame GS total and compute the non-overlapping GS-vs-VU1-vs-other split. The GS
 // raster runs SYNCHRONOUSLY inside VU1 XGKICK, so vu1.run time double-counts it — this global
 // lets the frame decomposition subtract it out.
+// G434: l2l-edge workload invariant for the DC2_G434_NO_L2LPIN ceiling probe.
+std::atomic<uint64_t> g_g434L2lEdges{0};
 std::atomic<uint64_t> g_g141GsRasterNs{0};
 // G141 sub-profile: rasterizer coverage + primitive-type split (DC2_PERF). bboxPx = total
 // bounding-box pixels iterated, insidePx = passed the barycentric edge test, drawnPx = reached
@@ -296,11 +298,21 @@ thread_local uint32_t t_g364FogCol = 0u;
 extern std::atomic<uint32_t> g_g419AbArm;
 extern std::atomic<uint32_t> g_g419AbUsed;
 
+// G446 env-read census (defined at global scope in ps2_gif_arbiter.cpp; no-op unless
+// DC2_G446_ENVCENSUS=1).
+extern void g446NoteEnvRead(const char *name);
+
 namespace
 {
 
+    // G446 (diagnosis only, default OFF, DC2_G446_ENVCENSUS=1): the host PC sampler measured
+    // getenv() at 1.4% of ALL GS-worker samples on a thread whose span IS the frame, but a PC
+    // sampler cannot name the CALLER. Bucketing by the flag NAME does, exactly: every call site
+    // passes a distinct string literal, so the top row names the defective predicate directly.
+    // Cost when off: one predictable branch on a `static const bool`.
     bool envFlagEnabled(const char *name)
     {
+        g446NoteEnvRead(name);
         const char *value = std::getenv(name);
         return value != nullptr &&
                value[0] != '\0' &&
@@ -313,6 +325,7 @@ namespace
 
     bool envFlagDisabled(const char *name)
     {
+        g446NoteEnvRead(name);
         const char *value = std::getenv(name);
         return value != nullptr &&
                (value[0] == '\0' ||

@@ -12,6 +12,10 @@
 #include "Kernel/Stubs/MPEG.h"
 #include "ps2_host_backend.h"
 
+// G438 derivative-probe arm selector (defined in ps2_gs_rasterizer_parts/g419_ab_instrument.inc).
+// -1 = this probe is not the selected DC2_G419_AB lever, 0 = control frame, 1 = candidate frame.
+extern int g438SlowArm(int which);
+
 #include <iostream>
 #include <fstream>
 #include <algorithm>
@@ -31,6 +35,7 @@
 #include <condition_variable>
 #include <memory>
 #include <vector>
+#include <immintrin.h>
 
 namespace ps2_stubs
 {
@@ -456,17 +461,62 @@ private:
 
     void worker()
     {
+        // G442 CEILING PROBE (default OFF: DC2_G442_FTZ=1). Nothing in this tree touches MXCSR, so
+        // the VU1 interpreter's SSE2 FMACs run with subnormal support ON and every subnormal
+        // operand/result costs a microcode assist. Setting FTZ|DAZ on THIS thread only prices that
+        // assist: it cannot change any other thread's arithmetic. Output under this flag may be
+        // wrong (subnormal lanes read as +0 and the MAC underflow nibble stops being set), so it is
+        // a price, not a lever — the workload invariant is kicks/f + pairs/run.
+        {
+            static const bool s_g442Ftz = (std::getenv("DC2_G442_FTZ") != nullptr);
+            if (s_g442Ftz)
+            {
+                _mm_setcsr(_mm_getcsr() | 0x8040u); // FTZ (bit 15) | DAZ (bit 6)
+                std::fprintf(stderr, "[G442:ftz] VU1 worker MXCSR=0x%08x (FTZ|DAZ armed)\n",
+                             (unsigned)_mm_getcsr());
+            }
+        }
         for (;;)
         {
+            // G441 (diagnostic, DEFAULT OFF: DC2_G441_KICK=1). m_workerBusyNs times only
+            // execute()/resume(), so the VU1 worker's per-kick PROLOGUE — the queue pop and the
+            // G301 VU-RAM write replay — is invisible to [G303:vu1w] busyMs/f, exactly the class
+            // of instrument hole G440 found on the GS worker. Price it before assuming the whole
+            // VU1 thread is the pair loop. One cached env read; default path does zero clock work.
+            static const bool s_g441Kick = (std::getenv("DC2_G441_KICK") != nullptr);
+            const auto g441T0 = s_g441Kick ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
             G297KickPtr item;
+            // G441 (REJECTED, measured neutral — kept only as this comment): batching this pop
+            // into a worker-local prefix queue, so ~1260 lock acquisitions/frame become ~20, is
+            // frame-neutral (+0.38 ms, order-balanced blocks disagreeing in sign). [G441:kick]'s
+            // popUs of 0.5-4.8 us/kick is the cv/lock ROUND TRIP around an already-full queue, not
+            // CPU the pole thread spends — the VU1 worker runs 1000-1800 kicks behind the EE and
+            // starves 0.0% of the time. Do not rebuild it.
             {
                 std::unique_lock<std::mutex> lk(m_mtx);
-                m_cvWork.wait(lk, [&] { return m_stop || !m_work.empty(); });
+                // G441: separate "the queue already had work" (pure lock cost) from STARVATION
+                // (the worker had to sleep because the EE has not produced the next kick yet).
+                // On the pole thread the second is idle time the frame pays for.
+                if (s_g441Kick && m_work.empty())
+                {
+                    ++m_g441Starved;
+                    const auto s0 = std::chrono::steady_clock::now();
+                    m_cvWork.wait(lk, [&] { return m_stop || !m_work.empty(); });
+                    m_g441StarveNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - s0).count();
+                }
+                else
+                    m_cvWork.wait(lk, [&] { return m_stop || !m_work.empty(); });
                 if (m_stop && m_work.empty())
                     return;
+                if (s_g441Kick)
+                    m_g441Backlog += m_work.size();
                 item = m_work.front();
                 m_work.pop_front();
             }
+            const auto g441T1 = s_g441Kick ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
             g_g297KickCapture = &item->packets; // redirect this kick's XGKICKs into item->packets
             g_g297KickTop = item->top;          // captured XTOP (double-buffer top) for this kick
             // G301: replay this kick's ordered VU-RAM writes onto the PERSISTENT worker buffers, in
@@ -488,6 +538,19 @@ private:
                     }
                     run += w.len;
                 }
+                if (s_g441Kick)
+                {
+                    m_g441Writes += item->writes.size();
+                    m_g441WriteBytes += run;
+                }
+            }
+            if (s_g441Kick)
+            {
+                const auto g441T2 = std::chrono::steady_clock::now();
+                m_g441PopNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    g441T1 - g441T0).count();
+                m_g441ReplayNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    g441T2 - g441T1).count();
             }
             // G303: worker-thread derivative arm — inject a fixed busy-spin per kick to slow ONLY the
             // VU1 worker (the clean "slow VU1 worker" A/B; the old DC2_G295_VU1_DIAG_LOOP arm disables
@@ -506,11 +569,20 @@ private:
             else
                 m_vu1->execute(m_workerVuCode, PS2_VU1_CODE_SIZE, m_workerVuData, PS2_VU1_DATA_SIZE,
                                *m_gs, m_mem, item->startPC, item->itop, item->budget);
-            if (s_g303SlowUs > 0)
+            // G438: when DC2_G419_AB=vu1slow is armed the spin runs on CANDIDATE frames only, so the
+            // probe becomes a within-process paired measurement instead of a difference of two run
+            // means (whose run-level spread is ~4.5 ms here — larger than the effect). The spin
+            // length still comes from DC2_G303_VU1_SLOW_US, defaulting to 5 us/kick.
             {
-                const auto spinUntil = std::chrono::steady_clock::now() +
-                                       std::chrono::microseconds(s_g303SlowUs);
-                while (std::chrono::steady_clock::now() < spinUntil) { /* busy-spin, worker only */ }
+                const int g438Arm = g438SlowArm(0);
+                const long long spinUs = s_g303SlowUs > 0 ? s_g303SlowUs : 5LL;
+                const bool doSpin = (g438Arm >= 0) ? (g438Arm == 1) : (s_g303SlowUs > 0);
+                if (doSpin)
+                {
+                    const auto spinUntil = std::chrono::steady_clock::now() +
+                                           std::chrono::microseconds(spinUs);
+                    while (std::chrono::steady_clock::now() < spinUntil) { /* busy-spin, worker only */ }
+                }
             }
             if (instr)
             {
@@ -521,6 +593,8 @@ private:
                 m_workerKicksRun.fetch_add(1ull, std::memory_order_relaxed);
             }
             g_g297KickCapture = nullptr;
+            const auto g441T3 = s_g441Kick ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
             {
                 // Publish ready under the DONE mutex (separate from the work-queue m_mtx, so this
                 // does not contend with the GS worker's batch collection or the EE's enqueue). The
@@ -529,8 +603,62 @@ private:
                 item->ready.store(true, std::memory_order_release);
             }
             m_cvDone.notify_all();
+            if (s_g441Kick)
+            {
+                const auto g441T4 = std::chrono::steady_clock::now();
+                m_g441PublishNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    g441T4 - g441T3).count();
+                m_g441ExecNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    g441T3 - g441T0).count() -
+                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        g441T1 - g441T0).count();
+                m_g441KickNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    g441T4 - g441T0).count();
+                if ((++m_g441Kicks % 30000ull) == 0ull)
+                {
+                    // Per-kick microseconds; multiply by kicks/f (~1260 on lean MAP-0) for ms/f.
+                    const double n = (double)(m_g441Kicks - m_g441LastKicks);
+                    std::fprintf(stderr,
+                                 "[G441:kick] kicks=%llu | kickUs=%.2f popUs=%.2f replayUs=%.2f "
+                                 "execUs=%.2f publishUs=%.2f | starve=%.1f%%/%.2fus backlog=%.1f "
+                                 "| writes/kick=%.1f bytes/kick=%.0f\n",
+                                 (unsigned long long)m_g441Kicks,
+                                 (double)(m_g441KickNs - m_g441LastKickNs) / 1e3 / n,
+                                 (double)(m_g441PopNs - m_g441LastPopNs) / 1e3 / n,
+                                 (double)(m_g441ReplayNs - m_g441LastReplayNs) / 1e3 / n,
+                                 (double)(m_g441ExecNs - m_g441LastExecNs) / 1e3 / n,
+                                 (double)(m_g441PublishNs - m_g441LastPublishNs) / 1e3 / n,
+                                 100.0 * (double)(m_g441Starved - m_g441LastStarved) / n,
+                                 (double)(m_g441StarveNs - m_g441LastStarveNs) / 1e3 / n,
+                                 (double)(m_g441Backlog - m_g441LastBacklog) / n,
+                                 (double)(m_g441Writes - m_g441LastWrites) / n,
+                                 (double)(m_g441WriteBytes - m_g441LastWriteBytes) / n);
+                    m_g441LastKicks = m_g441Kicks;
+                    m_g441LastKickNs = m_g441KickNs;
+                    m_g441LastPopNs = m_g441PopNs;
+                    m_g441LastReplayNs = m_g441ReplayNs;
+                    m_g441LastExecNs = m_g441ExecNs;
+                    m_g441LastPublishNs = m_g441PublishNs;
+                    m_g441LastStarved = m_g441Starved;
+                    m_g441LastStarveNs = m_g441StarveNs;
+                    m_g441LastBacklog = m_g441Backlog;
+                    m_g441LastWrites = m_g441Writes;
+                    m_g441LastWriteBytes = m_g441WriteBytes;
+                }
+            }
         }
     }
+
+    // G441 per-kick prologue accounting (VU1 worker thread ONLY — plain scalars, no atomics,
+    // and every one of them is written only under DC2_G441_KICK=1).
+    uint64_t m_g441Kicks = 0ull, m_g441KickNs = 0ull, m_g441PopNs = 0ull, m_g441ReplayNs = 0ull;
+    uint64_t m_g441ExecNs = 0ull, m_g441PublishNs = 0ull;
+    uint64_t m_g441Writes = 0ull, m_g441WriteBytes = 0ull;
+    uint64_t m_g441LastKicks = 0ull, m_g441LastKickNs = 0ull, m_g441LastPopNs = 0ull;
+    uint64_t m_g441LastReplayNs = 0ull, m_g441LastExecNs = 0ull, m_g441LastPublishNs = 0ull;
+    uint64_t m_g441LastWrites = 0ull, m_g441LastWriteBytes = 0ull;
+    uint64_t m_g441Starved = 0ull, m_g441StarveNs = 0ull, m_g441Backlog = 0ull;
+    uint64_t m_g441LastStarved = 0ull, m_g441LastStarveNs = 0ull, m_g441LastBacklog = 0ull;
 
     VU1Interpreter *m_vu1 = nullptr;
     PS2Memory *m_mem = nullptr;

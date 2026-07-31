@@ -40,6 +40,19 @@ namespace
         uint64_t zeroLenHist[9] = {};              // 1..7 exact, [8] = >=8
         uint64_t zeroPairsInRunsGE2 = 0ull;        // pairs collapsible by a >=2 run lever
         uint32_t zeroCur = 0u;                     // current run length (in flight)
+        // G428: SIMD-op accounting for the fast-upper path. The pair loop is throughput-bound
+        // on SSE2 ops (G426) and scalar bookkeeping is a closed vein (G427), so the only
+        // remaining question is where the SIMD ops go. Two shares decide it:
+        //   * destHist  - the dest mask of every FMAC that runs inline. dest==0xF lets the
+        //                 masked store (load+and+andnot+or+store) collapse to one store.
+        //   * fmacExec  - FMAC uppers, i.e. the ops that pay the ~10-op G329/G330 classifier.
+        //   * flagRead  - executed lower slots that actually CONSUME MAC/STATUS. If this is 0
+        //                 the classifier's product is dead except for the architectural tail.
+        uint64_t destHist[16] = {};
+        uint64_t fmacExec = 0ull;     // covered upper with cls 1 or 2 (writes MAC/STATUS)
+        uint64_t nonFmacCovered = 0ull; // covered upper with cls >= 3 (no MAC/STATUS)
+        uint64_t flagReadExec = 0ull; // executed lower reads s_vuMacVisible/s_vuStatusVisible
+        uint64_t statusReadExec = 0ull; // subset: FSEQ/FSAND/FSOR (the STICKY consumers)
     };
 
     thread_local G421Census s_g421;
@@ -106,6 +119,18 @@ namespace
     {
         ++s_g421.cycles;
         ++s_g421.upperKind[kind == 0xffu ? 0x7fu : (kind & 0x7fu)];
+        // G428: fast-upper SIMD accounting (same descriptor table the lever dispatches on).
+        if (kind < 0x80u && ((upper >> 31u) & 1u) == 0u)
+        {
+            const uint8_t cls = g421Desc()[kind & 0x7fu].cls;
+            if (cls == 1u || cls == 2u)
+            {
+                ++s_g421.fmacExec;
+                ++s_g421.destHist[(upper >> 21u) & 0xFu];
+            }
+            else if (cls != 0u)
+                ++s_g421.nonFmacCovered;
+        }
         // G425 zero-work run census.
         if (kind == 0x6fu && ((upper >> 30u) & 3u) == 0u &&
             (lower == 0x00000000u || lower == 0x8000033Cu))
@@ -129,6 +154,13 @@ namespace
         ++s_g421.lowerOpHi[op];
         if (op == 0x40u)
             ++s_g421.lowerS2[S2_FUNC(lower) & 0x7fu];
+        if (op == 0x14u || op == 0x16u || op == 0x17u || op == 0x18u ||
+            op == 0x1au || op == 0x1bu || op == 0x1cu)
+        {
+            ++s_g421.flagReadExec;
+            if (op == 0x14u || op == 0x16u || op == 0x17u)
+                ++s_g421.statusReadExec;
+        }
         const uint8_t lk = g422DecodeLowerKind(lower);
         if (lk < (uint8_t)G422_LK_COUNT)
             ++s_g421.lowerKind[lk];
@@ -217,6 +249,26 @@ namespace
                          100.0 * (double)s_g421.zeroLenHist[6] / (double)(s_g421.zeroRuns ? s_g421.zeroRuns : 1ull),
                          100.0 * (double)s_g421.zeroLenHist[7] / (double)(s_g421.zeroRuns ? s_g421.zeroRuns : 1ull),
                          100.0 * (double)s_g421.zeroLenHist[8] / (double)(s_g421.zeroRuns ? s_g421.zeroRuns : 1ull));
+        }
+        // G428: where the SIMD ops go on the fast-upper path.
+        {
+            const double fm = (double)(s_g421.fmacExec ? s_g421.fmacExec : 1ull);
+            std::fprintf(stderr,
+                         "[G428:simd] fmac=%llu (%.1f%% ofCycles) nonFmacCovered=%llu | "
+                         "destF=%.2f%% destXYZ=%.2f%% destX=%.2f%% other=%.2f%% | "
+                         "flagRead=%llu (%.4f%% ofCycles) statusRead=%llu\n",
+                         (unsigned long long)s_g421.fmacExec,
+                         100.0 * (double)s_g421.fmacExec / cyc,
+                         (unsigned long long)s_g421.nonFmacCovered,
+                         100.0 * (double)s_g421.destHist[0xF] / fm,
+                         100.0 * (double)s_g421.destHist[0xE] / fm,
+                         100.0 * (double)s_g421.destHist[0x8] / fm,
+                         100.0 * (double)(s_g421.fmacExec - s_g421.destHist[0xF] -
+                                          s_g421.destHist[0xE] - s_g421.destHist[0x8]) / fm,
+                         (unsigned long long)s_g421.flagReadExec,
+                         100.0 * (double)s_g421.flagReadExec / cyc,
+                         (unsigned long long)s_g421.statusReadExec);
+            g421DumpHist("destMask", s_g421.destHist, 16u, s_g421.fmacExec);
         }
         g421DumpHist("upperKind", s_g421.upperKind, 0x80u, s_g421.cycles);
         g421DumpHist("lowerOpHi", s_g421.lowerOpHi, 0x80u, s_g421.cycles);

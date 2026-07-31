@@ -1724,7 +1724,14 @@ void dc2G385HandleMidiCommand(uint32_t family, uint32_t port,
         g385StartMusicPort(port);
         break;
     case 0x0020u:
+        // G450: an EZMIDI Stop owns the whole port, not just its BGM source.
+        // `sndSeAllStop` -> `SeAllStop_Sub` -> `Stop__6CSound` is exactly this
+        // command, so SFX voices on the port must go silent with it.
+        g385StopMusicPort(port);
+        dc2G391StopSlotVoices(port);
+        break;
     case 0x0040u:
+        // SetSq replaces the port's sequence; it does not stop its SFX voices.
         g385StopMusicPort(port);
         break;
     case 0x0030u:
@@ -1744,6 +1751,8 @@ void dc2G385HandleMidiCommand(uint32_t family, uint32_t port,
         {
             g385StopMusicPort(musicPort);
         }
+        // G450: EZMIDI Quit tears the module down; nothing may survive it.
+        dc2G391StopAllVoices();
         break;
     default:
         break;

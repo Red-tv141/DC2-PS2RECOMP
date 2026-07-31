@@ -267,11 +267,43 @@ bool g418ProfileOn()
 // guarantees that already-issued commands complete in finite time.
 bool g418EarlyKickOn()
 {
-    // Bring-up state: opt-in arm with a same-binary kill switch so an armed run can be reversed
-    // without a rebuild.
-    static const bool on = g158EnvFlag("DC2_G418_EARLY_KICK") &&
-                           !g158EnvFlag("DC2_G418_NO_EARLY_KICK");
+    // G445: PROMOTED to default-ON. G418 left this opt-in after a cross-run block read it neutral,
+    // but that block was taken while VU1 bound the frame and every GS-resident lever was multiplied
+    // by a sensitivity near zero. With the GS worker the pole (G444/G445: gsslow 0.84, vu1slow 0.05)
+    // the same code is worth -6.3 ms/f, measured twice in the within-process paired instrument
+    // (DC2_G419_AB=earlykick, t = -118 and -154). Rollback: DC2_G418_NO_EARLY_KICK=1.
+    static const bool on = !g158EnvFlag("DC2_G418_NO_EARLY_KICK");
     return on;
+}
+
+// G445: the same decision, but consulted through the within-process randomized A/B instrument when
+// DC2_G419_AB=earlykick is armed. The env form above was only ever gated by a cross-run block taken
+// while VU1 bound the frame; this host's run-level drift (~1.4x within one session) is several times
+// the lever, so the paired within-process form is the only admissible gate. -1 means "not the
+// selected lever" and the env decision stands unchanged, so the shipping path is untouched.
+// (g445KickArm is declared at global scope in the parent ps2_gs_gpu_raster.cpp — these parts are
+// compiled inside an anonymous namespace, so a declaration here would name a different symbol.)
+bool g445EarlyKickActive()
+{
+    const int arm = g445KickArm();
+    if (arm < 0)
+        return g418EarlyKickOn();
+    return arm != 0;
+}
+
+// G445 extension: the same kick for the copy/composite/upload backend items. Default OFF — it is a
+// probe until it is measured. DC2_G445_KICK_ALL=1 forces it on; DC2_G419_AB=kickall gates it.
+bool g445KickAllOn()
+{
+    static const bool on = g158EnvFlag("DC2_G445_KICK_ALL");
+    return on;
+}
+bool g445KickAllActive()
+{
+    const int arm = g445KickAllArm();
+    if (arm < 0)
+        return g445KickAllOn();
+    return arm != 0;
 }
 
 // --- Minimal GL>1.1 loader. Microsoft's <GL/gl.h> only declares GL 1.1; every entry point used
