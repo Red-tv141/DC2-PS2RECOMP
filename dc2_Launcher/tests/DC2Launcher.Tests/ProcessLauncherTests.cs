@@ -75,6 +75,67 @@ public class ProcessLauncherTests
     }
 
     [Fact]
+    public void BuildLaunchConfiguration_AlwaysExportsDataDirectory()
+    {
+        // The runner reads game content from the extracted DATA folder, never the ISO, so
+        // DC2_DATA_DIR must be present on every launch — not only when mods are enabled.
+        var env = new TestLauncherEnvironment { LauncherRoot = @"C:\MockLauncher" };
+        var launcher = new ProcessLauncher(env, new ValidationService(env, new MockFileSystemService()), new MockLoggerService());
+
+        var settings = new LauncherSettings();
+        settings.Mods.Enabled = false;
+
+        var config = launcher.BuildLaunchConfiguration(settings);
+
+        Assert.True(config.EnvironmentVariables.ContainsKey("DC2_DATA_DIR"));
+        Assert.Equal(Path.GetFullPath(@"C:\MockLauncher\DATA"), config.EnvironmentVariables["DC2_DATA_DIR"]);
+        Assert.False(config.EnvironmentVariables.ContainsKey("DC2_MODS_ENABLED"));
+    }
+
+    [Fact]
+    public void BuildLaunchConfiguration_AlwaysExportsControllerConfigPath()
+    {
+        var env = new TestLauncherEnvironment { LauncherRoot = @"C:\MockLauncher" };
+        var launcher = new ProcessLauncher(env, new ValidationService(env, new MockFileSystemService()), new MockLoggerService());
+
+        var config = launcher.BuildLaunchConfiguration(new LauncherSettings());
+
+        Assert.Equal(Path.GetFullPath(@"C:\MockLauncher\Config\controller.json"),
+                     config.EnvironmentVariables["DC2_CONTROLLER_CONFIG"]);
+    }
+
+    [Fact]
+    public void BuildLaunchConfiguration_DebugPerformance_ArmsHostCheckAndForcesUncapped()
+    {
+        // The G447 host check compares both arms inside one process. DC2 is a locked-30
+        // title, so a capped run reads the cap rather than a result — the uncapped patch is
+        // part of the measurement, not a separate user choice.
+        var env = new TestLauncherEnvironment { LauncherRoot = @"C:\MockLauncher" };
+        var launcher = new ProcessLauncher(env, new ValidationService(env, new MockFileSystemService()), new MockLoggerService());
+
+        var settings = new LauncherSettings();
+        settings.Game.DebugPerformance = true;
+        settings.Game.Enable60Fps = false;
+
+        var config = launcher.BuildLaunchConfiguration(settings);
+
+        Assert.Equal("1", config.EnvironmentVariables["DC2_G447_HOSTCHECK"]);
+        Assert.Equal("1", config.EnvironmentVariables["DC2_PATCH_60FPS"]);
+    }
+
+    [Fact]
+    public void BuildLaunchConfiguration_DebugPerformanceOff_OmitsHostCheck()
+    {
+        var env = new TestLauncherEnvironment { LauncherRoot = @"C:\MockLauncher" };
+        var launcher = new ProcessLauncher(env, new ValidationService(env, new MockFileSystemService()), new MockLoggerService());
+
+        var config = launcher.BuildLaunchConfiguration(new LauncherSettings());
+
+        Assert.False(config.EnvironmentVariables.ContainsKey("DC2_G447_HOSTCHECK"));
+        Assert.False(config.EnvironmentVariables.ContainsKey("DC2_PATCH_60FPS"));
+    }
+
+    [Fact]
     public void LaunchConfiguration_FormatDiagnosticSummary_ProducesReadableSummary()
     {
         var config = new LaunchConfiguration

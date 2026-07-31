@@ -379,6 +379,9 @@
                                 <CheckBox Content="Enable Debug Menu [Known Supported]" IsChecked="{Binding EnableDebugMenu}" IsEnabled="{Binding CanModifySettings}"/>
                                 <CheckBox Content="Skip Game Intro [Awaiting Recomp Hook]" IsChecked="{Binding SkipIntro}" IsEnabled="{Binding CanModifySettings}"/>
                                 <CheckBox Content="Fullscreen Mode [Awaiting Recomp Hook]" IsChecked="{Binding Fullscreen}" IsEnabled="{Binding CanModifySettings}"/>
+                                <CheckBox Content="Debug Performance [Diagnostic]" IsChecked="{Binding DebugPerformance}" IsEnabled="{Binding CanModifySettings}"/>
+                                <TextBlock Text="Measures whether this PC benefits from the frame-pacing optimisations and writes a verdict to Logs\performance_*.log. Runs uncapped and alternates settings while playing, so leave it off for normal play."
+                                           TextWrapping="Wrap" FontSize="11" Foreground="#9A8F7A" Margin="24,2,0,4"/>
 
                                 <!-- Resolution Mode -->
                                 <Grid Margin="0,12,0,4">
