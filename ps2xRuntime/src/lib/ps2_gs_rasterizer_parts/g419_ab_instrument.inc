@@ -132,6 +132,92 @@ enum G419Lever
     // shipped default against exactly the double rollback. The two levers act on DIFFERENT threads
     // and each carries a CPU-burn cost, so only a combined arm answers "does the promoted pair pay".
     kG447LeverSpinBoth = 18,
+    // G452: corrected one-slot G305 async break. G444 admitted G310 batches to async submission,
+    // but its drain sites remained gated only by DC2_G305_ASYNC; the second submit therefore
+    // failed and fell back to CPU replay. This arm keeps every consumer/frame drain live for both
+    // buckets and alternates only admission of eligible G310 skip-readback batches.
+    kG452LeverAsyncOne = 19,
+    // G454: knowingly-wrong dependency-edge deletion probes. The candidate keeps the same
+    // publication rows and unpack work but omits the synchronous FBO readback at one named
+    // ownership boundary. These price an exact future ownership mechanism; they can never ship.
+    kG454LeverReadbackAll = 20,
+    kG454LeverReadbackL2l = 21,
+    kG454LeverReadbackResync = 22,
+    kG454LeverReadbackDisplay = 23,
+    // G456: exact short-circuit form of G407's sprite-axis UV predicate. Both arms
+    // return identical flags; this paired gate measures only the avoided gcd/divides.
+    kG456LeverUvPredicate = 24,
+    // G473: exact four-pixel SSE2 form of the G440 dual-CRT presentation blend. The scalar
+    // control and SIMD candidate use the same signed-delta /255 truncation rule byte-for-byte.
+    kG473LeverSimdMerge = 25,
+    // G475: compact VU1 trace for sequential VNOP-upper + covered non-control lower pairs.
+    // Thread-level code-shape lever; hold blocks prevent MTVU work leaking between arms.
+    kG475LeverVnopTrace = 26,
+    // G476: run-weighted page-generation walk. The +1 slack page makes the old loop visit every
+    // interior page twice; the candidate adds 2 once instead of 1 twice, halving the `lock xadd`
+    // count in g178BumpRectImpl. Identical final counters, so this gate measures only avoided work.
+    kG476LeverPageBump = 27,
+    // G477: swizzle-row hoisted IMAGE run writers (CT32/Z32 pair stores, P4 row hoist). Both arms
+    // write byte-identical VRAM; the gate measures only the avoided per-pixel address derivation.
+    kG477LeverRunWrite = 28,
+    // G478: recycling pool for the per-kick G297KickItem. Both arms build a byte-identical item;
+    // the gate measures only the avoided make_shared / vector regrow / cross-thread free.
+    kG478LeverKickPool = 29,
+    // G479: fused 16-byte VU1 pair record. Both arms decode the same two words from the same
+    // precisely-invalidated cache; the gate measures only the removed second address chain and
+    // the VU1 code store leaving the hot loop's working set. Thread-level code-SHAPE lever (it
+    // selects a loop copy), so it inherits the G438 block hold like G475.
+    kG479LeverLeanFetch = 30,
+    // G480: cross-thread recycling of the per-XGKICK Path1 packet buffers. Both arms hand the GS
+    // worker byte-identical packet bytes; the gate measures only the removed per-packet malloc on
+    // the VU1 worker (the pole) and the cross-thread free on the GS worker.
+    kG480LeverPktPool = 31,
+    // G480: the COMBINED promotion arm — the per-XGKICK packet pool AND the G478 kick-item pool
+    // switched together. G447's rule: two levers on the same serialized edge do not add, so the
+    // promotion number must come from one arm that is exactly the shipped default against exactly
+    // the full rollback. Both pools live on the same VU1-worker allocation edge.
+    kG480LeverPoolBoth = 32,
+    // G480: skip the out-of-line g422FastLower call on a NOP lower slot (39% of pairs). Both arms
+    // leave VU1State and VU RAM identical — the NOP case of that function is literally `return;`.
+    // Loop-invariant, read once per run(), so the arm is held for a G438 block like G475/G479.
+    kG480LeverNopSkip = 33,
+    // G481: execute the seven HOT G422 lower kinds (~42% of pairs) inline in the pair loop instead
+    // of through the out-of-line g422FastLower call. Both arms expand the SAME body tokens
+    // (vu1_g481_hot_lower.inc), so VU1State and VU RAM are identical and the gate measures only the
+    // removed call. Loop-invariant code-SHAPE lever, so it inherits the G438 block hold.
+    kG481LeverHotLower = 34,
+    // G482: PRICE ONLY. The candidate arm computes the full intra-frame memo KEY (16 KB of
+    // persistent VU data RAM + VU1State + code generation + kick params) once per geometry kick on
+    // the VU1 worker and sinks it; the control arm does nothing. Neither arm changes a single byte
+    // of guest state or output, so the gate measures exactly one thing: what the memo's key costs
+    // the frame. Census before mechanism (G476) — if this exceeds the ~1.3 ms/f the memo could
+    // return, the vein closes on arithmetic.
+    kG482LeverMemoHash = 35,
+    // G482: coalesce contiguous VU-RAM writes on the EE so the VU1 worker replays a handful of
+    // long memcpys instead of ~59 short ones per kick. Both arms replay byte-identical content to
+    // byte-identical offsets; the gate measures only the removed per-record loop work on the pole.
+    kG482LeverWCoal = 36,
+    // G482: skip the per-kick m_doneMtx acquire + notify_all when m_doneWaiters is zero. Both arms
+    // publish the same `ready` flag with the same happens-before; the gate measures the lock only.
+    kG482LeverNotifySkip = 37,
+    // G482: RETIRED combined arm. `notifyskip` measured +0.528 ms/f SLOWER and is now default-off,
+    // so the shipped default is `wcoal` alone and `wcoal` IS the promotion arm. Kept so an explicit
+    // DC2_G419_AB=g482both still selects the notify lever only (its own record).
+    kG482LeverBoth = 38,
+    kG483LeverPcReg = 39,
+    // G484: the pair loop addresses the nine scalar-pipe / flag-pipe thread_locals through ONE
+    // hoisted base pointer instead of seven. Same storage, same bytes, same order — the arms
+    // differ only in the addressing mode, so this measures register pressure and nothing else.
+    kG484LeverWideVf0 = 40,
+    // G485 REFUTED the register-form G139 hazard (`hazreg`, lever 41): mean +0.232 ms/f, sign 3/4
+    // SLOWER. Removing the aliasing does not pay for the three loop-live values it adds. The lever
+    // id is retired rather than reused so an old command line fails loudly instead of selecting
+    // something else.
+    // G486 REFUTED the wide single-lane FMAC destination store (`widedest`, lever 42): mean
+    // +0.597 ms/f, sign 4/4 SLOWER. A single-lane write cannot be widened without READING the
+    // destination's other three lanes, so the candidate turns a pure store into a
+    // load-modify-store and puts a 16-byte load on the dependency chain. The lever id is retired
+    // rather than reused so an old command line fails loudly instead of selecting something else.
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -192,10 +278,55 @@ static int g419AbLever()
             return static_cast<int>(kG447LeverWSpin);
         if (std::strcmp(value, "spinboth") == 0)
             return static_cast<int>(kG447LeverSpinBoth);
+        if (std::strcmp(value, "async1") == 0)
+            return static_cast<int>(kG452LeverAsyncOne);
+        if (std::strcmp(value, "rb_all") == 0)
+            return static_cast<int>(kG454LeverReadbackAll);
+        if (std::strcmp(value, "rb_l2l") == 0)
+            return static_cast<int>(kG454LeverReadbackL2l);
+        if (std::strcmp(value, "rb_resync") == 0)
+            return static_cast<int>(kG454LeverReadbackResync);
+        if (std::strcmp(value, "rb_display") == 0)
+            return static_cast<int>(kG454LeverReadbackDisplay);
+        if (std::strcmp(value, "uvpred") == 0)
+            return static_cast<int>(kG456LeverUvPredicate);
+        if (std::strcmp(value, "simdmerge") == 0)
+            return static_cast<int>(kG473LeverSimdMerge);
+        if (std::strcmp(value, "vnoptrace") == 0)
+            return static_cast<int>(kG475LeverVnopTrace);
+        if (std::strcmp(value, "pagebump") == 0)
+            return static_cast<int>(kG476LeverPageBump);
+        if (std::strcmp(value, "runwrite") == 0)
+            return static_cast<int>(kG477LeverRunWrite);
+        if (std::strcmp(value, "kickpool") == 0)
+            return static_cast<int>(kG478LeverKickPool);
+        if (std::strcmp(value, "leanfetch") == 0)
+            return static_cast<int>(kG479LeverLeanFetch);
+        if (std::strcmp(value, "pktpool") == 0)
+            return static_cast<int>(kG480LeverPktPool);
+        if (std::strcmp(value, "poolboth") == 0)
+            return static_cast<int>(kG480LeverPoolBoth);
+        if (std::strcmp(value, "nopskip") == 0)
+            return static_cast<int>(kG480LeverNopSkip);
+        if (std::strcmp(value, "hotlower") == 0)
+            return static_cast<int>(kG481LeverHotLower);
+        if (std::strcmp(value, "memohash") == 0)
+            return static_cast<int>(kG482LeverMemoHash);
+        if (std::strcmp(value, "wcoal") == 0)
+            return static_cast<int>(kG482LeverWCoal);
+        if (std::strcmp(value, "notifyskip") == 0)
+            return static_cast<int>(kG482LeverNotifySkip);
+        if (std::strcmp(value, "g482both") == 0)
+            return static_cast<int>(kG482LeverBoth);
+        if (std::strcmp(value, "pcreg") == 0)
+            return static_cast<int>(kG483LeverPcReg);
+        if (std::strcmp(value, "widevf0") == 0)
+            return static_cast<int>(kG484LeverWideVf0);
         std::fprintf(stderr,
                      "[G419:ab] unknown DC2_G419_AB='%s' (expected "
                      "narrow|pack|lanes|all|zero|packlanes|pool|all420|narrowtouch|matunpack|"
-                     "vu1slow|gsslow|coalesce|earlykick|kickall|spinwait|wspin|spinboth)\n",
+                     "vu1slow|gsslow|coalesce|earlykick|kickall|spinwait|wspin|spinboth|async1|"
+                     "rb_all|rb_l2l|rb_resync|rb_display|uvpred|simdmerge|vnoptrace|pagebump)\n",
                      value);
         return static_cast<int>(kG419LeverNone);
     }();
@@ -224,6 +355,28 @@ static const char *g419AbLeverName(int lever)
     case kG447LeverSpinWait: return "spinwait";
     case kG447LeverWSpin: return "wspin";
     case kG447LeverSpinBoth: return "spinboth";
+    case kG452LeverAsyncOne: return "async1";
+    case kG454LeverReadbackAll: return "rb_all";
+    case kG454LeverReadbackL2l: return "rb_l2l";
+    case kG454LeverReadbackResync: return "rb_resync";
+    case kG454LeverReadbackDisplay: return "rb_display";
+    case kG456LeverUvPredicate: return "uvpred";
+    case kG473LeverSimdMerge: return "simdmerge";
+    case kG475LeverVnopTrace: return "vnoptrace";
+    case kG478LeverKickPool: return "kickpool";
+    case kG476LeverPageBump: return "pagebump";
+    case kG477LeverRunWrite: return "runwrite";
+    case kG479LeverLeanFetch: return "leanfetch";
+    case kG480LeverPktPool: return "pktpool";
+    case kG480LeverPoolBoth: return "poolboth";
+    case kG480LeverNopSkip: return "nopskip";
+    case kG481LeverHotLower: return "hotlower";
+    case kG482LeverMemoHash: return "memohash";
+    case kG482LeverWCoal: return "wcoal";
+    case kG482LeverNotifySkip: return "notifyskip";
+    case kG482LeverBoth: return "g482both";
+    case kG483LeverPcReg: return "pcreg";
+    case kG484LeverWideVf0: return "widevf0";
     default: return "none";
     }
 }
@@ -299,6 +452,16 @@ static bool g419AbArmFor(int lever, bool defaultOn)
     return arm != 0u;
 }
 
+static bool g452AsyncSelected()
+{
+    return g419AbLever() == static_cast<int>(kG452LeverAsyncOne);
+}
+
+static bool g452AsyncArm()
+{
+    return g419AbArmFor(static_cast<int>(kG452LeverAsyncOne), false);
+}
+
 // G438: the derivative probes' arm selector, callable from the VU1-worker and GS-worker TUs (the
 // rest of this instrument is static to the rasterizer TU). `which` is 0 for the VU1 spin, 1 for the
 // GS spin. Returns -1 when that probe is not the selected lever (the caller then falls back to the
@@ -310,9 +473,9 @@ static bool g419AbArmFor(int lever, bool defaultOn)
 // a per-call cross-core cost paid by BOTH arms — i.e. it would inflate the very baseline the probe
 // is dividing by. The arm only changes once per frame, so a thread-local memo turns it into one
 // atomic per thread per frame.
-// G438: how many consecutive frames one arm is held for. 1 (the default, and the only value the
-// G419/G420/G432 behaviour levers ever use) reproduces the original per-frame alternation exactly.
-// DC2_G438_HOLD sets it; the derivative probes default to 16.
+// G438: how many consecutive frames one arm is held for. 1 reproduces the original per-frame
+// alternation exactly. DC2_G438_HOLD sets it; thread-level probes, including G456's GS-worker
+// predicate, default to 16 so pipelined work does not leak into the opposite bucket.
 static uint64_t g438ArmHoldFrames()
 {
     static const uint64_t n = [] {
@@ -324,9 +487,13 @@ static uint64_t g438ArmHoldFrames()
         // rate between the EE and the GS worker), so it inherits the block hold for the same
         // pipelined-runtime reason — see the g419AbTick comment on DC2_G438_HOLD.
         return (sel == kG438LeverVu1Slow || sel == kG438LeverGsSlow ||
+                sel == kG456LeverUvPredicate || sel == kG473LeverSimdMerge ||
+                sel == kG475LeverVnopTrace || sel == kG476LeverPageBump ||
+                sel == kG477LeverRunWrite || sel == kG478LeverKickPool ||
                 sel == kG439LeverCoalesce || sel == kG445LeverEarlyKick ||
                 sel == kG445LeverKickAll || sel == kG447LeverSpinWait || sel == kG447LeverWSpin ||
-                sel == kG447LeverSpinBoth)
+                sel == kG447LeverSpinBoth || sel == kG452LeverAsyncOne ||
+                (sel >= kG454LeverReadbackAll && sel <= kG454LeverReadbackDisplay))
                    ? 16ull
                    : 1ull;
     }();
@@ -337,6 +504,280 @@ static uint64_t g438ArmHoldFrames()
 // the same arm on consecutive frames about half the time, and keying on the value would then leave
 // `used` clear and the tick would drop that frame as unattributable.
 static std::atomic<uint64_t> s_g438TickSeq{0ull};
+
+// G456 runs twice per sprite on the GS worker. Memo the attribution RMW once per
+// frame; relaxed arm/sequence loads remain cheap and are paid by both paired arms.
+int g456UvPredicateArm()
+{
+    if (g419AbLever() != static_cast<int>(kG456LeverUvPredicate))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G473 runs once in the GS worker's frame-boundary latch. A/B selection always forces the exact
+// scalar/candidate pair. The exact SIMD path is promoted default-on; the rollback restores scalar.
+int g473SimdMergeArm()
+{
+    if (g419AbLever() == static_cast<int>(kG473LeverSimdMerge))
+        return g419AbArmFor(static_cast<int>(kG473LeverSimdMerge), false) ? 1 : 0;
+    static const bool on = [] {
+        if (std::getenv("DC2_G473_NO_SIMD_MERGE") != nullptr)
+            return false;
+        const char *value = std::getenv("DC2_G473_SIMD_MERGE");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on ? 1 : 0;
+}
+
+// G476: run-weighted page-generation walk. Returns 1 for the candidate (one weighted RMW per
+// distinct page) and 0 for the control (the old per-px pair), or -1 when this lever is not selected
+// so the sites fall through to their own default/rollback flag. Called ~10-20k/f on the GS worker,
+// so it records the arm-used bit at most once per A/B tick like G475 rather than on every call.
+int g476PageBumpArm()
+{
+    if (g419AbLever() != static_cast<int>(kG476LeverPageBump))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G477: swizzle-row hoisted IMAGE run writers. Returns 1 for the candidate (hoisted row + pair
+// stores), 0 for the control (the G424 per-pixel run loop), or -1 when this lever is not selected
+// so the writers fall through to their own DC2_G477_NO_FAST_RUN rollback. Called once per
+// horizontal RUN on the GS worker, so the attribution RMW is recorded once per A/B tick.
+int g477RunWriteArm()
+{
+    if (g419AbLever() != static_cast<int>(kG477LeverRunWrite))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G475 runs once per VU1 microprogram (~1,240/f). Memo the attribution RMW once per frame on
+// the VU1 worker, mirroring G438, while returning the held arm for every run so one microprogram
+// never changes loop copies mid-execution.
+int g475VnopTraceArm()
+{
+    if (g419AbLever() != static_cast<int>(kG475LeverVnopTrace))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G478 runs once per VU1 KICK (~1,230/f) on the EE thread, which is where the item is acquired.
+// Same once-per-frame memo as G475/G456: the arm is held for a block of frames, so an item
+// acquired from the pool in a candidate frame is always released back into the same pool.
+// G479 runs once per VU1 microprogram on the VU1 worker (~1,080/f). Same once-per-tick
+// attribution memo as G475, and the arm is held for a block of frames so a run() never
+// switches loop copies mid-execution.
+int g479LeanFetchArm()
+{
+    if (g419AbLever() != static_cast<int>(kG479LeverLeanFetch))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G483 selects a different COPY of the pair loop (the one that carries the program counter in a
+// loop-carried local instead of reloading `m_state.pc` through memory on every pair), so it obeys
+// exactly the G479 rule above: read once per run(), never per pair, and held for a block of frames
+// so a microprogram never switches loop copies mid-execution.
+int g483PcRegArm()
+{
+    if (g419AbLever() != static_cast<int>(kG483LeverPcReg))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G484 selects the pair-loop copy that reaches the scalar-pipe / flag-pipe state through ONE
+// hoisted base pointer instead of seven. Same rule as G479/G483: read once per run(), never per
+// pair, and held for a block of frames so a microprogram never switches loop copies mid-execution.
+int g484WideVf0Arm()
+{
+    if (g419AbLever() != static_cast<int>(kG484LeverWideVf0))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G480 is a TWO-THREAD lever: the VU1 worker acquires a recycled packet buffer (per XGKICK) and
+// the GS worker returns it (per window). Both sides call this, and both must read the SAME arm for
+// the whole hold block or a buffer acquired in one arm would be returned in the other — hence the
+// G438 block hold (DC2_G438_HOLD=16) is mandatory for this gate, and the `used` attribution RMW is
+// memoised once per A/B tick PER THREAD rather than taken on every packet.
+int g480PktPoolArm()
+{
+    const int lever = g419AbLever();
+    if (lever != static_cast<int>(kG480LeverPktPool) &&
+        lever != static_cast<int>(kG480LeverPoolBoth))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G480 runs once per VU1 microprogram on the VU1 worker (~1,080/f) — the dispatch shape is chosen
+// at run() entry, so the arm must be HELD for a block (G438) exactly like G475/G479.
+int g480NopSkipArm()
+{
+    if (g419AbLever() != static_cast<int>(kG480LeverNopSkip))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G481 selects a loop dispatch shape at run() entry on the VU1 worker (~1,080 runs/f), exactly like
+// G475/G479/G480's nopskip — the arm is HELD for a G438 block so no microprogram can change its
+// dispatch mid-execution, and the attribution RMW is memoised once per A/B tick.
+int g481HotLowerArm()
+{
+    if (g419AbLever() != static_cast<int>(kG481LeverHotLower))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G482 price-only arm, read once per geometry kick on the VU1 worker (~1,230/f). Same G438 block
+// hold as every other thread-level arm: the memo key is a per-kick cost, so the arm must not
+// alternate inside a pipelined window or the injected work leaks across arms (G438).
+int g482MemoHashArm()
+{
+    if (g419AbLever() != static_cast<int>(kG482LeverMemoHash))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G482 write-coalescing arm. Read on the EE thread once per noteVuWrite (~59/kick); the G438 block
+// hold guarantees every write belonging to one kick sees the same arm, so a kick's replay is never
+// half-coalesced.
+int g482WriteCoalesceArm()
+{
+    const int lever = g419AbLever();
+    if (lever != static_cast<int>(kG482LeverWCoal))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G482 publish-notify-skip arm, read once per kick on the VU1 worker.
+int g482NotifySkipArm()
+{
+    const int lever = g419AbLever();
+    if (lever != static_cast<int>(kG482LeverNotifySkip) && lever != static_cast<int>(kG482LeverBoth))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g478KickPoolArm()
+{
+    const int lever = g419AbLever();
+    if (lever != static_cast<int>(kG478LeverKickPool) &&
+        lever != static_cast<int>(kG480LeverPoolBoth))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
 
 bool g438SlowLeverSelected(int which);
 int g438SlowArm(int which)
@@ -458,6 +899,7 @@ int g445KickAllArm()
     return arm != 0u ? 1 : 0;
 }
 
+
 // How many extra idempotent repetitions this frame's site should perform (ballast mode only).
 static int g419AbBallastReps(int lever)
 {
@@ -495,12 +937,14 @@ static void g419AbTick()
     static uint64_t s_winN[2]{};
     static double s_blkSum = 0.0, s_blkSq = 0.0;
     static uint64_t s_blkN = 0u, s_blkFav = 0u, s_dropped = 0u;
+    static uint64_t s_usedCounts[4]{};
     // G438: frames whose interval spans an arm CHANGE. See g438ArmHoldFrames below.
     static bool s_skipNext = false;
     static uint64_t s_transition = 0u;
 
     const auto now = std::chrono::steady_clock::now();
     const uint32_t used = g_g419AbUsed.exchange(0u, std::memory_order_relaxed);
+    ++s_usedCounts[used & 3u];
     const uint64_t idx = s_frame++;
     const bool skipThis = s_skipNext;
     s_skipNext = false;
@@ -592,6 +1036,7 @@ static void g419AbTick()
     }
     std::fprintf(stderr,
                  "[G419:ab] lever=%s ballast=%d hold=%llu frames=%llu drop=%llu trans=%llu "
+                 "used(0=%llu 1=%llu 2=%llu 3=%llu) "
                  "cand(n=%llu ms=%.3f se=%.3f) ctrl(n=%llu ms=%.3f se=%.3f) "
                  "delta=%.3f (%.2f%%) seDelta=%.3f "
                  "blocked(w=%llu mean=%.3f se=%.3f t=%.2f fav=%llu)\n",
@@ -601,6 +1046,10 @@ static void g419AbTick()
                  static_cast<unsigned long long>(idx),
                  static_cast<unsigned long long>(s_dropped),
                  static_cast<unsigned long long>(s_transition),
+                 static_cast<unsigned long long>(s_usedCounts[0]),
+                 static_cast<unsigned long long>(s_usedCounts[1]),
+                 static_cast<unsigned long long>(s_usedCounts[2]),
+                 static_cast<unsigned long long>(s_usedCounts[3]),
                  static_cast<unsigned long long>(s_n[0]), c, sc,
                  static_cast<unsigned long long>(s_n[1]), k, sk,
                  c - k, k != 0.0 ? 100.0 * (c - k) / k : 0.0,

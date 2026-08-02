@@ -45,7 +45,6 @@ std::uint32_t AddressP8(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32
 bool g264_backend_write_color_rect(uint32_t fbp, int texWidth, int texHeight,
                                    int glX, int glY, int width, int rows,
                                    const std::vector<uint32_t> &in);
-
 // G281 private .cpp-to-.cpp bridge: build one decoded RGBA texture view directly from a
 // resident CT32 target FBO. `mapRgba` encodes {srcX,srcGlY,byteLane} per PSMT8 texel; the
 // backend combines those bytes with `clutRgba` on-GPU and installs the result under `texKey`.

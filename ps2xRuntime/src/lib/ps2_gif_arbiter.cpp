@@ -2,6 +2,15 @@
 #include "runtime/ps2_gs_gpu.h"
 #include "ps2_log.h"
 #include "ps2_gif_arbiter_parts/g370_nan_source_probe.inc"
+#include "ps2_g480_packet_pool.inc"
+
+// G480: the shared packet-buffer bin lives in THIS TU (the return side). Deliberately leaked so a
+// buffer still in flight at process teardown always has a valid home (same reasoning as G478Pool).
+G480PktBin &g480PktBin()
+{
+    static G480PktBin *s_bin = new G480PktBin();
+    return *s_bin;
+}
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -54,12 +63,17 @@ static uint64_t g156ThreadCpuNs() { return 0ull; }
 // G332: defined at global scope in ps2_gs_gpu_raster.cpp (lle_gpu_raster_backend.inc). Forward-
 // declared here at global scope so the anon-namespace g332ReportBoundary() resolves it externally.
 void g332_backend_snapshot(uint64_t nsOut[4], uint64_t cntOut[4]);
+void g453_backend_other_snapshot(uint64_t nsOut[4], uint64_t cntOut[4]);
 
 // G412: depth-two frame ownership is default-on after the route/performance promotion.
 bool g412_cross_frame_enabled();
 
 // G446: host PC sampler for THIS thread's pole (default-off, DC2_G446_GSPROF=1). Splits
 // [G332:gsw] frontMs/f, which no phase has ever attributed from the inside.
+// G478: the same sampler also exports g478RegisterVu1WorkerThread() (DC2_G478_VU1PROF=1) for the
+// MTVU worker, which the G478 premise gate re-ranked to co-pole with this thread, and resolves
+// FILE:LINE for each row's hottest PC so a PDB symbol FOLD cannot misname the owner.
+// G483: the sampler also emits [G483:rawpc] preferred-base PCs (DC2_G483_RAWPC=1) for /MAP resolution.
 #include "ps2_gif_arbiter_parts/g446_gsworker_pcsample.inc"
 
 // G447: GS-worker blocking-EDGE census (default-off, DC2_G447_EDGE=1). G446 proved the pole thread
@@ -723,6 +737,37 @@ namespace
         s_lastTotal = total;
     }
 
+    // G453: exact 30-frame subtype split for G332 backend-other. Diagnostic only; source counters
+    // are updated by the GL worker at the single dispatch choke point.
+    void g453ReportBoundary()
+    {
+        static const bool s_on = f50_12_env_flag("DC2_G453_CENSUS");
+        if (!s_on)
+            return;
+        static uint64_t s_frame = 0u;
+        static uint64_t s_lastNs[4]{};
+        static uint64_t s_lastCnt[4]{};
+        if ((++s_frame % 30u) != 0u)
+            return;
+        uint64_t ns[4], cnt[4];
+        g453_backend_other_snapshot(ns, cnt);
+        double ms[4], ops[4];
+        for (int i = 0; i < 4; ++i)
+        {
+            ms[i] = static_cast<double>(ns[i] - s_lastNs[i]) / 1.0e6 / 30.0;
+            ops[i] = static_cast<double>(cnt[i] - s_lastCnt[i]) / 30.0;
+            s_lastNs[i] = ns[i];
+            s_lastCnt[i] = cnt[i];
+        }
+        std::fprintf(stderr,
+                     "[G453:other] frame=%llu window=30 t8=%.3f/%.2f ct24=%.3f/%.2f "
+                     "composite=%.3f/%.2f upload=%.3f/%.2f total=%.3f/%.2f\n",
+                     static_cast<unsigned long long>(s_frame),
+                     ms[0], ops[0], ms[1], ops[1], ms[2], ops[2], ms[3], ops[3],
+                     ms[0] + ms[1] + ms[2] + ms[3],
+                     ops[0] + ops[1] + ops[2] + ops[3]);
+    }
+
     // G157: one queue item is either a draw window (packets) or a frame-boundary marker (the
     // G144-flush + present-latch closure). Both travel through the SAME FIFO deque, so the
     // marker is guaranteed to be processed strictly after all of its frame's windows and
@@ -1263,6 +1308,7 @@ namespace
                         m_g316LeafSample = ((++m_g316BoundaryN % 30u) == 0u);
                     }
                     g332ReportBoundary();
+                    g453ReportBoundary();
                     // G447: blocking-edge split of the window span (no-op unless DC2_G447_EDGE=1).
                     g447ReportBoundary(static_cast<unsigned long long>(
                         g_g151WorkerBusyNs.load(std::memory_order_relaxed)));
@@ -1538,6 +1584,17 @@ namespace
                     }
                     begin = end;
                 }
+            }
+            // G480: every packet in this window has now been dispatched to the GS, and nothing
+            // reads `q` after this point (processWindow returns, and the caller's `item.packets` /
+            // `seg` are not touched again). Move each buffer back into the shared bin so the VU1
+            // WORKER — the pole — can reuse it instead of calling malloc for the next XGKICK.
+            // One mutex acquisition per window; the per-packet path here is a move, not a free.
+            if (g480RecycleOn())
+            {
+                for (auto &pkt : q)
+                    g480StageReturn(std::move(pkt.data));
+                g480FlushReturns();
             }
             if (g316On)
             {

@@ -1,4 +1,7 @@
-#include <array>
+﻿#include <array>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 
 #include "runtime/ps2_gs_memory.h"
@@ -6,7 +9,13 @@
 // G424: the horizontal-run IMAGE upload writers at the bottom of this file live in an .inc.
 // MSBuild does not reliably rebuild a .cpp when only an included .inc changed (G359 trap), so this
 // marker comment must be touched whenever g424_image_run_writers.inc is edited.
-// g424_image_run_writers.inc revision: 1
+// g424_image_run_writers.inc revision: 5 (G477 swizzle-row hoisted CT32/Z32/P4 run writers)
+// g477_fast_run_writers.inc revision: 7 (CT32 aligned-group stores + PSMT4 quad-gather)
+
+// G477's paired within-process gate lives in the rasterizer TU. Declared at GLOBAL scope, above
+// `namespace GSMem`, so it binds to the external symbol rather than to a nested-namespace one
+// (the anonymous-namespace linkage trap documented in appendix-dc2-project.md ֲ§3).
+int g477RunWriteArm();
 
 namespace GSMem
 {

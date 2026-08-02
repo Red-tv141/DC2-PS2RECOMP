@@ -42,6 +42,11 @@ static uint64_t g_g280ContentGen[kG248TargetCount] = {};
 static std::atomic<uint64_t> g_g280Binds{0}, g_g280Copies{0}, g_g280CopyFail{0},
     g_g280Restores{0}, g_g280RestoreFail{0}, g_g280Drops{0}, g_g280SibSkips{0},
     g_g280RejFoot{0}, g_g280RejTuple{0}, g_g280RejPage{0}, g_g280VerifyBad{0};
+
+// G455 is included here because its ownership proof needs G261/G276 state declared earlier in
+// this translation unit and the G280 overlay state declared immediately above.
+#include "rasterizer_g455_readback_runway.inc"
+
 // G281: PSMT8 view over the resident 0x13c CT32 target. The view is a decoded RGBA texture
 // produced entirely on the G178 worker from the source FBO + current guest CLUT; no guest-VRAM
 // color publication occurs. It is deliberately a child of the G280 alias/view lever.
@@ -801,11 +806,15 @@ static bool g278DepthRbOn()
                              !envFlagDisabled("DC2_G278_Z_RB_COALESCE");
     return s_on && g261WaveOn() && !g277CensusOn();
 }
-// G337 arm (default-off): persistent depth authority. Rides G278 (so every oracle/census/kill
-// that disables G278 disables this too, and DC2_G26X_NO_NATIVE=1 kills the whole stack).
+// G337 persistent depth authority. G474 PROMOTION (2026-08-02): default-on after the current
+// uncapped binary repriced the frame-boundary publication at 0.74-1.14 ms/f, with zero owner
+// failures/evictions/overlap flushes and the affected route matrix clean. Rides G278, so every
+// oracle/census/kill that disables G278 disables this too. Roll back with
+// DC2_G337_NO_ZAUTH=1 (or DC2_G337_ZAUTH=0).
 static bool g337ZAuthOn()
 {
-    static const bool s_on = envFlagEnabled("DC2_G337_ZAUTH");
+    static const bool s_on = !envFlagEnabled("DC2_G337_NO_ZAUTH") &&
+                             !envFlagDisabled("DC2_G337_ZAUTH");
     return s_on && g278DepthRbOn();
 }
 // G338: retire the CT24 display-composite consumer that re-reads a resident CT32 producer FBO at
@@ -1525,6 +1534,8 @@ static bool g264FlushMirror(int ti)
         return false;
     }
     static std::vector<uint32_t> s_g264Px; // single-threaded (flush-owner threads only)
+    const bool g351MirDup = g351SplitOn() && fbp == 0x139u &&
+                            (s_g351Band0IsB || s_g351Band1IsB);
     bool anyPatch = false;
     int patchLo = 512, patchHi = -1;
     uint32_t patchRects = 0u;
@@ -1563,7 +1574,8 @@ static bool g264FlushMirror(int ti)
                 ++x;
             const int width = x - x0;
             const int glY = 511 - groupHi;
-            s_g264Px.assign(static_cast<size_t>(width) * rows, 0u);
+            const size_t pixelCount = static_cast<size_t>(width) * rows;
+            s_g264Px.assign(pixelCount, 0u);
             bool packed = true;
             for (int gy = y; gy <= groupHi && packed; ++gy)
             {
@@ -1585,14 +1597,12 @@ static bool g264FlushMirror(int ti)
             // G351: a mirror patch carries VRAM-authoritative bytes — under the surface split
             // the sibling FBO may be the one a later materialize reads, so patch it too
             // (writing newest-VRAM bytes into both FBOs is always coherent).
-            const bool g351MirDup = g351SplitOn() && fbp == 0x139u &&
-                                    (s_g351Band0IsB || s_g351Band1IsB);
             if (!packed ||
-                !g264_backend_write_color_rect(fbp, r.fbW, 512, x0, glY,
-                                                width, rows, s_g264Px) ||
-                (g351MirDup &&
-                 !g264_backend_write_color_rect(kG351Sprite139, r.fbW, 512, x0, glY,
-                                                width, rows, s_g264Px)))
+                     !g264_backend_write_color_rect(fbp, r.fbW, 512, x0, glY,
+                                                     width, rows, s_g264Px) ||
+                     (g351MirDup &&
+                      !g264_backend_write_color_rect(kG351Sprite139, r.fbW, 512, x0, glY,
+                                                     width, rows, s_g264Px)))
             {
                 clearBits();
                 g_g264MirFail.fetch_add(1u, std::memory_order_relaxed);
@@ -1675,6 +1685,7 @@ static void g264FlushMirrorsAtFlush()
 // G305 forward decls (definitions live next to g178TryFlushGpu). g261Materialize is a target-FBO
 // read consumer, so it must fence any in-flight async packet first.
 static bool g305AsyncOn();
+static bool g305DrainRequired();
 static void g305DrainPending();
 
 // ===== G432: the SECOND colour-readback unpack site =====
@@ -1711,6 +1722,20 @@ static bool g432MatUnpackOn()
 static constexpr int kG432MatUnpackLeverId = 10; // == kG419Lever::kG432LeverMatUnpack
 static bool g419AbArmFor(int lever, bool defaultOn);
 
+// G454 dependency-boundary deletion probes. IDs mirror G419Lever, declared later in this TU.
+// Candidate output is knowingly stale; downstream publication work remains unchanged so the
+// delta prices the synchronous readback edge, not a smaller pixel-copy microbenchmark.
+static constexpr int kG454RbAllLeverId = 20;
+static constexpr int kG454RbL2lLeverId = 21;
+static constexpr int kG454RbResyncLeverId = 22;
+static constexpr int kG454RbDisplayLeverId = 23;
+static bool g454SkipReadbackAt(int siteLever)
+{
+    if (g419AbArmFor(kG454RbAllLeverId, false))
+        return true;
+    return siteLever != 0 && g419AbArmFor(siteLever, false);
+}
+
 // Behaviour-pure timing of this publication loop only (DC2_G432_CENSUS=1).
 static bool g432MatCensusOn()
 {
@@ -1722,7 +1747,7 @@ static uint64_t g_g432MatUnpackNs = 0, g_g432MatUnpackN = 0, g_g432MatUnpackPx =
 static void g261Materialize(int ti, int cause)
 {
     g324NoteObserver(1u); // direct resident-FBO/guest-authority consumer
-    if (g305AsyncOn())
+    if (g305DrainRequired())
         g305DrainPending();
     G261Res &r = g_g261Res[ti];
     if (!r.dirty)
@@ -1779,6 +1804,11 @@ static void g261Materialize(int ti, int cause)
         const int glY = 512 - 1 - r.dirtyHi;
         const auto g279ReadT0 = g279Profile ? std::chrono::steady_clock::now()
                                             : std::chrono::steady_clock::time_point{};
+        const int g455Site = fbp == 0x139u && cause == kG261MatLocal ? kG455Local139
+                           : fbp == 0x139u && cause == kG261MatResync ? kG455Resync139
+                                                                          : -1;
+        const G455Ticket g455Ticket = g455BeginRead(
+            g455Site, s_g455ResWriteSeq, fbp, r.fbw, r.fbW, r.dirtyLo, r.dirtyHi);
         // G351: under the surface split the CURRENT wide-0x139 content lives in the per-band
         // routed FBO (scene rows on the fbp key, sprite-only rows possibly on the sibling).
         const bool g351Split139 = g351SplitOn() && fbp == 0x139u;
@@ -1786,7 +1816,16 @@ static void g261Materialize(int ti, int cause)
         const uint32_t g351K1 = g351Split139 ? g351Band1Key139() : fbp; // rows >= 416
         bool readOk;
         uint32_t g351ReadKey = fbp; // 0 = mixed-band read (no single FBO equals VRAM after)
-        if (!g351Split139 || g351K0 == g351K1 || r.dirtyLo >= 416 || r.dirtyHi <= 415)
+        const int g454Site = cause == kG261MatLocal ? kG454RbL2lLeverId
+                            : cause == kG261MatResync ? kG454RbResyncLeverId
+                                                     : 0;
+        const bool g454Skip = g454SkipReadbackAt(g454Site);
+        if (g454Skip)
+        {
+            s_g261Px.resize(static_cast<size_t>(r.fbW) * rows);
+            readOk = true;
+        }
+        else if (!g351Split139 || g351K0 == g351K1 || r.dirtyLo >= 416 || r.dirtyHi <= 415)
         {
             const uint32_t k = r.dirtyLo >= 416 ? g351K1 : g351K0;
             g351ReadKey = k;
@@ -1815,6 +1854,7 @@ static void g261Materialize(int ti, int cause)
                             s_g351Lo.size() * sizeof(uint32_t));
             }
         }
+        g455EndRead(g455Ticket);
         if (g279Profile)
             g_g279MatReadNs[cause & 7].fetch_add(
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -2001,7 +2041,14 @@ static void g276FlushPendingDisplay(int cause)
         const int glY = 512 - 1 - p.rowHi;
         const auto g279ReadT0 = g279Profile ? std::chrono::steady_clock::now()
                                             : std::chrono::steady_clock::time_point{};
-        const bool readOk = g178_backend_read_color(p.fbp, p.fbW, 512, glY, rows, s_g276Px);
+        const G455Ticket g455Ticket = g455BeginRead(
+            kG455Display, s_g455DisplayWriteSeq, p.fbp, p.fbw, p.fbW, p.rowLo, p.rowHi);
+        const bool g454Skip = g454SkipReadbackAt(kG454RbDisplayLeverId);
+        if (g454Skip)
+            s_g276Px.resize(static_cast<size_t>(p.fbW) * rows);
+        const bool readOk = g454Skip ||
+            g178_backend_read_color(p.fbp, p.fbW, 512, glY, rows, s_g276Px);
+        g455EndRead(g455Ticket);
         if (g279Profile && cause >= 0 && cause < 9)
             g_g279DisplayReadNs[cause].fetch_add(
                 static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(

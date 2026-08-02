@@ -131,6 +131,22 @@ static thread_local bool g_g102LastFrontValid = false;
 
 namespace
 {
+    // ---- G484 (REVERTED — kept as the record) ---------------------------------------------------
+    // G483 §5.2 read the pair loop out of the linker /MAP, saw it "full of `[rbp±X]` reloads of
+    // hoisted pointers", and concluded it was SPILL-BOUND on the seven separate `thread_local`
+    // objects the loop addresses. G484 built exactly that fix — the nine scalar-pipe / flag-pipe
+    // thread_locals folded into one `alignas(64)` block so the loop hoists ONE base pointer and
+    // reaches every field at a constant displacement — and it is REFUTED:
+    //
+    //   * frame: +0.469 / −0.308 / +0.099 / −0.197 ms/f over four paired runs (mean +0.02, sign
+    //     2/4) — neutral, i.e. inside this host's run-level floor;
+    //   * binary: the candidate loop copy had **88** `[rbp+X]` references against the control's
+    //     **89**, and 1342 instructions against 1343.
+    //
+    // The consolidation removed ONE reload, because those spill slots were never the seven TLS
+    // pointers. The real reloads are `&m_state` (24× per pair off `[rbp+0x118]`) and a 16-byte
+    // scalar staging buffer at `[rbp-0x78]`. See plans/phase-G484-fix-log.md §2. Do not rebuild
+    // this; the nine objects below stay separate.
     std::atomic<uint32_t> s_debugVu1XgkickCount{0};
     std::atomic<uint32_t> s_g22Vu1StopCount{0};
     std::atomic<uint32_t> s_g22Vu1XgkickOpCount{0};

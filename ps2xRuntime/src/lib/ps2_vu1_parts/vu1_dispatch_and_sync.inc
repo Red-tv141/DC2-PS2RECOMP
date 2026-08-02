@@ -2505,7 +2505,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                     std::memcpy(buf.data() + 24u, &adAddr, 8);
                     std::memcpy(buf.data() + 32u, pkt, bytes);
                     if (g_g297KickCapture) // G297 MTVU: capture on the worker, splice on the EE
-                        g_g297KickCapture->emplace_back(buf.data(), buf.data() + bytes + 32u);
+                        g480CapturePacket(*g_g297KickCapture, buf.data(), bytes + 32u); // G480 pool
                     else if (memory)
                         memory->submitGifPacket(GifPathId::Path1, buf.data(), bytes + 32u, !g95_defer_gif_enabled());
                     else
@@ -2596,7 +2596,7 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
                         }
                     }
                     if (g_g297KickCapture) // G297 MTVU: capture on the worker, splice on the EE
-                        g_g297KickCapture->emplace_back(pkt, pkt + bytes);
+                        g480CapturePacket(*g_g297KickCapture, pkt, bytes); // G480 recycling pool
                     else if (memory)
                         memory->submitGifPacket(GifPathId::Path1, pkt, bytes, !g95_defer_gif_enabled());
                     else

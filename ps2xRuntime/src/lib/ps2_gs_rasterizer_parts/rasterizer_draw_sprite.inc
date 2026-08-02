@@ -910,12 +910,27 @@ static void g178CensusScan();
 
 void g144FlushPending()
 {
+    // G474: split the remaining frame-boundary flush wall time. Diagnostic only; the default path
+    // performs one cached branch and no clock reads. This function is owned by one GS worker.
+    static const bool s_g474Boundary = std::getenv("DC2_G474_BOUNDARY") != nullptr;
+    const auto g474Start = s_g474Boundary ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
+    auto g474Last = g474Start;
+    uint64_t g474StageNs[6]{};
+    const auto g474Lap = [&](unsigned stage) {
+        if (!s_g474Boundary)
+            return;
+        const auto now = std::chrono::steady_clock::now();
+        g474StageNs[stage] = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(now - g474Last).count());
+        g474Last = now;
+    };
     g324NoteObserver(2u); // frame/presentation boundary
     // G305: fence any trailing async packet at the frame boundary (before present), even when the
     // deferred list is empty because the last flush submitted async. Under the default MTGS+pipeline
     // config this runs on the same GS-worker thread as the mid-frame flushes (see g150_frame_barrier
     // note below), so the pending state is single-threaded.
-    if (g305AsyncOn())
+    if (g305DrainRequired())
         g305DrainPending();
     g248Report();
     // G219 (default-off, DC2_G219_SKYPX=1): log the frame-end drain cadence + pending size so
@@ -1015,6 +1030,7 @@ void g144FlushPending()
         G146PerfScope g146FlushScope(g_g146G144FlushFrameNs, g_g146G144FlushFrameCount);
         g_g144FlushSeqFn();
     }
+    g474Lap(0); // observer/drain/reports/pending graph/trailing list
     // Conservative phase-1 ownership boundary: frame presentation still sees color readback as
     // before, and guest VRAM leaves mgEndFrame with real Z materialized.  Once route canaries prove
     // every downstream reader has an explicit barrier this can be profiled as a removable fence.
@@ -1030,6 +1046,7 @@ void g144FlushPending()
             (void)g278FlushPendingDepth(5); // never cross presentation/frame ownership
         else
             g_g337Carried.fetch_add(1u, std::memory_order_relaxed);
+        g474Lap(1); // depth publication
         // G289's measured 0x14a work owner is not itself a display surface. Let it cross this
         // boundary only in the exact post-upload state; copyFrameToHostRgbaUnlocked audits every
         // actual display/preferred/fallback source before reading. Raw-VRAM diagnostics retain the
@@ -1056,10 +1073,14 @@ void g144FlushPending()
         }
         if (g289AnyCarried)
             g_g289FrameCarries.fetch_add(1u, std::memory_order_relaxed);
+        g474Lap(2); // G289/G345 owner-slot publication
         g272MaterializeAll(5);
+        g474Lap(3); // remaining resident colour owners
         g277CensusHardEdge(5);
         g276FlushPendingDisplay(5); // G276: publish the frame's coalesced display readback here
+        g474Lap(4); // display publication
         g242PrepareVramReadAll(g_g144LastVram);
+        g474Lap(5); // private/persistent depth read preparation
         if (g345StatOn())
         {
             static uint64_t s_g345Frames = 0; // frame-boundary owner thread only
@@ -1070,6 +1091,32 @@ void g144FlushPending()
                 g350PrintOwnCensus();
                 g351PrintCon();
             }
+        }
+    }
+    if (s_g474Boundary)
+    {
+        static uint64_t s_g474Frames = 0u;
+        static uint64_t s_g474Ns[7]{};
+        ++s_g474Frames;
+        for (unsigned i = 0; i < 6; ++i)
+            s_g474Ns[i] += g474StageNs[i];
+        s_g474Ns[6] += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g474Start).count());
+        if ((s_g474Frames % 30u) == 0u)
+        {
+            std::fprintf(stderr,
+                         "[G474:boundary] frames=30 total=%.3f pre=%.3f depth=%.3f owners=%.3f "
+                         "resident=%.3f display=%.3f prepare=%.3f ms/f\n",
+                         static_cast<double>(s_g474Ns[6]) / 30.0e6,
+                         static_cast<double>(s_g474Ns[0]) / 30.0e6,
+                         static_cast<double>(s_g474Ns[1]) / 30.0e6,
+                         static_cast<double>(s_g474Ns[2]) / 30.0e6,
+                         static_cast<double>(s_g474Ns[3]) / 30.0e6,
+                         static_cast<double>(s_g474Ns[4]) / 30.0e6,
+                         static_cast<double>(s_g474Ns[5]) / 30.0e6);
+            for (uint64_t &ns : s_g474Ns)
+                ns = 0u;
         }
     }
 }
@@ -1703,6 +1750,9 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
         {
             ++g_g432EdgeIdleN;
         }
+        const bool g455DisplayWillDefer = g455RunwayOn() && g289CanDeferLocalCopy(
+            sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        g455ArmLocalEdge(src, dst, srcUnknown, dstUnknown, g455DisplayWillDefer);
         // G261: the local→local copy READS src (must observe wave-rendered pixels) and WRITES
         // dst — both must see real VRAM bytes for any GPU-resident RTT row they touch.
         G432EdgeStage g432s(g432On);

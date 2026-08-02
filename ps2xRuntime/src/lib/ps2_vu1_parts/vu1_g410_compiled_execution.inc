@@ -12,6 +12,15 @@
 
 #include <array>
 
+// G479: within-process paired A/B arm for the fused pair record (see G479FusedPair below).
+extern int g479LeanFetchArm();
+
+// G483: within-process paired A/B arm for the register-carried program counter.
+extern int g483PcRegArm();
+
+// G484: within-process paired A/B arm for the wide VF0 re-pin.
+extern int g484WideVf0Arm();
+
 namespace
 {
     struct G410CompiledUpper
@@ -106,11 +115,44 @@ namespace
     constexpr uint8_t G410_PAIR_E_BIT = 0x01u;
     constexpr uint8_t G410_PAIR_I_BIT = 0x02u;
 
+    // G479 - FUSED PAIR RECORD.
+    //
+    // PREMISE (G442/G443, still the standing model of this loop). The binding resource in the pair
+    // loop is LIVE VALUES and dependency LATENCY, not instruction count: one added loop-carried
+    // local was measured at +2.6..2.8 ms/f against 0.068 host cycles per deleted instruction.
+    // G442's own note names the chain precisely — "the bounds check, the two `vuCode + currentPc`
+    // fetches and the `g410Pairs[pc >> 3]` sidecar load" all hang off the `m_state.pc` load at the
+    // top of the iteration. That is TWO independent address computations and THREE loads from TWO
+    // arrays before the pair can start.
+    //
+    // MECHANISM. `sources[i]` already holds exactly the 64-bit pair word that lives at
+    // `codeBase + i*8` (it is what g410VerifyCachedPair compares against, and precise invalidation
+    // keeps it exact), and `uppers[i]` is exactly 8 bytes. Storing them ADJACENT as one 16-byte
+    // record turns the whole fetch into a single scaled index off one base: one address chain, one
+    // cache line, and the VU1 code store leaves the hot loop's working set entirely.
+    //
+    // EXACTNESS. `fused[i]` is written only by g410CompilePairSlow, from the same `source` and the
+    // same `g410DecodePair(source)` that feed `sources[i]` / `uppers[i]`, in the same statement. The
+    // control arm keeps reading the old arrays, so both arms decode identical words.
+    // Verify: DC2_G479_VERIFY=1 re-reads the live code word per pair and aborts on a mismatch.
+    struct G479FusedPair
+    {
+        uint64_t source;
+        G410CompiledUpper pair;
+    };
+    static_assert(sizeof(G479FusedPair) == 16u);
+
     struct G410CompiledCache
     {
         const uint8_t *codeBase = nullptr;
         std::array<G410CompiledUpper, PS2_VU1_CODE_SIZE / 8u> uppers{};
         std::array<uint64_t, PS2_VU1_CODE_SIZE / 8u> sources{};
+        // G479: the same two words, interleaved. 16-byte aligned so one record is never split
+        // across two cache lines.
+        alignas(16) std::array<G479FusedPair, PS2_VU1_CODE_SIZE / 8u> fused{};
+        // G475: maximal sequential run starting at each slot for the compact
+        // VNOP-upper + covered non-control-lower trace (0 = ineligible, capped at 255).
+        std::array<uint8_t, PS2_VU1_CODE_SIZE / 8u> g475RunLen{};
         uint64_t hits = 0u;
         uint64_t compiles = 0u;
         uint64_t upperFallbacks = 0u;
@@ -133,6 +175,88 @@ namespace
     {
         static const bool s_on =
             !f50_12_vu_env_flag("DC2_G410_NO_VU_COMPILED");
+        return s_on;
+    }
+
+    // G479: paired-arm accessor (DC2_G419_AB=leanfetch) or the standalone bring-up flag. Read once
+    // per run() — never per pair — so one microprogram never changes loop copies mid-execution.
+    bool g479LeanFetchRequested()
+    {
+        static const bool s_paired = [] {
+            const char *ab = std::getenv("DC2_G419_AB");
+            return ab != nullptr && std::strcmp(ab, "leanfetch") == 0;
+        }();
+        if (s_paired)
+            return g479LeanFetchArm() > 0;
+        // PROMOTED default-on (G479). Rollback: DC2_G479_NO_LEAN_FETCH=1 restores the split
+        // vuCode + uppers[] fetch exactly.
+        static const bool s_on = !f50_12_vu_env_flag("DC2_G479_NO_LEAN_FETCH");
+        return s_on;
+    }
+
+    // G483: register-carried PC arm. Paired gate DC2_G419_AB=pcreg, standalone DC2_G483_PCREG=1.
+    bool g483PcRegRequested()
+    {
+        static const bool s_paired = [] {
+            const char *ab = std::getenv("DC2_G419_AB");
+            return ab != nullptr && std::strcmp(ab, "pcreg") == 0;
+        }();
+        if (s_paired)
+            return g483PcRegArm() > 0;
+        static const bool s_on = f50_12_vu_env_flag("DC2_G483_PCREG");
+        return s_on;
+    }
+
+    // G484 built it, G485 PROMOTED it: the pair's VF0 re-pin is ONE 16-byte store of (0,0,0,1)
+    // instead of four 4-byte scalar stores. Four paired A/Bs read −0.691 / −0.172 / −0.768 /
+    // −0.846 ms/f (mean −0.619, sign 4/4) on lean MAP-0. Value-identical bytes — the win is
+    // store-to-load forwarding into the next pair's 16-byte `_mm_loadu_ps(vf[FS])`.
+    // Paired gate DC2_G419_AB=widevf0, standalone DC2_G484_WIDE_VF0=1,
+    // ROLLBACK DC2_G485_NO_WIDE_VF0=1. Read once per run().
+    bool g484WideVf0Requested()
+    {
+        static const bool s_paired = [] {
+            const char *ab = std::getenv("DC2_G419_AB");
+            return ab != nullptr && std::strcmp(ab, "widevf0") == 0;
+        }();
+        if (s_paired)
+            return g484WideVf0Arm() > 0;
+        // PROMOTED default-on (G485). Rollback restores the four scalar stores exactly.
+        static const bool s_on = !f50_12_vu_env_flag("DC2_G485_NO_WIDE_VF0");
+        return s_on;
+    }
+
+    // G486: WIDE SINGLE-LANE FMAC DESTINATION STORE.
+    //
+    // G428 measured the dest distribution of the inline FMAC population and specialised the two
+    // shapes that dominate it: dest==0xF became one unmasked 16-byte store, and the four
+    // single-lane masks became one shuffle plus a 4-byte `_mm_store_ss`. G486 re-prices the second
+    // half of that decision under G485's store-forwarding result: a 4-byte store into a 16-byte
+    // register that the NEXT pair fetches with `_mm_loadu_ps(st.vf[FS])` cannot be
+    // store-to-load forwarded, so the load waits for it to retire to L1. The candidate replaces
+    // each `_mm_store_ss` with a whole-lane blend of the destination's own bits and one 16-byte
+    // store, which forwards. Value-identical: every lane the blend writes is either the FMAC
+    // result lane applyDest() assigns or the destination's own current bits.
+    //
+    // RESULT: REFUTED. Four paired A/Bs (DC2_G419_AB=widedest, both arms confirmed used) read
+    // +0.732 / +0.476 / +0.553 / +0.627 ms/f — mean +0.597, sign 4/4 SLOWER. The blend cannot be
+    // built without READING the destination's other three lanes, so the candidate replaces a pure
+    // 4-byte store with a load-modify-store: a 16-byte load of `vf[fd]` joins the dependency chain
+    // and `old` stays live across the blend. That costs more than the forwarding block it removes.
+    // The store-forwarding class needs the wide replacement to be INPUT-FREE (G485's VF0 re-pin
+    // stores constants); it does not generalise to every narrow store. The arm, the accessor, the
+    // loop copy and the whole `wideDest` plumbing were REMOVED, so the default path is
+    // source-identical to G485's. Full record at `g428StoreDest` in vu1_g421_fast_upper.inc.
+
+    bool g483VerifyPcOn()
+    {
+        static const bool s_on = f50_12_vu_env_flag("DC2_G483_VERIFY");
+        return s_on;
+    }
+
+    bool g479VerifyOn()
+    {
+        static const bool s_on = f50_12_vu_env_flag("DC2_G479_VERIFY");
         return s_on;
     }
 
@@ -313,11 +437,42 @@ namespace
             ++s_g410Cache.macReaderSlots;
         s_g410Cache.sources[index] = source;
         s_g410Cache.uppers[index] = pair;
+        // G479: the fused record is written from the SAME two values in the same statement, so it
+        // can never carry a different decode than the split arrays.
+        s_g410Cache.fused[index].source = source;
+        s_g410Cache.fused[index].pair = pair;
         if (countStats)
         {
             ++s_g410Cache.compiles;
             if (pair.upperKind == 0xffu)
                 ++s_g410Cache.upperFallbacks;
+        }
+    }
+
+    bool g475TracePairEligible(const G410CompiledUpper &pair)
+    {
+        const bool lowerControl = pair.lowerKind >= G422_LK_B &&
+                                  pair.lowerKind <= G422_LK_IBGEZ;
+        return pair.upperKind == 0x6fu && pair.pairFlags == 0u &&
+               pair.lowerKind != G422_LK_NONE && !lowerControl;
+    }
+
+    void g475RebuildRunLengths()
+    {
+        uint32_t run = 0u;
+        for (size_t i = s_g410Cache.uppers.size(); i-- > 0u;)
+        {
+            if (g475TracePairEligible(s_g410Cache.uppers[i]))
+            {
+                if (run < 255u)
+                    ++run;
+                s_g410Cache.g475RunLen[i] = static_cast<uint8_t>(run);
+            }
+            else
+            {
+                run = 0u;
+                s_g410Cache.g475RunLen[i] = 0u;
+            }
         }
     }
 
@@ -332,6 +487,7 @@ namespace
                 s_g410Cache.uppers[index].g425Flags = 0u;
             for (size_t index = 0u; index < s_g410Cache.uppers.size(); ++index)
                 g410CompilePairSlow(index, codeBase, countStats);
+            g475RebuildRunLengths();
         }
         return s_g410Cache.uppers.data();
     }
@@ -406,6 +562,16 @@ namespace
                a.mac == b.mac && a.status == b.status && a.clip == b.clip;
     }
 
+    // G479: exactness counter for the fused record (DC2_G479_VERIFY=1 arm only).
+    std::atomic<uint64_t> s_g479Verified{0u};
+    void g479NoteVerified()
+    {
+        const uint64_t n = s_g479Verified.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if ((n % 20000000ull) == 0ull)
+            std::fprintf(stderr, "[G479:verify] pairs=%llu bad=0\n",
+                         (unsigned long long)n);
+    }
+
     void g410ReportMaybe()
     {
         if (!g410StatOn())
@@ -462,6 +628,8 @@ void dc2_g410_vu_code_written(const uint8_t *codeBase, uint32_t offset, uint32_t
             ++invalidated;
         }
     }
+    if (invalidated != 0u)
+        g475RebuildRunLengths();
     if (g410StatOn())
     {
         ++s_g410Cache.invalidations;

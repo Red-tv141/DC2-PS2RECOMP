@@ -33,6 +33,16 @@ bool g332BackendArmed()
     static const bool on = g332BackendCensusOn() || g158EnvFlag("DC2_G332_EMPTY");
     return on;
 }
+// G453 (diagnosis only, default OFF): split G332's broad backend-other class into the four
+// directly-dispatched operation families. One timestamp at the existing worker choke point avoids
+// perturbing the GL bodies. Buckets: 0=T8 view, 1=CT24 view, 2=composite, 3=color upload.
+std::atomic<uint64_t> g_g453BackendOtherNs[4] = {};
+std::atomic<uint64_t> g_g453BackendOtherCount[4] = {};
+bool g453BackendCensusOn()
+{
+    static const bool on = g158EnvFlag("DC2_G453_CENSUS");
+    return on;
+}
 // G447 (diagnosis only, default OFF, DC2_G447_EDGE=1): time the GS worker's blocking wait at EVERY
 // backend entry point, classified by item type. G332 above times the same work from INSIDE the GL
 // worker; this times it from the caller's side, so the difference is the promise/future round-trip
@@ -120,6 +130,22 @@ bool g447WorkerSpinActive()
     return !off;
 }
 
+// G471 CLOSED the shape of these two spins; do not re-open it.
+//
+// Both loops are "load the flag, read steady_clock::now(), PAUSE" — one QueryPerformanceCounter per
+// PAUSE — and that looked like pure waste: G471's PC sampler on the GS worker measured the shipped
+// default spending ~18% of the thread's whole span inside the spin bodies and a further ~9% in
+// RtlQueryPerformanceCounter plus the CRT's QPC wrappers, and rolling BOTH spins back
+// (DC2_G447_NO_SPIN=1 + DC2_G447_NO_WSPIN=1) removed both buckets entirely.
+//
+// It is not waste. Polling the flag 32x between clock reads measured **+0.18 ms/f (t = +3.51, 0/7
+// windows favouring candidate)** on the paired MAP-0 gate: removing the clock makes the loop
+// tighter, so it hammers the shared completion line ~30x more often, and that coherence traffic
+// costs more than the clock. Inverting it — one flag load per 16 PAUSEs, backing BOTH rates off —
+// recovered the loss but only to neutral (−0.05 ms/f, t = −0.08, 3/7 windows). The clock read is
+// doing the job of a backoff, and the loop is at a local optimum in both directions. Neither arm was
+// promoted and both were removed; the ~2.4 ms/f of QPC inside these spins is NOT recoverable frame
+// time. See plans/phase-G471-fix-log.md.
 bool g447WaitFuture(std::future<bool> &fut, std::atomic<uint32_t> &done)
 {
     if (g447SpinActive())
@@ -144,6 +170,21 @@ bool g447WaitFuture(std::future<bool> &fut, std::atomic<uint32_t> &done)
         return false;
     }
 }
+
+struct SyncWait
+{
+    std::atomic<uint32_t> done{0u};
+    std::shared_ptr<std::promise<bool>> promise;
+    std::future<bool> future;
+
+    SyncWait() : promise(std::make_shared<std::promise<bool>>()),
+                 future(promise->get_future()) {}
+
+    bool wait()
+    {
+        return g447WaitFuture(future, done);
+    }
+};
 
 // NOTE: this whole .inc is inside the anonymous namespace opened in persistent_t8_decoder.inc
 // (closed at the end of this file). The cross-TU accessor g332_backend_snapshot() is therefore
@@ -442,7 +483,8 @@ public:
     // beyond the queue mutex that hands the slot to the worker.
     bool submitAsync(G178Batch &batch)
     {
-        if (!m_ready.load(std::memory_order_acquire) || m_asyncPending)
+        static constexpr size_t kAsyncSlots = 1u;
+        if (!m_ready.load(std::memory_order_acquire) || m_asyncSlots.size() >= kAsyncSlots)
             return false;
         // G415: an async packet is skip-readback by contract, so no colour window can apply.
         // Consume any published window here so it can never leak onto a later submit.
@@ -453,16 +495,26 @@ public:
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
                 return false;
-            m_asyncSlot = std::move(batch); // vectors moved out of the caller's s_batch, scalars copied
+            // Recycle completed vector storage back to the caller before installing the new packet.
+            // Scalar fields deliberately remain copied in `batch`: the optimistic epilogue reads
+            // them after submission, exactly as it did under the original move-assignment.
+            G178Batch next = std::move(batch);
+            batch.fbPixels = std::move(m_asyncRecycle.fbPixels);
+            batch.texUploads = std::move(m_asyncRecycle.texUploads);
+            batch.verts = std::move(m_asyncRecycle.verts);
+            batch.draws = std::move(m_asyncRecycle.draws);
+            batch.readback = std::move(m_asyncRecycle.readback);
+            AsyncSlot slot;
+            slot.batch = std::move(next);
+            slot.future = std::move(fut);
+            m_asyncSlots.push_back(std::move(slot));
             QueueItem item;
-            item.batch = &m_asyncSlot;
+            item.batch = &m_asyncSlots.back().batch;
             item.promise = promise;
             if (g299ProfileOn())
                 item.g299Enqueue = std::chrono::steady_clock::now();
             m_queue.push_back(std::move(item));
         }
-        m_asyncFut = std::move(fut);
-        m_asyncPending = true;
         m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
         return true;
@@ -473,11 +525,13 @@ public:
     // returns the worker is done with m_asyncSlot, so the front-end may reuse it.
     bool drainAsync(bool &ok)
     {
-        if (!m_asyncPending)
+        if (m_asyncSlots.empty())
             return false;
-        m_asyncPending = false;
-        try { ok = m_asyncFut.get(); }
+        AsyncSlot &slot = m_asyncSlots.front();
+        try { ok = slot.future.get(); }
         catch (...) { ok = false; }
+        m_asyncRecycle = std::move(slot.batch);
+        m_asyncSlots.pop_front();
         return true;
     }
 
@@ -527,9 +581,7 @@ public:
         if (width <= 0 || height <= 0 || glY < 0 || rows <= 0 ||
             glY > height || rows > height - glY || !m_ready.load(std::memory_order_acquire))
             return false;
-        auto promise = std::make_shared<std::promise<bool>>();
-        std::future<bool> fut = promise->get_future();
-        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
+        SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -542,14 +594,14 @@ public:
             item.colorW = width;
             item.colorY = glY;
             item.colorRows = rows;
-            item.promise = promise;
-            item.doneFlag = &g447Done;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
             m_queue.push_back(std::move(item));
         }
         m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
         G447WaitScope g447Scope(1);
-        return g447WaitFuture(fut, g447Done);
+        return wait.wait();
     }
 
     bool writeColor(uint32_t fbp, int texWidth, int texHeight,
@@ -562,9 +614,7 @@ public:
             in.size() != static_cast<size_t>(width) * rows ||
             !m_ready.load(std::memory_order_acquire))
             return false;
-        auto promise = std::make_shared<std::promise<bool>>();
-        std::future<bool> fut = promise->get_future();
-        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
+        SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -578,14 +628,14 @@ public:
             item.colorW = width;
             item.colorY = glY;
             item.colorRows = rows;
-            item.promise = promise;
-            item.doneFlag = &g447Done;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
             m_queue.push_back(std::move(item));
         }
         m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
         G447WaitScope g447Scope(2);
-        return g447WaitFuture(fut, g447Done);
+        return wait.wait();
     }
 
     // G280: synchronous GPU->GPU page-tile copies between two persistent target FBOs (alias
@@ -595,9 +645,7 @@ public:
         if (srcFbp == dstFbp || rects6.empty() || (rects6.size() % 6u) != 0u ||
             !m_ready.load(std::memory_order_acquire))
             return false;
-        auto promise = std::make_shared<std::promise<bool>>();
-        std::future<bool> fut = promise->get_future();
-        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
+        SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -606,14 +654,14 @@ public:
             item.colorFbp = dstFbp;
             item.copySrcFbp = srcFbp;
             item.copyRects = &rects6;
-            item.promise = promise;
-            item.doneFlag = &g447Done;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
             m_queue.push_back(std::move(item));
         }
         m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
         G447WaitScope g447Scope(3);
-        return g447WaitFuture(fut, g447Done);
+        return wait.wait();
     }
 
     // G289: same synchronous bit-exact color copy as G280, but the one measured work target may
@@ -624,9 +672,7 @@ public:
         if (srcFbp == dstFbp || dstW <= 0 || dstH <= 0 || rects6.empty() ||
             (rects6.size() % 6u) != 0u || !m_ready.load(std::memory_order_acquire))
             return false;
-        auto promise = std::make_shared<std::promise<bool>>();
-        std::future<bool> fut = promise->get_future();
-        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
+        SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -638,14 +684,14 @@ public:
             item.copyEnsureDest = true;
             item.colorTexW = dstW;
             item.colorTexH = dstH;
-            item.promise = promise;
-            item.doneFlag = &g447Done;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
             m_queue.push_back(std::move(item));
         }
         m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
         G447WaitScope g447Scope(3);
-        return g447WaitFuture(fut, g447Done);
+        return wait.wait();
     }
 
     // G281: synchronously build/update one decoded RGBA texture directly from a resident CT32
@@ -661,9 +707,7 @@ public:
             mapRgba.size() != static_cast<size_t>(texW) * texH ||
             clutRgba.size() != 256u || !m_ready.load(std::memory_order_acquire))
             return false;
-        auto promise = std::make_shared<std::promise<bool>>();
-        std::future<bool> fut = promise->get_future();
-        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
+        SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -683,14 +727,14 @@ public:
                 item.g324Class = 1u;
                 item.g324Enqueue = std::chrono::steady_clock::now();
             }
-            item.promise = promise;
-            item.doneFlag = &g447Done;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
             m_queue.push_back(std::move(item));
         }
         m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
         G447WaitScope g447Scope(4);
-        return g447WaitFuture(fut, g447Done);
+        return wait.wait();
     }
 
     // G338: build/update one resident CT24-alpha view texture from a resident CT32 target FBO.
@@ -703,9 +747,7 @@ public:
         if (texKey == 0u || srcFbp == 0u || srcFbW <= 0 || texW <= 0 || texH <= 0 ||
             !m_ready.load(std::memory_order_acquire))
             return false;
-        auto promise = std::make_shared<std::promise<bool>>();
-        std::future<bool> fut = promise->get_future();
-        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
+        SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -726,14 +768,14 @@ public:
                 item.g324Class = 1u;
                 item.g324Enqueue = std::chrono::steady_clock::now();
             }
-            item.promise = promise;
-            item.doneFlag = &g447Done;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
             m_queue.push_back(std::move(item));
         }
         m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
         G447WaitScope g447Scope(4);
-        return g447WaitFuture(fut, g447Done);
+        return wait.wait();
     }
 
     // G309: synchronously prepare five live target FBOs plus the measured 8x16 authority map.
@@ -747,9 +789,7 @@ public:
         if (pageMap.size() != 128u || basePixels.size() != 512u * 512u ||
             !m_ready.load(std::memory_order_acquire))
             return false;
-        auto promise = std::make_shared<std::promise<bool>>();
-        std::future<bool> fut = promise->get_future();
-        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
+        SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -758,14 +798,14 @@ public:
             item.g309PageMap = &pageMap;
             item.g309BasePixels = &basePixels;
             item.g309Readback = readback ? &out : nullptr;
-            item.promise = promise;
-            item.doneFlag = &g447Done;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
             m_queue.push_back(std::move(item));
         }
         m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
         G447WaitScope g447Scope(4);
-        return g447WaitFuture(fut, g447Done);
+        return wait.wait();
     }
 
     // G310: use G309's exact atlas compositor once to populate the persistent logical FBO.
@@ -777,9 +817,7 @@ public:
         if (pageMap.size() != 128u || basePixels.size() != 512u * 512u ||
             !m_ready.load(std::memory_order_acquire))
             return false;
-        auto promise = std::make_shared<std::promise<bool>>();
-        std::future<bool> fut = promise->get_future();
-        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
+        SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -794,14 +832,14 @@ public:
                 item.g324Class = 2u;
                 item.g324Enqueue = std::chrono::steady_clock::now();
             }
-            item.promise = promise;
-            item.doneFlag = &g447Done;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
             m_queue.push_back(std::move(item));
         }
         m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
         G447WaitScope g447Scope(4);
-        return g447WaitFuture(fut, g447Done);
+        return wait.wait();
     }
 
 private:
@@ -818,9 +856,7 @@ private:
         // (readDepth() reaches this same path with a synthetic batch).
         const G415ColorWindow g415Window = g_g415PendWindow;
         g_g415PendWindow.valid = false;
-        auto promise = std::make_shared<std::promise<bool>>();
-        std::future<bool> fut = promise->get_future();
-        std::atomic<uint32_t> g447Done{0u};  // G447 spin-then-block completion flag
+        SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             if (m_stop || !m_ready.load(std::memory_order_acquire))
@@ -836,8 +872,8 @@ private:
             item.depthReadY = depthReadY;
             item.depthReadRows = depthReadRows;
             item.renderThenReadDepth = renderThenReadDepth;
-            item.promise = promise;
-            item.doneFlag = &g447Done;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
             if (g299ProfileOn())
                 item.g299Enqueue = std::chrono::steady_clock::now();
             m_queue.push_back(std::move(item));
@@ -845,7 +881,7 @@ private:
         m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
         G447WaitScope g447Scope(0);
-        return g447WaitFuture(fut, g447Done);
+        return wait.wait();
     }
 
     struct QueueItem
@@ -975,6 +1011,8 @@ private:
                 // schedule it back on. Spin on a submit sequence counter for a bounded budget before
                 // falling into the condition variable. Purely a hint: the cv predicate below is
                 // still the authority, so the queue discipline and ordering are unchanged.
+                // G471 tested both a cheaper and a more backed-off poll here too (the two spins read
+                // the same shared QPC page, so they were armed together); see g447WaitFuture above.
                 if (g447WorkerSpinActive())
                 {
                     const uint64_t seen = m_submitSeq.load(std::memory_order_acquire);
@@ -993,6 +1031,201 @@ private:
                     break;
                 item = std::move(m_queue.front());
                 m_queue.pop_front();
+            }
+            // G472 premise census: price how many synchronous render round trips could collapse
+            // into one worker item without crossing an observable backend dependency.  Restrict the
+            // candidate runs to skip-readback colour batches with no guest-depth side channel and
+            // no framebuffer upload; any other backend item, FBO geometry change, or key change is
+            // a hard boundary.  Diagnostic only: no queue, promise, or GL behaviour changes.
+            static const bool s_g472Census = g158EnvFlag("DC2_G472_CENSUS");
+            if (s_g472Census)
+            {
+                static uint64_t s_renderItems = 0u;
+                static uint64_t s_eligibleItems = 0u;
+                static uint64_t s_closedRuns = 0u;
+                static uint64_t s_avoidableTrips = 0u;
+                static uint64_t s_runBins[8]{}; // 1,2,3,4,5-8,9-16,17-32,33+
+                // Item classes: eligible render, depth render, upload/other render, readback render,
+                // read job, write job, copy job, other.  The successor row explains exactly what
+                // prevents eligible submits from becoming a run.
+                static uint64_t s_classCounts[8]{};
+                static uint64_t s_afterEligible[8]{};
+                static unsigned s_prevClass = 8u;
+                static uint64_t s_renderPairs = 0u, s_sameFboRenderPairs = 0u;
+                static uint64_t s_renderPairClass[16]{};
+                static uint64_t s_sameFboPairClass[16]{};
+                static bool s_prevRender = false;
+                static unsigned s_prevRenderClass = 0u;
+                static uint32_t s_prevRenderKey = 0u;
+                static int s_prevRenderW = 0, s_prevRenderH = 0;
+                static uint64_t s_run = 0u;
+                static uint32_t s_key = 0u;
+                static int s_w = 0, s_h = 0;
+                const bool renderItem =
+                    item.batch != nullptr &&
+                    !(item.depthReadback != nullptr && !item.renderThenReadDepth);
+                const bool eligible =
+                    renderItem && item.batch->skipReadback && item.depthKey == 0u &&
+                    !item.batch->uploadFb;
+                const uint32_t key = eligible
+                    ? (item.batch->fboKey != 0u ? item.batch->fboKey : item.batch->fbp)
+                    : 0u;
+                const int w = eligible ? item.batch->fbW : 0;
+                const int h = eligible ? item.batch->fbH : 0;
+                unsigned itemClass = 7u;
+                if (renderItem)
+                {
+                    if (eligible)
+                        itemClass = 0u;
+                    else if (item.depthKey != 0u)
+                        itemClass = 1u;
+                    else if (item.batch->uploadFb)
+                        itemClass = 2u;
+                    else
+                        itemClass = 3u;
+                }
+                else if (item.colorReadback != nullptr || item.depthReadback != nullptr)
+                    itemClass = 4u;
+                else if (item.colorWrite != nullptr)
+                    itemClass = 5u;
+                else if (item.copyRects != nullptr)
+                    itemClass = 6u;
+                ++s_classCounts[itemClass];
+                if (s_prevClass == 0u)
+                    ++s_afterEligible[itemClass];
+                s_prevClass = itemClass;
+                if (renderItem)
+                {
+                    const uint32_t renderKey =
+                        item.batch->fboKey != 0u ? item.batch->fboKey : item.batch->fbp;
+                    if (s_prevRender)
+                    {
+                        ++s_renderPairs;
+                        ++s_renderPairClass[s_prevRenderClass * 4u + itemClass];
+                        if (renderKey == s_prevRenderKey && item.batch->fbW == s_prevRenderW &&
+                            item.batch->fbH == s_prevRenderH)
+                        {
+                            ++s_sameFboRenderPairs;
+                            ++s_sameFboPairClass[s_prevRenderClass * 4u + itemClass];
+                        }
+                    }
+                    s_prevRender = true;
+                    s_prevRenderClass = itemClass;
+                    s_prevRenderKey = renderKey;
+                    s_prevRenderW = item.batch->fbW;
+                    s_prevRenderH = item.batch->fbH;
+                }
+                else
+                {
+                    s_prevRender = false;
+                }
+                const auto closeRun = [&] {
+                    if (s_run == 0u)
+                        return;
+                    ++s_closedRuns;
+                    s_avoidableTrips += s_run - 1u;
+                    const unsigned bin = s_run <= 4u
+                        ? static_cast<unsigned>(s_run - 1u)
+                        : (s_run <= 8u ? 4u : (s_run <= 16u ? 5u : (s_run <= 32u ? 6u : 7u)));
+                    ++s_runBins[bin];
+                    s_run = 0u;
+                };
+                if (eligible && s_run != 0u && key == s_key && w == s_w && h == s_h)
+                {
+                    ++s_run;
+                }
+                else
+                {
+                    closeRun();
+                    if (eligible)
+                    {
+                        s_run = 1u;
+                        s_key = key;
+                        s_w = w;
+                        s_h = h;
+                    }
+                }
+                if (renderItem)
+                    ++s_renderItems;
+                if (eligible)
+                    ++s_eligibleItems;
+                if (renderItem && (s_renderItems % 4096u) == 0u)
+                {
+                    const uint64_t liveAvoid = s_run != 0u ? s_run - 1u : 0u;
+                    std::fprintf(stderr,
+                                 "[G472:census] render=%llu eligible=%llu runs=%llu live=%llu "
+                                 "avoidable=%llu bins=[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu] "
+                                 "class=[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu] "
+                                 "afterElig=[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu] "
+                                 "renderPairs=%llu sameFbo=%llu "
+                                 "pairClass=[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+                                 "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu] "
+                                 "sameClass=[%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu,"
+                                 "%llu,%llu,%llu,%llu,%llu,%llu,%llu,%llu]\n",
+                                 static_cast<unsigned long long>(s_renderItems),
+                                 static_cast<unsigned long long>(s_eligibleItems),
+                                 static_cast<unsigned long long>(s_closedRuns + (s_run != 0u ? 1u : 0u)),
+                                 static_cast<unsigned long long>(s_run),
+                                 static_cast<unsigned long long>(s_avoidableTrips + liveAvoid),
+                                 static_cast<unsigned long long>(s_runBins[0]),
+                                 static_cast<unsigned long long>(s_runBins[1]),
+                                 static_cast<unsigned long long>(s_runBins[2]),
+                                 static_cast<unsigned long long>(s_runBins[3]),
+                                 static_cast<unsigned long long>(s_runBins[4]),
+                                 static_cast<unsigned long long>(s_runBins[5]),
+                                 static_cast<unsigned long long>(s_runBins[6]),
+                                 static_cast<unsigned long long>(s_runBins[7]),
+                                 static_cast<unsigned long long>(s_classCounts[0]),
+                                 static_cast<unsigned long long>(s_classCounts[1]),
+                                 static_cast<unsigned long long>(s_classCounts[2]),
+                                 static_cast<unsigned long long>(s_classCounts[3]),
+                                 static_cast<unsigned long long>(s_classCounts[4]),
+                                 static_cast<unsigned long long>(s_classCounts[5]),
+                                 static_cast<unsigned long long>(s_classCounts[6]),
+                                 static_cast<unsigned long long>(s_classCounts[7]),
+                                 static_cast<unsigned long long>(s_afterEligible[0]),
+                                 static_cast<unsigned long long>(s_afterEligible[1]),
+                                 static_cast<unsigned long long>(s_afterEligible[2]),
+                                 static_cast<unsigned long long>(s_afterEligible[3]),
+                                 static_cast<unsigned long long>(s_afterEligible[4]),
+                                 static_cast<unsigned long long>(s_afterEligible[5]),
+                                 static_cast<unsigned long long>(s_afterEligible[6]),
+                                 static_cast<unsigned long long>(s_afterEligible[7]),
+                                 static_cast<unsigned long long>(s_renderPairs),
+                                 static_cast<unsigned long long>(s_sameFboRenderPairs),
+                                 static_cast<unsigned long long>(s_renderPairClass[0]),
+                                 static_cast<unsigned long long>(s_renderPairClass[1]),
+                                 static_cast<unsigned long long>(s_renderPairClass[2]),
+                                 static_cast<unsigned long long>(s_renderPairClass[3]),
+                                 static_cast<unsigned long long>(s_renderPairClass[4]),
+                                 static_cast<unsigned long long>(s_renderPairClass[5]),
+                                 static_cast<unsigned long long>(s_renderPairClass[6]),
+                                 static_cast<unsigned long long>(s_renderPairClass[7]),
+                                 static_cast<unsigned long long>(s_renderPairClass[8]),
+                                 static_cast<unsigned long long>(s_renderPairClass[9]),
+                                 static_cast<unsigned long long>(s_renderPairClass[10]),
+                                 static_cast<unsigned long long>(s_renderPairClass[11]),
+                                 static_cast<unsigned long long>(s_renderPairClass[12]),
+                                 static_cast<unsigned long long>(s_renderPairClass[13]),
+                                 static_cast<unsigned long long>(s_renderPairClass[14]),
+                                 static_cast<unsigned long long>(s_renderPairClass[15]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[0]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[1]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[2]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[3]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[4]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[5]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[6]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[7]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[8]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[9]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[10]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[11]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[12]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[13]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[14]),
+                                 static_cast<unsigned long long>(s_sameFboPairClass[15]));
+                }
             }
             bool ok = false;
             const bool g299ProfileBatch =
@@ -1024,6 +1257,21 @@ private:
             }
             const auto g332WorkStart = g332Armed ? std::chrono::steady_clock::now()
                                                  : std::chrono::steady_clock::time_point{};
+            const bool g453On = g453BackendCensusOn();
+            uint32_t g453Cls = 4u;
+            if (g453On)
+            {
+                if (item.g281Map != nullptr)
+                    g453Cls = 0u;
+                else if (item.g338Ct24View)
+                    g453Cls = 1u;
+                else if (item.g309PageMap != nullptr)
+                    g453Cls = 2u;
+                else if (item.colorWrite != nullptr)
+                    g453Cls = 3u;
+            }
+            const auto g453WorkStart = g453Cls < 4u ? std::chrono::steady_clock::now()
+                                                    : std::chrono::steady_clock::time_point{};
             // G425 readback census keeps its own clock so it does not depend on G332 being armed.
             static const bool s_g425RbOn = (std::getenv("DC2_G425_RBCENSUS") != nullptr);
             const auto g425WorkStart = s_g425RbOn ? std::chrono::steady_clock::now()
@@ -1156,6 +1404,14 @@ private:
                     g_g332BackendNs[g332Cls].fetch_add(workNs, std::memory_order_relaxed);
                     g_g332BackendCount[g332Cls].fetch_add(1u, std::memory_order_relaxed);
                 }
+            }
+            if (g453Cls < 4u)
+            {
+                const uint64_t workNs = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - g453WorkStart).count());
+                g_g453BackendOtherNs[g453Cls].fetch_add(workNs, std::memory_order_relaxed);
+                g_g453BackendOtherCount[g453Cls].fetch_add(1u, std::memory_order_relaxed);
             }
             if (g324Profile)
             {
@@ -2590,7 +2846,9 @@ private:
         const auto t0 = s_g433Stat ? std::chrono::steady_clock::now()
                                    : std::chrono::steady_clock::time_point{};
         if (!s_g433NoRb)
+        {
             g433DoReadPixels(m_f, glY, w, rows, out.data());
+        }
         if (s_g433Stat)
         {
             static uint64_t s_n = 0ull, s_px = 0ull, s_ns = 0ull;
@@ -2885,14 +3143,16 @@ private:
         // arms fully overlapping. The blocking cost is the worker round-trip itself (~0.05 ms
         // wall vs 0.005 ms CPU), not the storage churn. Kept OPT-IN (DC2_G431_VIEW_REUSE=1) as
         // an exact instrument; do not quote it as a win.
-        static const bool s_g431NoReuse = !g158EnvFlag("DC2_G431_VIEW_REUSE");
+        static const bool s_g431Reuse = g158EnvFlag("DC2_G431_VIEW_REUSE");
+        const bool reuseStorage = s_g431Reuse;
         static GLuint s_g431MapId = 0u, s_g431ClutId = 0u;
         static int s_g431MapW = -1, s_g431MapH = -1;
 
         m_f.glActiveTexture_(GL158_TEXTURE0 + 1u);
         glBindTexture(GL_TEXTURE_2D, m_g281MapTex);
-        if (s_g431NoReuse || m_g281MapTex != s_g431MapId ||
-            texW != s_g431MapW || texH != s_g431MapH)
+        const bool mapFresh = m_g281MapTex != s_g431MapId ||
+                              texW != s_g431MapW || texH != s_g431MapH;
+        if (!reuseStorage || mapFresh)
         {
             glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, texW, texH, 0,
                          GL_RGBA, GL_UNSIGNED_BYTE, mapRgba.data());
@@ -2907,12 +3167,15 @@ private:
             s_g431MapH = texH;
         }
         else
+        {
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, texW, texH,
                             GL_RGBA, GL_UNSIGNED_BYTE, mapRgba.data());
+        }
 
         m_f.glActiveTexture_(GL158_TEXTURE0 + 2u);
         glBindTexture(GL_TEXTURE_2D, m_g281ClutTex);
-        if (s_g431NoReuse || m_g281ClutTex != s_g431ClutId)
+        const bool clutFresh = m_g281ClutTex != s_g431ClutId;
+        if (!reuseStorage || clutFresh)
         {
             glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, 256, 1, 0,
                          GL_RGBA, GL_UNSIGNED_BYTE, clutRgba.data());
@@ -2925,8 +3188,10 @@ private:
             s_g431ClutId = m_g281ClutTex;
         }
         else
+        {
             glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 256, 1,
                             GL_RGBA, GL_UNSIGNED_BYTE, clutRgba.data());
+        }
 
         TexEntry &out = m_texCache[texKey];
         bool g431OutFresh = false;
@@ -2946,7 +3211,7 @@ private:
         glBindTexture(GL_TEXTURE_2D, out.id);
         // The destination is fully rewritten by the full-viewport draw below, so when the
         // existing allocation already has these exact dimensions nothing needs re-specifying.
-        if (s_g431NoReuse || g431OutFresh || out.w != texW || out.h != texH)
+        if (!reuseStorage || g431OutFresh || out.w != texW || out.h != texH)
         {
             glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, texW, texH, 0,
                          GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
@@ -3579,7 +3844,8 @@ private:
             else
             {
                 glEnable(GL_DEPTH_TEST);
-                glDepthFunc(depthFunc == 1 ? GL_ALWAYS : (depthFunc == 2 ? GL_GEQUAL : GL_GREATER));
+                glDepthFunc(depthFunc == 1 ? GL_ALWAYS :
+                                (depthFunc == 2 ? GL_GEQUAL : GL_GREATER));
                 glDepthMask(d.depthWrite ? GL_TRUE : GL_FALSE);
             }
             if (g256Exact)
@@ -3642,7 +3908,7 @@ private:
                                              ((d.blend == 3 || d.blend == 4) ? GL_ONE : GL_SRC_ALPHA),
                                          (d.blend == 1 || d.blend == 5) ?
                                              GL_ONE_MINUS_SRC_ALPHA : GL_ONE,
-                                         GL_ONE, GL_ZERO);
+                                             GL_ONE, GL_ZERO);
             }
             int mode = 0;
             const bool g286Exact = b.fbp == 0x13bu;
@@ -4092,13 +4358,15 @@ private:
     std::atomic<bool> m_ready{false};
     std::atomic<bool> m_failed{false};
 
-    // G305: one-slot move-owned async submit (default-off DC2_G305_ASYNC=1). A skip-readback
-    // color wave is moved into m_asyncSlot so the front-end can reuse its s_batch immediately;
-    // the backend renders it while the GS worker prepares the next flush. At most one packet in
-    // flight (the front-end drains at every flush top before the next submit).
-    G178Batch m_asyncSlot;
-    std::future<bool> m_asyncFut;
-    bool m_asyncPending = false;
+    struct AsyncSlot
+    {
+        G178Batch batch;
+        std::future<bool> future;
+    };
+    // G452: stable deque storage keeps QueueItem::batch pointers valid while up to eight packets
+    // are in flight. Legacy G305 still drains at every flush and therefore uses this as one slot.
+    std::deque<AsyncSlot> m_asyncSlots;
+    G178Batch m_asyncRecycle;
 
     std::mutex m_residentMtx;
     std::unordered_set<uint64_t> m_resident;
@@ -4140,5 +4408,15 @@ void g332_backend_snapshot(uint64_t nsOut[4], uint64_t cntOut[4])
     {
         nsOut[i] = g_g332BackendNs[i].load(std::memory_order_relaxed);
         cntOut[i] = g_g332BackendCount[i].load(std::memory_order_relaxed);
+    }
+}
+
+// G453: global-scope accessor for the 30-frame GS-worker boundary report.
+void g453_backend_other_snapshot(uint64_t nsOut[4], uint64_t cntOut[4])
+{
+    for (int i = 0; i < 4; ++i)
+    {
+        nsOut[i] = g_g453BackendOtherNs[i].load(std::memory_order_relaxed);
+        cntOut[i] = g_g453BackendOtherCount[i].load(std::memory_order_relaxed);
     }
 }

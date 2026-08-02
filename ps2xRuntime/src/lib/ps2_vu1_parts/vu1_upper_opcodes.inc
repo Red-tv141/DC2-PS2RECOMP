@@ -9,6 +9,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     G141PerfScope g141Scope(s_g141PerfOn, &s_g141Sum, &s_g141Win, "vu1.run", 2000u);
     g141Scope.accumNs = &g_g141Vu1RunNs;
 
+    // G483: run() entry stamp for the prologue/loop/epilogue split (DC2_G483_RUNPROF=1).
+    const uint64_t g483T0 = dc2_g483_run_prof_on()
+        ? (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+              std::chrono::steady_clock::now().time_since_epoch()).count()
+        : 0ull;
+
     // G425: VU1-worker internal attribution (default OFF). One clock read per run() call.
     const bool g425Prof = g425ProfileOn();
     const uint64_t g425RunT0 = g425Prof ? g425NowNs() : 0ull;
@@ -310,7 +316,36 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool g422FastLowerRun =
         g422FastLowerRequested() && g410CompiledRun && !g410VerifyRun && g422LowerDiagFree();
     const bool g422VerifyRun = g422FastLowerRun && g422VerifyOn();
+    // G480: skip the g422FastLower CALL on a NOP lower slot.
+    //
+    // G422 was built on the premise that "NOP -> the call disappears entirely (39.3% of pairs)",
+    // which holds only if `g422FastLower` is actually inlined. It is NOT: it is declared
+    // `static __forceinline`, MSVC declined (33 kinds is far past its budget), and the linker map
+    // for this binary carries a real out-of-line body at 0x14031eb30 with its own unwind and
+    // $chain$ records. The G478 VU1-worker PC sampler attributes 4.0-4.5% of the pole thread to
+    // the public symbol immediately BEFORE it (`std::_Atomic_integral<unsigned int,4>::fetch_or`,
+    // 0x140318e70) — the G471 PDB fold, resolved here from the map rather than guessed.
+    //
+    // So ~39% of ~1.41 M pairs/frame make a five-argument call into a function whose entire body
+    // for that kind is `case G422_LK_NOP: return;`. Hoisting that one comparison into the loop is
+    // exact by construction (read the case), costs one more perfectly-predicted branch on the
+    // pairs that do call, and deletes ~554 k null calls per frame.
+    //
+    // Loop-INVARIANT (read once per run(), never per pair), so it joins g422FastLowerRun rather
+    // than adding a loop-CARRIED value — the resource G427/G442/G479 proved this loop binds on.
+    // Promoted default-on; rollback DC2_G480_NO_NOPSKIP=1; paired gate DC2_G419_AB=nopskip.
+    const bool g480NopSkip = g422FastLowerRun && !g422VerifyRun && g480NopSkipRun();
+    // G481: inline the seven HOT lower kinds (LQ/SQI/IADDI/LQI/IBNE/IADDIU/IAND, ~42% of all pairs
+    // per [G479:lk]) into the loop, leaving the other 26 kinds behind the existing call. Same
+    // premise and the same shape as G480's NOP skip, one step further: the call MSVC refused to
+    // inline is what is being removed, not the work. Bodies are shared token-for-token with
+    // g422FastLower through vu1_g481_hot_lower.inc, so the two paths cannot drift.
+    // Loop-INVARIANT (read once per run()); rollback DC2_G481_NO_HOT_LOWER=1; gate
+    // DC2_G419_AB=hotlower; shadow oracle DC2_G481_VERIFY=1.
+    const bool g481VerifyRun = g422FastLowerRun && !g422VerifyRun && g481VerifyOn();
+    const bool g481HotLower = g422FastLowerRun && !g422VerifyRun && g481HotLowerRun();
     static std::atomic<uint64_t> s_g422Verified{0ull};
+    static std::atomic<uint64_t> s_g481Verified{0ull};
     // Cold shadow-verify path (DC2_G422_VERIFY): run the fast path, restore both the register
     // state AND all 16 KB of VU data memory, re-run the legacy execLower from the same
     // pre-state, and compare everything either path can write.
@@ -344,6 +379,43 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             std::fprintf(stderr, "[G422:verify] ok=%llu bad=0\n",
                          (unsigned long long)s_g422Verified.load(std::memory_order_relaxed));
     };
+    // G481 shadow oracle (DC2_G481_VERIFY=1): execute the INLINE hot body, snapshot everything it
+    // can write, restore, execute the out-of-line g422FastLower from the identical pre-state, and
+    // compare the whole VU1State plus all 16 KB of VU data memory. The bodies are shared tokens so
+    // this can only fail on a macro-expansion defect — which is exactly what it is here to catch.
+    auto g481VerifyHotSlow = [&](uint32_t lowerWord, uint8_t lowerKind) {
+        const bool touchesMem = g422KindStores(lowerKind);
+        s_g422VerBefore = m_state;
+        if (touchesMem && vuData != nullptr && dataSize <= PS2_VU1_DATA_SIZE)
+            std::memcpy(s_g422VerMemBefore, vuData, dataSize);
+        bool handled = false;
+        DC2_G481_HOT_LOWER(lowerKind, m_state, lowerWord, vuData, dataSize, handled);
+        if (!handled)
+            return false;
+        s_g422VerFast = m_state;
+        if (touchesMem && vuData != nullptr && dataSize <= PS2_VU1_DATA_SIZE)
+        {
+            std::memcpy(s_g422VerMemFast, vuData, dataSize);
+            std::memcpy(vuData, s_g422VerMemBefore, dataSize);
+        }
+        m_state = s_g422VerBefore;
+        g422FastLower(m_state, lowerWord, lowerKind, vuData, dataSize);
+        const bool badState = !g422StatesEqual(s_g422VerFast, m_state);
+        const bool badMem = touchesMem && vuData != nullptr && dataSize <= PS2_VU1_DATA_SIZE &&
+                            std::memcmp(s_g422VerMemFast, vuData, dataSize) != 0;
+        if (badState || badMem)
+        {
+            std::fprintf(stderr,
+                         "[G481:verify] mismatch pc=0x%x lower=%08x kind=%u state=%d mem=%d\n",
+                         s_g422VerBefore.pc, lowerWord, (unsigned)lowerKind,
+                         (int)badState, (int)badMem);
+            std::abort();
+        }
+        if ((s_g481Verified.fetch_add(1ull, std::memory_order_relaxed) % 50000000ull) == 0ull)
+            std::fprintf(stderr, "[G481:verify] ok=%llu bad=0\n",
+                         (unsigned long long)s_g481Verified.load(std::memory_order_relaxed));
+        return true;
+    };
 // Runs the lower slot. A macro for the same reason as DC2_G421_RUN_UPPER: when the lever is off
 // the control arm must keep the byte-identical legacy `execLower(...)` call, reached through one
 // loop-invariant, perfectly-predicted branch.
@@ -352,6 +424,31 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         if (g422FastLowerRun)                                                         \
         {                                                                             \
             const uint8_t g422kind = g410Pair->lowerKind;                             \
+            /* G481 REJECTED (+0.53 ms/f, t = 1.33): folding the NOP test, the hot     \
+               switch and the G422_LK_NONE test into ONE jump on the kind adds no text \
+               and removes two compares per pair — and still LOSES the whole win. A    \
+               switch whose default arm is a call re-shapes the loop the compiler had  \
+               already scheduled around three predictable compares. Do not retry. */    \
+            /* G480: g422FastLower's NOP case is exactly `return;` — do not call it. */\
+            if (g480NopSkip && g422kind == G422_LK_NOP)                               \
+                break;                                                                \
+            /* G481: the seven hot kinds run inline; no call at all. */                \
+            if (g481HotLower)                                                         \
+            {                                                                         \
+                if (g481VerifyRun)                                                    \
+                {                                                                     \
+                    if (g481VerifyHotSlow(lower, g422kind))                           \
+                        break;                                                        \
+                }                                                                     \
+                else                                                                  \
+                {                                                                     \
+                    bool g481Handled = false;                                         \
+                    DC2_G481_HOT_LOWER(g422kind, m_state, lower, vuData, dataSize,    \
+                                       g481Handled);                                  \
+                    if (g481Handled)                                                  \
+                        break;                                                        \
+                }                                                                     \
+            }                                                                         \
             if (g422kind != G422_LK_NONE)                                             \
             {                                                                         \
                 if (g422VerifyRun)                                                    \
@@ -809,15 +906,311 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         }
     }
 
+    // G479: fused pair record. Read the arm ONCE per run() (never per pair) so a microprogram
+    // never changes loop copies mid-execution, and hoist the base pointer exactly like g410Pairs.
+    const bool g479LeanFetch = g443Fixed && g479LeanFetchRequested();
+    const bool g479Verify = g479VerifyOn();
+    const G479FusedPair *const g479Fused = s_g410Cache.fused.data();
+    (void)g479Fused;
+
+    // G483: register-carried PC. Read ONCE per run() (G479's rule) so a microprogram can never
+    // switch loop copies mid-execution. Default OFF during bring-up; paired gate
+    // DC2_G419_AB=pcreg, standalone arm DC2_G483_PCREG=1, oracle DC2_G483_VERIFY=1.
+    const bool g483PcReg = g443Fixed && g483PcRegRequested();
+    const bool g483VerifyPc = g483VerifyPcOn();
+    if (g483VerifyPc)
+    {
+        // One-shot proof that the oracle copy is actually the one running — a silent oracle that
+        // was never selected proves nothing (G457).
+        static std::atomic<uint32_t> s_g483Once{0u};
+        if (s_g483Once.fetch_add(1u, std::memory_order_relaxed) == 0u)
+            std::fprintf(stderr, "[G483:verify] armed pcreg=%d fixed=%d leanfetch=%d\n",
+                         g483PcReg ? 1 : 0, g443Fixed ? 1 : 0, g479LeanFetch ? 1 : 0);
+    }
+
+    // G484: WIDE VF0 RE-PIN, made MEASURABLE.
+    //
+    // G435 built the exact 16-byte form of the VF0 re-pin and shipped it opt-in
+    // (`DC2_G435_WIDE_VF0=1`). It has been dead ever since: `!g435WideVf0` is a conjunct of
+    // `g443Fixed`, so arming the old flag does not put the wide store into the promoted loop —
+    // it drops the whole run onto a different, slower loop copy and measures THAT (the G482
+    // "structurally unmeasurable" class). This selects the wide store INSIDE the promoted
+    // fixed+fused body, which is the only place its price can be read.
+    //
+    // G485 PROMOTED it default-ON (−0.619 ms/f mean, sign 4/4 over four paired A/Bs).
+    // Read ONCE per run() (G479's rule) so a microprogram can never switch loop copies
+    // mid-execution. Paired gate DC2_G419_AB=widevf0, standalone arm DC2_G484_WIDE_VF0=1,
+    // rollback DC2_G485_NO_WIDE_VF0=1.
+    const bool g484WideVf0 = g443Fixed && g479LeanFetch && !g479Verify && !g483PcReg &&
+                             g484WideVf0Requested();
+    // G486 REFUTED the wide single-lane FMAC destination store (`widedest`). It was built exactly
+    // like G485's widevf0 — a copy of the promoted body in which the four single-lane dest masks
+    // blend whole lanes and issue one 16-byte store instead of a 4-byte `_mm_store_ss` — and four
+    // paired A/Bs read +0.732 / +0.476 / +0.553 / +0.627 ms/f (mean +0.597, sign 4/4 SLOWER).
+    // WHY, and this is the durable half: G485's win was four narrow stores of CONSTANTS collapsing
+    // into one wide store, which needs no input. A single-lane write cannot be widened without
+    // READING the destination's other three lanes, so the candidate turns a pure store into a
+    // load-modify-store — it puts a 16-byte load of `vf[fd]` on the dependency chain (and holds
+    // `old` live across the blend) to avoid a forwarding block that costs less. The
+    // store-forwarding class does NOT generalise from "write lanes individually" to "any narrow
+    // store"; it needs the wide replacement to be input-free. The copy, its arm and the whole
+    // `wideDest` plumbing were REMOVED, so this selector and the pair-loop body are
+    // source-identical to G485's. The full record is at `g428StoreDest` in
+    // vu1_g421_fast_upper.inc. Do not rebuild it.
+    // G485 REFUTED the register-form G139 pair hazard (DC2_G485_HAZREG). It WAS measurable — a
+    // copy in which the pointer form is textually absent, layered on the promoted body, which is
+    // the isolation G482 recorded as impossible. Four paired A/Bs read +0.395 / +0.277 / −0.088 /
+    // +0.344 ms/f (mean +0.232, sign 3/4 SLOWER). Removing the aliasing does not pay for the three
+    // loop-live values it adds (an index and two __m128) to a register-starved loop — the fifth
+    // confirmation of the G427/G442/G479/G483 live-value law. G435's ~4.9 ms/f premise came from
+    // DC2_G435_SKIP=2, a CORRUPTING deletion probe, which G444/G479 say is not a price at all.
+    // The copy, its arm and its accessor were removed; the #if scaffolding in
+    // vu1_g435_pair_loop.inc remains so one edit can re-instantiate it if the loop's register
+    // pressure ever changes. Do not rebuild it before that.
+    {
+        // G457: a copy that was never selected proves nothing — but this is the DEFAULT path now,
+        // so the proof must stay quiet unless asked for. DC2_G485_STAT=1 prints it for the default
+        // path; any DC2_G419_AB run prints it automatically.
+        static const bool s_g484Stat = (std::getenv("DC2_G485_STAT") != nullptr) ||
+                                       (std::getenv("DC2_G419_AB") != nullptr);
+        if (s_g484Stat)
+        {
+            static std::atomic<uint32_t> s_g484Once{0u};
+            if (s_g484Once.fetch_add(1u, std::memory_order_relaxed) == 0u)
+                std::fprintf(stderr, "[G484:armed] widevf0=%d fixed=%d leanfetch=%d\n",
+                             g484WideVf0 ? 1 : 0, g443Fixed ? 1 : 0, g479LeanFetch ? 1 : 0);
+        }
+    }
+
+    // G483: prologue/loop/epilogue split (DC2_G483_RUNPROF=1). Three clock reads per KICK, never
+    // per pair; the default path evaluates one cached bool.
+    const bool g483RunProf = dc2_g483_run_prof_on();
+    const uint64_t g483T1 = g483RunProf ? (uint64_t)std::chrono::duration_cast<
+        std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0ull;
+
         // G435: copies of the same loop body (vu1_g435_pair_loop.inc). The lean copy is
         // the identical body with the four never-executed G295 diagnostic regions removed by the
         // preprocessor. Selected only when no per-cycle probe can fire. G443 adds a third copy
         // of the lean body whose lever predicates are compile-time constants.
-        if (g443Fixed)
+        if (g443Fixed && g479LeanFetch && g483PcReg && g483VerifyPc)
+        {
+            // G483 ORACLE COPY: the candidate body with the per-pair assertion that the carried
+            // PC equals `m_state.pc` (DC2_G483_VERIFY=1). Never a timing arm.
+#define DC2_VU1_LOOP_DIAG 0
+#define DC2_G443_FIXED 1
+#define DC2_G475_TRACE 0
+#define DC2_G475_VERIFY_TRACE 0
+#define DC2_G479_FUSED 1
+#define DC2_G479_QPREG 0
+#define DC2_G479_VERIFY_FUSED 0
+#define DC2_G483_PCREG 1
+#define DC2_G483_VERIFY_PCREG 1
+#include "vu1_g435_pair_loop.inc"
+#undef DC2_G483_VERIFY_PCREG
+#undef DC2_G483_PCREG
+#undef DC2_G479_VERIFY_FUSED
+#undef DC2_G479_QPREG
+#undef DC2_G479_FUSED
+#undef DC2_G475_VERIFY_TRACE
+#undef DC2_G475_TRACE
+#undef DC2_G443_FIXED
+#undef DC2_VU1_LOOP_DIAG
+        }
+        else if (g443Fixed && g479LeanFetch && !g479Verify && g483PcReg)
+        {
+            // G483 CANDIDATE COPY: identical to the promoted fixed+fused body below, with the
+            // program counter carried in a loop-carried local across the back edge instead of
+            // reloaded from `m_state.pc`. A separate COPY (rather than a per-pair select) because
+            // an in-binary selector inside the loop pollutes BOTH arms (G436).
+#define DC2_VU1_LOOP_DIAG 0
+#define DC2_G443_FIXED 1
+#define DC2_G475_TRACE 0
+#define DC2_G475_VERIFY_TRACE 0
+#define DC2_G479_FUSED 1
+#define DC2_G479_QPREG 0
+#define DC2_G479_VERIFY_FUSED 0
+#define DC2_G483_PCREG 1
+#define DC2_G483_VERIFY_PCREG 0
+#include "vu1_g435_pair_loop.inc"
+#undef DC2_G483_VERIFY_PCREG
+#undef DC2_G483_PCREG
+#undef DC2_G479_VERIFY_FUSED
+#undef DC2_G479_QPREG
+#undef DC2_G479_FUSED
+#undef DC2_G475_VERIFY_TRACE
+#undef DC2_G475_TRACE
+#undef DC2_G443_FIXED
+#undef DC2_VU1_LOOP_DIAG
+        }
+        else if (g443Fixed && g479LeanFetch && g479Verify)
         {
 #define DC2_VU1_LOOP_DIAG 0
 #define DC2_G443_FIXED 1
+#define DC2_G475_TRACE 0
+#define DC2_G475_VERIFY_TRACE 0
+#define DC2_G479_FUSED 1
+#define DC2_G479_QPREG 0
+#define DC2_G479_VERIFY_FUSED 1
+// G483: every copy that does not explicitly ask for the register-carried PC gets the historical
+// `m_state.pc` reload, byte-for-byte as before.
+#ifndef DC2_G483_PCREG
+#define DC2_G483_PCREG 0
+#endif
+#ifndef DC2_G483_VERIFY_PCREG
+#define DC2_G483_VERIFY_PCREG 0
+#endif
 #include "vu1_g435_pair_loop.inc"
+#undef DC2_G483_VERIFY_PCREG
+#undef DC2_G483_PCREG
+#undef DC2_G479_VERIFY_FUSED
+#undef DC2_G479_QPREG
+#undef DC2_G479_FUSED
+#undef DC2_G475_VERIFY_TRACE
+#undef DC2_G475_TRACE
+#undef DC2_G443_FIXED
+#undef DC2_VU1_LOOP_DIAG
+        }
+        else if (g484WideVf0)
+        {
+            // G485 PROMOTED COPY (built G484): identical to the fixed+fused body below, except
+            // that the VF0 re-pin at the bottom of the pair writes ONE 16-byte store of (0,0,0,1)
+            // instead of four 4-byte scalar stores. This is the DEFAULT path; the body below is
+            // now the DC2_G485_NO_WIDE_VF0=1 rollback. Value-identical bytes; the next pair's
+            // 16-byte `_mm_loadu_ps(vf[FS])` over the same address can then be satisfied by
+            // store-to-load forwarding instead of waiting for four narrow stores to retire.
+            // A separate COPY (not an in-loop select) because an in-binary selector inside the
+            // loop pollutes BOTH arms (G436).
+#define DC2_VU1_LOOP_DIAG 0
+#define DC2_G443_FIXED 1
+#define DC2_G475_TRACE 0
+#define DC2_G475_VERIFY_TRACE 0
+#define DC2_G479_FUSED 1
+#define DC2_G479_QPREG 0
+#define DC2_G479_VERIFY_FUSED 0
+#define DC2_G483_PCREG 0
+#define DC2_G483_VERIFY_PCREG 0
+#define DC2_G484_WIDEVF0 1
+#include "vu1_g435_pair_loop.inc"
+#undef DC2_G484_WIDEVF0
+#undef DC2_G483_VERIFY_PCREG
+#undef DC2_G483_PCREG
+#undef DC2_G479_VERIFY_FUSED
+#undef DC2_G479_QPREG
+#undef DC2_G479_FUSED
+#undef DC2_G475_VERIFY_TRACE
+#undef DC2_G475_TRACE
+#undef DC2_G443_FIXED
+#undef DC2_VU1_LOOP_DIAG
+        }
+        else if (g443Fixed && g479LeanFetch)
+        {
+#define DC2_VU1_LOOP_DIAG 0
+#define DC2_G443_FIXED 1
+#define DC2_G475_TRACE 0
+#define DC2_G475_VERIFY_TRACE 0
+#define DC2_G479_FUSED 1
+#define DC2_G479_QPREG 0
+#define DC2_G479_VERIFY_FUSED 0
+// G483: every copy that does not explicitly ask for the register-carried PC gets the historical
+// `m_state.pc` reload, byte-for-byte as before.
+#ifndef DC2_G483_PCREG
+#define DC2_G483_PCREG 0
+#endif
+#ifndef DC2_G483_VERIFY_PCREG
+#define DC2_G483_VERIFY_PCREG 0
+#endif
+#include "vu1_g435_pair_loop.inc"
+#undef DC2_G483_VERIFY_PCREG
+#undef DC2_G483_PCREG
+#undef DC2_G479_VERIFY_FUSED
+#undef DC2_G479_QPREG
+#undef DC2_G479_FUSED
+#undef DC2_G475_VERIFY_TRACE
+#undef DC2_G475_TRACE
+#undef DC2_G443_FIXED
+#undef DC2_VU1_LOOP_DIAG
+        }
+        else if (g443Fixed && g475TraceRequested() && g475VerifyOn())
+        {
+#define DC2_VU1_LOOP_DIAG 0
+#define DC2_G443_FIXED 1
+#define DC2_G475_TRACE 1
+#define DC2_G475_VERIFY_TRACE 1
+#define DC2_G479_FUSED 0
+#define DC2_G479_QPREG 0
+#define DC2_G479_VERIFY_FUSED 0
+// G483: every copy that does not explicitly ask for the register-carried PC gets the historical
+// `m_state.pc` reload, byte-for-byte as before.
+#ifndef DC2_G483_PCREG
+#define DC2_G483_PCREG 0
+#endif
+#ifndef DC2_G483_VERIFY_PCREG
+#define DC2_G483_VERIFY_PCREG 0
+#endif
+#include "vu1_g435_pair_loop.inc"
+#undef DC2_G483_VERIFY_PCREG
+#undef DC2_G483_PCREG
+#undef DC2_G479_VERIFY_FUSED
+#undef DC2_G479_QPREG
+#undef DC2_G479_FUSED
+#undef DC2_G475_VERIFY_TRACE
+#undef DC2_G475_TRACE
+#undef DC2_G443_FIXED
+#undef DC2_VU1_LOOP_DIAG
+        }
+        else if (g443Fixed && g475TraceRequested())
+        {
+#define DC2_VU1_LOOP_DIAG 0
+#define DC2_G443_FIXED 1
+#define DC2_G475_TRACE 1
+#define DC2_G475_VERIFY_TRACE 0
+#define DC2_G479_FUSED 0
+#define DC2_G479_QPREG 0
+#define DC2_G479_VERIFY_FUSED 0
+// G483: every copy that does not explicitly ask for the register-carried PC gets the historical
+// `m_state.pc` reload, byte-for-byte as before.
+#ifndef DC2_G483_PCREG
+#define DC2_G483_PCREG 0
+#endif
+#ifndef DC2_G483_VERIFY_PCREG
+#define DC2_G483_VERIFY_PCREG 0
+#endif
+#include "vu1_g435_pair_loop.inc"
+#undef DC2_G483_VERIFY_PCREG
+#undef DC2_G483_PCREG
+#undef DC2_G479_VERIFY_FUSED
+#undef DC2_G479_QPREG
+#undef DC2_G479_FUSED
+#undef DC2_G475_VERIFY_TRACE
+#undef DC2_G475_TRACE
+#undef DC2_G443_FIXED
+#undef DC2_VU1_LOOP_DIAG
+        }
+        else if (g443Fixed)
+        {
+#define DC2_VU1_LOOP_DIAG 0
+#define DC2_G443_FIXED 1
+#define DC2_G475_TRACE 0
+#define DC2_G475_VERIFY_TRACE 0
+#define DC2_G479_FUSED 0
+#define DC2_G479_QPREG 0
+#define DC2_G479_VERIFY_FUSED 0
+// G483: every copy that does not explicitly ask for the register-carried PC gets the historical
+// `m_state.pc` reload, byte-for-byte as before.
+#ifndef DC2_G483_PCREG
+#define DC2_G483_PCREG 0
+#endif
+#ifndef DC2_G483_VERIFY_PCREG
+#define DC2_G483_VERIFY_PCREG 0
+#endif
+#include "vu1_g435_pair_loop.inc"
+#undef DC2_G483_VERIFY_PCREG
+#undef DC2_G483_PCREG
+#undef DC2_G479_VERIFY_FUSED
+#undef DC2_G479_QPREG
+#undef DC2_G479_FUSED
+#undef DC2_G475_VERIFY_TRACE
+#undef DC2_G475_TRACE
 #undef DC2_G443_FIXED
 #undef DC2_VU1_LOOP_DIAG
         }
@@ -825,7 +1218,27 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         {
 #define DC2_VU1_LOOP_DIAG 0
 #define DC2_G443_FIXED 0
+#define DC2_G475_TRACE 0
+#define DC2_G475_VERIFY_TRACE 0
+#define DC2_G479_FUSED 0
+#define DC2_G479_QPREG 0
+#define DC2_G479_VERIFY_FUSED 0
+// G483: every copy that does not explicitly ask for the register-carried PC gets the historical
+// `m_state.pc` reload, byte-for-byte as before.
+#ifndef DC2_G483_PCREG
+#define DC2_G483_PCREG 0
+#endif
+#ifndef DC2_G483_VERIFY_PCREG
+#define DC2_G483_VERIFY_PCREG 0
+#endif
 #include "vu1_g435_pair_loop.inc"
+#undef DC2_G483_VERIFY_PCREG
+#undef DC2_G483_PCREG
+#undef DC2_G479_VERIFY_FUSED
+#undef DC2_G479_QPREG
+#undef DC2_G479_FUSED
+#undef DC2_G475_VERIFY_TRACE
+#undef DC2_G475_TRACE
 #undef DC2_G443_FIXED
 #undef DC2_VU1_LOOP_DIAG
         }
@@ -833,10 +1246,33 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         {
 #define DC2_VU1_LOOP_DIAG 1
 #define DC2_G443_FIXED 0
+#define DC2_G475_TRACE 0
+#define DC2_G475_VERIFY_TRACE 0
+#define DC2_G479_FUSED 0
+#define DC2_G479_QPREG 0
+#define DC2_G479_VERIFY_FUSED 0
+// G483: every copy that does not explicitly ask for the register-carried PC gets the historical
+// `m_state.pc` reload, byte-for-byte as before.
+#ifndef DC2_G483_PCREG
+#define DC2_G483_PCREG 0
+#endif
+#ifndef DC2_G483_VERIFY_PCREG
+#define DC2_G483_VERIFY_PCREG 0
+#endif
 #include "vu1_g435_pair_loop.inc"
+#undef DC2_G483_VERIFY_PCREG
+#undef DC2_G483_PCREG
+#undef DC2_G479_VERIFY_FUSED
+#undef DC2_G479_QPREG
+#undef DC2_G479_FUSED
+#undef DC2_G475_VERIFY_TRACE
+#undef DC2_G475_TRACE
 #undef DC2_G443_FIXED
 #undef DC2_VU1_LOOP_DIAG
         }
+
+    const uint64_t g483T2 = g483RunProf ? (uint64_t)std::chrono::duration_cast<
+        std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0ull;
 
     // The hardware drains EFU (and FDIV/FMAC) when an E-bit program ends. Preserve an in-flight
     // P only across max-cycle suspension/resume; a normal microprogram completion publishes it.
@@ -880,6 +1316,19 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             g428Slot = (g428Slot + 1 < s_macpipeDepth) ? g428Slot + 1 : 0;
         }
         m_state.mac = g428ResolveSlot(g428Slot);
+    }
+
+    // G483: publish this run's pair-loop iteration count for [G441:kick]'s resume/geometry split.
+    g_g483LastRunCycles = (uint64_t)cycle;
+    // `stopReason` is one of exactly three string literals set in this TU; the first character
+    // discriminates them ("maxcycles" / "pc-oob" / "ebit-latched") without a strcmp.
+    g_g483LastStopReason = (stopReason[0] == 'e') ? 2u : ((stopReason[0] == 'p') ? 1u : 0u);
+    if (g483RunProf)
+    {
+        const uint64_t g483T3 = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        dc2_g483_run_prof_note(g483T1 - g483T0, g483T2 - g483T1, g483T3 - g483T2,
+                               (uint64_t)cycle);
     }
 
     if (g425Prof)

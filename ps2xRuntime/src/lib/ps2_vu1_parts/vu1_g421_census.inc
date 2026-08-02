@@ -31,6 +31,24 @@ namespace
         // G422: executed-lower coverage, derived from the SAME decoder the G422 lever
         // dispatches on, so the two cannot drift apart.
         uint64_t lowerKind[G422_LK_COUNT] = {};
+        // G486: WHICH lower opcodes are the uncovered 4.61% of pairs. `[G422:cover]` has read
+        // "uncovered=7.70% of executed lowers" for four phases without ever naming them, and
+        // `[G421:mix] lowerS2` cannot: its index is S2_FUNC, which for a top-level Special2 op
+        // (IADD/IAND/IOR...) is a function of bits 6-10 and 0-1 only, so covered and uncovered
+        // encodings collide in the same bucket. This histogram is keyed on the decision the G422
+        // decoder actually makes, so an entry here is by construction an `execLower()` call:
+        //   index = (opHi == 0x40) ? (0x80 | S2_FUNC(lower)) : opHi
+        // Every one of these pairs pays a call into the full ~1400-line execLower switch instead
+        // of the compact g422FastLower one. Extending coverage is an OUT-OF-LINE change, so it
+        // cannot hit the G481 inline-budget cliff — but only if the mass is in ops that are cheap
+        // and side-effect-free (an XGKICK or a DIV carries its own machinery and moving it buys
+        // nothing). Price the population before building anything (G476).
+        //
+        // NOTE the storage: the two counters live OUTSIDE this struct and are NOT thread_local
+        // (`s_g486UncovHist` / `s_g486UncovTotal` below). `G421Census` is a thread_local object,
+        // and adding 2 KB to it shifts every thread_local declared after it — a data-placement
+        // change on the pole's own TLS block, which G437 priced at 3.48 ms/f for one alignment.
+        // A default-OFF diagnostic must never be able to move the default path.
         // G425: consecutive "zero-work pair" runs. A zero-work pair is VNOP upper + NOP lower
         // with neither the E nor the I bit, i.e. a pair whose only effect is to advance the
         // Q/P delays, the MAC/STATUS delay line and the PC. Bucketed by run length so a
@@ -53,9 +71,35 @@ namespace
         uint64_t nonFmacCovered = 0ull; // covered upper with cls >= 3 (no MAC/STATUS)
         uint64_t flagReadExec = 0ull; // executed lower reads s_vuMacVisible/s_vuStatusVisible
         uint64_t statusReadExec = 0ull; // subset: FSEQ/FSAND/FSOR (the STICKY consumers)
+        // G475: runway for a compact VNOP-upper + covered non-control lower trace. Unlike the
+        // older zero-work census, this admits useful lower-slot work; unlike a source scan, it
+        // follows the actual dynamic PC stream and rejects branch-delay/latched-E entries.
+        uint64_t g475Pairs = 0ull;
+        uint64_t g475Runs = 0ull;
+        uint64_t g475PairsInRunsGE2 = 0ull;
+        uint64_t g475LenHist[9] = {}; // 1..7 exact, [8] = >=8
+        uint32_t g475Cur = 0u;
+        uint32_t g475PrevPc = 0xffffffffu;
+        // G479: WHERE the pairs are, in microprogram space. Every closed vein on this thread
+        // (G426/G435/G436/G442/G475) made a pair cheaper; the only class left is executing
+        // FEWER pairs, and that decision needs the dynamic PC distribution, not the opcode mix.
+        // 2048 slots = the whole VU1 code store at one entry per instruction pair.
+        uint64_t pcHist[PS2_VU1_CODE_SIZE / 8u] = {};
+        // G479: pairs per run() call, bucketed by power of two. `cyc/run` is a mean over a
+        // bimodal population (a transform batch and a short setup/resume kick look nothing
+        // alike), so the mean alone cannot say whether the mass is in many small kicks or a
+        // few huge ones.
+        uint64_t runLenHist[24] = {};
+        uint64_t runStart[0x80] = {}; // startPC>>3 for the low code region, bucketed
+        uint32_t curRunPairs = 0u;
+        uint32_t curRunStartPc = 0xffffffffu;
     };
 
     thread_local G421Census s_g421;
+    // G486: uncovered-lower histogram. File-scope static, NOT part of the thread_local census
+    // struct — see the uncovHist note in G421Census.
+    uint64_t s_g486UncovHist[0x100] = {};
+    uint64_t s_g486UncovTotal = 0ull;
 
     bool g421CensusOn()
     {
@@ -115,9 +159,32 @@ namespace
         s_g421.zeroCur = 0u;
     }
 
-    void g421NoteCycle(uint8_t kind, uint32_t upper, uint32_t lower)
+    void g475CloseRunway()
+    {
+        if (s_g421.g475Cur == 0u)
+            return;
+        const uint32_t len = s_g421.g475Cur;
+        ++s_g421.g475Runs;
+        ++s_g421.g475LenHist[len < 8u ? len : 8u];
+        if (len >= 2u)
+            s_g421.g475PairsInRunsGE2 += len;
+        s_g421.g475Cur = 0u;
+        s_g421.g475PrevPc = 0xffffffffu;
+    }
+
+    void g421NoteCycle(uint32_t pc, uint8_t kind, uint32_t upper, uint32_t lower,
+                       bool traceEntrySafe)
     {
         ++s_g421.cycles;
+        // G479: dynamic PC distribution + per-run pair count (see the struct comment).
+        {
+            const uint32_t slot = (pc >> 3u);
+            if (slot < (PS2_VU1_CODE_SIZE / 8u))
+                ++s_g421.pcHist[slot];
+            if (s_g421.curRunPairs == 0u)
+                s_g421.curRunStartPc = pc;
+            ++s_g421.curRunPairs;
+        }
         ++s_g421.upperKind[kind == 0xffu ? 0x7fu : (kind & 0x7fu)];
         // G428: fast-upper SIMD accounting (same descriptor table the lever dispatches on).
         if (kind < 0x80u && ((upper >> 31u) & 1u) == 0u)
@@ -142,6 +209,26 @@ namespace
         {
             g421CloseZeroRun();
         }
+        // G475: G422's dense covered kinds 8..17 are control transfers. All other covered
+        // kinds are branch-free and scalar-pipe/flag-reader-free by G422's contract.
+        const uint8_t g475LowerKind = g422DecodeLowerKind(lower);
+        const bool g475Control = g475LowerKind >= G422_LK_B &&
+                                 g475LowerKind <= G422_LK_IBGEZ;
+        const bool g475Safe = traceEntrySafe && kind == 0x6fu &&
+                              ((upper >> 30u) & 3u) == 0u &&
+                              g475LowerKind != G422_LK_NONE && !g475Control;
+        if (g475Safe)
+        {
+            if (s_g421.g475Cur != 0u && pc != s_g421.g475PrevPc + 8u)
+                g475CloseRunway();
+            ++s_g421.g475Pairs;
+            ++s_g421.g475Cur;
+            s_g421.g475PrevPc = pc;
+        }
+        else
+        {
+            g475CloseRunway();
+        }
         if (((upper >> 31u) & 1u) != 0u)
             return;
         if (lower == 0x00000000u || lower == 0x8000033Cu)
@@ -164,11 +251,42 @@ namespace
         const uint8_t lk = g422DecodeLowerKind(lower);
         if (lk < (uint8_t)G422_LK_COUNT)
             ++s_g421.lowerKind[lk];
+        // G486: name the uncovered lowers (see the uncovHist comment).
+        if (lk == (uint8_t)G422_LK_NONE)
+        {
+            const uint32_t uidx = (op == 0x40u) ? (0x80u | (uint32_t)S2_FUNC(lower))
+                                                : (uint32_t)op;
+            ++s_g486UncovHist[uidx & 0xFFu];
+            ++s_g486UncovTotal;
+        }
     }
 
+    // G479: a run() boundary closes the per-run pair count. Called from the same site that
+    // increments `runs`, i.e. once per MSCAL/MSCNT, not per pair.
+    void g479CloseRun()
+    {
+        if (s_g421.curRunPairs == 0u)
+            return;
+        uint32_t b = 0u;
+        uint32_t n = s_g421.curRunPairs;
+        while (n > 1u && b + 1u < 24u) { n >>= 1u; ++b; }
+        ++s_g421.runLenHist[b];
+        const uint32_t sslot = s_g421.curRunStartPc >> 3u;
+        ++s_g421.runStart[sslot < 0x80u ? sslot : 0x7fu];
+        s_g421.curRunPairs = 0u;
+        s_g421.curRunStartPc = 0xffffffffu;
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
     void g421ReportMaybe()
     {
+        g479CloseRun();
         g421CloseZeroRun(); // a run() boundary always ends a zero-work run
+        g475CloseRunway();
         if (s_g421.runs % g421ReportEvery() != 0ull)
             return;
         const double runs = (double)(s_g421.runs ? s_g421.runs : 1ull);
@@ -250,6 +368,102 @@ namespace
                          100.0 * (double)s_g421.zeroLenHist[7] / (double)(s_g421.zeroRuns ? s_g421.zeroRuns : 1ull),
                          100.0 * (double)s_g421.zeroLenHist[8] / (double)(s_g421.zeroRuns ? s_g421.zeroRuns : 1ull));
         }
+        // G479: dynamic PC distribution. Top slots by executed-pair share, plus how much of the
+        // stream the hottest 16/64/256 slots carry — a concentrated distribution says a
+        // specialised path can reach most of the thread; a flat one says it cannot.
+        {
+            // Static, not a local: MSVC reserves the maximum frame for the whole function, and
+            // this report is called (inlined or not) from run(), whose hot loop must not pay a
+            // 16 KB frame / stack probe for a default-off diagnostic.
+            static thread_local size_t order[PS2_VU1_CODE_SIZE / 8u];
+            size_t used = 0u;
+            for (size_t i = 0u; i < (PS2_VU1_CODE_SIZE / 8u); ++i)
+                if (s_g421.pcHist[i] != 0ull)
+                    order[used++] = i;
+            std::sort(order, order + used, [](size_t a, size_t b) {
+                return s_g421.pcHist[a] > s_g421.pcHist[b];
+            });
+            uint64_t c16 = 0ull, c64 = 0ull, c256 = 0ull;
+            for (size_t k = 0u; k < used; ++k)
+            {
+                const uint64_t v = s_g421.pcHist[order[k]];
+                if (k < 16u) c16 += v;
+                if (k < 64u) c64 += v;
+                if (k < 256u) c256 += v;
+            }
+            std::fprintf(stderr,
+                         "[G479:pc] live=%zu top16=%.1f%% top64=%.1f%% top256=%.1f%% |",
+                         used, 100.0 * (double)c16 / cyc, 100.0 * (double)c64 / cyc,
+                         100.0 * (double)c256 / cyc);
+            const size_t cap = used < 20u ? used : 20u;
+            for (size_t k = 0u; k < cap; ++k)
+                std::fprintf(stderr, " %04zx:%.2f", order[k] * 8u,
+                             100.0 * (double)s_g421.pcHist[order[k]] / cyc);
+            std::fprintf(stderr, "\n");
+        }
+        // G479: which G422 lower kinds carry the executed mass. The inline lower switch is the
+        // largest block of TEXT in the pair loop and G435 already proved this loop pays for text
+        // it never executes, so the outlining decision needs the per-kind shares, not the
+        // aggregate coverage number.
+        {
+            uint64_t tot = 0ull;
+            for (unsigned k = 0u; k < (unsigned)G422_LK_COUNT; ++k)
+                tot += s_g421.lowerKind[k];
+            std::fprintf(stderr, "[G479:lk] exec=%llu |", (unsigned long long)tot);
+            for (unsigned k = 0u; k < (unsigned)G422_LK_COUNT; ++k)
+                if (s_g421.lowerKind[k] != 0ull)
+                    std::fprintf(stderr, " %u=%.2f%%", k,
+                                 100.0 * (double)s_g421.lowerKind[k] / cyc);
+            std::fprintf(stderr, "\n");
+        }
+        // G479: pairs-per-run distribution (power-of-two buckets) and where runs START.
+        {
+            std::fprintf(stderr, "[G479:run] runs=%llu |",
+                         (unsigned long long)s_g421.runs);
+            for (uint32_t b = 0u; b < 24u; ++b)
+                if (s_g421.runLenHist[b] != 0ull)
+                    std::fprintf(stderr, " 2^%u=%.1f%%", b,
+                                 100.0 * (double)s_g421.runLenHist[b] / runs);
+            std::fprintf(stderr, " | startPC");
+            for (uint32_t s = 0u; s < 0x80u; ++s)
+                if (s_g421.runStart[s] != 0ull)
+                    std::fprintf(stderr, " %03x:%.1f%%", s * 8u,
+                                 100.0 * (double)s_g421.runStart[s] / runs);
+            std::fprintf(stderr, "\n");
+        }
+        // G475 compact lower-only trace runway. This is the fraction that can avoid the
+        // full upper/hazard/dispatch half of the pair loop while still doing useful lower work.
+        {
+            const double gp = (double)(s_g421.g475Pairs ? s_g421.g475Pairs : 1ull);
+            std::fprintf(stderr,
+                         "[G475:runway] pairs=%llu (%.1f%% ofCycles) runs=%llu avgLen=%.2f "
+                         "inRunsGE2=%llu (%.1f%% ofPairs) "
+                         "len1=%.1f%% len2=%.1f%% len3=%.1f%% len4=%.1f%% "
+                         "len5=%.1f%% len6=%.1f%% len7=%.1f%% len8+=%.1f%%\n",
+                         (unsigned long long)s_g421.g475Pairs,
+                         100.0 * (double)s_g421.g475Pairs / cyc,
+                         (unsigned long long)s_g421.g475Runs,
+                         (double)s_g421.g475Pairs /
+                             (double)(s_g421.g475Runs ? s_g421.g475Runs : 1ull),
+                         (unsigned long long)s_g421.g475PairsInRunsGE2,
+                         100.0 * (double)s_g421.g475PairsInRunsGE2 / gp,
+                         100.0 * (double)s_g421.g475LenHist[1] /
+                             (double)(s_g421.g475Runs ? s_g421.g475Runs : 1ull),
+                         100.0 * (double)s_g421.g475LenHist[2] /
+                             (double)(s_g421.g475Runs ? s_g421.g475Runs : 1ull),
+                         100.0 * (double)s_g421.g475LenHist[3] /
+                             (double)(s_g421.g475Runs ? s_g421.g475Runs : 1ull),
+                         100.0 * (double)s_g421.g475LenHist[4] /
+                             (double)(s_g421.g475Runs ? s_g421.g475Runs : 1ull),
+                         100.0 * (double)s_g421.g475LenHist[5] /
+                             (double)(s_g421.g475Runs ? s_g421.g475Runs : 1ull),
+                         100.0 * (double)s_g421.g475LenHist[6] /
+                             (double)(s_g421.g475Runs ? s_g421.g475Runs : 1ull),
+                         100.0 * (double)s_g421.g475LenHist[7] /
+                             (double)(s_g421.g475Runs ? s_g421.g475Runs : 1ull),
+                         100.0 * (double)s_g421.g475LenHist[8] /
+                             (double)(s_g421.g475Runs ? s_g421.g475Runs : 1ull));
+        }
         // G428: where the SIMD ops go on the fast-upper path.
         {
             const double fm = (double)(s_g421.fmacExec ? s_g421.fmacExec : 1ull);
@@ -269,6 +483,37 @@ namespace
                          100.0 * (double)s_g421.flagReadExec / cyc,
                          (unsigned long long)s_g421.statusReadExec);
             g421DumpHist("destMask", s_g421.destHist, 16u, s_g421.fmacExec);
+        }
+        // G486: the uncovered lowers, biggest first. `4x` = a top-level opHi, `S2:xx` = a
+        // Special2 S2_FUNC. Shares are of the uncovered population AND of all cycles, because the
+        // second is what sizes a lever.
+        {
+            const double ut = (double)(s_g486UncovTotal ? s_g486UncovTotal : 1ull);
+            size_t uorder[0x100];
+            size_t uused = 0u;
+            for (size_t i = 0u; i < 0x100u; ++i)
+                if (s_g486UncovHist[i] != 0ull)
+                    uorder[uused++] = i;
+            std::sort(uorder, uorder + uused, [](size_t a, size_t b) {
+                return s_g486UncovHist[a] > s_g486UncovHist[b];
+            });
+            std::fprintf(stderr, "[G486:uncov] n=%llu (%.2f%% ofCycles) distinct=%zu |",
+                         (unsigned long long)s_g486UncovTotal,
+                         100.0 * (double)s_g486UncovTotal / cyc, uused);
+            const size_t ucap = uused < 16u ? uused : 16u;
+            for (size_t k = 0u; k < ucap; ++k)
+            {
+                const size_t i = uorder[k];
+                if (i & 0x80u)
+                    std::fprintf(stderr, " S2:%02x=%.1f%%/%.2f%%", (unsigned)(i & 0x7Fu),
+                                 100.0 * (double)s_g486UncovHist[i] / ut,
+                                 100.0 * (double)s_g486UncovHist[i] / cyc);
+                else
+                    std::fprintf(stderr, " op:%02x=%.1f%%/%.2f%%", (unsigned)i,
+                                 100.0 * (double)s_g486UncovHist[i] / ut,
+                                 100.0 * (double)s_g486UncovHist[i] / cyc);
+            }
+            std::fprintf(stderr, "\n");
         }
         g421DumpHist("upperKind", s_g421.upperKind, 0x80u, s_g421.cycles);
         g421DumpHist("lowerOpHi", s_g421.lowerOpHi, 0x80u, s_g421.cycles);

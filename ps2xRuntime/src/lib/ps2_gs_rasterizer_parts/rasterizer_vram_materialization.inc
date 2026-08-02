@@ -875,9 +875,20 @@ static bool g305StatOn()  { static const bool v = envFlagEnabled("DC2_G305_STAT"
 // fail as a priced ceiling. Never default-on without the full route matrix.
 static bool g444AsyncOn() { static const bool v = envFlagEnabled("DC2_G444_ASYNC"); return v; }
 
-static bool g_g305PendActive = false;               // a packet is in flight + its fallback retained
-static std::vector<G144Entry> g_g305PendList;       // retained fallback authority for the in-flight batch
-static GS *g_g305PendGs = nullptr;
+// Every drain stays armed for the whole paired run. This is deliberately selected-by-lever,
+// not selected-by-current-arm: a candidate packet may still be pending when the tick changes to
+// control, and that packet must be retired before any consumer or next submission proceeds.
+static bool g305DrainRequired()
+{
+    return g305AsyncOn() || g444AsyncOn() || g452AsyncSelected();
+}
+
+struct G305Pending
+{
+    std::vector<G144Entry> list;
+    GS *gs = nullptr;
+};
+static std::deque<G305Pending> g_g305Pending;       // FIFO matches backend async-slot order
 static bool g_g305ForceSync = false;                // set during failure-replay: suppress re-async + re-drain
 static std::atomic<uint64_t> g_g305Submitted{0};    // async packets submitted
 static std::atomic<uint64_t> g_g305Drained{0};      // packets drained (== submitted at steady state)
@@ -885,11 +896,12 @@ static std::atomic<uint64_t> g_g305Failed{0};       // backend render failures c
 
 // Drain the in-flight async packet (if any) and resolve the delayed-failure contract. Cheap no-op
 // when nothing is pending; safe to call at every consumer edge. Runs only on the front-end thread.
-static void g305DrainPending()
+static bool g305DrainOne()
 {
-    if (!g_g305PendActive || g_g305ForceSync)
-        return;
-    g_g305PendActive = false;
+    if (g_g305Pending.empty() || g_g305ForceSync)
+        return false;
+    G305Pending pending = std::move(g_g305Pending.front());
+    g_g305Pending.pop_front();
     bool ok = true;
     g178_backend_drain_async(ok);
     const uint64_t nDrained = g_g305Drained.fetch_add(1u, std::memory_order_relaxed) + 1u;
@@ -899,10 +911,7 @@ static void g305DrainPending()
                      (unsigned long long)nDrained,
                      (unsigned long long)g_g305Failed.load(std::memory_order_relaxed));
     if (ok)
-    {
-        g_g305PendList.clear();
-        return;
-    }
+        return true;
     // Rare: the backend render/readback failed AFTER the optimistic front-end commit. Void the
     // optimistic snapshot and re-run the proven sequential drain (which itself re-attempts the GPU
     // synchronously and, on failure, runs the whole materialize-chain + CPU band replay) on the
@@ -912,18 +921,23 @@ static void g305DrainPending()
     std::vector<G144Entry> savedList;
     savedList.swap(g_g144List);
     GS *savedGs = g_g144LastGs;
-    g_g144List.swap(g_g305PendList);
-    g_g144LastGs = g_g305PendGs;
+    g_g144List.swap(pending.list);
+    g_g144LastGs = pending.gs;
     g_g305ForceSync = true;
     if (g_g144FlushSeqFn)
         g_g144FlushSeqFn();
     g_g305ForceSync = false;
     g_g144List.swap(savedList);
     g_g144LastGs = savedGs;
-    g_g305PendList.clear();
     if (g305StatOn())
         std::fprintf(stderr, "[G305:async] backend FAILURE recovered via CPU replay (n=%llu)\n",
                      (unsigned long long)g_g305Failed.load(std::memory_order_relaxed));
+    return true;
+}
+
+static void g305DrainPending()
+{
+    while (g305DrainOne()) {}
 }
 
 static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t vramSize)
@@ -932,9 +946,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     G324FlushDiag g324Diag{};
     const bool g324IsArmed = g324Armed();
     G324DiagScope g324Scope(g324IsArmed ? &g324Diag : nullptr);
-    // G305: fence the previous async packet before this flush reads any FBO/snapshot/residency
-    // state or reuses s_batch. Catches a (rare) delayed backend failure before the next prep.
-    if (g305AsyncOn())
+    if (g305DrainRequired())
         g305DrainPending();
     if (!g178GpuOn() || g_g144List.empty() || vram == nullptr)
     {
@@ -3776,10 +3788,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     }
     // G444: `|| g444AsyncOn()` relaxes ONLY the G310 exclusion (and only when the probe is armed);
     // every other eligibility term is unchanged, so a non-armed run takes the identical decision.
+    const bool g452Async = g452AsyncArm();
     const bool g305Async =
-        (g305AsyncOn() || g444AsyncOn()) && !g_g305ForceSync && s_batch.skipReadback && !guestDepth &&
+        (g305AsyncOn() || g444AsyncOn() || g452Async) && !g_g305ForceSync && s_batch.skipReadback && !guestDepth &&
         !g275FuseReadback && !g262WaveDepth && !g286Transient && !g282Tight &&
-        !(g255Rtt && g255VerifyOn()) && (!g310On() || g444AsyncOn());
+        !(g255Rtt && g255VerifyOn()) &&
+        (!g310On() || g444AsyncOn() || g452Async);
     // G324 premise only: this is the existing G305 pure-epilogue contract with G310 admitted as
     // the missing completion-ordered state family. No submission behavior changes here.
     const bool g324TxnEligible =
@@ -3820,10 +3834,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         {
             // Retain fallback authority for the drain-time failure check; leave g_g144List empty so
             // the closure's post-success clear() is a no-op and the next flush accumulates fresh.
-            g_g305PendGs = gs;
-            g_g305PendList.clear();
-            g_g305PendList.swap(g_g144List);
-            g_g305PendActive = true;
+            G305Pending pending;
+            pending.gs = gs;
+            pending.list.swap(g_g144List);
+            g_g305Pending.push_back(std::move(pending));
             g_g305Submitted.fetch_add(1u, std::memory_order_relaxed);
         }
     }
@@ -4245,6 +4259,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             // generations advance when (and only when) the rows materialize at a real CPU
             // consumer edge, which is when the VRAM bytes actually change.
             G261Res &r = g_g261Res[ti];
+            g455NoteResidentWrite(ti);
             r.fbw = fbw;
             r.fbW = fbW;
             r.dirty = true;
@@ -4373,6 +4388,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         s_g276Pend.fbW = fbW;
         if (rowLo < s_g276Pend.rowLo) s_g276Pend.rowLo = rowLo;
         if (rowHi > s_g276Pend.rowHi) s_g276Pend.rowHi = rowHi;
+        g455NoteDisplayWrite();
         g_g276Deferred.fetch_add(1u, std::memory_order_relaxed);
     }
 

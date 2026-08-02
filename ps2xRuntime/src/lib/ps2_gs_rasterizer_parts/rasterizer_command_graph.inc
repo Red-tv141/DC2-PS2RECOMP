@@ -31,6 +31,11 @@
 // fwd (defined later in this file): replayed-batch write notes need it before its definition.
 void g178NoteVramWriteRect(uint8_t *vram, uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
                            uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+// G476 paired A/B arm for the run-weighted page walk. Defined with EXTERNAL linkage in
+// g419_ab_instrument.inc, which this TU includes after this file. It must be declared in this
+// GLOBAL-scope gap: a declaration inside the anonymous namespace below names a different,
+// never-defined symbol.
+int g476PageBumpArm();
 namespace
 {
 
@@ -866,18 +871,160 @@ void g178PageDims(uint32_t psm, uint32_t &pw, uint32_t &ph)
     }
 }
 
-// Sum of write-generations over a conservative page range for a rect at BLOCK base `bp`.
-// Any VRAM write into the range changes the sum (each bump is a monotonic increment).
-uint64_t g178GenSumRect(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
-                        uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+// G471 — the SHIFT form of g178PageDims. Every GS page dimension above is a power of two
+// (64/128 wide, 32/64/128 tall), so every `/pw` and `/ph` in the page-range walks is exactly a
+// right shift. The compiler cannot make that substitution itself: `pw`/`ph` arrive as runtime
+// out-params of a three-way switch, so it must emit a real `div`. G471's PC sampler measured the
+// page-range bookkeeping family (g178NoteVramWriteRect / the g144 flush helpers / g149BumpVramGen /
+// g242PrepareVramReadRect) at roughly 14% of the GS worker's whole span, and the hot entry
+// g178BumpRectImpl runs once or twice per CAPTURED DRAW (~10k/f on MAP-0) with FIVE unsigned
+// divisions in its prologue.
+//
+// Exact by construction: for unsigned n and a power-of-two d, n / d == n >> log2(d). Same page
+// indices, same walk, same generation increments — this changes only the instructions used to
+// derive them. Verified against the division form by DC2_G471_PAGESHIFT_VERIFY=1.
+void g178PageShifts(uint32_t psm, uint32_t &pwSh, uint32_t &phSh)
 {
+    switch (psm)
+    {
+    case GS_PSM_T8: pwSh = 7u; phSh = 6u; break;   // 128 x 64
+    case GS_PSM_T4: pwSh = 7u; phSh = 7u; break;   // 128 x 128
+    case GS_PSM_CT16: case GS_PSM_CT16S: case GS_PSM_Z16: case GS_PSM_Z16S:
+        pwSh = 6u; phSh = 6u; break;               // 64 x 64
+    default: pwSh = 6u; phSh = 5u; break;          // 64 x 32 (CT32/CT24/Z32/Z24)
+    }
+}
+
+// Shared prologue of every conservative page-range walk, in shift form. Returns the page
+// rectangle [px0..px1] x [py0..py1] and the row stride in pages.
+struct G471PageRect
+{
+    uint32_t widthPages, px0, px1, py0, py1, basePage;
+};
+
+static inline G471PageRect g471PageRect(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
+                                        uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    uint32_t pwSh, phSh;
+    g178PageShifts(psm, pwSh, phSh);
+    G471PageRect r;
+    r.widthPages = std::max(1u, (std::max(1u, bw64) << 6u) >> pwSh);
+    r.py0 = y >> phSh;
+    r.py1 = (y + std::max(1u, h) - 1u) >> phSh;
+    r.px0 = x >> pwSh;
+    r.px1 = (x + std::max(1u, w) - 1u) >> pwSh;
+    r.basePage = bpBlocks >> 5;
+    return r;
+}
+
+// Bring-up oracle (default OFF): recompute the same page rectangle with the ORIGINAL division
+// form and report any disagreement. Kept so the substitution can be re-proved after a PSM or
+// page-geometry change rather than re-argued. g471PageShiftVerifyOn() is defined in
+// rasterizer_draw_prim_probe.inc, which this file is included after.
+static inline void g471VerifyPageRect(const G471PageRect &r, uint32_t bpBlocks, uint32_t bw64,
+                                      uint32_t psm, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (!g471PageShiftVerifyOn())
+        return;
     uint32_t pw, ph;
     g178PageDims(psm, pw, ph);
     const uint32_t widthPages = std::max(1u, (std::max(1u, bw64) * 64u) / pw);
     const uint32_t py0 = y / ph, py1 = (y + std::max(1u, h) - 1u) / ph;
     const uint32_t px0 = x / pw, px1 = (x + std::max(1u, w) - 1u) / pw;
-    const uint32_t basePage = bpBlocks >> 5;
+    if (r.widthPages != widthPages || r.py0 != py0 || r.py1 != py1 ||
+        r.px0 != px0 || r.px1 != px1)
+    {
+        static std::atomic<uint32_t> s_bad{0};
+        if (s_bad.fetch_add(1u, std::memory_order_relaxed) < 32u)
+            std::fprintf(stderr,
+                         "[G471:pageshift-BAD] psm=0x%x bw=%u rect=(%u,%u %ux%u) "
+                         "shift=(wp=%u px=%u..%u py=%u..%u) div=(wp=%u px=%u..%u py=%u..%u)\n",
+                         psm, bw64, x, y, w, h, r.widthPages, r.px0, r.px1, r.py0, r.py1,
+                         widthPages, px0, px1, py0, py1);
+    }
+}
+
+// ===== G476: the +1 SLACK PAGE MAKES EVERY INTERIOR PAGE PAY TWICE =====
+//
+// Both page-range walks visit `px` from px0..px1 and touch `pg` AND `pg + 1` — the slack page that
+// covers a non-page-aligned block base. Across one row that is 2*(px1-px0+1) accesses over only
+// (px1-px0+2) DISTINCT pages, because page `s+j` is reached once as `pg` (at px=j) and once as
+// `pg+1` (at px=j-1). Every interior page is therefore visited exactly twice and the two ends
+// exactly once.
+//
+// The bump walk pays that in `lock xadd` — the single most repeated instruction on the GS worker's
+// bookkeeping path, since g178BumpRectImpl runs once or twice per CAPTURED DRAW (~10k/f on MAP-0)
+// and a full-screen CT32 rect covers ~140 pages, i.e. ~280 atomic RMWs per call.
+//
+// EXACT BY CONSTRUCTION. Adding 2 once is the same value as adding 1 twice: the generations are
+// plain monotone counters and no consumer observes an intermediate state (every reader compares a
+// whole SUM taken outside the walk). The masked index of each contribution is computed exactly as
+// before, so wrap-around aliasing lands identically. Same final counters, same sums, same
+// invalidation verdicts — only the instruction count changes. The row is walked from the ends
+// inward so the weights stay obvious: `+1, 2, 2, ..., 2, +1`.
+//
+// VERDICT (G476): exact and verified, but PRICED OUT — kept DEFAULT-OFF (DC2_G476_PAGERUN=1).
+// The visit census below measured 1.2 M walks producing 10.17 M old visits against 7.64 M new ones,
+// i.e. only ~940 atomic RMWs removed per frame (~6 us/f at ~20 cycles each). The ratio is 1.33x and
+// not 2x because most bump rects are ONE page wide (px0 == px1), where the old loop already does
+// the minimum. This site is therefore not the ~4.3% the G446 PC sampler attributed to
+// `g178NoteVramWriteRect` — that row is another symbol FOLD (G471's law: a PDB public symbol name
+// is a hypothesis). Do not re-open this walk; re-open the attribution instead.
+//
+// Oracle: DC2_G476_PAGERUN=1 + DC2_G476_VERIFY=1 re-runs the original per-px form into shadow
+// counters, compares them, and prints the visit ceiling (the oracle lives inside the candidate
+// branch, so it needs the lever armed). Paired gate: DC2_G419_AB=pagebump.
+// Both walks are hot, so the default path must not pay a cross-TU call per invocation: whether the
+// paired lever is SELECTED is fixed for the process (DC2_G419_AB is read once), so that question is
+// answered by one static, and only the selected arm re-reads the alternating value.
+static bool g476PageRunOn()
+{
+    static const bool armed = (g476PageBumpArm() >= 0);
+    if (armed)
+        return g476PageBumpArm() == 1;
+    static const bool on = envFlagEnabled("DC2_G476_PAGERUN");
+    return on;
+}
+
+static bool g476VerifyOn()
+{
+    static const bool on = envFlagEnabled("DC2_G476_VERIFY");
+    return on;
+}
+
+// The weight page `s + j` receives from one row's walk over px0..px1: 1 at each end, 2 inside.
+// (px1 >= px0 always, so a single-page row yields weights 1 and 1 over pages s+px0 and s+px0+1 —
+// exactly what the old loop's single iteration did.)
+static inline uint32_t g476RowWeight(uint32_t j, uint32_t px0, uint32_t px1)
+{
+    return (j == px0 || j == px1 + 1u) ? 1u : 2u;
+}
+
+// Sum of write-generations over a conservative page range for a rect at BLOCK base `bp`.
+// Any VRAM write into the range changes the sum (each bump is a monotonic increment).
+uint64_t g178GenSumRect(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
+                        uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    // G471: shift form of the identical page-rect prologue (see g471PageRect).
+    const G471PageRect pr = g471PageRect(bpBlocks, bw64, psm, x, y, w, h);
+    g471VerifyPageRect(pr, bpBlocks, bw64, psm, x, y, w, h);
+    const uint32_t widthPages = pr.widthPages;
+    const uint32_t py0 = pr.py0, py1 = pr.py1, px0 = pr.px0, px1 = pr.px1;
+    const uint32_t basePage = pr.basePage;
     uint64_t sum = 0;
+    if (g476PageRunOn())
+    {
+        // G476: same multiset of contributions, one load per distinct page (see g476RowWeight).
+        for (uint32_t py = py0; py <= py1; ++py)
+        {
+            const uint32_t s = basePage + py * widthPages;
+            for (uint32_t j = px0; j <= px1 + 1u; ++j)
+                sum += static_cast<uint64_t>(g476RowWeight(j, px0, px1)) *
+                       g_g178PageGen[(s + j) & (kG178PageCount - 1)].load(
+                           std::memory_order_relaxed);
+        }
+        return sum;
+    }
     for (uint32_t py = py0; py <= py1; ++py)
         for (uint32_t px = px0; px <= px1; ++px)
         {
@@ -949,12 +1096,12 @@ void g178BumpRectImpl(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
             }
         }
     }
-    uint32_t pw, ph;
-    g178PageDims(psm, pw, ph);
-    const uint32_t widthPages = std::max(1u, (std::max(1u, bw64) * 64u) / pw);
-    const uint32_t py0 = y / ph, py1 = (y + std::max(1u, h) - 1u) / ph;
-    const uint32_t px0 = x / pw, px1 = (x + std::max(1u, w) - 1u) / pw;
-    const uint32_t basePage = bpBlocks >> 5;
+    // G471: shift form of the identical page-rect prologue (see g471PageRect).
+    const G471PageRect pr = g471PageRect(bpBlocks, bw64, psm, x, y, w, h);
+    g471VerifyPageRect(pr, bpBlocks, bw64, psm, x, y, w, h);
+    const uint32_t widthPages = pr.widthPages;
+    const uint32_t py0 = pr.py0, py1 = pr.py1, px0 = pr.px0, px1 = pr.px1;
+    const uint32_t basePage = pr.basePage;
     // G277-R mover probe: report every bump whose page walk (incl. the +1 slack) can touch the
     // 0x68 display chunk-12 pages 200..207 — pins the writer that trips publish-before-upload.
     {
@@ -981,6 +1128,77 @@ void g178BumpRectImpl(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
                                  bpBlocks, bw64, psm, x, y, w, h, pgLo, pgHi);
             }
         }
+    }
+    if (g476PageRunOn())
+    {
+        // G476: one `lock xadd` per DISTINCT page instead of one per (px, slack) visit. Weights
+        // reproduce the old visit counts exactly — see g476RowWeight.
+        if (g476VerifyOn())
+        {
+            // Oracle: tally both forms into plain per-page counters and compare the deltas. Runs
+            // only under DC2_G476_VERIFY=1; the default path never allocates or touches this.
+            static uint32_t refCount[kG178PageCount];
+            static uint32_t newCount[kG178PageCount];
+            for (uint32_t py = py0; py <= py1; ++py)
+                for (uint32_t px = px0; px <= px1; ++px)
+                {
+                    const uint32_t pg = basePage + py * widthPages + px;
+                    ++refCount[pg & (kG178PageCount - 1)];
+                    ++refCount[(pg + 1) & (kG178PageCount - 1)];
+                }
+            for (uint32_t py = py0; py <= py1; ++py)
+            {
+                const uint32_t s = basePage + py * widthPages;
+                for (uint32_t j = px0; j <= px1 + 1u; ++j)
+                    newCount[(s + j) & (kG178PageCount - 1)] +=
+                        g476RowWeight(j, px0, px1);
+            }
+            bool bad = false;
+            for (uint32_t i = 0; i < kG178PageCount; ++i)
+            {
+                if (refCount[i] != newCount[i])
+                    bad = true;
+                refCount[i] = 0u;
+                newCount[i] = 0u;
+            }
+            static std::atomic<uint64_t> s_checks{0};
+            const uint64_t n = s_checks.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (bad)
+            {
+                static std::atomic<uint32_t> s_bad{0};
+                if (s_bad.fetch_add(1u, std::memory_order_relaxed) < 32u)
+                    std::fprintf(stderr,
+                                 "[G476:pagerun-BAD] bp=0x%x bw=%u psm=0x%x rect=(%u,%u %ux%u) "
+                                 "wp=%u px=%u..%u py=%u..%u\n",
+                                 bpBlocks, bw64, psm, x, y, w, h, widthPages, px0, px1, py0, py1);
+            }
+            else
+            {
+                // Also tally the visits each form performs, so the lever's ceiling (atomic RMWs
+                // removed per frame) is a measured number and not an inference from a PC sample.
+                static std::atomic<uint64_t> s_refVisits{0}, s_newVisits{0};
+                const uint64_t refV = static_cast<uint64_t>(py1 - py0 + 1u) *
+                                      static_cast<uint64_t>(px1 - px0 + 1u) * 2ull;
+                const uint64_t newV = static_cast<uint64_t>(py1 - py0 + 1u) *
+                                      static_cast<uint64_t>(px1 - px0 + 2u);
+                const uint64_t rv = s_refVisits.fetch_add(refV, std::memory_order_relaxed) + refV;
+                const uint64_t nv = s_newVisits.fetch_add(newV, std::memory_order_relaxed) + newV;
+                if (n <= 2ull || (n % 100000ull) == 0ull)
+                    std::fprintf(stderr,
+                                 "[G476:pagerun] walks=%llu bad=0 refVisits=%llu newVisits=%llu\n",
+                                 static_cast<unsigned long long>(n),
+                                 static_cast<unsigned long long>(rv),
+                                 static_cast<unsigned long long>(nv));
+            }
+        }
+        for (uint32_t py = py0; py <= py1; ++py)
+        {
+            const uint32_t s = basePage + py * widthPages;
+            for (uint32_t j = px0; j <= px1 + 1u; ++j)
+                g_g178PageGen[(s + j) & (kG178PageCount - 1)].fetch_add(
+                    g476RowWeight(j, px0, px1), std::memory_order_relaxed);
+        }
+        return;
     }
     for (uint32_t py = py0; py <= py1; ++py)
         for (uint32_t px = px0; px <= px1; ++px)

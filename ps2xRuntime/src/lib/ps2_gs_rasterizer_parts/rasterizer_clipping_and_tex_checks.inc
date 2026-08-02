@@ -35,8 +35,8 @@ struct G407AxisRoundInfo
     bool biasDown = false;
 };
 
-G407AxisRoundInfo g407AxisRoundInfo(int pos0, int pos1, int tex0, int tex1,
-                                   bool pointSampled)
+G407AxisRoundInfo g407AxisRoundInfoLegacy(int pos0, int pos1, int tex0, int tex1,
+                                         bool pointSampled)
 {
     G407AxisRoundInfo out;
     const int dp = pos1 - pos0;
@@ -84,6 +84,60 @@ G407AxisRoundInfo g407AxisRoundInfo(int pos0, int pos1, int tex0, int tex1,
     return out;
 }
 
+G407AxisRoundInfo g407AxisRoundInfoFast(int pos0, int pos1, int tex0, int tex1,
+                                       bool pointSampled)
+{
+    G407AxisRoundInfo out;
+    const int dp = pos1 - pos0;
+    const int dt = tex1 - tex0;
+    if (dp == 0)
+        return out;
+
+    // Preserve G407's exact decisions, but avoid the reduced-denominator gcd/divide
+    // unless it can still change allow. Half alignment is a required conjunct, while
+    // scaled alignment and either endpoint bias already make allow true.
+    bool scaledAligned = false;
+    if ((dt % dp) == 0)
+    {
+        const int scale = dt / dp;
+        const int pos0Round = (pos0 + 0xF) & ~0xF;
+        const int pos1Round = pos1 & ~0xF;
+        const int tex0Round = tex0 + (pos0Round - pos0) * scale;
+        const int tex1Round = tex1 + (pos1Round - pos1) * scale;
+        scaledAligned = ((tex0Round | tex1Round) & 7) == 0;
+    }
+
+    if (pointSampled)
+    {
+        const int absDp = std::abs(dp);
+        const int absDt = std::abs(dt);
+        const bool anchor0 = ((pos0 | tex0) & 0xF) == 0;
+        const bool anchor1 = ((pos1 | tex1) & 0xF) == 0;
+        const bool dtUp = absDt > absDp && absDt <= absDp + 0x10;
+        const bool dtDown = absDt < absDp && absDt >= absDp - 0x10;
+        out.biasUp =
+            (anchor0 && dt > 0 && dtUp) || (anchor0 && dt < 0 && dtDown) ||
+            (anchor1 && dt > 0 && dtDown) || (anchor1 && dt < 0 && dtUp);
+        out.biasDown =
+            (anchor0 && dt > 0 && dtDown) || (anchor0 && dt < 0 && dtUp) ||
+            (anchor1 && dt > 0 && dtUp) || (anchor1 && dt < 0 && dtDown);
+    }
+
+    bool alignedDenominator = false;
+    if (!scaledAligned && !out.biasUp && !out.biasDown &&
+        ((pos0 | pos1 | tex0 | tex1) & 7) == 0)
+    {
+        const int absDp = std::abs(dp);
+        const int absDt = std::abs(dt);
+        const int denominator =
+            absDp / std::gcd(std::max(absDp, 1), std::max(absDt, 1));
+        alignedDenominator = denominator < 32;
+    }
+
+    out.allow = scaledAligned || alignedDenominator || out.biasUp || out.biasDown;
+    return out;
+}
+
 G406UvRoundInfo g406SpriteUvRoundInfo(const GSVertex &v0, const GSVertex &v1,
                                       int ofx, int ofy, bool pointSampled,
                                       bool textured, bool fst)
@@ -101,10 +155,45 @@ G406UvRoundInfo g406SpriteUvRoundInfo(const GSVertex &v0, const GSVertex &v1,
 
     const int dx = x1 - x0, dy = y1 - y0;
     const int du = u1 - u0, dv = v1f - v0f;
-    const G407AxisRoundInfo axisU =
-        g407AxisRoundInfo(x0, x1, u0, u1, pointSampled);
-    const G407AxisRoundInfo axisV =
-        g407AxisRoundInfo(y0, y1, v0f, v1f, pointSampled);
+    static const bool s_g456FastDefault =
+        std::getenv("DC2_G456_NO_FAST_UV_PREDICATE") == nullptr;
+    const int g456Arm = g456UvPredicateArm();
+    const bool g456Fast = g456Arm >= 0 ? g456Arm != 0 : s_g456FastDefault;
+    const G407AxisRoundInfo axisU = g456Fast
+        ? g407AxisRoundInfoFast(x0, x1, u0, u1, pointSampled)
+        : g407AxisRoundInfoLegacy(x0, x1, u0, u1, pointSampled);
+    const G407AxisRoundInfo axisV = g456Fast
+        ? g407AxisRoundInfoFast(y0, y1, v0f, v1f, pointSampled)
+        : g407AxisRoundInfoLegacy(y0, y1, v0f, v1f, pointSampled);
+
+    // Default-off proof gate. Compare both complete axis results on live inputs; only
+    // aggregate periodically so verification never becomes a per-sprite logging path.
+    static const bool s_g456Verify = std::getenv("DC2_G456_VERIFY") != nullptr;
+    if (s_g456Verify)
+    {
+        const G407AxisRoundInfo legacyU =
+            g407AxisRoundInfoLegacy(x0, x1, u0, u1, pointSampled);
+        const G407AxisRoundInfo legacyV =
+            g407AxisRoundInfoLegacy(y0, y1, v0f, v1f, pointSampled);
+        const G407AxisRoundInfo fastU =
+            g407AxisRoundInfoFast(x0, x1, u0, u1, pointSampled);
+        const G407AxisRoundInfo fastV =
+            g407AxisRoundInfoFast(y0, y1, v0f, v1f, pointSampled);
+        const auto same = [](const G407AxisRoundInfo &a, const G407AxisRoundInfo &b) {
+            return a.allow == b.allow && a.biasUp == b.biasUp && a.biasDown == b.biasDown;
+        };
+        static std::atomic<uint64_t> s_total{0u}, s_bad{0u};
+        const bool bad = !same(legacyU, fastU) || !same(legacyV, fastV);
+        if (bad)
+            s_bad.fetch_add(1u, std::memory_order_relaxed);
+        const uint64_t total = s_total.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (total == 1u || (total & 0xFFFFu) == 0u || bad)
+        {
+            std::fprintf(stderr, "[G456:verify] total=%llu bad=%llu\n",
+                         static_cast<unsigned long long>(total),
+                         static_cast<unsigned long long>(s_bad.load(std::memory_order_relaxed)));
+        }
+    }
     static const bool legacyWideNudge =
         std::getenv("DC2_G407_LEGACY_WIDE_UV_NUDGE") != nullptr;
 

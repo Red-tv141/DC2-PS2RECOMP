@@ -115,6 +115,9 @@ namespace
         uint64_t count;
     };
     G446Bucket g_g446Table[kG446Slots]{};
+    // G478: which thread this sampler instance is pointed at (report tag only). The sampler is a
+    // singleton — arm at most one of DC2_G446_GSPROF / DC2_G478_VU1PROF per run.
+    const char *g_g446Label = "gsprof";
     uint64_t g_g446Total = 0;
     uint64_t g_g446Failed = 0;
     uint64_t g_g446Distinct = 0;
@@ -268,7 +271,8 @@ namespace
                   [](const G446Bucket &a, const G446Bucket &b) { return a.count > b.count; });
 
         std::fprintf(stderr,
-                     "[G446:gsprof] samples=%llu distinctPc=%llu dropped=%llu periodUs=%u (top %zu)\n",
+                     "[G446:%s] samples=%llu distinctPc=%llu dropped=%llu periodUs=%u (top %zu)\n",
+                     g_g446Label,
                      static_cast<unsigned long long>(g_g446Total),
                      static_cast<unsigned long long>(g_g446Distinct),
                      static_cast<unsigned long long>(g_g446Failed),
@@ -286,14 +290,97 @@ namespace
                          100.0 * static_cast<double>(g_g446StageWait[s]) /
                              static_cast<double>(g_g446StageCount[s]));
         }
+        // G478: a public-symbol name is a hypothesis (G471/G476) — every `static` folds into the
+        // preceding exported symbol, so the top rows of this report have repeatedly named the wrong
+        // function. If the PDB carries line info, SymGetLineFromAddr64 resolves the FILE:LINE the
+        // sample actually landed on, which no fold can corrupt. Printed for the fn-base rip AND
+        // for that function's single hottest raw PC, since the base of a folded row belongs to the
+        // wrong function while the hot PC belongs to the real one.
         for (size_t i = 0; i < nTop; ++i)
         {
             char name[560];
             g446Symbolize(top[i].rip, name, sizeof(name));
-            std::fprintf(stderr, "[G446:gsprof]   %5.2f%% n=%llu rip=0x%llx %s\n",
+            uint64_t hotPc = top[i].rip;
+            uint64_t hotN = 0;
+            for (size_t s = 0; s < kG446Slots; ++s)
+            {
+                if (g_g446Table[s].count == 0)
+                    continue;
+                if (g446FuncBase(g_g446Table[s].rip) != top[i].rip)
+                    continue;
+                if (g_g446Table[s].count > hotN)
+                {
+                    hotN = g_g446Table[s].count;
+                    hotPc = g_g446Table[s].rip;
+                }
+            }
+            IMAGEHLP_LINE64 line{};
+            line.SizeOfStruct = sizeof(line);
+            DWORD lineDisp = 0;
+            if (SymGetLineFromAddr64(GetCurrentProcess(), static_cast<DWORD64>(hotPc), &lineDisp,
+                                     &line) != FALSE)
+            {
+                const char *base = line.FileName ? std::strrchr(line.FileName, '\\') : nullptr;
+                std::fprintf(stderr, "[G446:%sline]   %5.2f%% hotPc=0x%llx n=%llu %s:%lu\n",
+                             g_g446Label,
+                             100.0 * static_cast<double>(top[i].count) / denom,
+                             static_cast<unsigned long long>(hotPc),
+                             static_cast<unsigned long long>(hotN),
+                             base ? base + 1 : line.FileName, line.LineNumber);
+            }
+            std::fprintf(stderr, "[G446:%s]   %5.2f%% n=%llu rip=0x%llx %s\n", g_g446Label,
                          100.0 * static_cast<double>(top[i].count) / denom,
                          static_cast<unsigned long long>(top[i].count),
                          static_cast<unsigned long long>(top[i].rip), name);
+        }
+
+        // G483: RAW-PC report in PREFERRED-BASE form (DC2_G483_RAWPC=1).
+        //
+        // WHY. The fn-folded rows above answer "which function", and for this thread the answer has
+        // been "82.75% VU1Interpreter::run" since G478 — one function of ~76 KB. That is not an
+        // attribution, it is a restatement of the problem. What names the cost is WHERE INSIDE it,
+        // and the PDB has no line info (G478), so the only resolver is the linker /MAP (G480).
+        // A /MAP lists preferred VAs, so convert here rather than making the reader guess the
+        // ASLR slide: preferred = rip - imageBase + 0x140000000.
+        //
+        // The rows are individual sampled PCs, NOT folded, because a 76 KB function's internal
+        // distribution is the entire question.
+        {
+            static const bool s_rawPc = (std::getenv("DC2_G483_RAWPC") != nullptr);
+            if (s_rawPc && g_g446ExeLo != 0)
+            {
+                static G446Bucket raw[64];
+                size_t nRaw = 0;
+                for (size_t i = 0; i < kG446Slots; ++i)
+                {
+                    const G446Bucket &b = g_g446Table[i];
+                    if (b.count == 0)
+                        continue;
+                    if (nRaw < 64)
+                        raw[nRaw++] = b;
+                    else
+                    {
+                        size_t worst = 0;
+                        for (size_t j = 1; j < 64; ++j)
+                            if (raw[j].count < raw[worst].count)
+                                worst = j;
+                        if (raw[worst].count < b.count)
+                            raw[worst] = b;
+                    }
+                }
+                std::sort(raw, raw + nRaw,
+                          [](const G446Bucket &a, const G446Bucket &b) { return a.count > b.count; });
+                for (size_t i = 0; i < nRaw; ++i)
+                {
+                    const uint64_t pref = raw[i].rip >= g_g446ExeLo && raw[i].rip < g_g446ExeHi
+                                              ? raw[i].rip - g_g446ExeLo + 0x140000000ull
+                                              : 0ull;
+                    std::fprintf(stderr, "[G483:rawpc]   %5.2f%% n=%llu pref=0x%llx\n",
+                                 100.0 * static_cast<double>(raw[i].count) / denom,
+                                 static_cast<unsigned long long>(raw[i].count),
+                                 static_cast<unsigned long long>(pref));
+                }
+            }
         }
     }
 
@@ -348,13 +435,12 @@ namespace
 
     // Called once from the GS worker thread's own entry, so the handle is guaranteed to be that
     // thread and no registry/lookup is needed.
-    void g446RegisterGsWorkerThread(std::atomic<int> *stageBreadcrumb)
+    void g446ArmSamplerOnThisThread(std::atomic<int> *stageBreadcrumb, const char *label)
     {
 #ifdef _WIN32
-        if (!g446GsProfOn())
-            return;
         if (g_g446SamplerStarted.exchange(true))
             return;
+        g_g446Label = label;
         g_g446Stage = stageBreadcrumb;
         // Exe address range, so "sampled inside a kernel/driver wait" can be told from
         // "sampled inside our own code" without symbolising on the sampling path.
@@ -371,13 +457,43 @@ namespace
                              THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
                              FALSE, 0))
         {
-            std::fprintf(stderr, "[G446:gsprof] DuplicateHandle failed (%lu) — sampler disabled\n",
-                         GetLastError());
+            std::fprintf(stderr, "[G446:%s] DuplicateHandle failed (%lu) — sampler disabled\n",
+                         label, GetLastError());
             return;
         }
-        std::fprintf(stderr, "[G446:gsprof] armed: sampling the GS worker at %u us, report every %u s\n",
-                     g446SampleUs(), g446ReportSec());
+        std::fprintf(stderr, "[G446:%s] armed: sampling at %u us, report every %u s\n",
+                     label, g446SampleUs(), g446ReportSec());
         std::thread(g446SamplerMain, dup).detach();
+#else
+        (void)stageBreadcrumb;
+        (void)label;
 #endif
     }
+
+    // Called once from the GS worker thread's own entry, so the handle is guaranteed to be that
+    // thread and no registry/lookup is needed.
+    void g446RegisterGsWorkerThread(std::atomic<int> *stageBreadcrumb)
+    {
+        if (!g446GsProfOn())
+            return;
+        g446ArmSamplerOnThisThread(stageBreadcrumb, "gsprof");
+    }
 } // namespace
+
+// ===== G478: the same sampler, pointed at the VU1 (MTVU) worker thread =====
+//
+// G476 closed the VU1 direction on a derivative probe that read +0.129 ms/f (t = 1.22) for +1.2 ms
+// injected. G477 then took ~1.0 ms of CPU off the GS worker, and the G478 premise gate re-read the
+// two probes as GS 1.59 -> +1.21 (sens 0.76) and VU1 1.23 -> +0.99 (sens 0.80): the two workers are
+// now a SERIALIZED CHAIN of near-equal sensitivity, so the VU1 worker is a live pole again. It has
+// never been sampled — [G303:vu1w] busyMs/f is OCCUPANCY (G434/G476), not a distribution. Default
+// OFF; arm with DC2_G478_VU1PROF=1 and never together with DC2_G446_GSPROF.
+void g478RegisterVu1WorkerThread()
+{
+#ifdef _WIN32
+    static const bool s_on = (std::getenv("DC2_G478_VU1PROF") != nullptr);
+    if (!s_on)
+        return;
+    g446ArmSamplerOnThisThread(nullptr, "vu1prof");
+#endif
+}

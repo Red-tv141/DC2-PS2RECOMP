@@ -102,6 +102,33 @@ static std::atomic<uint64_t> g_g312Seg2aNs{0}, g_g312Seg2bNs{0};
 static thread_local std::chrono::steady_clock::time_point t_g312Seg2Start{};
 static thread_local std::chrono::steady_clock::time_point t_g312Seg2aEnd{}, t_g312Seg2bEnd{};
 
+// G458 exact clipped-primitive rejection (default on; rollback: DC2_G458_NO_CULL_CLIPPED=1).
+// A primitive whose complete screen-space bounding box is disjoint from SCISSOR cannot sample,
+// blend, test, or write a pixel.  The GS front end has already consumed the vertex kick; this
+// predicate only avoids building/executing an empty raster command.  It intentionally lives after
+// drawPrimitive's stateful prologue (costume-Z/display-source bookkeeping) and immediately before
+// the G144 capture/inline dependency machinery.
+static bool g458CullClippedOn()
+{
+    static const bool on = (std::getenv("DC2_G458_NO_CULL_CLIPPED") == nullptr) &&
+                           !envFlagDisabled("DC2_G458_CULL_CLIPPED");
+    return on;
+}
+
+static bool g458CullStatOn()
+{
+    static const bool on = (std::getenv("DC2_G458_STAT") != nullptr);
+    return on;
+}
+
+// G459 diagnostic-only triangle/scissor separation census. Its 0.043% hit rate failed the
+// premise gate, so no behavior arm remains.
+static bool g459TriScissorStatOn()
+{
+    static const bool on = envFlagEnabled("DC2_G459_STAT");
+    return on;
+}
+
 void GSRasterizer::drawPrimitive(GS *gs)
 {
     g401NoteFrontDoor(this, gs, gs->m_vram, gs->m_vtxQueue[0],
@@ -114,14 +141,24 @@ void GSRasterizer::drawPrimitive(GS *gs)
     // G369 (diagnostic, default-off DC2_G369_CENSUS=1): count every submitted primitive here,
     // at the front door — after this point a draw can be deferred (G144) or handed to the GPU
     // backend (G178) and never reach drawTriangle/drawSprite on this thread.
+    // G471: the enabled test used to live INSIDE g369NoteDrawPrim, so every draw paid a real
+    // out-of-line call with seven arguments (three GSVertex references) plus an activeContext()
+    // resolve just to return immediately. G369 itself was refuted by G371 and this census is
+    // permanently default-off, yet the sampler still charged its folded bucket ~1.4% of the GS
+    // worker's span. Hoisting the cached-bool gate to the call site removes the call entirely on
+    // the default path; behaviour with DC2_G369_CENSUS=1 is unchanged.
     {
+        extern bool g369CensusEnabled();
         extern void g369NoteDrawPrim(uint32_t type, const GSVertex &v0, const GSVertex &v1,
                                      const GSVertex &v2, uint32_t fbp, uint32_t tbp0, uint32_t tme);
-        const auto &g369ctx = gs->activeContext();
-        g369NoteDrawPrim(static_cast<uint32_t>(gs->m_prim.type),
-                         gs->m_vtxQueue[0], gs->m_vtxQueue[1], gs->m_vtxQueue[2],
-                         g369ctx.frame.fbp, g369ctx.tex0.tbp0,
-                         static_cast<uint32_t>(gs->m_prim.tme));
+        if (g369CensusEnabled())
+        {
+            const auto &g369ctx = gs->activeContext();
+            g369NoteDrawPrim(static_cast<uint32_t>(gs->m_prim.type),
+                             gs->m_vtxQueue[0], gs->m_vtxQueue[1], gs->m_vtxQueue[2],
+                             g369ctx.frame.fbp, g369ctx.tex0.tbp0,
+                             static_cast<uint32_t>(gs->m_prim.tme));
+        }
     }
     // G219 transition sentinel (inert unless DC2_G219_SKYPX=1).
     {

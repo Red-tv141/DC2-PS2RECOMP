@@ -1,3 +1,5 @@
+int g473SimdMergeArm();
+
 // G397: reserved A+D display-alias fix plus presentation diagnostics live in the parts below.
 // G412: force-recompile marker for immutable depth-two frame-boundary presentation snapshots.
 // G399: DC2_G399_SURFDUMP raw render-target surface probe (diagnostic, default-off).
@@ -6,6 +8,7 @@
 // G440: present-latch component profile (DC2_G440_LATCH=1, behaviour-pure). Must precede the
 // helpers/display parts so both can use G440LatchScope.
 // g440_latch_profile.inc revision: 3 (merge loop restored to the vectorisable three-pass form)
+// G473: exact SSE2 dual-CRT merge promoted + scalar byte oracle (force recompile v2).
 #include "ps2_gs_gpu_parts/g440_latch_profile.inc"
 #include "ps2_gs_gpu_parts/gpu_bridge_and_latch_helpers.inc"
 // G432: TRXDIR cost census (DC2_G432_CENSUS=1, behaviour-pure). Must precede

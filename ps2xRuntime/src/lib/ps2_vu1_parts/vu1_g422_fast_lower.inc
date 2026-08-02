@@ -42,6 +42,12 @@
 // Kill:     DC2_G422_NO_FAST_LOWER=1  (restores the legacy execLower path exactly)
 // Verify:   DC2_G422_VERIFY=1  (shadow-executes legacy execLower from the same pre-state and
 //                               compares the whole VU1State *and* all 16 KB of VU data memory)
+// G480 NOP-skip paired gate (defined in ps2_gs_rasterizer_parts/g419_ab_instrument.inc).
+// -1 = this lever is not selected (honour DC2_G480_NO_NOPSKIP), 0 = control, 1 = candidate.
+extern int g480NopSkipArm();
+// G481 hot-kind inline paired gate (same file). -1 = not selected, 0 = control, 1 = candidate.
+extern int g481HotLowerArm();
+
 namespace
 {
     // Dense kind space, so the dispatch below compiles to one jump table.
@@ -160,6 +166,35 @@ namespace
         return s_on;
     }
 
+    // G480: hoist the NOP test out of the (out-of-line) g422FastLower call. Read once per run(),
+    // never per pair, and — like G475/G479 — the A/B arm is HELD for a block of frames so a single
+    // microprogram can never change dispatch shape mid-execution. See the g480NopSkip comment in
+    // vu1_upper_opcodes.inc for the mechanism and the map evidence.
+    bool g480NopSkipRun()
+    {
+        if (g480NopSkipArm() >= 0)
+            return g480NopSkipArm() > 0;
+        static const bool s_on = !f50_12_vu_env_flag("DC2_G480_NO_NOPSKIP");
+        return s_on;
+    }
+
+    // G481: execute the seven HOT kinds inline in the loop instead of through the (out-of-line,
+    // MSVC-refused-to-inline) g422FastLower call. Loop-INVARIANT like g480NopSkip: read once per
+    // run(), never per pair, and the A/B arm is HELD for a block of frames.
+    bool g481HotLowerRun()
+    {
+        if (g481HotLowerArm() >= 0)
+            return g481HotLowerArm() > 0;
+        static const bool s_on = !f50_12_vu_env_flag("DC2_G481_NO_HOT_LOWER");
+        return s_on;
+    }
+
+    bool g481VerifyOn()
+    {
+        static const bool s_on = f50_12_vu_env_flag("DC2_G481_VERIFY");
+        return s_on;
+    }
+
     // Every env that arms a probe living INSIDE one of the covered execLower bodies (or inside
     // execLower's own prologue). Any of them keeps the whole lower slot on the legacy path.
     // NOTE: DC2_TRACE_VU1 (which arms the G39 load trace) and DC2_TRACE_G32 already force
@@ -206,22 +241,12 @@ namespace
         case G422_LK_NOP:
             return;
 
+        // G481: the seven HOT kinds' bodies live in vu1_g481_hot_lower.inc so that this
+        // out-of-line path and the loop's inline path expand the SAME tokens. Nothing about the
+        // executed code changed when they moved.
         case G422_LK_LQ:
-        {
-            const uint8_t it = LIT(instr);
-            const uint8_t is = LIS(instr);
-            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
-            const int16_t imm = IMM11(instr);
-            uint32_t addr = ((uint32_t)(int32_t)(st.vi[is] + imm)) * 16u;
-            addr &= (dataSize - 1);
-            if (addr + 16 <= dataSize)
-            {
-                float tmp[4];
-                std::memcpy(tmp, vuData + addr, 16);
-                g422ApplyDest(st.vf[it], tmp, dest);
-            }
+            G481_LOWER_BODY_LQ(st, instr, vuData, dataSize);
             return;
-        }
         case G422_LK_SQ:
         {
             const uint8_t is = LIS(instr);
@@ -295,47 +320,20 @@ namespace
             return;
         }
         case G422_LK_IADDIU:
-        {
-            const uint8_t it = LIT(instr);
-            const uint8_t is = LIS(instr);
-            const int16_t imm = (int16_t)((int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800));
-            if (it != 0)
-                st.vi[it] = (int16_t)(st.vi[is] + imm);
+            G481_LOWER_BODY_IADDIU(st, instr);
             return;
-        }
         case G422_LK_ISUBIU:
-        {
-            const uint8_t it = LIT(instr);
-            const uint8_t is = LIS(instr);
-            const int16_t imm = (int16_t)((int16_t)(instr & 0x7FF) | ((instr >> 10) & 0x7800));
-            if (it != 0)
-                st.vi[it] = (int16_t)(st.vi[is] - imm);
+            G481_LOWER_BODY_ISUBIU(st, instr);
             return;
-        }
         case G422_LK_B:
-        {
-            const int16_t imm = IMM11(instr);
-            const uint32_t target = (st.pc + 8 + imm * 8) & 0x3FFF;
-            st.pc = target - 8;
+            G481_LOWER_BODY_B(st, instr);
             return;
-        }
         case G422_LK_BAL:
-        {
-            const uint8_t it = LIT(instr);
-            const int16_t imm = IMM11(instr);
-            const uint32_t target = (st.pc + 8 + imm * 8) & 0x3FFF;
-            if (it != 0)
-                st.vi[it] = (int32_t)((st.pc + 16) / 8);
-            st.pc = target - 8;
+            G481_LOWER_BODY_BAL(st, instr);
             return;
-        }
         case G422_LK_JR:
-        {
-            const uint8_t is = LIS(instr);
-            const uint32_t target = ((uint32_t)(uint16_t)st.vi[is] * 8u) & 0x3FFF;
-            st.pc = target - 8;
+            G481_LOWER_BODY_JR(st, instr);
             return;
-        }
         case G422_LK_JALR:
         {
             const uint8_t it = LIT(instr);
@@ -347,29 +345,11 @@ namespace
             return;
         }
         case G422_LK_IBEQ:
-        {
-            const uint8_t it = LIT(instr);
-            const uint8_t is = LIS(instr);
-            const int16_t imm = IMM11(instr);
-            if ((int16_t)st.vi[is] == (int16_t)st.vi[it])
-            {
-                const uint32_t target = (st.pc + 8 + imm * 8) & 0x3FFF;
-                st.pc = target - 8;
-            }
+            G481_LOWER_BODY_IBEQ(st, instr);
             return;
-        }
         case G422_LK_IBNE:
-        {
-            const uint8_t it = LIT(instr);
-            const uint8_t is = LIS(instr);
-            const int16_t imm = IMM11(instr);
-            if ((int16_t)st.vi[is] != (int16_t)st.vi[it])
-            {
-                const uint32_t target = (st.pc + 8 + imm * 8) & 0x3FFF;
-                st.pc = target - 8;
-            }
+            G481_LOWER_BODY_IBNE(st, instr);
             return;
-        }
         case G422_LK_IBLTZ:
         {
             const uint8_t is = LIS(instr);
@@ -415,50 +395,20 @@ namespace
             return;
         }
         case G422_LK_IADD:
-        {
-            const uint8_t it = LIT(instr);
-            const uint8_t is = LIS(instr);
-            const uint8_t id = LID(instr);
-            if (id != 0)
-                st.vi[id] = (int16_t)(st.vi[is] + st.vi[it]);
+            G481_LOWER_BODY_IADD(st, instr);
             return;
-        }
         case G422_LK_ISUB:
-        {
-            const uint8_t it = LIT(instr);
-            const uint8_t is = LIS(instr);
-            const uint8_t id = LID(instr);
-            if (id != 0)
-                st.vi[id] = (int16_t)(st.vi[is] - st.vi[it]);
+            G481_LOWER_BODY_ISUB(st, instr);
             return;
-        }
         case G422_LK_IADDI:
-        {
-            const uint8_t it = LIT(instr);
-            const uint8_t is = LIS(instr);
-            const int16_t imm5 = (int16_t)((int32_t)((instr >> 6) & 0x1F) << 27 >> 27);
-            if (it != 0)
-                st.vi[it] = (int16_t)(st.vi[is] + imm5);
+            G481_LOWER_BODY_IADDI(st, instr);
             return;
-        }
         case G422_LK_IAND:
-        {
-            const uint8_t it = LIT(instr);
-            const uint8_t is = LIS(instr);
-            const uint8_t id = LID(instr);
-            if (id != 0)
-                st.vi[id] = st.vi[is] & st.vi[it];
+            G481_LOWER_BODY_IAND(st, instr);
             return;
-        }
         case G422_LK_IOR:
-        {
-            const uint8_t it = LIT(instr);
-            const uint8_t is = LIS(instr);
-            const uint8_t id = LID(instr);
-            if (id != 0)
-                st.vi[id] = st.vi[is] | st.vi[it];
+            G481_LOWER_BODY_IOR(st, instr);
             return;
-        }
         case G422_LK_MOVE:
         {
             const uint8_t it = LIT(instr);
@@ -479,47 +429,11 @@ namespace
             return;
         }
         case G422_LK_LQI:
-        {
-            const uint8_t it = LIT(instr);
-            const uint8_t is = LIS(instr);
-            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
-            uint32_t addr = ((uint32_t)(uint16_t)st.vi[is]) * 16u;
-            addr &= (dataSize - 1);
-            if (addr + 16 <= dataSize)
-            {
-                float tmp[4];
-                std::memcpy(tmp, vuData + addr, 16);
-                g422ApplyDest(st.vf[it], tmp, dest);
-            }
-            if (is != 0)
-                st.vi[is] = (int16_t)(st.vi[is] + 1);
+            G481_LOWER_BODY_LQI(st, instr, vuData, dataSize);
             return;
-        }
         case G422_LK_SQI:
-        {
-            const uint8_t it = LIT(instr);
-            const uint8_t is = LIS(instr);
-            const uint8_t dest = (uint8_t)((instr >> 21) & 0xF);
-            uint32_t addr = ((uint32_t)(uint16_t)st.vi[it]) * 16u;
-            addr &= (dataSize - 1);
-            if (addr + 16 <= dataSize)
-            {
-                float tmp[4];
-                std::memcpy(tmp, vuData + addr, 16);
-                if (dest & 0x8)
-                    tmp[0] = st.vf[is][0];
-                if (dest & 0x4)
-                    tmp[1] = st.vf[is][1];
-                if (dest & 0x2)
-                    tmp[2] = st.vf[is][2];
-                if (dest & 0x1)
-                    tmp[3] = st.vf[is][3];
-                std::memcpy(vuData + addr, tmp, 16);
-            }
-            if (it != 0)
-                st.vi[it] = (int16_t)(st.vi[it] + 1);
+            G481_LOWER_BODY_SQI(st, instr, vuData, dataSize);
             return;
-        }
         case G422_LK_LQD:
         {
             const uint8_t it = LIT(instr);

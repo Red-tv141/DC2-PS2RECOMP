@@ -467,12 +467,16 @@ static bool g310ApplyDesired(
             if (runLo == px)
                 continue;
             const uint32_t pages = px - runLo;
-            if (!g310DecodeGuestRun(py, runLo, pages, s_guestPixels) ||
-                !g264_backend_write_color_rect(
-                    kG310LogicalFbp, 512, 512,
-                    static_cast<int>(runLo * 64u),
-                    static_cast<int>(512u - (py + 1u) * 32u),
-                    static_cast<int>(pages * 64u), 32, s_guestPixels))
+            const int x = static_cast<int>(runLo * 64u);
+            const int y = static_cast<int>(512u - (py + 1u) * 32u);
+            const int width = static_cast<int>(pages * 64u);
+            if (!g310DecodeGuestRun(py, runLo, pages, s_guestPixels))
+            {
+                g310Invalidate("guest-upload", true);
+                return false;
+            }
+            if (!g264_backend_write_color_rect(
+                    kG310LogicalFbp, 512, 512, x, y, width, 32, s_guestPixels))
             {
                 g310Invalidate("guest-upload", true);
                 return false;
@@ -481,7 +485,6 @@ static bool g310ApplyDesired(
             g_g310GuestPages.fetch_add(pages, std::memory_order_relaxed);
         }
     }
-
     for (uint32_t t = 0u; t < kG248TargetCount; ++t)
     {
         static std::vector<int32_t> s_rects;

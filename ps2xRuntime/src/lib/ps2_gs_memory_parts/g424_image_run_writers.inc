@@ -29,12 +29,26 @@ namespace
             Traits::Write(table, data, bp, bw, x + i, y,
                           static_cast<typename Traits::PackedT>(load(i)));
     }
+
 }
+
+// G477: swizzle-row hoisted forms of the two run writers this route actually spends time in.
+#include "ps2_gs_memory_parts/g477_fast_run_writers.inc"
 
 // --- 32-bit colour / depth ---------------------------------------------------------------------
 
 void WriteRunCT32(u8 *data, u32 bp, u32 bw, u32 x, u32 y, const u8 *src, u32 count)
 {
+    if (g477CensusOn())
+        g477NoteRun(0u, count);
+    if (g477UseFast())
+    {
+        if (g477VerifyOn())
+            g477RunWrite32<C32, true>(PageTableC32, data, bp, bw, x, y, src, count);
+        else
+            g477RunWrite32<C32, false>(PageTableC32, data, bp, bw, x, y, src, count);
+        return;
+    }
     G424RunWrite<C32>(PageTableC32, data, bp, bw, x, y, count, [src](u32 i) {
         u32 v;
         std::memcpy(&v, src + i * 4u, 4u);
@@ -44,6 +58,14 @@ void WriteRunCT32(u8 *data, u32 bp, u32 bw, u32 x, u32 y, const u8 *src, u32 cou
 
 void WriteRunZ32(u8 *data, u32 bp, u32 bw, u32 x, u32 y, const u8 *src, u32 count)
 {
+    if (g477UseFast())
+    {
+        if (g477VerifyOn())
+            g477RunWrite32<Z32, true>(PageTableZ32, data, bp, bw, x, y, src, count);
+        else
+            g477RunWrite32<Z32, false>(PageTableZ32, data, bp, bw, x, y, src, count);
+        return;
+    }
     G424RunWrite<Z32>(PageTableZ32, data, bp, bw, x, y, count, [src](u32 i) {
         u32 v;
         std::memcpy(&v, src + i * 4u, 4u);
@@ -120,6 +142,16 @@ void WriteRunP8H(u8 *data, u32 bp, u32 bw, u32 x, u32 y, const u8 *src, u32 coun
 void WriteRunP4(u8 *data, u32 bp, u32 bw, u32 x, u32 y,
                 const u8 *src, u32 nibble0, u32 count)
 {
+    if (g477CensusOn())
+        g477NoteRun(1u, count);
+    if (g477UseFast())
+    {
+        if (g477VerifyOn())
+            g477RunWriteP4<true>(data, bp, bw, x, y, src, nibble0, count);
+        else
+            g477RunWriteP4<false>(data, bp, bw, x, y, src, nibble0, count);
+        return;
+    }
     G424RunWrite<P4>(PageTableP4, data, bp, bw, x, y, count, [src, nibble0](u32 i) {
         const u32 n = nibble0 + i;
         return static_cast<u32>((src[n >> 1u] >> ((n & 1u) * 4u)) & 0x0Fu);

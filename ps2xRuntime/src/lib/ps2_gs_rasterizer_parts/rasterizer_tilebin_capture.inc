@@ -1,3 +1,135 @@
+    // G458: exact empty-work rejection.  Keep this after the stateful prologue in the preceding
+    // part, but before any capture, target-switch flush, ownership edge, or inline raster work.
+    // DC2_G458_STAT=1 enables cumulative per-type counts without timing every draw.
+    const bool g458MissesScissor = g458CullClippedOn() && [&]() {
+        int vertexCount = 3;
+        switch (gs->m_prim.type)
+        {
+        case GS_PRIM_POINT: vertexCount = 1; break;
+        case GS_PRIM_LINE:
+        case GS_PRIM_LINESTRIP:
+        case GS_PRIM_SPRITE: vertexCount = 2; break;
+        case GS_PRIM_TRIANGLE:
+        case GS_PRIM_TRISTRIP:
+        case GS_PRIM_TRIFAN: vertexCount = 3; break;
+        default: return false;
+        }
+
+        float minX = gs->m_vtxQueue[0].x;
+        float maxX = minX;
+        float minY = gs->m_vtxQueue[0].y;
+        float maxY = minY;
+        for (int i = 1; i < vertexCount; ++i)
+        {
+            minX = std::min(minX, gs->m_vtxQueue[i].x);
+            maxX = std::max(maxX, gs->m_vtxQueue[i].x);
+            minY = std::min(minY, gs->m_vtxQueue[i].y);
+            maxY = std::max(maxY, gs->m_vtxQueue[i].y);
+        }
+
+        const float ofx = static_cast<float>(ctx.xyoffset.ofx >> 4);
+        const float ofy = static_cast<float>(ctx.xyoffset.ofy >> 4);
+        // Expand outward before rejecting.  This is deliberately more conservative than each
+        // leaf rasterizer: it also covers line/point integer truncation and the legacy sprite-edge
+        // rollback, so no sub-pixel primitive that could reach the boundary pixel is removed.
+        return std::ceil(maxX - ofx) < static_cast<float>(ctx.scissor.x0) ||
+               std::floor(minX - ofx) > static_cast<float>(ctx.scissor.x1) ||
+               std::ceil(maxY - ofy) < static_cast<float>(ctx.scissor.y0) ||
+               std::floor(minY - ofy) > static_cast<float>(ctx.scissor.y1);
+    }();
+    if (g458MissesScissor)
+    {
+        if (g458CullStatOn())
+        {
+            static std::atomic<uint64_t> s_culled[7]{};
+            static std::atomic<uint64_t> s_total{0};
+            const uint32_t type = static_cast<uint32_t>(gs->m_prim.type);
+            if (type < 7u)
+                s_culled[type].fetch_add(1u, std::memory_order_relaxed);
+            const uint64_t n = s_total.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if ((n & 0x1FFFull) == 0u)
+                std::fprintf(stderr,
+                             "[G458:cull] total=%llu type(0..6)=%llu,%llu,%llu,%llu,%llu,%llu,%llu\n",
+                             static_cast<unsigned long long>(n),
+                             static_cast<unsigned long long>(s_culled[0].load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(s_culled[1].load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(s_culled[2].load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(s_culled[3].load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(s_culled[4].load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(s_culled[5].load(std::memory_order_relaxed)),
+                             static_cast<unsigned long long>(s_culled[6].load(std::memory_order_relaxed)));
+        }
+        return;
+    }
+
+    // G459: G458 rejects only primitives whose bounding box misses SCISSOR. A diagonal triangle
+    // can overlap that box while its complete area remains outside. Test the remaining triangle
+    // against the rectangle's two axes (already covered by G458) and the three triangle-edge
+    // normals. The rectangle is expanded one pixel on every side: normal triangles sample at
+    // x/y+0.5, G408 shadow triangles sample at integer coordinates, and the legacy barycentric
+    // tolerance expands an edge by <1 pixel over the GS coordinate range. Strict separation from
+    // this larger rectangle therefore cannot remove a pixel accepted by any current leaf.
+    const bool g459Stat = g459TriScissorStatOn();
+    const bool g459Triangle =
+        gs->m_prim.type == GS_PRIM_TRIANGLE ||
+        gs->m_prim.type == GS_PRIM_TRISTRIP ||
+        gs->m_prim.type == GS_PRIM_TRIFAN;
+    const bool g459Separated = g459Stat && g459Triangle && [&]() {
+        double x[3], y[3];
+        const double ofx = static_cast<double>(ctx.xyoffset.ofx >> 4);
+        const double ofy = static_cast<double>(ctx.xyoffset.ofy >> 4);
+        for (int i = 0; i < 3; ++i)
+        {
+            const GSVertex &v = gs->m_vtxQueue[i];
+            // Custom near-plane handling in drawTriangle may replace mixed/behind vertices.
+            // Fail closed unless all vertices are ordinary finite, positive-Q inputs.
+            if (!std::isfinite(v.x) || !std::isfinite(v.y) ||
+                !std::isfinite(v.q) || v.q <= 0.0f)
+                return false;
+            x[i] = static_cast<double>(v.x) - ofx;
+            y[i] = static_cast<double>(v.y) - ofy;
+        }
+
+        const double rx0 = static_cast<double>(ctx.scissor.x0) - 1.0;
+        const double rx1 = static_cast<double>(ctx.scissor.x1) + 1.0;
+        const double ry0 = static_cast<double>(ctx.scissor.y0) - 1.0;
+        const double ry1 = static_cast<double>(ctx.scissor.y1) + 1.0;
+        auto edgeSeparates = [&](int a, int b, int inside) {
+            const double dx = x[b] - x[a];
+            const double dy = y[b] - y[a];
+            const double interior = dx * (y[inside] - y[a]) - dy * (x[inside] - x[a]);
+            if (interior == 0.0)
+                return false; // degenerate edge/triangle: legacy leaf decides
+
+            // E(p) = (-dy)*px + dx*py + constant. Select rectangle extrema without four
+            // corner evaluations; strict opposite-side separation is the SAT rejection.
+            const double cx = -dy;
+            const double cy = dx;
+            const double c = dy * x[a] - dx * y[a];
+            const double minE = c + cx * (cx >= 0.0 ? rx0 : rx1) +
+                                      cy * (cy >= 0.0 ? ry0 : ry1);
+            const double maxE = c + cx * (cx >= 0.0 ? rx1 : rx0) +
+                                      cy * (cy >= 0.0 ? ry1 : ry0);
+            return interior > 0.0 ? maxE < 0.0 : minE > 0.0;
+        };
+        return edgeSeparates(0, 1, 2) ||
+               edgeSeparates(1, 2, 0) ||
+               edgeSeparates(2, 0, 1);
+    }();
+
+    if (g459Stat && g459Triangle)
+    {
+        static std::atomic<uint64_t> s_tested{0}, s_separated{0};
+        const uint64_t tested = s_tested.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (g459Separated)
+            s_separated.fetch_add(1u, std::memory_order_relaxed);
+        if ((tested & 0x7FFFull) == 0u)
+            std::fprintf(stderr, "[G459:sat] tested=%llu separated=%llu\n",
+                         static_cast<unsigned long long>(tested),
+                         static_cast<unsigned long long>(
+                             s_separated.load(std::memory_order_relaxed)));
+    }
+
     // ===== G144 frame-level tile-binning capture/flush (G168: DEFAULT 8 lanes) =====
     // Runs AFTER the perf counters (so deferred tris still count) and BEFORE the switch (so the
     // flush's parallel raster time is still inside this drawPrimitive's G141PerfScope → measurable).

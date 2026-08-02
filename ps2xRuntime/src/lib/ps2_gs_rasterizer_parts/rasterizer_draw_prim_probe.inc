@@ -80,6 +80,86 @@ static bool g144PsmPageDims(uint8_t psm, uint32_t &pageW, uint32_t &pageH, bool 
     }
 }
 
+// G471 — SHIFT form of g144PsmPageDims. Every page dimension it can return is a power of two
+// (64/128 wide, 32/64/128 tall), so the four unsigned 64-bit divisions in g144RangeForRect below
+// are exactly right shifts. MSVC cannot substitute them itself because pageW/pageH are runtime
+// out-params of the switch above, and a 64-bit `div` is ~40-90 cycles here — on a range test that
+// runs once or twice per CAPTURED DRAW through g242WriteOverlapsDirtyDepth (~10k draws/f on MAP-0).
+// Exact: for unsigned n and power-of-two d, n / d == n >> log2(d). Same page indices, same block
+// range, same overlap verdicts. Oracle: DC2_G471_PAGESHIFT_VERIFY=1 (see g144VerifyPageShifts).
+static bool g144PsmPageShifts(uint8_t psm, uint32_t &pageWSh, uint32_t &pageHSh, bool &halfWidthBw)
+{
+    halfWidthBw = false;
+    switch (psm)
+    {
+    case GS_PSM_CT32:
+    case GS_PSM_CT24:
+    case GS_PSM_Z32:
+    case GS_PSM_Z24:
+    case GS_PSM_T8H:
+    case GS_PSM_T4HL:
+    case GS_PSM_T4HH:
+        pageWSh = 6u; // 64
+        pageHSh = 5u; // 32
+        return true;
+    case GS_PSM_CT16:
+    case GS_PSM_CT16S:
+    case GS_PSM_Z16:
+    case GS_PSM_Z16S:
+        pageWSh = 6u; // 64
+        pageHSh = 6u; // 64
+        return true;
+    case GS_PSM_T8:
+        pageWSh = 7u; // 128
+        pageHSh = 6u; // 64
+        halfWidthBw = true;
+        return true;
+    case GS_PSM_T4:
+        pageWSh = 7u; // 128
+        pageHSh = 7u; // 128
+        halfWidthBw = true;
+        return true;
+    default:
+        return false;
+    }
+}
+
+// G471 bring-up oracle (default OFF, DC2_G471_PAGESHIFT_VERIFY=1): recompute every shifted page
+// index with the ORIGINAL division form and report any disagreement. Defined here because this is
+// the first parts file that needs it; rasterizer_command_graph.inc reuses it for its own walks.
+static bool g471PageShiftVerifyOn()
+{
+    static const bool on = (std::getenv("DC2_G471_PAGESHIFT_VERIFY") != nullptr);
+    return on;
+}
+
+static void g144VerifyPageShifts(uint8_t psm, uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                                 uint64_t x0Page, uint64_t x1Page,
+                                 uint64_t y0Page, uint64_t y1Page)
+{
+    uint32_t pageW = 0u, pageH = 0u;
+    bool half = false;
+    if (!g144PsmPageDims(psm, pageW, pageH, half))
+        return;
+    const uint64_t rx0 = static_cast<uint64_t>(x) / pageW;
+    const uint64_t rx1 = (static_cast<uint64_t>(x) + static_cast<uint64_t>(w) - 1u) / pageW;
+    const uint64_t ry0 = static_cast<uint64_t>(y) / pageH;
+    const uint64_t ry1 = (static_cast<uint64_t>(y) + static_cast<uint64_t>(h) - 1u) / pageH;
+    if (rx0 != x0Page || rx1 != x1Page || ry0 != y0Page || ry1 != y1Page)
+    {
+        static std::atomic<uint32_t> s_bad{0};
+        if (s_bad.fetch_add(1u, std::memory_order_relaxed) < 32u)
+            std::fprintf(stderr,
+                         "[G471:pageshift-BAD] g144RangeForRect psm=0x%x rect=(%u,%u %ux%u) "
+                         "shift=(%llu..%llu, %llu..%llu) div=(%llu..%llu, %llu..%llu)\n",
+                         psm, x, y, w, h,
+                         (unsigned long long)x0Page, (unsigned long long)x1Page,
+                         (unsigned long long)y0Page, (unsigned long long)y1Page,
+                         (unsigned long long)rx0, (unsigned long long)rx1,
+                         (unsigned long long)ry0, (unsigned long long)ry1);
+    }
+}
+
 static G144BlockRange g144FullVramRange()
 {
     return {0u, 0x3FFFu, true};
@@ -96,19 +176,22 @@ static G144BlockRange g144RangeForRect(uint32_t baseBlock,
     if (w == 0u || h == 0u)
         return {};
 
-    uint32_t pageW = 0u, pageH = 0u;
+    // G471: shift form of the same page-dimension divides (see g144PsmPageShifts).
+    uint32_t pageWSh = 0u, pageHSh = 0u;
     bool halfWidthBw = false;
-    if (!g144PsmPageDims(psm, pageW, pageH, halfWidthBw))
+    if (!g144PsmPageShifts(psm, pageWSh, pageHSh, halfWidthBw))
         return g144FullVramRange();
 
     uint32_t pageBw = (bw != 0u) ? bw : 1u;
     if (halfWidthBw)
         pageBw = std::max<uint32_t>((pageBw + 1u) >> 1u, 1u);
 
-    const uint64_t x0Page = static_cast<uint64_t>(x) / pageW;
-    const uint64_t x1Page = (static_cast<uint64_t>(x) + static_cast<uint64_t>(w) - 1u) / pageW;
-    const uint64_t y0Page = static_cast<uint64_t>(y) / pageH;
-    const uint64_t y1Page = (static_cast<uint64_t>(y) + static_cast<uint64_t>(h) - 1u) / pageH;
+    const uint64_t x0Page = static_cast<uint64_t>(x) >> pageWSh;
+    const uint64_t x1Page = (static_cast<uint64_t>(x) + static_cast<uint64_t>(w) - 1u) >> pageWSh;
+    const uint64_t y0Page = static_cast<uint64_t>(y) >> pageHSh;
+    const uint64_t y1Page = (static_cast<uint64_t>(y) + static_cast<uint64_t>(h) - 1u) >> pageHSh;
+    if (g471PageShiftVerifyOn())
+        g144VerifyPageShifts(psm, x, y, w, h, x0Page, x1Page, y0Page, y1Page);
 
     const uint64_t firstPage = y0Page * pageBw + x0Page;
     const uint64_t lastPage = y1Page * pageBw + x1Page;

@@ -239,6 +239,27 @@ namespace
         return leanTab ? g421MaskTableConst.m[dest] : g421MaskRows()[dest];
     }
 
+    // G486 REFUTED widening the four SINGLE-LANE destination writes below.
+    //
+    // The premise was G485's: this loop pays a store-to-load forwarding block whenever it writes a
+    // VF register narrowly and reads it back as a 16-byte vector, and `_mm_store_ss` writes 4 bytes
+    // of a register whose next reader is `_mm_loadu_ps(st.vf[FS])` in the following pair. The site
+    // is real and was priced first (G476): ~24.0% of the ~732 k inline FMACs per frame take a
+    // single-lane arm (dest 0x1 = 22.3%, 0x4 = 1.3%, 0x8 = 0.4%, 0x2 = 0.0%), plus the cls>=3 share.
+    //
+    // The candidate replaced each `_mm_store_ss` with a whole-lane blend (`_mm_move_ss` for lane 0,
+    // one `unpck*ps` + one `shufps` for lanes 1-3 — bit-exact, no mask constants) and one
+    // `_mm_storeu_ps`, built as a loop COPY exactly like G485's widevf0. Four paired A/Bs
+    // (DC2_G419_AB=widedest, both arms confirmed used) read +0.732 / +0.476 / +0.553 / +0.627 ms/f:
+    // mean **+0.597, sign 4/4 SLOWER**.
+    //
+    // WHY, and this is the durable half. G485's win was four narrow stores of CONSTANTS collapsing
+    // into one wide store, which needs no input. A single-lane write cannot be widened without
+    // READING the destination's other three lanes, so the candidate turns a pure store into a
+    // load-modify-store: a 16-byte load of `vf[fd]` joins the dependency chain and `old` stays live
+    // across the blend. That costs more than the forwarding block it removes. The store-forwarding
+    // class needs the wide replacement to be INPUT-FREE; it does not generalise from "a hot loop
+    // writes lanes individually" to "any narrow store this loop makes". Do not rebuild it.
     static DC2_G330_FORCEINLINE void g428StoreDest(float *dst, __m128 value, uint8_t dest,
                                                    bool leanTab)
     {

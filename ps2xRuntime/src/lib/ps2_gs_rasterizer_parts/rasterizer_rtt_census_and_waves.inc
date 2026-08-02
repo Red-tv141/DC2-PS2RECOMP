@@ -734,12 +734,13 @@ void g242MarkRectPages(std::array<uint8_t, kG178PageCount> &pages,
 {
     if (w == 0u || h == 0u)
         return;
-    uint32_t pw = 0u, ph = 0u;
-    g178PageDims(psm, pw, ph);
-    const uint32_t widthPages = std::max(1u, (std::max(1u, bw64) * 64u) / pw);
+    // G471: shift form of the same page-dimension divides (see g178PageShifts).
+    uint32_t pwSh = 0u, phSh = 0u;
+    g178PageShifts(psm, pwSh, phSh);
+    const uint32_t widthPages = std::max(1u, (std::max(1u, bw64) << 6u) >> pwSh);
     const uint32_t basePage = bpBlocks >> 5u;
-    const uint32_t px0 = x / pw, px1 = (x + w - 1u) / pw;
-    const uint32_t py0 = y / ph, py1 = (y + h - 1u) / ph;
+    const uint32_t px0 = x >> pwSh, px1 = (x + w - 1u) >> pwSh;
+    const uint32_t py0 = y >> phSh, py1 = (y + h - 1u) >> phSh;
     for (uint32_t py = py0; py <= py1 && py - py0 < kG178PageCount; ++py)
         for (uint32_t px = px0; px <= px1 && px - px0 < kG178PageCount; ++px)
         {
@@ -749,10 +750,83 @@ void g242MarkRectPages(std::array<uint8_t, kG178PageCount> &pages,
         }
 }
 
-bool g242RectsOverlap(uint32_t aBp, uint32_t aBw, uint32_t aPsm,
-                      uint32_t ax, uint32_t ay, uint32_t aw, uint32_t ah,
-                      uint32_t bBp, uint32_t bBw, uint32_t bPsm,
-                      uint32_t bx, uint32_t by, uint32_t bw, uint32_t bh)
+// ===== G471: page-set overlap without materializing two 512-byte maps =====
+//
+// g242RectsOverlap used to zero TWO std::array<uint8_t,512>, mark both rects into them, then scan
+// all 512 entries. That is ~1 KB of memset plus a 512-entry scan PER CALL, and the call runs once
+// or twice per captured draw through g242WriteOverlapsDirtyDepth (~20k/f on MAP-0). G471's PC
+// sampler put the g178NoteVramWriteRect family at ~3.8% of the GS worker's whole span with `memset`
+// visible beside it.
+//
+// The replacement enumerates exactly the same pages (same walk, same +1 slack, same 512-page wrap)
+// but stores side A as a 512-BIT set — 64 bytes, one cache line, zeroed with 8 stores — and then
+// TESTS side B's pages against it, returning at the first hit instead of scanning a full map.
+// Set-intersection semantics are unchanged: a non-empty intersection exists iff some page of B is
+// marked in A. Oracle: DC2_G471_PAGESHIFT_VERIFY=1 re-runs the original two-array form and reports
+// any disagreement.
+using G471PageBits = uint64_t[kG178PageCount / 64];
+
+static inline void g471ClearPageBits(uint64_t *bits)
+{
+    for (uint32_t i = 0; i < kG178PageCount / 64u; ++i)
+        bits[i] = 0ull;
+}
+
+static void g471MarkRectBits(uint64_t *bits, uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
+                             uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (w == 0u || h == 0u)
+        return;
+    uint32_t pwSh = 0u, phSh = 0u;
+    g178PageShifts(psm, pwSh, phSh);
+    const uint32_t widthPages = std::max(1u, (std::max(1u, bw64) << 6u) >> pwSh);
+    const uint32_t basePage = bpBlocks >> 5u;
+    const uint32_t px0 = x >> pwSh, px1 = (x + w - 1u) >> pwSh;
+    const uint32_t py0 = y >> phSh, py1 = (y + h - 1u) >> phSh;
+    const auto set = [&](uint32_t pg) {
+        const uint32_t i = pg & (kG178PageCount - 1u);
+        bits[i >> 6u] |= (1ull << (i & 63u));
+    };
+    for (uint32_t py = py0; py <= py1 && py - py0 < kG178PageCount; ++py)
+        for (uint32_t px = px0; px <= px1 && px - px0 < kG178PageCount; ++px)
+        {
+            const uint32_t pg = basePage + py * widthPages + px;
+            set(pg);
+            set(pg + 1u);
+        }
+}
+
+// True as soon as any page of this rect is marked in `bits` (same enumeration as g471MarkRectBits).
+static bool g471RectHitsBits(const uint64_t *bits, uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
+                             uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (w == 0u || h == 0u)
+        return false;
+    uint32_t pwSh = 0u, phSh = 0u;
+    g178PageShifts(psm, pwSh, phSh);
+    const uint32_t widthPages = std::max(1u, (std::max(1u, bw64) << 6u) >> pwSh);
+    const uint32_t basePage = bpBlocks >> 5u;
+    const uint32_t px0 = x >> pwSh, px1 = (x + w - 1u) >> pwSh;
+    const uint32_t py0 = y >> phSh, py1 = (y + h - 1u) >> phSh;
+    const auto test = [&](uint32_t pg) {
+        const uint32_t i = pg & (kG178PageCount - 1u);
+        return (bits[i >> 6u] & (1ull << (i & 63u))) != 0ull;
+    };
+    for (uint32_t py = py0; py <= py1 && py - py0 < kG178PageCount; ++py)
+        for (uint32_t px = px0; px <= px1 && px - px0 < kG178PageCount; ++px)
+        {
+            const uint32_t pg = basePage + py * widthPages + px;
+            if (test(pg) || test(pg + 1u))
+                return true;
+        }
+    return false;
+}
+
+// Original two-array form, retained ONLY as the bring-up oracle for the bitset path.
+static bool g471RectsOverlapRef(uint32_t aBp, uint32_t aBw, uint32_t aPsm,
+                                uint32_t ax, uint32_t ay, uint32_t aw, uint32_t ah,
+                                uint32_t bBp, uint32_t bBw, uint32_t bPsm,
+                                uint32_t bx, uint32_t by, uint32_t bw, uint32_t bh)
 {
     std::array<uint8_t, kG178PageCount> a{};
     std::array<uint8_t, kG178PageCount> b{};
@@ -762,6 +836,33 @@ bool g242RectsOverlap(uint32_t aBp, uint32_t aBw, uint32_t aPsm,
         if (a[i] != 0u && b[i] != 0u)
             return true;
     return false;
+}
+
+bool g242RectsOverlap(uint32_t aBp, uint32_t aBw, uint32_t aPsm,
+                      uint32_t ax, uint32_t ay, uint32_t aw, uint32_t ah,
+                      uint32_t bBp, uint32_t bBw, uint32_t bPsm,
+                      uint32_t bx, uint32_t by, uint32_t bw, uint32_t bh)
+{
+    G471PageBits bits;
+    g471ClearPageBits(bits);
+    g471MarkRectBits(bits, aBp, aBw, aPsm, ax, ay, aw, ah);
+    const bool hit = g471RectHitsBits(bits, bBp, bBw, bPsm, bx, by, bw, bh);
+    if (g471PageShiftVerifyOn())
+    {
+        const bool ref = g471RectsOverlapRef(aBp, aBw, aPsm, ax, ay, aw, ah,
+                                             bBp, bBw, bPsm, bx, by, bw, bh);
+        if (ref != hit)
+        {
+            static std::atomic<uint32_t> s_bad{0};
+            if (s_bad.fetch_add(1u, std::memory_order_relaxed) < 32u)
+                std::fprintf(stderr,
+                             "[G471:overlap-BAD] a=(bp=0x%x bw=%u psm=0x%x %u,%u %ux%u) "
+                             "b=(bp=0x%x bw=%u psm=0x%x %u,%u %ux%u) bits=%d ref=%d\n",
+                             aBp, aBw, aPsm, ax, ay, aw, ah,
+                             bBp, bBw, bPsm, bx, by, bw, bh, hit ? 1 : 0, ref ? 1 : 0);
+        }
+    }
+    return hit;
 }
 
 // G273: exact page-set overlap for PAGE-ALIGNED bases. g242MarkRectPages deliberately marks pg+1
@@ -845,9 +946,17 @@ bool g242WriteOverlapsDirtyDepth(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
         // diverge.  Even when it misses the dirty row interval, publish that interval first so the
         // subsequent clean mismatch can be handled by a normal full upload (never an invariant
         // failure or a lossy merge).
-        if (s.dirty && g242RectsOverlap(s.zbpPage << 5u, s.fbw, GS_PSM_Z24,
-                                        0u, 0u, static_cast<uint32_t>(s.fbW), 512u,
-                                        bpBlocks, bw64, psm, x, y, w, h))
+        if (!s.dirty)
+            continue;
+        // G471: build this state's Z-surface page set as a 512-BIT set (64 bytes, one cache line)
+        // and test the incoming write rect against it, returning at the first hit. Same pages, same
+        // +1 slack, same verdict as the old pair of zeroed 512-BYTE arrays plus a full 512-entry
+        // scan -- see g471MarkRectBits / g471RectHitsBits.
+        G471PageBits bits;
+        g471ClearPageBits(bits);
+        g471MarkRectBits(bits, s.zbpPage << 5u, s.fbw, GS_PSM_Z24,
+                         0u, 0u, static_cast<uint32_t>(s.fbW), 512u);
+        if (g471RectHitsBits(bits, bpBlocks, bw64, psm, x, y, w, h))
             return true;
     }
     return false;

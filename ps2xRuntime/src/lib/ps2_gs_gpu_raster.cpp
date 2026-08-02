@@ -66,6 +66,12 @@ int g447WorkerSpinArm();
 // G445: DC2_G419_AB=earlykick arm selector wired into the early-kick site (force recompile v2).
 // G447: spin-then-block backend round trip + edge census hooks (force recompile v2, PROMOTED).
 // G445: early kick PROMOTED default-ON + DC2_G445_KICK_ALL extension probe (force recompile v3).
+// G452: recycle completed async-slot vector capacity to the GS front end (force recompile v1).
+// G452: rejected deeper FIFO removed; one-slot capacity recycling retained (force recompile v4).
+// G453: backend-other subtype census (DC2_G453_CENSUS=1; force recompile v1).
+// G453: rejected behavior levers removed; subtype census retained (force recompile v6).
+// G471: both spin-poll reshapes REJECTED and removed; loops restored verbatim (force recompile v3).
+// G472: same-FBO synchronous render-round-trip opportunity census (force recompile v3).
 #else // !(_WIN32 && !PLATFORM_VITA)
 
 bool g158_gpu_raster_enabled() { return false; }

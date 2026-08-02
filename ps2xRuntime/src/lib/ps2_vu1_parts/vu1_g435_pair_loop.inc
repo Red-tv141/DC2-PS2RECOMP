@@ -24,6 +24,29 @@
 // is replaced by. See the g443Fixed comment in vu1_upper_opcodes.inc for the premise (G427/G442
 // priced ONE added loop-carried local at +2.6..2.8 ms/f, and /FAsc found the loop at ~1.2 IPC
 // with 36 spills, i.e. on a register-pressure cliff).
+// G485 - REGISTER-FORM G139 PAIR HAZARD as a compile-time property of the copy. When 1, the raw
+// `float *g139dst` into m_state.vf and the address-taken `g139old`/`g139new` stack arrays are
+// TEXTUALLY ABSENT from this copy, which is the whole point: G435 measured the hazard block at
+// ~4.9 ms/f of VU1 busy while its own predicate fires on a small minority of pairs, i.e. almost
+// all of that cost is the aliasing those three names force on every m_state.vf access in the
+// inline upper AND the inline lower, on all ~1.65 M pairs/frame. A runtime `if (g435HazReg)`
+// cannot remove it (the declarations still exist); only a separate copy can. Must be defined
+// BEFORE the DC2_G443_FIXED block below, which reads it into a constexpr shadow.
+//
+// G485 BUILT that copy and REFUTED the lever. Four paired A/Bs (DC2_G419_AB=hazreg, both arms
+// confirmed used) read +0.395 / +0.277 / -0.088 / +0.344 ms/f: mean +0.232, sign 3/4 SLOWER. The
+// aliasing IS removed, and it does not pay for the three loop-live values the register form adds
+// (an index and two __m128) to a loop G483 proved register-starved — the fifth confirmation of
+// the G427/G442/G479/G483 live-value law. Note also that G435's ~4.9 ms/f premise came from
+// DC2_G435_SKIP=2, a CORRUPTING deletion probe, which G444/G479 say is not a price at all.
+// This scaffolding is kept (every arm below is byte-identical at DC2_G485_HAZREG 0) so ONE edit
+// in vu1_upper_opcodes.inc can re-instantiate the copy. Do not do so until something has actually
+// changed the loop's register pressure. It also corrects G482's record: g435HazReg was never
+// structurally unmeasurable, only unmeasured through the wrong flag.
+#ifndef DC2_G485_HAZREG
+#define DC2_G485_HAZREG 0
+#define G485_LOCAL_DEFAULT 1
+#endif
 #if DC2_G443_FIXED
 #pragma warning(push)
 #pragma warning(disable : 4456 4457 4459)
@@ -66,7 +89,12 @@
     constexpr bool g436Lean         = true;
     constexpr bool g436FlagStore    = false;
     // --- opt-in / never-promoted substrates ---------------------------------------------
-    constexpr bool g435HazReg       = false;
+    // G485: the register form of the G139 pair hazard is now a COMPILE-TIME property of the copy
+    // (DC2_G485_HAZREG), not a runtime lever. G482 recorded `g435HazReg` as structurally
+    // unmeasurable because `!g435HazReg` is a conjunct of `g443Fixed`, so the old flag selected a
+    // different, slower loop. It is measurable the same way G484 made the wide VF0 store
+    // measurable: a copy of THIS body in which the pointer form is textually absent.
+    constexpr bool g435HazReg       = (DC2_G485_HAZREG != 0);
     constexpr bool g435WideVf0      = false;
     constexpr bool s_g295KeepHaz    = false;
     constexpr bool s_g106ParallelFlags = false;
@@ -77,9 +105,98 @@
     constexpr bool g435SkipHaz      = false;
 #pragma warning(pop)
 #endif // DC2_G443_FIXED
+    // G484 - WIDE VF0 RE-PIN inside the promoted loop. Every copy that does not explicitly ask for
+    // it keeps the historical four-scalar-store form, byte-for-byte as before. See the
+    // g484WideVf0 comment in vu1_upper_opcodes.inc for why the old DC2_G435_WIDE_VF0 flag could
+    // never measure this.
+#ifndef DC2_G484_WIDEVF0
+#define DC2_G484_WIDEVF0 0
+#define G484_LOCAL_DEFAULT 1
+#endif
+    // G486 built and REFUTED a copy of this body in which the four single-lane FMAC destination
+    // masks blend whole lanes and issue one 16-byte store instead of `_mm_store_ss` (mean
+    // +0.597 ms/f, sign 4/4 SLOWER). The plumbing was removed so this body is source-identical to
+    // G485's; the refutation and its mechanism are recorded at `g428StoreDest` in
+    // vu1_g421_fast_upper.inc. Do not rebuild it — a single-lane write cannot be widened without
+    // reading the destination back, so the wide form is a load-modify-store, not a store.
+    // G479 - the Q/P delay counters as LOOP LOCALS.
+    //
+    // Both counters are read-modify-written on EVERY pair through a hoisted thread_local pointer,
+    // so each pair pays a load, a compare and (on expiry) a store to the same address as the
+    // previous pair — a store-to-load forward on the loop's own carried state. The ONLY writer
+    // outside this loop body is execLower (the FDIV/EFU producers and WAITQ/WAITP at
+    // vu1_dispatch_and_sync.inc:688-1091, all reached through g239_stage_p / g239_wait_p), which
+    // this arm brackets with an explicit spill/reload; nothing in g422FastLower, g421FastUpper or
+    // execUpper touches them. Every loop exit writes both back before the run() tail reads
+    // `*s_pDelayP`, so the architectural state at the E-bit drain is unchanged.
+    //
+    // This ADDS two loop-carried locals to a loop G427/G442 priced at +2.6..2.8 ms/f for one — but
+    // it REMOVES the memory they replace, which is the opposite side of that trade.
+    //
+    // RESULT: REJECTED (G479). Stacked on the fused record in the same loop copy it took the
+    // paired blocked estimator from −0.724 (t = −3.09) / −0.586 (t = −1.92) to −0.178 (t = −0.73),
+    // i.e. it gave back essentially the whole fused-fetch win. The G427/G442 live-value law holds:
+    // two more loop-carried locals cost more than the two per-pair loads they delete. Compiled out
+    // (`DC2_G479_QPREG 0` in every copy) and kept only as this record — do not rebuild it.
+#if DC2_G479_QPREG
+    int g479Qd = *s_qDelayP;
+    int g479Pd = *s_pDelayP;
+#define G479_QD g479Qd
+#define G479_PD g479Pd
+#define G479_QP_SYNC() do { *s_qDelayP = g479Qd; *s_pDelayP = g479Pd; } while (0)
+#define G479_QP_RELOAD() do { g479Qd = *s_qDelayP; g479Pd = *s_pDelayP; } while (0)
+#else
+#define G479_QD (*s_qDelayP)
+#define G479_PD (*s_pDelayP)
+#define G479_QP_SYNC() ((void)0)
+#define G479_QP_RELOAD() ((void)0)
+#endif
+    // G483 - CARRY THE PROGRAM COUNTER ACROSS THE BACK EDGE.
+    //
+    // The /MAP + capstone audit of the current binary (G483) reads the loop as:
+    //     top:    mov ecx, [rax+0x25c]        ; currentPc = m_state.pc
+    //             ...
+    //     tail:   mov [rbx+0x25c], eax        ; m_state.pc = nextPC
+    //             jb  top
+    // i.e. every pair ENDS by storing the PC to VU1State and BEGINS by loading the same four bytes
+    // back — a store-to-load forward on the loop's own carried state, and G442 already named that
+    // load as the head of the loop's critical chain ("the bounds check, the two fetches and the
+    // sidecar load all hang off the m_state.pc load"). Nothing runs between the store and the
+    // reload, so the value is provably identical; the load exists only because MSVC must assume
+    // the callees in the body alias `m_state`.
+    //
+    // THE STORE STAYS. execLower/g422FastLower/execUpper read and WRITE m_state.pc (that is how a
+    // branch lower reports its target — the body reads it back as `postExecPc`), so VU1State must
+    // stay authoritative through the body. Only the reload at the top is removed.
+    //
+    // EXACTNESS. `g483Pc` is written at exactly the sites that write `m_state.pc` as the LAST word
+    // on the value for this iteration (the `m_state.pc = nextPC` at the bottom, and the G475 trace
+    // block's post-run store, which is the only other place a pair can leave the body with a new
+    // PC). Every exit path leaves `m_state.pc` written as before. DC2_G483_VERIFY=1 asserts
+    // `g483Pc == m_state.pc` at the top of every pair.
+    //
+    // This is NOT G479's rejected Q/P-locals lever. That ADDED two loop-carried locals to keep two
+    // counters in registers while their memory stayed live; this REPLACES a load with a value the
+    // loop already computes into a register at the bottom, so it adds no new live range.
+#if DC2_G483_PCREG
+    uint32_t g483Pc = m_state.pc;
+#define G483_PC_CUR (g483Pc)
+#define G483_PC_SET(v) do { g483Pc = (v); } while (0)
+#else
+#define G483_PC_CUR (m_state.pc)
+#define G483_PC_SET(v) ((void)(v))
+#endif
     for (; cycle < maxCycles; ++cycle)
     {
-        const uint32_t currentPc = m_state.pc;
+        const uint32_t currentPc = G483_PC_CUR;
+#if DC2_G483_PCREG && DC2_G483_VERIFY_PCREG
+        if (g483Pc != m_state.pc)
+        {
+            std::fprintf(stderr, "[G483:verify-BAD] pcreg=0x%x m_state.pc=0x%x cycle=%u\n",
+                         g483Pc, m_state.pc, cycle);
+            std::abort();
+        }
+#endif
 #if DC2_VU1_LOOP_DIAG
         const int16_t g72_vi1_before = g425Lean ? (int16_t)0 : (int16_t)m_state.vi[1];
 #endif // DC2_VU1_LOOP_DIAG
@@ -411,6 +528,7 @@
         if (currentPc + 8 > codeSize)
         {
             stopReason = "pc-oob";
+            G479_QP_SYNC();
             break;
         }
 
@@ -423,6 +541,32 @@
         // I-bit, the G239 prestall S2 and the legacy G139 dest decode) to their cached side.
         __assume(g410Pairs != nullptr);
 #endif
+#if DC2_G479_FUSED
+        // G479: ONE 16-byte record, ONE address chain. `fused[i].source` is bit-identical to the
+        // live `vuCode + pc` word (precise invalidation, same writer as `sources[i]`) and
+        // `fused[i].pair` to `uppers[i]`, so this decodes exactly what the split fetch above does.
+        {
+            const G479FusedPair &g479fp = g479Fused[currentPc >> 3u];
+            const uint64_t g479src = g479fp.source;
+            lower = static_cast<uint32_t>(g479src);
+            upper = static_cast<uint32_t>(g479src >> 32u);
+            g410Pair = const_cast<G410CompiledUpper *>(&g479fp.pair);
+#if DC2_G479_VERIFY_FUSED
+            uint64_t g479live = 0u;
+            std::memcpy(&g479live, vuCode + currentPc, sizeof(g479live));
+            if (g479live != g479src ||
+                std::memcmp(g410Pair, &g410Pairs[currentPc >> 3u], sizeof(*g410Pair)) != 0)
+            {
+                std::fprintf(stderr,
+                             "[G479:verify-BAD] pc=0x%x fused=%016llx live=%016llx\n",
+                             currentPc, (unsigned long long)g479src,
+                             (unsigned long long)g479live);
+                std::abort();
+            }
+            g479NoteVerified();
+#endif
+        }
+#else
         if (g410CountStats)
             g410Pair = &g410FetchPair(
                 g410Pairs, vuCode, currentPc, g410CountStats, g410VerifyRun,
@@ -434,6 +578,7 @@
             if (g410Pairs != nullptr)
                 g410Pair = &g410Pairs[currentPc >> 3u];
         }
+#endif
         if (!g425Lean)
         {
             lastPc = currentPc;
@@ -442,9 +587,118 @@
         }
 
         if (g421On)
-            g421NoteCycle(g410Pair != nullptr ? g410Pair->upperKind
+            g421NoteCycle(currentPc,
+                          g410Pair != nullptr ? g410Pair->upperKind
                                               : g410SelectUpperKind(upper),
-                          upper, lower);
+                          upper, lower,
+                          pendingBranchTarget == DC2_G442_NO_BRANCH && !m_state.ebit);
+
+#if DC2_G475_TRACE
+        // G475: this source-side run length is maintained beside G410's precisely invalidated
+        // pair cache. Branch-delay entries and a latched E-bit must still execute one pair in
+        // the main loop, so they fail closed here. maxCycles is also an architectural suspension
+        // edge; truncate the trace rather than stepping past it.
+        if (pendingBranchTarget == DC2_G442_NO_BRANCH && !m_state.ebit)
+        {
+            const uint32_t g475Avail =
+                static_cast<uint32_t>(s_g410Cache.g475RunLen[currentPc >> 3u]);
+            const uint32_t g475Budget = maxCycles - cycle;
+            const uint32_t g475Count = g475Avail < g475Budget ? g475Avail : g475Budget;
+            if (g475Count >= 2u)
+            {
+#if DC2_G475_VERIFY_TRACE
+                // Candidate: compact trace with G422 fast lowers. Reference: the exact old
+                // per-pair order with legacy execLower. Safe trace pairs have no upper work,
+                // scalar producer/wait, flag consumer, branch, E-bit or I-bit, so Q/P clocks,
+                // lower execution, zero-register enforcement and sequential PC are the complete
+                // visible transition. G430 history is stamp-only and `cycle` advances below.
+                s_g422VerBefore = m_state;
+                const bool g475HasMem = vuData != nullptr && dataSize <= PS2_VU1_DATA_SIZE;
+                if (g475HasMem)
+                    std::memcpy(s_g422VerMemBefore, vuData, dataSize);
+                const int g475QBefore = *s_qDelayP;
+                const int g475PBefore = *s_pDelayP;
+
+                g475ExecuteVnopTrace(m_state, currentPc >> 3u, g475Count,
+                                     vuData, dataSize, s_qDelayP, s_pDelayP);
+                s_g422VerFast = m_state;
+                if (g475HasMem)
+                    std::memcpy(s_g422VerMemFast, vuData, dataSize);
+                const int g475QFast = *s_qDelayP;
+                const int g475PFast = *s_pDelayP;
+
+                m_state = s_g422VerBefore;
+                if (g475HasMem)
+                    std::memcpy(vuData, s_g422VerMemBefore, dataSize);
+                *s_qDelayP = g475QBefore;
+                *s_pDelayP = g475PBefore;
+                const uint32_t g475First = currentPc >> 3u;
+                for (uint32_t g475j = 0u; g475j < g475Count; ++g475j)
+                {
+                    const size_t g475idx = static_cast<size_t>(g475First + g475j);
+                    const G410CompiledUpper &g475pair = s_g410Cache.uppers[g475idx];
+                    const uint64_t g475source = s_g410Cache.sources[g475idx];
+                    const uint32_t g475lower = static_cast<uint32_t>(g475source);
+                    const uint32_t g475upper = static_cast<uint32_t>(g475source >> 32u);
+                    m_state.pc = static_cast<uint32_t>(g475idx * 8u);
+                    if (*s_qDelayP > 0 && --(*s_qDelayP) == 0)
+                        m_state.q = s_vuQPending;
+                    if (*s_pDelayP > 0 && --(*s_pDelayP) == 0)
+                        m_state.p = s_vuPPending;
+                    execLower(g475lower, vuData, dataSize, gs, memory, g475upper);
+                    if ((g475pair.g425Flags & G425_PF_TOUCHES_ZERO) != 0u)
+                    {
+                        m_state.vf[0][0] = 0.0f;
+                        m_state.vf[0][1] = 0.0f;
+                        m_state.vf[0][2] = 0.0f;
+                        m_state.vf[0][3] = 1.0f;
+                        m_state.vi[0] = 0;
+                    }
+                }
+                const uint32_t g475Next = g475First + g475Count;
+                m_state.pc = g475Next < s_g410Cache.uppers.size() ? g475Next * 8u : 0u;
+
+                const bool g475BadState = !g422StatesEqual(s_g422VerFast, m_state);
+                const bool g475BadMem = g475HasMem &&
+                    std::memcmp(s_g422VerMemFast, vuData, dataSize) != 0;
+                const bool g475BadPipe = *s_qDelayP != g475QFast || *s_pDelayP != g475PFast;
+                if (g475BadState || g475BadMem || g475BadPipe)
+                {
+                    std::fprintf(stderr,
+                                 "[G475:verify-BAD] pc=0x%x count=%u state=%d mem=%d "
+                                 "pipe=%d q=%d/%d p=%d/%d next=%x/%x\n",
+                                 currentPc, g475Count, static_cast<int>(g475BadState),
+                                 static_cast<int>(g475BadMem), static_cast<int>(g475BadPipe),
+                                 g475QFast, *s_qDelayP, g475PFast, *s_pDelayP,
+                                 s_g422VerFast.pc, m_state.pc);
+                    std::abort();
+                }
+
+                m_state = s_g422VerFast;
+                if (g475HasMem)
+                    std::memcpy(vuData, s_g422VerMemFast, dataSize);
+                *s_qDelayP = g475QFast;
+                *s_pDelayP = g475PFast;
+                const uint64_t g475OldVerified =
+                    s_g475Verified.fetch_add(g475Count, std::memory_order_relaxed);
+                if (g475OldVerified == 0u ||
+                    g475OldVerified / 10000000u !=
+                        (g475OldVerified + g475Count) / 10000000u)
+                    std::fprintf(stderr, "[G475:verify] pairs=%llu bad=0\n",
+                                 static_cast<unsigned long long>(g475OldVerified + g475Count));
+#else
+                g475ExecuteVnopTrace(m_state, currentPc >> 3u, g475Count,
+                                     vuData, dataSize, s_qDelayP, s_pDelayP);
+#endif
+                g475NoteTrace(g475Count);
+                // G483: the trace block is the only other path that leaves the body with a new PC
+                // (it `continue`s past the bottom's store), so re-sync the carried copy here.
+                G483_PC_SET(m_state.pc);
+                cycle += g475Count - 1u;
+                continue;
+            }
+        }
+#endif // DC2_G475_TRACE
 
 #if DC2_VU1_LOOP_DIAG
         // G295 diag region B (post-fetch): G68/G69/G117/G132/G237/G70 censuses, VU1 XGKICK
@@ -868,13 +1122,13 @@
         // G87: advance the Q pipeline one cycle BEFORE this word executes. A pending DIV/SQRT/
         // RSQRT result becomes visible in m_state.q when its delay expires; a producer in THIS
         // word (re)arms the delay afterwards (in execLower) so it counts from the next word.
-        if (*s_qDelayP > 0 && --(*s_qDelayP) == 0)
+        if (G479_QD > 0 && --G479_QD == 0)
             m_state.q = s_vuQPending;
 
         // G239: advance the EFU pipeline before this instruction pair. An MFP in the pair
         // where the latency expires sees the newly published architectural P, matching the
         // interpreter ordering in PCSX2 (_vuTestPipes before lower execution).
-        if (s_ppipeOn && *s_pDelayP > 0 && --(*s_pDelayP) == 0)
+        if (s_ppipeOn && G479_PD > 0 && --G479_PD == 0)
             m_state.p = s_vuPPending;
 
         // G239: PCSX2's interpreter performs _vuTestLowerStalls + _vuTestPipes before
@@ -908,11 +1162,11 @@
             {
                 const bool waitQ239 = lowerS2239 == 0x3bu;
                 const bool fdivProducer239 = lowerS2239 >= 0x38u && lowerS2239 <= 0x3au;
-                if (s_qlatOn && *s_qDelayP > 0 &&
+                if (s_qlatOn && G479_QD > 0 &&
                     (waitQ239 || (fdivProducer239 && g200_qstall_enabled())))
                 {
                     m_state.q = s_vuQPending;
-                    *s_qDelayP = 0;
+                    G479_QD = 0;
                 }
 
                 const bool waitP239 = lowerS2239 == 0x7bu;
@@ -921,10 +1175,10 @@
                     lowerS2239 == 0x72u || lowerS2239 == 0x73u ||
                     lowerS2239 == 0x76u || lowerS2239 == 0x78u ||
                     lowerS2239 == 0x79u || lowerS2239 == 0x7au;
-                if (s_ppipeOn && *s_pDelayP > 0 && (waitP239 || efuProducer239))
+                if (s_ppipeOn && G479_PD > 0 && (waitP239 || efuProducer239))
                 {
                     m_state.p = s_vuPPending;
-                    *s_pDelayP = 0;
+                    G479_PD = 0;
                 }
             }
         }
@@ -1100,8 +1354,10 @@
             // and the inline lower — so the register-form below keeps the same three values in
             // an index + two __m128 registers and never materialises a pointer. See the
             // g435HazReg comment in vu1_upper_opcodes.inc.
+#if !DC2_G485_HAZREG
             float *g139dst = nullptr;
             float g139old[4], g139new[4];
+#endif
             int g139Idx = -1;
             __m128 g139OldV = _mm_setzero_ps();
             __m128 g139NewV = _mm_setzero_ps();
@@ -1136,6 +1392,10 @@
                 // G426: hazard applicability is a property of the pair encoding, decoded once.
                 if ((g410Pair->g425Flags & G426_PF_HAZ) != 0u)
                 {
+#if DC2_G485_HAZREG
+                    g139Idx = (int)g410Pair->upperVfDest;
+                    g139OldV = _mm_loadu_ps(m_state.vf[g139Idx]);
+#else
                     if (g435HazReg)
                     {
                         g139Idx = (int)g410Pair->upperVfDest;
@@ -1146,8 +1406,15 @@
                         g139dst = m_state.vf[g410Pair->upperVfDest];
                         std::memcpy(g139old, g139dst, 16);
                     }
+#endif
                 }
             }
+#if DC2_G485_HAZREG
+            // G485: under DC2_G443_FIXED, `g426Predecode` is constexpr true, so the legacy
+            // non-predecode hazard branch below is unreachable in this copy. It is elided
+            // TEXTUALLY (not merely by constant folding) because its `g139dst` / `g139old` uses
+            // are exactly the aliasing this copy exists to remove.
+#else
             else if (s_pairhazOn && !g435SkipHaz)
             {
                 uint32_t g139DstIdx = 0u;
@@ -1193,6 +1460,7 @@
                     std::memcpy(g139old, g139dst, 16);
                 }
             }
+#endif // DC2_G485_HAZREG
             if (g410VerifyRun)
                 g410VerifyUpper(lower, upper);
             else if ((!g410CompiledRun || g410Pair->upperKind != 0x6fu) && !g430SkipUpper)
@@ -1204,11 +1472,13 @@
                 g139NewV = _mm_loadu_ps(m_state.vf[g139Idx]);
                 _mm_storeu_ps(m_state.vf[g139Idx], g139OldV);
             }
+#if !DC2_G485_HAZREG
             else if (g139dst)
             {
                 std::memcpy(g139new, g139dst, 16);
                 std::memcpy(g139dst, g139old, 16);
             }
+#endif
             if (s_g106ParallelFlags)
             {
                 s_g106LowerMacRead = g106MacBeforeUpper;
@@ -1277,7 +1547,20 @@
             }
             } // G295 diag region C end
 #endif // DC2_VU1_LOOP_DIAG
+#if DC2_G479_QPREG
+            // Same two arms the macro expands to under g443Fixed, with the local Q/P counters
+            // spilled around the ONLY callee that can write them.
+            if (g410Pair->lowerKind != G422_LK_NONE)
+                g422FastLower(m_state, lower, g410Pair->lowerKind, vuData, dataSize);
+            else
+            {
+                G479_QP_SYNC();
+                execLower(lower, vuData, dataSize, gs, memory, upper);
+                G479_QP_RELOAD();
+            }
+#else
             DC2_G422_RUN_LOWER();
+#endif
             // G436: `true` is only ever written to this thread_local inside the
             // `if (s_g106ParallelFlags)` block above, so when that lever is off the store is the
             // identity — and it was costing a TLS materialisation plus a store on every pair.
@@ -1296,6 +1579,7 @@
                               _mm_or_ps(_mm_and_ps(g139mask, g139NewV),
                                         _mm_andnot_ps(g139mask, _mm_loadu_ps(g139p))));
             }
+#if !DC2_G485_HAZREG
             else if (g139dst)
             {
                 // The upper result lands after the lower's same-cycle access: overlay the
@@ -1306,6 +1590,7 @@
                 if (g139m & 0x2u) g139dst[2] = g139new[2];
                 if (g139m & 0x1u) g139dst[3] = g139new[3];
             }
+#endif
         }
         // G369 (diagnostic, default-off DC2_G369_VUNAN=1): the cutscene gray screen was measured
         // at the GS as every vertex arriving with NaN/Inf. VIF source data is clean, so the
@@ -1734,6 +2019,14 @@
         if (!g430SkipHaz && !g435SkipRepin &&
             (!g425Lean || (g410Pair->g425Flags & G425_PF_TOUCHES_ZERO) != 0u))
         {
+#if DC2_G484_WIDEVF0
+            // G484: ONE 16-byte store of exactly the four constants the scalar form writes.
+            // Nothing can observe the store granularity — this is the last statement of the pair
+            // and VU1State is thread-private — but the next pair's 16-byte `_mm_loadu_ps` over
+            // these bytes can now be store-to-load forwarded instead of waiting for four narrow
+            // stores to retire to L1.
+            _mm_storeu_ps(m_state.vf[0], _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f));
+#else
             if (g435WideVf0)
             {
                 // G435: ONE 16-byte store of the same four constants (see the comment at the
@@ -1748,6 +2041,7 @@
                 m_state.vf[0][2] = 0.0f;
                 m_state.vf[0][3] = 1.0f;
             }
+#endif
             // Enforce VI0 invariant
             m_state.vi[0] = 0;
         }
@@ -1767,6 +2061,10 @@
             }
         }
 
+        // G479 (REJECTED): folding this wrap to `& (PS2_VU1_CODE_SIZE - 1)` — exact, since pc is
+        // a multiple of 8 below a power-of-two code store — read +0.93 ms/f (t = +6.4, 0/5
+        // windows) on top of the fused record, a clean sign flip from its −0.91. Removing two
+        // compares from this loop is not free; do not rebuild it.
         uint32_t sequentialPC = currentPc + 8;
         if (sequentialPC >= codeSize)
             sequentialPC = 0;
@@ -1792,13 +2090,32 @@
         if (nextPC >= codeSize)
             nextPC = 0;
         m_state.pc = nextPC;
+        G483_PC_SET(nextPC);
 
         if (m_state.ebit)
         {
             stopReason = "ebit-latched";
+            G479_QP_SYNC();
             break;
         }
 
         if (eBit)
             m_state.ebit = true;
     }
+
+    // The loop can also fall out at maxCycles; the run() tail reads *s_pDelayP directly.
+    G479_QP_SYNC();
+#undef G483_PC_CUR
+#undef G483_PC_SET
+#undef G479_QP_RELOAD
+#undef G479_QP_SYNC
+#undef G479_PD
+#undef G479_QD
+#if G484_LOCAL_DEFAULT
+#undef DC2_G484_WIDEVF0
+#undef G484_LOCAL_DEFAULT
+#endif
+#if G485_LOCAL_DEFAULT
+#undef DC2_G485_HAZREG
+#undef G485_LOCAL_DEFAULT
+#endif

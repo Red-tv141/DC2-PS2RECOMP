@@ -16,6 +16,32 @@
 // -1 = this probe is not the selected DC2_G419_AB lever, 0 = control frame, 1 = candidate frame.
 extern int g438SlowArm(int which);
 
+// G478 VU1-worker PC sampler (defined in ps2_gif_arbiter_parts/g446_gsworker_pcsample.inc).
+// No-op unless DC2_G478_VU1PROF=1.
+extern void g478RegisterVu1WorkerThread();
+
+// G478 kick-item pool paired gate (DC2_G419_AB=kickpool). -1 = not selected, 0 = control, 1 = cand.
+extern int g478KickPoolArm();
+
+// G482 memo-key PRICE arm (DC2_G419_AB=memohash). -1 = not selected, 0 = control, 1 = candidate.
+extern int g482MemoHashArm();
+
+// G482 VU-RAM write-coalescing arm (DC2_G419_AB=wcoal). -1 = not selected, 0 = control, 1 = cand.
+extern int g482WriteCoalesceArm();
+
+// G482 publish-notify-skip arm (DC2_G419_AB=notifyskip). -1 = not selected, 0 = control, 1 = cand.
+extern int g482NotifySkipArm();
+
+// G483 pair-loop iteration count of the LAST VU1Interpreter::run() on THIS thread (defined in
+// ps2_vu1_parts/vu1_g483_run_cycles.inc). Consumed only under DC2_G441_KICK=1.
+extern uint64_t dc2_g483_last_run_cycles();
+extern uint32_t dc2_g483_last_stop_reason();
+
+// G482 COMBINED promotion arm (DC2_G419_AB=g482both) — both levers switched together, exactly the
+// shipped default against exactly the full rollback (G447: two levers on one serialized edge do
+// not add, so the promotion number must come from one arm).
+
+
 #include <iostream>
 #include <fstream>
 #include <algorithm>
@@ -106,6 +132,117 @@ struct G297KickItem
     std::atomic<bool> ready{false};
 };
 using G297KickPtr = std::shared_ptr<G297KickItem>;
+
+// ---------------------------------------------------------------------------
+// G478 kick-item RECYCLING POOL (MEASURED NEUTRAL — default OFF, opt-in DC2_G478_KICKPOOL=1).
+//
+// RESULT: the paired gate `DC2_G419_AB=kickpool` (hold=16, 3,000 frames) read **+0.065 ms/f
+// (0.26%, t = 0.76)** — i.e. no win, trending to zero as n grew (+0.40 -> +0.26 -> +0.12 -> +0.08
+// -> +0.065). The ~4% allocator rows in the VU1 sample are therefore NOT the item; they belong to
+// the per-XGKICK inner packet buffers, which this pool cannot recycle because
+// collectWindowPackets MOVES them out to the GS worker's window list and they are freed there.
+// Kept, default-off, with its paired gate so it can be re-priced if packet ownership changes.
+//
+// The G478 premise gate re-ranked the VU1 worker to CO-POLE (a +1.23 ms/f spin moved the frame
+// +0.99, t = 11.4, against the GS worker's 0.76), and the first PC sample ever taken of that
+// thread found it 82.75% inside VU1Interpreter::run with ~0% blocked — and ~4% spread over
+// RtlAllocateHeap / malloc / operator new / _Emplace_reallocate / _Uninitialized_move /
+// _Destroy_range / memmove. That residue is this item: MAP-0 issues ~1,230 kicks/frame and each
+// one was a fresh `make_shared<G297KickItem>` whose three vectors were grown from zero capacity
+// and freed again, with the ALLOCATION on one thread and the FREE on another (the item's last
+// reference dies in the GS worker's collectWindowPackets batch).
+//
+// EXACTNESS. A recycled item is reset to exactly the state `make_shared` produced: `writes`,
+// `writeBytes` and `packets` cleared (size 0) and `ready` false. Only CAPACITY survives, which no
+// consumer can observe. The two payload vectors are `swap`ped with the EE's pending accumulators
+// rather than moved, so the EE gets the item's old buffer back instead of a capacity-less husk —
+// the previous `std::move` + `clear()` left `m_pendWrites` with no capacity, so every noteVuWrite
+// after a kick re-grew it from scratch. The pool is a process-lifetime static (never destroyed),
+// so an item whose last reference outlives the MTVU object still has a valid home.
+struct G478KickPool
+{
+    std::mutex mtx;
+    std::vector<G297KickItem *> free;
+};
+inline G478KickPool &g478KickPool()
+{
+    static G478KickPool *s_pool = new G478KickPool(); // intentionally leaked: process lifetime
+    return *s_pool;
+}
+// G480 PROMOTED this default-ON. G478 measured the same pool at +0.065 ms/f (t = 0.76) and left it
+// opt-in; that verdict EXPIRED the moment G480's packet pool took the per-XGKICK buffers off the
+// same heap (the G445 expiry rule, and the second time this arc has seen a "neutral" flip once the
+// edge underneath it moved — cf. G474). Re-priced on the G480 binary the paired gate
+// `DC2_G419_AB=kickpool` reads **-0.333 ms/f (t = -5.24, 5/5 windows)**. Two allocation sources
+// were CONTENDING for the same allocator: removing either alone left the other to keep the heap
+// hot, so neither could show its size. Rollback: DC2_G478_NO_KICKPOOL=1.
+// G482: contiguous VU-RAM write coalescing (default ON; see noteVuWrite for the mechanism).
+inline bool g482WriteCoalesceOn()
+{
+    static const bool s_on = (std::getenv("DC2_G482_NO_WCOAL") == nullptr);
+    return s_on;
+}
+
+// G482: skip the per-kick done-mutex + notify when no thread is waiting.
+// REJECTED — MEASURED SLOWER, default OFF (opt-in DC2_G482_NOTIFYSKIP=1, kept as the record).
+// The paired gate `DC2_G419_AB=notifyskip` read **+0.528 ms/f (t = +2.66, 0/4 windows)**. The lock
+// this removes is UNCONTENDED (the GS worker runs ~1,950 kicks behind and never sleeps here), so
+// its acquire/release is a couple of cache-hot atomics and `notify_all` on an empty condition
+// variable is a cheap no-op. What replaces it is strictly more expensive: `ready` has to be
+// upgraded from `release` to `seq_cst` and the waiter count read `seq_cst`, i.e. TWO full barriers
+// per kick on the sole pole thread. Removing a lock is only a win if the lock is contended.
+inline bool g482NotifySkipOn()
+{
+    static const bool s_on = (std::getenv("DC2_G482_NOTIFYSKIP") != nullptr);
+    return s_on;
+}
+
+inline bool g478KickPoolOn()
+{
+    static const bool s_on = (std::getenv("DC2_G478_NO_KICKPOOL") == nullptr);
+    return s_on;
+}
+inline G297KickPtr g478AcquireKickItem()
+{
+    // DC2_G419_AB=kickpool: -1 = not the selected lever (use the shipped default), 0 = control
+    // frame (the pre-G478 fresh allocation), 1 = candidate frame (pooled).
+    const int abArm = g478KickPoolArm();
+    if (abArm == 0 || (abArm < 0 && !g478KickPoolOn()))
+        return std::make_shared<G297KickItem>();
+    G478KickPool &pool = g478KickPool();
+    G297KickItem *raw = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(pool.mtx);
+        if (!pool.free.empty())
+        {
+            raw = pool.free.back();
+            pool.free.pop_back();
+        }
+    }
+    if (raw == nullptr)
+        raw = new G297KickItem();
+    else
+    {
+        // Reset to the exact post-construction state; only capacity is carried forward.
+        raw->writes.clear();
+        raw->writeBytes.clear();
+        raw->packets.clear();
+        raw->startPC = 0u;
+        raw->itop = 0u;
+        raw->top = 0u;
+        raw->budget = 0u;
+        raw->isResume = false;
+        raw->ready.store(false, std::memory_order_relaxed);
+    }
+    return G297KickPtr(raw, [](G297KickItem *p) {
+        G478KickPool &p2 = g478KickPool();
+        std::lock_guard<std::mutex> lk(p2.mtx);
+        if (p2.free.size() < 8192u)
+            p2.free.push_back(p);
+        else
+            delete p;
+    });
+}
 
 // ---------------------------------------------------------------------------
 // G331 kick-redundancy census (DC2_G331_KICKCENSUS=1). EE-thread only (called
@@ -209,6 +346,10 @@ static inline void g331KickCensus(uint32_t startPC, uint32_t itop, uint32_t top,
     ++s_frame[h];
 }
 
+// G482: full-identity memo census + memo-key price arm (both default-off). Placed here so it can
+// see G297KickItem/VU1State and be called from the worker loop below.
+#include "runtime_g482_memo_census.inc"
+
 class G297Mtvu
 {
 public:
@@ -246,6 +387,36 @@ public:
     {
         if (!src || bytes == 0u)
             return;
+        // G482: COALESCE CONTIGUOUS WRITES. MAP-0 records ~59 writes/kick averaging ~16 bytes
+        // ([G441:kick] writes/kick=59.3 bytes/kick=973), because a VIF1 UNPACK run arrives one
+        // qword at a time. The worker then replays each one as its own bounds-checked `memcpy` of
+        // ~16 bytes plus, for code, a `dc2_g410_vu_code_written` call — ~0.64 us/kick, ~0.79 ms/f
+        // ON THE POLE THREAD.
+        //
+        // The payload bytes are ALREADY concatenated in `writes` order, so two records that are
+        // adjacent in the list AND adjacent in VU RAM describe one contiguous copy. Merging them
+        // here replays byte-identical content to byte-identical offsets — the merged record's
+        // `memcpy` covers exactly the two it replaces, in the same order, on the same buffer.
+        //
+        // The G480 placement rule: this comparison runs on the EE thread, whose derivative
+        // sensitivity is ~0, and it REMOVES work from the VU1 worker, which is the sole pole.
+        // Strict contiguity only — an overlapping or out-of-order write keeps its own record, so
+        // last-writer-wins ordering is preserved exactly.
+        // Rollback: DC2_G482_NO_WCOAL=1   Paired gate: DC2_G419_AB=wcoal
+        const int abArm = g482WriteCoalesceArm();
+        if (abArm == 1 || (abArm < 0 && g482WriteCoalesceOn()))
+        {
+            if (!m_pendWrites.empty())
+            {
+                G297VuWrite &back = m_pendWrites.back();
+                if (back.isCode == (isCode ? 1u : 0u) && back.off + back.len == off)
+                {
+                    back.len += bytes;
+                    m_pendWriteBytes.insert(m_pendWriteBytes.end(), src, src + bytes);
+                    return;
+                }
+            }
+        }
         m_pendWrites.push_back(G297VuWrite{off, bytes, static_cast<uint8_t>(isCode ? 1u : 0u)});
         m_pendWriteBytes.insert(m_pendWriteBytes.end(), src, src + bytes);
     }
@@ -254,10 +425,13 @@ public:
     // return immediately. The worker owns/persists VU RAM, so there is no per-kick full snapshot.
     void enqueueKick(uint32_t startPC, uint32_t itop, uint32_t top, uint32_t budget, bool isResume)
     {
-        auto item = std::make_shared<G297KickItem>();
-        item->writes = std::move(m_pendWrites);        // EE-local until pushed: move, never copy
-        item->writeBytes = std::move(m_pendWriteBytes);
-        m_pendWrites.clear();                          // moved-from vectors → empty + reusable
+        // G478: recycled item (see G478KickPool). SWAP, not move — a move leaves m_pendWrites with
+        // zero capacity, so the next kick's noteVuWrite run re-grows it from scratch; the swap hands
+        // the EE back the item's previous buffer instead. Both accumulators end EMPTY either way.
+        auto item = g478AcquireKickItem();
+        item->writes.swap(m_pendWrites);               // EE-local until pushed: swap, never copy
+        item->writeBytes.swap(m_pendWriteBytes);
+        m_pendWrites.clear();                          // swapped-in buffers → empty + capacity kept
         m_pendWriteBytes.clear();
         item->startPC = startPC;
         item->itop = itop;
@@ -279,8 +453,10 @@ public:
         static const bool s_syncWorker = (std::getenv("DC2_G301_SYNC_WORKER") != nullptr);
         if (s_syncWorker)
         {
+            m_doneWaiters.fetch_add(1, std::memory_order_seq_cst); // G482: see collectWindowPackets
             std::unique_lock<std::mutex> lk(m_doneMtx);
             m_cvDone.wait(lk, [&] { return m_stop || item->ready.load(std::memory_order_acquire); });
+            m_doneWaiters.fetch_sub(1, std::memory_order_seq_cst);
         }
     }
 
@@ -383,8 +559,13 @@ public:
                 const auto stall0 = instr ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
                 {
+                    // G482: publish this thread's intent to sleep BEFORE taking the done mutex, so
+                    // the VU1 worker's `ready` store and its waiter test cannot both land in the
+                    // gap. See the publish site for the full ordering argument.
+                    m_doneWaiters.fetch_add(1, std::memory_order_seq_cst);
                     std::unique_lock<std::mutex> lk(m_doneMtx);
                     m_cvDone.wait(lk, [&] { return m_stop || item->ready.load(std::memory_order_acquire); });
+                    m_doneWaiters.fetch_sub(1, std::memory_order_seq_cst);
                 }
                 if (instr)
                 {
@@ -461,6 +642,10 @@ private:
 
     void worker()
     {
+        // G478: arm the host PC sampler on THIS thread (no-op unless DC2_G478_VU1PROF=1). The G478
+        // premise gate re-opened the VU1 direction (sensitivity 0.80 vs the GS worker's 0.76), and
+        // this thread has never had a sample distribution — only occupancy timers.
+        g478RegisterVu1WorkerThread();
         // G442 CEILING PROBE (default OFF: DC2_G442_FTZ=1). Nothing in this tree touches MXCSR, so
         // the VU1 interpreter's SSE2 FMACs run with subnormal support ON and every subnormal
         // operand/result costs a microcode assist. Setting FTZ|DAZ on THIS thread only prices that
@@ -534,7 +719,13 @@ private:
                     {
                         std::memcpy(dst + w.off, item->writeBytes.data() + run, w.len);
                         if (w.isCode)
+                        {
                             dc2_g410_vu_code_written(m_workerVuCode, w.off, w.len);
+                            // G482: the CODE half of the persistent VU state is tracked as a
+                            // monotonic generation instead of a second 16 KB hash. Present in BOTH
+                            // A/B arms (one non-atomic worker-local increment), so it cancels.
+                            ++g_g482CodeGen;
+                        }
                     }
                     run += w.len;
                 }
@@ -559,6 +750,49 @@ private:
                 const char *v = std::getenv("DC2_G303_VU1_SLOW_US");
                 return v ? std::atoll(v) : 0LL;
             }();
+            // ---- G482 (BOTH halves default-off) ----------------------------------------------
+            // (a) PRICE arm `DC2_G419_AB=memohash`: compute the full memo KEY and sink it. No clock
+            //     read, no map, no branch on the result — the candidate arm pays exactly the hash
+            //     and nothing else, so the paired window difference IS the key's frame cost.
+            // (b) CENSUS `DC2_G482_MEMOCENSUS=1`: the same key, plus a post-state key, an exec
+            //     timer and an intra-frame table, to read the TRUE full-identity hit rate and the
+            //     execute time those hits carry. Perturbs the pole (three extra clock reads and a
+            //     second 16 KB hash per kick) and is therefore never a timing arm.
+            const bool g482Census = g482CensusOn();
+            const int g482Arm = g482MemoHashArm();
+            uint64_t g482PreKey = 0ull, g482PreNs = 0ull;
+            uint64_t g482DataK = 0ull, g482RegK = 0ull, g482ParamK = 0ull;
+            std::chrono::steady_clock::time_point g482Exec0;
+            if (g482Census)
+            {
+                g482FrameTick();
+                ++g482Win().kicks;
+                if (item->isResume)
+                    ++g482Win().resume;
+            }
+            if (!item->isResume && (g482Census || g482Arm == 1))
+            {
+                if (g482Census)
+                {
+                    const auto h0 = std::chrono::steady_clock::now();
+                    g482PreKey = g482StateKey(m_workerVuData, PS2_VU1_DATA_SIZE, m_vu1->state(),
+                                              item->startPC, item->itop, item->top, item->budget);
+                    g482PreNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - h0).count();
+                    // Split keys (census only, OUTSIDE the timed region) so a miss can be
+                    // attributed to the data RAM or to the registers.
+                    g482DataK = g482DataKey(m_workerVuData, PS2_VU1_DATA_SIZE);
+                    g482RegK = g482RegKey(m_vu1->state());
+                    g482ParamK = g482ParamKey(item->startPC, item->itop, item->top,
+                                              item->writeBytes);
+                }
+                else
+                    g_g482HashSink ^= g482StateKey(m_workerVuData, PS2_VU1_DATA_SIZE,
+                                                   m_vu1->state(), item->startPC, item->itop,
+                                                   item->top, item->budget);
+            }
+            if (g482Census)
+                g482Exec0 = std::chrono::steady_clock::now();
             // Busy-time attribution is gated so the default (non-measuring) path does zero clock work.
             const bool instr = g303InstrOn();
             const auto twBusy0 = instr ? std::chrono::steady_clock::now()
@@ -593,25 +827,126 @@ private:
                 m_workerKicksRun.fetch_add(1ull, std::memory_order_relaxed);
             }
             g_g297KickCapture = nullptr;
+            // G482 census tail: post-state key + intra-frame table. `item->packets` is final here,
+            // so its byte count is exactly what a memo hit would have to replay.
+            if (g482Census && !item->isResume)
+            {
+                const auto e1 = std::chrono::steady_clock::now();
+                const uint64_t execNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    e1 - g482Exec0).count();
+                const uint64_t postKey = g482StateKey(m_workerVuData, PS2_VU1_DATA_SIZE,
+                                                      m_vu1->state(), 0u, 0u, 0u, 0u);
+                uint64_t pkt = 0ull;
+                for (const auto &pk : item->packets)
+                    pkt += pk.size();
+                G482Win &wa = g482Win();
+                wa.hashNs += g482PreNs; // PRE key only — the post key is census-only overhead
+                ++wa.hashCalls;
+                wa.execNsAll += execNs;
+                auto wit = g482WeakMap().find(g482ParamK);
+                if (wit == g482WeakMap().end())
+                    g482WeakMap().emplace(g482ParamK, G482WeakRec{g482DataK, g482RegK});
+                else
+                {
+                    ++wa.weakDup;
+                    if (wit->second.dataKey == g482DataK)
+                        ++wa.weakDataMatch;
+                    if (wit->second.regKey == g482RegK)
+                        ++wa.weakRegMatch;
+                }
+                auto it = g482FrameMap().find(g482PreKey);
+                if (it == g482FrameMap().end())
+                    g482FrameMap().emplace(g482PreKey, G482PostRec{postKey, execNs, pkt, 1u});
+                else
+                {
+                    ++it->second.count;
+                    ++wa.dupIntra;
+                    if (it->second.postKey != postKey)
+                        ++wa.dupUnsound; // key insufficient => memo would be WRONG
+                    wa.execNsDup += execNs;
+                    wa.dupPktBytes += pkt;
+                    wa.dupStateBytes += PS2_VU1_DATA_SIZE;
+                }
+            }
             const auto g441T3 = s_g441Kick ? std::chrono::steady_clock::now()
                                            : std::chrono::steady_clock::time_point{};
             {
-                // Publish ready under the DONE mutex (separate from the work-queue m_mtx, so this
-                // does not contend with the GS worker's batch collection or the EE's enqueue). The
-                // lock closes the lost-wakeup gap against collectWindowPackets' slow-path wait.
-                std::lock_guard<std::mutex> lk(m_doneMtx);
-                item->ready.store(true, std::memory_order_release);
+                // G482: SKIP THE PUBLISH LOCK AND NOTIFY WHEN NOBODY IS WAITING.
+                //
+                // The VU1 worker runs ~1,900 kicks AHEAD of the GS worker ([G441:kick]
+                // backlog=1916, starve=0.0%), so collectWindowPackets takes its fast lock-free
+                // `ready` path on essentially every kick and NOTHING ever sleeps on m_cvDone. The
+                // old code still paid the `m_doneMtx` acquire/release plus a `notify_all` syscall
+                // path on all ~1,236 kicks/frame (~0.25 us/kick, ~0.31 ms/f) on the SOLE POLE.
+                //
+                // ORDERING (no lost wakeup). A waiter does `m_doneWaiters++` (seq_cst) BEFORE
+                // taking m_doneMtx and re-checking `ready`. The publisher does `ready.store`
+                // (seq_cst) BEFORE `m_doneWaiters.load` (seq_cst). Both pairs are in the single
+                // total order, so for any waiter/publisher pair either:
+                //   - the increment precedes the load  -> the publisher sees a non-zero count and
+                //     takes the lock + notifies, or
+                //   - the load precedes the increment  -> the store precedes the increment too,
+                //     so the waiter's own predicate re-check (under the lock, after the increment)
+                //     already observes ready == true and never blocks.
+                // Rollback: DC2_G482_NO_NOTIFYSKIP=1   Paired gate: DC2_G419_AB=notifyskip
+                const int g482Arm2 = g482NotifySkipArm();
+                if (g482Arm2 == 1 || (g482Arm2 < 0 && g482NotifySkipOn()))
+                {
+                    item->ready.store(true, std::memory_order_seq_cst);
+                    if (m_doneWaiters.load(std::memory_order_seq_cst) != 0)
+                    {
+                        { std::lock_guard<std::mutex> lk(m_doneMtx); }
+                        m_cvDone.notify_all();
+                    }
+                }
+                else
+                {
+                    // Publish ready under the DONE mutex (separate from the work-queue m_mtx, so
+                    // this does not contend with the GS worker's batch collection or the EE's
+                    // enqueue). The lock closes the lost-wakeup gap against collectWindowPackets'
+                    // slow-path wait.
+                    {
+                        std::lock_guard<std::mutex> lk(m_doneMtx);
+                        item->ready.store(true, std::memory_order_release);
+                    }
+                    m_cvDone.notify_all();
+                }
             }
-            m_cvDone.notify_all();
             if (s_g441Kick)
             {
                 const auto g441T4 = std::chrono::steady_clock::now();
                 m_g441PublishNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                     g441T4 - g441T3).count();
-                m_g441ExecNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    g441T3 - g441T0).count() -
+                const uint64_t g441ExecNs =
+                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        g441T3 - g441T0).count() -
                     (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                         g441T1 - g441T0).count();
+                m_g441ExecNs += g441ExecNs;
+                // G483: split the exec bucket by KICK KIND and record the pair-loop iteration
+                // count, so ns/pair is directly comparable between the two populations. G482
+                // measured execute()/resume() at 98.4% of the kick span as ONE number; every
+                // census this arc (G331/G479/G482) then excluded resume kicks, so ~30% of the
+                // pole's work has never been characterised. `cycle` is the pair loop's own
+                // counter, published by vu1_g483_run_cycles.inc.
+                {
+                    const uint64_t pairs = dc2_g483_last_run_cycles();
+                    const uint32_t stop = dc2_g483_last_stop_reason();
+                    m_g483Pairs += pairs;
+                    if (stop == 0u)
+                    {
+                        ++m_g483MaxCycKicks;
+                        m_g483MaxCycPairs += pairs;
+                    }
+                    if (item->isResume)
+                    {
+                        ++m_g483ResKicks;
+                        m_g483ResExecNs += g441ExecNs;
+                        m_g483ResPairs += pairs;
+                        if (stop == 0u)
+                            ++m_g483ResMaxCyc;
+                    }
+                }
                 m_g441KickNs += (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                     g441T4 - g441T0).count();
                 if ((++m_g441Kicks % 30000ull) == 0ull)
@@ -633,6 +968,51 @@ private:
                                  (double)(m_g441Backlog - m_g441LastBacklog) / n,
                                  (double)(m_g441Writes - m_g441LastWrites) / n,
                                  (double)(m_g441WriteBytes - m_g441LastWriteBytes) / n);
+                    // G483: kick-kind split of the same window. `resExecUs`/`geoExecUs` are per
+                    // kick OF THAT KIND (not per kick overall), so they compare directly; the
+                    // ns/pair columns say whether a kind is expensive because it runs more pairs
+                    // or because its pairs are slower.
+                    {
+                        const double rk = (double)(m_g483ResKicks - m_g483LastResKicks);
+                        const double gk = n - rk;
+                        const double rp = (double)(m_g483ResPairs - m_g483LastResPairs);
+                        const double gp = (double)(m_g483Pairs - m_g483LastPairs) - rp;
+                        const double rns = (double)(m_g483ResExecNs - m_g483LastResExecNs);
+                        const double gns = (double)(m_g441ExecNs - m_g441LastExecNs) - rns;
+                        std::fprintf(stderr,
+                                     "[G483:kind] resume=%.1f%% | res(kicks=%.0f execUs=%.2f "
+                                     "pairs=%.0f nsPerPair=%.1f) geo(kicks=%.0f execUs=%.2f "
+                                     "pairs=%.0f nsPerPair=%.1f) | resShareOfExec=%.1f%% "
+                                     "resShareOfPairs=%.1f%%\n",
+                                     100.0 * rk / n,
+                                     rk, rk > 0.0 ? rns / 1e3 / rk : 0.0,
+                                     rk > 0.0 ? rp / rk : 0.0, rp > 0.0 ? rns / rp : 0.0,
+                                     gk, gk > 0.0 ? gns / 1e3 / gk : 0.0,
+                                     gk > 0.0 ? gp / gk : 0.0, gp > 0.0 ? gns / gp : 0.0,
+                                     100.0 * rns / (rns + gns > 0.0 ? rns + gns : 1.0),
+                                     100.0 * rp / (rp + gp > 0.0 ? rp + gp : 1.0));
+                        // Budget exhaustion: a kick whose pair loop ended because `maxCycles` ran
+                        // out, not because the microprogram latched its E bit. Split by kind, and
+                        // report the share of ALL pairs those kicks account for.
+                        const double mk = (double)(m_g483MaxCycKicks - m_g483LastMaxCycKicks);
+                        const double mp = (double)(m_g483MaxCycPairs - m_g483LastMaxCycPairs);
+                        const double rmk = (double)(m_g483ResMaxCyc - m_g483LastResMaxCyc);
+                        std::fprintf(stderr,
+                                     "[G483:stop] maxcycKicks=%.1f%% (res=%.1f%% geo=%.1f%%) "
+                                     "maxcycPairs=%.1f%% ofAll pairs/maxcycKick=%.0f\n",
+                                     100.0 * mk / n,
+                                     rk > 0.0 ? 100.0 * rmk / rk : 0.0,
+                                     gk > 0.0 ? 100.0 * (mk - rmk) / gk : 0.0,
+                                     (rp + gp) > 0.0 ? 100.0 * mp / (rp + gp) : 0.0,
+                                     mk > 0.0 ? mp / mk : 0.0);
+                        m_g483LastMaxCycKicks = m_g483MaxCycKicks;
+                        m_g483LastMaxCycPairs = m_g483MaxCycPairs;
+                        m_g483LastResMaxCyc = m_g483ResMaxCyc;
+                        m_g483LastResKicks = m_g483ResKicks;
+                        m_g483LastResExecNs = m_g483ResExecNs;
+                        m_g483LastResPairs = m_g483ResPairs;
+                        m_g483LastPairs = m_g483Pairs;
+                    }
                     m_g441LastKicks = m_g441Kicks;
                     m_g441LastKickNs = m_g441KickNs;
                     m_g441LastPopNs = m_g441PopNs;
@@ -659,6 +1039,13 @@ private:
     uint64_t m_g441LastWrites = 0ull, m_g441LastWriteBytes = 0ull;
     uint64_t m_g441Starved = 0ull, m_g441StarveNs = 0ull, m_g441Backlog = 0ull;
     uint64_t m_g441LastStarved = 0ull, m_g441LastStarveNs = 0ull, m_g441LastBacklog = 0ull;
+    // G483 kick-kind split (same DC2_G441_KICK=1 gate, same thread, same plain-scalar rules).
+    uint64_t m_g483ResKicks = 0ull, m_g483ResExecNs = 0ull, m_g483ResPairs = 0ull;
+    uint64_t m_g483Pairs = 0ull;
+    uint64_t m_g483LastResKicks = 0ull, m_g483LastResExecNs = 0ull, m_g483LastResPairs = 0ull;
+    uint64_t m_g483LastPairs = 0ull;
+    uint64_t m_g483MaxCycKicks = 0ull, m_g483MaxCycPairs = 0ull, m_g483ResMaxCyc = 0ull;
+    uint64_t m_g483LastMaxCycKicks = 0ull, m_g483LastMaxCycPairs = 0ull, m_g483LastResMaxCyc = 0ull;
 
     VU1Interpreter *m_vu1 = nullptr;
     PS2Memory *m_mem = nullptr;
@@ -670,6 +1057,10 @@ private:
     std::mutex m_doneMtx;                               // done-signal: VU1 worker / GS worker (decoupled)
     std::condition_variable m_cvWork;                  // paired with m_mtx
     std::condition_variable m_cvDone;                  // paired with m_doneMtx
+    // G482: number of threads that have declared intent to sleep on m_cvDone but have not yet
+    // returned from wait(). Incremented BEFORE m_doneMtx is taken (see the publish site's ordering
+    // argument). Zero on essentially every kick, which is what makes the publish lock skippable.
+    std::atomic<int> m_doneWaiters{0};
     std::deque<G297KickPtr> m_work;                     // worker input FIFO
     std::vector<G297KickPtr> m_curBatch;               // EE-only: kicks in the current window
     std::mutex m_batchMtx;
