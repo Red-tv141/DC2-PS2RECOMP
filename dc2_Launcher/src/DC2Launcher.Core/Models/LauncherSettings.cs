@@ -14,16 +14,6 @@ public class GameOptions
     public bool Enable60Fps { get; set; } = false;
     public bool EnableDebugMenu { get; set; } = false;
 
-    /// <summary>
-    /// Arms the runner's G447 host check (DC2_G447_HOSTCHECK=1): a paired within-process
-    /// A/B of the two spin-then-block waits on the GS worker to GL backend round trip,
-    /// which are the only levers whose value depends on the machine's spare cores. The
-    /// runner prints a plain KEEP DEFAULT / ROLL BACK / NEUTRAL verdict, which the launcher
-    /// captures to Logs/performance_*.log. Diagnostic only - it alternates both arms, so it
-    /// is not a play mode.
-    /// </summary>
-    public bool DebugPerformance { get; set; } = false;
-
     public ResolutionSettings Resolution { get; set; } = new();
 }
 

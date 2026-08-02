@@ -308,26 +308,6 @@ public class MainViewModel : ViewModelBase
             }
         }
     }
-
-    /// <summary>
-    /// Arms the runner's G447 host check. The runner alternates the shipped default against
-    /// the full rollback of the two spin-then-block waits inside one process and prints a
-    /// verdict; the launcher captures it to Logs/performance_*.log. Diagnostic only.
-    /// </summary>
-    public bool DebugPerformance
-    {
-        get => _settings.Game.DebugPerformance;
-        set
-        {
-            if (_settings.Game.DebugPerformance != value)
-            {
-                _settings.Game.DebugPerformance = value;
-                OnPropertyChanged();
-                SaveSettings();
-            }
-        }
-    }
-
     public bool SkipIntro
     {
         get => _settings.Game.SkipIntro;

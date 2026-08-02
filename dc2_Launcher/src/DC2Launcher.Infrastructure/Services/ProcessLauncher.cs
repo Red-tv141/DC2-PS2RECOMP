@@ -80,16 +80,6 @@ public class ProcessLauncher : IProcessLauncher
             config.EnvironmentVariables["DC2_PATCH_60FPS"] = "1";
         }
 
-        // Debug Performance: the G447 host check. It measures the shipped default against
-        // the full rollback inside one process, so it needs UNCAPPED frames on both arms —
-        // DC2 is a locked-30 title and a capped run reads the cap, not a result. Force the
-        // patch on here rather than making the user remember to tick two boxes.
-        if (settings.Game.DebugPerformance)
-        {
-            config.EnvironmentVariables["DC2_G447_HOSTCHECK"] = "1";
-            config.EnvironmentVariables["DC2_PATCH_60FPS"] = "1";
-        }
-
         if (settings.Game.EnableDebugMenu)
         {
             config.EnvironmentVariables["DC2_DEBUG_MENU"] = "1";
@@ -226,18 +216,6 @@ public class ProcessLauncher : IProcessLauncher
                     psi.EnvironmentVariables[kvp.Key] = kvp.Value;
                 }
 
-                // Debug Performance writes its verdict to the runner's stderr, which is
-                // invisible for a windowed launch — capture it to a file the user can find.
-                // Only in this mode: redirection is otherwise pure overhead.
-                var capturePerfLog = settings.Game.DebugPerformance;
-                string perfLogPath = string.Empty;
-                StreamWriter? perfLog = null;
-                if (capturePerfLog)
-                {
-                    psi.RedirectStandardError = true;
-                    psi.RedirectStandardOutput = true;
-                }
-
                 _logger.LogInfo($"Launching process '{psi.FileName}' with working dir '{psi.WorkingDirectory}'.");
                 _runningProcess = Process.Start(psi);
 
@@ -246,40 +224,6 @@ public class ProcessLauncher : IProcessLauncher
                     errorMessage = "Failed to start process (Process.Start returned null).";
                     _logger.LogError(errorMessage);
                     return false;
-                }
-
-                if (capturePerfLog)
-                {
-                    var logDir = Path.Combine(_environment.LauncherRoot, "Logs");
-                    Directory.CreateDirectory(logDir);
-                    perfLogPath = Path.Combine(
-                        logDir, $"performance_{DateTime.Now:yyyyMMdd_HHmmss}.log");
-                    perfLog = new StreamWriter(perfLogPath, append: false) { AutoFlush = true };
-
-                    var sync = new object();
-                    void Write(string? line)
-                    {
-                        if (line == null) return;
-                        lock (sync)
-                        {
-                            try { perfLog?.WriteLine(line); } catch { /* log is best-effort */ }
-                        }
-                    }
-
-                    _runningProcess.OutputDataReceived += (_, e) => Write(e.Data);
-                    _runningProcess.ErrorDataReceived += (_, e) => Write(e.Data);
-                    _runningProcess.EnableRaisingEvents = true;
-                    _runningProcess.Exited += (_, _) =>
-                    {
-                        lock (sync)
-                        {
-                            try { perfLog?.Dispose(); } catch { }
-                            perfLog = null;
-                        }
-                    };
-                    _runningProcess.BeginOutputReadLine();
-                    _runningProcess.BeginErrorReadLine();
-                    _logger.LogInfo($"Debug Performance active. Runner output -> '{perfLogPath}'.");
                 }
 
                 _logger.LogInfo($"Game runner process started with PID {_runningProcess.Id}.");
