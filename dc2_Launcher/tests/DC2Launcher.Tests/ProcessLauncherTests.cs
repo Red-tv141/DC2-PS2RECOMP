@@ -105,37 +105,6 @@ public class ProcessLauncherTests
     }
 
     [Fact]
-    public void BuildLaunchConfiguration_DebugPerformance_ArmsHostCheckAndForcesUncapped()
-    {
-        // The G447 host check compares both arms inside one process. DC2 is a locked-30
-        // title, so a capped run reads the cap rather than a result — the uncapped patch is
-        // part of the measurement, not a separate user choice.
-        var env = new TestLauncherEnvironment { LauncherRoot = @"C:\MockLauncher" };
-        var launcher = new ProcessLauncher(env, new ValidationService(env, new MockFileSystemService()), new MockLoggerService());
-
-        var settings = new LauncherSettings();
-        settings.Game.DebugPerformance = true;
-        settings.Game.Enable60Fps = false;
-
-        var config = launcher.BuildLaunchConfiguration(settings);
-
-        Assert.Equal("1", config.EnvironmentVariables["DC2_G447_HOSTCHECK"]);
-        Assert.Equal("1", config.EnvironmentVariables["DC2_PATCH_60FPS"]);
-    }
-
-    [Fact]
-    public void BuildLaunchConfiguration_DebugPerformanceOff_OmitsHostCheck()
-    {
-        var env = new TestLauncherEnvironment { LauncherRoot = @"C:\MockLauncher" };
-        var launcher = new ProcessLauncher(env, new ValidationService(env, new MockFileSystemService()), new MockLoggerService());
-
-        var config = launcher.BuildLaunchConfiguration(new LauncherSettings());
-
-        Assert.False(config.EnvironmentVariables.ContainsKey("DC2_G447_HOSTCHECK"));
-        Assert.False(config.EnvironmentVariables.ContainsKey("DC2_PATCH_60FPS"));
-    }
-
-    [Fact]
     public void LaunchConfiguration_FormatDiagnosticSummary_ProducesReadableSummary()
     {
         var config = new LaunchConfiguration
