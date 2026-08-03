@@ -92,7 +92,12 @@ namespace
 
             const G421UpperDesc d = desc[kind];
             if (d.cls != 1u && d.cls != 2u)
-                continue; // ITOF/FTOI/ABS/MOVE/MR32 and unsupported stay on the G421 path
+                continue; // ITOF/FTOI/ABS/MOVE/MR32/CLIPw and unsupported stay on the G421 path
+            // G488: OPMSUB (op 7) and OPMULA (op 8) are cls 1/2 FMACs but their operands are a
+            // CROSS-LANE permutation, which this control record cannot express — its `op` switch
+            // would silently fold them into its `default` (MIN). They stay on the G421 path.
+            if (d.op > 6u)
+                continue;
 
             c.valid = 1u;
             c.accDest = (d.cls == 2u) ? 1u : 0u;
@@ -182,6 +187,12 @@ namespace
     static DC2_G330_FORCEINLINE bool g426FastUpper(
         VU1State &st, uint32_t upper, uint8_t kind, const G426Ctl *ctl)
     {
+        // G488: this table is 0x80 entries and `kind` is the raw sidecar byte, which is 0xff for an
+        // encoding with no compiled kind. Same latent out-of-bounds read G488 closed in
+        // G421DescTable, closed here with a bound test instead because a G426Ctl is 128 bytes and
+        // this whole path is default-off (DC2_G426_FUSED_UPPER).
+        if (kind >= 0x80u)
+            return false;
         const G426Ctl &c = ctl[kind];
         if (c.valid == 0u)
             return false;

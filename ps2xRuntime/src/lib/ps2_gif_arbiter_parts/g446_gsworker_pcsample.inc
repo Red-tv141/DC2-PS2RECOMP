@@ -388,7 +388,13 @@ namespace
 
     void g446SamplerMain(HANDLE target)
     {
-        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
+        // G497: SYMOPT_LOAD_LINES was missing, so SymGetLineFromAddr64 below ALWAYS failed and the
+        // report printed only public-symbol names. Every `static` function folds into the preceding
+        // exported symbol, so those names are hypotheses (the G478 note below says so) — and without
+        // lines there was no way to test them. G497's first gsprof read
+        // `g415_backend_set_color_window 12.51%` on a thread whose span IS the frame; that symbol is
+        // a two-line setter. One missing option cost the arc six phases of "the pole thread is flat".
+        SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
         SymInitialize(GetCurrentProcess(), nullptr, TRUE);
 
         const unsigned periodUs = g446SampleUs();

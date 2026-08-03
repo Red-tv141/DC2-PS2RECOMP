@@ -894,6 +894,11 @@ static std::atomic<uint64_t> g_g305Submitted{0};    // async packets submitted
 static std::atomic<uint64_t> g_g305Drained{0};      // packets drained (== submitted at steady state)
 static std::atomic<uint64_t> g_g305Failed{0};       // backend render failures caught at drain (expect 0)
 
+// G493: the late-drain lever, its predicates and its [G493:ovl] census. Included here because it
+// needs g_g305Pending / g_g305ForceSync / g_g305Drained above and must be visible at the flush's
+// submit point below.
+#include "g493_late_drain.inc"
+
 // Drain the in-flight async packet (if any) and resolve the delayed-failure contract. Cheap no-op
 // when nothing is pending; safe to call at every consumer edge. Runs only on the front-end thread.
 static bool g305DrainOne()
@@ -903,7 +908,19 @@ static bool g305DrainOne()
     G305Pending pending = std::move(g_g305Pending.front());
     g_g305Pending.pop_front();
     bool ok = true;
-    g178_backend_drain_async(ok);
+    // G493: when the late drain already waited on this packet and saw it FAIL, the backend slot is
+    // gone — do not wait again, just run the replay here, where s_batch is not live.
+    if (g_g493FailPending)
+    {
+        g_g493FailPending = false;
+        ok = false;
+    }
+    else
+    {
+        const auto g493T0 = g493DrainBegin();
+        g178_backend_drain_async(ok);
+        g493DrainEnd(g493T0);
+    }
     const uint64_t nDrained = g_g305Drained.fetch_add(1u, std::memory_order_relaxed) + 1u;
     if (g305StatOn() && (nDrained % 1000u) == 0u)
         std::fprintf(stderr, "[G305:async] submitted=%llu drained=%llu failed=%llu\n",
@@ -946,7 +963,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     G324FlushDiag g324Diag{};
     const bool g324IsArmed = g324Armed();
     G324DiagScope g324Scope(g324IsArmed ? &g324Diag : nullptr);
-    if (g305DrainRequired())
+    // G493: under the late-drain lever this ONE drain moves to just before this flush's own submit,
+    // so the pending render overlaps everything below instead of nothing. It still runs here when a
+    // late drain deferred a FAILURE to us — that replay re-enters the flush sequence and must not
+    // happen once s_batch is live. Every other g305DrainPending() call site is untouched.
+    if (g305DrainRequired() && (!g493LateDrainActive() || g_g493FailPending))
         g305DrainPending();
     if (!g178GpuOn() || g_g144List.empty() || vram == nullptr)
     {
@@ -3826,12 +3847,22 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // discarded. Published unconditionally: the backend honours it only when its arm is on, and
     // the census needs the window even in the control arm.
     g415_backend_set_color_window(kFbH - 1 - rowHi, rowHi - rowLo + 1);
+    // G493 LATE DRAIN. Everything above this line — batch building, materialization, the G310
+    // freeze, argument validation and the colour-window publication — is the front-end CPU the
+    // previous packet's render was supposed to overlap with, and under the shipped top-of-flush
+    // drain it overlapped with none of it. Retire the packet HERE instead: submitAsync's one slot
+    // is free by the next statement, GL order is unchanged (single FIFO worker), and every
+    // consumer-side drain site is untouched. Failure is deferred, never replayed inline: s_batch is
+    // live and the replay rebuilds it.
+    if (g305DrainRequired() && g493LateDrainActive())
+        g493LateDrainPending();
     bool submitted;
     if (g305Async)
     {
         submitted = g178_backend_submit_async(s_batch);
         if (submitted)
         {
+            g493NoteSubmit();
             // Retain fallback authority for the drain-time failure check; leave g_g144List empty so
             // the closure's post-success clear() is a no-op and the next flush accumulates fresh.
             G305Pending pending;

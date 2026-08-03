@@ -21,6 +21,18 @@ extern int g483PcRegArm();
 // G484: within-process paired A/B arm for the wide VF0 re-pin.
 extern int g484WideVf0Arm();
 
+// G487: within-process paired A/B arm for the compiled flag-consumer lowers. Unlike every other
+// arm in this file it is NOT a loop-copy selector — it changes what this cache DECODES, so a flip
+// must re-decode the cache (see g410PreparePairs).
+extern int g487FlagLowerArm();
+
+// G488: same shape, for the three cross-lane/flag-only UPPER encodings.
+extern int g488FastOpArm();
+
+// G489: same shape, for the cached "this lower can write pc" bit that lets the loop tail skip the
+// `postExecPc` read-back. Also a cache-decode arm, so a flip re-decodes (see g410PreparePairs).
+extern int g489PcSkipArm();
+
 namespace
 {
     struct G410CompiledUpper
@@ -69,6 +81,51 @@ namespace
     // sticky bits accumulate over every FMAC ever executed and therefore cannot be reconstructed
     // lazily. FMEQ/FMAND/FMOR read only `s_vuMacVisible`, which is a per-pair snapshot.
     constexpr uint8_t G428_PF_STATUSREAD = 0x10u;
+
+    // G489: the lower slot of this pair can WRITE `m_state.pc`, i.e. it is a branch or a jump.
+    //
+    // The pair loop's tail asks "did the lower slot branch?" by reading `m_state.pc` back and
+    // comparing it with `currentPc` (the `postExecPc` round trip). That read is a reload of
+    // `&m_state` out of its spill slot plus a dependent 4-byte load, on EVERY pair, in the loop
+    // TAIL — the /MAP + PC-sample audit of the G489 binary put 22.6% of all VU1 samples in that
+    // 512-byte tail region and named `mov rax,[rbp+0x160]` / `mov edx,[rax+0x25c]` as two of its
+    // hottest instructions. But the answer is a pure function of the lower ENCODING, which this
+    // sidecar already caches and precisely invalidates.
+    //
+    // EXACTNESS. `m_state.pc` / `st.pc` is assigned by exactly two executors, and in both the
+    // complete set of assigning cases is the branch/jump group:
+    //   * VU1Interpreter::execLower  - `case 0x20/0x21/0x24/0x25/0x28/0x29/0x2C/0x2D/0x2E/0x2F`
+    //     (B / BAL / JR / JALR / IBEQ / IBNE / IBLTZ / IBGTZ / IBLEZ / IBGEZ), the only ten
+    //     `m_state.pc =` statements in the whole file;
+    //   * g422FastLower / the G481 inline bodies - `G422_LK_B .. G422_LK_IBGEZ`, which
+    //     g422DecodeLowerKind produces from exactly those same ten `opHi` values.
+    // execUpper never writes pc. So a pair whose lower `opHi` is outside that set provably leaves
+    // `m_state.pc == currentPc`, whichever executor ran it, covered or not.
+    //
+    // Conservative on the I-bit: an LOI pair's lower word is a float immediate that is never
+    // executed as an instruction, so it cannot write pc either — but its bit pattern can land in
+    // the branch range, and the bit is set rather than reasoned away.
+    constexpr uint8_t G489_PF_CANBRANCH = 0x20u;
+
+    inline bool g489LowerWritesPc(uint32_t lower)
+    {
+        switch (static_cast<uint8_t>((lower >> 25u) & 0x7fu))
+        {
+        case 0x20u: // B
+        case 0x21u: // BAL
+        case 0x24u: // JR
+        case 0x25u: // JALR
+        case 0x28u: // IBEQ
+        case 0x29u: // IBNE
+        case 0x2cu: // IBLTZ
+        case 0x2du: // IBGTZ
+        case 0x2eu: // IBLEZ
+        case 0x2fu: // IBGEZ
+            return true;
+        default:
+            return false;
+        }
+    }
 
     inline bool g428LowerReadsStatus(uint32_t lower)
     {
@@ -145,6 +202,19 @@ namespace
     struct G410CompiledCache
     {
         const uint8_t *codeBase = nullptr;
+        // G487: the flag-consumer arm this cache's `lowerKind` bytes were decoded under. Every
+        // decode site (the bulk prepare, the MPG invalidation path and the cache verifier) reads
+        // it from HERE rather than from the arm accessor, so the cache can never hold a mixture:
+        // the only place the arm is sampled is g410PreparePairs, once per run(), and sampling it
+        // is what triggers the rebuild.
+        bool decodeFlagLower = false;
+        // G488: the compiled cross-lane/flag-only UPPER arm this cache's `upperKind` bytes were
+        // decoded under. Same contract as decodeFlagLower — sampled once, in g410PreparePairs.
+        bool decodeFastOp = false;
+        // G489: the pc-skip arm this cache's `G489_PF_CANBRANCH` bits were decoded under. Same
+        // contract as the two above — sampled once, in g410PreparePairs, and a flip rebuilds.
+        bool decodePcSkip = false;
+        bool decodeArmValid = false;
         std::array<G410CompiledUpper, PS2_VU1_CODE_SIZE / 8u> uppers{};
         std::array<uint64_t, PS2_VU1_CODE_SIZE / 8u> sources{};
         // G479: the same two words, interleaved. 16-byte aligned so one record is never split
@@ -153,6 +223,10 @@ namespace
         // G475: maximal sequential run starting at each slot for the compact
         // VNOP-upper + covered non-control-lower trace (0 = ineligible, capped at 255).
         std::array<uint8_t, PS2_VU1_CODE_SIZE / 8u> g475RunLen{};
+        // G490: the same shape for the WIDENED block run — every covered upper class, not only
+        // VNOP. Maintained by the same two call sites as g475RunLen, so precise invalidation
+        // covers it identically.
+        std::array<uint8_t, PS2_VU1_CODE_SIZE / 8u> g490RunLen{};
         uint64_t hits = 0u;
         uint64_t compiles = 0u;
         uint64_t upperFallbacks = 0u;
@@ -248,6 +322,191 @@ namespace
     // loop copy and the whole `wideDest` plumbing were REMOVED, so the default path is
     // source-identical to G485's. Full record at `g428StoreDest` in vu1_g421_fast_upper.inc.
 
+    // G487: COMPILED FLAG-CONSUMER LOWERS.
+    //
+    // PREMISE, priced off THIS binary's linker /MAP before anything was built (G476/G480/G483).
+    // `execLower`'s call boundary is the largest in the pair loop by a wide margin — its prologue
+    // is 8 GPR pushes, `sub rsp,0x728`, TEN `movaps` spills of xmm6-xmm15 and a /GS cookie, all
+    // mirrored on return, before the two-level opcode switch is even reached. `[G422:cover]` says
+    // 4.61% of pairs (~75 k/frame) cross it, and `[G486:uncov]` says the only coverable mass in
+    // that population is the four flag consumers (2.54% of pairs, ~41 k/frame); the rest is DIV
+    // (Q-latency staging), XGKICK and the EFU/WAIT scalar pipe, none of which can move.
+    //
+    // WHY THIS SHAPE. `g421FastUpper` and `g422FastLower` are both FULLY INLINED into
+    // `VU1Interpreter::run()` in this binary (confirmed from the /MAP: run() contains no call to
+    // either), so a kind that becomes "covered" stops making a call at all rather than trading one
+    // call for a cheaper one. That also means the change grows the loop's inlined text, which is
+    // the resource G481's inline-budget cliff binds on — hence exactly four bodies, each three or
+    // four instructions with no memory access and no branch.
+    //
+    // WHY THE ARM IS A CACHE PROPERTY. `g422DecodeLowerKind` runs at G410 cache-build time, so
+    // flipping the arm has to re-decode the cache. The alternative — selecting in the loop with
+    // `kind != NONE && (ARM || kind < FIRST_FLAG)` — would put an extra compare on the CONTROL arm
+    // on 59.9% of pairs and bias the gate in the candidate's favour, the one direction that must
+    // never be accepted (G486 §4). The rebuild is ~2,048 slots once per G438 hold block.
+    //
+    // RESULT: PROMOTED default-on. Four paired A/Bs (DC2_G419_AB=flaglower, both arms confirmed
+    // selected by [G487:armed] on every run, 3,000 frames each) read −0.452 / −1.047 / −0.489 /
+    // −0.214 ms/f — mean **−0.55, sign 4/4 FASTER**, blocked mean −0.60 with 19 of 20 windows
+    // favouring. Back-solving: −0.55 ms/f of frame at this phase's VU1 sensitivity is ~0.42 ms of
+    // worker time over ~41 k removed calls = **~10 ns per call**, i.e. ~34 cycles — exactly the
+    // prologue/epilogue the /MAP predicted. The prediction and the measurement agree, which is why
+    // this is a call-boundary result and not a code-shape accident.
+    // `[G422:cover]` moved 92.29% → **96.52%** covered and `[G486:uncov]` 4.61% → **2.08%** of
+    // cycles, with the four flag opcodes gone from the histogram and only DIV (80.8% of the
+    // residue), XGKICK, WAITQ/WAITP, XTOP, MFP, ERLENG and RSQRT left — all structurally
+    // non-coverable. The compiled LOWER slot is closed after this phase.
+    //
+    // Default:  ON.  Rollback DC2_G487_NO_FLAG_LOWER=1 (restores the execLower path exactly).
+    //           Paired gate DC2_G419_AB=flaglower, proof DC2_G487_STAT=1,
+    //           oracle DC2_G422_VERIFY=1 (already generic over kinds; 350 M+ pairs, bad=0).
+    bool g487FlagLowerRequested()
+    {
+        if (!g487FlagLowerSupported())
+            return false;
+        static const bool s_paired = [] {
+            const char *ab = std::getenv("DC2_G419_AB");
+            return ab != nullptr && std::strcmp(ab, "flaglower") == 0;
+        }();
+        if (s_paired)
+            return g487FlagLowerArm() > 0;
+        static const bool s_on = !f50_12_vu_env_flag("DC2_G487_NO_FLAG_LOWER");
+        return s_on;
+    }
+
+    // G488: COMPILED CROSS-LANE / FLAG-ONLY UPPERS (OPMSUB, OPMULA, CLIPw).
+    //
+    // PREMISE. G487 closed the compiled LOWER slot and PRICED the mechanism that closed it: an
+    // interpreter call boundary in this loop is worth ~10 ns (~34 cycles), measured over 41 k
+    // removed `execLower` calls and predicted independently by the /MAP disassembly of its
+    // prologue. `execUpper` is the same shape one size down — 8 GPR pushes, `sub rsp,0xa0`, four
+    // `movaps` of xmm6-xmm9 and a /GS cookie, mirrored on return — and `[G421:cover]` said 2.16%
+    // of non-VNOP uppers (~1.08% of pairs, ~17.6 k/frame) still crossed it. That population is
+    // EXACTLY the three `cls == 0` entries of G421's descriptor table that this route executes:
+    // OPMSUB (0x2E), CLIPw (0x5F) and OPMULA (0x6E). G421 skipped them because they are
+    // cross-lane or flag-only, not because they are expensive: OPMSUB/OPMULA are one outer-product
+    // permutation of an FMAC that G421 already runs, and CLIPw is six ordered compares.
+    //
+    // WHY THE ARM IS A CACHE PROPERTY (G487 §4, and the reason it must not be an in-loop test).
+    // The fallback decision is `desc[kind].cls == 0`, and `kind` is decoded once at cache-build
+    // time into `G410CompiledUpper::upperKind`. Selecting the arm inside the loop would put an
+    // extra compare on the CONTROL arm on ~49% of pairs and bias the gate toward the candidate —
+    // the one direction that must never be accepted. Instead the CONTROL arm decodes these three
+    // encodings to SHADOW kinds (0x72/0x73/0x74) whose descriptor entries are zero, so the loop
+    // body is byte-identical in both arms and the only difference is one byte in the pair cache.
+    // A flip forces the full 2,048-slot re-decode before a single pair of that run() executes.
+    //
+    // WHAT THIS CANNOT MEASURE. Both arms carry the new inline bodies in the loop's TEXT, so the
+    // paired gate prices the removed call but NOT the added footprint — the resource G481's inline
+    // budget binds on. That is checked separately, from the linker /MAP (run() size and whether
+    // g421FastUpper is still inlined) plus the default-path level.
+    //
+    // Default:  ON.  Rollback DC2_G488_NO_FAST_OP=1 (restores the execUpper path exactly).
+    //           Paired gate DC2_G419_AB=fastop, proof DC2_G488_STAT=1,
+    //           oracle DC2_G421_VERIFY=1 (already generic over kinds).
+    bool g488FastOpRequested()
+    {
+        static const bool s_paired = [] {
+            const char *ab = std::getenv("DC2_G419_AB");
+            return ab != nullptr && std::strcmp(ab, "fastop") == 0;
+        }();
+        if (s_paired)
+            return g488FastOpArm() > 0;
+        static const bool s_on = !f50_12_vu_env_flag("DC2_G488_NO_FAST_OP");
+        return s_on;
+    }
+
+    // G489 - SKIP THE `postExecPc` READ-BACK ON PAIRS WHOSE LOWER CANNOT BRANCH.
+    //
+    // Same arm contract as G487/G488: the decision is a property of the pair CACHE, sampled once
+    // per run(), never a test inside the loop. But it needs no shadow encoding, because the arm is
+    // the VALUE of one cache bit rather than a different decode of the opcode:
+    //   * CANDIDATE - `G489_PF_CANBRANCH` is set only for the ten branch/jump `opHi` values.
+    //   * CONTROL   - the bit is set on EVERY pair, so `g489CanBranch` is always true, the tail
+    //                 reads `m_state.pc` and compares it exactly as it did before this phase, and
+    //                 the loop body is byte-identical in both arms.
+    // The control arm therefore carries one always-true, perfectly-predicted byte test that the
+    // pre-G489 binary did not have. That biases the gate TOWARD the candidate, so it is quoted as
+    // a floor, and the phase also checks the default-path level against the /MAP relink.
+    //
+    // Default:  ON.  Rollback DC2_G489_NO_PCSKIP=1 (sets the bit on every pair = old behaviour).
+    //           Paired gate DC2_G419_AB=pcskip, proof DC2_G489_STAT=1,
+    //           oracle DC2_G489_VERIFY=1 (asserts m_state.pc == currentPc whenever the bit is 0).
+    bool g489PcSkipRequested()
+    {
+        static const bool s_paired = [] {
+            const char *ab = std::getenv("DC2_G419_AB");
+            return ab != nullptr && std::strcmp(ab, "pcskip") == 0;
+        }();
+        if (s_paired)
+            return g489PcSkipArm() > 0;
+        static const bool s_on = !f50_12_vu_env_flag("DC2_G489_NO_PCSKIP");
+        return s_on;
+    }
+
+    bool g489VerifyOn()
+    {
+        static const bool s_on = f50_12_vu_env_flag("DC2_G489_VERIFY");
+        return s_on;
+    }
+
+    // G489 oracle: the predicate says this pair's lower slot cannot write pc, so `m_state.pc` must
+    // still be `currentPc` after both slots executed. Aborting is deliberate — a false negative
+    // here would silently drop a taken branch, which is a correctness class no route matrix could
+    // be trusted to catch. Cold and out of line; only reachable with DC2_G489_VERIFY=1.
+    void g489VerifyFail(uint32_t currentPc, uint32_t postPc, uint32_t lower)
+    {
+        std::fprintf(stderr,
+                     "[G489:verify-BAD] pc=0x%x post=0x%x lower=%08x opHi=0x%02x\n",
+                     currentPc, postPc, lower,
+                     static_cast<unsigned>((lower >> 25u) & 0x7fu));
+        std::fflush(stderr);
+        std::abort();
+    }
+
+    // G489 counters for DC2_G489_VERIFY / DC2_G489_STAT. File-scope statics, NOT members of any
+    // thread_local block — G486: a default-off diagnostic must not be able to move the default
+    // path's TLS layout.
+    std::atomic<uint64_t> g_g489Checked{0ull};
+    std::atomic<uint64_t> g_g489CanBranch{0ull};
+
+    // G489 proof-of-selection (G457). Out of line and entirely behind the flag check, so `run()`
+    // carries one call and nothing else. Counts the slots the candidate arm actually spares.
+    void g489ReportArmed()
+    {
+        static const bool s_on = (std::getenv("DC2_G489_STAT") != nullptr) ||
+                                 (std::getenv("DC2_G419_AB") != nullptr);
+        if (!s_on)
+            return;
+        static std::atomic<uint32_t> s_seen{0u};
+        const uint32_t bit = s_g410Cache.decodePcSkip ? 2u : 1u;
+        if ((s_seen.fetch_or(bit, std::memory_order_relaxed) & bit) != 0u)
+            return;
+        size_t canBranch = 0u;
+        for (const auto &p : s_g410Cache.uppers)
+            if ((p.g425Flags & G489_PF_CANBRANCH) != 0u)
+                ++canBranch;
+        std::fprintf(stderr, "[G489:armed] pcskip=%d slots=%zu canBranch=%zu (%.2f%%)\n",
+                     s_g410Cache.decodePcSkip ? 1 : 0, s_g410Cache.uppers.size(), canBranch,
+                     100.0 * static_cast<double>(canBranch) /
+                         static_cast<double>(s_g410Cache.uppers.size()));
+    }
+
+    void g489NoteVerified(bool canBranch)
+    {
+        const uint64_t n = g_g489Checked.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+        if (canBranch)
+            g_g489CanBranch.fetch_add(1ull, std::memory_order_relaxed);
+        if ((n % 50000000ull) == 0ull)
+            std::fprintf(stderr, "[G489:verify] pairs=%llu bad=0 canBranch=%llu (%.2f%%)\n",
+                         static_cast<unsigned long long>(n),
+                         static_cast<unsigned long long>(
+                             g_g489CanBranch.load(std::memory_order_relaxed)),
+                         100.0 * static_cast<double>(
+                             g_g489CanBranch.load(std::memory_order_relaxed)) /
+                             static_cast<double>(n));
+    }
+
     bool g483VerifyPcOn()
     {
         static const bool s_on = f50_12_vu_env_flag("DC2_G483_VERIFY");
@@ -281,27 +540,47 @@ namespace
         return s_ok;
     }
 
-    uint8_t g410SelectUpperKind(uint32_t upper)
+    // G488: the CONTROL arm's kinds for OPMSUB / CLIPw / OPMULA.
+    //
+    // `g410SelectUpperKind` never produces 0x72-0x7f (op <= 0x2f gives 0x00-0x2f, and Special2
+    // gives 0x40 + func with func <= 0x31, i.e. at most 0x71), so these three values are free.
+    // They index the ZERO-initialised tail of G421DescTable, so `cls == 0` and `g421FastUpper`
+    // falls straight through to execUpper — the pre-G488 behaviour, byte for byte, with no test
+    // anywhere in the pair loop. `[G421:cover]`'s covered predicate is already `k < 0x72u`, so the
+    // census reports the arm correctly for free, and the histogram keeps the two arms distinct
+    // (72/73/74 vs 2e/5f/6e) because it folds with `& 0x7f`.
+    constexpr uint8_t G488_UK_SHADOW_OPMSUB = 0x72u;
+    constexpr uint8_t G488_UK_SHADOW_CLIPW = 0x73u;
+    constexpr uint8_t G488_UK_SHADOW_OPMULA = 0x74u;
+
+    uint8_t g410SelectUpperKind(uint32_t upper, bool fastOp)
     {
         const uint8_t op = static_cast<uint8_t>(upper & 0x3fu);
         if (op <= 0x2fu)
-            return op;
+            return (!fastOp && op == 0x2eu) ? G488_UK_SHADOW_OPMSUB : op;
 
         if (op < 0x3cu)
             return 0xffu;
 
         const uint8_t func = S2_FUNC(upper);
-        return func <= 0x31u && func != 0x2bu
-            ? static_cast<uint8_t>(0x40u + func)
-            : 0xffu;
+        if (func > 0x31u || func == 0x2bu)
+            return 0xffu;
+        if (!fastOp)
+        {
+            if (func == 0x1fu)
+                return G488_UK_SHADOW_CLIPW;
+            if (func == 0x2eu)
+                return G488_UK_SHADOW_OPMULA;
+        }
+        return static_cast<uint8_t>(0x40u + func);
     }
 
-    G410CompiledUpper g410DecodePair(uint64_t source)
+    G410CompiledUpper g410DecodePair(uint64_t source, bool flagLower, bool fastOp, bool pcSkip)
     {
         const uint32_t upper = static_cast<uint32_t>(source >> 32u);
         const uint32_t lower = static_cast<uint32_t>(source);
         G410CompiledUpper pair{};
-        pair.upperKind = g410SelectUpperKind(upper);
+        pair.upperKind = g410SelectUpperKind(upper, fastOp);
         pair.lowerFs = FS(lower);
         pair.lowerFt = FT(lower);
         if ((upper & (1u << 30u)) != 0u)
@@ -312,7 +591,7 @@ namespace
             pair.lowerS2 = S2_FUNC(lower);
         // G422: predecode the lower slot's inline-execution kind here, so the hot loop never
         // decodes it. The cache verifier's whole-struct memcmp covers this field too.
-        pair.lowerKind = g422DecodeLowerKind(lower);
+        pair.lowerKind = g422DecodeLowerKind(lower, flagLower);
 
         const uint8_t upperOp = static_cast<uint8_t>(upper & 0x3fu);
         if (upperOp < 0x3cu)
@@ -343,6 +622,10 @@ namespace
                 touchesZero = true;
             if (pair.upperKind == 0xffu)
                 touchesZero = true; // legacy execUpper decoder: be conservative
+            // G488: both arms land here with the SAME answer. `upperDst` is derived from the raw
+            // encoding, not from the kind, and the three shadow kinds are not 0xff — so a pair's
+            // g425Flags byte is identical whether the cache was decoded with the arm on or off,
+            // and the arms differ in exactly one field of the sidecar.
         }
         switch (pair.lowerKind)
         {
@@ -397,10 +680,21 @@ namespace
             touchesZero = true; // G422_LK_NONE and anything new: legacy execLower
             break;
         }
+        // G487: the four flag consumers deliberately fall through to `default` above, i.e. they
+        // KEEP the conservative G425 re-pin exactly as they had it while they were G422_LK_NONE.
+        // They provably cannot write VF0 or VI0 (FCAND/FCOR write vi[1]; FMAND/FCGET are guarded
+        // by `it != 0`), so classifying them as zero-safe would ALSO delete five stores per pair —
+        // a second mechanism inside one A/B arm, which the phase policy forbids. Leave it.
         if ((pair.pairFlags & G410_PAIR_I_BIT) != 0u)
             touchesZero = true; // LOI: the lower word is an immediate, not an instruction
         if (touchesZero)
             pair.g425Flags |= G425_PF_TOUCHES_ZERO;
+        // G489: the candidate arm sets this only for the ten branch/jump encodings (plus the LOI
+        // pair, conservatively); the control arm sets it on every pair, which is exactly the
+        // pre-G489 behaviour of the loop tail with the loop text unchanged.
+        if (!pcSkip || g489LowerWritesPc(lower) ||
+            (pair.pairFlags & G410_PAIR_I_BIT) != 0u)
+            pair.g425Flags |= G489_PF_CANBRANCH;
         // G426: an LOI pair's lower word is a float immediate, so neither predicate applies
         // (the run loop already gates both on !iBit / the LOI branch).
         if ((pair.pairFlags & G410_PAIR_I_BIT) == 0u)
@@ -424,7 +718,11 @@ namespace
     {
         uint64_t source = 0u;
         std::memcpy(&source, codeBase + index * sizeof(source), sizeof(source));
-        const G410CompiledUpper pair = g410DecodePair(source);
+        // G487: decode under the arm THIS cache was built with, never under a freshly sampled one,
+        // so an MPG write that lands mid-block cannot mix two decodes into one cache.
+        const G410CompiledUpper pair =
+            g410DecodePair(source, s_g410Cache.decodeFlagLower, s_g410Cache.decodeFastOp,
+                           s_g410Cache.decodePcSkip);
         // G428: keep the whole-code-store reader tallies exact across precise invalidation.
         const uint8_t oldFlags = s_g410Cache.uppers[index].g425Flags;
         if ((oldFlags & G428_PF_STATUSREAD) != 0u)
@@ -453,9 +751,19 @@ namespace
     {
         const bool lowerControl = pair.lowerKind >= G422_LK_B &&
                                   pair.lowerKind <= G422_LK_IBGEZ;
+        // G487: G475's contract is that every covered non-control kind is branch-free AND
+        // flag-reader-free — the trace replays a run of pairs without advancing the MAC/STATUS
+        // delay line per pair. The four flag consumers break that half of the contract, so they
+        // are excluded here and in the census's `g475Safe` (same edit, as G486 §4 required).
+        const bool lowerFlag = pair.lowerKind >= G422_LK_FIRST_FLAG;
         return pair.upperKind == 0x6fu && pair.pairFlags == 0u &&
-               pair.lowerKind != G422_LK_NONE && !lowerControl;
+               pair.lowerKind != G422_LK_NONE && !lowerControl && !lowerFlag;
     }
+
+    // G490: defined in vu1_g490_block_run.inc, which must be included after vu1_g421_fast_upper.inc
+    // (its eligibility test reads `g421DescTableConst`). Same anonymous namespace, same TU — this
+    // declaration only lets the two invalidation sites below call it in source order.
+    void g490RebuildRunLengths();
 
     void g475RebuildRunLengths()
     {
@@ -478,6 +786,21 @@ namespace
 
     G410CompiledUpper *g410PreparePairs(const uint8_t *codeBase, bool countStats)
     {
+        // G487/G488: the ONLY place either decode arm is sampled. A flip re-decodes the whole
+        // 2,048-slot cache before a single pair of this run() executes, which is what makes the
+        // arm a property of the cache instead of a per-pair test in the loop.
+        const bool flagLower = g487FlagLowerRequested();
+        const bool fastOp = g488FastOpRequested();
+        const bool pcSkip = g489PcSkipRequested();
+        if (!s_g410Cache.decodeArmValid || s_g410Cache.decodeFlagLower != flagLower ||
+            s_g410Cache.decodeFastOp != fastOp || s_g410Cache.decodePcSkip != pcSkip)
+        {
+            s_g410Cache.decodeFlagLower = flagLower;
+            s_g410Cache.decodeFastOp = fastOp;
+            s_g410Cache.decodePcSkip = pcSkip;
+            s_g410Cache.decodeArmValid = true;
+            s_g410Cache.codeBase = nullptr; // force the full rebuild below
+        }
         if (s_g410Cache.codeBase != codeBase)
         {
             s_g410Cache.codeBase = codeBase;
@@ -488,6 +811,7 @@ namespace
             for (size_t index = 0u; index < s_g410Cache.uppers.size(); ++index)
                 g410CompilePairSlow(index, codeBase, countStats);
             g475RebuildRunLengths();
+            g490RebuildRunLengths();
         }
         return s_g410Cache.uppers.data();
     }
@@ -533,7 +857,9 @@ namespace
         const size_t index = pc >> 3u;
         if (s_g410Cache.sources[index] != liveSource)
             g410MissedInvalidation(pc, s_g410Cache.sources[index], liveSource);
-        const G410CompiledUpper expected = g410DecodePair(liveSource);
+        const G410CompiledUpper expected =
+            g410DecodePair(liveSource, s_g410Cache.decodeFlagLower, s_g410Cache.decodeFastOp,
+                           s_g410Cache.decodePcSkip);
         if (std::memcmp(&pair, &expected, sizeof(pair)) != 0)
             g410MismatchedPredecode(pc, pair, expected);
     }
@@ -629,7 +955,10 @@ void dc2_g410_vu_code_written(const uint8_t *codeBase, uint32_t offset, uint32_t
         }
     }
     if (invalidated != 0u)
+    {
         g475RebuildRunLengths();
+        g490RebuildRunLengths();
+    }
     if (g410StatOn())
     {
         ++s_g410Cache.invalidations;

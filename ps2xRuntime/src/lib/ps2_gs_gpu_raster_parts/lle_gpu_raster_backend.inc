@@ -146,6 +146,43 @@ bool g447WorkerSpinActive()
 // doing the job of a backoff, and the loop is at a local optimum in both directions. Neither arm was
 // promoted and both were removed; the ~2.4 ms/f of QPC inside these spins is NOT recoverable frame
 // time. See plans/phase-G471-fix-log.md.
+// G491 — DO NOT SPIN ON THE READBACK EDGE.
+//
+// The spin above is a flat 400 us budget on EVERY backend round trip, promoted by G447 on edges
+// whose GL work is "typically only ~130-200 us". `[G447:edge]` prices backend-readcolor at
+// 3.2-3.4 ms/f over SIX calls, i.e. ~545 us each: the readback wait CANNOT complete inside the
+// budget, so every one of those six spins burns its full 400 us and then blocks anyway. That is
+// ~2.3 ms/f of a core spent on the pole thread with no possible return, and `[G446:gsprof]` sees
+// it directly — 17.66% of the whole GS-worker span sits on one instruction inside this loop.
+//
+// Exactness: identical to g447WaitFuture with the spin disabled. The result still comes from the
+// future; only the caller's wait strategy changes. Kept as a SEPARATE function so the control
+// arm's call shape stays byte-identical (17a law 17 — the lever-OFF path IS the control arm).
+//
+// Levers: DC2_G419_AB=rbspin (paired gate), DC2_G491_NO_RB_SPIN=1 (standalone arm),
+// DC2_G491_RB_SPIN=1 (force the historical spin back on).
+bool g491RbNoSpinActive()
+{
+    const int arm = g491RbSpinArm(); // -1 unless DC2_G419_AB=rbspin
+    if (arm >= 0)
+        return arm == 1; // candidate arm = NO spin on this edge
+    static const bool on = (std::getenv("DC2_G491_NO_RB_SPIN") != nullptr) &&
+                           (std::getenv("DC2_G491_RB_SPIN") == nullptr);
+    return on;
+}
+
+bool g491WaitFutureNoSpin(std::future<bool> &fut)
+{
+    try
+    {
+        return fut.get();
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
 bool g447WaitFuture(std::future<bool> &fut, std::atomic<uint32_t> &done)
 {
     if (g447SpinActive())
@@ -581,6 +618,7 @@ public:
         if (width <= 0 || height <= 0 || glY < 0 || rows <= 0 ||
             glY > height || rows > height - glY || !m_ready.load(std::memory_order_acquire))
             return false;
+        g492Note(kG492EdgeReadColor, 0ull, false); // G492 invariant only — never skipped here
         SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
@@ -601,6 +639,10 @@ public:
         m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
         G447WaitScope g447Scope(1);
+        // G491: this edge (and only this edge) can elect not to spin — see g491RbNoSpinActive.
+        // Six calls per frame, so the branch itself is free.
+        if (g491RbNoSpinActive())
+            return g491WaitFutureNoSpin(wait.future);
         return wait.wait();
     }
 
@@ -614,6 +656,7 @@ public:
             in.size() != static_cast<size_t>(width) * rows ||
             !m_ready.load(std::memory_order_acquire))
             return false;
+        g492Note(kG492EdgeWriteColor, 0ull, false); // G492 invariant only — never skipped here
         SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
@@ -645,6 +688,7 @@ public:
         if (srcFbp == dstFbp || rects6.empty() || (rects6.size() % 6u) != 0u ||
             !m_ready.load(std::memory_order_acquire))
             return false;
+        g492Note(kG492EdgeCopy, 0ull, false); // G492 invariant only — never skipped here
         SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
@@ -672,6 +716,7 @@ public:
         if (srcFbp == dstFbp || dstW <= 0 || dstH <= 0 || rects6.empty() ||
             (rects6.size() % 6u) != 0u || !m_ready.load(std::memory_order_acquire))
             return false;
+        g492Note(kG492EdgeCopy, 0ull, false); // G492 invariant only — never skipped here
         SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
@@ -707,6 +752,14 @@ public:
             mapRgba.size() != static_cast<size_t>(texW) * texH ||
             clutRgba.size() != 256u || !m_ready.load(std::memory_order_acquire))
             return false;
+        // G492 CEILING PROBE (never promotable): the resident view texture keeps last frame's
+        // content on a candidate frame. Excluded when the verifier out-param is requested.
+        {
+            const bool g492Skip = g492NoOtherActive() && !verify;
+            g492Note(kG492EdgeOther, 0ull, g492Skip);
+            if (g492Skip)
+                return true;
+        }
         SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
@@ -747,6 +800,13 @@ public:
         if (texKey == 0u || srcFbp == 0u || srcFbW <= 0 || texW <= 0 || texH <= 0 ||
             !m_ready.load(std::memory_order_acquire))
             return false;
+        // G492 CEILING PROBE (never promotable) — see prepareT8View above.
+        {
+            const bool g492Skip = g492NoOtherActive() && !verify;
+            g492Note(kG492EdgeOther, 0ull, g492Skip);
+            if (g492Skip)
+                return true;
+        }
         SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
@@ -789,6 +849,14 @@ public:
         if (pageMap.size() != 128u || basePixels.size() != 512u * 512u ||
             !m_ready.load(std::memory_order_acquire))
             return false;
+        // G492 CEILING PROBE (never promotable). Excluded when the caller wants the composite read
+        // back — `out` would then stay empty and the caller's size check would flip.
+        {
+            const bool g492Skip = g492NoOtherActive() && !readback;
+            g492Note(kG492EdgeOther, 0ull, g492Skip);
+            if (g492Skip)
+                return true;
+        }
         SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
@@ -817,6 +885,14 @@ public:
         if (pageMap.size() != 128u || basePixels.size() != 512u * 512u ||
             !m_ready.load(std::memory_order_acquire))
             return false;
+        // G492 CEILING PROBE (never promotable): the persistent logical FBO keeps last frame's
+        // composition on a candidate frame. No out-param, so nothing downstream changes size.
+        {
+            const bool g492Skip = g492NoOtherActive();
+            g492Note(kG492EdgeOther, 0ull, g492Skip);
+            if (g492Skip)
+                return true;
+        }
         SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
@@ -856,6 +932,22 @@ private:
         // (readDepth() reaches this same path with a synthetic batch).
         const G415ColorWindow g415Window = g_g415PendWindow;
         g_g415PendWindow.valid = false;
+        // G492 CEILING PROBE (never promotable). Delete the whole round trip at this edge and
+        // report success, so the caller keeps its post-submit epilogue and its VRAM unpack instead
+        // of falling into the CPU-replay path. Items carrying a depth-readback OUT vector are
+        // excluded: their size is validated by the caller, and a stale one would change its control
+        // flow. See g492_overlap_ceiling.inc.
+        {
+            // The arm accessor marks the frame as having consumed an arm, so it must be called on
+            // EVERY entry — never behind a short-circuit that a depth item could skip.
+            const bool g492Arm = g492NoRenderActive();
+            const bool g492Skip = g492Arm && batch != nullptr && depthReadback == nullptr;
+            g492Note(kG492EdgeRender,
+                     batch != nullptr ? static_cast<unsigned long long>(batch->draws.size()) : 0ull,
+                     g492Skip);
+            if (g492Skip)
+                return true;
+        }
         SyncWait wait;
         {
             std::unique_lock<std::mutex> lk(m_mtx);
@@ -943,6 +1035,16 @@ private:
         GLuint id = 0;
         int w = 0, h = 0;
         uint64_t lastUse = 0;
+        // G492: set only by prepareCt24ViewOnWorker, and only for storage IT allocated at (w,h).
+        // Lives on the entry so eviction/recreation or a build by any other path clears it — the
+        // storage-reuse arm can then never skip an allocation it did not make.
+        uint32_t g492Ct24Alloc = 0;
+        // G496b: this texture OBJECT's sampler parameters, as last set through g496TexFilter /
+        // g496TexWrap. 0 = never set by us (GL's own defaults), which always forces a real call.
+        // Object state, so it survives rebinds and batches; glTexImage2D does not disturb it. Only
+        // prepareCt24ViewOnWorker parameterises an m_texCache entry outside the draw loop, and it
+        // records what it set.
+        int g496MinF = 0, g496MagF = 0, g496WrapS = 0, g496WrapT = 0;
     };
     struct FboEntry
     {
@@ -1276,6 +1378,54 @@ private:
             static const bool s_g425RbOn = (std::getenv("DC2_G425_RBCENSUS") != nullptr);
             const auto g425WorkStart = s_g425RbOn ? std::chrono::steady_clock::now()
                                                   : std::chrono::steady_clock::time_point{};
+            // G495 queued-ahead census (DC2_G495_RB=1, default OFF). Classify and price this item
+            // BEFORE it runs, so a readback never counts itself in its own "ahead" set, and mark
+            // whether it is a pipeline fence so the accumulator can be cleared after it.
+            bool g495Fence = false;
+            int g495Cls = kG495ClsRenderSkip;
+            if (g495RbCensusOn() || g495GpuCensusOn())
+            {
+                uint64_t g495Draws = 0ull, g495Verts = 0ull, g495TexN = 0ull;
+                uint64_t g495TexBytes = 0ull, g495FbBytes = 0ull;
+                if (item.g309PageMap != nullptr)
+                    g495Cls = kG495ClsComposite;
+                else if (item.g281Map != nullptr)
+                    g495Cls = kG495ClsT8;
+                else if (item.g338Ct24View)
+                    g495Cls = kG495ClsCt24;
+                else if (item.copyRects != nullptr)
+                    g495Cls = kG495ClsCopy;
+                else if (item.colorReadback != nullptr)
+                {
+                    g495Cls = kG495ClsReadColor;
+                    g495Fence = true;
+                }
+                else if (item.colorWrite != nullptr)
+                {
+                    g495Cls = kG495ClsWriteColor;
+                    g495TexBytes = static_cast<uint64_t>(item.colorWrite->size()) * 4ull;
+                }
+                else if (item.depthReadback != nullptr && !item.renderThenReadDepth)
+                {
+                    g495Cls = kG495ClsReadDepth;
+                    g495Fence = true;
+                }
+                else if (item.batch != nullptr)
+                {
+                    g495Cls = item.batch->skipReadback ? kG495ClsRenderSkip : kG495ClsRenderRb;
+                    g495Fence = !item.batch->skipReadback;
+                    g495Draws = item.batch->draws.size();
+                    g495Verts = item.batch->verts.size();
+                    g495TexN = item.batch->texUploads.size();
+                    for (const auto &u : item.batch->texUploads)
+                        g495TexBytes += static_cast<uint64_t>(u.px.size()) * 4ull;
+                    g495FbBytes = static_cast<uint64_t>(item.batch->fbPixels.size()) * 4ull;
+                }
+                g495NoteItem(g495Cls, g495Draws, g495Verts, g495TexN, g495TexBytes, g495FbBytes);
+            }
+            // G495b GPU-side clock (DC2_G495_GPU=1): GL_TIME_ELAPSED around this item's whole GL
+            // body, so the per-class sum is GPU busy ms/f. Never quote a frame time from this run.
+            g495GpuBegin(g495Cls);
             try
             {
                 if (item.g309PageMap != nullptr)
@@ -1329,6 +1479,7 @@ private:
             {
                 ok = false;
             }
+            g495GpuEnd();
             // G425: readback-redundancy ceiling census (default OFF, DC2_G425_RBCENSUS=1).
             // Question: how much of the GS worker's blocking colour-readback time re-reads a
             // window that NOTHING has mutated since the previous readback of the same window?
@@ -1412,6 +1563,25 @@ private:
                         std::chrono::steady_clock::now() - g453WorkStart).count());
                 g_g453BackendOtherNs[g453Cls].fetch_add(workNs, std::memory_order_relaxed);
                 g_g453BackendOtherCount[g453Cls].fetch_add(1u, std::memory_order_relaxed);
+            }
+            // G494 failsafe: while the sync-query elision is armed, one real glGetError every 64th
+            // backend item (~1.1/frame against ~110 elided) catches anything the elided checks would
+            // have caught, one frame late, and latches them all back on. Inert otherwise.
+            g494SentinelTick();
+            // G495: a fence has just emptied the pipeline; everything after it is a new "ahead" set.
+            if (g495Fence)
+                g495FenceReset();
+            // G495 per-surface mutation clock (census only). Only items whose OUTPUT surface is
+            // identified by an fbp tick it; anything else bumps the unknown epoch, which unproves
+            // every cached window. T8/CT24 views write a texture object, not a target FBO.
+            if (g495RbCensusOn())
+            {
+                if (g495Cls == kG495ClsRenderSkip || g495Cls == kG495ClsRenderRb)
+                    g495NoteWrite(item.batch->fbp, item.batch->fboKey != 0u);
+                else if (g495Cls == kG495ClsCopy || g495Cls == kG495ClsWriteColor)
+                    g495NoteWrite(item.colorFbp, false);
+                else if (g495Cls == kG495ClsComposite)
+                    g495NoteWrite(item.g309OutputFbp, item.g309OutputFbp == 0u);
             }
             if (g324Profile)
             {
@@ -2031,13 +2201,19 @@ private:
             m_resident.erase(texKey);
         };
 
-        while (glGetError() != GL_NO_ERROR) {}
+        g494DrainErrors(kG494Ct24Drain);
         if (m_g281Fbo == 0u)
             m_f.glGenFramebuffers_(1, &m_g281Fbo);
         if (m_g281Fbo == 0u)
             return fail("objects");
 
         TexEntry &out = m_texCache[texKey];
+        // G492: the full-screen draw below rewrites every texel of this output, so reallocating its
+        // storage each build is redundant. Reuse it only when THIS function allocated it at exactly
+        // these dimensions (g492Ct24Alloc), which makes the skip bit-exact by construction.
+        // See g492_overlap_ceiling.inc.
+        const bool g492Reuse = out.id != 0u && out.g492Ct24Alloc != 0u &&
+                               out.w == texW && out.h == texH && g492Ct24ReuseActive();
         if (out.id == 0u)
         {
             glGenTextures(1, &out.id);
@@ -2047,27 +2223,39 @@ private:
                 return fail("output");
             }
         }
-        else
+        else if (!g492Reuse)
             m_texBytes -= static_cast<size_t>(out.w) * out.h * 4u;
         m_f.glActiveTexture_(GL158_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, out.id);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, texW, texH, 0,
-                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                        static_cast<GLint>(GL158_CLAMP_TO_EDGE));
-        out.w = texW;
-        out.h = texH;
+        if (!g492Reuse)
+        {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, texW, texH, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                            static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                            static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            // G496b: the ONE site outside the draw loop that parameterises an m_texCache entry.
+            // Record what it set so the per-object sampler cache never goes stale.
+            out.g496MinF = GL_NEAREST;
+            out.g496MagF = GL_NEAREST;
+            out.g496WrapS = static_cast<int>(GL158_CLAMP_TO_EDGE);
+            out.g496WrapT = static_cast<int>(GL158_CLAMP_TO_EDGE);
+            out.w = texW;
+            out.h = texH;
+            out.g492Ct24Alloc = 1u;
+            m_texBytes += static_cast<size_t>(texW) * texH * 4u;
+        }
         out.lastUse = m_batchCounter + 1u;
-        m_texBytes += static_cast<size_t>(texW) * texH * 4u;
 
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g281Fbo);
         m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0,
                                     GL_TEXTURE_2D, out.id, 0);
-        if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) != GL158_FRAMEBUFFER_COMPLETE)
+        if (g494FboStatus(kG494Ct24Fbo, GL158_FRAMEBUFFER_COMPLETE, [&]() {
+                return m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER);
+            }) != GL158_FRAMEBUFFER_COMPLETE)
         {
             dropOutput();
             return fail("framebuffer");
@@ -2087,7 +2275,8 @@ private:
         m_f.glUniform1i_(m_locG338Ta0, ta0 & 0xFF);
         m_f.glUniform1i_(m_locG338Aem, aem != 0 ? 1 : 0);
         glDrawArrays(GL_TRIANGLES, 0, 3);
-        if (glGetError() != GL_NO_ERROR)
+        g496PassBallast(); // G496 GPU derivative probe, `pass` site (idempotent re-issue)
+        if (g494GetError(kG494Ct24Err) != GL_NO_ERROR)
         {
             dropOutput();
             return fail("draw");
@@ -2731,8 +2920,12 @@ private:
                                             GL_TEXTURE_2D, e.colorTex, 0);
                 m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
                                                GL178_RENDERBUFFER, e.depthRb);
-                if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) ==
-                    GL158_FRAMEBUFFER_COMPLETE)
+                // G494: the REVIVE path re-attaches the same colour texture and the same depth
+                // renderbuffer this FBO was created and validated with, so its completeness is
+                // invariant. The CREATE path's check below is deliberately NOT elided.
+                if (g494FboStatus(kG494EnsureFbo, GL158_FRAMEBUFFER_COMPLETE, [&]() {
+                        return m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER);
+                    }) == GL158_FRAMEBUFFER_COMPLETE)
                 {
                     glDisable(GL_SCISSOR_TEST);
                     glDepthMask(GL_TRUE);
@@ -2845,9 +3038,31 @@ private:
         static const bool s_g433Stat = (std::getenv("DC2_G433_RBSTAT") != nullptr);
         const auto t0 = s_g433Stat ? std::chrono::steady_clock::now()
                                    : std::chrono::steady_clock::time_point{};
+        // ===== G495 drain/transfer split (default OFF, DC2_G495_RB=1) ================================
+        // [G418:edge] instruments only the ONE render-batch readback; these SIX readColor items have
+        // never been split. glFinish changes no result, no GL state and no command order, so the
+        // split is exact — it only moves wall time out of the transfer half and names it.
+        const bool g495On = g495RbCensusOn();
+        uint64_t g495DrainNs = 0ull, g495XferNs = 0ull;
+        std::chrono::steady_clock::time_point g495T1;
+        if (g495On)
+        {
+            const auto g495T0 = std::chrono::steady_clock::now();
+            glFinish();
+            g495T1 = std::chrono::steady_clock::now();
+            g495DrainNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(g495T1 - g495T0).count());
+        }
         if (!s_g433NoRb)
         {
             g433DoReadPixels(m_f, glY, w, rows, out.data());
+        }
+        if (g495On)
+        {
+            g495XferNs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - g495T1).count());
+            g495NoteRead(fbp, glY, rows, w * rows, g495DrainNs, g495XferNs);
         }
         if (s_g433Stat)
         {
@@ -2888,7 +3103,7 @@ private:
         glBindTexture(GL_TEXTURE_2D, it->second.colorTex);
         glTexSubImage2D(GL_TEXTURE_2D, 0, glX, glY, w, rows, GL_RGBA, GL_UNSIGNED_BYTE,
                         in.data());
-        return glGetError() == GL_NO_ERROR;
+        return g494GetError(kG494WColErr) == GL_NO_ERROR;
     }
 
     // G280: copy aligned CT32 page tiles from one persistent target FBO into another target's
@@ -2923,7 +3138,7 @@ private:
         for (size_t k = 0; k < rects6.size(); k += 6u)
             glCopyTexSubImage2D(GL_TEXTURE_2D, 0, rects6[k + 2], rects6[k + 3],
                                 rects6[k], rects6[k + 1], rects6[k + 4], rects6[k + 5]);
-        return glGetError() == GL_NO_ERROR;
+        return g494GetError(kG494CopyErr) == GL_NO_ERROR;
     }
 
     bool buildAuthoritativeCompositeOnWorker(
@@ -2975,7 +3190,7 @@ private:
                 return fail("map");
         }
 
-        while (glGetError() != GL_NO_ERROR) {}
+        g494DrainErrors(kG494CompDrain);
         if (m_g309MapTex == 0u)
             glGenTextures(1, &m_g309MapTex);
         if (m_g309MapTex == 0u)
@@ -3043,7 +3258,7 @@ private:
             // Timing path samples the prepared sources/map directly in the display shader.
             // Keep the transient FBO only as the verifier's exact reference surface.
             m_f.glActiveTexture_(GL158_TEXTURE0);
-            return glGetError() == GL_NO_ERROR;
+            return g494GetError(kG494CompErr) == GL_NO_ERROR;
         }
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, out.fbo);
         glViewport(0, 0, 512, 512);
@@ -3059,7 +3274,8 @@ private:
             glBindTexture(GL_TEXTURE_2D, sourceTex[t]);
         }
         glDrawArrays(GL_TRIANGLES, 0, 3);
-        if (glGetError() != GL_NO_ERROR)
+        g496PassBallast(); // G496 GPU derivative probe, `pass` site (idempotent re-issue)
+        if (g494GetError(kG494CompErr) != GL_NO_ERROR)
             return fail("draw");
 
         if (readback != nullptr)
@@ -3069,7 +3285,7 @@ private:
             glBindTexture(GL_TEXTURE_2D, out.colorTex);
             glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE,
                           readback->data());
-            if (glGetError() != GL_NO_ERROR)
+            if (g494GetError(kG494CompErr) != GL_NO_ERROR)
             {
                 readback->clear();
                 return fail("readback");
@@ -3121,7 +3337,7 @@ private:
             m_resident.erase(texKey);
         };
 
-        while (glGetError() != GL_NO_ERROR) {}
+        g494DrainErrors(kG494T8Drain);
         if (m_g281MapTex == 0u)
             glGenTextures(1, &m_g281MapTex);
         if (m_g281ClutTex == 0u)
@@ -3230,7 +3446,9 @@ private:
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g281Fbo);
         m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0,
                                     GL_TEXTURE_2D, out.id, 0);
-        if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) != GL158_FRAMEBUFFER_COMPLETE)
+        if (g494FboStatus(kG494T8Fbo, GL158_FRAMEBUFFER_COMPLETE, [&]() {
+                return m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER);
+            }) != GL158_FRAMEBUFFER_COMPLETE)
         {
             dropOutput();
             return fail("framebuffer");
@@ -3247,7 +3465,8 @@ private:
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
         glDrawArrays(GL_TRIANGLES, 0, 3);
-        if (glGetError() != GL_NO_ERROR)
+        g496PassBallast(); // G496 GPU derivative probe, `pass` site (idempotent re-issue)
+        if (g494GetError(kG494T8Err) != GL_NO_ERROR)
         {
             dropOutput();
             return fail("draw");
@@ -3313,7 +3532,9 @@ private:
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, scratch.fbo);
         m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
                                     GL_TEXTURE_2D, it->second.tex, 0);
-        if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) != GL158_FRAMEBUFFER_COMPLETE)
+        if (g494FboStatus(kG494DepthFbo, GL158_FRAMEBUFFER_COMPLETE, [&]() {
+                return m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER);
+            }) != GL158_FRAMEBUFFER_COMPLETE)
         {
             m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
                                            GL178_RENDERBUFFER, scratch.depthRb);
@@ -3724,8 +3945,11 @@ private:
             }
             m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
                                         GL_TEXTURE_2D, depth.tex, 0);
-            if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) !=
-                GL158_FRAMEBUFFER_COMPLETE)
+            // G494: `depth` was just validated to be exactly b.fbW x b.fbH against the same
+            // colour attachment, so completeness here is a property of an invariant attachment set.
+            if (g494FboStatus(kG494RenderFbo, GL158_FRAMEBUFFER_COMPLETE, [&]() {
+                    return m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER);
+                }) != GL158_FRAMEBUFFER_COMPLETE)
             {
                 m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
                                                GL178_RENDERBUFFER, fbo.depthRb);
@@ -3736,8 +3960,11 @@ private:
         {
             m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
                                            GL178_RENDERBUFFER, fbo.depthRb);
-            if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) !=
-                GL158_FRAMEBUFFER_COMPLETE)
+            // G494: this attaches the FBO's OWN depth renderbuffer — the same object, at the same
+            // size, that ensureFbo already validated when it built this FBO.
+            if (g494FboStatus(kG494RenderFbo, GL158_FRAMEBUFFER_COMPLETE, [&]() {
+                    return m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER);
+                }) != GL158_FRAMEBUFFER_COMPLETE)
                 return false;
         }
         if (b.clearDepth && !guestDepth)
@@ -3829,24 +4056,32 @@ private:
             glDisable(GL_BLEND);
         }
         g415Note(); // 5: program / VBO / uniform / exact-path state
+        // G496b: redundant GL state elision. The arm is read ONCE per batch (thread-level, block
+        // held) and the non-texture cache is reset here, because the composite / T8 / CT24 / copy /
+        // writecolor items that run between batches own all of this state. Both arms leave GL
+        // holding the same state vector — the cache is written on every path, elision only decides
+        // whether the call that would set the value already there is issued.
+        const int g496GlArm = g496GlStateArm(); // -1 unless DC2_G419_AB=glstate
+        const bool g496GlCache =
+            (g496GlArm >= 0) ? (g496GlArm == 1) : g496GlCacheDefaultOn();
+        g496GlReset();
+        const auto g496Uni = [&](GLint loc, int value) { m_f.glUniform1i_(loc, value); };
         for (size_t drawIndex = 0; drawIndex < b.draws.size(); ++drawIndex)
         {
             const G178Draw &d = b.draws[drawIndex];
             // GS scissor is inclusive, top-origin; GL is bottom-origin.
             const int scH = d.scY1 - d.scY0 + 1;
-            glScissor(d.scX0, b.fbH - 1 - d.scY1, d.scX1 - d.scX0 + 1, scH);
+            g496Scissor(d.scX0, b.fbH - 1 - d.scY1, d.scX1 - d.scX0 + 1, scH, g496GlCache);
             const uint8_t depthFunc = d.depthFunc & 0x0Fu;
             if (depthFunc == 0)
             {
-                glDisable(GL_DEPTH_TEST);
-                glDepthMask(GL_FALSE);
+                g496DepthOff(g496GlCache);
             }
             else
             {
-                glEnable(GL_DEPTH_TEST);
-                glDepthFunc(depthFunc == 1 ? GL_ALWAYS :
-                                (depthFunc == 2 ? GL_GEQUAL : GL_GREATER));
-                glDepthMask(d.depthWrite ? GL_TRUE : GL_FALSE);
+                g496DepthOn(depthFunc == 1 ? GL_ALWAYS :
+                                (depthFunc == 2 ? GL_GEQUAL : GL_GREATER),
+                            d.depthWrite != 0u, g496GlCache);
             }
             if (g256Exact)
             {
@@ -3891,24 +4126,28 @@ private:
             }
             if (d.blend == 0)
             {
-                glDisable(GL_BLEND);
+                g496BlendOff(g496GlCache);
             }
             else
             {
-                glEnable(GL_BLEND);
                 // Alpha channel: keep dest alpha = written src value (CPU writePixel stores the
                 // source alpha unblended). blend==3 (G262): (Cs-0)*(FIX=128)>>7 + Cd == Cs + Cd
                 // additive; blend==4 (G262): (0-Cs)*(FIX=128)>>7 + Cd == Cd - Cs subtractive
                 // (GL_FUNC_REVERSE_SUBTRACT = dst - src, both clamp at the [0,1] rail like GS
-                // COLCLAMP). RGB equation must be reset per draw — it is persistent GL state.
-                m_e.glBlendEquationSeparate_(d.blend == 4 ? GL178_FUNC_REVERSE_SUBTRACT
-                                                          : GL178_FUNC_ADD,
-                                             GL178_FUNC_ADD);
-                m_e.glBlendFuncSeparate_(d.blend == 5 ? GL_ZERO :
-                                             ((d.blend == 3 || d.blend == 4) ? GL_ONE : GL_SRC_ALPHA),
-                                         (d.blend == 1 || d.blend == 5) ?
-                                             GL_ONE_MINUS_SRC_ALPHA : GL_ONE,
-                                             GL_ONE, GL_ZERO);
+                // COLCLAMP). The RGB equation is persistent GL state, so it must be re-set whenever
+                // it is not already the one this draw wants — which is exactly what the cache
+                // tracks; a run of same-mode blended draws now sets it once.
+                g496BlendOn([&](GLenum eqRgb, GLenum eqA)
+                            { m_e.glBlendEquationSeparate_(eqRgb, eqA); },
+                            [&](GLenum sRgb, GLenum dRgb, GLenum sA, GLenum dA)
+                            { m_e.glBlendFuncSeparate_(sRgb, dRgb, sA, dA); },
+                            d.blend == 4 ? GL178_FUNC_REVERSE_SUBTRACT : GL178_FUNC_ADD,
+                            GL178_FUNC_ADD,
+                            d.blend == 5 ? GL_ZERO
+                                         : ((d.blend == 3 || d.blend == 4) ? GL_ONE
+                                                                           : GL_SRC_ALPHA),
+                            (d.blend == 1 || d.blend == 5) ? GL_ONE_MINUS_SRC_ALPHA : GL_ONE,
+                            GL_ONE, GL_ZERO, g496GlCache);
             }
             int mode = 0;
             const bool g286Exact = b.fbp == 0x13bu;
@@ -3939,7 +4178,13 @@ private:
                     for (uint32_t t = 0u; t < 5u; ++t)
                     {
                         m_f.glActiveTexture_(GL158_TEXTURE0 + t);
-                        glBindTexture(GL_TEXTURE_2D, m_fbos.find(kSources[t])->second.colorTex);
+                        const GLuint g496Src = m_fbos.find(kSources[t])->second.colorTex;
+                        // G496b: only unit 0 is cached - it is the unit every other draw in this
+                        // loop binds through, and this branch leaves kSources[0] resident on it.
+                        if (t == 0u)
+                            g496BindTex(g496Src, g496GlCache);
+                        else
+                            glBindTexture(GL_TEXTURE_2D, g496Src);
                     }
                     m_f.glActiveTexture_(GL158_TEXTURE0 + 5u);
                     glBindTexture(GL_TEXTURE_2D, m_g309MapTex);
@@ -3952,7 +4197,10 @@ private:
                 {
                     const FboEntry &src =
                         m_fbos.find(g289RealSourceFbp(d.srcFbp))->second;
-                    glBindTexture(GL_TEXTURE_2D, src.colorTex);
+                    // G496b: the BIND is cached; the four sampler params are NOT. An FboEntry
+                    // colour texture is re-parameterised by the T8, CT24, composite-source and
+                    // spare-swap paths, so a per-object record here could go stale.
+                    g496BindTex(src.colorTex, g496GlCache);
                     const GLint filter = d.bilinear ? GL_LINEAR : GL_NEAREST;
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
@@ -3982,31 +4230,32 @@ private:
                 TexEntry *const texture = drawTextures[drawIndex];
                 if (texture == nullptr)
                     return false;
-                glBindTexture(GL_TEXTURE_2D, texture->id);
+                g496BindTex(texture->id, g496GlCache);
                 // Newly created cache textures default to a mipmapped MIN filter while this
                 // cache intentionally uploads level 0 only. The first G287 batch therefore
                 // sampled the GL incomplete-texture value until another path happened to make
                 // the object complete. Integer taps do not need filtering, but the sampler
                 // object must still be complete from first use.
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                g496TexFilter(texture->g496MinF, texture->g496MagF, GL_NEAREST, GL_NEAREST,
+                              g496GlCache);
                 mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
                 mode |= 512;
-                m_f.glUniform1i_(m_locLinear, d.bilinear ? 1 : 0);
-                m_f.glUniform1i_(m_locWrapU, static_cast<GLint>(d.wrapU));
-                m_f.glUniform1i_(m_locWrapV, static_cast<GLint>(d.wrapV));
+                g496Uniform1i(g496Uni, kG496ULinear, m_locLinear, d.bilinear ? 1 : 0, g496GlCache);
+                g496Uniform1i(g496Uni, kG496UWrapU, m_locWrapU, static_cast<int>(d.wrapU),
+                              g496GlCache);
+                g496Uniform1i(g496Uni, kG496UWrapV, m_locWrapV, static_cast<int>(d.wrapV),
+                              g496GlCache);
             }
             else if (d.texKey != 0)
             {
                 TexEntry *const texture = drawTextures[drawIndex];
-                glBindTexture(GL_TEXTURE_2D, texture->id);
+                g496BindTex(texture->id, g496GlCache);
                 const GLint filter = d.bilinear ? GL_LINEAR : GL_NEAREST;
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                                d.wrapU == 0 ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE));
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                                d.wrapV == 0 ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+                g496TexFilter(texture->g496MinF, texture->g496MagF, filter, filter, g496GlCache);
+                g496TexWrap(texture->g496WrapS, texture->g496WrapT,
+                            d.wrapU == 0 ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE),
+                            d.wrapV == 0 ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE),
+                            g496GlCache);
                 mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
                 if (g362PointGuard)
                     mode |= 4096;
@@ -4019,9 +4268,11 @@ private:
             {
                 // Accurate UV uses exact 12.4 point/bilinear taps. The wrap mode travels as a
                 // uniform because integer taps do not use the GL sampler's addressing state.
-                m_f.glUniform1i_(m_locLinear, d.bilinear ? 1 : 0);
-                m_f.glUniform1i_(m_locWrapU, static_cast<GLint>(d.wrapU));
-                m_f.glUniform1i_(m_locWrapV, static_cast<GLint>(d.wrapV));
+                g496Uniform1i(g496Uni, kG496ULinear, m_locLinear, d.bilinear ? 1 : 0, g496GlCache);
+                g496Uniform1i(g496Uni, kG496UWrapU, m_locWrapU, static_cast<int>(d.wrapU),
+                              g496GlCache);
+                g496Uniform1i(g496Uni, kG496UWrapV, m_locWrapV, static_cast<int>(d.wrapV),
+                              g496GlCache);
                 m_g362GuardDraws += 1u;
             }
             else if ((mode & 1) != 0)
@@ -4034,15 +4285,20 @@ private:
             if (d.fge != 0u)
             {
                 mode |= 8192;
-                m_f.glUniform1i_(m_locFogCol, static_cast<GLint>(d.fogCol & 0x00FFFFFFu));
+                g496Uniform1i(g496Uni, kG496UFogCol, m_locFogCol,
+                              static_cast<int>(d.fogCol & 0x00FFFFFFu), g496GlCache);
             }
             if (d.uvRoundU != 0u || d.uvRoundV != 0u)
             {
                 mode |= 16384;
-                m_f.glUniform1i_(m_locUvOriginX, static_cast<GLint>(d.uvOriginX));
-                m_f.glUniform1i_(m_locUvOriginY, static_cast<GLint>(d.uvOriginY));
-                m_f.glUniform1i_(m_locUvRoundU, static_cast<GLint>(d.uvRoundU));
-                m_f.glUniform1i_(m_locUvRoundV, static_cast<GLint>(d.uvRoundV));
+                g496Uniform1i(g496Uni, kG496UOriginX, m_locUvOriginX,
+                              static_cast<int>(d.uvOriginX), g496GlCache);
+                g496Uniform1i(g496Uni, kG496UOriginY, m_locUvOriginY,
+                              static_cast<int>(d.uvOriginY), g496GlCache);
+                g496Uniform1i(g496Uni, kG496URoundU, m_locUvRoundU,
+                              static_cast<int>(d.uvRoundU), g496GlCache);
+                g496Uniform1i(g496Uni, kG496URoundV, m_locUvRoundV,
+                              static_cast<int>(d.uvRoundV), g496GlCache);
             }
             if (g255RttAlpha && d.blend != 0u)
             {
@@ -4050,11 +4306,14 @@ private:
                 // framebuffer alpha stores the unblended source A byte. Preserve RGB blending in
                 // pass one with alpha masked, then overwrite alpha only with the raw source value.
                 glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
-                m_f.glUniform1i_(m_locMode, mode);
+                g496Uniform1i(g496Uni, kG496UMode, m_locMode, mode, g496GlCache);
                 glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
-                glDisable(GL_BLEND);
+                // Routed through the cache so the record tracks the real GL state: this branch
+                // disables blending after g496BlendOn enabled it, and the next draw must not
+                // believe blending is still on.
+                g496BlendOff(g496GlCache);
                 glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
-                m_f.glUniform1i_(m_locMode, mode | 32);
+                g496Uniform1i(g496Uni, kG496UMode, m_locMode, mode | 32, g496GlCache);
                 glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
                 glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
             }
@@ -4062,9 +4321,37 @@ private:
             {
                 if (g255RttAlpha)
                     mode |= 32;
-                m_f.glUniform1i_(m_locMode, mode);
+                g496Uniform1i(g496Uni, kG496UMode, m_locMode, mode, g496GlCache);
                 glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
             }
+        }
+
+        // G496 GPU DERIVATIVE PROBE (diagnostic only — DC2_G419_AB=gpuslow / DC2_G496_FORCE=1).
+        // Re-issue this batch's whole vertex range with an IDENTITY BLEND: dst = 0*src + 1*dst, with
+        // the depth test disabled and depth writes masked. Every fragment is rasterized, shaded,
+        // blended and written, so no driver can elide it (the colour-mask form the G495 roadmap
+        // proposed is elidable on this platform — see the note above the exact program's scratch
+        // attachment), and the byte written is the byte that was already there. One draw call covers
+        // the whole batch, so the CPU cost added to the GL worker is one call per batch.
+        // Excluded on the G256 exact path: that shader's imageStore is a side effect no blend can
+        // undo. g256ExactRttOn() needs two env flags and is off on every default/perf run.
+        const int g496Reps = g256Exact ? 0 : g496BallastForBatch(m_batchCounter);
+        if (g496Reps > 0 && b.verts.size() >= 3u)
+        {
+            g496CalBegin();
+            glScissor(0, 0, b.fbW, b.fbH);
+            glDisable(GL_DEPTH_TEST);
+            glDepthMask(GL_FALSE);
+            glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+            glEnable(GL_BLEND);
+            m_e.glBlendEquationSeparate_(GL178_FUNC_ADD, GL178_FUNC_ADD);
+            m_e.glBlendFuncSeparate_(GL_ZERO, GL_ONE, GL_ZERO, GL_ONE);
+            const GLsizei g496Vtx = static_cast<GLsizei>((b.verts.size() / 3u) * 3u);
+            for (int rep = 0; rep < g496Reps; ++rep)
+                glDrawArrays(GL_TRIANGLES, 0, g496Vtx);
+            glDisable(GL_BLEND);
+            g496CalEnd(static_cast<uint64_t>(g496Reps),
+                       static_cast<uint64_t>(g496Vtx) * static_cast<uint64_t>(g496Reps));
         }
 
         if (g256Exact)
@@ -4153,6 +4440,11 @@ private:
         int g415ReadRows = 0;
         if (!b.skipReadback)
         {
+            // G496 calibration frame clock on the GL worker: exactly one render batch per frame
+            // reads back (G495 §2 measured rb/frames = 0.99), so this is the divisor that turns the
+            // ballast's accumulated GPU nanoseconds into a real ms/FRAME. No-op unless DC2_G496_CAL.
+            g496NoteFrame();
+            g496GlNoteFrame();
             // G415: read only the GS row window this batch's caller actually consumes, into that
             // window's existing offsets in the full-height buffer. Buffer row index == GL row, so
             // the destination pointer offset is glY*fbW and every consumer index is unchanged.
@@ -4419,4 +4711,21 @@ void g453_backend_other_snapshot(uint64_t nsOut[4], uint64_t cntOut[4])
         nsOut[i] = g_g453BackendOtherNs[i].load(std::memory_order_relaxed);
         cntOut[i] = g_g453BackendOtherCount[i].load(std::memory_order_relaxed);
     }
+}
+
+// G494: global-scope accessor for the driver-round-trip census, read from the same 30-frame GS-worker
+// boundary that prints [G453:other]. Returns the site count so the printer never has to hard-code it.
+int g494_backend_sync_snapshot(uint64_t nsOut[], uint64_t nOut[], uint64_t badOut[], int cap,
+                               const char *const **namesOut)
+{
+    const int n = cap < kG494SyncSites ? cap : kG494SyncSites;
+    for (int i = 0; i < n; ++i)
+    {
+        nsOut[i] = g_g494SyncNs[i].load(std::memory_order_relaxed);
+        nOut[i] = g_g494SyncN[i].load(std::memory_order_relaxed);
+        badOut[i] = g_g494SyncBad[i].load(std::memory_order_relaxed);
+    }
+    if (namesOut != nullptr)
+        *namesOut = kG494SyncName;
+    return n;
 }

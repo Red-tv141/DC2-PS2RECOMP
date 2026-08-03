@@ -30,7 +30,14 @@ namespace
         uint64_t lowerS2[0x80] = {};    // S2_FUNC(lower) when opHi == 0x40
         // G422: executed-lower coverage, derived from the SAME decoder the G422 lever
         // dispatches on, so the two cannot drift apart.
-        uint64_t lowerKind[G422_LK_COUNT] = {};
+        // G487: FIXED capacity, deliberately decoupled from G422_LK_COUNT. Sizing it by the enum
+        // meant that extending the covered set RESIZED this thread_local member and shifted every
+        // thread_local declared after it — the exact data-placement hazard G486 §5 recorded (G437
+        // priced one such shift at 3.48 ms/f). 64 slots is paid once, here, and no future coverage
+        // phase has to touch the layout again.
+        static constexpr size_t kLowerKindCap = 64u;
+        static_assert(G422_LK_COUNT <= kLowerKindCap, "G487: raise kLowerKindCap");
+        uint64_t lowerKind[kLowerKindCap] = {};
         // G486: WHICH lower opcodes are the uncovered 4.61% of pairs. `[G422:cover]` has read
         // "uncovered=7.70% of executed lowers" for four phases without ever naming them, and
         // `[G421:mix] lowerS2` cannot: its index is S2_FUNC, which for a top-level Special2 op
@@ -211,12 +218,16 @@ namespace
         }
         // G475: G422's dense covered kinds 8..17 are control transfers. All other covered
         // kinds are branch-free and scalar-pipe/flag-reader-free by G422's contract.
-        const uint8_t g475LowerKind = g422DecodeLowerKind(lower);
+        const uint8_t g475LowerKind =
+            g422DecodeLowerKind(lower, s_g410Cache.decodeFlagLower);
         const bool g475Control = g475LowerKind >= G422_LK_B &&
                                  g475LowerKind <= G422_LK_IBGEZ;
+        // G487: a flag consumer is covered but NOT trace-safe — same exclusion as
+        // g475TracePairEligible, made in the same edit so the two cannot drift.
+        const bool g475Flag = g475LowerKind >= (uint8_t)G422_LK_FIRST_FLAG;
         const bool g475Safe = traceEntrySafe && kind == 0x6fu &&
                               ((upper >> 30u) & 3u) == 0u &&
-                              g475LowerKind != G422_LK_NONE && !g475Control;
+                              g475LowerKind != G422_LK_NONE && !g475Control && !g475Flag;
         if (g475Safe)
         {
             if (s_g421.g475Cur != 0u && pc != s_g421.g475PrevPc + 8u)
@@ -248,7 +259,9 @@ namespace
             if (op == 0x14u || op == 0x16u || op == 0x17u)
                 ++s_g421.statusReadExec;
         }
-        const uint8_t lk = g422DecodeLowerKind(lower);
+        // G487: decode under the arm the G410 pair cache was actually built with, so
+        // `[G422:cover]` / `[G479:lk]` / `[G486:uncov]` report the dispatch that RAN.
+        const uint8_t lk = g422DecodeLowerKind(lower, s_g410Cache.decodeFlagLower);
         if (lk < (uint8_t)G422_LK_COUNT)
             ++s_g421.lowerKind[lk];
         // G486: name the uncovered lowers (see the uncovHist comment).

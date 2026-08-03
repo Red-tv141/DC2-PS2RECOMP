@@ -17,6 +17,9 @@
 // G447: host core-count probe. Defined at global scope in ps2_gif_arbiter.cpp
 // (g447_edge_census.inc), which is the TU that already pulls in <windows.h>. Declared here outside
 // the parts' anonymous namespaces so DC2_G447_HOSTCHECK links against the real cross-TU symbol.
+// G493: NEW part g493_late_drain.inc, included from rasterizer_vram_materialization.inc — moves the
+// async break's drain from the flush TOP to just before that flush's submit, so the pending render
+// overlaps the flush's own preparation instead of nothing (force recompile v1).
 void g447HostShape(int *logicalOut, int *physicalOut);
 int g456UvPredicateArm();
 
@@ -127,6 +130,8 @@ int g456UvPredicateArm();
 // G481: DC2_G419_AB=hotlower lever + g481HotLowerArm in g419_ab_instrument.inc (force recompile v1).
 // G482: DC2_G419_AB=memohash lever + g482MemoHashArm in g419_ab_instrument.inc (force recompile v1).
 // G484: DC2_G419_AB=tlsblock lever + g484TlsBlockArm in g419_ab_instrument.inc (force recompile v1).
+// G488: DC2_G419_AB=fastop lever + g488FastOpArm in g419_ab_instrument.inc; added to the hold-16
+//       default set because an arm flip re-decodes the whole G410 pair cache (force recompile v1).
 // G454: readback dependency-edge A/B probes + callsite selection (force recompile v1).
 // G455: DC2_G455_RUNWAY last-writer/readback runway census (force recompile v4).
 // G456: paired exact G407 UV-predicate short circuit + shadow verifier (force recompile v4, promoted).

@@ -147,5 +147,16 @@ static void g433DoReadPixels(GLFns &f, int glY, int w, int rows, uint32_t *out)
         }
         return;
     }
+    // G491: read in the driver's native packed format and restore RGBA byte order on the CPU.
+    // Placed here, at the ONE site that reads colour pixels, so both arms share every other
+    // statement in the call (G421's control-arm rule). The control arm below is byte-identical to
+    // the pre-G491 body.
+    g491ProbeReadFormat();
+    if (g491NativeReadActive() && g491ReadPixelsNative(glY, w, rows, out))
+    {
+        if (g491RbVerifyOn())
+            g491VerifyNative(glY, w, rows, out);
+        return;
+    }
     glReadPixels(0, glY, w, rows, GL_RGBA, GL_UNSIGNED_BYTE, out);
 }

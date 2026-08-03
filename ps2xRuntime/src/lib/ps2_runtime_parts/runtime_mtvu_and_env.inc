@@ -23,6 +23,13 @@ extern void g478RegisterVu1WorkerThread();
 // G478 kick-item pool paired gate (DC2_G419_AB=kickpool). -1 = not selected, 0 = control, 1 = cand.
 extern int g478KickPoolArm();
 
+// G497 per-window handoff-buffer recycling arm (DC2_G419_AB=winbuf). -1 = not selected, 0 = ctrl.
+extern int g497WinBufArm();
+// G497 combined arm+default predicate. Defined LOWER IN THIS FILE at global scope; declared up here,
+// above the anonymous namespace, because both the anon-namespace call sites below and the arbiter's
+// extern in another TU must bind to the SAME symbol.
+bool g497WinBufActive();
+
 // G482 memo-key PRICE arm (DC2_G419_AB=memohash). -1 = not selected, 0 = control, 1 = candidate.
 extern int g482MemoHashArm();
 
@@ -202,6 +209,43 @@ inline bool g478KickPoolOn()
     static const bool s_on = (std::getenv("DC2_G478_NO_KICKPOOL") == nullptr);
     return s_on;
 }
+
+// ---- G497: PER-WINDOW handoff-buffer recycling --------------------------------------------------
+//
+// G478/G480 took the per-KICK allocations off the heap (~1,230/frame). One level up, the per-WINDOW
+// handoff was never touched, and MAP-0 seals ~1,560 windows/frame — MORE often than it kicks:
+//
+//   EE   onWindowHandoff:      m_windowBatches.push_back(std::move(m_curBatch));  m_curBatch.clear();
+//   GS   collectWindowPackets: batch = std::move(front); pop_front();  ... ; ~batch();
+//
+// After the move `m_curBatch` has ZERO capacity, so the next noteKick regrows it from the heap; and
+// the vector the GS worker ends up destroying was allocated by the EE. That is allocation on one
+// thread and free on another, 1,560x/frame — the same mechanism G478's own comment names as the
+// expensive one, at a higher rate than the kicks it fixed.
+//
+// EXACTNESS. Only CAPACITY survives a recycle: every buffer enters the free list at size 0, and the
+// GS worker clears its buffer at exactly the point the destructor would have run, so each kick's
+// shared_ptr reference is released on the same thread at the same instant as before. No consumer can
+// observe a vector's capacity. The free list is bounded (kG497MaxFreeBufs) so a backlog burst cannot
+// pin memory, and it lives inside G297Mtvu under m_batchMtx, which BOTH sides already hold — the
+// mechanism adds no lock, no atomic and no allocation.
+//
+// The CONTROL arm neither takes from the free list nor feeds it, so a candidate frame's recycled
+// buffers can never subsidise a control frame (17a law 17 — the lever-OFF path IS the control arm).
+//
+// Levers: DC2_G419_AB=winbuf (paired gate), DC2_G497_NO_WINBUF=1 (rollback of the default).
+static constexpr size_t kG497MaxFreeBufs = 8u;
+
+inline bool g497WinBufOn()
+{
+    static const bool s_on = (std::getenv("DC2_G497_NO_WINBUF") == nullptr);
+    return s_on;
+}
+
+// g497WinBufActive() is DECLARED at the top of this file, above the anonymous namespace, and
+// defined at global scope beside the g297* bridges. Do not re-declare it here: a declaration inside
+// the anonymous namespace binds the call to an anon symbol that nothing defines (the linkage trap
+// in appendix-dc2-project.md §3 — it cost this phase two links, once in each direction).
 inline G297KickPtr g478AcquireKickItem()
 {
     // DC2_G419_AB=kickpool: -1 = not the selected lever (use the shipped default), 0 = control
@@ -481,10 +525,20 @@ public:
     void onWindowHandoff()
     {
         const size_t batchKicks = m_curBatch.size();
+        // G497: read the arm OUTSIDE the lock (it is a relaxed load plus a once-per-frame memo).
+        const bool g497Recycle = g497WinBufActive();
         {
             std::lock_guard<std::mutex> lk(m_batchMtx);
             m_windowBatches.push_back(std::move(m_curBatch));
             m_curBatch.clear();
+            // G497: the move above left m_curBatch with zero capacity, so without this the next
+            // noteKick regrows it from the heap. Take back a buffer the GS worker already emptied.
+            // Move-assign is safe: m_curBatch is a moved-from husk, so it owns nothing to free.
+            if (g497Recycle && !m_g497FreeBufs.empty())
+            {
+                m_curBatch = std::move(m_g497FreeBufs.back());
+                m_g497FreeBufs.pop_back();
+            }
         }
         static const bool s_stat = (std::getenv("DC2_G297_STAT") != nullptr);
         if (s_stat)
@@ -534,9 +588,19 @@ public:
         } g344Timer{this, g344Instr,
                     g344Instr ? std::chrono::steady_clock::now()
                               : std::chrono::steady_clock::time_point{}};
+        // G497: read the arm once, outside the lock. Both sides of the handoff read the same global
+        // arm and the block hold is 16 frames, so producer and consumer agree except across a block
+        // boundary — where the only consequence is that one buffer is or is not recycled.
+        const bool g497Recycle = g497WinBufActive();
         std::vector<G297KickPtr> batch;
         {
             std::lock_guard<std::mutex> lk(m_batchMtx);
+            // G497: hand back the PREVIOUS window's emptied buffer under the lock this call already
+            // takes, so recycling costs no extra acquire. Bounded, so a producer backlog cannot pin
+            // memory; over the cap the buffer is simply freed as it was before.
+            if (g497Recycle && m_g497Used.capacity() != 0u &&
+                m_g497FreeBufs.size() < kG497MaxFreeBufs)
+                m_g497FreeBufs.push_back(std::move(m_g497Used));
             if (m_windowBatches.empty())
                 return;
             batch = std::move(m_windowBatches.front());
@@ -580,6 +644,14 @@ public:
                 return;
             for (auto &pk : item->packets)
                 out.push_back(std::move(pk));
+        }
+        // G497: release every kick reference HERE — the same thread and the same instant the
+        // destructor below would have released them — then keep the storage instead of freeing it.
+        // The next call hands it to the free list under the lock it already takes.
+        if (g497Recycle)
+        {
+            batch.clear();
+            m_g497Used = std::move(batch);
         }
     }
 
@@ -1065,6 +1137,14 @@ private:
     std::vector<G297KickPtr> m_curBatch;               // EE-only: kicks in the current window
     std::mutex m_batchMtx;
     std::deque<std::vector<G297KickPtr>> m_windowBatches; // per-window batches (EE push / worker pop)
+    // G497: free list of spent per-window batch buffers, guarded by m_batchMtx (which BOTH sides
+    // already take, so recycling adds no lock). The EE takes one instead of regrowing m_curBatch
+    // from zero capacity; the GS worker returns the one it finished with instead of freeing memory
+    // the EE allocated. Only capacity travels — every buffer enters the list at size 0.
+    std::vector<std::vector<G297KickPtr>> m_g497FreeBufs;
+    // GS-worker-private: last window's buffer, cleared, waiting to be handed to the free list under
+    // the lock the NEXT collect already takes. Deferring it this way keeps the call at one lock.
+    std::vector<G297KickPtr> m_g497Used;
     // G301: worker-owned PERSISTENT VU RAM (worker thread ONLY — no lock). Zero = VU reset state;
     // ALL content arrives via replayed UNPACK/MPG writes. VIF1 is the complete funnel into VU RAM
     // (verified: no memory-mapped guest Store path writes m_vu1Data/m_vu1Code in this runtime).
@@ -1114,6 +1194,17 @@ void g297CollectWindowPackets(std::vector<std::vector<uint8_t>> &out)
 void g297ShutdownMtvu()
 {
     G297Mtvu::instance().shutdown();
+}
+// G497: GLOBAL linkage on purpose — the arbiter's processWindow (another TU) holds the second half
+// of this mechanism and must select the SAME arm on the same frame, so both halves share this one
+// accessor. It must live out here beside the g297* bridges: the G478/G497 helper region above is
+// inside an anonymous namespace.
+bool g497WinBufActive()
+{
+    const int arm = g497WinBufArm(); // -1 unless DC2_G419_AB=winbuf
+    if (arm >= 0)
+        return arm == 1;
+    return g497WinBufOn();
 }
 // G303 worker-thread busy-time attribution bridges (0 when MTVU inactive).
 uint64_t g297WorkerBusyNs() { return G297Mtvu::activeCached() ? G297Mtvu::instance().workerBusyNs() : 0ull; }

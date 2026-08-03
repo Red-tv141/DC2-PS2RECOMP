@@ -86,18 +86,63 @@ namespace
         G422_LK_MFIR,
         G422_LK_ILWR,
         G422_LK_ISWR,
+        // G487: the FLAG CONSUMERS. `[G486:uncov]` measured the population that still crosses
+        // execLower's call boundary and it is only two things — these four (2.54% of all pairs,
+        // ~41 k/frame) and DIV (1.68%, which carries the Q-latency staging and is therefore not
+        // a candidate). Their bodies are three or four instructions on values the pair loop has
+        // ALREADY resolved: `m_state.clip` for FCAND/FCOR/FCGET and `s_vuMacVisible` for FMAND,
+        // which the loop publishes exactly for these pairs (G427_PF_FLAGREAD).
+        // These four MUST stay after every kind above: `g475TracePairEligible` and the census's
+        // `g475Safe` classify "control transfer" as the closed range [G422_LK_B, G422_LK_IBGEZ],
+        // and both now exclude this range explicitly (a flag reader is not trace-safe).
+        G422_LK_FCAND,  // opHi 0x12 - reads m_state.clip
+        G422_LK_FCOR,   // opHi 0x13 - reads m_state.clip
+        G422_LK_FMAND,  // opHi 0x1A - reads the G138 MAC delay line (s_vuMacVisible)
+        G422_LK_FCGET,  // opHi 0x1C - reads m_state.clip (default s_fmFixed mapping)
         G422_LK_COUNT
     };
 
-    // Pure function of the lower word. Called once per pair at G410 compile time (and by the
-    // G410 cache verifier, and by the census), never in the hot loop.
-    uint8_t g422DecodeLowerKind(uint32_t lower)
+    // G487: the first covered kind that reads flag state. Everything below it is branch-free and
+    // flag-reader-free, which is the contract G475's trace runway depends on.
+    constexpr uint8_t G422_LK_FIRST_FLAG = G422_LK_FCAND;
+
+    // G487: the flag-consumer kinds are only ever produced when the runtime is in the exact
+    // configuration their transcribed bodies assume. Both conditions are process-wide constants
+    // read from the environment once, so this is a compile-once property of the run, not a
+    // per-pair test:
+    //   * `s_fmFixed` (DC2_VU1_NO_FMSWAPFIX unset) — the G138 opcode mapping the bodies below
+    //     transcribe. Under the legacy mapping FMAND and FMEQ swap and FCGET reads MAC, so the
+    //     bodies would be wrong.
+    //   * `g138_macpipe_enabled()` (DC2_VU1_NO_MACPIPE unset) — FMAND's `macRead` source. With the
+    //     pipe off, execLower reads `s_g106LowerMacRead`/`m_state.mac` through a chain this path
+    //     does not reproduce.
+    // Either one non-default and every flag consumer decodes to G422_LK_NONE, i.e. straight back
+    // onto the interpreter. Note this is deliberately NOT gated on g422LowerDiagFree(): none of
+    // the eight probe envs listed there lives in a flag-consumer body, and any of them already
+    // forces the whole slot back through execLower at the caller.
+    bool g487FlagLowerSupported()
+    {
+        static const bool s_ok = (std::getenv("DC2_VU1_NO_FMSWAPFIX") == nullptr) &&
+                                 g138_macpipe_enabled();
+        return s_ok;
+    }
+
+    // Pure function of the lower word AND of the flag-consumer arm the G410 pair cache was built
+    // with. Called once per pair at G410 compile time (and by the G410 cache verifier, and by the
+    // census), never in the hot loop — which is exactly why the arm has to be a property of the
+    // CACHE and not an in-loop compare (G486 §4: an extra per-pair test would sit on the control
+    // arm on 59.9% of pairs and bias the gate toward the candidate).
+    uint8_t g422DecodeLowerKind(uint32_t lower, bool flagLower)
     {
         if (lower == 0x00000000u || lower == 0x8000033Cu)
             return G422_LK_NOP;
 
         switch ((lower >> 25u) & 0x7Fu)
         {
+        case 0x12u: return flagLower ? G422_LK_FCAND : G422_LK_NONE;
+        case 0x13u: return flagLower ? G422_LK_FCOR : G422_LK_NONE;
+        case 0x1Au: return flagLower ? G422_LK_FMAND : G422_LK_NONE;
+        case 0x1Cu: return flagLower ? G422_LK_FCGET : G422_LK_NONE;
         case 0x00u: return G422_LK_LQ;
         case 0x01u: return G422_LK_SQ;
         case 0x04u: return G422_LK_ILW;
@@ -544,6 +589,42 @@ namespace
                 if (dest & 0x1)
                     std::memcpy(vuData + addr + 12u, &value, 4);
             }
+            return;
+        }
+        // G487: the four flag consumers, transcribed verbatim from VU1Interpreter::execLower
+        // (vu1_dispatch_and_sync.inc cases 0x12 / 0x13 / 0x1A / 0x1C) under the two constants
+        // g487FlagLowerSupported() pins: `s_fmFixed == true` and `g138_macpipe_enabled() == true`.
+        // With those two fixed, execLower's bodies reduce to exactly these statements — the
+        // `s_g106UseLowerFlagRead` alternative is unreachable (it is written only inside the
+        // `s_g106ParallelFlags` block, which `g443Fixed` excludes) and every `if (1 != 0)` is the
+        // identity. Nothing is re-ordered and no expression is re-associated.
+        // The shadow oracle DC2_G422_VERIFY=1 re-runs the real execLower from the identical
+        // pre-state and compares the whole VU1State, so a drift here cannot ship silently.
+        case G422_LK_FCAND:
+        {
+            const uint32_t imm24 = instr & 0xFFFFFF;
+            st.vi[1] = ((st.clip & imm24) != 0) ? 1 : 0;
+            return;
+        }
+        case G422_LK_FCOR:
+        {
+            const uint32_t imm24 = instr & 0xFFFFFF;
+            st.vi[1] = ((st.clip | imm24) == 0xFFFFFF) ? 1 : 0;
+            return;
+        }
+        case G422_LK_FMAND:
+        {
+            const uint8_t it = LIT(instr);
+            const uint8_t is = LIS(instr);
+            if (it != 0)
+                st.vi[it] = (int32_t)(s_vuMacVisible & (uint32_t)(uint16_t)st.vi[is]);
+            return;
+        }
+        case G422_LK_FCGET:
+        {
+            const uint8_t it = LIT(instr);
+            if (it != 0)
+                st.vi[it] = (int32_t)(st.clip & 0xFFFu);
             return;
         }
         default:

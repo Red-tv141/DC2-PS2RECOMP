@@ -218,6 +218,99 @@ enum G419Lever
     // destination's other three lanes, so the candidate turns a pure store into a
     // load-modify-store and puts a 16-byte load on the dependency chain. The lever id is retired
     // rather than reused so an old command line fails loudly instead of selecting something else.
+    // G487: extend the G422 compiled lower to the four flag consumers (FMAND/FCOR/FCGET/FCAND,
+    // 2.54% of pairs) so they stop crossing execLower's call boundary — 8 GPR pushes, ten xmm6-15
+    // `movaps` spills, a 1832-byte frame and a /GS cookie, read off this binary's own /MAP. Both
+    // arms execute the SAME bodies (the candidate's are a verbatim transcription of execLower's
+    // cases) and the loop body is byte-identical; the arm changes only what
+    // `g422DecodeLowerKind` writes into the G410 pair cache, which is re-decoded on every arm
+    // flip. That is why this cannot be an in-loop compare: an extra per-pair test would sit on
+    // the CONTROL arm on 59.9% of pairs and bias the gate in the candidate's favour (G486 §4).
+    kG487LeverFlagLower = 43,
+    // G488: extend the G421 compiled upper to OPMSUB/OPMULA/CLIPw (~1.08% of pairs, ~17.6 k/f) so
+    // they stop crossing execUpper's call boundary — 8 GPR pushes, `sub rsp,0xa0`, four xmm6-9
+    // `movaps` and a /GS cookie each way. Same shape as `flaglower`: both arms run the SAME loop
+    // text and the arm changes only the `upperKind` byte the G410 pair cache is decoded with (the
+    // control arm gets SHADOW kinds 0x72/0x73/0x74, whose G421 descriptor entries are zero), which
+    // is re-decoded on every flip. An in-loop test is inadmissible for the same reason as G487's:
+    // it would sit on the CONTROL arm on ~49% of pairs. NOTE what this gate does NOT cover — both
+    // arms carry the added inline bodies in the loop's text, so it prices the removed call, not
+    // the G481 inline-budget footprint; that is checked from the /MAP and the default-path level.
+    kG488LeverFastOp = 44,
+    // G489: the cached "this lower can write pc" bit. Also a cache-decode arm, so it must be held
+    // for a G438 block. Unlike G487/G488 there is no shadow encoding — the CONTROL arm simply sets
+    // the bit on every pair, which reproduces the pre-G489 tail exactly with identical loop text.
+    // The control arm does carry one always-true byte test the old binary did not, so this gate
+    // reads as a FLOOR on the lever.
+    kG489LeverPcSkip = 45,
+    // G490: the WIDENED BLOCK RUN — a whole run of eligible pairs executed in one noinline call,
+    // paying the per-pair envelope once per RUN. Selects a LOOP COPY (like G483/G484/G485), so it
+    // must be held for a G438 block: a flip mid-run() is impossible by construction (the arm is
+    // read once per run()), but a per-frame flip would still put the ~20 us cache rebuild on one
+    // arm's frames. The control arm is the SHIPPED default copy, textually identical apart from
+    // the hook, so this gate prices the mechanism and not a refactor of the control.
+    kG490LeverBlockRun = 46,
+    // G491: the GS colour readback taken in the driver's NATIVE packed format (BGRA/8888_REV) with
+    // the channel restore done on the CPU, instead of the spec-guaranteed GL_RGBA/UNSIGNED_BYTE.
+    // Six reads per frame on the GS worker, ~545 us each; a per-read decision, so it does NOT need
+    // a block hold for correctness — but it is held anyway (16) because the GL driver's readback
+    // path is stateful enough that alternating it per frame would measure the transition.
+    kG491LeverRbFmt = 47,
+    // G491: drop the G447 spin on the readback edge only. Thread-level (it changes which thread
+    // burns CPU), so it inherits the G438 block hold for the same reason the two G447 spins do.
+    kG491LeverRbSpin = 48,
+    // G492: the two unpriced blocking edges of the pole thread, deleted whole. `norender` drops the
+    // backend-render round trip (3.5 ms/f over 34 items), `noother` the T8/CT24/composite round trip
+    // (2.8 ms/f over 20). Knowingly-wrong output, built on the G454 rb_all pattern: every byte of
+    // front-end preparation and downstream publication stays, only the queue push and the blocking
+    // wait go. Ceiling probes — they can never be promoted. Thread-level (they change whether the GL
+    // worker has anything queued at all), so both inherit the G438 block hold.
+    kG492LeverNoRender = 49,
+    kG492LeverNoOther = 50,
+    // G492: skip the redundant glTexImage2D storage reallocation of the CT24 view's OUTPUT texture.
+    // The build's full-screen draw rewrites every texel, so both arms produce a bit-identical view
+    // and the gate measures only the removed allocation. One call per frame on the GL worker; held
+    // for a G438 block anyway because GL driver allocation state is sticky across frames.
+    kG492LeverCt24Reuse = 51,
+    // G493: move the async break's drain from the TOP of g178TryFlushGpu to immediately before that
+    // flush's own submit. G493 §1 measured the async break deleting 16 of 34 render waits
+    // (blocked -1.1 ms/f) while `cpu` rose 1.6 ms/f and the frame did not move — the wait relocates
+    // into the un-scoped drainAsync(). The candidate arm gives the pending packet the flush's whole
+    // preparation to overlap with. Run it with DC2_G444_ASYNC=1 on BOTH arms: the only variable is
+    // the drain POINT. Thread-level (it changes whether the GL worker runs concurrently with the
+    // pole thread at all), so it inherits the G438 block hold.
+    kG493LeverLateDrain = 52,
+    // G494: elide the GL backend's per-item VALIDATION queries (glGetError, glCheckFramebufferStatus)
+    // — the calls that force a rendezvous with the NVIDIA threaded driver's own worker and produce no
+    // output byte. ~110 per frame against ~73 backend items. Read on the GL WORKER thread, several
+    // times per item; thread-level (it changes how often that thread blocks on the driver), so it
+    // inherits the G438 block hold like every other thread-level arm.
+    kG494LeverNoSync = 53,
+    // G496: the GPU DERIVATIVE PROBE — the arc's third derivative probe, and the first on the GPU.
+    // The candidate arm re-issues each render batch's whole vertex range with an identity blend
+    // (dst = 0*src + 1*dst), depth test off and depth writes off: every fragment is rasterized,
+    // shaded, blended and written, and the byte written is the byte that was already there. Like
+    // `gsslow` and `vu1slow` it deliberately WASTES time and can never be promoted. Thread-level in
+    // the strongest sense (it changes how much work the GPU has queued when the next fence lands),
+    // so it inherits the G438 block hold. Its injected cost is MEASURED, not assumed —
+    // DC2_G496_FORCE=1 DC2_G496_CAL=1 prints `[G496:cal] injMs/f`.
+    kG496LeverGpuSlow = 54,
+    // G496b: redundant GL state elision in the render-batch draw loop. Both arms leave GL holding
+    // the SAME state vector and render the same bytes; the arm decides only whether a call that
+    // sets the value already there is issued at all. Read once per render batch on the GL worker,
+    // and thread-level (it changes how much command translation that thread hands the driver), so
+    // it takes the G438 block hold.
+    kG496LeverGlState = 55,
+    // G497: recycle the PER-WINDOW handoff buffers. MAP-0 seals ~1,560 windows/frame, and each one
+    // (a) leaves the EE's `m_curBatch` with zero capacity after the move, so the next kick regrows
+    // it from the heap, and (b) hands the GS worker a vector it then FREES — allocation on one
+    // thread, free on another, 1,560x/frame. That is the same mechanism G478/G480 priced on the
+    // 1,230 kicks/frame, one level up, and it was never touched. The candidate arm returns both
+    // buffers to a bounded free list instead. Only CAPACITY survives a recycle; every consumer sees
+    // size 0 and the kick shared_ptrs are released at exactly the same point as before, so the arms
+    // are exact by construction. Thread-level (it changes the EE<->GS handoff cost), so it takes
+    // the G438 block hold.
+    kG497LeverWinBuf = 56,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -322,11 +415,41 @@ static int g419AbLever()
             return static_cast<int>(kG483LeverPcReg);
         if (std::strcmp(value, "widevf0") == 0)
             return static_cast<int>(kG484LeverWideVf0);
+        if (std::strcmp(value, "flaglower") == 0)
+            return static_cast<int>(kG487LeverFlagLower);
+        if (std::strcmp(value, "fastop") == 0)
+            return static_cast<int>(kG488LeverFastOp);
+        if (std::strcmp(value, "pcskip") == 0)
+            return static_cast<int>(kG489LeverPcSkip);
+        if (std::strcmp(value, "blockrun") == 0)
+            return static_cast<int>(kG490LeverBlockRun);
+        if (std::strcmp(value, "rbfmt") == 0)
+            return static_cast<int>(kG491LeverRbFmt);
+        if (std::strcmp(value, "rbspin") == 0)
+            return static_cast<int>(kG491LeverRbSpin);
+        if (std::strcmp(value, "norender") == 0)
+            return static_cast<int>(kG492LeverNoRender);
+        if (std::strcmp(value, "noother") == 0)
+            return static_cast<int>(kG492LeverNoOther);
+        if (std::strcmp(value, "ct24reuse") == 0)
+            return static_cast<int>(kG492LeverCt24Reuse);
+        if (std::strcmp(value, "latedrain") == 0)
+            return static_cast<int>(kG493LeverLateDrain);
+        if (std::strcmp(value, "nosync") == 0)
+            return static_cast<int>(kG494LeverNoSync);
+        if (std::strcmp(value, "gpuslow") == 0)
+            return static_cast<int>(kG496LeverGpuSlow);
+        if (std::strcmp(value, "glstate") == 0)
+            return static_cast<int>(kG496LeverGlState);
+        if (std::strcmp(value, "winbuf") == 0)
+            return static_cast<int>(kG497LeverWinBuf);
         std::fprintf(stderr,
                      "[G419:ab] unknown DC2_G419_AB='%s' (expected "
                      "narrow|pack|lanes|all|zero|packlanes|pool|all420|narrowtouch|matunpack|"
                      "vu1slow|gsslow|coalesce|earlykick|kickall|spinwait|wspin|spinboth|async1|"
-                     "rb_all|rb_l2l|rb_resync|rb_display|uvpred|simdmerge|vnoptrace|pagebump)\n",
+                     "rb_all|rb_l2l|rb_resync|rb_display|uvpred|simdmerge|vnoptrace|pagebump|"
+                     "leanfetch|pcreg|widevf0|flaglower|fastop|pcskip|blockrun|rbfmt|rbspin|"
+                     "norender|noother|ct24reuse|latedrain|nosync|gpuslow|glstate|winbuf)\n",
                      value);
         return static_cast<int>(kG419LeverNone);
     }();
@@ -377,6 +500,20 @@ static const char *g419AbLeverName(int lever)
     case kG482LeverBoth: return "g482both";
     case kG483LeverPcReg: return "pcreg";
     case kG484LeverWideVf0: return "widevf0";
+    case kG487LeverFlagLower: return "flaglower";
+    case kG488LeverFastOp: return "fastop";
+    case kG489LeverPcSkip: return "pcskip";
+    case kG490LeverBlockRun: return "blockrun";
+    case kG491LeverRbFmt: return "rbfmt";
+    case kG491LeverRbSpin: return "rbspin";
+    case kG492LeverNoRender: return "norender";
+    case kG492LeverNoOther: return "noother";
+    case kG492LeverCt24Reuse: return "ct24reuse";
+    case kG493LeverLateDrain: return "latedrain";
+    case kG494LeverNoSync: return "nosync";
+    case kG496LeverGpuSlow: return "gpuslow";
+    case kG496LeverGlState: return "glstate";
+    case kG497LeverWinBuf: return "winbuf";
     default: return "none";
     }
 }
@@ -490,6 +627,13 @@ static uint64_t g438ArmHoldFrames()
                 sel == kG456LeverUvPredicate || sel == kG473LeverSimdMerge ||
                 sel == kG475LeverVnopTrace || sel == kG476LeverPageBump ||
                 sel == kG477LeverRunWrite || sel == kG478LeverKickPool ||
+                sel == kG487LeverFlagLower || sel == kG488LeverFastOp ||
+                sel == kG489LeverPcSkip || sel == kG490LeverBlockRun ||
+                sel == kG491LeverRbFmt || sel == kG491LeverRbSpin ||
+                sel == kG492LeverNoRender || sel == kG492LeverNoOther ||
+                sel == kG492LeverCt24Reuse || sel == kG493LeverLateDrain ||
+                sel == kG494LeverNoSync || sel == kG496LeverGpuSlow ||
+                sel == kG496LeverGlState || sel == kG497LeverWinBuf ||
                 sel == kG439LeverCoalesce || sel == kG445LeverEarlyKick ||
                 sel == kG445LeverKickAll || sel == kG447LeverSpinWait || sel == kG447LeverWSpin ||
                 sel == kG447LeverSpinBoth || sel == kG452LeverAsyncOne ||
@@ -708,6 +852,266 @@ int g481HotLowerArm()
     return arm != 0u ? 1 : 0;
 }
 
+// G487 selects what `g422DecodeLowerKind` writes into the G410 pair cache, read once per run() on
+// the VU1 worker (~1,230/f). An arm flip forces a full 2,048-slot re-decode of that cache, so the
+// arm MUST be held for a G438 block (the default above adds this lever to the hold-16 set): at
+// hold=1 the ~20 us rebuild would land on one arm's frame every frame and bias the gate.
+int g487FlagLowerArm()
+{
+    if (g419AbLever() != static_cast<int>(kG487LeverFlagLower))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G488 selects which `upperKind` byte `g410SelectUpperKind` writes into the G410 pair cache, read
+// once per run() on the VU1 worker (~1,230/f). Identical contract to g487FlagLowerArm: an arm flip
+// forces a full 2,048-slot re-decode of that cache, so the arm MUST be held for a G438 block or
+// the ~20 us rebuild would land on one arm's frame every frame and bias the gate.
+int g488FastOpArm()
+{
+    if (g419AbLever() != static_cast<int>(kG488LeverFastOp))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G489 selects the VALUE of the `G489_PF_CANBRANCH` bit this cache's slots are decoded with, read
+// once per run() on the VU1 worker (~1,230/f). Identical contract to g487FlagLowerArm /
+// g488FastOpArm: a flip forces a full 2,048-slot re-decode, so the arm MUST be held for a G438
+// block or the ~20 us rebuild would land on one arm's frame every frame and bias the gate.
+int g489PcSkipArm()
+{
+    if (g419AbLever() != static_cast<int>(kG489LeverPcSkip))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G490 selects which LOOP COPY run() enters, read once per run() on the VU1 worker (~1,230/f).
+// Same G438 block hold and the same per-frame-sequence memo as every other thread-level arm: the
+// memo keys on the tick SEQUENCE, never on the arm value (the LCG draws the same arm on
+// consecutive frames about half the time, and a value-keyed memo would stop marking the frame).
+int g490BlockRunArm()
+{
+    if (g419AbLever() != static_cast<int>(kG490LeverBlockRun))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G491 readback-format arm, read once per colour readback on the GL WORKER thread (6/f). The
+// per-frame memo below marks the frame from that thread — which is correct and necessary: the arm
+// must be attributed on whichever thread consumes it, and 6 relaxed RMWs per frame is nothing
+// (17a law 7c's instrument-cost corollary bites at thousands per frame, not six).
+int g491RbFmtArm()
+{
+    if (g419AbLever() != static_cast<int>(kG491LeverRbFmt))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G491 readback-spin arm, read once per colour readback on the GS WORKER thread (6/f). Candidate
+// arm (1) = do NOT spin on this edge.
+int g491RbSpinArm()
+{
+    if (g419AbLever() != static_cast<int>(kG491LeverRbSpin))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G492 ceiling-probe arms, read once per backend item on the GS worker (~34 and ~20 per frame).
+// Candidate arm (1) = DELETE the round trip at that edge. Same per-frame memo as every other
+// thread-level arm; the memo keys on the tick SEQUENCE, never on the arm value.
+int g492NoRenderArm()
+{
+    if (g419AbLever() != static_cast<int>(kG492LeverNoRender))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g492NoOtherArm()
+{
+    if (g419AbLever() != static_cast<int>(kG492LeverNoOther))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G492 CT24 output-storage reuse arm, read once per CT24 view build on the GL WORKER thread (1/f).
+// Candidate arm (1) = REUSE the existing allocation. Both arms produce a bit-identical view.
+int g492Ct24ReuseArm()
+{
+    if (g419AbLever() != static_cast<int>(kG492LeverCt24Reuse))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G493 late-drain arm, read on the GS-worker/front-end thread at the flush top and again at the
+// flush's submit point (~34 + ~18 per frame). Candidate arm (1) = drain LATE, i.e. hand the pending
+// async render the whole of this flush's preparation to overlap with. Same per-frame thread-local
+// memo as every other thread-level arm; the memo keys on the tick SEQUENCE, never on the arm value.
+int g493LateDrainArm()
+{
+    if (g419AbLever() != static_cast<int>(kG493LeverLateDrain))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G494 sync-query elision arm, read on the GL BACKEND WORKER thread several times per backend item
+// (~110 reads/frame). Candidate arm (1) = elide the validation queries. Same per-frame thread-local
+// tick-sequence memo as every other thread-level arm — never key the memo on the arm VALUE (G438).
+int g494NoSyncArm()
+{
+    if (g419AbLever() != static_cast<int>(kG494LeverNoSync))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G496 GPU derivative-probe arm, read once per render batch on the GL BACKEND WORKER thread
+// (~34 reads/frame). Candidate arm (1) = re-issue the batch's geometry with an identity blend, i.e.
+// inject GPU work that changes no byte. Same per-frame thread-local tick-sequence memo as every
+// other thread-level arm — never key the memo on the arm VALUE (G438).
+int g496GpuSlowArm()
+{
+    if (g419AbLever() != static_cast<int>(kG496LeverGpuSlow))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G496b GL-state-elision arm, read once per render batch on the GL BACKEND WORKER thread
+// (~34 reads/frame). Candidate arm (1) = elide GL calls that set the value GL already holds. Same
+// per-frame thread-local tick-sequence memo as every other thread-level arm.
+int g496GlStateArm()
+{
+    if (g419AbLever() != static_cast<int>(kG496LeverGlState))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G492 WORKLOAD INVARIANT (17a law 22). A ceiling probe that deletes work in an incorrect-output
+// arm is only a price if the GUEST ran the same amount of work on both arms. This counts, per arm
+// and inside the same run, every entry into all five backend edges plus the render batches' draw
+// count; `[G492:inv]` prints both arms beside every `[G419:ab]` window. The non-target edges, the
+// draw count and the CPU-replay fallback count must MATCH across arms for the ceiling to be
+// admissible. Called only while a G492 probe (or DC2_G492_INV=1) is armed — ~73 relaxed adds per
+// frame then, and literally nothing on the shipping path.
+// Bucket index follows the tick's convention: [0] = candidate (arm != 0), [1] = control.
+static std::atomic<uint64_t> g_g492Edge[2][5];
+static std::atomic<uint64_t> g_g492Skip[2][5];
+static std::atomic<uint64_t> g_g492Draws[2];
+
+void g492NoteEdge(int edge, unsigned long long draws, unsigned long long skipped)
+{
+    if (edge < 0 || edge >= 5)
+        return;
+    const int a = g_g419AbArm.load(std::memory_order_relaxed) != 0u ? 0 : 1;
+    g_g492Edge[a][edge].fetch_add(1ull, std::memory_order_relaxed);
+    if (skipped != 0ull)
+        g_g492Skip[a][edge].fetch_add(skipped, std::memory_order_relaxed);
+    if (draws != 0ull)
+        g_g492Draws[a].fetch_add(draws, std::memory_order_relaxed);
+}
+
 // G482 price-only arm, read once per geometry kick on the VU1 worker (~1,230/f). Same G438 block
 // hold as every other thread-level arm: the memo key is a per-kick cost, so the arm must not
 // alternate inside a pipelined window or the injected work leaks across arms (G438).
@@ -767,6 +1171,26 @@ int g478KickPoolArm()
     const int lever = g419AbLever();
     if (lever != static_cast<int>(kG478LeverKickPool) &&
         lever != static_cast<int>(kG480LeverPoolBoth))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G497 per-window handoff-buffer recycling arm. Read on BOTH sides of the handoff — the EE thread
+// in onWindowHandoff and the GS worker in collectWindowPackets — so the `used` memo is per-thread
+// (fetch_or from two threads is fine; each marks the frame once). The CONTROL arm is byte-identical
+// to the pre-G497 path: it neither takes from the free list nor feeds it, so a candidate frame's
+// recycled buffers can never subsidise a control frame.
+int g497WinBufArm()
+{
+    if (g419AbLever() != static_cast<int>(kG497LeverWinBuf))
         return -1;
     const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
     const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
@@ -942,6 +1366,23 @@ static void g419AbTick()
     static bool s_skipNext = false;
     static uint64_t s_transition = 0u;
 
+    // G492 workload invariant: charge this frame (and the flush/fallback counters it produced) to
+    // the arm it actually ran under. Read BEFORE the redraw below — g_g419AbArm still holds the arm
+    // of the frame that just ended.
+    static uint64_t s_g492Frames[2]{};
+    static uint64_t s_g492Flush[2]{}, s_g492Fb[2]{};
+    static uint64_t s_g492LastFlush = 0ull, s_g492LastFb = 0ull;
+    {
+        const int a492 = g_g419AbArm.load(std::memory_order_relaxed) != 0u ? 0 : 1;
+        const uint64_t fl = g_g178Flushes.load(std::memory_order_relaxed);
+        const uint64_t fb = g_g178Fallbacks.load(std::memory_order_relaxed);
+        ++s_g492Frames[a492];
+        s_g492Flush[a492] += fl - s_g492LastFlush;
+        s_g492Fb[a492] += fb - s_g492LastFb;
+        s_g492LastFlush = fl;
+        s_g492LastFb = fb;
+    }
+
     const auto now = std::chrono::steady_clock::now();
     const uint32_t used = g_g419AbUsed.exchange(0u, std::memory_order_relaxed);
     ++s_usedCounts[used & 3u];
@@ -1056,6 +1497,41 @@ static void g419AbTick()
                  std::sqrt(sc * sc + sk * sk),
                  static_cast<unsigned long long>(s_blkN), blkMean, blkSe, blkT,
                  static_cast<unsigned long long>(s_blkFav));
+
+    // G492 workload-invariant report (17a law 22). Per-arm per-frame rates for all five backend
+    // edges, the render draw count, the flush count and the CPU-replay fallback count. Read it
+    // BEFORE quoting any G492 ceiling: the target edge's `skip` column is the lever, and EVERY
+    // other column must match across arms or the arms ran different guest work.
+    // G493: DC2_G492_INV=1 prints the invariant for ANY lever. g492ProbeArmed() already accepted
+    // that flag for the COUNTING side, so the census was collectable but invisible for every lever
+    // but the two G492 probes. A lever that changes when the GL worker runs — latedrain does — can
+    // change how many items reach each edge, and the standing gate needs that visible.
+    static const bool g493InvAlways = (std::getenv("DC2_G492_INV") != nullptr);
+    if (g493InvAlways ||
+        g419AbLever() == static_cast<int>(kG492LeverNoRender) ||
+        g419AbLever() == static_cast<int>(kG492LeverNoOther))
+    {
+        char inv[2][320];
+        for (int a = 0; a < 2; ++a)
+        {
+            const double f = s_g492Frames[a] != 0u ? static_cast<double>(s_g492Frames[a]) : 1.0;
+            std::snprintf(inv[a], sizeof(inv[a]),
+                          "f=%llu render=%.1f/%.1f rdcol=%.1f wrcol=%.1f copy=%.1f "
+                          "other=%.1f/%.1f draws=%.0f flush=%.1f fallback=%.2f",
+                          static_cast<unsigned long long>(s_g492Frames[a]),
+                          g_g492Edge[a][0].load(std::memory_order_relaxed) / f,
+                          g_g492Skip[a][0].load(std::memory_order_relaxed) / f,
+                          g_g492Edge[a][1].load(std::memory_order_relaxed) / f,
+                          g_g492Edge[a][2].load(std::memory_order_relaxed) / f,
+                          g_g492Edge[a][3].load(std::memory_order_relaxed) / f,
+                          g_g492Edge[a][4].load(std::memory_order_relaxed) / f,
+                          g_g492Skip[a][4].load(std::memory_order_relaxed) / f,
+                          g_g492Draws[a].load(std::memory_order_relaxed) / f,
+                          static_cast<double>(s_g492Flush[a]) / f,
+                          static_cast<double>(s_g492Fb[a]) / f);
+        }
+        std::fprintf(stderr, "[G492:inv] cand(%s) | ctrl(%s)\n", inv[0], inv[1]);
+    }
 
     // G447 host check: turn the paired statistic into a verdict a reader who has never seen this
     // instrument can act on, and flag the two ways the run can measure NOTHING.

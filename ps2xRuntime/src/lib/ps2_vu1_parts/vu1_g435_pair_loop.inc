@@ -66,6 +66,7 @@
     constexpr bool s_g428Verify     = false;
     constexpr bool s_g328Verify     = false;
     constexpr bool s_g328Stat       = false;
+    constexpr bool g489Verify       = false;
     // --- inline execution --------------------------------------------------------------
     constexpr bool g421FastUpperRun = true;
     constexpr bool g422FastLowerRun = true;
@@ -587,9 +588,14 @@
         }
 
         if (g421On)
+            // G488: read the arm from the CACHE, never from the accessor (G487's rule), so the
+            // census reports the dispatch that RAN. With no cache there is no compiled upper
+            // either, and `decodeFastOp` is false, so the shadow kinds it returns are exactly the
+            // right report: every upper on that path goes through execUpper.
             g421NoteCycle(currentPc,
-                          g410Pair != nullptr ? g410Pair->upperKind
-                                              : g410SelectUpperKind(upper),
+                          g410Pair != nullptr
+                              ? g410Pair->upperKind
+                              : g410SelectUpperKind(upper, s_g410Cache.decodeFastOp),
                           upper, lower,
                           pendingBranchTarget == DC2_G442_NO_BRANCH && !m_state.ebit);
 
@@ -699,6 +705,58 @@
             }
         }
 #endif // DC2_G475_TRACE
+
+#ifndef DC2_G490_BLOCKRUN
+#define DC2_G490_BLOCKRUN 0
+#define G490_LOCAL_DEFAULT 1
+#endif
+#ifndef DC2_G490_VERIFY_BLOCK
+#define DC2_G490_VERIFY_BLOCK 0
+#define G490_VERIFY_LOCAL_DEFAULT 1
+#endif
+#if DC2_G490_BLOCKRUN
+        // G490 - WIDENED BLOCK RUN. Pay the per-pair ENVELOPE (G489: 54.7% of all VU1 time) ONCE
+        // per run of eligible pairs instead of once per pair. Unlike G475's VNOP-only trace this
+        // covers every upper class the inlined g421FastUpper executes, which is the class a block
+        // translator would emit. Eligibility (vu1_g490_block_run.inc) admits a pair only when the
+        // machinery this body performs around the two slots is provably inert for it, so the run
+        // executes exactly: Q advance, P advance, upper, lower, VF0/VI0 re-pin, pc += 8.
+        //
+        // Fails closed on a pending branch delay slot and on a latched E-bit, exactly like G475:
+        // both must step ONE pair through the main body. `maxCycles` is an architectural
+        // suspension edge, so the run is truncated to the remaining budget rather than stepping
+        // past it.
+        if (pendingBranchTarget == DC2_G442_NO_BRANCH && !m_state.ebit)
+        {
+            const uint32_t g490Avail =
+                static_cast<uint32_t>(s_g410Cache.g490RunLen[currentPc >> 3u]);
+            const uint32_t g490Budget = maxCycles - cycle;
+            const uint32_t g490Count = g490Avail < g490Budget ? g490Avail : g490Budget;
+            if (g490Count >= G490_MIN_RUN)
+            {
+#if DC2_G490_VERIFY_BLOCK
+                // A SEPARATE COPY, selected by DC2_G490_VERIFY=1, exactly like the G483 oracle
+                // copy — never a timing arm. G489 §6's rule (a verifier must not sit in a copy its
+                // own flag deselects) is satisfied by construction: the flag selects THIS copy.
+                g490VerifyBlock(vuCode, currentPc >> 3u, g490Count);
+#endif
+                g490ExecuteBlock(m_state, currentPc >> 3u, g490Count, vuData, dataSize,
+                                 s_qDelayP, s_pDelayP, g430Base + (int64_t)cycle, g436Hb);
+                // Sequential by construction: eligibility excludes every lower that can write pc
+                // (G489's complete branch/jump set), so this is `currentPc + 8 * count` with the
+                // same wrap the tail applies.
+                uint32_t g490Next = currentPc + 8u * g490Count;
+                if (g490Next >= codeSize)
+                    g490Next = 0u;
+                m_state.pc = g490Next;
+                G483_PC_SET(g490Next);
+                if (g490Stat)
+                    g490NoteBlock(g490Count);
+                cycle += g490Count - 1u;
+                continue;
+            }
+        }
+#endif // DC2_G490_BLOCKRUN
 
 #if DC2_VU1_LOOP_DIAG
         // G295 diag region B (post-fetch): G68/G69/G117/G132/G237/G70 censuses, VU1 XGKICK
@@ -1691,7 +1749,56 @@
                                  s_macpipeDepth);
             }
         }
+        // G489 - SKIP THE `postExecPc` READ-BACK ON PAIRS WHOSE LOWER CANNOT BRANCH.
+        //
+        // The tail asks "did the lower slot branch?" by reading `m_state.pc` back and comparing it
+        // with `currentPc`. The G489 /MAP + PC-sample overlay put 22.6% of all VU1 samples in the
+        // 512-byte tail window and named `mov rax,[rbp+0x160]` (the `&m_state` spill reload) and
+        // `mov edx,[rax+0x25c]` among its hottest instructions, and the answer is a pure function
+        // of the lower ENCODING the G410 cache already holds — 90.43% of executed pairs cannot
+        // branch at all.
+        //
+        // RESULT: REFUTED (G489). Six paired A/Bs (DC2_G419_AB=pcskip, both arms confirmed built)
+        // read -0.395 / +0.249 / -0.025 / -0.051 / -0.097 / +0.270: mean **-0.008 ms/f**, blocked
+        // -0.067, sign 4/6 — a null, and the control arm carried one extra always-true test, which
+        // biases that null TOWARD the candidate. The predicate itself is exact (2.5 G pairs,
+        // `bad=0`). What it refutes is the premise: `m_state.pc` was stored by the previous pair's
+        // own tail, so the read is an L1 store-to-load forward the loop's ILP already hides. Read
+        // together with G483 — which measured removing the PC load at the TOP of the loop at
+        // +0.47..+0.64 ms/f SLOWER — the PC round trip is closed from BOTH ends: it is not a cost.
+        //
+        // Compiled out (`DC2_G489_PCSKIP 0`) rather than shipped default-off, because leaving it in
+        // would cost the default path an always-true byte test AND 2,884 bytes of `run()` text,
+        // which is the resource G481's inline-budget cliff binds on. The decode, the oracle and the
+        // A/B arm are kept so ONE edit here re-instantiates it if the loop's shape ever changes.
+#ifndef DC2_G489_PCSKIP
+#define DC2_G489_PCSKIP 0
+#define G489_LOCAL_DEFAULT 1
+#endif
+#if DC2_G489_PCSKIP
+        // `g425Flags` is the same cache byte the G425 re-pin already reads at the bottom of this
+        // body, out of the same 16-byte G479 record — no added load, no new address chain.
+        const bool g489CanBranch =
+            (g410Pair->g425Flags & G489_PF_CANBRANCH) != 0u;
+#endif
+#if DC2_VU1_LOOP_DIAG || !DC2_G489_PCSKIP
+        // The G71/G72/G137/G140 probes below all read `postExecPc`, so the diagnostic copy keeps
+        // the unconditional read-back. It is never the promoted path.
         const uint32_t postExecPc = m_state.pc;
+#endif
+#if DC2_G489_PCSKIP
+        // The oracle lives OUTSIDE the DIAG copy guard on purpose: `g489Verify` is a conjunct of
+        // `g443Fixed`, so arming it drops the run onto a NON-fixed copy — and if the check were
+        // only in the lean copy it would silently never execute (which is exactly what the first
+        // G489 oracle run did: `[G489:armed]` printed, `[G489:verify]` never did). `m_state.pc`
+        // here is the same value the diagnostic copy calls `postExecPc`.
+        if (g489Verify)
+        {
+            if (!g489CanBranch && m_state.pc != currentPc)
+                g489VerifyFail(currentPc, m_state.pc, lower);
+            g489NoteVerified(g489CanBranch);
+        }
+#endif
 
 #if DC2_VU1_LOOP_DIAG
         // G295 diag region D (post-exec): G72 VI1/dispatch, G71 gate, G137 provenance, G140
@@ -2080,12 +2187,23 @@
             nextPC = pendingBranchTarget;
             pendingBranchTarget = DC2_G442_NO_BRANCH;
         }
+#if DC2_VU1_LOOP_DIAG || !DC2_G489_PCSKIP
         else if (postExecPc != currentPc)
         {
             pendingBranchTarget = postExecPc + 8;
             if (pendingBranchTarget >= codeSize)
                 pendingBranchTarget = 0;
         }
+#else
+        // G489 (refuted, compiled out): `&&` short-circuits, so a non-branch pair never touches
+        // `m_state.pc` here.
+        else if (g489CanBranch && m_state.pc != currentPc)
+        {
+            pendingBranchTarget = m_state.pc + 8;
+            if (pendingBranchTarget >= codeSize)
+                pendingBranchTarget = 0;
+        }
+#endif
 
         if (nextPC >= codeSize)
             nextPC = 0;
@@ -2118,4 +2236,16 @@
 #if G485_LOCAL_DEFAULT
 #undef DC2_G485_HAZREG
 #undef G485_LOCAL_DEFAULT
+#endif
+#if G489_LOCAL_DEFAULT
+#undef DC2_G489_PCSKIP
+#undef G489_LOCAL_DEFAULT
+#endif
+#if G490_LOCAL_DEFAULT
+#undef DC2_G490_BLOCKRUN
+#undef G490_LOCAL_DEFAULT
+#endif
+#if G490_VERIFY_LOCAL_DEFAULT
+#undef DC2_G490_VERIFY_BLOCK
+#undef G490_VERIFY_LOCAL_DEFAULT
 #endif

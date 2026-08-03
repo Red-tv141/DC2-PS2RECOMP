@@ -27,9 +27,10 @@
 //     lanes are rewritten with their own bits — value-identical to the legacy branch chain.
 //   * MAC/STATUS come from the same classifier G330 already ships, fed from a register instead
 //     of memory.
-// Ops that are cross-lane or flag-only (OPMSUB, OPMULA, CLIPw, MSUBA's unmapped encoding) and
-// every diagnostic mode that perturbs the FMAC result (DC2_NO_VU1_MAC, DC2_VU1_CLAMP,
-// G71 clamp census, G330 rollback) stay on the legacy execUpper path.
+// G488 CLOSED the last three: OPMSUB (0x2E), OPMULA (0x6E) and CLIPw (0x5F) — the only `cls == 0`
+// encodings this route ever executes — now run inline as well (see the G488 block below). Every
+// diagnostic mode that perturbs the FMAC result (DC2_NO_VU1_MAC, DC2_VU1_CLAMP, G71 clamp census,
+// G330 rollback) still keeps the legacy execUpper path, and so does the unmapped 0x6B encoding.
 //
 // Status:   PROMOTED default-on.
 // Kill:     DC2_G421_NO_FAST_UPPER=1  (restores the legacy execUpper path exactly)
@@ -40,7 +41,9 @@ namespace
     //      1 = FMAC -> VF[fd] (+MAC/STATUS)   2 = FMAC -> ACC (+MAC/STATUS)
     //      3 = ITOF -> VF[ft]                 4 = FTOI -> VF[ft]
     //      5 = ABS  -> VF[ft]                 6 = MOVE -> VF[ft]     7 = MR32 -> VF[ft]
+    //      8 = CLIPw -> m_state.clip only (G488; no VF/ACC, no MAC/STATUS)
     // op:  0 ADD  1 SUB  2 MADD  3 MSUB  4 MUL  5 MAX  6 MIN
+    //      7 OPMSUB (G488, cross-lane)        8 OPMULA (G488, cross-lane)
     // src: 0 broadcast(vt, bc)  1 Q  2 I  3 vt
     struct G421UpperDesc
     {
@@ -50,9 +53,18 @@ namespace
         uint8_t bc = 0u; // broadcast lane, or ITOF/FTOI scale index
     };
 
+    // G488: 0x100 entries, not 0x80. `g421FastUpper` indexes this with the RAW `upperKind` byte
+    // from the G410 sidecar, and that byte is 0xff whenever the upper encoding has no compiled
+    // kind (op 0x30-0x3b, Special2 func 0x2b or > 0x31) or the sidecar pointer was null — a read
+    // 508 bytes past the end of a 0x80-entry table, i.e. `cls` came from whatever .rdata followed
+    // it. `[G410:jit] upperFallback=0` on lean MAP-0 means no such slot is resident on THIS route,
+    // which is why it has never fired, but it is a latent out-of-bounds read on any route that has
+    // one. Sizing the table to the full uint8_t domain closes it for free: the 0x72-0xff entries
+    // are zero-initialised, so `cls == 0` and the caller falls back to execUpper exactly as
+    // intended. The upper half also gives G488's A/B its SHADOW KINDS (0x72/0x73/0x74) a home.
     struct G421DescTable
     {
-        G421UpperDesc e[0x80] = {};
+        G421UpperDesc e[0x100] = {};
     };
 
     // G436: constexpr, so the table below is a link-time constant with NO initialisation guard.
@@ -92,7 +104,7 @@ namespace
         set(0x2Bu, 1u, 5u, 3u, 0u); // MAX
         set(0x2Cu, 1u, 1u, 3u, 0u); // SUB
         set(0x2Du, 1u, 3u, 3u, 0u); // MSUB
-        // 0x2E OPMSUB is cross-lane -> legacy
+        set(0x2Eu, 1u, 7u, 3u, 0u); // G488 OPMSUB (cross-lane, w lane forced to +0.0)
         set(0x2Fu, 1u, 6u, 3u, 0u); // MINI
 
         // ---- Special2 space (kind == 0x40 + func) ----
@@ -109,7 +121,7 @@ namespace
         set(0x5Cu, 2u, 4u, 1u, 0u); // MULAq
         set(0x5Du, 5u, 0u, 0u, 0u); // ABS
         set(0x5Eu, 2u, 4u, 2u, 0u); // MULAi
-        // 0x5F CLIPw writes only m_state.clip -> legacy
+        set(0x5Fu, 8u, 0u, 0u, 0u); // G488 CLIPw (writes only m_state.clip)
         set(0x60u, 2u, 0u, 1u, 0u); // ADDAq
         set(0x61u, 2u, 2u, 1u, 0u); // MADDAq
         set(0x62u, 2u, 0u, 2u, 0u); // ADDAi
@@ -125,7 +137,8 @@ namespace
         // to the fallback kind). Leave unsupported so behaviour is preserved exactly.
         set(0x6Cu, 2u, 1u, 3u, 0u); // SUBA
         set(0x6Du, 2u, 3u, 3u, 0u); // MSUBA
-        // 0x6E OPMULA is cross-lane -> legacy.  0x6F VNOP never reaches here.
+        set(0x6Eu, 2u, 8u, 3u, 0u); // G488 OPMULA (cross-lane, w lane keeps ACC.w)
+        // 0x6F VNOP never reaches here.
         set(0x70u, 6u, 0u, 0u, 0u); // MOVE
         set(0x71u, 7u, 0u, 0u, 0u); // MR32
         return t;
@@ -178,6 +191,57 @@ namespace
     const uint32_t (*g421MaskRows())[4]
     {
         return g421MaskTableConst.m;
+    }
+
+    // G488 - CLIPw flag word, computed in registers.
+    //
+    // execUpper's `case 0x1F` is six ORDERED float comparisons of vs.xyz against +|vt.w| and
+    // -|vt.w|, packed as (x>, x<, y>, y<, z>, z<) into bits 0..5. `_mm_cmpgt_ps` / `_mm_cmplt_ps`
+    // lower to `cmpltps` with ordered predicates, so a NaN operand yields false on exactly the
+    // same side as the C++ `>` / `<` the legacy body uses. `and` with 0x7FFFFFFF is `std::fabs`
+    // bit-for-bit (including NaN payloads), and `xor` with the sign bit is the negation — for
+    // w = +0.0 it yields -0.0 where the legacy `-w` may yield +0.0, which is unobservable because
+    // IEEE comparison treats the two as equal.
+    //
+    // The interleave of the two 3-bit movemasks is the only part that is not free in SSE2 (there
+    // is no PDEP at this ISA baseline), so it is one 64-byte table load off `gt | (lt << 3)`.
+    struct G488ClipTable
+    {
+        uint8_t e[64] = {};
+    };
+
+    constexpr G488ClipTable g488BuildClipTable()
+    {
+        G488ClipTable t;
+        for (unsigned gt = 0u; gt < 8u; ++gt)
+            for (unsigned lt = 0u; lt < 8u; ++lt)
+            {
+                unsigned f = 0u;
+                for (unsigned lane = 0u; lane < 3u; ++lane)
+                {
+                    if ((gt & (1u << lane)) != 0u)
+                        f |= 1u << (2u * lane); // vs[lane] > +|w|
+                    if ((lt & (1u << lane)) != 0u)
+                        f |= 2u << (2u * lane); // vs[lane] < -|w|
+                }
+                t.e[gt | (lt << 3u)] = static_cast<uint8_t>(f);
+            }
+        return t;
+    }
+
+    // Link-time constant with no initialisation guard, for the same reason as g421DescTableConst.
+    constexpr G488ClipTable g488ClipTableConst = g488BuildClipTable();
+
+    static DC2_G330_FORCEINLINE uint32_t g488ClipFlags(__m128 vs, __m128 vt)
+    {
+        const __m128 aw = _mm_and_ps(_mm_shuffle_ps(vt, vt, _MM_SHUFFLE(3, 3, 3, 3)),
+                                     _mm_castsi128_ps(_mm_set1_epi32(0x7FFFFFFF)));
+        const __m128 nw = _mm_xor_ps(aw, _mm_castsi128_ps(_mm_set1_epi32(INT32_MIN)));
+        const uint32_t gt =
+            static_cast<uint32_t>(_mm_movemask_ps(_mm_cmpgt_ps(vs, aw))) & 7u;
+        const uint32_t lt =
+            static_cast<uint32_t>(_mm_movemask_ps(_mm_cmplt_ps(vs, nw))) & 7u;
+        return g488ClipTableConst.e[gt | (lt << 3u)];
     }
 
     // Same classifier as g329MakeMacSimd, fed from a register instead of a memory operand.
@@ -503,11 +567,18 @@ namespace
             case 6u: // MOVE
                 r = vs;
                 break;
+            case 8u: // G488 CLIPw : the ONLY covered upper that writes neither VF nor ACC.
+                // execUpper: `m_state.clip = (m_state.clip << 6) | flags`, no MAC, no STATUS,
+                // no destination write and `dest` is a don't-care field. Returns from inside the
+                // switch so the shared VF[ft] store below is not reached.
+                st.clip = (st.clip << 6) |
+                          g488ClipFlags(vs, _mm_loadu_ps(st.vf[FT(upper)]));
+                return true;
             default: // 7u MR32 : {vs[1], vs[2], vs[3], vs[0]}
                 r = _mm_shuffle_ps(vs, vs, _MM_SHUFFLE(0, 3, 2, 1));
                 break;
             }
-            // None of these five update MAC/STATUS, and all write VF[ft].
+            // None of the five VF-writing forms above updates MAC/STATUS, and all write VF[ft].
             g428StoreDest(st.vf[FT(upper)], r, dest, g436Lean);
             return true;
         }
@@ -541,6 +612,36 @@ namespace
         case 3u: r = _mm_sub_ps(_mm_loadu_ps(st.acc), _mm_mul_ps(vs, b)); break;
         case 4u: r = _mm_mul_ps(vs, b); break;
         case 5u: r = _mm_max_ps(vs, b); break;
+        // G488 - the two cross-lane FMAC forms. Both build the SAME outer-product permutation:
+        //   a  = {vs.y, vs.z, vs.x, vs.w}   bb = {vt.z, vt.x, vt.y, vt.w}
+        //   a*bb = {vs.y*vt.z, vs.z*vt.x, vs.x*vt.y, (don't care)}
+        // which is execUpper's operand pairing lane for lane. `d.src` is 3 for both, so `b` is
+        // already the full `vt` vector.
+        case 7u: // OPMSUB : ACC - (vs x vt), w lane forced to +0.0
+        {
+            const __m128 g488a = _mm_shuffle_ps(vs, vs, _MM_SHUFFLE(3, 0, 2, 1));
+            const __m128 g488b = _mm_shuffle_ps(b, b, _MM_SHUFFLE(3, 1, 0, 2));
+            // `result[3] = 0.0f` in execUpper. Masking the w lane to all-zero bits produces the
+            // +0.0f bit pattern for ANY value the subtract left there, so the classifier and the
+            // destination store both see exactly what the legacy body wrote.
+            r = _mm_and_ps(
+                _mm_sub_ps(_mm_loadu_ps(st.acc), _mm_mul_ps(g488a, g488b)),
+                _mm_castsi128_ps(_mm_setr_epi32(-1, -1, -1, 0)));
+            break;
+        }
+        case 8u: // OPMULA : (vs x vt) -> ACC, w lane keeps the CURRENT ACC.w
+        {
+            const __m128 g488a = _mm_shuffle_ps(vs, vs, _MM_SHUFFLE(3, 0, 2, 1));
+            const __m128 g488b = _mm_shuffle_ps(b, b, _MM_SHUFFLE(3, 1, 0, 2));
+            const __m128 g488p = _mm_mul_ps(g488a, g488b);
+            // `result[3] = m_state.acc[3]`, read BEFORE applyDestAcc writes ACC — so a dest that
+            // includes w rewrites ACC.w with its own value, and the MAC classifies that value.
+            // unpackhi gives {p.z, acc.z, p.w, acc.w}; the shuffle then takes {p.x, p.y, p.z, acc.w}.
+            const __m128 g488acc = _mm_loadu_ps(st.acc);
+            r = _mm_shuffle_ps(g488p, _mm_unpackhi_ps(g488p, g488acc),
+                               _MM_SHUFFLE(3, 0, 1, 0));
+            break;
+        }
         default: r = _mm_min_ps(vs, b); break;
         }
 

@@ -9,6 +9,9 @@
 #include "ps2_vu1_parts/vu1_g426_fused_upper.inc"
 #include "ps2_vu1_parts/vu1_g421_census.inc"
 #include "ps2_vu1_parts/vu1_g475_vnop_trace.inc"
+// G490: after vu1_g421_fast_upper.inc — its eligibility test reads `g421DescTableConst`, and its
+// block body calls the inlined g421FastUpper / g422FastLower directly.
+#include "ps2_vu1_parts/vu1_g490_block_run.inc"
 #include "ps2_vu1_parts/vu1_g483_run_cycles.inc"
 #include "ps2_vu1_parts/vu1_upper_opcodes.inc"
 #include "ps2_vu1_parts/vu1_lower_opcodes.inc"
@@ -55,3 +58,46 @@
 //       g428StoreDest in vu1_g421_fast_upper.inc.
 // G486: [G486:uncov] names the lower opcodes that fall through g422FastLower into the full
 //       execLower switch (DC2_G421_CENSUS=1, diagnostic only, non-TLS storage, force recompile v3).
+// G487: audit relink to obtain a linker /MAP for THIS binary — which of g421FastUpper /
+//       g422FastLower / g481 hot bodies MSVC actually inlined, and what execLower/execUpper
+//       really cost at their call boundary (G480/G483 technique, force recompile v1).
+// G487: COMPILED FLAG-CONSUMER LOWERS — FCAND/FCOR/FMAND/FCGET (2.54% of pairs, ~41 k/f) leave
+//       execLower for g422FastLower, which this binary's /MAP proves is fully inlined into run().
+//       The arm is a property of the G410 pair CACHE (re-decoded on every flip), never an in-loop
+//       compare. PROMOTED default-on: mean −0.55 ms/f, sign 4/4. Gate DC2_G419_AB=flaglower,
+//       ROLLBACK DC2_G487_NO_FLAG_LOWER=1, proof DC2_G487_STAT=1, oracle DC2_G422_VERIFY=1
+//       (force recompile v3).
+// G488: COMPILED CROSS-LANE / FLAG-ONLY UPPERS — OPMSUB (0x2E), OPMULA (0x6E) and CLIPw (0x5F),
+//       the whole `[G421:cover] uncovered` population on this route (~1.08% of pairs, ~17.6 k/f),
+//       leave execUpper for the inlined g421FastUpper. OPMSUB/OPMULA reuse G421's FMAC tail
+//       verbatim (MAC/STATUS, G428 park, G430 stamped history, g428StoreDest) and differ only in
+//       one outer-product permutation of the operands; CLIPw joins the cls>=3 group and writes
+//       only m_state.clip. The arm is a property of the G410 pair CACHE (control decodes SHADOW
+//       kinds 0x72/0x73/0x74 whose descriptor entries are zero), so the loop body is byte-identical
+//       in both arms. Also closes a latent out-of-bounds read: G421DescTable/G426CtlTable were
+//       indexed with the raw 0xff fallback kind. Gate DC2_G419_AB=fastop, ROLLBACK
+//       DC2_G488_NO_FAST_OP=1, proof DC2_G488_STAT=1, oracle DC2_G421_VERIFY=1
+//       (force recompile v2 — v2 is the /MAP audit relink: the paired gate cannot see loop TEXT
+//       growth because both arms carry the new bodies, so the G481 inline-budget question is
+//       answered from the map instead).
+// G489: /MAP audit relink to re-take G484 §2's stack-traffic census on the CURRENT loop. G484
+//       measured `[rbp+0x118]` (&m_state) at 24 reloads/pair and attributed them to the
+//       out-of-line calls in the body; G487/G488 have since removed the frequent execLower /
+//       execUpper calls from the covered population, so that premise has to be re-measured
+//       before any lever is built on it (force recompile v1).
+// G489: default-on cached "this lower can write pc" bit (G489_PF_CANBRANCH) so the pair loop's
+//       TAIL stops reading m_state.pc back on every pair to ask whether the lower slot branched.
+//       Gate DC2_G419_AB=pcskip, ROLLBACK DC2_G489_NO_PCSKIP=1, proof DC2_G489_STAT=1,
+//       oracle DC2_G489_VERIFY=1 (force recompile v2).
+// G490: WIDENED BLOCK RUN — a whole run of eligible pairs executed in one noinline call
+//       (vu1_g490_block_run.inc), paying the per-pair ENVELOPE that G489 measured at 54.7% of all
+//       VU1 time ONCE per run instead of once per pair. Covers every upper class g421FastUpper
+//       executes, not only VNOP, so it prices the block-translation arc's real premise. Also
+//       records that G475's trace copy has been STRUCTURALLY UNREACHABLE since G479 was promoted
+//       (its selector arms sit below `else if (g443Fixed && g479LeanFetch)`), so G478's +0.34 ms/f
+//       verdict describes a pre-G479/pre-G485 body in both arms. Gate DC2_G419_AB=blockrun,
+//       standalone DC2_G490_BLOCK=1, oracle DC2_G490_VERIFY=1, stats DC2_G490_STAT=1
+//       (force recompile v1).
+// G490 map relink v1.
+// G490 oracle copy compiled out (force recompile v2).
+// G490 map relink v2.

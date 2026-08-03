@@ -37,6 +37,10 @@ extern bool g297MtvuActive();
 extern bool g297HasPendingKicks();
 extern void g297OnWindowHandoff();
 extern void g297CollectWindowPackets(std::vector<std::vector<uint8_t>> &out);
+// G497 per-window handoff-buffer recycling arm (defined in runtime_mtvu_and_env.inc). Both halves
+// of the mechanism — the batch-buffer free list there and the packet-vector reuse in processWindow
+// here — must select the same arm on the same frame, so they share this one accessor.
+extern bool g497WinBufActive();
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -64,6 +68,9 @@ static uint64_t g156ThreadCpuNs() { return 0ull; }
 // declared here at global scope so the anon-namespace g332ReportBoundary() resolves it externally.
 void g332_backend_snapshot(uint64_t nsOut[4], uint64_t cntOut[4]);
 void g453_backend_other_snapshot(uint64_t nsOut[4], uint64_t cntOut[4]);
+// G494: driver-round-trip census (DC2_G494_SYNC=1). Same global-scope contract as the two above.
+int g494_backend_sync_snapshot(uint64_t nsOut[], uint64_t nOut[], uint64_t badOut[], int cap,
+                               const char *const **namesOut);
 
 // G412: depth-two frame ownership is default-on after the route/performance promotion.
 bool g412_cross_frame_enabled();
@@ -768,6 +775,49 @@ namespace
                      ops[0] + ops[1] + ops[2] + ops[3]);
     }
 
+    // G494: exact 30-frame split of the GL worker's DRIVER ROUND TRIPS — the per-item validation
+    // queries (glGetError / glCheckFramebufferStatus) that must rendezvous with the NVIDIA threaded
+    // driver's own worker before they can return a value. Diagnostic only; source counters are
+    // updated at the query sites in lle_gpu_raster_backend.inc. `bad` is how many of them have ever
+    // reported anything but the success value — read that column BEFORE pricing the elision.
+    void g494ReportBoundary()
+    {
+        static const bool s_on = f50_12_env_flag("DC2_G494_SYNC");
+        if (!s_on)
+            return;
+        static uint64_t s_frame = 0u;
+        static constexpr int kCap = 16;
+        static uint64_t s_lastNs[kCap]{};
+        static uint64_t s_lastN[kCap]{};
+        if ((++s_frame % 30u) != 0u)
+            return;
+        uint64_t ns[kCap]{}, n[kCap]{}, bad[kCap]{};
+        const char *const *names = nullptr;
+        const int sites = g494_backend_sync_snapshot(ns, n, bad, kCap, &names);
+        double totMs = 0.0, totN = 0.0;
+        char buf[768];
+        int off = 0;
+        for (int i = 0; i < sites && off < static_cast<int>(sizeof(buf)) - 64; ++i)
+        {
+            const double ms = static_cast<double>(ns[i] - s_lastNs[i]) / 1.0e6 / 30.0;
+            const double cnt = static_cast<double>(n[i] - s_lastN[i]) / 30.0;
+            s_lastNs[i] = ns[i];
+            s_lastN[i] = n[i];
+            totMs += ms;
+            totN += cnt;
+            if (cnt <= 0.0)
+                continue;
+            off += std::snprintf(buf + off, sizeof(buf) - off, " %s=%.3f/%.1f",
+                                 names != nullptr ? names[i] : "?", ms, cnt);
+        }
+        uint64_t badTotal = 0u;
+        for (int i = 0; i < sites; ++i)
+            badTotal += bad[i];
+        std::fprintf(stderr, "[G494:sync] frame=%llu window=30 total=%.3f/%.1f bad=%llu |%s\n",
+                     static_cast<unsigned long long>(s_frame), totMs, totN,
+                     static_cast<unsigned long long>(badTotal), buf);
+    }
+
     // G157: one queue item is either a draw window (packets) or a frame-boundary marker (the
     // G144-flush + present-latch closure). Both travel through the SAME FIFO deque, so the
     // marker is guaranteed to be processed strictly after all of its frame's windows and
@@ -1309,6 +1359,7 @@ namespace
                     }
                     g332ReportBoundary();
                     g453ReportBoundary();
+                    g494ReportBoundary();
                     // G447: blocking-edge split of the window span (no-op unless DC2_G447_EDGE=1).
                     g447ReportBoundary(static_cast<unsigned long long>(
                         g_g151WorkerBusyNs.load(std::memory_order_relaxed)));
@@ -1469,7 +1520,19 @@ namespace
             {
                 const auto g316MergeT0 = g316Sample ? std::chrono::steady_clock::now()
                                                      : std::chrono::steady_clock::time_point{};
-                std::vector<std::vector<uint8_t>> g297pk;
+                // G497: the SECOND per-window allocation. This outer vector was constructed and
+                // destroyed once per window (~1,560x/frame) purely to carry packets a few lines
+                // down. Its ELEMENTS are moved out into GifArbiterPacket::data below, so after the
+                // loop they are husks and clear() frees nothing — only the outer buffer's capacity
+                // survives, which no consumer can observe. thread_local because processWindow also
+                // runs on the EE thread when MTGS is off. Held by the same arm as the batch-buffer
+                // recycling: both are the per-window handoff's allocation churn.
+                static thread_local std::vector<std::vector<uint8_t>> s_g497Pk;
+                const bool g497PkReuse = g497WinBufActive();
+                std::vector<std::vector<uint8_t>> g297pkLocal;
+                std::vector<std::vector<uint8_t>> &g297pk = g497PkReuse ? s_g497Pk : g297pkLocal;
+                if (g497PkReuse)
+                    g297pk.clear(); // size 0 before the collect appends; capacity retained
                 // G447 edge 5: the MTVU Path1 merge. It back-pressures per kick when VU1 has not
                 // caught up, so it is the second candidate for the pole thread's kernel wait.
                 const bool g447On = g447EdgeOn();

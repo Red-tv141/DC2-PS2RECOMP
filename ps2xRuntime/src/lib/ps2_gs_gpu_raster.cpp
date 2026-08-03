@@ -56,10 +56,33 @@ void g447NoteWait(int edge, unsigned long long ns);
 // G447 spin-then-block lever arm (DC2_G419_AB=spinwait); defined in g419_ab_instrument.inc.
 int g447SpinArm();
 int g447WorkerSpinArm();
+// G491 arms (DC2_G419_AB=rbfmt / =rbspin); defined at global scope in g419_ab_instrument.inc.
+int g491RbFmtArm();
+int g491RbSpinArm();
+// G492 ceiling-probe arms (DC2_G419_AB=norender / =noother) and the per-arm workload-invariant
+// counter that makes them admissible (17a law 22). Same global-scope contract as the G491 arms.
+int g492NoRenderArm();
+int g492NoOtherArm();
+int g492Ct24ReuseArm();
+void g492NoteEdge(int edge, unsigned long long draws, unsigned long long skipped);
+// G494 sync-query elision arm (DC2_G419_AB=nosync). Same global-scope contract as the G491/G492 arms
+// — declared here, ABOVE the anonymous namespace the parts sit inside.
+int g494NoSyncArm();
+// G496 GPU derivative-probe arm (DC2_G419_AB=gpuslow). Same global-scope contract as the G491/G492
+// arms — declared here, ABOVE the anonymous namespace the parts sit inside.
+int g496GpuSlowArm();
+// G496b redundant-GL-state-elision arm (DC2_G419_AB=glstate). Same global-scope contract.
+int g496GlStateArm();
 
 #include "ps2_gs_gpu_raster_parts/gpu_raster_infrastructure.inc"
 #include "ps2_gs_gpu_raster_parts/persistent_t8_decoder.inc"
+#include "ps2_gs_gpu_raster_parts/g491_readback_format.inc"
+#include "ps2_gs_gpu_raster_parts/g492_overlap_ceiling.inc"
 #include "ps2_gs_gpu_raster_parts/g433_pbo_readback.inc"
+#include "ps2_gs_gpu_raster_parts/g494_driver_sync_census.inc"
+#include "ps2_gs_gpu_raster_parts/g495_readback_queue_census.inc"
+#include "ps2_gs_gpu_raster_parts/g496_gpu_ballast.inc"
+#include "ps2_gs_gpu_raster_parts/g496_gl_state_cache.inc"
 #include "ps2_gs_gpu_raster_parts/lle_gpu_raster_backend.inc"
 #include "ps2_gs_gpu_raster_parts/gpu_raster_bridge_and_stubs.inc"
 // G425: readback-redundancy ceiling census added in lle_gpu_raster_backend.inc (force recompile v1).
@@ -72,6 +95,20 @@ int g447WorkerSpinArm();
 // G453: rejected behavior levers removed; subtype census retained (force recompile v6).
 // G471: both spin-poll reshapes REJECTED and removed; loops restored verbatim (force recompile v3).
 // G472: same-FBO synchronous render-round-trip opportunity census (force recompile v3).
+// G491: native-format colour readback (g491_readback_format.inc) + the no-spin readback wait
+// (force recompile v1).
+// G492: backend-render / backend-other ceiling probes + the per-arm workload-invariant census
+// (g492_overlap_ceiling.inc; force recompile v1).
+// G494: driver-round-trip census + the sync-query elision, PROMOTED default-ON
+// (g494_driver_sync_census.inc; census DC2_G494_SYNC=1 — which now needs DC2_G494_NO_ELIDE=1
+// alongside it to see anything; rollback DC2_G494_NO_ELIDE=1; arm DC2_G419_AB=nosync;
+// force recompile v2).
+// G495: queued-ahead census for the SIX colour readbacks (DC2_G495_RB=1, DC2_G495_SEQ=1) in
+// g495_readback_queue_census.inc — [G418:edge] only ever instrumented the ONE render-batch
+// readback, so backend-readcolor has never had a drain/transfer split (force recompile v1).
+// G496: the GPU DERIVATIVE PROBE (g496_gpu_ballast.inc; DC2_G419_AB=gpuslow, calibration
+// DC2_G496_FORCE=1 DC2_G496_CAL=1). Identity-blend replay of each render batch's vertex range —
+// real fragment work, zero byte change. Diagnostic only, never promotable (force recompile v1).
 #else // !(_WIN32 && !PLATFORM_VITA)
 
 bool g158_gpu_raster_enabled() { return false; }

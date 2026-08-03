@@ -212,6 +212,50 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool g410CountStats = g410CompiledRun && (g410StatOn() || g410VerifyRun);
     G410CompiledUpper *const g410Pairs =
         g410CompiledRun ? g410PreparePairs(vuCode, g410CountStats) : nullptr;
+    // G487: proof-of-selection for the compiled flag-consumer lowers. A copy/arm that was never
+    // selected proves nothing (G457), and this arm is invisible in the loop body — it only shows
+    // up as a different `lowerKind` byte in the pair cache — so the one-shot has to report what
+    // the cache was actually decoded with. Quiet by default; any DC2_G419_AB run prints it.
+    {
+        static const bool s_g487Stat = (std::getenv("DC2_G487_STAT") != nullptr) ||
+                                       (std::getenv("DC2_G419_AB") != nullptr);
+        if (s_g487Stat && g410Pairs != nullptr)
+        {
+            // One line the FIRST time each arm value is seen, so a paired run proves BOTH caches
+            // were really built (at most two lines for the whole process).
+            static std::atomic<uint32_t> s_g487Seen{0u};
+            const uint32_t bit = s_g410Cache.decodeFlagLower ? 2u : 1u;
+            if ((s_g487Seen.fetch_or(bit, std::memory_order_relaxed) & bit) == 0u)
+                std::fprintf(stderr,
+                             "[G487:armed] flaglower=%d supported=%d compiled=%d\n",
+                             s_g410Cache.decodeFlagLower ? 1 : 0,
+                             g487FlagLowerSupported() ? 1 : 0,
+                             g410CompiledRun ? 1 : 0);
+        }
+    }
+    // G488: the same proof for the compiled cross-lane / flag-only uppers. This arm is likewise
+    // invisible in the loop body — it shows up only as a different `upperKind` byte in the pair
+    // cache — so a paired run has to prove BOTH caches were really built (G457).
+    {
+        static const bool s_g488Stat = (std::getenv("DC2_G488_STAT") != nullptr) ||
+                                       (std::getenv("DC2_G419_AB") != nullptr);
+        if (s_g488Stat && g410Pairs != nullptr)
+        {
+            static std::atomic<uint32_t> s_g488Seen{0u};
+            const uint32_t bit = s_g410Cache.decodeFastOp ? 2u : 1u;
+            if ((s_g488Seen.fetch_or(bit, std::memory_order_relaxed) & bit) == 0u)
+                std::fprintf(stderr,
+                             "[G488:armed] fastop=%d compiled=%d fastUpper=%d\n",
+                             s_g410Cache.decodeFastOp ? 1 : 0,
+                             g410CompiledRun ? 1 : 0,
+                             g421FastUpperRequested() ? 1 : 0);
+        }
+    }
+    // G489: same proof-of-selection for the pc-skip arm. The whole body is out of line
+    // (g489ReportArmed) — an in-`run()` slot census would have added ~1.7 KB of cold text to a
+    // function G481 proved is bound by its own size.
+    if (g410Pairs != nullptr)
+        g489ReportArmed();
     auto g410VerifyUpper = [&](uint32_t lowerWord, uint32_t upperWord) {
         const VU1State before = m_state;
         // Special2 function 0x2f with opcode low bits 0x3f is VNOP. Its register and
@@ -244,6 +288,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         g421FastUpperRequested() && g410CompiledRun && !g410VerifyRun &&
         s_g330FusedMacOn && !s_vu1MacDisabled && !s_g71clampcount && !s_vu1Clamp;
     const bool g421VerifyRun = g421FastUpperRun && g421VerifyOn();
+    // G489: oracle for the cached "this lower can write pc" predicate (DC2_G489_VERIFY=1). Cold,
+    // and a conjunct of `g443Fixed` below, so arming it drops the run onto the non-fixed copy the
+    // same way every other shadow verifier does.
+    const bool g489Verify = g489VerifyOn();
     static std::atomic<uint64_t> s_g421Verified{0ull};
     // Cold shadow-verify path (DC2_G421_VERIFY): run the fast path, restore, run the legacy
     // decoder from the same pre-state, and compare every field execUpper can write. Returns
@@ -867,7 +915,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         // census + every shadow verifier
         !g421On && !g421VerifyRun && !g422VerifyRun && !g426VerifyRun &&
         !s_g425Verify && !s_g425VuNan && !s_g426VerifyPredecode && !s_g427Verify &&
-        !s_g428Verify && !s_g328Verify && !s_g328Stat &&
+        !s_g428Verify && !s_g328Verify && !s_g328Stat && !g489Verify &&
         // inline execution
         g421FastUpperRun && g422FastLowerRun && !g426FusedRun &&
         // correctness machinery (all default-ON hardware models)
@@ -943,6 +991,21 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     // rollback DC2_G485_NO_WIDE_VF0=1.
     const bool g484WideVf0 = g443Fixed && g479LeanFetch && !g479Verify && !g483PcReg &&
                              g484WideVf0Requested();
+    // G490: the WIDENED BLOCK RUN, layered on the PROMOTED body. It is a copy of the g484WideVf0
+    // arm below with the run hook added, so the control arm of its A/B is the shipped default and
+    // nothing else differs — which is the only form in which the block-translation arc's premise
+    // can be priced. (G475's trace copy cannot be: its selector arms sit BELOW
+    // `else if (g443Fixed && g479LeanFetch)`, and g479LeanFetch has been default-ON since G479 was
+    // promoted, so arming DC2_G419_AB=vnoptrace today drops the run onto a DIFFERENT, slower copy
+    // instead of putting the trace into the promoted loop. G478's +0.34 ms/f therefore describes a
+    // pre-G479, pre-G485 body in both arms — the G482/G484 "structurally unmeasurable" class.)
+    // Read ONCE per run() (G479's rule) so a microprogram cannot switch copies mid-execution.
+    // Paired gate DC2_G419_AB=blockrun, standalone DC2_G490_BLOCK=1, oracle DC2_G490_VERIFY=1.
+    const bool g490BlockRun = g484WideVf0 && g490BlockRequested();
+    const bool g490VerifyBlockOn = g490BlockRun && g490VerifyOn();
+    (void)g490VerifyBlockOn; // read only by the oracle copy, which ships compiled out
+    const bool g490Stat = g490StatOn();
+    g490ReportArmed(g490BlockRun);
     // G486 REFUTED the wide single-lane FMAC destination store (`widedest`). It was built exactly
     // like G485's widevf0 — a copy of the promoted body in which the four single-lane dest masks
     // blend whole lanes and issue one 16-byte store instead of a 4-byte `_mm_store_ss` — and four
@@ -1060,6 +1123,81 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 #define DC2_G483_VERIFY_PCREG 0
 #endif
 #include "vu1_g435_pair_loop.inc"
+#undef DC2_G483_VERIFY_PCREG
+#undef DC2_G483_PCREG
+#undef DC2_G479_VERIFY_FUSED
+#undef DC2_G479_QPREG
+#undef DC2_G479_FUSED
+#undef DC2_G475_VERIFY_TRACE
+#undef DC2_G475_TRACE
+#undef DC2_G443_FIXED
+#undef DC2_VU1_LOOP_DIAG
+        }
+        // G490 ORACLE COPY: the candidate body with the per-block predicate verifier
+        // (DC2_G490_VERIFY=1). Never a timing arm. A separate COPY selected by the oracle's OWN
+        // flag, which is how G489 §6's rule is satisfied here — the verifier cannot end up in a
+        // copy its flag deselects, because its flag is what selects this copy.
+        //
+        // COMPILED OUT on the shipped binary (`DC2_G490_ORACLE 0`). It ran and PASSED —
+        // `[G490:verify] pairs=4200000019 bad=0` over 4.2 G pairs on MAP-0 — and a copy that is
+        // never selected is pure `run()` text: this one is ~5.7 KB of it, and G481's inline-budget
+        // cliff binds on exactly that resource. Set the #define to 1 to re-instantiate it (the
+        // DC2_G479_QPREG / DC2_G485_HAZREG / DC2_G489_PCSKIP convention); everything the oracle
+        // needs is still compiled in vu1_g490_block_run.inc.
+#ifndef DC2_G490_ORACLE
+#define DC2_G490_ORACLE 0
+#endif
+#if DC2_G490_ORACLE
+        else if (g490VerifyBlockOn)
+        {
+#define DC2_VU1_LOOP_DIAG 0
+#define DC2_G443_FIXED 1
+#define DC2_G475_TRACE 0
+#define DC2_G475_VERIFY_TRACE 0
+#define DC2_G479_FUSED 1
+#define DC2_G479_QPREG 0
+#define DC2_G479_VERIFY_FUSED 0
+#define DC2_G483_PCREG 0
+#define DC2_G483_VERIFY_PCREG 0
+#define DC2_G484_WIDEVF0 1
+#define DC2_G490_BLOCKRUN 1
+#define DC2_G490_VERIFY_BLOCK 1
+#include "vu1_g435_pair_loop.inc"
+#undef DC2_G490_VERIFY_BLOCK
+#undef DC2_G490_BLOCKRUN
+#undef DC2_G484_WIDEVF0
+#undef DC2_G483_VERIFY_PCREG
+#undef DC2_G483_PCREG
+#undef DC2_G479_VERIFY_FUSED
+#undef DC2_G479_QPREG
+#undef DC2_G479_FUSED
+#undef DC2_G475_VERIFY_TRACE
+#undef DC2_G475_TRACE
+#undef DC2_G443_FIXED
+#undef DC2_VU1_LOOP_DIAG
+        }
+#endif // DC2_G490_ORACLE
+        else if (g490BlockRun)
+        {
+            // G490 CANDIDATE COPY: the PROMOTED body (fixed + fused + wide VF0), plus the block
+            // run hook at the top of the iteration. Every other statement is textually identical
+            // to the g484WideVf0 arm below, which is therefore the exact control arm.
+#define DC2_VU1_LOOP_DIAG 0
+#define DC2_G443_FIXED 1
+#define DC2_G475_TRACE 0
+#define DC2_G475_VERIFY_TRACE 0
+#define DC2_G479_FUSED 1
+#define DC2_G479_QPREG 0
+#define DC2_G479_VERIFY_FUSED 0
+#define DC2_G483_PCREG 0
+#define DC2_G483_VERIFY_PCREG 0
+#define DC2_G484_WIDEVF0 1
+#define DC2_G490_BLOCKRUN 1
+#define DC2_G490_VERIFY_BLOCK 0
+#include "vu1_g435_pair_loop.inc"
+#undef DC2_G490_VERIFY_BLOCK
+#undef DC2_G490_BLOCKRUN
+#undef DC2_G484_WIDEVF0
 #undef DC2_G483_VERIFY_PCREG
 #undef DC2_G483_PCREG
 #undef DC2_G479_VERIFY_FUSED
@@ -1290,6 +1428,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     // Carry the pair counter forward unconditionally so stamps stay monotonic across MSCALs on
     // this thread, whatever representation each run used.
     s_g430PairBase = g430Base + (int64_t)cycle;
+    // G490: the denominator for `cover=`, tallied ONCE per run() (~1,230/f) from the pair counter
+    // the loop already carries — never a counter inside the loop (G421 law 17).
+    if (g490Stat)
+        g490NoteTotalPairs(cycle);
     if (g430Hist)
     {
         // Publish the architectural MAC once per run() (~1243 runs/frame).
