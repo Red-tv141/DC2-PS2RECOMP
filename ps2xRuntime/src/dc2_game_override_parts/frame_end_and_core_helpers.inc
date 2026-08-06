@@ -11,6 +11,51 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
     static uint32_t calls = 0u;
     const uint32_t n = ++calls;
 
+    // ===== G503: the fourth derivative probe, and the EE thread's first PC sampler =====
+    //
+    // This override wraps mgEndFrame, so it fires EXACTLY ONCE PER GUEST FRAME on the EE thread —
+    // which makes it the natural mirror of the vu1slow (per kick) and gsslow (per window) spins, and
+    // the one site where the injected magnitude needs no calibration run: it IS the spin length.
+    //
+    // WHY THE EE. G503's premise gate re-took all three existing probes and read VU1 0.04 / GS 0.27
+    // / GPU ~0.00 — a sensitivity SUM of 0.31 against G502's 0.85, G501's 1.10 and G498's ~1.20. Two
+    // thirds of the frame's marginal cost was in a unit nobody had ever injected into. The occupancy
+    // census then named the candidate: `[G182:ee] cpuMs/f` (the GetThreadTimes delta a few lines
+    // below, NOT the `busyMs/f` frame bracket beside it) reads 16.7-19.3 ms of REAL CPU per ~20 ms
+    // frame at onCPU 84-96%, and `[G146:perf]` reports VIF1 / GIFsubmit / GSimage / GSlocal all 0.0,
+    // so that CPU is recompiled GUEST code rather than the EE-side graphics path.
+    //
+    // Placement is the TOP of the frame-end hook: the guest's own logic for this frame has finished
+    // and the flush/present tail has not started, so the spin extends the EE's compute span without
+    // sitting inside any other thread's critical section. If the EE has slack, the wait that follows
+    // absorbs the spin and the probe correctly reads ~0.
+    //
+    // Wastes time by construction — it can never be promoted, exactly like the other three.
+    {
+        static const long long s_g503EeSlowUs = []() {
+            const char *v = std::getenv("DC2_G503_EE_SLOW_US");
+            return v ? std::atoll(v) : 0LL;
+        }();
+        const int g503Arm = g503EeSlowArm();
+        const long long spinUs = s_g503EeSlowUs > 0 ? s_g503EeSlowUs : 1000LL;
+        const bool doSpin = (g503Arm >= 0) ? (g503Arm == 1) : (s_g503EeSlowUs > 0);
+        if (doSpin)
+        {
+            const auto spinUntil = std::chrono::steady_clock::now() +
+                                   std::chrono::microseconds(spinUs);
+            while (std::chrono::steady_clock::now() < spinUntil) { /* busy-spin, EE thread only */ }
+        }
+        // Arm the host PC sampler on THIS thread (no-op unless DC2_G503_EEPROF=1). Idempotent
+        // inside the sampler, but gated here too so the default path does not call across TUs
+        // 1,236 times a frame for nothing.
+        static bool s_g503Sampled = false;
+        if (!s_g503Sampled)
+        {
+            s_g503Sampled = true;
+            g503RegisterEeThread();
+        }
+    }
+
     // G141: measure-first perf instrumentation (skill 17-performance-optimization.md).
     // This probe fires once per guest frame (wraps mgEndFrame), so the wall-clock delta
     // between successive entries is the whole guest frame time (game logic + VU1 draw-list

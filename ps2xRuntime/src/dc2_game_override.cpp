@@ -46,6 +46,13 @@ static uint64_t g182ThreadCpuNs()
 static uint64_t g182ThreadCpuNs() { return 0ull; }
 #endif
 
+// G503: the FOURTH derivative probe's arm selector (g419_ab_instrument.inc, the rasterizer TU) and
+// the EE-thread instance of the G446 host PC sampler (g446_gsworker_pcsample.inc, the gif-arbiter
+// TU). Both are called from f29_mgendframe_probe below, which runs ON the EE thread once per guest
+// frame. Same declaration style as ps2_gif_arbiter.cpp's `extern int g438SlowArm(int)`.
+extern int g503EeSlowArm();
+extern void g503RegisterEeThread();
+
 // G183: statistical PC-sampling profiler. G182 found EE is 90-99% on-CPU with 92-93% of
 // that time inside the single mgEndFrame call -- but mgEndFrame is translated GUEST code
 // (a deep inlined C++ call tree with no returns to instrument), so there are no free

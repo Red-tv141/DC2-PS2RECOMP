@@ -479,7 +479,11 @@ static void dc2_seed_title_mode(uint8_t *rdram, R5900Context *ctx)
     // mode-3 memory-card check is still seeded. Restore the old skip with
     // DC2_G376_SEED_FMV_SKIP=1.
     static const bool g376SeedFmvSkip = dc2_env_flag_enabled("DC2_G376_SEED_FMV_SKIP");
-    const bool seedThisMode = (mode == 3u) || (mode == 0u && g376SeedFmvSkip);
+    // G451: F21's mode-3 shortcut was introduced while memory-card completion
+    // was still blocked.  That state machine now completes, so mode 3 must run
+    // naturally: TitleLoop performs 3 -> 4 -> 1 and calls TitleModeInit,
+    // including its PlayEnvBgm, at the guest-authored transition edge.
+    const bool seedThisMode = mode == 0u && g376SeedFmvSkip;
     if (seedThisMode && sub == 0xFFFFFFFFu)
     {
         // F21 seed: the MC-check (mode 3) — and, with the G376 lever, the intro FMV
