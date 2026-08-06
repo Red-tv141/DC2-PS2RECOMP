@@ -227,6 +227,21 @@ namespace
         // VNOP. Maintained by the same two call sites as g475RunLen, so precise invalidation
         // covers it identically.
         std::array<uint8_t, PS2_VU1_CODE_SIZE / 8u> g490RunLen{};
+        // G500: how many CONTROL-TRANSFER TAIL pairs a block may execute at this slot — 0 (this
+        // slot is not an admissible branch terminator), 1 (the branch pair alone; its delay slot
+        // is not block-eligible and stays with the pair loop) or 2 (the branch pair AND its delay
+        // slot). Built by the same g490RebuildRunLengths() pass, from the same precisely
+        // invalidated sidecar, so it can never describe a stale encoding either.
+        std::array<uint8_t, PS2_VU1_CODE_SIZE / 8u> g500Tail{};
+        // G502: `g500Tail[i + g490RunLen[i]]` — the tail available to a block that STARTS at slot i,
+        // pre-joined by the same rebuild pass. The hook used to form that index itself
+        // (`currentPc + 8*avail`, bounds test, then the load), which is free while the lookup only
+        // happens once per BLOCK but is not once `blktail0` makes it happen on every hook entry.
+        // One byte load at the slot already being indexed, and the address arithmetic and the two
+        // clamps run only when it is non-zero. Exact by construction: the hook only reads it when
+        // `g490Count == g490Avail`, and the pass writes 0 whenever `i + g490RunLen[i]` leaves the
+        // table, which is the same answer the hook's own `g500BPc + 8 > codeSize` test gives.
+        std::array<uint8_t, PS2_VU1_CODE_SIZE / 8u> g502TailAt{};
         uint64_t hits = 0u;
         uint64_t compiles = 0u;
         uint64_t upperFallbacks = 0u;

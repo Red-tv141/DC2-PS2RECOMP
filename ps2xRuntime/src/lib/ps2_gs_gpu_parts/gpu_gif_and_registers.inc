@@ -19,7 +19,13 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             g_g147ImageBytes.fetch_add(g147ImageBytesLocal, std::memory_order_relaxed);
     };
 
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    // G508: the outer holder. Nested writeRegister guards skip the already-owned recursive
+    // re-acquisition when this raises the depth. The arm is read HERE, once per packet (~4,465/f),
+    // and never in writeRegister (~55.8k/f) — the measured path carries no instrument. Gated on the
+    // arm VALUE (G504): -1 = not under the A/B (shipped default, raise), 0 = control (pre-G508
+    // path), 1 = candidate.
+    const int g508Arm = g508LockSkipArm();
+    G508StateLock lock(m_stateMutex, g508Arm != 0);
     if (!data || sizeBytes < 16 || !m_vram)
         return;
 
@@ -658,7 +664,11 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    // G508: ~55.8k calls/frame, ~all of them nested inside processGIFPacket's own hold of this
+    // same recursive mutex. See G508StateLock in gpu_bridge_and_latch_helpers.inc.
+    G508StateLock lock(m_stateMutex);
+    if (g508RegCensusOn())
+        g508NoteRegisterWrite(regAddr, value);
     // PHASE F30: gsreg probe — track RGBAQ separately to catch color sets
     if (phaseDiagnosticsEnabled())
     {

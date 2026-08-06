@@ -311,6 +311,169 @@ enum G419Lever
     // are exact by construction. Thread-level (it changes the EE<->GS handoff cost), so it takes
     // the G438 block hold.
     kG497LeverWinBuf = 56,
+    // G498: route the two OWNER-PUBLISH colour unpacks (g345MaterializeSlot 212,992 px/f and
+    // g289Resolve14aBeforeDirect 49,152 px/f) through G418's promoted table/paired/lane arm on the
+    // rows where the owner's per-pixel block filter is provably a no-op. Both arms write the same
+    // bytes to the same VRAM addresses by construction (the filter decision is unchanged; only the
+    // rows it cannot affect change their loop). Read once per publication on the GS worker, and it
+    // dispatches row lanes, so it is thread-level and takes the G438 block hold.
+    kG498LeverOwnPub = 57,
+    // G499: give the G490 block executor the lower dispatch the pair loop has had since G480/G481
+    // — skip the `g422FastLower` call outright for the 39.5% of pairs whose lower is NOP (that
+    // case's whole body is `return;`) and run the three block-eligible hot INTEGER kinds
+    // (IADDI 6.99% + IADDIU 3.07% + IAND 3.02%) inline. Both are promoted default-ON in
+    // DC2_G422_RUN_LOWER and neither ever reached the block copy. Selects which of two noinline
+    // block bodies run() calls, read once per run() on the VU1 worker — thread-level code shape,
+    // so it takes the G438 block hold exactly like `blockrun`.
+    kG499LeverBlkLower = 58,
+    // G499: the Q/P delay counters as BLOCK LOCALS. `g490BlockBody` read-modify-writes both through
+    // `int *` on every pair with an inlined `g422FastLower` (which stores into `vuData`) in between,
+    // so MSVC must reload them from memory at the top of each iteration. Block eligibility excludes
+    // every writer of those counters (`G426_PF_PRESTALL` + the uncovered lowers), so inside a block
+    // they can only COUNT DOWN — a local copy written back once is exact. Control arm is the
+    // `blklower` candidate, so this prices the residency alone. Thread-level, G438 block hold.
+    kG499LeverQpBlock = 59,
+    // G500: let a G490 block run END on the control transfer that terminates it, and swallow that
+    // branch's delay slot. Control transfer is 8.88% of all pairs on this route and ~69% of all run
+    // terminations, and a TAKEN branch's delay slot is excluded a second time over (the block hook
+    // is gated on `pendingBranchTarget == NO_BRANCH`), so both populations pay the full per-pair
+    // envelope today. The arm only EXTENDS a run that was already long enough to form a block, so
+    // blocks/frame is invariant and the gate prices exactly the pairs it moves. Control arm is the
+    // G499 shipped body. Selects which noinline block body run() calls, read once per run() on the
+    // VU1 worker — thread-level code shape, so it takes the G438 block hold like `blklower`.
+    kG500LeverBlkBranch = 60,
+    // G502: the BLOCK ROUND-TRIP ceiling probe. `cover=88.99%` at `avg=9.15` is ~157 k block calls
+    // per frame, and each one costs a full trip round the pair loop's top of iteration plus a
+    // noinline 10-argument call before the next block's first pair runs. The candidate arm HALVES
+    // every block whose clamped length is >= 2*MIN_RUN, which leaves the executed pairs, their
+    // order and the coverage bit-identical and adds exactly ONE extra round trip per split block —
+    // an INFLATION probe, so it carries none of G492's producer-edge deletion hazard. Frame delta
+    // divided by `[G502:blk] split/f` IS the price of one round trip, i.e. the ceiling of any
+    // chaining executor. Thread-level code shape, so it takes the G438 block hold.
+    kG502LeverBlkSplit = 61,
+    // G502: the lever that ceiling prices. A block may CONTINUE into the next eligible run without
+    // returning to run() — after a sequential end, or across a control transfer whose delay slot
+    // the block already swallowed. Control arm is the G500 shipped body. PRICED OUT and compiled
+    // out — see DC2_G502_BLKCHAIN in vu1_g490_block_run.inc; the id is kept so a re-arm is one edit.
+    kG502LeverBlkChain = 62,
+    // G502: a block may consist of the CONTROL TRANSFER ALONE (plus the delay slot it swallows).
+    // G500 admitted a tail only onto a run that already reached MIN_RUN, so a branch preceded by
+    // fewer than two eligible pairs still pays the full per-pair envelope for itself AND for its
+    // delay slot. `[G502:excl]` prices that remainder at 2.10% + 2.05% of ALL pairs, and G500's own
+    // realised 7.0 ns/pair for exactly this population makes it ~0.47 ms/f gross. Control arm is
+    // the G500 shipped admission test; only `g490Count + tail >= MIN_RUN` replaces
+    // `g490Count >= MIN_RUN`. Thread-level code shape, so it takes the G438 block hold.
+    kG502LeverBlkTail0 = 63,
+    // G503: THE FOURTH DERIVATIVE PROBE — the EE (guest main) thread, the one unit this arc has
+    // never injected into. G503's premise gate read VU1 0.04 / GS 0.27 / GPU ~0.00, a sensitivity
+    // SUM of 0.31 against G502's 0.85 and G501's 1.10: two thirds of the frame's marginal cost was
+    // in something unprobed. The occupancy census names the candidate — `[G182:ee] cpuMs/f` is a
+    // GetThreadTimes delta (NOT the frame bracket `busyMs/f` is, G491's trap) and reads 16.7-19.3 ms
+    // of real CPU per ~20 ms frame at onCPU 84-96%, while `[G146:perf]` reports VIF1 / GIFsubmit /
+    // GSimage / GSlocal all 0.0, i.e. that CPU is recompiled GUEST code, not the EE-side graphics
+    // path. Exact mirror of vu1slow/gsslow: busy-spin DC2_G503_EE_SLOW_US once per guest frame on
+    // the EE thread, on candidate frames only. Injected magnitude is the spin length itself (ONE
+    // spin per frame), so it needs no calibration run. Wastes time by construction — never
+    // promotable. Thread-level, so it takes the G438 block hold.
+    kG503LeverEeSlow = 64,
+    // G503: recycled DMA-chain staging buffer. `PS2Memory::processTransferChain` built a FRESH
+    // zero-capacity `std::vector<uint8_t>` per DMA chain and appended up to 16,384 tag payloads into
+    // it, so every chain paid log2(N) geometric reallocations (each memmoving everything appended so
+    // far) plus one operator new and one free. The caller-attributed `eeprof` puts that at 13.78% of
+    // the EE thread in `_Insert_counted_range` with a 10.86% `memmove` leaf, beside 5.69%
+    // ZwFreeVirtualMemory / 1.59% RtlAllocateHeap / 1.43% operator new. Both arms append the SAME
+    // bytes in the same order and hand the consumer the same `size()`; only the buffer's CAPACITY on
+    // entry differs, so there is no output to verify. Thread-level (it changes allocator traffic on
+    // the pole thread), so it takes the G438 block hold.
+    kG503LeverChainPool = 65,
+    // G504: the G430 ring cursor as a block local. `[G483:rawpc]` resolved against a linker map put
+    // the SINGLE HOTTEST instruction of the VU1 worker — the pole at sensitivity 1.03 this session —
+    // inside `g430PushPending`, with the push at ~9.2% of the thread. Consecutive pushes are chained
+    // through memory (`H.head` loaded, four stores indexed off it, stored back), so each waits on
+    // the previous one's store to forward. Arm 6 carries that cursor in a block local; arm 3 (the
+    // G500/G501 shipped body) is the control. The two arms execute the identical pairs in the
+    // identical blocks and write the identical ring entries — only where the index lives differs.
+    // Thread-level code shape, so it takes the G438 block hold.
+    kG504LeverHistCur = 66,
+    // G506: the per-pair Q/P delay advance, hoisted out of the block's pair loop by segmentation.
+    // Selects block arm 7 against arm 3 (the G500/G501 shipped body) in g499BlkArmRun(). The two
+    // arms execute the identical pairs in the identical blocks and publish `st.q`/`st.p` at the
+    // identical pairs — only how often the two counters are TESTED differs. Thread-level code
+    // shape, so it takes the G438 block hold.
+    kG506LeverQpSeg = 67,
+    // G508: skip the REDUNDANT recursive re-acquisition of GS::m_stateMutex. `GS::writeRegister`
+    // locks that mutex on every call and `GS::processGIFPacket` — its only hot caller — already
+    // holds it for the whole packet, so the GS worker pays ~55.8k already-owned re-acquisitions per
+    // frame (`[G341:vifcensus]` 50,007 PATH1 + 5,827 PATH2 register writes). Priced BEFORE building
+    // on this host at 5.97 ns per skipped call (7.25 recursive re-lock vs 1.29 thread_local depth
+    // test) = ~0.33 ms/f.
+    //   ARM DESIGN. The arm is read ONCE PER PACKET, in processGIFPacket's own guard — never in
+    // writeRegister — so the instrument cannot pollute the 55.8k-call path it is measuring. The
+    // candidate arm raises the thread-local depth so nested guards skip; the control arm leaves it
+    // at 0 so every nested writeRegister locks for real, which is byte-for-byte the pre-G508 path.
+    // Both arms hold the mutex across the identical region and write the identical bytes.
+    // Thread-level (it changes the GS worker's per-frame CPU), so it takes the G438 block hold.
+    kG508LeverLockSkip = 68,
+    // G510: move the captured G144Entry into g_g144List instead of copying it. `G144Entry e` is a
+    // loop-local, fully assigned and dead immediately after the push, so a move lands the identical
+    // bytes in the identical slot and removes one whole ~150-byte struct copy plus the G149Buf
+    // copy-construct/destroy pair, ~9,900 times per frame ON THE GS WORKER (the pole). Read once per
+    // captured primitive through the standard per-frame tick-sequence memo, so the accessor is two
+    // relaxed loads on both arms and cannot bias the delta. Thread-level (it changes the pole
+    // thread's per-frame CPU), so it takes the G438 block hold.
+    kG510LeverCapMove = 69,
+    // G510: memoize g178ClassifyEntry across CONSECUTIVE graph entries with byte-identical state.
+    // G178EntryState is a pure function of the entry's state registers (ctx/prim/texa/texclut/pabe/
+    // fogcol/titleRockScope/townDepthScope) plus static env gates and per-fbp predicates that are
+    // themselves functions of ctx.frame.fbp — a mesh's triangles differ only in their vertices. The
+    // candidate arm compares that state against the previous entry's and reuses s_states[i-1] on a
+    // match; the control arm always calls classify. The comparison is a byte compare, so it can only
+    // produce false MISSES (padding), never a false hit. ~9,900 entries/frame on the pole thread.
+    // Read once per GPU flush (33.4/frame), so the accessor cannot pollute the measured loop.
+    // Thread-level, so it takes the G438 block hold.
+    kG510LeverClsMemo = 70,
+    // G510 PROMOTION GATE: both G510 levers together, i.e. exactly the shipped default against
+    // exactly the full rollback. They sit on the same thread but on different edges (capture vs
+    // flush), so G447's "two levers on one serialized edge do not add" does not apply — the combined
+    // arm exists so the promotion number comes from the shipped pair, not from a sum of two singles.
+    kG510LeverBoth = 71,
+    // G511: run-length dedup of the per-entry `s_batchKeys` probe in the flush's TEXTURE pass.
+    // That pass walks all ~9,900 graph entries and asks an unordered_set whether this entry's
+    // texture key was already collected in this flush; G510 measured 94.4% of entries carrying
+    // byte-identical state to their predecessor, so the key is almost always the SAME key the
+    // previous iteration just proved present. Remembering that one key turns the hash probe into a
+    // 64-bit compare for the repeat. Read once per GPU flush (33.4/frame) against the ~9,900 sites
+    // it gates, so the accessor cannot pollute the loop it measures (G502).
+    // Thread-level (it changes the pole thread's per-frame CPU), so it takes the G438 block hold.
+    kG511LeverTexRun = 72,
+    // G511 INFLATION probe (G502): the candidate arm performs ONE EXTRA `s_batchKeys.count()` per
+    // probing entry and folds the result into a sink so the optimiser cannot delete it. The paired
+    // delta divided by the census's probes/f is the price of ONE set probe on the real key
+    // distribution — i.e. the exact quantity `texrun` removes. It is a MEASUREMENT arm, never a
+    // promotion candidate: arm 1 is strictly slower than arm 0 by construction.
+    kG511LeverTexProbe = 73,
+    // G511 INFLATION probe #2 (G502): the candidate arm performs ONE EXTRA full state-identity test
+    // — the four `memcmp`s plus four scalar compares G510 put on EVERY graph entry — in the flush's
+    // Pass 1, folded into a sink. `class` reads 1.00 ms/f this session (§2) DESPITE the G510 memo
+    // serving 94.4% of the classifications, so the memo's own comparison cost is the one per-entry
+    // price in `pre` nobody has measured. The delta / 9,960 entries per frame is that price, and it
+    // decides whether a cheap state-generation stamp is worth a phase.
+    // Measurement arm only — never promoted, no env force flag.
+    kG511LeverClsProbe = 74,
+    // G512: the whole-texture DECODE inner loop. G511 priced `g178DecodeWhole` at 1.09 ms/f =
+    // ~26.6 ns of CPU per texel (~80 host cycles) over 4 calls/frame and ~81,601 px each, against
+    // 0.33 ns/px for merely HASHING the same VRAM. The G512 disassembly of `decodeRows`
+    // (0x1403db080, 0x260 bytes) named the 80 cycles: per TEXEL the emitted body reloaded `psm`
+    // through a closure pointer, re-ran a 6-way switch, made an out-of-line `call` into
+    // ps2_gs_memory.obj for the swizzled read (LTCG did not inline it), made a SECOND out-of-line
+    // call to g178LookupClutFixed for palettized formats — which re-derives a whole swizzled CLUT
+    // address per texel — then reloaded `texW` through two more pointer chases and did a 64-bit
+    // imul, twice. Candidate arm hoists every invariant into a VALUE, specialises the psm switch
+    // ONCE outside the loop, materialises the 256-entry CLUT ONCE per decode, and batches the
+    // swizzled read to one call per ROW. Read once per DECODE (4/frame) against ~326,000 texels,
+    // so the accessor cannot pollute the loop it measures (G502).
+    // Thread-level (it changes the pole thread's per-frame CPU), so it takes the G438 block hold.
+    kG512LeverFastDec = 75,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -443,13 +606,54 @@ static int g419AbLever()
             return static_cast<int>(kG496LeverGlState);
         if (std::strcmp(value, "winbuf") == 0)
             return static_cast<int>(kG497LeverWinBuf);
+        if (std::strcmp(value, "ownpub") == 0)
+            return static_cast<int>(kG498LeverOwnPub);
+        if (std::strcmp(value, "blklower") == 0)
+            return static_cast<int>(kG499LeverBlkLower);
+        if (std::strcmp(value, "qpblock") == 0)
+            return static_cast<int>(kG499LeverQpBlock);
+        if (std::strcmp(value, "blkbranch") == 0)
+            return static_cast<int>(kG500LeverBlkBranch);
+        if (std::strcmp(value, "blksplit") == 0)
+            return static_cast<int>(kG502LeverBlkSplit);
+        if (std::strcmp(value, "blkchain") == 0)
+            return static_cast<int>(kG502LeverBlkChain);
+        if (std::strcmp(value, "blktail0") == 0)
+            return static_cast<int>(kG502LeverBlkTail0);
+        if (std::strcmp(value, "eeslow") == 0)
+            return static_cast<int>(kG503LeverEeSlow);
+        if (std::strcmp(value, "chainpool") == 0)
+            return static_cast<int>(kG503LeverChainPool);
+        if (std::strcmp(value, "histcur") == 0)
+            return static_cast<int>(kG504LeverHistCur);
+        if (std::strcmp(value, "qpseg") == 0)
+            return static_cast<int>(kG506LeverQpSeg);
+        if (std::strcmp(value, "lockskip") == 0)
+            return static_cast<int>(kG508LeverLockSkip);
+        if (std::strcmp(value, "capmove") == 0)
+            return static_cast<int>(kG510LeverCapMove);
+        if (std::strcmp(value, "clsmemo") == 0)
+            return static_cast<int>(kG510LeverClsMemo);
+        if (std::strcmp(value, "g510both") == 0)
+            return static_cast<int>(kG510LeverBoth);
+        if (std::strcmp(value, "texrun") == 0)
+            return static_cast<int>(kG511LeverTexRun);
+        if (std::strcmp(value, "texprobe") == 0)
+            return static_cast<int>(kG511LeverTexProbe);
+        if (std::strcmp(value, "clsprobe") == 0)
+            return static_cast<int>(kG511LeverClsProbe);
+        if (std::strcmp(value, "fastdec") == 0)
+            return static_cast<int>(kG512LeverFastDec);
         std::fprintf(stderr,
                      "[G419:ab] unknown DC2_G419_AB='%s' (expected "
                      "narrow|pack|lanes|all|zero|packlanes|pool|all420|narrowtouch|matunpack|"
                      "vu1slow|gsslow|coalesce|earlykick|kickall|spinwait|wspin|spinboth|async1|"
                      "rb_all|rb_l2l|rb_resync|rb_display|uvpred|simdmerge|vnoptrace|pagebump|"
                      "leanfetch|pcreg|widevf0|flaglower|fastop|pcskip|blockrun|rbfmt|rbspin|"
-                     "norender|noother|ct24reuse|latedrain|nosync|gpuslow|glstate|winbuf)\n",
+                     "norender|noother|ct24reuse|latedrain|nosync|gpuslow|glstate|winbuf|ownpub|"
+                     "blklower|qpblock|blkbranch|blksplit|blkchain|blktail0|eeslow|chainpool|"
+                     "histcur|qpseg|lockskip|capmove|clsmemo|g510both|texrun|texprobe|clsprobe|"
+                     "fastdec)\n",
                      value);
         return static_cast<int>(kG419LeverNone);
     }();
@@ -514,6 +718,25 @@ static const char *g419AbLeverName(int lever)
     case kG496LeverGpuSlow: return "gpuslow";
     case kG496LeverGlState: return "glstate";
     case kG497LeverWinBuf: return "winbuf";
+    case kG498LeverOwnPub: return "ownpub";
+    case kG499LeverBlkLower: return "blklower";
+    case kG499LeverQpBlock: return "qpblock";
+    case kG500LeverBlkBranch: return "blkbranch";
+    case kG502LeverBlkSplit: return "blksplit";
+    case kG502LeverBlkChain: return "blkchain";
+    case kG502LeverBlkTail0: return "blktail0";
+    case kG503LeverEeSlow: return "eeslow";
+    case kG503LeverChainPool: return "chainpool";
+    case kG504LeverHistCur: return "histcur";
+    case kG506LeverQpSeg: return "qpseg";
+    case kG508LeverLockSkip: return "lockskip";
+    case kG510LeverCapMove: return "capmove";
+    case kG510LeverClsMemo: return "clsmemo";
+    case kG510LeverBoth: return "g510both";
+    case kG511LeverTexRun: return "texrun";
+    case kG511LeverTexProbe: return "texprobe";
+    case kG511LeverClsProbe: return "clsprobe";
+    case kG512LeverFastDec: return "fastdec";
     default: return "none";
     }
 }
@@ -634,6 +857,18 @@ static uint64_t g438ArmHoldFrames()
                 sel == kG492LeverCt24Reuse || sel == kG493LeverLateDrain ||
                 sel == kG494LeverNoSync || sel == kG496LeverGpuSlow ||
                 sel == kG496LeverGlState || sel == kG497LeverWinBuf ||
+                sel == kG498LeverOwnPub || sel == kG499LeverBlkLower ||
+                sel == kG499LeverQpBlock || sel == kG500LeverBlkBranch ||
+                sel == kG502LeverBlkSplit || sel == kG502LeverBlkChain ||
+                sel == kG502LeverBlkTail0 || sel == kG503LeverEeSlow ||
+                sel == kG503LeverChainPool || sel == kG504LeverHistCur ||
+                sel == kG506LeverQpSeg || sel == kG508LeverLockSkip ||
+                sel == kG510LeverCapMove || sel == kG510LeverClsMemo ||
+                sel == kG510LeverBoth ||
+                // G506's law: a new thread-level arm joins THIS predicate in the same edit that
+                // adds it, or it silently alternates every frame while its peers hold 16.
+                sel == kG511LeverTexRun || sel == kG511LeverTexProbe ||
+                sel == kG511LeverClsProbe || sel == kG512LeverFastDec ||
                 sel == kG439LeverCoalesce || sel == kG445LeverEarlyKick ||
                 sel == kG445LeverKickAll || sel == kG447LeverSpinWait || sel == kG447LeverWSpin ||
                 sel == kG447LeverSpinBoth || sel == kG452LeverAsyncOne ||
@@ -928,6 +1163,147 @@ int g490BlockRunArm()
     return arm != 0u ? 1 : 0;
 }
 
+// G499 selects which of the two noinline block bodies run() calls, read once per run() on the VU1
+// worker (~1,238/f). Same G438 block hold and the same per-frame-sequence memo as g490BlockRunArm
+// directly above: the arm must not flip inside a run(), and the memo keys on the tick SEQUENCE
+// rather than on the arm value.
+int g499BlkLowerArm()
+{
+    if (g419AbLever() != static_cast<int>(kG499LeverBlkLower))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G499 Q/P-residency arm. Same contract as g499BlkLowerArm directly above; its control arm is the
+// `blklower` candidate, so the two levers of this phase are priced independently.
+int g499QpBlockArm()
+{
+    if (g419AbLever() != static_cast<int>(kG499LeverQpBlock))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G500 control-transfer-tail arm. Same contract as the two directly above; its control arm is the
+// `blklower` candidate (the shipped G499 body), so the tail is priced alone.
+int g500BlkBranchArm()
+{
+    if (g419AbLever() != static_cast<int>(kG500LeverBlkBranch))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G502 block-round-trip CEILING PROBE arm. Same contract as the four directly above: read once per
+// run() on the VU1 worker, per-frame-sequence memo, G438 block hold. The candidate arm halves every
+// long block, so the arms differ only in how many times run()'s loop head is re-entered.
+int g502BlkSplitArm()
+{
+    if (g419AbLever() != static_cast<int>(kG502LeverBlkSplit))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G502 block-CHAIN arm — the lever the probe above priced OUT (see the fix log §4). Kept as
+// scaffolding beside a body that is compiled out, the DC2_G479_QPREG / DC2_G485_HAZREG convention.
+int g502BlkChainArm()
+{
+    if (g419AbLever() != static_cast<int>(kG502LeverBlkChain))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G502 TAIL-0 admission arm. Same contract as the four above: read once per run() on the VU1
+// worker, per-frame-sequence memo, G438 block hold.
+int g502BlkTail0Arm()
+{
+    if (g419AbLever() != static_cast<int>(kG502LeverBlkTail0))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G504 history-CURSOR arm. Same contract as the five above: read once per run() on the VU1 worker
+// (~1,236/frame, not per pair), per-frame-sequence memo, G438 block hold. Selects arm 6 against
+// arm 3 in g499BlkArmRun().
+int g504HistCurArm()
+{
+    if (g419AbLever() != static_cast<int>(kG504LeverHistCur))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G506 segmented Q/P-advance arm. Same contract as the six above: read once per run() on the VU1
+// worker (~1,236/frame, not per pair), per-frame-sequence memo, G438 block hold. Selects arm 7
+// against arm 3 in g499BlkArmRun().
+int g506QpSegArm()
+{
+    if (g419AbLever() != static_cast<int>(kG506LeverQpSeg))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
 // G491 readback-format arm, read once per colour readback on the GL WORKER thread (6/f). The
 // per-frame memo below marks the frame from that thread — which is correct and necessary: the arm
 // must be attributed on whichever thread consumes it, and 6 relaxed RMWs per frame is nothing
@@ -1070,6 +1446,320 @@ int g496GpuSlowArm()
     return arm != 0u ? 1 : 0;
 }
 
+// G508 lock-skip arm, read once per GIF PACKET on the GS WORKER thread (~4,465 reads/frame against
+// the ~55.8k register writes the lever acts on, so the accessor is ~1.3% of the sites it gates and
+// cannot pollute the measured path — G502's per-item-census bias, avoided by construction).
+// Candidate arm (1) = raise the thread-local depth so nested writeRegister guards skip the
+// already-owned recursive re-acquisition. Control arm (0) = leave it at 0, i.e. the pre-G508 path.
+// Same per-frame thread-local tick-sequence memo as every other thread-level arm — never key the
+// memo on the arm VALUE (G438).
+int g508LockSkipArm()
+{
+    if (g419AbLever() != static_cast<int>(kG508LeverLockSkip))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G510 capture-move arm, read once per CAPTURED PRIMITIVE on the GS WORKER thread (~9,900/frame).
+// That is the same rate as the site it gates, so the accessor must be as close to free as an arm
+// accessor can be: after the once-per-frame attribution RMW it is two relaxed loads, a compare and a
+// predicted branch, and it sits on BOTH arms identically, so it adds a constant to each bucket and
+// cannot bias the difference (G486 §4's asymmetry trap does not apply — no arm skips it).
+// Candidate arm (1) = move the entry into g_g144List; control arm (0) = the pre-G510 copy.
+// Never key the per-frame memo on the arm VALUE (G438/G501).
+int g510CapMoveArm()
+{
+    const int sel = g419AbLever();
+    if (sel != static_cast<int>(kG510LeverCapMove) && sel != static_cast<int>(kG510LeverBoth))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G510 classify-memo arm, read once per GPU FLUSH on the GS WORKER thread (~33.4/frame against the
+// ~9,900 entries the lever acts on, so the accessor is 0.3% of the sites it gates and cannot pollute
+// the measured loop — G502's per-item-census bias, avoided by construction).
+// Candidate arm (1) = reuse the previous entry's classification when the state bytes match.
+int g510ClsMemoArm()
+{
+    const int sel = g419AbLever();
+    if (sel != static_cast<int>(kG510LeverClsMemo) && sel != static_cast<int>(kG510LeverBoth))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G510 shipped-default predicates. The A/B arm always wins when this phase's gate is armed, so the
+// paired measurement is valid whichever way the default points; the env flags are the standalone
+// rollback / force pair every promoted lever in this arc carries.
+bool g510CapMoveActive()
+{
+    const int arm = g510CapMoveArm(); // -1 unless DC2_G419_AB=capmove|g510both
+    if (arm >= 0)
+        return arm == 1;
+    static const bool off = (std::getenv("DC2_G510_NO_CAPMOVE") != nullptr);
+    return !off;
+}
+
+bool g510ClsMemoActive()
+{
+    const int arm = g510ClsMemoArm(); // -1 unless DC2_G419_AB=clsmemo|g510both
+    if (arm >= 0)
+        return arm == 1;
+    static const bool off = (std::getenv("DC2_G510_NO_CLSMEMO") != nullptr);
+    return !off;
+}
+
+// G510 census (default OFF, DC2_G510_CENSUS=1): entries classified per frame and how many of them
+// the memo could serve. Behaviour-pure — it counts on BOTH arms and on the default path, so the
+// hit rate it reports is a property of the route, not of the lever.
+bool g510CensusOn()
+{
+    static const bool on = (std::getenv("DC2_G510_CENSUS") != nullptr);
+    return on;
+}
+std::atomic<uint64_t> g_g510ClsEntries{0};
+std::atomic<uint64_t> g_g510ClsEligible{0};
+std::atomic<uint64_t> g_g510ClsServed{0};
+std::atomic<uint64_t> g_g510Flushes{0};
+
+// G511 texture-pass run-length arm, read once per GPU FLUSH on the GS WORKER thread (~33.4/frame
+// against the ~9,900 entries the lever acts on — 0.3% of the sites it gates, so the accessor cannot
+// pollute the measured loop; G502's per-item-census bias, avoided by construction).
+// Candidate arm (1) = skip the `s_batchKeys` hash probe when this entry's effective texture key is
+// the one the previous iteration already proved present in the set.
+int g511TexRunArm()
+{
+    if (g419AbLever() != static_cast<int>(kG511LeverTexRun))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G511 INFLATION probe arm — same rate and same accessor shape as above. Arm 1 adds one extra
+// `s_batchKeys.count()` per probing entry; arm 0 is the untouched loop. This is a price, not a
+// lever: it is never promoted and has no env force flag.
+int g511TexProbeArm()
+{
+    if (g419AbLever() != static_cast<int>(kG511LeverTexProbe))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G511: NOT PROMOTED — default OFF, opt-in with DC2_G511_TEXRUN=1.
+// The lever is exact and removes real work, but G511 §4 PRICED the work it removes with an
+// inflation probe first: adding 5,264 extra s_batchKeys probes per frame moved the frame by
+// -0.102 +/- 0.058 ms (t = -1.26, i.e. the arm doing MORE work measured FASTER), bounding one probe
+// at <= 2.7 ns and the whole vein at <= 0.014 ms/f. Its own 4-run gate then read null in both
+// estimators and sign-inconsistent 2/4, exactly as the probe predicted. A neutral change is not
+// promoted: it would add a live value and a branch to the pole thread's hottest loop for a saving
+// the instrument cannot see. It is kept, gated, so a future route (§8) can re-test it in one run.
+bool g511TexRunActive()
+{
+    const int arm = g511TexRunArm(); // -1 unless DC2_G419_AB=texrun
+    if (arm >= 0)
+        return arm == 1;
+    static const bool on = (std::getenv("DC2_G511_TEXRUN") != nullptr);
+    return on;
+}
+
+// The inflation probe has NO default-on path — it only ever runs as the candidate arm of its own
+// paired gate, so a leaked env flag cannot put it under a later measurement.
+bool g511TexProbeActive()
+{
+    return g511TexProbeArm() == 1;
+}
+
+// G511 INFLATION probe #2 arm — read once per GPU FLUSH on the GS WORKER thread, same shape as the
+// two above. Arm 1 repeats the G510 state-identity comparison once more per graph entry.
+int g511ClsProbeArm()
+{
+    if (g419AbLever() != static_cast<int>(kG511LeverClsProbe))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+bool g511ClsProbeActive()
+{
+    return g511ClsProbeArm() == 1;
+}
+
+// G511 census (default OFF, DC2_G511_CENSUS=1): how many texture-pass iterations reach the set
+// probe and how many of those repeat the key the previous iteration already resolved. Behaviour-
+// pure — it counts on BOTH arms and on the default path, so the rate it reports is a property of
+// the route, not of the lever. Its own sites are three relaxed adds per FLUSH, not per entry
+// (G502's per-item-census bias: a per-entry counter here would inflate the very loop it prices).
+bool g511CensusOn()
+{
+    static const bool on = (std::getenv("DC2_G511_CENSUS") != nullptr);
+    return on;
+}
+std::atomic<uint64_t> g_g511TexEntries{0};  // iterations of the texture pass
+std::atomic<uint64_t> g_g511TexProbes{0};   // of those, iterations reaching the set probe
+std::atomic<uint64_t> g_g511TexRunRep{0};   // of those, iterations the run-length memo can serve
+std::atomic<uint64_t> g_g511TexFlushes{0};
+
+// G511 texture-pass DECOMPOSITION census (default OFF, DC2_G511_TEXSPLIT=1) → [G511:texsplit].
+// §2 puts `tex` at 1.44 ms/f, the largest of the five pre-passes, and §4 proved the per-entry hash
+// probe inside it is worth <= 0.014 ms/f — so the bucket's cost is somewhere else and nobody knows
+// where. This splits it into the two HEAVY per-KEY sites (whole-texture decode, source-page hash)
+// and leaves the rest as a stated residual.
+// Clock pairs go ONLY on sites that run ~24x/frame, never on the ~9,900-iteration loop body: a
+// per-entry clock pair would cost more than the thing it measures (G502).
+bool g511TexSplitOn()
+{
+    static const bool on = (std::getenv("DC2_G511_TEXSPLIT") != nullptr);
+    return on;
+}
+std::atomic<uint64_t> g_g511TexLoopNs{0};    // whole texture pass, one pair per flush
+std::atomic<uint64_t> g_g511TexHashNs{0};    // g178HashPages
+std::atomic<uint64_t> g_g511TexHashN{0};
+std::atomic<uint64_t> g_g511TexDecodeNs{0};  // g178DecodeWhole (+ the upload buffer resize)
+std::atomic<uint64_t> g_g511TexDecodeN{0};
+std::atomic<uint64_t> g_g511TexGenNs{0};     // g178GenSumRect pair + registry lookup
+std::atomic<uint64_t> g_g511TexGenN{0};
+// Pixel counts for the two heavy sites. G494's law: a per-item cost that does NOT scale with the
+// item's size is fixed OVERHEAD, not work — and the lever for overhead is different from the lever
+// for work. ns/px separates them; nothing else in this arc can.
+std::atomic<uint64_t> g_g511TexHashPx{0};
+std::atomic<uint64_t> g_g511TexDecodePx{0};
+std::atomic<uint64_t> g_g511TexSplitFlushes{0};
+// Sink for the inflation probe. Written with a relaxed RMW once per FLUSH (never per entry) so the
+// per-entry accumulation stays a register and the compiler still cannot prove the extra probes dead.
+std::atomic<uint64_t> g_g511Sink{0};
+
+// ---------------------------------------------------------------------------------------------
+// G512 — fast whole-texture decode.
+//
+// Read ONCE per g178DecodeWhole call (4/frame) and passed down to the row-pool lanes as a plain
+// bool, so the ~326,000 texels it gates never see the accessor (G502's per-item-census bias,
+// avoided by construction). Same per-frame thread-local tick-sequence memo as every other
+// thread-level arm.
+int g512FastDecArm()
+{
+    if (g419AbLever() != static_cast<int>(kG512LeverFastDec))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G504's law: gate per-arm BEHAVIOUR on the arm VALUE, never on `arm != 0` alone — and keep the
+// env rollback on the SAME accessor so a paired run and a forced run cannot disagree about which
+// body ran. Default ON once promoted; DC2_G512_NO_FASTDEC=1 restores the pre-G512 per-texel body.
+bool g512FastDecActive()
+{
+    const int arm = g512FastDecArm(); // -1 unless DC2_G419_AB=fastdec
+    if (arm >= 0)
+        return arm == 1;
+    static const bool off = (std::getenv("DC2_G512_NO_FASTDEC") != nullptr);
+    return !off;
+}
+
+// G512 exactness oracle (default OFF, DC2_G512_VERIFY=1). Decodes the texture BOTH ways into two
+// buffers and counts mismatching texels. The reference is the pre-G512 per-texel body, kept
+// verbatim in the same function — DC2_G298_VERIFY_TEXDECODE cannot serve here because it compares
+// the parallel decode against the SAME body, so it would agree with a wrong fast path.
+bool g512VerifyOn()
+{
+    static const bool on = (std::getenv("DC2_G512_VERIFY") != nullptr);
+    return on;
+}
+
+// G512 census (default OFF, DC2_G512_PSM=1) -> [G512:psm]. Which pixel formats the 4 decodes/frame
+// actually are, and how many texels each accounts for. G511 §9: `avgPx(decode=81601)` is a property
+// of MAP-0's texture set, and this phase's price rides on the psm mix as well as the pixel count.
+// Behaviour-pure: it counts on BOTH arms and on the default path.
+bool g512PsmCensusOn()
+{
+    static const bool on = (std::getenv("DC2_G512_PSM") != nullptr);
+    return on;
+}
+static std::atomic<uint64_t> s_g512PsmCalls[64] = {};
+static std::atomic<uint64_t> s_g512PsmPx[64] = {};
+static std::atomic<uint64_t> s_g512PsmFast{0};
+static std::atomic<uint64_t> s_g512PsmSlow{0};
+
+// Forward-declared in g512_fast_texdecode.inc (that file is included from
+// rasterizer_command_graph.inc, ~50 lines earlier in this TU).
+void g512PsmNote(uint8_t psm, uint64_t pixels, bool fast, int texW, int texH, int lanes)
+{
+    s_g512PsmCalls[psm & 63u].fetch_add(1u, std::memory_order_relaxed);
+    s_g512PsmPx[psm & 63u].fetch_add(pixels, std::memory_order_relaxed);
+    const uint64_t n =
+        (fast ? s_g512PsmFast : s_g512PsmSlow).fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if ((n % 256u) != 0u)
+        return;
+    char buf[640];
+    int off = std::snprintf(buf, sizeof(buf), "[G512:psm] fast=%llu ref=%llu",
+                            static_cast<unsigned long long>(
+                                s_g512PsmFast.load(std::memory_order_relaxed)),
+                            static_cast<unsigned long long>(
+                                s_g512PsmSlow.load(std::memory_order_relaxed)));
+    for (uint32_t k = 0; k < 64u && off > 0 && off < static_cast<int>(sizeof(buf)) - 64; ++k)
+    {
+        const uint64_t c = s_g512PsmCalls[k].load(std::memory_order_relaxed);
+        if (c == 0u)
+            continue;
+        off += std::snprintf(buf + off, sizeof(buf) - static_cast<size_t>(off),
+                             " psm%02x(n=%llu px=%llu)", k, static_cast<unsigned long long>(c),
+                             static_cast<unsigned long long>(
+                                 s_g512PsmPx[k].load(std::memory_order_relaxed)));
+    }
+    std::fprintf(stderr, "%s last=%dx%d lanes=%d\n", buf, texW, texH, lanes);
+}
+
 // G496b GL-state-elision arm, read once per render batch on the GL BACKEND WORKER thread
 // (~34 reads/frame). Candidate arm (1) = elide GL calls that set the value GL already holds. Same
 // per-frame thread-local tick-sequence memo as every other thread-level arm.
@@ -1203,12 +1893,73 @@ int g497WinBufArm()
     return arm != 0u ? 1 : 0;
 }
 
+// G498 owner-publish arm. Read once per publication (twice per frame) on the GS worker, so the
+// `used` memo costs one relaxed load and, at most, one atomic per thread per frame. The CONTROL arm
+// is the untouched per-pixel loop, so a candidate publication can never subsidise a control one:
+// both write the same VRAM bytes and neither leaves state behind (G418's page table is keyed on
+// (block,width) and is rebuilt on demand, so a control frame that skips it costs nothing later).
+int g498OwnPubArm()
+{
+    if (g419AbLever() != static_cast<int>(kG498LeverOwnPub))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
 bool g438SlowLeverSelected(int which);
 int g438SlowArm(int which)
 {
     const int want = (which == 0) ? static_cast<int>(kG438LeverVu1Slow)
                                   : static_cast<int>(kG438LeverGsSlow);
     if (g419AbLever() != want)
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G503: the EE derivative probe's arm selector, called from the guest-frame hook in
+// dc2_game_override.cpp (the EE thread). Same contract as g438SlowArm: -1 when the probe is not the
+// selected lever (the site then honours the always-on DC2_G503_EE_SLOW_US value), 0 on a control
+// frame, 1 on a candidate frame. The site runs ONCE per guest frame, so unlike g439CoalesceArm the
+// `used` RMW could have been unconditional; it keys on the tick sequence anyway so the two probes
+// read identically.
+int g503EeSlowArm()
+{
+    if (g419AbLever() != static_cast<int>(kG503LeverEeSlow))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G503: the recycled-chain-buffer arm selector, called from the memory TU on the EE thread. Same
+// contract as g438SlowArm: -1 when not the selected lever (the site then honours the shipped default
+// / DC2_G503_NO_CHAINPOOL), 0 on a control frame, 1 on a candidate frame. Called a handful of times
+// per frame (once per DMA chain plus twice in processPendingTransfers), so the `used` RMW is memoed
+// on the tick sequence like every other selector rather than run unconditionally.
+int g503ChainPoolArm()
+{
+    if (g419AbLever() != static_cast<int>(kG503LeverChainPool))
         return -1;
     const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
     const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);

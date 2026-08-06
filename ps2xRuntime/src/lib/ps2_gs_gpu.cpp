@@ -1,4 +1,10 @@
 int g473SimdMergeArm();
+// G508: A/B arm for the m_stateMutex lock-skip lever, read once per GIF packet in
+// GS::processGIFPacket. Defined at global scope in g419_ab_instrument.inc (rasterizer TU) — declared
+// HERE, above every anonymous namespace, or it would bind to an internal-linkage symbol and fail to
+// link (the appendix's anon-namespace trap).
+int g508LockSkipArm();
+// G508: force-recompile marker — .inc edits do not trigger MSBuild (G359). revision: 1
 
 // G397: reserved A+D display-alias fix plus presentation diagnostics live in the parts below.
 // G412: force-recompile marker for immutable depth-two frame-boundary presentation snapshots.

@@ -324,10 +324,17 @@ namespace
     // across the blend. That costs more than the forwarding block it removes. The store-forwarding
     // class needs the wide replacement to be INPUT-FREE; it does not generalise from "a hot loop
     // writes lanes individually" to "any narrow store this loop makes". Do not rebuild it.
+    // G501: `G501Pin` says the CALLER has already proved `g436Lean` and `s_g428DestStore` — see
+    // `g490BlockBody` in vu1_g490_block_run.inc. Both then constant-fold, which deletes the
+    // `g421MaskRows()` arm (a real out-of-line call) and the whole `!s_g428DestStore` control-arm
+    // block from this body. Default false, so every existing call site is byte-identical.
+    template <bool G501Pin = false>
     static DC2_G330_FORCEINLINE void g428StoreDest(float *dst, __m128 value, uint8_t dest,
                                                    bool leanTab)
     {
-        if (!s_g428DestStore)
+        if constexpr (G501Pin)
+            leanTab = true;
+        if (!(G501Pin || s_g428DestStore))
         {
             // Control arm: the G421 shape, byte-identical to the pre-G428 default.
             g421StoreMasked(
@@ -402,10 +409,14 @@ namespace
     // G436: `hb` is the run()-hoisted address of the thread's history block. Passing nullptr
     // re-derives it here, which is the DC2_G436_LEGACY_ADDR control arm (one TLS materialisation
     // per push instead of one per run()).
+    // G501: same pin as g421FastUpper — when the caller has proved `hb != nullptr` the ternary
+    // (a null test plus a reference to the thread_local fallback, on every inline FMAC) folds to
+    // the dereference the caller already intended.
+    template <bool G501Pin = false>
     static DC2_G330_FORCEINLINE void g430PushPending(G430HistBlock *hb, int64_t stamp, __m128 r,
                                                      uint8_t dest)
     {
-        G430HistBlock &H = hb ? *hb : s_g430HB;
+        G430HistBlock &H = G501Pin ? *hb : (hb ? *hb : s_g430HB);
         const int slot = H.head;
         _mm_store_ps(H.vec[slot], r);
         H.stamp[slot] = stamp;
@@ -413,6 +424,56 @@ namespace
         H.kind[slot] = G428_MK_PENDING;
         H.head = (slot + 1 < G430_HIST) ? slot + 1 : 0;
     }
+
+    // G504: the SAME push with the ring cursor carried in the CALLER's local instead of in
+    // `H.head`. Statement for statement identical to `g430PushPending` above — the four stores are
+    // the same stores to the same slot — except that the cursor is read from and written to
+    // `slot` rather than to memory.
+    //
+    // WHY. `[G483:rawpc]` + the linker map (G504 §3) put the single hottest instruction of the
+    // whole VU1 worker inside this function, and the block around it at ~9.2% of the thread. The
+    // shipped disassembly of `g490BlockBody<1,0,1,1,0>` reads, on EVERY inline FMAC:
+    //
+    //     mov    rdi, qword ptr [rbp+0x80]      ; reload `hb` from its stack home
+    //     movsxd r8,  dword ptr [rdi+0xf0]      ; load H.head
+    //     ... four stores ...
+    //     mov    dword ptr [rdi+0xf0], ecx      ; store H.head back
+    //
+    // so consecutive pushes are chained through MEMORY: each `movsxd` waits on the previous
+    // iteration's store to forward. That is a genuine loop-carried dependence, which is the one
+    // class the out-of-order engine cannot hide — unlike the six refuted "remove an instruction
+    // from this loop" levers (G427/G442/G479/G483/G485/G486), whose operands were L1-resident
+    // behind perfectly-predicted branches. It is the same class as G485's win.
+    //
+    // The reload exists because the block calls `g422FastLower` for the lower kinds G481 left
+    // out-of-line, and a call clobbers all memory — so every loop-invariant value in this leaf is
+    // respilled and reloaded per pair. A LOCAL whose address never escapes is the one thing a call
+    // cannot clobber, which is why the cursor must be a local and not a hoisted pointer.
+    //
+    // EXACTNESS. Inside a block the only writer of `H.head` is this push: `g430PushEager` is called
+    // only from vu1_upper_opcodes.inc (the legacy pair-loop macro and run()'s seeding prologue),
+    // `g430ResolveAt` scans all G430_HIST entries by STAMP and never reads `head`, and
+    // `g422FastLower` — the one call the block makes — cannot reach `s_g430HB` at all (it lives in
+    // vu1_g422_fast_lower.inc, which does not name it). So carrying the cursor across the block and
+    // writing it back once at the single exit leaves `H` byte-identical to what the per-push form
+    // would have left, entry by entry and in the same slots.
+    template <bool G501Pin = false>
+    static DC2_G330_FORCEINLINE void g430PushPendingAt(G430HistBlock *hb, int &slot, int64_t stamp,
+                                                       __m128 r, uint8_t dest)
+    {
+        G430HistBlock &H = G501Pin ? *hb : (hb ? *hb : s_g430HB);
+        const int s = slot;
+        _mm_store_ps(H.vec[s], r);
+        H.stamp[s] = stamp;
+        H.dest[s] = dest;
+        H.kind[s] = G428_MK_PENDING;
+        slot = (s + 1 < G430_HIST) ? s + 1 : 0;
+    }
+
+    // G504: the default target of `g421FastUpper`'s cursor parameter. Every call site that does not
+    // opt in instantiates with `G504Cursor = false`, and the `if constexpr` below discards the arm
+    // that names it — so this object is never read, never written, and generates no code.
+    int g504UnusedSlot = 0;
 
     // G430: record an already-classified MAC (a writer outside the inline FMAC path, e.g. the
     // legacy execUpper on an encoding G421 does not cover). Rare by construction.
@@ -526,14 +587,25 @@ namespace
     }
 #endif // DC2_G442_DENORM_CENSUS
 
+    // G501: `G501Pin` is the compile-time form of "`g436Hb` is non-null and `s_g428DestStore` is
+    // true", which `g443Fixed` already proves for every caller inside the block copy (it lists
+    // `g436Lean && g436Hb != nullptr` among its conjuncts, and G501 adds `s_g428DestStore`).
+    // Pinning them here is what lets MSVC delete the `g421Desc()` / `g421MaskRows()` arms — both
+    // REAL out-of-line calls — and the reload of `g436Hb` from its stack slot on every pair.
+    // Defaults to false, so every pre-existing call site compiles to exactly the same code.
+    // G504: `G504Cursor` says the CALLER carries the G430 ring cursor in `g504Slot` (a local of
+    // `g490BlockBody`) instead of in `H.head`. Defaults to false with the parameter bound to a
+    // never-read global, so every pre-existing call site compiles to exactly the same code.
+    template <bool G501Pin = false, bool G504Cursor = false>
     static DC2_G330_FORCEINLINE bool g421FastUpper(VU1State &st, uint32_t upper, uint8_t kind,
                                                    bool g428Defer, bool g428Shadow = false,
                                                    bool g430Hist = false, int64_t g430Stamp = 0,
-                                                   G430HistBlock *g436Hb = nullptr)
+                                                   G430HistBlock *g436Hb = nullptr,
+                                                   int &g504Slot = g504UnusedSlot)
     {
         // G436: a non-null history block also means "lean addressing" — the run() hoist is armed,
         // so the constant-initialised tables are used instead of the out-of-line accessors.
-        const bool g436Lean = g436Hb != nullptr;
+        const bool g436Lean = G501Pin ? true : (g436Hb != nullptr);
         const G421UpperDesc d = g436Lean ? g421DescTableConst.e[kind] : g421Desc()[kind];
         if (d.cls == 0u)
             return false;
@@ -579,7 +651,7 @@ namespace
                 break;
             }
             // None of the five VF-writing forms above updates MAC/STATUS, and all write VF[ft].
-            g428StoreDest(st.vf[FT(upper)], r, dest, g436Lean);
+            g428StoreDest<G501Pin>(st.vf[FT(upper)], r, dest, g436Lean);
             return true;
         }
 
@@ -658,7 +730,11 @@ namespace
         {
             // G430: record (stamp, result, dest). No head advance, no tag, no carry: the consumer
             // finds this entry by stamp.
-            g430PushPending(g436Hb, g430Stamp, r, dest);
+            // G504: same four stores; only where the ring cursor lives differs.
+            if constexpr (G504Cursor)
+                g430PushPendingAt<G501Pin>(g436Hb, g504Slot, g430Stamp, r, dest);
+            else
+                g430PushPending<G501Pin>(g436Hb, g430Stamp, r, dest);
             if (g428Shadow)
             {
                 const uint32_t mac = g421MakeMacReg(r, dest);
@@ -689,7 +765,7 @@ namespace
             st.mac = mac;
             g329UpdateStatus(st.status, mac);
         }
-        g428StoreDest(d.cls == 1u ? st.vf[FD(upper)] : st.acc, r, dest, g436Lean);
+        g428StoreDest<G501Pin>(d.cls == 1u ? st.vf[FD(upper)] : st.acc, r, dest, g436Lean);
         return true;
     }
 } // namespace

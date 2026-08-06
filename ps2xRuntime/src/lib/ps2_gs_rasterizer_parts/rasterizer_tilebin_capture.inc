@@ -726,7 +726,17 @@
             if (g260NrOn())
                 g260NoteAppend(e); // accumulate this entry's R/W block ranges (open batch)
             g336NoteConsumer(e); // G336: first next-frame consumer of boundary-published state (default-off)
-            g_g144List.push_back(e);
+            // G510: `e` is a loop-local, fully assigned above and dead from here on (only the
+            // g156 stat block and the `return` follow), so moving it into the list lands the
+            // identical bytes in the identical slot and removes one whole G144Entry copy —
+            // ~150 bytes of GSContext + registers, three GSVertex, and a G149Buf
+            // copy-construct/destroy pair — from the GS worker's per-primitive path (~9,900/frame
+            // on lean MAP-0). Exact by construction; nothing observes `e` after the push.
+            // Rollback: DC2_G510_NO_CAPMOVE=1. Paired gate: DC2_G419_AB=capmove | g510both.
+            if (g510CapMoveActive())
+                g_g144List.push_back(std::move(e));
+            else
+                g_g144List.push_back(e);
             if (g_g156Stat)
                 g_g156CaptureNs.fetch_add(
                     (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(

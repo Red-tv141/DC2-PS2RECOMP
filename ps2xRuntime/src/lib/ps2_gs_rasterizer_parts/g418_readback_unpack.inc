@@ -256,10 +256,14 @@ static const G418Ct32Table &g418Ct32Table(uint32_t block, uint32_t width)
 
 // Publish GS rows [rowLo,rowHi] of a bottom-first colour readback into guest VRAM. `legacy` runs the
 // original serial per-pixel path verbatim; the fast path is the table/paired/lane form above.
+// G498 added `lanesOverride`: 0 keeps G418's own promoted lane policy verbatim (its call site passes
+// nothing), a positive value pins the lane count. The owner-publish sites pass 1 because on this
+// 6-physical-core host the row pool spends more OTHER-core time than it saves on the caller, and the
+// pole is no longer this thread (G498 §1: gsslow 0.23, vu1slow 0.81).
 static void g418UnpackColorRows(uint8_t *vram, uint32_t vramSize,
                                 const std::vector<uint32_t> &src,
                                 uint32_t fbBlock, uint32_t fbw, int fbW, int fbH,
-                                int rowLo, int rowHi, bool legacy)
+                                int rowLo, int rowHi, bool legacy, int lanesOverride)
 {
     if (vram == nullptr || rowHi < rowLo || fbW <= 0)
         return;
@@ -308,8 +312,13 @@ static void g418UnpackColorRows(uint8_t *vram, uint32_t vramSize,
         }
     };
     const int rows = rowHi - rowLo + 1;
-    const int lanes = (g418ParUnpackOn() && rows >= 8) ? g418UnpackLanes() : 1;
-    GSRowPool::instance().run(rowLo, rowHi, lanes, fastRows);
+    const int lanes = lanesOverride > 0
+                          ? lanesOverride
+                          : ((g418ParUnpackOn() && rows >= 8) ? g418UnpackLanes() : 1);
+    if (lanes <= 1)
+        fastRows(rowLo, rowHi); // no dispatch at all — GSRowPool::run would still cost its setup
+    else
+        GSRowPool::instance().run(rowLo, rowHi, lanes, fastRows);
 }
 
 // DC2_G418_PROFILE aggregate for the CPU-copy component, keyed by target.

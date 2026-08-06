@@ -148,6 +148,56 @@ namespace
         }
     }
 
+    // ===== G503: CALLER ATTRIBUTION FOR OUT-OF-EXE LEAVES =====
+    //
+    // The instrument's blind spot, found the first time it was pointed at the EE thread. `eeprof`
+    // read **35% of that thread inside DLL leaves** — memmove 10.86%, getenv 6.95%, memcmp 6.03%,
+    // ZwFreeVirtualMemory 5.69%, NtDelayExecution 5.63% — and a rip-only histogram can name the
+    // LEAF but never the CALL SITE, so none of it is actionable. `getenv` in particular is the
+    // arc's highest-value pattern (G500: one uncached read on the VU1 path was ~8 ms/f) and the
+    // existing name-bucketed census, `[G446:envcensus]`, prints NOTHING because its
+    // `g446NoteEnvRead` hook was never wired to the `envFlagEnabled` bodies — a G494-class dead
+    // counter, which is why guessing from a grep was the only option before this.
+    //
+    // Mechanism: when the sampled rip is outside our own image, copy a fixed window of the
+    // suspended thread's stack and, after resuming, record the FIRST qword in it that points into
+    // our image. That is the return address of the outermost DLL call, i.e. our call site.
+    //
+    // Exactness caveats, both real:
+    //   * It is a HEURISTIC, not an unwind. A stale qword left by an earlier deeper call can win
+    //     over the true return address. Read the rows as "our code that leads to this leaf", and
+    //     confirm any row that selects a lever by reading the source at that address.
+    //   * G497's law still applies on top: a public-symbol name is a fold until the `/MAP` says
+    //     otherwise. This adds a second inference on top of the first.
+    //
+    // The stack read uses ReadProcessMemory rather than a direct dereference so an invalid Rsp
+    // returns FALSE instead of faulting inside the sampler thread. Nothing is allocated while the
+    // target is suspended (the same rule the rip table already follows).
+    constexpr size_t kG446StackWords = 48; // 384 B above Rsp — deep enough for a CRT leaf's frame
+    G446Bucket g_g446CallerTable[kG446Slots]{};
+    uint64_t g_g446CallerTotal = 0;
+    uint64_t g_g446CallerNone = 0;
+
+    void g446RecordInto(G446Bucket *table, uint64_t rip, uint64_t *distinct)
+    {
+        uint64_t h = rip * 0x9E3779B97F4A7C15ull;
+        size_t idx = static_cast<size_t>(h >> 51) & (kG446Slots - 1);
+        for (size_t probe = 0; probe < kG446Slots; ++probe)
+        {
+            G446Bucket &b = table[idx];
+            if (b.rip == rip) { ++b.count; return; }
+            if (b.count == 0)
+            {
+                b.rip = rip;
+                b.count = 1;
+                if (distinct) ++*distinct;
+                return;
+            }
+            idx = (idx + 1) & (kG446Slots - 1);
+        }
+        ++g_g446Failed;
+    }
+
     void g446Record(uint64_t rip)
     {
         // FNV-ish mix; rip is 16-byte-ish sparse so shift out the low bits' correlation.
@@ -334,6 +384,68 @@ namespace
                          static_cast<unsigned long long>(top[i].rip), name);
         }
 
+        // G503: OUR CALL SITES for every sample that landed outside our image. See the
+        // g446RecordInto note above for why (35% of the EE thread was unattributable DLL leaves)
+        // and for the two exactness caveats (stack heuristic, then G497's fold law on top).
+        if (g_g446CallerTotal > 0)
+        {
+            static G446Bucket ctop[20];
+            size_t nC = 0;
+            for (size_t i = 0; i < kG446Slots; ++i)
+            {
+                const G446Bucket &b = g_g446CallerTable[i];
+                if (b.count == 0)
+                    continue;
+                const uint64_t base = g446FuncBase(b.rip);
+                size_t at = kG446Slots;
+                for (size_t j = 0; j < nC; ++j)
+                    if (ctop[j].rip == base) { at = j; break; }
+                if (at != kG446Slots)
+                    ctop[at].count += b.count;
+                else if (nC < 20)
+                {
+                    ctop[nC].rip = base;
+                    ctop[nC].count = b.count;
+                    ++nC;
+                }
+                else
+                {
+                    size_t worst = 0;
+                    for (size_t j = 1; j < 20; ++j)
+                        if (ctop[j].count < ctop[worst].count)
+                            worst = j;
+                    if (ctop[worst].count < b.count)
+                    {
+                        ctop[worst].rip = base;
+                        ctop[worst].count = b.count;
+                    }
+                }
+            }
+            std::sort(ctop, ctop + nC,
+                      [](const G446Bucket &a, const G446Bucket &b) { return a.count > b.count; });
+            std::fprintf(stderr,
+                         "[G446:%scaller] outOfExeSamples=%llu (%5.2f%% of all) unattributed=%llu "
+                         "(stack heuristic — confirm any row that selects a lever)\n",
+                         g_g446Label,
+                         static_cast<unsigned long long>(g_g446CallerTotal),
+                         100.0 * static_cast<double>(g_g446CallerTotal) / denom,
+                         static_cast<unsigned long long>(g_g446CallerNone));
+            for (size_t i = 0; i < nC; ++i)
+            {
+                char cname[560];
+                g446Symbolize(ctop[i].rip, cname, sizeof(cname));
+                const uint64_t pref = (g_g446ExeLo != 0 && ctop[i].rip >= g_g446ExeLo &&
+                                       ctop[i].rip < g_g446ExeHi)
+                                          ? ctop[i].rip - g_g446ExeLo + 0x140000000ull
+                                          : 0ull;
+                std::fprintf(stderr,
+                             "[G446:%scaller]   %5.2f%% n=%llu pref=0x%llx %s\n", g_g446Label,
+                             100.0 * static_cast<double>(ctop[i].count) / denom,
+                             static_cast<unsigned long long>(ctop[i].count),
+                             static_cast<unsigned long long>(pref), cname);
+            }
+        }
+
         // G483: RAW-PC report in PREFERRED-BASE form (DC2_G483_RAWPC=1).
         //
         // WHY. The fn-folded rows above answer "which function", and for this thread the answer has
@@ -402,6 +514,7 @@ namespace
         auto nextReport = std::chrono::steady_clock::now() + reportEvery;
 
         CONTEXT ctx;
+        uint64_t stackWin[kG446StackWords];
         for (;;)
         {
             std::this_thread::sleep_for(std::chrono::microseconds(periodUs));
@@ -410,12 +523,42 @@ namespace
             std::memset(&ctx, 0, sizeof(ctx));
             ctx.ContextFlags = CONTEXT_CONTROL;
             const BOOL ok = GetThreadContext(target, &ctx);
+            // G503: grab the stack window BEFORE resuming — after ResumeThread the frame is gone.
+            // Only for out-of-exe rips, which is the only case that needs a caller.
+            size_t nStack = 0;
+            if (ok && (static_cast<uint64_t>(ctx.Rip) < g_g446ExeLo ||
+                       static_cast<uint64_t>(ctx.Rip) >= g_g446ExeHi))
+            {
+                SIZE_T got = 0;
+                if (ReadProcessMemory(GetCurrentProcess(),
+                                      reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(ctx.Rsp)),
+                                      stackWin, sizeof(stackWin), &got) &&
+                    got >= sizeof(uint64_t))
+                {
+                    nStack = static_cast<size_t>(got / sizeof(uint64_t));
+                }
+            }
             ResumeThread(target);
             if (ok)
             {
                 ++g_g446Total;
                 const uint64_t rip = static_cast<uint64_t>(ctx.Rip);
                 g446Record(rip);
+                if (rip < g_g446ExeLo || rip >= g_g446ExeHi)
+                {
+                    ++g_g446CallerTotal;
+                    uint64_t caller = 0ull;
+                    for (size_t i = 0; i < nStack; ++i)
+                        if (stackWin[i] >= g_g446ExeLo && stackWin[i] < g_g446ExeHi)
+                        {
+                            caller = stackWin[i];
+                            break;
+                        }
+                    if (caller != 0ull)
+                        g446RecordInto(g_g446CallerTable, caller, nullptr);
+                    else
+                        ++g_g446CallerNone;
+                }
                 int stage = 7;
                 if (g_g446Stage != nullptr)
                 {
@@ -501,5 +644,31 @@ void g478RegisterVu1WorkerThread()
     if (!s_on)
         return;
     g446ArmSamplerOnThisThread(nullptr, "vu1prof");
+#endif
+}
+
+// ===== G503: the same sampler, pointed at the EE (guest main) thread =====
+//
+// The one thread this arc has never sampled, and after G503's premise gate the leading pole
+// candidate: `[G182:ee] cpuMs/f` is a GetThreadTimes delta reading 16.7-19.3 ms of REAL CPU per
+// ~20 ms frame (onCPU 84-96%), while `[G146:perf]` reports the four instrumented EE-side graphics
+// paths — VIF1, GIFsubmit, GSimage, GSlocal — at 0.0 each. So the EE burns most of the frame inside
+// recompiled guest code, and nothing splits that: `[G182:ee]`'s other column, `busyMs/f`, is the
+// wall time between successive mgEndFrame entries, i.e. it BRACKETS THE FRAME and can never rank
+// anything (G491's law).
+//
+// Every caveat of the G446/G478 instances applies: singleton (arm at most one of DC2_G446_GSPROF /
+// DC2_G478_VU1PROF / DC2_G503_EEPROF per run), absolute frame numbers taken with it armed are
+// inadmissible, only the DISTRIBUTION is. And G497's law bites hardest here: a public-symbol name
+// is a HYPOTHESIS until the `/MAP` says it is not a fold — though the runner's `sub_*` bodies are
+// external functions, not statics, so they fold less readily than the runtime's anonymous
+// namespaces do.
+void g503RegisterEeThread()
+{
+#ifdef _WIN32
+    static const bool s_on = (std::getenv("DC2_G503_EEPROF") != nullptr);
+    if (!s_on)
+        return;
+    g446ArmSamplerOnThisThread(nullptr, "eeprof");
 #endif
 }

@@ -8,7 +8,7 @@ void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 
 void GS::reset()
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    G508StateLock lock(m_stateMutex);
     std::memset(m_ctx, 0, sizeof(m_ctx));
     m_prim = {};
     m_curR = 0x80;
@@ -72,7 +72,7 @@ GSContext &GS::activeContext()
 
 void GS::snapshotVRAM()
 {
-    std::lock_guard<std::recursive_mutex> stateLock(m_stateMutex);
+    G508StateLock stateLock(m_stateMutex);
     if (!m_vram || m_vramSize == 0)
         return;
     std::lock_guard<std::mutex> lock(m_snapshotMutex);
@@ -95,7 +95,7 @@ const uint8_t *GS::lockDisplaySnapshot(uint32_t &outSize)
 
 bool GS::getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    G508StateLock lock(m_stateMutex);
     if (!m_hasPreferredDisplaySource)
     {
         outSource = {};
@@ -1065,6 +1065,11 @@ void GS::latchHostPresentationFrame()
                 const bool useRc2 = !pmode.slbg;
                 const bool mmod = pmode.mmod;
                 const uint32_t alp = static_cast<uint32_t>(pmode.alp);
+                const bool g473Simd = g473SimdMergeArm() != 0;
+                const bool g473Verify = g473Simd && g473VerifyOn();
+                static thread_local std::vector<uint8_t> g473Reference;
+                if (g473Verify)
+                    g440PrepareHostBuffer(g473Reference, width, height);
                 // Three straight-line sub-loops per row, not one branchy one: the first two are
                 // trivially auto-vectorised (a masked 32-bit copy and a 32-bit fill), and folding
                 // them into the blend loop measured +0.24 ms/f because it destroyed that.
@@ -1083,40 +1088,44 @@ void GS::latchHostPresentationFrame()
                     for (uint32_t x = rc2W; x < width; ++x)
                         dst[x] = bgWord;
 
+                    uint32_t *g473RefRow = nullptr;
+                    if (g473Verify)
+                    {
+                        g473RefRow = reinterpret_cast<uint32_t *>(g473Reference.data() + rowOff);
+                        std::memcpy(g473RefRow, dst, static_cast<size_t>(width) * sizeof(uint32_t));
+                    }
+
                     if (y < height1)
                     {
                         const uint32_t *const s1 =
                             reinterpret_cast<const uint32_t *>(rc1.data() + rowOff);
-                        for (uint32_t x = 0; x < width1; ++x)
-                        {
-                            const uint32_t s = s1[x];
-                            const uint32_t factor =
-                                mmod ? alp : std::min<uint32_t>(255u, (s >> 24) * 2u);
-                            // factor 255 => blendPresentationChannel returns src exactly;
-                            // factor 0 => it returns dst unchanged. Both collapse to one store
-                            // (or none) instead of three byte read-modify-writes.
-                            if (factor == 255u)
-                            {
-                                dst[x] = s | 0xFF000000u;
-                            }
-                            else if (factor != 0u)
-                            {
-                                const uint32_t d = dst[x];
-                                dst[x] = 0xFF000000u |
-                                         static_cast<uint32_t>(blendPresentationChannel(
-                                             static_cast<uint8_t>(s & 0xFFu),
-                                             static_cast<uint8_t>(d & 0xFFu), factor)) |
-                                         (static_cast<uint32_t>(blendPresentationChannel(
-                                              static_cast<uint8_t>((s >> 8) & 0xFFu),
-                                              static_cast<uint8_t>((d >> 8) & 0xFFu), factor))
-                                          << 8) |
-                                         (static_cast<uint32_t>(blendPresentationChannel(
-                                              static_cast<uint8_t>((s >> 16) & 0xFFu),
-                                              static_cast<uint8_t>((d >> 16) & 0xFFu), factor))
-                                          << 16);
-                            }
-                        }
+                        if (g473Simd)
+                            g473BlendPresentationRowSimd(s1, dst, width1, mmod, alp);
+                        else
+                            g473BlendPresentationRowScalar(s1, dst, width1, mmod, alp);
+                        if (g473Verify)
+                            g473BlendPresentationRowScalar(s1, g473RefRow, width1, mmod, alp);
                     }
+                }
+                if (g473Verify)
+                {
+                    static uint64_t s_g473Frames = 0u, s_g473Bytes = 0u, s_g473Bad = 0u;
+                    ++s_g473Frames;
+                    const size_t bytes = static_cast<size_t>(kHostFrameWidth) *
+                                         kHostFrameHeight * 4u;
+                    s_g473Bytes += bytes;
+                    if (std::memcmp(merged.data(), g473Reference.data(), bytes) != 0)
+                    {
+                        for (size_t i = 0; i < bytes; ++i)
+                            if (merged[i] != g473Reference[i])
+                                ++s_g473Bad;
+                    }
+                    if (s_g473Bad != 0u || (s_g473Frames % 30u) == 0u)
+                        std::fprintf(stderr,
+                                     "[G473:verify] frames=%llu bytes=%llu bad=%llu\n",
+                                     static_cast<unsigned long long>(s_g473Frames),
+                                     static_cast<unsigned long long>(s_g473Bytes),
+                                     static_cast<unsigned long long>(s_g473Bad));
                 }
             }
             else

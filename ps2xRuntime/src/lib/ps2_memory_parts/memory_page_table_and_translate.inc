@@ -92,6 +92,13 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    // G503: recycle the staging buffers instead of letting clear() free them. Every consumer above
+    // has finished reading `p.chainData` by here (submitGifPacket copies or forwards synchronously),
+    // so returning the storage to the thread-local pool is safe and is what lets the next frame's
+    // chains start at the high-water capacity. See memory_g503_chain_pool.inc.
+    if (g503ChainPoolEnabled())
+        for (auto &p : m_pendingGifTransfers)
+            g503ReleaseChainBuf(p.chainData);
     m_pendingGifTransfers.clear();
 
     const bool hadVif1 = !m_pendingVif1Transfers.empty();
@@ -173,6 +180,11 @@ void PS2Memory::processPendingTransfers()
             }
         }
     }
+    // G503: same recycle on the VIF1 list. `processVIF1Data(p.chainData.data(), size())` above has
+    // fully consumed the stream by this point.
+    if (g503ChainPoolEnabled())
+        for (auto &p : m_pendingVif1Transfers)
+            g503ReleaseChainBuf(p.chainData);
     m_pendingVif1Transfers.clear();
 
     if (m_gifArbiter)

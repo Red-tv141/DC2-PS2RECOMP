@@ -1840,19 +1840,19 @@ void GS::performLocalToHostToBuffer()
 
 bool GS::clearFramebufferContext(uint32_t contextIndex, uint32_t rgba)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    G508StateLock lock(m_stateMutex);
     return clearFramebufferRect(m_vram, m_vramSize, m_ctx[(contextIndex != 0u) ? 1 : 0], rgba);
 }
 
 bool GS::clearActiveFramebuffer(uint32_t rgba)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    G508StateLock lock(m_stateMutex);
     return clearFramebufferRect(m_vram, m_vramSize, activeContext(), rgba);
 }
 
 uint32_t GS::consumeLocalToHostBytes(uint8_t *dst, uint32_t maxBytes)
 {
-    std::lock_guard<std::recursive_mutex> lock(m_stateMutex);
+    G508StateLock lock(m_stateMutex);
     if (!dst || maxBytes == 0)
         return 0;
     size_t avail = m_localToHostBuffer.size() - m_localToHostReadPos;

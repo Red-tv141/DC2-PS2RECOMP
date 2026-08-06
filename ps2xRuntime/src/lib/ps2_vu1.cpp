@@ -101,3 +101,43 @@
 // G490 map relink v1.
 // G490 oracle copy compiled out (force recompile v2).
 // G490 map relink v2.
+// G499: the G490 block executor's LOWER DISPATCH, brought level with the pair loop's. The block
+//       body called g422FastLower for every pair — it never got G480's NOP skip (the callee's whole
+//       body for that kind is `return;`, and NOP is 39.5% of all pairs) nor G481's inline hot
+//       INTEGER kinds (IADDI 6.99% + IADDIU 3.07% + IAND 3.02%), both promoted default-ON in
+//       DC2_G422_RUN_LOWER since G481. One template body, two noinline instantiations, so the
+//       control arm's text is unchanged. Gate DC2_G419_AB=blklower, ROLLBACK DC2_G499_NO_BLKLOWER=1,
+//       proof DC2_G499_STAT=1 (force recompile v1).
+// G499 §2: the Q/P delay counters as BLOCK LOCALS. The same body read-modify-wrote both through
+//       `int *` on every pair with an inlined g422FastLower (which stores into vuData) in between,
+//       so MSVC had to reload them from memory at the top of every iteration. Block eligibility
+//       excludes every writer of those counters, so inside a block they can only count down and a
+//       local written back once is exact. NOT G479's refuted QPREG — that was run()'s
+//       register-starved pair loop; this is a 4.7 KB leaf. Gate DC2_G419_AB=qpblock (control = the
+//       blklower candidate), ROLLBACK DC2_G499_NO_QPLOCAL=1 (force recompile v2).
+//       REFUTED and COMPILED OUT (DC2_G499_QPLOCAL 0): -0.050/+0.191/-0.057/-0.031 ms/f, mean
+//       +0.013, signs disagree. Sixth confirmation of the live-value law and the FIRST taken
+//       outside run()'s pair loop (force recompile v3).
+// G500: let a block run END on the CONTROL TRANSFER that terminates it, and swallow that branch's
+//       delay slot. Control transfer is 8.88% of all pairs and ~69% of all run terminations (why
+//       the average run is 7.81), and a TAKEN branch's delay slot is excluded twice over because
+//       the block hook is gated on `pendingBranchTarget == NO_BRANCH`. The tail only EXTENDS a run
+//       that already formed a block, so blocks/frame is invariant across the arms. New sidecar
+//       table g500Tail[] (0/1/2), built by the same g490RebuildRunLengths pass. Gate
+//       DC2_G419_AB=blkbranch (control = the G499 shipped body), ROLLBACK DC2_G500_NO_BLKBRANCH=1,
+//       per-arm invariant DC2_G500_STAT=1, oracle DC2_G490_VERIFY=1 (force recompile v1).
+// G501: PIN the block executor's loop-invariant ADDRESSING predicates. `dumpbin /DISASM` of the
+//       G500 block body g490BlockBody<1,0,1> (0x3538 bytes) showed `hb` reloaded from its STACK
+//       SLOT [rbp+80h] TWELVE times, the global s_g428DestStore loaded SIX times, and ELEVEN dead
+//       calls (g421Desc x3, g421MaskRows x8) on arms `g443Fixed` already proves unreachable —
+//       three of the `hb` tests on the MAIN per-pair path. The pair loop folds all of this through
+//       G443's constexpr shadows; the block leaf lost it at the call boundary because `hb` is a
+//       runtime pointer parameter. `G501Pin` restores the fold inside the leaf: 12 -> 4 stack
+//       refs, 6 -> 0 global loads, 11 -> 0 calls, 0x3538 -> 0x3364 bytes.
+//       UNCONDITIONAL, not an arm — it deletes provably-unreachable code, so there is nothing for
+//       a control arm to differ about. Rollback is the pre-existing one: DC2_G436_LEGACY_ADDR=1 or
+//       DC2_G428_NO_DEST_STORE=1 falsifies g443Fixed and drops the run onto the legacy loop copy.
+//       Gated as DC2_G419_AB=blkpin while it was being measured: -0.167 ms/f mean over 4 paired
+//       runs on the shipped link (-0.266 / +0.033 / -0.346 / -0.088, 3/4 negative, 20/32 windows)
+//       against -0.755 over 3 runs on the previous link. AT THE INSTRUMENT FLOOR — the scaffolding
+//       was removed and the fold kept (force recompile v3).

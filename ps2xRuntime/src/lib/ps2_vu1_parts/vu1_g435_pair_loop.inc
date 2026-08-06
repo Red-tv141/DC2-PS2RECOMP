@@ -731,31 +731,234 @@
             const uint32_t g490Avail =
                 static_cast<uint32_t>(s_g410Cache.g490RunLen[currentPc >> 3u]);
             const uint32_t g490Budget = maxCycles - cycle;
-            const uint32_t g490Count = g490Avail < g490Budget ? g490Avail : g490Budget;
-            if (g490Count >= G490_MIN_RUN)
+            uint32_t g490Count = g490Avail < g490Budget ? g490Avail : g490Budget;
+            // G502 CEILING PROBE (`DC2_G419_AB=blksplit`) — it has ANSWERED and is COMPILED OUT
+            // (`DC2_G502_SPLIT_PROBE 0`), so `g502Split` is a `constexpr 0` and this folds away.
+            // It cut every block whose clamped length reaches 2*MIN_RUN exactly in half, so the SAME
+            // pairs ran in the SAME order with bit-identical coverage and only the number of trips
+            // round this loop changed (`g490RunLen` decreases by exactly one per slot inside a run,
+            // so the second half's own run length is `>= MIN_RUN` and forms a block of its own; the
+            // G500 tail attaches to that second half because `g490Count == g490Avail` is false for
+            // the first). Four paired runs, +0.360 ms/f mean over 190,653 extra round trips/frame:
+            // **A BLOCK ROUND TRIP COSTS 1.89 ns**, which bounds every envelope lever ever proposed
+            // for this loop at 158 k × 1.89 = 0.30 ms/f. See the fix log §3.
+            if (g502Split && g490Count >= 2u * G490_MIN_RUN)
+                g490Count = (g490Count + 1u) / 2u;
+            // G500: may this block also execute the CONTROL TRANSFER that ends the run, and
+            // that branch's delay slot? Three conditions, all cheap and all once per BLOCK:
+            //   * the whole eligible run fits the cycle budget (`g490Count == g490Avail`), so
+            //     the pair after it really is the branch and not a budget truncation;
+            //   * the tail slots are inside `codeSize` (the pair loop would otherwise have
+            //     stopped on `pc-oob`, and the wrap below has to match its sequential wrap);
+            //   * the tail itself fits the remaining budget.
+            //
+            // G502 `blktail0` — REFUTED and COMPILED OUT (`DC2_G502_BLKTAIL0 0`), so `g502Tail0` is
+            // a `constexpr 0` and both guards below fold back to the G500 shape exactly. The shape
+            // is left here because the refutation is worth reading at the site: admitting a block on
+            // `count + tail` instead of on `count` would have captured the 4.15% of all pairs
+            // (`[G502:excl]`: branch 2.10% + their delay slots 2.05%) that G500's tail leaves
+            // outside — the very population G500 measured at 7.0 ns/pair — and it measured
+            // **+0.121 then +0.082 ms/f, slower 4/4 on each of two links**, with coverage doing
+            // exactly what it was designed to do (89.00% → 93.31%). **A block does not save the
+            // pair-loop iteration it is ENTERED from**, so a new 2-pair block is worth
+            // `2 × envelope − 1.89 ns` and that is ≤ 0. See the fix log §6.
+            uint32_t g500Tail = 0u;
+            uint32_t g500BPc = 0u;
+            bool g500Taken = false;
+            // G504: arm 6 is arm 3's body with the ring cursor in a local, so it must form the SAME
+            // tails — keying this on `== 3` alone would have given the two arms different work and
+            // made the paired gate meaningless. (G501 §6's law, one level up from an instrument:
+            // never key BEHAVIOUR on one arm value when a later phase adds another arm to the same
+            // family.) The test is loop-invariant and present on both arms, so it cancels.
+            // G506: arm 7 joins the same family for the same reason, and this is the THIRD time the
+            // law has fired here. It was caught by `[G490:block] cover=76.98% avg=7.80` — the
+            // pre-G500 figures — on the very first oracle run, i.e. by an invariant, not by the
+            // gate. **Any new arm on this body must be added here in the same edit that adds it.**
+            if ((g499BlkArm == 3 || g499BlkArm == 6 || g499BlkArm == 7) &&
+                g490Count == g490Avail &&
+                (g490Count >= G490_MIN_RUN || g502Tail0))
+            {
+                // G502: ONE byte load at the slot already being indexed. `g502TailAt[i]` IS
+                // `g500Tail[i + g490RunLen[i]]`, pre-joined by g490RebuildRunLengths, and it is
+                // zero for 87% of hook entries under `blktail0` — so the address arithmetic and
+                // both clamps below run only when there really is a tail.
+                uint32_t g500T =
+                    static_cast<uint32_t>(s_g410Cache.g502TailAt[currentPc >> 3u]);
+                if (g500T != 0u)
+                {
+                    g500BPc = currentPc + 8u * g490Avail;
+                    if (g500BPc + 8u > codeSize)
+                        g500T = 0u;
+                    else
+                    {
+                        if (g500T == 2u && g500BPc + 16u > codeSize)
+                            g500T = 1u;
+                        if (g490Avail + g500T > g490Budget)
+                            g500T = 0u;
+                    }
+                    g500Tail = g500T;
+                }
+            }
+            // `g500Tail != 0` already implies at least one pair, so a lone control transfer forms
+            // a one-pair block: it saves the ~7 ns/pair envelope and costs one 1.89 ns round trip.
+            // A lone ELIGIBLE pair (`count == 1`, `tail == 0`) is deliberately NOT admitted — G490's
+            // realised rate for a plain pair is 0.45 ns, which does not pay for the round trip.
+            if (g490Count >= G490_MIN_RUN || (g502Tail0 && g500Tail != 0u))
             {
 #if DC2_G490_VERIFY_BLOCK
                 // A SEPARATE COPY, selected by DC2_G490_VERIFY=1, exactly like the G483 oracle
                 // copy — never a timing arm. G489 §6's rule (a verifier must not sit in a copy its
                 // own flag deselects) is satisfied by construction: the flag selects THIS copy.
                 g490VerifyBlock(vuCode, currentPc >> 3u, g490Count);
+                if (g500Tail != 0u)
+                    g500VerifyTail(vuCode, g500BPc >> 3u, g500Tail);
 #endif
-                g490ExecuteBlock(m_state, currentPc >> 3u, g490Count, vuData, dataSize,
-                                 s_qDelayP, s_pDelayP, g430Base + (int64_t)cycle, g436Hb);
-                // Sequential by construction: eligibility excludes every lower that can write pc
-                // (G489's complete branch/jump set), so this is `currentPc + 8 * count` with the
-                // same wrap the tail applies.
-                uint32_t g490Next = currentPc + 8u * g490Count;
+                // G499: which block executor. The bodies differ ONLY inside the (noinline) block —
+                // the pair loop's own text is unchanged apart from these loop-invariant,
+                // perfectly-predicted branches, which are taken once per BLOCK (~160 k/frame
+                // against ~1.62 M pairs), not once per pair, and are present in both arms so they
+                // cancel in the paired estimator.
+#if DC2_G506_QPSEG
+                // G506 ORACLE (DC2_G506_VERIFY=1, default off, CALLER side). The lever rests on one
+                // claim: no block-eligible pair can RE-ARM either scalar-pipe counter, so inside a
+                // block both can only count down. If that holds, the value each counter is left
+                // with is exactly `max(entry - pairsConsumed, 0)`; a lower that armed one would
+                // leave 7, 13, 18 or 24 there instead, and a mistake in the segmentation would
+                // leave anything else. Kept OUT of the leaf deliberately — holding the entry values
+                // live across the block is the extra-live-value cost that grew G504's frame
+                // (G483's law), and the caller has them for free. One memoised bool per BLOCK.
+                // Declared here, ABOVE the whole dispatch chain, so it never lands between an
+                // `else` and its statement whatever combination of the arm #ifs is compiled in.
+                const bool g506Verify = g506VerifyOn();
+                const int g506QEntry = g506Verify ? *s_qDelayP : 0;
+                const int g506PEntry = g506Verify ? *s_pDelayP : 0;
+#endif
+#if DC2_G502_BLKCHAIN
+                // G502: the CHAIN arm returns only when the next slot would not have formed a
+                // block anyway, so everything the fold below computes is computed inside the leaf
+                // instead — once per chain rather than once per block. Nothing else about this
+                // iteration differs, which is why `[G500:inv]`'s every column but `calls=` is an
+                // invariant across the two arms.
+                if (g499BlkArm == 5)
+                {
+                    G502ChainOut g502o{};
+                    g502ExecuteBlockChain(m_state, currentPc >> 3u, g490Count, vuData, dataSize,
+                                          s_qDelayP, s_pDelayP, g430Base + (int64_t)cycle, g436Hb,
+                                          g500Tail, g502o, codeSize, g490Budget);
+                    if (g502o.pendingValid)
+                        pendingBranchTarget = g502o.pendingTarget;
+                    m_state.pc = g502o.nextPc;
+                    G483_PC_SET(g502o.nextPc);
+                    if (g500Stat)
+                        g500NoteChain(g500InvArm, g502o.segments, g502o.plain, g502o.tail1,
+                                      g502o.tail2, g502o.taken);
+                    if (g490Stat)
+                        g490NoteBlocks(g502o.segments, g502o.consumed);
+                    cycle += g502o.consumed - 1u;
+                    continue;
+                }
+#endif
+#if DC2_G499_QPLOCAL
+                if (g499BlkArm == 2)
+                    g499ExecuteBlockFastQp(m_state, currentPc >> 3u, g490Count, vuData, dataSize,
+                                           s_qDelayP, s_pDelayP, g430Base + (int64_t)cycle, g436Hb);
+                else
+#endif
+#if DC2_G506_QPSEG
+                if (g499BlkArm == 7)
+                    g506ExecuteBlockTailQpSeg(m_state, currentPc >> 3u, g490Count, vuData, dataSize,
+                                              s_qDelayP, s_pDelayP, g430Base + (int64_t)cycle,
+                                              g436Hb, g500Tail);
+                else
+#endif
+#if DC2_G504_HISTCUR
+                if (g499BlkArm == 6)
+                    g504ExecuteBlockTailCur(m_state, currentPc >> 3u, g490Count, vuData, dataSize,
+                                            s_qDelayP, s_pDelayP, g430Base + (int64_t)cycle, g436Hb,
+                                            g500Tail);
+                else
+#endif
+#if DC2_G500_BLKBRANCH
+                if (g499BlkArm == 3)
+                    g500ExecuteBlockTail(m_state, currentPc >> 3u, g490Count, vuData, dataSize,
+                                         s_qDelayP, s_pDelayP, g430Base + (int64_t)cycle, g436Hb,
+                                         g500Tail);
+                else
+#endif
+                if (g499BlkArm == 1)
+                    g499ExecuteBlockFast(m_state, currentPc >> 3u, g490Count, vuData, dataSize,
+                                         s_qDelayP, s_pDelayP, g430Base + (int64_t)cycle, g436Hb);
+                else
+                    g490ExecuteBlock(m_state, currentPc >> 3u, g490Count, vuData, dataSize,
+                                     s_qDelayP, s_pDelayP, g430Base + (int64_t)cycle, g436Hb);
+#if DC2_G506_QPSEG
+                if (g506Verify)
+                    g506VerifyBlockQp(g506QEntry, g506PEntry, g490Count + g500Tail,
+                                      *s_qDelayP, *s_pDelayP, g499BlkArm);
+#endif
+                uint32_t g490Next;
+                if (g500Tail == 0u)
+                {
+                    // Sequential by construction: eligibility excludes every lower that can write
+                    // pc (G489's complete branch/jump set), so this is `currentPc + 8 * count`
+                    // with the same wrap the tail applies.
+                    g490Next = currentPc + 8u * g490Count;
+                }
+                else
+                {
+                    // G500: the pair loop's own branch protocol, applied ONCE to the tail instead
+                    // of once per pair. `m_state.pc` different from the branch pair's own PC is
+                    // exactly the tail's `m_state.pc != currentPc` test, so the two arms agree
+                    // even on the degenerate `B 0` encoding that test treats as not-taken.
+                    g500Taken = (m_state.pc != g500BPc);
+                    if (g500Tail == 2u)
+                    {
+                        // The delay slot ran inside the block, so the pending target is consumed
+                        // here: taken -> the branch target, not taken -> past the delay slot.
+                        g490Next = g500Taken ? (m_state.pc + 8u) : (g500BPc + 16u);
+                    }
+                    else
+                    {
+                        // The delay slot is not block-eligible; hand it back to the pair loop with
+                        // the pending target the loop's own tail would have latched.
+                        if (g500Taken)
+                        {
+                            pendingBranchTarget = m_state.pc + 8u;
+                            if (pendingBranchTarget >= codeSize)
+                                pendingBranchTarget = 0u;
+                        }
+                        g490Next = g500BPc + 8u;
+                    }
+                }
                 if (g490Next >= codeSize)
                     g490Next = 0u;
+                if (g500Stat)
+                    g500NoteBlock(g500InvArm, g490Count, g500Tail, g500Taken);
+                // G502: block-entry census. Once per BLOCK, out of line, behind a bool cached once
+                // per run() — `chain=` is what a chaining executor could have kept, `split=` is the
+                // denominator the ceiling probe's frame delta is divided by.
+                if (g502Census)
+                    g502NoteBlock(g490Count, g500Tail, g500Taken,
+                                  g490Avail < g490Budget ? g490Avail : g490Budget,
+                                  g490Next, maxCycles - (cycle + g490Count + g500Tail),
+                                  pendingBranchTarget != DC2_G442_NO_BRANCH, codeSize);
                 m_state.pc = g490Next;
                 G483_PC_SET(g490Next);
                 if (g490Stat)
-                    g490NoteBlock(g490Count);
-                cycle += g490Count - 1u;
+                    g490NoteBlock(g490Count + g500Tail);
+                cycle += (g490Count + g500Tail) - 1u;
                 continue;
             }
         }
+        // G502: control reaches here only when this pair is about to be executed by the PAIR LOOP
+        // rather than by a block, so this call counts exactly the ~11% remainder and classifies it
+        // in g490BlockPairEligible's own test order. DYNAMIC by construction — a static slot tally
+        // in g490RebuildRunLengths cannot answer this, because the hot loop's slots execute orders
+        // of magnitude more often than the cold ones (the roadmap's own warning on task 2). One
+        // test of a loop-invariant bool plus a never-taken call (G421 law 17).
+        if (g502Census)
+            g502NotePlain(g410Pair, s_g410Cache.g490RunLen[currentPc >> 3u], maxCycles - cycle,
+                          pendingBranchTarget != DC2_G442_NO_BRANCH, m_state.ebit);
 #endif // DC2_G490_BLOCKRUN
 
 #if DC2_VU1_LOOP_DIAG

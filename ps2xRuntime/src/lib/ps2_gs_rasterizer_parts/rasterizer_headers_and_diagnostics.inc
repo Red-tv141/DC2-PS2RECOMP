@@ -38,7 +38,30 @@ using namespace GSInternal;
 namespace GSMem
 {
 std::uint32_t AddressP8(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+
+// G512: ROW-BATCHED swizzled readers for g178DecodeWhole's inner loop (implemented in
+// ps2_gs_memory_parts/g512_texdecode_row_readers.inc, likewise absent from the public header — a
+// header edit costs a 30+ hour full rebuild). MUST be declared HERE, at true global scope, and not
+// inside the anonymous namespace this file opens below: a `namespace GSMem` reopened in there
+// would name `(anonymous)::GSMem` and bind to a symbol that does not exist (the anonymous-namespace
+// linkage trap, appendix-dc2-project.md §3).
+void G512ReadRowCT32(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t *);
+void G512ReadRowP8(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint8_t *);
+void G512ReadRowP4(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint8_t *);
+void G512ReadRowP4HL(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint8_t *);
+void G512ReadRowP4HH(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint8_t *);
 }
+
+// G512: the fast-decode arm accessor, its exactness-oracle gate and its psm census sink. All four
+// are DEFINED with external linkage in g419_ab_instrument.inc, which this TU includes long after
+// rasterizer_command_graph.inc — but the call site (g178DecodeWhole) sits inside that file's
+// anonymous namespace, where a forward declaration would name a different, never-defined symbol.
+// So they are declared HERE, in the same true-global gap GSMem::AddressP8 above uses and for the
+// same reason rasterizer_command_graph.inc:30-38 hoists `int g476PageBumpArm();` out of it.
+bool g512FastDecActive();
+bool g512VerifyOn();
+bool g512PsmCensusOn();
+void g512PsmNote(std::uint8_t psm, std::uint64_t pixels, bool fast, int texW, int texH, int lanes);
 
 // G264 private .cpp-to-.cpp bridge: alias-aware partial FBO patch. Deliberately kept out of
 // ps2_gs_gpu_lle.h so no generated-target header is touched.

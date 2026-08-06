@@ -925,6 +925,12 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         g425Lean && g426Predecode && !g427Lazy && g428Defer && g428DeferPark &&
         g430MacPipeOn && g430Hist && !g430Shadow && g436Lean && !g436FlagStore &&
         g436Hb != nullptr &&
+        // G501: the promoted destination-store form. Same class as `g436Lean` above — a promoted
+        // representation whose rollback flag (DC2_G428_NO_DEST_STORE=1) now drops the run onto the
+        // legacy copy instead of putting a runtime test on the fixed one. It is a conjunct so that
+        // the block executor may treat it as a compile-time constant (vu1_g490_block_run.inc,
+        // `G501Pin`), which is what deletes the `g421MaskRows()` arms from that leaf.
+        s_g428DestStore &&
         // opt-in / never-promoted substrates
         !g435HazReg && !g435WideVf0 && !s_g295KeepHaz && !s_g106ParallelFlags &&
         // ceiling probes
@@ -1006,6 +1012,43 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     (void)g490VerifyBlockOn; // read only by the oracle copy, which ships compiled out
     const bool g490Stat = g490StatOn();
     g490ReportArmed(g490BlockRun);
+    // G499: the block executor's lower dispatch (G480 NOP skip + G481 hot-integer inline, both of
+    // which the pair loop has had since G481 and the block body never got). Read ONCE per run()
+    // like every other thread-level arm, and only meaningful when the block copy is the one
+    // selected — see vu1_g490_block_run.inc.
+    const int g499BlkArm = g490BlockRun ? g499BlkArmRun() : 0;
+    // G502: the block-round-trip ceiling probe's arm and the block-entry census. Read ONCE per
+    // run() like every other thread-level arm (G479's rule), and both memoised behind a
+    // function-local `static const` on their default paths (G500 §4's blind spot).
+    // Both are COMPILED OUT on the shipped binary (the probe has answered, the lever is refuted —
+    // §3/§6 of the fix log); the `constexpr 0` folds every one of their tests out of the hook.
+#if DC2_G502_SPLIT_PROBE
+    const int g502Split = g490BlockRun ? g502SplitArmRun() : 0;
+#else
+    [[maybe_unused]] constexpr int g502Split = 0;
+#endif
+    const bool g502Census = g490BlockRun && g502CensusOn();
+    // G502: the TAIL-0 admission. Orthogonal to `g499BlkArm` because it changes run()'s hook, not
+    // the block body, so it needs its own arm; DC2_G419_AB arms exactly one lever at a time, so
+    // each is gated with the other at its shipped default.
+#if DC2_G502_BLKTAIL0
+    const int g502Tail0 = g490BlockRun ? g502Tail0ArmRun() : 0;
+#else
+    [[maybe_unused]] constexpr int g502Tail0 = 0;
+#endif
+    // G502: which per-arm invariant bucket this run belongs to. `[G500:inv]` and `[G499:blk]` were
+    // being told `g499BlkArm == 3 ? 1 : 0` — a BOOLEAN OF THE ARM, which is the exact defect G501 §6
+    // fixed inside the counter array and left standing at the CALL SITE. It is the arm VALUE now,
+    // and because DC2_G419_AB arms exactly one lever at a time each new gate extends the same
+    // space: 4 = the `blksplit` candidate, 6 = the `blktail0` candidate, and the control arm of
+    // both is 3 (the G500 shipped body with the G500 admission test).
+    const int g500InvArm = g502Split ? 4 : (g502Tail0 ? 6 : g499BlkArm);
+    if (g490BlockRun)
+        g499ReportArmed(g500InvArm);
+    // G500: the per-arm workload-invariant census (DC2_G500_STAT=1). Read ONCE per run() like every
+    // other loop-invariant bool; the counters it feeds are updated once per BLOCK and once per
+    // run(), never per pair (G421 law 17).
+    const bool g500Stat = g490BlockRun && g500StatOn();
     // G486 REFUTED the wide single-lane FMAC destination store (`widedest`). It was built exactly
     // like G485's widevf0 — a copy of the promoted body in which the four single-lane dest masks
     // blend whole lanes and issue one 16-byte store instead of a 4-byte `_mm_store_ss` — and four
@@ -1144,6 +1187,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
         // cliff binds on exactly that resource. Set the #define to 1 to re-instantiate it (the
         // DC2_G479_QPREG / DC2_G485_HAZREG / DC2_G489_PCSKIP convention); everything the oracle
         // needs is still compiled in vu1_g490_block_run.inc.
+// G500 re-ran it with the control-transfer TAIL active (g500VerifyTail beside g490VerifyBlock):
+// `[G490:verify] pairs=2500000005 bad=0` at cover 88.99%, i.e. 204 M tail pairs re-derived from the
+// live code words — E/I bit clear, no prestall, no flag read, IS a pc-writer, no G139 pair hazard,
+// cached flags agreeing, and every tail-2 delay slot put through the plain-pair check. Compiled out
+// again immediately afterwards, and the gate in §5 of the G500 log was taken on THIS link.
 #ifndef DC2_G490_ORACLE
 #define DC2_G490_ORACLE 0
 #endif
@@ -1432,6 +1480,10 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     // the loop already carries — never a counter inside the loop (G421 law 17).
     if (g490Stat)
         g490NoteTotalPairs(cycle);
+    // G500: the same denominator, kept per ARM so the two buckets of a paired A/B can be compared
+    // without a second run (G492's rule — print the invariant PER ARM inside the same run).
+    if (g500Stat)
+        g500NoteRun(g500InvArm, cycle);
     if (g430Hist)
     {
         // Publish the architectural MAC once per run() (~1243 runs/frame).

@@ -1219,8 +1219,30 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     bool guestDepthWrites = false;
     uint32_t guestZbpPage = 0u;
     uint32_t guestZpsm = 0u;
-    for (const G144Entry &e : g_g144List)
+    // G510: consecutive graph entries almost always carry byte-identical STATE (a mesh's triangles
+    // differ only in their vertices), and G178EntryState is a pure function of that state — the
+    // ctx/prim/texa/texclut registers, pabe, fogcol and the two scope flags, plus static env gates
+    // and per-target predicates that are themselves functions of ctx.frame.fbp. When entry i's state
+    // compares byte-equal to entry i-1's, its classification IS entry i-1's, so reuse s_states[i-1]
+    // instead of re-deriving it. Exact by construction, and CONSERVATIVE in the safe direction: the
+    // comparison is over raw bytes, so struct padding can only ever cause a false MISS (an extra
+    // classify call), never a false HIT. Only accepted states are ever reused — the loop returns
+    // false on the first rejection, so a rejected entry can never be entry i-1.
+    // The two seen-counters inside classify (g262/g265) are census-only; the memo stands down
+    // whenever either census is armed so their totals stay exact.
+    const bool g510Memo = g510ClsMemoActive() && !g262CensusOn() && !g265CensusOn();
+    const bool g510Census = g510CensusOn();
+    // G511 INFLATION probe #2 (DC2_G419_AB=clsprobe, arm 1 only): repeat the state-identity test
+    // once more per entry and fold it into a sink that reaches an atomic once per FLUSH. `class`
+    // reads 1.00 ms/f (§2) with the G510 memo already serving 94.4% of the classifications, so the
+    // four memcmps + four scalar compares the memo pays on EVERY entry are the one per-entry price
+    // in `pre` that has never been measured. delta / entries-per-frame is that price.
+    const bool g511ClsProbe = g511ClsProbeActive();
+    uint64_t g511ClsSink = 0u;
+    uint64_t g510Eligible = 0u;
+    for (size_t g510i = 0; g510i < g_g144List.size(); ++g510i)
     {
+        const G144Entry &e = g_g144List[g510i];
         if (e.ctx.frame.fbp != fbp || e.ctx.frame.fbw != fbw)
         {
             static std::atomic<uint32_t> s_aliasColorLog{0};
@@ -1250,13 +1272,55 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             return false; // mixed targets in one flush — shouldn't happen (block flush on fbp change)
         }
         G178EntryState st;
-        if (!g178ClassifyEntry(e, st))
+        // G510: state-identity test against the immediately preceding entry. Each sub-struct is
+        // compared whole because every one of them is written by a single struct assignment at
+        // capture time (`e.ctx = ctx` etc), so their internal padding travels with their content.
+        const bool g510Same =
+            (g510Memo || g510Census) && g510i > 0u &&
+            std::memcmp(&e.ctx, &g_g144List[g510i - 1u].ctx, sizeof(GSContext)) == 0 &&
+            std::memcmp(&e.prim, &g_g144List[g510i - 1u].prim, sizeof(GSPrimReg)) == 0 &&
+            std::memcmp(&e.texa, &g_g144List[g510i - 1u].texa, sizeof(GSTexaReg)) == 0 &&
+            std::memcmp(&e.texclut, &g_g144List[g510i - 1u].texclut, sizeof(GSTexClutReg)) == 0 &&
+            e.pabe == g_g144List[g510i - 1u].pabe &&
+            e.fogcol == g_g144List[g510i - 1u].fogcol &&
+            e.titleRockScope == g_g144List[g510i - 1u].titleRockScope &&
+            e.townDepthScope == g_g144List[g510i - 1u].townDepthScope;
+        // G511: the extra comparison sits on the SAME operands as the real one, so it measures the
+        // marginal cost of the identity test itself (the second run is cache-warm exactly as a
+        // hypothetical replacement test would be). It cannot change behaviour — the result only
+        // reaches g511ClsSink.
+        if (g511ClsProbe && g510i > 0u)
+        {
+            const G144Entry &p = g_g144List[g510i - 1u];
+            g511ClsSink +=
+                (std::memcmp(&e.ctx, &p.ctx, sizeof(GSContext)) == 0 &&
+                 std::memcmp(&e.prim, &p.prim, sizeof(GSPrimReg)) == 0 &&
+                 std::memcmp(&e.texa, &p.texa, sizeof(GSTexaReg)) == 0 &&
+                 std::memcmp(&e.texclut, &p.texclut, sizeof(GSTexClutReg)) == 0 &&
+                 e.pabe == p.pabe && e.fogcol == p.fogcol &&
+                 e.titleRockScope == p.titleRockScope &&
+                 e.townDepthScope == p.townDepthScope)
+                    ? 1u : 0u;
+        }
+        if (g510Same)
+            ++g510Eligible;
+        if (g510Memo && g510Same)
+        {
+            st = s_states[g510i - 1u]; // identical state in ⇒ identical classification out
+        }
+        else if (!g178ClassifyEntry(e, st))
         {
             g_g266FlushRej = kG266FrClassify; // g_g266ClassifySite set inside g262NoteReject
             if (g261Wave)
                 g_g261RttClassifyRej.fetch_add(1u, std::memory_order_relaxed);
             g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
             g_g178FbSnap.clear(); // the CPU replay about to run writes VRAM the gens don't track
+            if (g510Census)
+            {
+                g_g510ClsEntries.fetch_add(g510i + 1u, std::memory_order_relaxed);
+                g_g510ClsEligible.fetch_add(g510Eligible, std::memory_order_relaxed);
+                g_g510Flushes.fetch_add(1u, std::memory_order_relaxed);
+            }
             return false;
         }
         // G282: G144 capture already computed conservative primitive rows with the same
@@ -1305,6 +1369,35 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 g282RowHi = std::max(g282RowHi, g282EntryHi);
             }
         }
+    }
+    // G511: one relaxed add per FLUSH (33.4/frame), never per entry (G502).
+    if (g511ClsProbe)
+        g_g511Sink.fetch_add(g511ClsSink, std::memory_order_relaxed);
+    if (g510Census)
+    {
+        g_g510ClsEntries.fetch_add(g_g144List.size(), std::memory_order_relaxed);
+        g_g510ClsEligible.fetch_add(g510Eligible, std::memory_order_relaxed);
+        if (g510Memo)
+            g_g510ClsServed.fetch_add(g510Eligible, std::memory_order_relaxed);
+        const uint64_t n = g_g510Flushes.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if ((n % 2000u) == 0u)
+            std::fprintf(stderr,
+                         "[G510:cls] flushes=%llu entries=%llu eligible=%llu (%.1f%%) served=%llu "
+                         "entriesPerFlush=%.1f\n",
+                         static_cast<unsigned long long>(n),
+                         static_cast<unsigned long long>(
+                             g_g510ClsEntries.load(std::memory_order_relaxed)),
+                         static_cast<unsigned long long>(
+                             g_g510ClsEligible.load(std::memory_order_relaxed)),
+                         100.0 * static_cast<double>(
+                                     g_g510ClsEligible.load(std::memory_order_relaxed)) /
+                             static_cast<double>(std::max<uint64_t>(
+                                 1u, g_g510ClsEntries.load(std::memory_order_relaxed))),
+                         static_cast<unsigned long long>(
+                             g_g510ClsServed.load(std::memory_order_relaxed)),
+                         static_cast<double>(
+                             g_g510ClsEntries.load(std::memory_order_relaxed)) /
+                             static_cast<double>(n));
     }
     static std::vector<uint32_t> s_g289OwnerSrc;
     bool g289OwnerViewReady = false;
@@ -3281,17 +3374,66 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // Textures: decode + upload anything not resident or invalidated by page-gen changes.
     static std::unordered_set<uint64_t> s_batchKeys;
     s_batchKeys.clear();
+    // G511: this pass walks every graph entry (~9,900/frame) and asks s_batchKeys whether the
+    // entry's effective texture key was already collected in THIS flush. G510 measured 94.4% of
+    // entries carrying byte-identical state to their predecessor, and the texture key is a function
+    // of that state, so the key is overwhelmingly the same key the previous iteration just resolved.
+    // `g511Present` remembers exactly one key that has been PROVEN resident in s_batchKeys, which
+    // turns the repeat's hash probe into a 64-bit compare.
+    //
+    // Exact by outcome, not merely by likelihood: the original test is
+    //   `effectiveKey == 0 || st.skip || s_batchKeys.count(effectiveKey)` -> continue
+    // and ALL THREE arms continue, so once the key is known-present the iteration continues whatever
+    // st.skip says. `g511Present` is only ever set where the set membership was actually
+    // established — after an insert, or after a count() that returned nonzero (never on the
+    // short-circuited st.skip arm, where count() was not evaluated) — and it is cleared on the one
+    // path that ERASES a key from the set (the G281 view-build failure below).
+    const bool g511Run = g511TexRunActive();
+    const bool g511Probe = g511TexProbeActive();
+    const bool g511Census = g511CensusOn();
+    const bool g511Split = g511TexSplitOn();
+    uint64_t g511Present = 0u;
+    uint64_t g511Entries = 0u, g511Probes = 0u, g511RunRep = 0u, g511ProbeSink = 0u;
+    uint64_t g511HashNs = 0u, g511HashN = 0u, g511DecodeNs = 0u, g511DecodeN = 0u;
+    uint64_t g511GenNs = 0u, g511GenN = 0u, g511HashPx = 0u, g511DecodePx = 0u;
+    const auto g511LoopT0 = g511Split ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
     for (size_t i = 0; i < g_g144List.size(); ++i)
     {
         const G178EntryState &st = s_states[i];
+        if (g511Census)
+            ++g511Entries;
         if (g261HaveFboSrc && s_g261FboSrc[i] != 0u)
             continue; // G261: sampled straight from the producer's FBO — no VRAM decode
         const uint64_t effectiveKey =
             (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u)
                 ? s_g281ViewKey[i] : st.texKey;
-        if (effectiveKey == 0u || st.skip || s_batchKeys.count(effectiveKey))
+        if (effectiveKey == 0u)
             continue;
+        if (g511Census)
+        {
+            ++g511Probes;
+            if (effectiveKey == g511Present)
+                ++g511RunRep;
+        }
+        // G511 INFLATION probe (DC2_G419_AB=texprobe, arm 1 only): one EXTRA set probe per PROBING
+        // entry, summed into a local that reaches an atomic once per flush so it cannot be deleted.
+        // It sits ABOVE the run-length shortcut deliberately: the population it prices must be the
+        // whole pre-G511 probe population (`probes/f` in the census), not the ~6% of entries that
+        // still miss the memo — otherwise the price would be divided by the wrong count, which is
+        // exactly how G508 mis-priced a lever 7.8x.
+        if (g511Probe)
+            g511ProbeSink += s_batchKeys.count(effectiveKey);
+        if (g511Run && effectiveKey == g511Present)
+            continue; // known present ⇒ the original test continues on its third arm
+        if (st.skip || s_batchKeys.count(effectiveKey))
+        {
+            if (!st.skip)
+                g511Present = effectiveKey; // count() was evaluated and said present
+            continue;
+        }
         s_batchKeys.insert(effectiveKey);
+        g511Present = effectiveKey;
         const G144Entry &e = g_g144List[i];
         const GSContext &ctx = e.ctx;
         const bool paletted = ctx.tex0.psm == GS_PSM_T8 || ctx.tex0.psm == GS_PSM_T4 ||
@@ -3360,6 +3502,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 }
             s_batchKeys.erase(failedKey);
             s_batchKeys.insert(st.texKey);
+            // G511: this is the ONLY path that removes a key from s_batchKeys, so the run-length
+            // memo's invariant ("g511Present is resident") would break here. Clear it — the next
+            // entry pays one ordinary hash probe. Costs nothing measurable: G281 build failures are
+            // rare by construction (they fall back to the legacy decode).
+            g511Present = 0u;
             // Continue below through the ordinary guest-VRAM texture registry/decode.
         }
 
@@ -3405,12 +3552,21 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             g_g178FbSnap.clear();
             return false;
         }
+        const auto g511GenT0 = g511Split ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
         const uint64_t genNow =
             g178GenSumRect(ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0, 0,
                            static_cast<uint32_t>(st.texW), static_cast<uint32_t>(st.texH)) +
             g178GenSumRect(ctx.tex0.cbp, 1, GS_PSM_CT32, 0, 0, 64, 32); // CLUT page(s)
         auto it = g_g178TexReg.find(st.texKey);
         const bool backendHas = g178_backend_has_tex(st.texKey);
+        if (g511Split)
+        {
+            g511GenNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - g511GenT0).count());
+            ++g511GenN;
+        }
         static const bool s_g401Ct24Redecode =
             envFlagEnabled("DC2_G401_CT24_REDECODE");
         const bool g401ForceDecode =
@@ -3424,9 +3580,19 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // Gen mismatch (or unknown): DC2 re-uploads texture data every frame, usually byte-
         // identical — hash the source pages before paying the swizzle+CLUT decode. Hash-equal +
         // still resident → refresh the gen stamp and keep the GPU copy.
+        const auto g511HashT0 = g511Split ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
         const uint64_t hashNow = g178HashPages(vram, vramSize, ctx.tex0.tbp0, ctx.tex0.tbw,
                                                ctx.tex0.psm, static_cast<uint32_t>(st.texW),
                                                static_cast<uint32_t>(st.texH), ctx.tex0.cbp);
+        if (g511Split)
+        {
+            g511HashNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - g511HashT0).count());
+            ++g511HashN;
+            g511HashPx += static_cast<uint64_t>(st.texW) * static_cast<uint64_t>(st.texH);
+        }
         if (!g401ForceDecode && it != g_g178TexReg.end() && backendHas &&
             it->second.contentHash == hashNow)
         {
@@ -3434,12 +3600,22 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             g_g178TexHashHits.fetch_add(1u, std::memory_order_relaxed);
             continue;
         }
+        const auto g511DecT0 = g511Split ? std::chrono::steady_clock::now()
+                                         : std::chrono::steady_clock::time_point{};
         G178TexUpload up;
         up.key = st.texKey;
         up.w = st.texW;
         up.h = st.texH;
         up.px.resize(static_cast<size_t>(st.texW) * st.texH);
         g178DecodeWhole(self, gs, vram, ctx, e.texa, e.texclut, st.texW, st.texH, up.px.data());
+        if (g511Split)
+        {
+            g511DecodeNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - g511DecT0).count());
+            ++g511DecodeN;
+            g511DecodePx += static_cast<uint64_t>(st.texW) * static_cast<uint64_t>(st.texH);
+        }
         if (g401CompositeOn() && ctx.tex0.psm == GS_PSM_CT24 &&
             ctx.tex0.tbp0 == 0x2720u)
         {
@@ -3474,6 +3650,93 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         s_batch.texUploads.push_back(std::move(up));
         g_g178TexReg[st.texKey] = G178TexReg{genNow, hashNow, st.texW, st.texH};
         g_g178TexDecodes.fetch_add(1u, std::memory_order_relaxed);
+    }
+    // G511: one relaxed add per counter per FLUSH (33.4/frame), never per entry — a per-entry
+    // counter would inflate the very loop it prices (G502).
+    if (g511Probe)
+        g_g511Sink.fetch_add(g511ProbeSink, std::memory_order_relaxed);
+    if (g511Split)
+    {
+        g_g511TexLoopNs.fetch_add(
+            static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g511LoopT0).count()),
+            std::memory_order_relaxed);
+        g_g511TexHashNs.fetch_add(g511HashNs, std::memory_order_relaxed);
+        g_g511TexHashN.fetch_add(g511HashN, std::memory_order_relaxed);
+        g_g511TexDecodeNs.fetch_add(g511DecodeNs, std::memory_order_relaxed);
+        g_g511TexDecodeN.fetch_add(g511DecodeN, std::memory_order_relaxed);
+        g_g511TexGenNs.fetch_add(g511GenNs, std::memory_order_relaxed);
+        g_g511TexGenN.fetch_add(g511GenN, std::memory_order_relaxed);
+        g_g511TexHashPx.fetch_add(g511HashPx, std::memory_order_relaxed);
+        g_g511TexDecodePx.fetch_add(g511DecodePx, std::memory_order_relaxed);
+        const uint64_t nf = g_g511TexSplitFlushes.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if ((nf % 2000u) == 0u)
+        {
+            // Per-FLUSH means; multiply by flushes/frame (33.4 on lean MAP-0) for ms/f. `rest` is
+            // a stated RESIDUAL — loop minus the three directly-timed sites — and must be read as
+            // one (G505/G507: never RANK with a residual; quoting one inside its own bucket, with
+            // the subtrahends measured directly, is what this is).
+            const double n = static_cast<double>(nf);
+            const double loop = static_cast<double>(
+                g_g511TexLoopNs.load(std::memory_order_relaxed)) / n / 1.0e6;
+            const double hash = static_cast<double>(
+                g_g511TexHashNs.load(std::memory_order_relaxed)) / n / 1.0e6;
+            const double dec = static_cast<double>(
+                g_g511TexDecodeNs.load(std::memory_order_relaxed)) / n / 1.0e6;
+            const double gen = static_cast<double>(
+                g_g511TexGenNs.load(std::memory_order_relaxed)) / n / 1.0e6;
+            const double hashN = static_cast<double>(
+                g_g511TexHashN.load(std::memory_order_relaxed));
+            const double decN = static_cast<double>(
+                g_g511TexDecodeN.load(std::memory_order_relaxed));
+            const double hashPx = static_cast<double>(
+                g_g511TexHashPx.load(std::memory_order_relaxed));
+            const double decPx = static_cast<double>(
+                g_g511TexDecodePx.load(std::memory_order_relaxed));
+            std::fprintf(stderr,
+                         "[G511:texsplit] flushes=%llu msPerFlush(loop=%.4f gen=%.4f hash=%.4f "
+                         "decode=%.4f rest=%.4f) perFlush(gen=%.2f hash=%.2f decode=%.2f) "
+                         "nsEach(gen=%.0f hash=%.0f decode=%.0f) "
+                         "avgPx(hash=%.0f decode=%.0f) nsPerPx(hash=%.2f decode=%.2f)\n",
+                         static_cast<unsigned long long>(nf), loop, gen, hash, dec,
+                         loop - gen - hash - dec,
+                         static_cast<double>(g_g511TexGenN.load(std::memory_order_relaxed)) / n,
+                         hashN / n, decN / n,
+                         gen * 1.0e6 / std::max(1.0, static_cast<double>(
+                             g_g511TexGenN.load(std::memory_order_relaxed)) / n),
+                         hash * 1.0e6 / std::max(1.0, hashN / n),
+                         dec * 1.0e6 / std::max(1.0, decN / n),
+                         hashPx / std::max(1.0, hashN), decPx / std::max(1.0, decN),
+                         hash * n * 1.0e6 / std::max(1.0, hashPx),
+                         dec * n * 1.0e6 / std::max(1.0, decPx));
+        }
+    }
+    if (g511Census)
+    {
+        g_g511TexEntries.fetch_add(g511Entries, std::memory_order_relaxed);
+        g_g511TexProbes.fetch_add(g511Probes, std::memory_order_relaxed);
+        g_g511TexRunRep.fetch_add(g511RunRep, std::memory_order_relaxed);
+        const uint64_t n = g_g511TexFlushes.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if ((n % 2000u) == 0u)
+        {
+            const uint64_t ent = g_g511TexEntries.load(std::memory_order_relaxed);
+            const uint64_t prb = g_g511TexProbes.load(std::memory_order_relaxed);
+            const uint64_t rep = g_g511TexRunRep.load(std::memory_order_relaxed);
+            std::fprintf(stderr,
+                         "[G511:tex] flushes=%llu entries=%llu probes=%llu (%.1f%% of entries) "
+                         "runRepeat=%llu (%.1f%% of probes) entriesPerFlush=%.1f "
+                         "probesPerFlush=%.1f\n",
+                         static_cast<unsigned long long>(n),
+                         static_cast<unsigned long long>(ent),
+                         static_cast<unsigned long long>(prb),
+                         100.0 * static_cast<double>(prb) /
+                             static_cast<double>(std::max<uint64_t>(1u, ent)),
+                         static_cast<unsigned long long>(rep),
+                         100.0 * static_cast<double>(rep) /
+                             static_cast<double>(std::max<uint64_t>(1u, prb)),
+                         static_cast<double>(ent) / static_cast<double>(n),
+                         static_cast<double>(prb) / static_cast<double>(n));
+        }
     }
 
     const auto g298T4 = s_g298Profile ? std::chrono::steady_clock::now()

@@ -1,4 +1,28 @@
-﻿// G475: held paired arm for the VU1 compact VNOP trace; force-consume g419 instrument edit.
+﻿// G511: two INFLATION prices on the flush's per-entry pre-work + one decomposition census, all in
+// .inc parts — content edit here forces MSBuild to consume them (G359). revision: 2
+//   * `texprobe` (kG511LeverTexProbe) — G502 INFLATION price: arm 1 adds ONE extra s_batchKeys probe
+//                per probing entry. MEASURED -0.102 +/- 0.058 ms/f over 5,264 probes/f, i.e. the
+//                probe costs <= 2.7 ns and the whole vein <= 0.014 ms/f. Measurement arm only.
+//   * `texrun`   (kG511LeverTexRun) — the lever that price refutes: remember the one s_batchKeys key
+//                proven resident and turn the repeat's probe into a 64-bit compare. Its own 4-run
+//                gate read null in both estimators. **NOT PROMOTED — default OFF**, opt in with
+//                DC2_G511_TEXRUN=1. Census DC2_G511_CENSUS=1 -> [G511:tex].
+//   * `clsprobe` (kG511LeverClsProbe) — G502 INFLATION price #2: arm 1 repeats G510's state-identity
+//                test (4 memcmps + 4 compares) once more per graph entry. Prices the memo's own
+//                per-entry comparison cost. Measurement arm only.
+//   * DC2_G511_TEXSPLIT=1 -> [G511:texsplit] — decomposes the `tex` pass (1.44 ms/f, the largest of
+//                the five pre-passes) into gen / hash / decode and a stated residual.
+// G510: two exact GS-worker levers + their paired gates, all in .inc parts — content edit here
+// forces MSBuild to consume them (G359). revision: 1
+//   * `capmove`  (kG510LeverCapMove) — rasterizer_tilebin_capture.inc moves the captured G144Entry
+//                into g_g144List instead of copying it (~9,900 entries/frame on the pole thread).
+//                Rollback DC2_G510_NO_CAPMOVE=1.
+//   * `clsmemo`  (kG510LeverClsMemo) — rasterizer_vram_materialization.inc reuses the previous
+//                entry's G178EntryState when the entry's state registers compare byte-equal.
+//                Rollback DC2_G510_NO_CLSMEMO=1. Census DC2_G510_CENSUS=1 → [G510:cls].
+//   * `g510both` (kG510LeverBoth) — the combined promotion arm.
+// G508: `lockskip` lever + g508LockSkipArm() in g419_ab_instrument.inc.
+// G475: held paired arm for the VU1 compact VNOP trace; force-consume g419 instrument edit.
 // G434: DC2_G434_NO_L2LPIN l2l-pin deletion ceiling probe in rasterizer_draw_sprite.inc ג€”
 // content edit here forces MSBuild to consume it.
 // G431: T8 resident-view rebuild redundancy census (DC2_G431_T8CENSUS=1) in
@@ -22,6 +46,21 @@
 // overlaps the flush's own preparation instead of nothing (force recompile v1).
 void g447HostShape(int *logicalOut, int *physicalOut);
 int g456UvPredicateArm();
+// G498: owner-publish unpack arm. Declared at global scope for the same reason as the line above —
+// every part that reads it is inside an anonymous namespace, and the definition lives in
+// g419_ab_instrument.inc far below.
+int g498OwnPubArm();
+// G499: new A/B lever `blklower` (kG499LeverBlkLower = 58) + its arm accessor g499BlkLowerArm(),
+// both defined in g419_ab_instrument.inc below. The consumer is the VU1 TU, which declares it
+// `extern` at global scope in vu1_g490_block_run.inc (force recompile v1).
+// G499 §2: second lever `qpblock` (kG499LeverQpBlock = 59) + g499QpBlockArm() (force recompile v2).
+// G500: new A/B lever `blkbranch` (kG500LeverBlkBranch = 60) + g500BlkBranchArm(), same shape and
+// the same G438 thread-level block hold. Consumed by the VU1 TU (force recompile v1).
+// G512: DC2_G419_AB=fastdec lever (kG512LeverFastDec = 75) + g512FastDecActive/g512VerifyOn/
+//       g512PsmCensusOn/g512PsmNote in g419_ab_instrument.inc, the specialised decode bodies in
+//       ps2_gs_rasterizer_parts/g512_fast_texdecode.inc (new, included from
+//       rasterizer_command_graph.inc), and the GSMem::G512ReadRow* global-scope declarations in
+//       rasterizer_headers_and_diagnostics.inc (force recompile v1).
 
 #include <deque>
 
@@ -86,6 +125,13 @@ int g456UvPredicateArm();
 // table/paired/lane arm plus its profile and oracle. Included before vram_materialization.inc so
 // g418UnpackColorRows is visible at the publication site.
 #include "ps2_gs_rasterizer_parts/g418_readback_unpack.inc"
+
+// G498: the two OWNER-PUBLISH colour unpacks G418 never reached (g345MaterializeSlot and
+// g289Resolve14aBeforeDirect, 262,144 px/frame of per-pixel addrPSMCT32 scatter on the pole
+// thread). Included after g418_readback_unpack.inc because it dispatches to G418's promoted arm on
+// the rows where the owner's per-pixel block filter is provably a no-op; the two call sites, which
+// sit far earlier in this TU, forward-declare g498PublishOwnedRows.
+#include "ps2_gs_rasterizer_parts/g498_owner_publish.inc"
 
 // G419: the generalized within-process randomized A/B instrument (DC2_G419_AB) plus the exact CT32
 // upload fast pack. Included before vram_materialization.inc so g419AbTick/g419PackFbRows are

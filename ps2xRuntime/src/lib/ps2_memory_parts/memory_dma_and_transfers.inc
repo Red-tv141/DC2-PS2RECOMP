@@ -131,7 +131,16 @@
                     // guard, but do not discard valid packets solely because the scene is
                     // complex.
                     const int kMaxChainTags = 16384;
-                    std::vector<uint8_t> chainBuf;
+                    // G503: was `std::vector<uint8_t> chainBuf;` — a fresh, zero-capacity vector per
+                    // chain, so every chain paid log2(N) geometric reallocations (each memmoving
+                    // everything appended so far) plus one operator new and one free. That was
+                    // 13.78% of the EE thread in `_Insert_counted_range` with a 10.86% `memmove`
+                    // leaf. The pooled buffer arrives at the high-water capacity and starts empty;
+                    // see memory_g503_chain_pool.inc for the exactness argument (only CAPACITY
+                    // differs, never a byte or a length).
+                    const bool g503Pool = g503ChainPoolEnabled();
+                    std::vector<uint8_t> chainBuf =
+                        g503Pool ? g503AcquireChainBuf() : std::vector<uint8_t>();
                     const bool g136Enabled = g136_trace_enabled() && channelBase == 0x10009000u;
                     const uint32_t g136Packet = g136_target_packet();
                     const uint32_t g136Bulk = g136_target_bulk();
@@ -590,6 +599,19 @@
                         {
                             m_pendingVif1Transfers.push_back(std::move(pt));
                         }
+                        else if (g503Pool)
+                        {
+                            // Neither list took it, so nothing downstream will release it: recycle
+                            // here instead of letting `pt` free the storage at scope exit.
+                            g503ReleaseChainBuf(pt.chainData);
+                        }
+                    }
+                    else if (g503Pool)
+                    {
+                        // The chain staged no bytes. `chainBuf` still owns the pooled capacity, so
+                        // hand it back rather than freeing it — this is the common case for a chain
+                        // whose every tag was a no-payload link.
+                        g503ReleaseChainBuf(chainBuf);
                     }
                     // else if (channelBase == 0x10009000u)
                     // {

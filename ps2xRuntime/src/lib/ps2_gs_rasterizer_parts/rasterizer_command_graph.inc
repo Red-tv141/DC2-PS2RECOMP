@@ -1503,6 +1503,8 @@ uint32_t g178LookupClutFixed(uint8_t *vram, const GSTexaReg &texa, const GSTexCl
     return 0xFFFF00FFu;
 }
 
+#include "g512_fast_texdecode.inc"
+
 // Eager whole-texture decode — the SAME leaf expressions as g149BuildDecoded's eager loop
 // (readTexel*/ReadP8 → lookupCLUT), so GPU sampling sees byte-identical texels to the CPU path.
 void g178DecodeWhole(GSRasterizer *self, GS *gs, uint8_t *vram, const GSContext &ctx,
@@ -1584,10 +1586,76 @@ void g178DecodeWhole(GSRasterizer *self, GS *gs, uint8_t *vram, const GSContext 
         s_g298ParTexDecode && texH >= 8 && pixels >= 4096
             ? s_g298TexDecodeLanes
             : 1;
+
+    // ------------------------------------------------------------------------------------------
+    // G512: build the fast path's plan ONCE per decode (4 calls/frame), never per lane and never
+    // per texel. Everything below is loop-invariant for the whole texture; the reference body
+    // re-derived all of it 81,601 times through closure pointers. See g512_fast_texdecode.inc.
+    // ------------------------------------------------------------------------------------------
+    // DC2_G365_WATCH puts a per-texel census inside readTexelPSMCT32; the fast path does not call
+    // it, so that diagnostic keeps the reference body (it is default-off on every perf run).
+    static const bool s_g365Watch = (std::getenv("DC2_G365_WATCH") != nullptr);
+    G512DecodePlan plan;
+    alignas(64) uint32_t g512Clut[256];
+    const bool g512Fast = g512FastDecActive() && !s_g365Watch && g512PsmFastable(psm) &&
+                          texW > 0 && texW <= kG512MaxRowW && texH > 0;
+    if (g512Fast)
+    {
+        plan.usable = true;
+        plan.psm = psm;
+        plan.tbp0 = ctx.tex0.tbp0;
+        plan.bwDirect = (ctx.tex0.tbw == 0u) ? 1u : ctx.tex0.tbw; // readTexelPSMCT32's rule
+        plan.bwT8 = pageBwT8;
+        plan.bwT4 = ((ctx.tex0.tbw >> 1u) != 0u) ? (ctx.tex0.tbw >> 1u) : 1u;
+        plan.bwT4High = ctx.tex0.tbw;
+        plan.ta0 = texa.ta0;
+        plan.aem = texa.aem != 0u;
+        if (g512PsmUsesClut(psm))
+        {
+            g512BuildClut(vram, texa, texclut, ctx, psm, g512Clut);
+            plan.clut = g512Clut;
+        }
+    }
+
     const auto joinedDecode = [&](int rowLo, int rowHi) {
-        decodeRows(rowLo, rowHi, outPx);
+        if (plan.usable)
+            g512DecodeRowsFast(vram, plan, texW, rowLo, rowHi, outPx);
+        else
+            decodeRows(rowLo, rowHi, outPx);
     };
     GSRowPool::instance().run(0, texH - 1, lanes, joinedDecode);
+
+    // G512 census (DC2_G512_PSM=1). Behaviour-pure, counted on both arms and on the default path.
+    if (g512PsmCensusOn())
+        g512PsmNote(psm, static_cast<uint64_t>(pixels), g512Fast, texW, texH, lanes);
+
+    // G512 exactness oracle (DC2_G512_VERIFY=1): decode the SAME texture with the pre-G512 body
+    // and count mismatching texels. This compares fast-vs-reference, which is what has to hold;
+    // DC2_G298_VERIFY_TEXDECODE below only compares the parallel decode against the same body.
+    if (g512Fast && g512VerifyOn())
+    {
+        static thread_local std::vector<uint32_t> s_g512Ref;
+        s_g512Ref.resize(static_cast<size_t>(texW) * texH);
+        decodeRows(0, texH - 1, s_g512Ref.data());
+        uint64_t bad = 0u;
+        for (size_t i = 0; i < s_g512Ref.size(); ++i)
+            bad += outPx[i] != s_g512Ref[i] ? 1u : 0u;
+        static std::atomic<uint64_t> s_n{0u}, s_px{0u}, s_bad{0u};
+        const uint64_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        const uint64_t totPx =
+            s_px.fetch_add(static_cast<uint64_t>(pixels), std::memory_order_relaxed) +
+            static_cast<uint64_t>(pixels);
+        const uint64_t totBad = s_bad.fetch_add(bad, std::memory_order_relaxed) + bad;
+        if (bad != 0u || n <= 8u || (n % 256u) == 0u)
+            std::fprintf(stderr,
+                         "[G512:verify] calls=%llu px=%llu bad=%llu last=%dx%d psm=%02x "
+                         "cpsm=%02x lastBad=%llu\n",
+                         static_cast<unsigned long long>(n),
+                         static_cast<unsigned long long>(totPx),
+                         static_cast<unsigned long long>(totBad), texW, texH,
+                         static_cast<unsigned>(psm), static_cast<unsigned>(ctx.tex0.cpsm),
+                         static_cast<unsigned long long>(bad));
+    }
 
     static const bool s_g298Verify =
         envFlagEnabled("DC2_G298_VERIFY_TEXDECODE");

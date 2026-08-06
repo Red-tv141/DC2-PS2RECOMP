@@ -1,3 +1,14 @@
+// G498: the two owner-publish colour unpacks below (g345MaterializeSlot, g289Resolve14aBeforeDirect)
+// go through this helper instead of their own per-pixel addrPSMCT32 + 4-byte memcpy loop. It is
+// DEFINED in g498_owner_publish.inc, which this TU includes much later (it needs G418's promoted
+// fast unpack), so it is forward-declared here — the same pattern rasterizer_row_pool.inc uses for
+// g420PoolNarrowArm.
+static void g498PublishOwnedRows(int site, uint8_t *vram, uint32_t vramSize,
+                                 const std::vector<uint32_t> &src,
+                                 uint32_t dstBlock, uint32_t bw, int fbW, int fbH,
+                                 int rowLo, int rowHi,
+                                 uint32_t firstBlock, uint32_t lastBlock);
+
 // ===== G280 GPU PHYSICAL-ALIAS PAGE VIEW (default-off bring-up, DC2_G280_ALIAS_VIEW=1) =====
 // G267 proved the display TRISTRIP consumer of the 0x139 character RTT samples one physical CT32
 // page (0x2920) that is NEWER in the dirty sibling target 0x146 — the same GS page rendered under
@@ -1704,10 +1715,13 @@ static void g305DrainPending();
 // G418 mechanism unchanged, already oracle-verified at 109,051,904 pixels with bad=0.
 //
 // Declared here because g418_readback_unpack.inc is included later in this TU.
+// G498 added `lanesOverride` (0 = G418's own promoted lane policy). The default argument lives on
+// THIS declaration, the first one in the TU — repeating it on the definition would make the two
+// signatures a two-member overload set and every 10-argument call ambiguous.
 static void g418UnpackColorRows(uint8_t *vram, uint32_t vramSize,
                                 const std::vector<uint32_t> &src,
                                 uint32_t fbBlock, uint32_t fbw, int fbW, int fbH,
-                                int rowLo, int rowHi, bool legacy);
+                                int rowLo, int rowHi, bool legacy, int lanesOverride = 0);
 
 // DC2_G432_NO_MAT_UNPACK=1 restores the serial per-pixel publication loop (rollback arm).
 static bool g432MatUnpackOn()
@@ -2057,18 +2071,15 @@ static void g276FlushPendingDisplay(int cause)
         ok = readOk && s_g276Px.size() == static_cast<size_t>(p.fbW) * rows;
         if (ok)
         {
-            for (int y = p.rowLo; y <= p.rowHi; ++y)
-            {
-                const size_t srcRow = static_cast<size_t>(511 - y - glY) * p.fbW;
-                for (int x = 0; x < p.fbW; ++x)
-                {
-                    const uint32_t off = GSPSMCT32::addrPSMCT32(p.fbBlock, p.fbw,
-                                                                static_cast<uint32_t>(x),
-                                                                static_cast<uint32_t>(y));
-                    if (off + 4u <= vramSize)
-                        std::memcpy(vram + off, &s_g276Px[srcRow + x], 4);
-                }
-            }
+            // G498: the frame's LARGEST owner publish — 512 x 416 = 212,992 px, once per frame on
+            // lean MAP-0, and the site `[G495:rb]` sees as the `0x0`/`0x68 @96/416` readback. The
+            // loop it replaces had NO block filter, only the vramSize clip, so the whole row range
+            // takes G418's promoted arm; `g498PublishOwnedRows` still classifies, because the clip
+            // itself can fail near the end of VRAM and those rows must keep the original loop.
+            // `glY = 511 - p.rowHi`, so the original `srcRow = (511 - y - glY)` IS `(p.rowHi - y)`,
+            // i.e. G418's bottom-first convention with fbH = p.rowHi + 1.
+            g498PublishOwnedRows(0, vram, vramSize, s_g276Px, p.fbBlock, p.fbw, p.fbW,
+                                 p.rowHi + 1, p.rowLo, p.rowHi, 0u, 0xFFFFFFFFu);
             // G336: this display-color readback published guest VRAM rows rowLo..rowHi at
             // (fbBlock,fbw) as CT32 — capture it into the boundary's published set (no-op unless
             // DC2_G336_RUNWAY=1 and inside the boundary window).
@@ -2330,18 +2341,10 @@ static bool g345MaterializeSlot(G289CopyOwner &slot, int cause)
     if (ok)
     {
         const uint32_t dstBlock = framePageBaseToBlock(owner.dstFbp);
-        for (uint32_t y = 0u; y < 416u; ++y)
-        {
-            const size_t srcRow = static_cast<size_t>(415u - y) * 512u;
-            for (uint32_t x = 0u; x < 512u; ++x)
-            {
-                const uint32_t off = GSPSMCT32::addrPSMCT32(dstBlock, 8u, x, y);
-                const uint32_t block = off >> 8u;
-                if (block >= owner.firstOwnedBlock && block <= owner.lastOwnedBlock &&
-                    off + 4u <= owner.vramSize)
-                    std::memcpy(owner.vram + off, &s_px[srcRow + x], 4u);
-            }
-        }
+        // G498: 212,992 px/frame. The per-pixel loop this replaces is reproduced verbatim inside
+        // g498PublishRowsLegacy and runs for every row the owner's block filter does not cover.
+        g498PublishOwnedRows(0, owner.vram, owner.vramSize, s_px, dstBlock, 8u, 512, 416,
+                             0, 415, owner.firstOwnedBlock, owner.lastOwnedBlock);
         g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 0u, 512u, 416u);
         g_g289Materializes.fetch_add(1u, std::memory_order_relaxed);
     }
@@ -2535,18 +2538,11 @@ static bool g289Resolve14aBeforeDirect()
         return g289MaterializeOwner(12);
 
     const uint32_t dstBlock = framePageBaseToBlock(owner.dstFbp);
-    for (uint32_t y = 320u; y < 416u; ++y)
-    {
-        const size_t srcRow = static_cast<size_t>(415u - y) * 512u;
-        for (uint32_t x = 0u; x < 512u; ++x)
-        {
-            const uint32_t off = GSPSMCT32::addrPSMCT32(dstBlock, 8u, x, y);
-            const uint32_t block = off >> 8u;
-            if (block >= owner.firstOwnedBlock && block <= owner.lastOwnedBlock &&
-                off + 4u <= owner.vramSize)
-                std::memcpy(owner.vram + off, &s_px[srcRow + x], 4u);
-        }
-    }
+    // G498: 49,152 px/frame. `s_px` holds only the 96 read rows, and the original loop indexed it
+    // as (415 - y) with y in [320,415] — i.e. exactly the fbH=416 bottom-first convention
+    // g418UnpackColorRows already uses, so the same (fbH, rowLo, rowHi) triple reproduces it.
+    g498PublishOwnedRows(1, owner.vram, owner.vramSize, s_px, dstBlock, 8u, 512, 416,
+                         320, 415, owner.firstOwnedBlock, owner.lastOwnedBlock);
     g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 320u, 512u, 96u);
     o14a->active = false;
     s_g289PendingUpload.active = false;

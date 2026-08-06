@@ -165,6 +165,18 @@ namespace
     std::atomic<uint32_t> s_g136PendingSeq{0};
     std::atomic<uint32_t> s_g136ArmedChains{0};
 
+} // close the anonymous namespace so the G503 pool can open its own at file scope
+
+// G503: the recycled DMA-chain staging buffer. It must be declared at FILE SCOPE before its two
+// users — the chain walk in memory_dma_and_transfers.inc acquires, PS2Memory::processPendingTransfers
+// in memory_page_table_and_translate.inc releases — and those two .inc files are mid-member-function
+// CONTINUATIONS, so ps2_memory.cpp cannot include anything between them (doing so puts `m_gsVRAM` and
+// friends out of scope). This is the last file-scope point before them.
+#include "memory_g503_chain_pool.inc"
+
+namespace
+{
+
     bool g136_addr_matches(uint32_t addr, uint32_t target)
     {
         return (addr & 0x1FFFFFFFu) == target;

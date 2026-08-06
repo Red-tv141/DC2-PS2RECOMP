@@ -259,6 +259,14 @@ void VU1Interpreter::applyDestAcc(const float *result, uint8_t dest)
 // DC2_G65_KICKAGG to find which VU1 program emits the rock tristrips.
 static uint32_t s_g65CurStartPC = 0u;
 
+// G502: which KICK KIND the current run() belongs to. G501 §3b established that this route's kick
+// population is BIMODAL — resume kicks are 29% of kicks but 58% of ALL PAIRS, and their pairs cost
+// ~25% LESS (10.5-12.6 ns against geometry's 13.0-15.0) — so every "pairs/kick" and "ns/pair"
+// figure in this arc averages two populations. `[G490:block]` and `[G500:inv]` are global for the
+// same reason, and the roadmap's task 3 is to split them. One store per kick (~1,236/frame), never
+// per pair; same single-threaded-worker idiom as s_g65CurStartPC. Read ONLY by the census.
+static bool s_g502Resume = false;
+
 // G215: MAP-4 head/cap batch-cull discriminator. Per model-program execute (startPC=0x10)
 // inside the character COutLineDraw window, count how much geometry the batch KICKS out vs how
 // much vertex data was uploaded (XTOP window). Reset at execute() entry, bumped at each XGKICK,
@@ -327,6 +335,7 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint32_t maxCycles)
 {
     s_g65CurStartPC = startPC;
+    s_g502Resume = false;   // G502: geometry kick (MSCAL)
     if (s_g215batch || s_g216clip || s_g216ForceGate || s_g217TagVu)
     {
         s_g215KickCount = 0u; s_g215KickBytes = 0ull;
@@ -829,6 +838,7 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
 {
     m_state.ebit = false;
     m_state.itop = itop;
+    s_g502Resume = true;    // G502: resume kick (MSCNT) — 29% of kicks, 58% of all pairs
     if (vu1_trace_enabled())
     {
         const uint32_t n = s_vu1ExecCount.fetch_add(1u, std::memory_order_relaxed);

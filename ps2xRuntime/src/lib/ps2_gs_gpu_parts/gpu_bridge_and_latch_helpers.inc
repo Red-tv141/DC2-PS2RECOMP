@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iostream>
 #include <sstream>
+#include <emmintrin.h>
 
 // [G37] Shared GS-order sequence counter for the costume RTT-lifecycle trace (uploads here +
 // RTT draws/composites in the rasterizer). Global so both translation units can use it.
@@ -254,6 +255,111 @@ namespace
                std::strcmp(value, "FALSE") != 0 &&
                std::strcmp(value, "off") != 0 &&
                std::strcmp(value, "OFF") != 0;
+    }
+
+    // ===== G508: skip the REDUNDANT recursive re-acquisition of GS::m_stateMutex ==============
+    //
+    // WHAT IT REMOVES. `GS::writeRegister` takes `m_stateMutex` on every call, and its only hot
+    // caller — `GS::processGIFPacket`, via `writeRegisterPacked`'s PRIM / A+D / default arms —
+    // already holds that same mutex for the whole packet. Every such call re-acquires a lock this
+    // thread already owns.
+    //
+    // ⚠️ WHAT IT IS WORTH: **0.043 ms/f. Below the paired instrument's floor.** Shipped because it
+    // is exact and strictly removes work — NOT as a promotion, and not to be quoted as a win.
+    // A price is COUNT x COST and this phase got only the cost right first time:
+    //   * COST, measured BEFORE building (G502's law), on this host, uncontended and already-owned:
+    //     7.254 ns recursive re-acquire vs 1.287 ns thread_local depth test = **5.967 ns/call**.
+    //   * COUNT, first INHERITED from `[G341:vifcensus]` (50,007 PATH1 + 5,827 PATH2 register
+    //     writes/f => a predicted 0.33 ms/f) and **wrong by 7.8x**. Those are VIF-stream register
+    //     SLOTS; `writeRegisterPacked` services most of them inline in its own `case` arms
+    //     (RGBAQ/ST/UV/XYZ2/XYZF2) and never calls this function. `[G508:regcensus]` below counts
+    //     the function directly: **7,143 calls/frame**.
+    // Four paired runs agreed: -0.178 / -0.144 / +0.034 / -0.297 ms/f, |t| <= 1.36. See
+    // `plans/phase-G508-fix-log.md` section 4.
+    //
+    // EXACTNESS. `std::recursive_mutex` already ALLOWS the nested acquisition; taking it a second
+    // time from the owning thread only increments a recursion count. Skipping it changes no
+    // ordering, no visibility and no state — the mutex is held across the whole region either way.
+    //
+    // SAFETY UNDER PARTIAL ADOPTION. `t_g508StateDepth` is raised only by this guard, so a site
+    // that still uses a plain `lock_guard` leaves the depth at 0 and any guard nested inside it
+    // locks for real. `m_owned == false` requires a live outer G508StateLock on THIS thread, which
+    // by RAII nesting still holds the mutex. Converting a site can only make it faster, never
+    // unsafe; forgetting one costs performance only. (Use this guard for `m_stateMutex` ONLY — the
+    // depth counter is per-thread, not per-mutex.)
+    //
+    // Rollback `DC2_G508_NO_LOCKSKIP=1` restores the unconditional lock at every converted site.
+    // Namespace-scope (not function-local) so the hot path pays no magic-static guard load.
+    const bool g_g508LockSkip = !envFlagEnabled("DC2_G508_NO_LOCKSKIP");
+    thread_local int t_g508StateDepth = 0;
+
+    class G508StateLock
+    {
+    public:
+        // `raiseDepth` is the A/B arm at the ONE site that has one (processGIFPacket). Everywhere
+        // else it defaults to true: raising the depth from a site that genuinely holds the mutex is
+        // always sound, and a false only ever costs speed.
+        explicit G508StateLock(std::recursive_mutex &m, bool raiseDepth = true)
+            : m_mutex(m), m_raise(raiseDepth && g_g508LockSkip), m_owned(t_g508StateDepth == 0)
+        {
+            if (m_owned)
+                m_mutex.lock();
+            t_g508StateDepth += m_raise ? 1 : 0;
+        }
+        ~G508StateLock()
+        {
+            t_g508StateDepth -= m_raise ? 1 : 0;
+            if (m_owned)
+                m_mutex.unlock();
+        }
+        G508StateLock(const G508StateLock &) = delete;
+        G508StateLock &operator=(const G508StateLock &) = delete;
+
+    private:
+        std::recursive_mutex &m_mutex;
+        bool m_raise;
+        bool m_owned;
+    };
+
+    // G508 register census (DC2_G508_REGCENSUS=1, default OFF, behaviour-pure). Answers the two
+    // numbers the lever was priced from, in-process: how many times `GS::writeRegister` actually
+    // runs per frame, and how many of those write a value the register ALREADY holds (the price of
+    // a future dedup lever — measured here so the next phase does not have to guess it, G502).
+    // Windowed per report, never cumulative-over-run divided by frames (the G492 `fallback` trap).
+    bool g508RegCensusOn()
+    {
+        static const bool on = envFlagEnabled("DC2_G508_REGCENSUS");
+        return on;
+    }
+
+    void g508NoteRegisterWrite(uint8_t regAddr, uint64_t value)
+    {
+        // GS-worker thread dominates this path; the counters are plain (census-only) and the
+        // report is windowed off the call count, so no clock and no atomic is on the hot path.
+        static uint64_t s_prev[256] = {};
+        static bool s_seen[256] = {};
+        static uint64_t s_calls = 0ull, s_same = 0ull, s_lastCalls = 0ull, s_lastSame = 0ull;
+        static uint64_t s_reports = 0ull;
+        ++s_calls;
+        if (s_seen[regAddr] && s_prev[regAddr] == value)
+            ++s_same;
+        s_seen[regAddr] = true;
+        s_prev[regAddr] = value;
+        // Report every 3,000,000 calls (~60 frames at the censused rate) as a WINDOW delta.
+        if ((s_calls % 3000000ull) == 0ull)
+        {
+            const uint64_t calls = s_calls - s_lastCalls;
+            const uint64_t same = s_same - s_lastSame;
+            s_lastCalls = s_calls;
+            s_lastSame = s_same;
+            ++s_reports;
+            std::fprintf(stderr,
+                         "[G508:regcensus] win=%llu calls=%llu sameValue=%llu (%.1f%%)\n",
+                         static_cast<unsigned long long>(s_reports),
+                         static_cast<unsigned long long>(calls),
+                         static_cast<unsigned long long>(same),
+                         100.0 * static_cast<double>(same) / static_cast<double>(calls ? calls : 1));
+        }
     }
 
     bool uploadPresentationFallbackEnabled()
@@ -753,6 +859,112 @@ namespace
     {
         const int delta = static_cast<int>(src) - static_cast<int>(dst);
         return GSInternal::clampU8(static_cast<int>(dst) + ((delta * static_cast<int>(factor)) / 255));
+    }
+
+    inline bool g473VerifyOn()
+    {
+        static const bool on = std::getenv("DC2_G473_VERIFY") != nullptr;
+        return on;
+    }
+
+    inline void g473BlendPresentationRowScalar(const uint32_t *src, uint32_t *dst,
+                                                uint32_t width, bool mmod, uint32_t alp)
+    {
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            const uint32_t s = src[x];
+            const uint32_t factor =
+                mmod ? alp : std::min<uint32_t>(255u, (s >> 24) * 2u);
+            if (factor == 255u)
+            {
+                dst[x] = s | 0xFF000000u;
+            }
+            else if (factor != 0u)
+            {
+                const uint32_t d = dst[x];
+                dst[x] = 0xFF000000u |
+                         static_cast<uint32_t>(blendPresentationChannel(
+                             static_cast<uint8_t>(s & 0xFFu),
+                             static_cast<uint8_t>(d & 0xFFu), factor)) |
+                         (static_cast<uint32_t>(blendPresentationChannel(
+                              static_cast<uint8_t>((s >> 8) & 0xFFu),
+                              static_cast<uint8_t>((d >> 8) & 0xFFu), factor))
+                          << 8) |
+                         (static_cast<uint32_t>(blendPresentationChannel(
+                              static_cast<uint8_t>((s >> 16) & 0xFFu),
+                              static_cast<uint8_t>((d >> 16) & 0xFFu), factor))
+                          << 16);
+            }
+        }
+    }
+
+    inline __m128i g473Div255Epu16(__m128i value)
+    {
+        // Exact for 0..255*255: floor(value/255) ==
+        // (value + 1 + (value >> 8)) >> 8. The maximum intermediate is 65280.
+        const __m128i one = _mm_set1_epi16(1);
+        return _mm_srli_epi16(
+            _mm_add_epi16(_mm_add_epi16(value, one), _mm_srli_epi16(value, 8)), 8);
+    }
+
+    inline __m128i g473BlendPresentationHalf(__m128i src, __m128i dst,
+                                              __m128i positiveDiff,
+                                              __m128i negativeDiff,
+                                              __m128i factor)
+    {
+        const __m128i positive = g473Div255Epu16(_mm_mullo_epi16(positiveDiff, factor));
+        const __m128i negative = g473Div255Epu16(_mm_mullo_epi16(negativeDiff, factor));
+        return _mm_sub_epi16(_mm_add_epi16(dst, positive), negative);
+    }
+
+    inline void g473BlendPresentationRowSimd(const uint32_t *src, uint32_t *dst,
+                                              uint32_t width, bool mmod, uint32_t alp)
+    {
+        const __m128i zero = _mm_setzero_si128();
+        const __m128i cap255 = _mm_set1_epi16(255);
+        const __m128i alphaMask = _mm_set1_epi32(static_cast<int>(0xFF000000u));
+        const __m128i rgbMask = _mm_set1_epi32(0x00FFFFFF);
+        const __m128i constantFactor = _mm_set1_epi16(static_cast<short>(alp));
+        uint32_t x = 0u;
+        for (; x + 4u <= width; x += 4u)
+        {
+            const __m128i src8 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i *>(src + x));
+            const __m128i dst8 = _mm_loadu_si128(
+                reinterpret_cast<const __m128i *>(dst + x));
+            const __m128i srcLo = _mm_unpacklo_epi8(src8, zero);
+            const __m128i srcHi = _mm_unpackhi_epi8(src8, zero);
+            const __m128i dstLo = _mm_unpacklo_epi8(dst8, zero);
+            const __m128i dstHi = _mm_unpackhi_epi8(dst8, zero);
+            const __m128i positive8 = _mm_subs_epu8(src8, dst8);
+            const __m128i negative8 = _mm_subs_epu8(dst8, src8);
+            const __m128i positiveLo = _mm_unpacklo_epi8(positive8, zero);
+            const __m128i positiveHi = _mm_unpackhi_epi8(positive8, zero);
+            const __m128i negativeLo = _mm_unpacklo_epi8(negative8, zero);
+            const __m128i negativeHi = _mm_unpackhi_epi8(negative8, zero);
+
+            __m128i factorLo = constantFactor;
+            __m128i factorHi = constantFactor;
+            if (!mmod)
+            {
+                factorLo = _mm_shufflelo_epi16(srcLo, _MM_SHUFFLE(3, 3, 3, 3));
+                factorLo = _mm_shufflehi_epi16(factorLo, _MM_SHUFFLE(3, 3, 3, 3));
+                factorHi = _mm_shufflelo_epi16(srcHi, _MM_SHUFFLE(3, 3, 3, 3));
+                factorHi = _mm_shufflehi_epi16(factorHi, _MM_SHUFFLE(3, 3, 3, 3));
+                factorLo = _mm_min_epi16(_mm_add_epi16(factorLo, factorLo), cap255);
+                factorHi = _mm_min_epi16(_mm_add_epi16(factorHi, factorHi), cap255);
+            }
+
+            const __m128i outLo = g473BlendPresentationHalf(
+                srcLo, dstLo, positiveLo, negativeLo, factorLo);
+            const __m128i outHi = g473BlendPresentationHalf(
+                srcHi, dstHi, positiveHi, negativeHi, factorHi);
+            __m128i out8 = _mm_packus_epi16(outLo, outHi);
+            out8 = _mm_or_si128(_mm_and_si128(out8, rgbMask), alphaMask);
+            _mm_storeu_si128(reinterpret_cast<__m128i *>(dst + x), out8);
+        }
+        if (x != width)
+            g473BlendPresentationRowScalar(src + x, dst + x, width - x, mmod, alp);
     }
 
     // G440: every hot-path use of countNonBlackPixels is an `== 0` / `!= 0` test — the COUNT is
