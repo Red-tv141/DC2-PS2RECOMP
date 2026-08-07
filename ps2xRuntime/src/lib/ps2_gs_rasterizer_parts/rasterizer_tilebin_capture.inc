@@ -32,10 +32,43 @@
         // Expand outward before rejecting.  This is deliberately more conservative than each
         // leaf rasterizer: it also covers line/point integer truncation and the legacy sprite-edge
         // rollback, so no sub-pixel primitive that could reach the boundary pixel is removed.
-        return std::ceil(maxX - ofx) < static_cast<float>(ctx.scissor.x0) ||
-               std::floor(minX - ofx) > static_cast<float>(ctx.scissor.x1) ||
-               std::ceil(maxY - ofy) < static_cast<float>(ctx.scissor.y0) ||
-               std::floor(minY - ofy) > static_cast<float>(ctx.scissor.y1);
+        const float cx = maxX - ofx;
+        const float fx = minX - ofx;
+        const float cy = maxY - ofy;
+        const float fy = minY - ofy;
+        const float sx0 = static_cast<float>(ctx.scissor.x0);
+        const float sx1 = static_cast<float>(ctx.scissor.x1);
+        const float sy0 = static_cast<float>(ctx.scissor.y0);
+        const float sy1 = static_cast<float>(ctx.scissor.y1);
+
+        // G519: the four rounding calls above are the only reason this cull touches the CRT.
+        // `ceilf(a) < b` and `floorf(a) > b` are decided WITHOUT rounding whenever b is an exact
+        // integer, which every GSScissorReg field is (uint16_t). See kG519LeverCullCmp in
+        // g419_ab_instrument.inc for the proof, including the NaN/+-Inf cases.
+        // Gated on the arm VALUE (G504): -1 = not under the A/B, 0 = control (CRT), 1 = candidate.
+        // No `extern` redeclaration here on purpose: all four are DEFINED earlier in this same TU
+        // (g419_ab_instrument.inc, include line 145 vs this file's 160), so an unqualified call
+        // resolves by ordinary lookup whatever their linkage is. A block-scope `extern` would
+        // instead assert GLOBAL linkage and break if the definitions ever move into the anonymous
+        // namespace this TU opens (the appendix §3 anon-namespace linkage trap).
+        const int g519Arm = g519CullCmpArm();
+        const bool g519UseCmp = (g519Arm >= 0) ? (g519Arm == 1) : g519CullCmpDefaultOn();
+
+        if (g519UseCmp)
+        {
+            const bool cmpForm = cx <= sx0 - 1.0f || fx >= sx1 + 1.0f ||
+                                 cy <= sy0 - 1.0f || fy >= sy1 + 1.0f;
+            // The oracle recomputes the CRT form, so it must live OUT OF LINE: leaving it inline
+            // put four never-executed ceilf/floorf CALL SITES inside the candidate's own basic
+            // block — exactly the work this lever exists to delete — and the first G519 gate paid
+            // for it (+0.51/+0.71 ms/f, blocked +0.68). G490's law: a never-selected copy costs
+            // real ms/f. g519VerifyCull is __declspec(noinline) for the same reason.
+            if (g519CullVerifyOn())
+                g519VerifyCull(cx, fx, cy, fy, sx0, sx1, sy0, sy1, cmpForm);
+            return cmpForm;
+        }
+        return std::ceil(cx) < sx0 || std::floor(fx) > sx1 ||
+               std::ceil(cy) < sy0 || std::floor(fy) > sy1;
     }();
     if (g458MissesScissor)
     {
@@ -617,7 +650,28 @@
             const GSVertex &cv1 = gs->m_vtxQueue[1];
             const int cofy = ctx.xyoffset.ofy >> 4;
             int crawMinY, crawMaxY;
-            G144Entry e;
+            // G521: build the entry DIRECTLY in g_g144List instead of in a stack local that is
+            // then moved in. G510's capmove made the push a move, but G144Entry is trivially
+            // copyable except for one shared_ptr, so the move still transfers all 256 bytes —
+            // the entry is written twice per captured primitive, ~9,927 times a frame on the pole
+            // thread. Nothing between here and the push returns, throws, flushes or reads
+            // g_g144List, so constructing in the final slot lands the identical bytes.
+            // The G144NoInit tag DEFAULT-initializes; a bare emplace_back() would value-initialize
+            // and zero-fill 256 bytes the control arm never writes.
+            // Rollback DC2_G521_NO_CAPINPLACE=1. Paired gate: DC2_G419_AB=capinplace.
+#if DC2_G521_INPLACEARM
+            const bool g521InPlace = g521CapInPlaceActive();
+            G144Entry g521Local;
+            if (g521InPlace)
+                g_g144List.emplace_back(G144NoInit{});
+            // ⚠️ G521 §6b — THIS LINE IS WHY THE LEVER LOST. A runtime-varying reference turns the
+            // ~40 field writes below from direct stores at known rsp offsets into indirect stores
+            // through a base pointer, on BOTH arms. G520 §7b's codegen-symmetry law, hitting the
+            // candidate instead of the control.
+            G144Entry &e = g521InPlace ? g_g144List.back() : g521Local;
+#else
+            G144Entry e; // pre-G521 shape, restored (capinplace REFUTED)
+#endif
             if (isSprite144)
             {
                 // Sprite bbox: 2-vertex unclipped rect, min/max SWAPPED (drawSprite's own formula),
@@ -733,10 +787,38 @@
             // copy-construct/destroy pair — from the GS worker's per-primitive path (~9,900/frame
             // on lean MAP-0). Exact by construction; nothing observes `e` after the push.
             // Rollback: DC2_G510_NO_CAPMOVE=1. Paired gate: DC2_G419_AB=capmove | g510both.
+            g521ReportEntrySize(); // G521: one-shot layout report, inert unless DC2_G521_SIZE=1
+#if !DC2_G521_INPLACEARM
             if (g510CapMoveActive())
                 g_g144List.push_back(std::move(e));
             else
                 g_g144List.push_back(e);
+#else
+            if (!g521InPlace)
+            {
+                if (g510CapMoveActive())
+                    g_g144List.push_back(std::move(e));
+                else
+                    g_g144List.push_back(e);
+            }
+            else if (g521VerifyOn())
+            {
+                // Oracle: the entry is already in its slot, so re-derive what the CONTROL arm
+                // would have produced (the same field values, read back out of the slot) and
+                // compare the groups the flush's five pre-passes actually read. Out of line via
+                // g521NoteEntry so the comparison is not inside the measured basic block.
+                const G144Entry &g521Slot = g_g144List.back();
+                const bool bad =
+                    std::memcmp(&g521Slot.ctx, &ctx, sizeof(GSContext)) != 0 ||
+                    std::memcmp(&g521Slot.prim, &gs->m_prim, sizeof(GSPrimReg)) != 0 ||
+                    std::memcmp(&g521Slot.texa, &gs->m_texa, sizeof(GSTexaReg)) != 0 ||
+                    std::memcmp(&g521Slot.texclut, &gs->m_texclut, sizeof(GSTexClutReg)) != 0 ||
+                    g521Slot.pabe != gs->m_pabe || g521Slot.fogcol != g_g364FogCol ||
+                    g521Slot.minY != clampInt(crawMinY, ctx.scissor.y0, ctx.scissor.y1) ||
+                    g521Slot.maxY != clampInt(crawMaxY, ctx.scissor.y0, ctx.scissor.y1);
+                g521NoteEntry(bad);
+            }
+#endif
             if (g_g156Stat)
                 g_g156CaptureNs.fetch_add(
                     (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(

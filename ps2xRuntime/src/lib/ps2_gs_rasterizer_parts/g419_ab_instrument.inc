@@ -474,6 +474,218 @@ enum G419Lever
     // so the accessor cannot pollute the loop it measures (G502).
     // Thread-level (it changes the pole thread's per-frame CPU), so it takes the G438 block hold.
     kG512LeverFastDec = 75,
+    // G513 — the source-page hash's byte loop. G512 halved the decode and thereby promoted
+    // g178HashPages to the largest remaining part of the texture pass: 0.0094 ms/flush = 0.31 ms/f
+    // over ~23 calls/f, ~18.9 of which are HITS, i.e. ~0.25 ms/f spent proving a texture did not
+    // change. The emitted loop is one xor->imul chain, 4 host cycles per 8 bytes. Candidate arm
+    // runs eight independent FNV lanes over the same page set in the same order. Read ONCE per
+    // g178HashPages call (~23/frame) against ~9,200 loop iterations, so the accessor cannot
+    // pollute the loop it measures (G502).
+    // Thread-level (it changes the GS worker's per-frame CPU), so it takes the G438 block hold.
+    kG513LeverHashLane = 76,
+    // G514 — the VU data-memory STORE staging buffer inside the block leaf.
+    //
+    // `[G478:vu1prof]` + `/MAP` (G514 §3) put 78.6% of the whole VU1 worker inside
+    // `g490BlockBody<1,0,1,1,0,0,1>` and 9.1% of it on FOUR instructions, all the same shape:
+    //
+    //     movss  xmm0, [rbx + rcx*8 + 0xc]     ; st.vf[is][3]
+    //     movss  [rbp-0x35], xmm0              ; tmp[3]        (4-byte store)
+    //     movups xmm0, [rbp-0x41]              ; reload tmp[0..3] as ONE 16-byte load
+    //     movups [rdx + r12], xmm0             ; -> VU RAM      <= the sample lands HERE
+    //
+    // Four 4-byte stores followed by a 16-byte load that overlaps them is a store-to-load
+    // forwarding FAILURE by construction on every x86 since Core: the load cannot be satisfied
+    // from the store buffer and must wait for the stores to drain to L1 (~12-15 cycles). The
+    // buffer is `tmp[4]` in the SQ / SQI / SQD bodies, and `rbp-0x41` is not even 16-byte
+    // aligned, so the reload can also split a line.
+    //
+    // Candidate arm writes the 16 bytes in ONE store: whole-vector when the dest mask is 0xF
+    // (no read-modify-write at all — every lane is overwritten) and the promoted G421 bit-select
+    // otherwise. No stack slot, no partial store, no forwarding stall.
+    //
+    // Scoped to the BLOCK LEAF, which is what makes it a different lever from G481's refuted
+    // `*_SIMD` set: G481 measured those in `run()`'s inline dispatch, where they ADD text to the
+    // one function whose inline budget binds (+0.190 ms/f, 0/5). Here the scalar staging bodies
+    // are ALREADY inlined into the block leaf (the shipped `g490BlockBody` contains zero calls —
+    // G514 §3 disassembly), so the SIMD form REPLACES text instead of adding it.
+    //
+    // Thread-level code shape, so it takes the G438 block hold like every other block arm.
+    kG514LeverVStore = 77,
+    // G514b — the SAME staging buffer on the LOAD side (LQ / LQI / LQD), which write `st.vf[it]`
+    // with up to four `movss` lane stores that the NEXT pairs read back with a 16-byte `movups`.
+    // Separate lever because the two sides differ in the one way that decides whether a
+    // forwarding stall costs anything: a VU-RAM store is a dead end the store buffer hides (G514
+    // measured that side at −0.7% of the loop), a VF register is consumed by the next
+    // instructions. LQ 9.4% + LQI 6.8% of ALL pairs against the store side's 11%.
+    // Control arm is 8 (the store side), so the load side is priced alone.
+    kG514LeverVLoad = 78,
+    // G514 PROMOTION GATE — the shipped default (arm 10, both sides) against the pre-G514 body
+    // (arm 7). `vstore` and `vload` each price one side against the other's arm; this is the one
+    // number the promotion decision actually rests on, measured rather than added, because
+    // "overlap does not compose" (G493) and two serial work removals on one thread need not sum.
+    kG514LeverVMem = 79,
+    // G515 — PEEL `G422_LK_NOP` OUT OF THE BLOCK LEAF'S LOWER DISPATCH.
+    //
+    // The shipped leaf's annotated disassembly (`tools/g504_disasm.py`, +0x57d..+0x5a3) puts
+    // **16.89% of the whole VU1 worker** on the seven instructions of ONE two-level jump-table
+    // dispatch: `movzx` the `lowerKind` byte, range-check it, `movzx` a table-1 index byte whose
+    // address depends on it, `mov` a table-2 rel32 whose address depends on THAT, `add` the image
+    // base (7.17% on its own — the single hottest instruction in the binary this session) and a
+    // 28-way indirect `jmp`. Three dependent L1 loads feeding an indirect branch.
+    //
+    // `[G479:lk]` names the dominant destination: `G422_LK_NOP` is 40.2% of ALL pairs (~44% of
+    // block-eligible ones once the never-eligible control transfers are removed), ~630 k pairs per
+    // frame, and its case body is `break`. The peel gives those pairs one compare and one DIRECT
+    // branch off a byte already loaded, and takes the loop's most frequent target out of the
+    // indirect predictor's stream.
+    //
+    // This is the class that has paid on this thread and nothing else has (G485, G513, G514): a
+    // dependency chain, not an instruction count (G506: 0.030 host cycles per deleted instruction).
+    // Exact by construction — the guarded statement set is empty — so it needs no oracle.
+    // Control arm is 10 (the G514 shipped body). Thread-level code shape, so it takes the G438
+    // block hold like every other block arm.
+    kG515LeverNopDisp = 80,
+    // G516 — RESOLVE BOTH OF THE BLOCK LEAF'S DEPENDENT-LOAD DISPATCH CHAINS AT DECODE TIME.
+    //
+    // G515 peeled the biggest destination out of the lower jump table and paid −1.09%. The
+    // re-taken attribution (G516 §1) shows the SAME shape still standing twice per pair, and in
+    // both cases the second load's ADDRESS is the first load's RESULT:
+    //
+    //   upper:  movzx eax,[rsi+9]  ->  mov eax,[g421DescTableConst + rax*4]     3.79% + 3.09%
+    //   lower:  movzx eax,[rsi+0xe] -> movzx eax,[tbl1 + rax] -> mov ecx,[tbl2 + rax*4]  ~7.7%
+    //
+    // Both bytes are decoded once per code write into the G410 sidecar, so both lookups can be
+    // done there instead — into a per-pair `G516BlockDesc` indexed by the SAME pair index the leaf
+    // already holds. Every load's address then depends only on the index.
+    //   * `updesc`   (arm 13) — the UPPER side alone: the materialised descriptor replaces the
+    //     `upperKind` load AND the table lookup, and `cls == 0` replaces the `!= 0x6f` test (for a
+    //     block-eligible pair those are the same predicate by construction).
+    //   * `lowdense` (arm 14) — the LOWER side alone: the dense 1..10 class replaces `lowerKind`,
+    //     which removes MSVC's byte-index level because ten dense values with ten distinct targets
+    //     have nothing to compress.
+    //   * `dispdense` (arm 15) — BOTH, i.e. the promotion candidate. Measured rather than added:
+    //     overlap does not compose (G493), and these two chains can issue in parallel.
+    // Control arm for all three is 12, the G515 shipped body. Exact by construction on both sides;
+    // `[G490:block]` and `[G516:disp]` are the per-arm invariants.
+    kG516LeverUpDesc = 81,
+    kG516LeverLowDense = 82,
+    kG516LeverDispDense = 83,
+    // G516b — PEEL THE FOUR BIGGEST REMAINING INDIRECT-BRANCH DESTINATIONS.
+    // The isolated BRANCH variable: no new array, no load removed, the same statements in the same
+    // order reached through a direct compare instead of the 28-way indirect jump. LQ 9.37 +
+    // SQI 8.16 + IADDI 6.99 + LQI 6.78 = 31.3% of ALL pairs. Control arm is 12.
+    kG516LeverPeel4 = 84,
+    // G516 PROMOTION GATE — arm 18 (dense lower class + four peeled destinations) against arm 12,
+    // the G515 shipped body. Measured rather than added: overlap does not compose (G493).
+    kG516LeverDisp = 85,
+    // G517 — STRENGTH-REDUCE THE PAIR LOOP'S THREE INDEX EXPRESSIONS.
+    //
+    // The re-taken attribution puts 9.4% of the whole VU1 worker on address arithmetic that is a
+    // pure function of the loop counter, with every input SPILLED because the leaf is out of
+    // registers (29 stack references in the shipped body's first 0x700 — G483's binding resource):
+    //   &fused[firstIndex+j]      mov r14d,eax / shl r14,4 / add r14,r9      4.03%
+    //   &g516LowCls[firstIndex+j] mov eax,0x8340 / add rax,[rbp-0x51]        1.14%
+    //   the loop tail's RELOADS   mov esi,[rbp+0x4f] / mov r9,[rbp-0x59]     2.46%
+    //   stampBase + j             mov ecx,r15d / add rcx,[rbp+0x7f]          4.27%
+    // Iterating pointers and a running stamp deletes all of it AND drops the pressure that spilled
+    // the inputs — this is a live-value lever (G483/G516 §4a), not an instruction-count one
+    // (G506: 0.030 host cycles per deleted instruction would price the raw count at ~0.08 ms/f).
+    //   * `fpind`    (arm 19) — the two POINTERS alone.
+    //   * `stampind` (arm 20) — the running STAMP alone.
+    //   * `g517ind`  (arm 21) — both; the promotion gate. Measured, never summed (G493).
+    // Control arm is 18 for all three. Exact by construction; oracle DC2_G517_VERIFY=1 (arm 22).
+    kG517LeverPtrInd = 86,
+    kG517LeverStampInd = 87,
+    kG517LeverInd = 88,
+    // G519 — DELETE THE FOUR CRT ROUNDING CALLS IN THE PER-DRAW SCISSOR CULL.
+    //
+    // G458's empty-work rejection runs on EVERY drawPrimitive (14,600/f on lean MAP-0) and asks
+    // four questions of the form `ceilf(a) < b` / `floorf(a) > b`. Under MSVC's default /fp:precise
+    // and /arch:SSE2 each is a real out-of-line CRT call, so the cull costs 58,400 calls/frame —
+    // and the G519 PC sampler measured `ceilf` 1.00% + `floorf` 0.82% = 1.82% of the pole thread's
+    // whole span (~0.40 ms/f), with the caller report putting 1.66% of the out-of-exe samples on
+    // the `drawPrimitive` fold. This is a CALL-CLASS lever (G496), not an instruction-count one.
+    //
+    // EXACT BY CONSTRUCTION, and the exactness is the whole point: every `b` here is a
+    // `GSScissorReg` field, i.e. a `uint16_t`, so `(float)b` is an exact integer and `(float)b ± 1`
+    // is exactly representable. For an INTEGER b and any float a:
+    //     ceilf(a)  < b   <=>   a <= b - 1      (ceil(a) and b are both integers)
+    //     floorf(a) > b   <=>   a >= b + 1
+    // Both hold for NaN (every comparison false on each side), for +Inf and for -Inf. The four
+    // subtractions `maxX - ofx` are unchanged, so the compared VALUE is bit-identical; only the
+    // rounding call disappears. Oracle DC2_G519_VERIFY=1 recomputes the CRT form and compares the
+    // final BOOLEAN DECISION (G513's law), not the intermediate rounded values.
+    //
+    // Control arm is the shipped CRT form. Rollback DC2_G519_NO_CULLCMP=1.
+    kG519LeverCullCmp = 89,
+    // G520 — THE MAC-HISTORY RESOLVE, BRANCHLESS.
+    //
+    // `[G478:vu1prof]` + the `/MAP` for the binary in hand (G520 §2) put 4.47% of the WHOLE VU1
+    // worker — the POLE thread whenever `[G332:gsw] backend` reads LOW — inside the 592-byte
+    // `g430ResolveAt`, i.e. ~0.8 ms/f over the ~33.4 k flag-reading pairs/frame that reach it
+    // (2.06% of pairs; every one runs in the PAIR LOOP because `!G427_PF_FLAGREAD` is a
+    // block-eligibility condition). ~84 host cycles to scan EIGHT int64 stamps that all live in
+    // ONE cache line — the cost is the loop-carried `bestStamp`/`best` update and its two
+    // data-dependent branches per slot, not the loads. That is the one class this arc has ever
+    // been paid for (G513: a serial chain is its own vein; G485's win is the same shape).
+    //
+    // EXACT BY CONSTRUCTION — the SAME reduction, re-associated. The legacy body computes
+    // `argmax{ stamp[i] : stamp[i] <= target }` with "lowest index wins" on ties, and ties ARE
+    // reachable (all eight stamps initialise to -1). That is exactly `max` over the packed key
+    //     key[i] = (stamp[i] <= target) ? (stamp[i] * 8 + (7 - i)) : INT64_MIN
+    // because `stamp*8 + (7-i)` encodes lexicographic `(stamp, 7-i)` order for 0 <= i < 8, and
+    // `max` is associative and commutative — so an 8->4->2->1 TREE returns the identical slot with
+    // a dependency depth of three conditional moves instead of eight branchy updates. No key can
+    // collide with the INT64_MIN sentinel (stamps are pair counters bounded below by run()'s
+    // seeding prologue) and `stamp * 8` cannot overflow before 2^60 executed pairs.
+    //
+    // Control arm is the shipped scan. Rollback DC2_G520_NO_MACSCAN=1; oracle DC2_G520_VERIFY=1.
+    kG520LeverMacScan = 90,
+    // G521: build the captured G144Entry DIRECTLY IN g_g144List instead of filling a stack local
+    // and then pushing it. G510's `capmove` turned the push's COPY into a MOVE, but G144Entry is
+    // trivially copyable except for one shared_ptr, so its move constructor still transfers all
+    // 256 bytes — the entry is written twice per captured primitive, ~9,927 times a frame on the
+    // GS worker (the pole thread in the HIGH backend state).
+    //   PRICED IN-SESSION, NOT INHERITED (G508's count x cost law). G521's entry-SIZE inflation
+    // probe added 256 dead bytes to G144Entry and cost +0.46 ms/f of frame time while the five
+    // flush pre-passes ([G298:profile]) took only +0.067 of it — so ~0.39 ms/f of the difference is
+    // one extra 256-byte copy per entry on the capture path, which is exactly what this lever
+    // deletes.
+    //   EXACT BY CONSTRUCTION. Both arms write the identical fields in the identical order and the
+    // entry lands in the identical slot; only its ADDRESS during construction differs. There is no
+    // early return, no throw and no flush between the entry's first field write and the push (all
+    // verified), nothing reads g_g144List during the fill (g149BuildDecoded/g161CensusEligibility
+    // never touch it), and g260NoteAppend/g336NoteConsumer run after the fill on both arms.
+    // The candidate emplaces with the G144NoInit tag so it DEFAULT-initializes; a bare
+    // emplace_back() would value-initialize and zero-fill 256 bytes the control never writes.
+    //   Read once per captured primitive, the same rate as the site it gates, and on BOTH arms
+    // identically — so it adds a constant to each bucket and cannot bias the delta (G486 §4).
+    // Rollback DC2_G521_NO_CAPINPLACE=1; oracle DC2_G521_VERIFY=1 -> [G521:verify].
+    kG521LeverCapInPlace = 91,
+    // G522: skip the local->local edge's guest-VRAM PUBLICATION when the copy is going to be done
+    // as an FBO->FBO GPU blit and therefore never reads or writes a guest-VRAM byte.
+    //   MEASURED, NOT ASSUMED (G522 §2-§4). `[G171:regstat] desc=0x0E addr=0x53` is 5.26 ms/f over
+    // 199 TRXDIR writes/frame, and `[G432:trxdir]` splits it: 10.8 of those dispatch a dir=2
+    // local->local transfer costing 5.10 ms/f, of which the PIXEL COPY is 0.18 and the dependency
+    // pin is 4.90. `[G432:l2ledge]` splits the pin again and finds `exec=0` — the deferred-draw
+    // graph drain NEVER runs on this edge, contradicting the recorded "conserved graph drain"
+    // attribution — leaving exactly two owners: `g261mat` 2.92 ms/f and `g285cons` 1.81 ms/f, both
+    // of which end in g261Materialize (a blocking glReadPixels of the target's dirty rows).
+    // `[G261:stat] mat(l2l=...)` is 2.0 materializes/frame, and `g289TryGpuLocalCopy` is taken
+    // 1.97 times/frame — the SAME two full-screen (512x416) edges. The pin publishes rows for a
+    // copy that never looks at them.
+    //   EXACTNESS. g289CanDeferLocalCopy is the admission predicate g289TryGpuLocalCopy itself
+    // re-tests; when it holds, performLocalToLocalTransfer returns immediately after the backend
+    // blit (`if (g289GpuCopy) return;`) without touching guest VRAM, so publishing the resident
+    // source into guest VRAM is unobservable to this transfer. Every other stage of the edge
+    // (g289MaterializeForRanges, the graph-execute test, g266/g278/g272/g277, the g276 display
+    // decision) is untouched. FAIL-SAFE: if the blit is not taken after all, g144L2lLatePin()
+    // runs the two skipped calls before the CPU copy reads VRAM, so the skip can only ever
+    // REORDER the publication, never delete one the copy needs.
+    //   Read once per l2l edge (~10.8/frame) on BOTH arms, so it adds a constant to each bucket
+    // and cannot bias the delta (G486 §4). GS-WORKER thread lever => takes the G438 block hold.
+    // Rollback DC2_G522_NO_L2LSKIP=1; census DC2_G522_STAT=1 -> [G522:l2lskip].
+    kG522LeverL2lSkip = 92,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -644,6 +856,40 @@ static int g419AbLever()
             return static_cast<int>(kG511LeverClsProbe);
         if (std::strcmp(value, "fastdec") == 0)
             return static_cast<int>(kG512LeverFastDec);
+        if (std::strcmp(value, "hashlane") == 0)
+            return static_cast<int>(kG513LeverHashLane);
+        if (std::strcmp(value, "vstore") == 0)
+            return static_cast<int>(kG514LeverVStore);
+        if (std::strcmp(value, "vload") == 0)
+            return static_cast<int>(kG514LeverVLoad);
+        if (std::strcmp(value, "vmem") == 0)
+            return static_cast<int>(kG514LeverVMem);
+        if (std::strcmp(value, "nopdisp") == 0)
+            return static_cast<int>(kG515LeverNopDisp);
+        if (std::strcmp(value, "updesc") == 0)
+            return static_cast<int>(kG516LeverUpDesc);
+        if (std::strcmp(value, "lowdense") == 0)
+            return static_cast<int>(kG516LeverLowDense);
+        if (std::strcmp(value, "dispdense") == 0)
+            return static_cast<int>(kG516LeverDispDense);
+        if (std::strcmp(value, "peel4") == 0)
+            return static_cast<int>(kG516LeverPeel4);
+        if (std::strcmp(value, "g516disp") == 0)
+            return static_cast<int>(kG516LeverDisp);
+        if (std::strcmp(value, "fpind") == 0)
+            return static_cast<int>(kG517LeverPtrInd);
+        if (std::strcmp(value, "stampind") == 0)
+            return static_cast<int>(kG517LeverStampInd);
+        if (std::strcmp(value, "g517ind") == 0)
+            return static_cast<int>(kG517LeverInd);
+        if (std::strcmp(value, "cullcmp") == 0)
+            return static_cast<int>(kG519LeverCullCmp);
+        if (std::strcmp(value, "macscan") == 0)
+            return static_cast<int>(kG520LeverMacScan);
+        if (std::strcmp(value, "capinplace") == 0)
+            return static_cast<int>(kG521LeverCapInPlace);
+        if (std::strcmp(value, "l2lskip") == 0)
+            return static_cast<int>(kG522LeverL2lSkip);
         std::fprintf(stderr,
                      "[G419:ab] unknown DC2_G419_AB='%s' (expected "
                      "narrow|pack|lanes|all|zero|packlanes|pool|all420|narrowtouch|matunpack|"
@@ -653,7 +899,9 @@ static int g419AbLever()
                      "norender|noother|ct24reuse|latedrain|nosync|gpuslow|glstate|winbuf|ownpub|"
                      "blklower|qpblock|blkbranch|blksplit|blkchain|blktail0|eeslow|chainpool|"
                      "histcur|qpseg|lockskip|capmove|clsmemo|g510both|texrun|texprobe|clsprobe|"
-                     "fastdec)\n",
+                     "fastdec|hashlane|vstore|vload|vmem|nopdisp|updesc|lowdense|dispdense|"
+                     "peel4|g516disp|fpind|stampind|g517ind|cullcmp|macscan|capinplace|"
+                     "l2lskip)\n",
                      value);
         return static_cast<int>(kG419LeverNone);
     }();
@@ -737,6 +985,23 @@ static const char *g419AbLeverName(int lever)
     case kG511LeverTexProbe: return "texprobe";
     case kG511LeverClsProbe: return "clsprobe";
     case kG512LeverFastDec: return "fastdec";
+    case kG513LeverHashLane: return "hashlane";
+    case kG514LeverVStore: return "vstore";
+    case kG514LeverVLoad: return "vload";
+    case kG514LeverVMem: return "vmem";
+    case kG515LeverNopDisp: return "nopdisp";
+    case kG516LeverUpDesc: return "updesc";
+    case kG516LeverLowDense: return "lowdense";
+    case kG516LeverDispDense: return "dispdense";
+    case kG516LeverPeel4: return "peel4";
+    case kG516LeverDisp: return "g516disp";
+    case kG517LeverPtrInd: return "fpind";
+    case kG517LeverStampInd: return "stampind";
+    case kG517LeverInd: return "g517ind";
+    case kG519LeverCullCmp: return "cullcmp";
+    case kG520LeverMacScan: return "macscan";
+    case kG521LeverCapInPlace: return "capinplace";
+    case kG522LeverL2lSkip: return "l2lskip";
     default: return "none";
     }
 }
@@ -869,6 +1134,21 @@ static uint64_t g438ArmHoldFrames()
                 // adds it, or it silently alternates every frame while its peers hold 16.
                 sel == kG511LeverTexRun || sel == kG511LeverTexProbe ||
                 sel == kG511LeverClsProbe || sel == kG512LeverFastDec ||
+                // G519's per-draw cull comparison is a GS-WORKER-thread lever like G510's two, so
+                // it inherits the block hold for the same pipelined-runtime reason.
+                sel == kG519LeverCullCmp ||
+                // G520's MAC-history resolve is a VU1-WORKER-thread lever like G490's blockrun,
+                // so it inherits the block hold for the same pipelined-runtime reason (G506's law:
+                // a new thread-level arm joins THIS predicate in the SAME edit that adds it).
+                sel == kG520LeverMacScan ||
+                // G521's capture in-place construction is a GS-WORKER-thread lever like G510's
+                // two, so it inherits the block hold for the same pipelined-runtime reason
+                // (G506's law: a new thread-level arm joins THIS predicate in the SAME edit).
+                sel == kG521LeverCapInPlace ||
+                // G522's l2l publication skip is a GS-WORKER-thread lever like G510's two and
+                // G521's, so it inherits the block hold for the same pipelined-runtime reason
+                // (G506's law: a new thread-level arm joins THIS predicate in the SAME edit).
+                sel == kG522LeverL2lSkip ||
                 sel == kG439LeverCoalesce || sel == kG445LeverEarlyKick ||
                 sel == kG445LeverKickAll || sel == kG447LeverSpinWait || sel == kG447LeverWSpin ||
                 sel == kG447LeverSpinBoth || sel == kG452LeverAsyncOne ||
@@ -1304,6 +1584,271 @@ int g506QpSegArm()
     return arm != 0u ? 1 : 0;
 }
 
+// G514 whole-vector VU-store arm. Same contract as g506QpSegArm directly above — read ONCE per
+// run() on the VU1 worker, per-frame-sequence memo, G438 block hold. Its control arm is 7 (the
+// G506 shipped body), so both arms execute the identical pairs in the identical blocks and differ
+// only in how the SQ/SQI/SQD bodies put 16 bytes into VU RAM.
+int g514VStoreArm()
+{
+    if (g419AbLever() != static_cast<int>(kG514LeverVStore))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G514b whole-vector VU-LOAD arm. Same contract as g514VStoreArm directly above; its control arm
+// is 8 (the store side), so the load side is priced alone.
+int g514VLoadArm()
+{
+    if (g419AbLever() != static_cast<int>(kG514LeverVLoad))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G514 PROMOTION-GATE arm: the shipped default against the pre-G514 body. Same contract as the two
+// directly above.
+int g514VMemArm()
+{
+    if (g419AbLever() != static_cast<int>(kG514LeverVMem))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G515 NOP-peel arm. Same contract as the three directly above — read ONCE per run() on the VU1
+// worker, per-frame-sequence memo, G438 block hold. Its control arm is 10 (the G514 shipped body),
+// so both arms execute the identical pairs in the identical blocks and differ only in whether
+// G422_LK_NOP reaches its empty body through the two-level jump table or through one compare.
+int g515NopPeelArm()
+{
+    if (g419AbLever() != static_cast<int>(kG515LeverNopDisp))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G516: the three decode-time-dispatch arms. Same contract as every block arm above — read ONCE
+// per run() on the VU1 worker, per-frame-sequence memo, G438 block hold. Control arm is 12 (the
+// G515 shipped body) for all three, so every arm executes the identical pairs in the identical
+// blocks and differs only in where the dispatch inputs come from.
+static int g516ArmFor(int lever)
+{
+    if (g419AbLever() != lever)
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq[5] = {
+        0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull,
+        0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull};
+    const int slot = lever - static_cast<int>(kG516LeverUpDesc);
+    if (slot >= 0 && slot < 5 && s_lastSeq[slot] != seq)
+    {
+        s_lastSeq[slot] = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g516UpDescArm() { return g516ArmFor(static_cast<int>(kG516LeverUpDesc)); }
+int g516LowDenseArm() { return g516ArmFor(static_cast<int>(kG516LeverLowDense)); }
+int g516DispDenseArm() { return g516ArmFor(static_cast<int>(kG516LeverDispDense)); }
+int g516Peel4Arm() { return g516ArmFor(static_cast<int>(kG516LeverPeel4)); }
+int g516DispArm() { return g516ArmFor(static_cast<int>(kG516LeverDisp)); }
+
+// G517: the three pair-loop strength-reduction arms. Same contract as every block arm above — read
+// ONCE per run() on the VU1 worker, per-frame-sequence memo (never on the arm VALUE — G501 §6),
+// G438 block hold. Control arm is 18 (the G516 shipped body) for all three.
+static int g517ArmFor(int lever)
+{
+    if (g419AbLever() != lever)
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq[3] = {
+        0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull};
+    const int slot = lever - static_cast<int>(kG517LeverPtrInd);
+    if (slot >= 0 && slot < 3 && s_lastSeq[slot] != seq)
+    {
+        s_lastSeq[slot] = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g517PtrIndArm() { return g517ArmFor(static_cast<int>(kG517LeverPtrInd)); }
+int g517StampIndArm() { return g517ArmFor(static_cast<int>(kG517LeverStampInd)); }
+int g517IndArm() { return g517ArmFor(static_cast<int>(kG517LeverInd)); }
+
+// G519 per-draw scissor-cull comparison arm, read ONCE per drawPrimitive on the GS worker
+// (~14,600/f). The per-frame-sequence memo keyed on the SEQUENCE (never on the arm value — G501 §6)
+// keeps the used-arm bookkeeping to one relaxed RMW per frame; the steady-state per-draw cost is a
+// cached int compare plus one relaxed load, i.e. ~0.02 ms/f against a 0.40 ms/f subject.
+// Returns -1 when not under this A/B, so the caller can distinguish "shipped default" (-1) from
+// "control arm" (0) and gate BEHAVIOUR on the arm VALUE (G504's law).
+int g519CullCmpArm()
+{
+    if (g419AbLever() != static_cast<int>(kG519LeverCullCmp))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// PROMOTED DEFAULT-ON (G519). Four paired gates at 3,600 frames each, in the HIGH state
+// (backend 8.3-8.4) the phase was scoped in:
+//   raw     -0.283 / -0.207 / -0.338 / -0.521  =>  mean -0.337 ms/f (-1.53%), 4/4 negative
+//   blocked -0.156 / -0.173 / -0.243 / -0.387  =>  mean -0.240 ms/f,          4/4 negative
+//   windows favouring the candidate: 20 of 24
+// Both estimators agree in sign (G500's law) and the size matches the prediction the PC sampler
+// made before the lever existed: 0.40 ms/f of CRT rounding x the session's GS sensitivity 0.69
+// = 0.28 expected. Rollback: DC2_G519_NO_CULLCMP=1 (which is also the control body of the A/B).
+// Consulted once per drawPrimitive through a cached static, so the default path never pays a
+// getenv (G268/G500's law).
+bool g519CullCmpDefaultOn()
+{
+    static const bool on = (std::getenv("DC2_G519_NO_CULLCMP") == nullptr);
+    return on;
+}
+
+// Bring-up oracle (default OFF): run BOTH forms and compare the final boolean DECISION, which is
+// what the caller consumes — not the intermediate rounded values (G513's law).
+bool g519CullVerifyOn()
+{
+    static const bool on = (std::getenv("DC2_G519_VERIFY") != nullptr);
+    return on;
+}
+
+// __declspec(noinline) is LOAD-BEARING, not decoration. This body contains the four CRT ceilf /
+// floorf calls the lever exists to delete; if it is inlined into the candidate's basic block inside
+// drawPrimitive (14,600 calls/f) those call sites are back in the hot path even though the runtime
+// gate never takes them, and the gate then measures the oracle instead of the lever. G519's first
+// gate did exactly that and read +0.51 / +0.71 ms/f on a change that removes work (G490's law: a
+// never-selected copy costs real ms/f; G517's law: a dead operand perturbs the arm it sits in).
+#if defined(_MSC_VER)
+__declspec(noinline)
+#endif
+void g519VerifyCull(float cx, float fx, float cy, float fy,
+                    float sx0, float sx1, float sy0, float sy1, bool cmpForm)
+{
+    const bool crtForm = std::ceil(cx) < sx0 || std::floor(fx) > sx1 ||
+                         std::ceil(cy) < sy0 || std::floor(fy) > sy1;
+    static std::atomic<uint64_t> s_checked{0};
+    static std::atomic<uint64_t> s_bad{0};
+    const uint64_t n = s_checked.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (crtForm != cmpForm)
+    {
+        const uint64_t bad = s_bad.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (bad <= 32u)
+            std::fprintf(stderr,
+                         "[G519:verify-BAD] bad=%llu of %llu  maxX-ofx=%.9g minX-ofx=%.9g "
+                         "maxY-ofy=%.9g minY-ofy=%.9g scissor=(%.1f..%.1f, %.1f..%.1f) "
+                         "crt=%u cmp=%u\n",
+                         static_cast<unsigned long long>(bad),
+                         static_cast<unsigned long long>(n),
+                         cx, fx, cy, fy, sx0, sx1, sy0, sy1,
+                         static_cast<unsigned>(crtForm), static_cast<unsigned>(cmpForm));
+    }
+    if ((n % 2000000ull) == 0ull)
+        std::fprintf(stderr, "[G519:verify] cullsChecked=%llu mismatches=%llu\n",
+                     static_cast<unsigned long long>(n),
+                     static_cast<unsigned long long>(s_bad.load(std::memory_order_relaxed)));
+}
+
+// ===== G520 — the MAC-history resolve arm (VU1 WORKER thread) =====
+//
+// Read once per CALL of `g430ResolveAt` (~33.4 k/f, i.e. the 2.06% flag-reading pairs, NOT per
+// pair): the ~1.62 M-pair block loop never reaches it, so this accessor cannot enlarge the leaf
+// G506 priced at 0.030 host cycles per instruction. The per-frame-sequence memo keys on the
+// SEQUENCE, never on the arm value (G501 §6). Returns -1 when not under this A/B so the caller can
+// tell "shipped default" (-1) from "control arm" (0) and gate BEHAVIOUR on the arm VALUE (G504).
+int g520MacScanArm()
+{
+    if (g419AbLever() != static_cast<int>(kG520LeverMacScan))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// The shipped default (see the kG520LeverMacScan comment for the exactness argument). Consulted
+// through a cached static so the default path never pays a getenv (G268/G500's law).
+bool g520MacScanDefaultOn()
+{
+    static const bool on = (std::getenv("DC2_G520_NO_MACSCAN") == nullptr);
+    return on;
+}
+
+bool g520MacVerifyOn()
+{
+    static const bool on = (std::getenv("DC2_G520_VERIFY") != nullptr);
+    return on;
+}
+
+// Reporter half of the oracle. The COMPARISON half must live in the VU1 TU (it needs `s_g430HB`),
+// and it is `__declspec(noinline)` there for the reason G519 §5b paid a whole build cycle to
+// learn: an oracle that contains the very construct the lever deletes must not be inlined into the
+// candidate's basic block, or the gate measures the oracle (G490's law).
+void g520NoteResolve(uint32_t fastVal, uint32_t legacyVal, long long target)
+{
+    static std::atomic<uint64_t> s_checked{0};
+    static std::atomic<uint64_t> s_bad{0};
+    const uint64_t n = s_checked.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (fastVal != legacyVal)
+    {
+        const uint64_t bad = s_bad.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (bad <= 32u)
+            std::fprintf(stderr,
+                         "[G520:verify-BAD] bad=%llu of %llu target=%lld fast=%08x legacy=%08x\n",
+                         static_cast<unsigned long long>(bad),
+                         static_cast<unsigned long long>(n), target, fastVal, legacyVal);
+    }
+    if ((n % 1000000ull) == 0ull)
+        std::fprintf(stderr, "[G520:verify] resolvesChecked=%llu mismatches=%llu\n",
+                     static_cast<unsigned long long>(n),
+                     static_cast<unsigned long long>(s_bad.load(std::memory_order_relaxed)));
+}
+
 // G491 readback-format arm, read once per colour readback on the GL WORKER thread (6/f). The
 // per-frame memo below marks the frame from that thread — which is correct and necessary: the arm
 // must be attributed on whichever thread consumes it, and 6 relaxed RMWs per frame is nothing
@@ -1532,6 +2077,117 @@ bool g510ClsMemoActive()
     return !off;
 }
 
+// G522 local->local publication-skip arm. Read once per l2l edge (~10.8/frame on the GS worker),
+// on BOTH arms, so it adds a constant to each bucket and cannot bias the delta (G486 §4).
+// Never key the per-frame memo on the arm VALUE (G501).
+int g522L2lSkipArm()
+{
+    const int sel = g419AbLever();
+    if (sel != static_cast<int>(kG522LeverL2lSkip))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// Gate the per-arm BEHAVIOUR on the arm VALUE, never on `arm != 0` (G504's law): -1 means the run
+// is not under this A/B and the shipped default (plus its rollback flag) decides.
+bool g522L2lSkipActive()
+{
+    const int arm = g522L2lSkipArm(); // -1 unless DC2_G419_AB=l2lskip
+    if (arm >= 0)
+        return arm == 1;
+    static const bool off = (std::getenv("DC2_G522_NO_L2LSKIP") != nullptr);
+    return !off;
+}
+
+// [G522:l2lskip] census (DC2_G522_STAT=1). `edges` counts every l2l dependency edge, `skipped` the
+// ones whose publication was elided, and `late` the fail-safe replays — a non-zero `late` is the
+// only shape in which this lever can reorder a publication the copy actually needed.
+std::atomic<uint64_t> g_g522Edges{0}, g_g522Skipped{0}, g_g522Late{0};
+bool g522StatOn()
+{
+    static const bool on = (std::getenv("DC2_G522_STAT") != nullptr);
+    return on;
+}
+void g522NoteEdge(bool skipped)
+{
+    if (!g522StatOn())
+        return;
+    const uint64_t n = g_g522Edges.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (skipped)
+        g_g522Skipped.fetch_add(1u, std::memory_order_relaxed);
+    if ((n % 4096u) == 0u)
+        std::fprintf(stderr, "[G522:l2lskip] edges=%llu skipped=%llu late=%llu\n",
+                     static_cast<unsigned long long>(n),
+                     static_cast<unsigned long long>(
+                         g_g522Skipped.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(
+                         g_g522Late.load(std::memory_order_relaxed)));
+}
+
+// G521 capture in-place arm. Same shape, same rate and same thread as G510's capmove arm (once per
+// captured primitive, ~9,927/frame on the GS worker), and read on BOTH arms, so it adds a constant
+// to each bucket and cannot bias the delta. Never key the per-frame memo on the arm VALUE (G501).
+int g521CapInPlaceArm()
+{
+    const int sel = g419AbLever();
+    if (sel != static_cast<int>(kG521LeverCapInPlace))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+bool g521CapInPlaceActive()
+{
+    const int arm = g521CapInPlaceArm(); // -1 unless DC2_G419_AB=capinplace
+    if (arm >= 0)
+        return arm == 1;
+    static const bool off = (std::getenv("DC2_G521_NO_CAPINPLACE") != nullptr);
+    return !off;
+}
+
+// G521 EXACTNESS ORACLE (default OFF, DC2_G521_VERIFY=1). The lever changes only WHERE the entry is
+// constructed, so the decision it must preserve is "the bytes that reach the list slot". The oracle
+// re-runs the CONTROL path into a scratch local on the candidate arm and compares the two field
+// groups the flush actually reads. It is deliberately NOT inline in the candidate's basic block
+// (G519 §5b: an oracle containing the construct the lever deletes measures itself).
+std::atomic<uint64_t> g_g521Checked{0};
+std::atomic<uint64_t> g_g521Mismatch{0};
+bool g521VerifyOn()
+{
+    static const bool on = (std::getenv("DC2_G521_VERIFY") != nullptr);
+    return on;
+}
+void g521NoteEntry(bool bad)
+{
+    const uint64_t n = g_g521Checked.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (bad)
+    {
+        const uint64_t m = g_g521Mismatch.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (m <= 16u)
+            std::fprintf(stderr, "[G521:verify-BAD] n=%llu mismatches=%llu\n",
+                         (unsigned long long)n, (unsigned long long)m);
+    }
+    if ((n % 1000000ull) == 0ull)
+        std::fprintf(stderr, "[G521:verify] entriesChecked=%llu mismatches=%llu\n",
+                     (unsigned long long)n,
+                     (unsigned long long)g_g521Mismatch.load(std::memory_order_relaxed));
+}
+
 // G510 census (default OFF, DC2_G510_CENSUS=1): entries classified per frame and how many of them
 // the memo could serve. Behaviour-pure — it counts on BOTH arms and on the default path, so the
 // hit rate it reports is a property of the route, not of the lever.
@@ -1706,6 +2362,65 @@ bool g512FastDecActive()
     static const bool off = (std::getenv("DC2_G512_NO_FASTDEC") != nullptr);
     return !off;
 }
+
+// ---------------------------------------------------------------------------------------------
+// G513 — 8-lane source-page hash.
+//
+// Read ONCE per g178HashPages call (~23/frame) and passed down as a plain bool, so the ~9,200
+// 64-byte loop iterations it gates never see the accessor (G502's per-item-census bias, avoided by
+// construction). Same per-frame thread-local tick-sequence memo as every other thread-level arm.
+int g513HashLaneArm()
+{
+    if (g419AbLever() != static_cast<int>(kG513LeverHashLane))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G504's law: gate per-arm BEHAVIOUR on the arm VALUE, never on `arm != 0` alone — and keep the env
+// rollback on the SAME accessor so a paired run and a forced run cannot disagree about which body
+// ran. Default ON once promoted; DC2_G513_NO_HASHLANE=1 restores the single-chain reference loop.
+bool g513HashLaneActive()
+{
+    const int arm = g513HashLaneArm(); // -1 unless DC2_G419_AB=hashlane
+    if (arm >= 0)
+        return arm == 1;
+    static const bool off = (std::getenv("DC2_G513_NO_HASHLANE") != nullptr);
+    return !off;
+}
+
+// The EXACTNESS oracle (default OFF, DC2_G513_VERIFY=1). G512's law: an old verifier is an oracle
+// only if it compares against the body you REPLACED — and here even that is not enough, because
+// the two bodies deliberately return DIFFERENT values. What must hold is not value equality but
+// DECISION equality: whenever the reference digest says "this texture is unchanged", the 8-lane
+// digest must say so too, and vice versa. So the oracle keeps a parallel reference-digest registry,
+// runs both bodies on every call, and compares the two hit/miss verdicts. A false HIT (fast says
+// equal, reference says changed) is the failure that would put a stale texture on screen; a false
+// MISS is merely a wasted decode. Both are counted and printed separately.
+bool g513VerifyOn()
+{
+    static const bool on = (std::getenv("DC2_G513_VERIFY") != nullptr);
+    return on;
+}
+std::atomic<uint64_t> g_g513VerifyN{0};         // calls with a prior stamp of both kinds
+std::atomic<uint64_t> g_g513VerifyAgree{0};     // verdicts that matched
+std::atomic<uint64_t> g_g513VerifyFalseHit{0};  // fast HIT where reference MISSED  <- the dangerous one
+std::atomic<uint64_t> g_g513VerifyFalseMiss{0}; // fast MISS where reference HIT
+
+// Bytes actually walked by the byte loop, so [G511:texsplit] can report ns/BYTE. G494's law: a
+// per-item cost that does not scale with the item's size is fixed overhead, not work — and the
+// hash's item is a PAGE, never a texel, so the existing nsPerPx column silently divides by the
+// wrong denominator (a 256x256 T8 texture is 65,536 texels but ~98,000 hashed bytes once the
+// conservative +1 page per column and the CLUT page are counted). One relaxed add per CALL, never
+// per page and never per 64-byte group.
+std::atomic<uint64_t> g_g513HashBytes{0};
 
 // G512 exactness oracle (default OFF, DC2_G512_VERIFY=1). Decodes the texture BOTH ways into two
 // buffers and counts mismatching texels. The reference is the pre-G512 per-texel body, kept

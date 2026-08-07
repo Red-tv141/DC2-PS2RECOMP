@@ -297,6 +297,146 @@
             (st).vi[it] = (int16_t)((st).vi[it] + 1);                                     \
     }
 
+// ---------------------------------------------------------------------------------------------
+// G514 — THE THREE VU-DATA-MEMORY STORE BODIES WITHOUT THE STAGING BUFFER.
+//
+// These are NOT G481's `*_SIMD` macros above (which are unexpanded and stay that way). The
+// difference is the `dest == 0xF` arm: 16 bytes are written with ONE store and NOTHING is read
+// back, because every lane is overwritten. G481's blend form always paid a mask-table load and a
+// destination load even when the mask selected all four lanes.
+//
+// WHY THEY EXIST — measured, not inferred (G514 §3). `[G478:vu1prof]` resolved against the linker
+// `/MAP` puts 78.6% of the VU1 worker inside `g490BlockBody<1,0,1,1,0,0,1>` and 9.1% of the whole
+// thread on four instructions, one per store site, every one of them the `movups [rdx+r12], xmm0`
+// that follows `movups xmm0, [rbp-0x41]` — a 16-byte load overlapping four 4-byte `movss` stores
+// issued three instructions earlier. That is a store-to-load forwarding failure by construction,
+// and `rbp-0x41` is 16-byte MISaligned on top of it. The scalar bodies are already inlined into
+// the block leaf (it contains zero calls), so replacing them there removes text.
+//
+// EXACTNESS.
+//   * `dest == 0xF`: the scalar body loads 16 bytes, overwrites all four lanes from `st.vf[is]`,
+//     and stores 16 bytes back. Every loaded byte is dead. `_mm_storeu_ps(dst, _mm_loadu_ps(src))`
+//     writes the same 16 source bytes to the same address. `movups`/`movss` both MOVE BITS — no
+//     lane reaches an FP unit, so no value can be renormalised, quieted or clamped, and a float
+//     assignment on x64/SSE is itself a `movss` bit move.
+//   * otherwise: the G421 bit-select `g421StoreMasked`, which writes the loaded word back into
+//     every lane the mask does not select — value-identical to the four conditional assignments,
+//     and the same helper G421/G428/G485 already ship for the upper slot's destination write.
+//   * `st.vf[is]` (VU1State) and `vuData` (VU RAM) are disjoint objects, so the load cannot alias
+//     the store. `addr` is a multiple of 16, so the destination store is in fact ALIGNED.
+//   * the address arithmetic, the `dataSize` mask, the `addr + 16 <= dataSize` guard and the
+//     post-in/decrement guards are the SAME tokens as the scalar bodies above.
+// Checked, not asserted: DC2_G514_VERIFY=1 re-derives the 16 bytes the SCALAR body would have
+// written — from a snapshot taken BEFORE the fast store — and compares them against VU RAM
+// afterwards. It compares against the body being REPLACED (G512 §5's rule), not against itself.
+#define G514_STORE16(dstPtr, srcVec, dest)                                                \
+    {                                                                                     \
+        if ((dest) == 0xFu)                                                               \
+            _mm_storeu_ps((dstPtr), (srcVec));                                            \
+        else                                                                              \
+            g421StoreMasked((dstPtr), (srcVec), G481_MASKROW(dest));                      \
+    }
+
+#define G514_LOWER_BODY_SQ(st, instr, vuData, dataSize)                                   \
+    {                                                                                     \
+        const uint8_t is = LIS(instr);                                                    \
+        const uint8_t it = LIT(instr);                                                    \
+        const uint8_t dest = (uint8_t)(((instr) >> 21) & 0xF);                            \
+        const int16_t imm = IMM11(instr);                                                 \
+        uint32_t addr = ((uint32_t)(int32_t)((st).vi[it] + imm)) * 16u;                   \
+        addr &= ((dataSize) - 1);                                                         \
+        if (addr + 16 <= (dataSize))                                                      \
+            G514_STORE16((float *)((vuData) + addr), _mm_loadu_ps((st).vf[is]), dest)     \
+    }
+
+#define G514_LOWER_BODY_SQI(st, instr, vuData, dataSize)                                  \
+    {                                                                                     \
+        const uint8_t it = LIT(instr);                                                    \
+        const uint8_t is = LIS(instr);                                                    \
+        const uint8_t dest = (uint8_t)(((instr) >> 21) & 0xF);                            \
+        uint32_t addr = ((uint32_t)(uint16_t)(st).vi[it]) * 16u;                          \
+        addr &= ((dataSize) - 1);                                                         \
+        if (addr + 16 <= (dataSize))                                                      \
+            G514_STORE16((float *)((vuData) + addr), _mm_loadu_ps((st).vf[is]), dest)     \
+        if (it != 0)                                                                      \
+            (st).vi[it] = (int16_t)((st).vi[it] + 1);                                     \
+    }
+
+// G514b — THE SAME TRANSFER IN THE OTHER DIRECTION, AND THE ONE THAT IS ON THE CHAIN.
+//
+// LQ / LQI / LQD stage 16 bytes of VU RAM into `tmp[4]` and then hand them to `g422ApplyDest`,
+// which writes `st.vf[it]` with up to FOUR 4-byte `movss` stores. The very next pairs read that
+// same register with `movups xmm, [rbx + ft*16]` — a 16-byte load overlapping four 4-byte stores,
+// i.e. the identical forwarding failure as the store side BUT ON THE DEPENDENCY CHAIN, because a
+// VF register is consumed immediately whereas VU RAM is a dead end. That distinction is the whole
+// reason these are a separate arm: G514 §6 measured the STORE side at −0.7% of the loop (the store
+// buffer hides it) and this side is the one G485's `widevf0` already won on, for the same reason.
+//
+// Population (`[G421:mix]`, this session): LQ 9.4% + LQI 6.8% of ALL pairs — 1.5x the store side.
+// Exactness argument, oracle and aliasing note are the store side's, verbatim; `g422ApplyDest`'s
+// four conditional lane assignments and the bit-select write the same bits into the same lanes.
+#define G514_LOAD16(dstPtr, srcVec, dest)                                                 \
+    {                                                                                     \
+        if ((dest) == 0xFu)                                                               \
+            _mm_storeu_ps((dstPtr), (srcVec));                                            \
+        else                                                                              \
+            g421StoreMasked((dstPtr), (srcVec), G481_MASKROW(dest));                      \
+    }
+
+#define G514_LOWER_BODY_LQ(st, instr, vuData, dataSize)                                   \
+    {                                                                                     \
+        const uint8_t it = LIT(instr);                                                    \
+        const uint8_t is = LIS(instr);                                                    \
+        const uint8_t dest = (uint8_t)(((instr) >> 21) & 0xF);                            \
+        const int16_t imm = IMM11(instr);                                                 \
+        uint32_t addr = ((uint32_t)(int32_t)((st).vi[is] + imm)) * 16u;                   \
+        addr &= ((dataSize) - 1);                                                         \
+        if (addr + 16 <= (dataSize))                                                      \
+            G514_LOAD16((st).vf[it],                                                      \
+                        _mm_loadu_ps((const float *)((vuData) + addr)), dest)             \
+    }
+
+#define G514_LOWER_BODY_LQI(st, instr, vuData, dataSize)                                  \
+    {                                                                                     \
+        const uint8_t it = LIT(instr);                                                    \
+        const uint8_t is = LIS(instr);                                                    \
+        const uint8_t dest = (uint8_t)(((instr) >> 21) & 0xF);                            \
+        uint32_t addr = ((uint32_t)(uint16_t)(st).vi[is]) * 16u;                           \
+        addr &= ((dataSize) - 1);                                                         \
+        if (addr + 16 <= (dataSize))                                                      \
+            G514_LOAD16((st).vf[it],                                                      \
+                        _mm_loadu_ps((const float *)((vuData) + addr)), dest)             \
+        if (is != 0)                                                                      \
+            (st).vi[is] = (int16_t)((st).vi[is] + 1);                                     \
+    }
+
+#define G514_LOWER_BODY_LQD(st, instr, vuData, dataSize)                                  \
+    {                                                                                     \
+        const uint8_t it = LIT(instr);                                                    \
+        const uint8_t is = LIS(instr);                                                    \
+        const uint8_t dest = (uint8_t)(((instr) >> 21) & 0xF);                            \
+        if (is != 0)                                                                      \
+            (st).vi[is] = (int16_t)((st).vi[is] - 1);                                     \
+        uint32_t addr = ((uint32_t)(uint16_t)(st).vi[is]) * 16u;                           \
+        addr &= ((dataSize) - 1);                                                         \
+        if (addr + 16 <= (dataSize))                                                      \
+            G514_LOAD16((st).vf[it],                                                      \
+                        _mm_loadu_ps((const float *)((vuData) + addr)), dest)             \
+    }
+
+#define G514_LOWER_BODY_SQD(st, instr, vuData, dataSize)                                  \
+    {                                                                                     \
+        const uint8_t it = LIT(instr);                                                    \
+        const uint8_t is = LIS(instr);                                                    \
+        const uint8_t dest = (uint8_t)(((instr) >> 21) & 0xF);                            \
+        if (it != 0)                                                                      \
+            (st).vi[it] = (int16_t)((st).vi[it] - 1);                                     \
+        uint32_t addr = ((uint32_t)(uint16_t)(st).vi[it]) * 16u;                          \
+        addr &= ((dataSize) - 1);                                                         \
+        if (addr + 16 <= (dataSize))                                                      \
+            G514_STORE16((float *)((vuData) + addr), _mm_loadu_ps((st).vf[is]), dest)     \
+    }
+
 // The loop-side dispatch. `kind` is the G410 sidecar byte; only the covered kinds are handled here
 // and every other kind (including G422_LK_NONE) falls out of the switch so the caller can take its
 // existing path. Written as a macro rather than a function for the same reason DC2_G422_RUN_LOWER

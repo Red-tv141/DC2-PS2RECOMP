@@ -1066,7 +1066,22 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     static const bool s_g273Profile = envFlagEnabled("DC2_G273_PROFILE");
     // G298 diagnosis: split G273's large front-end "pre" bucket at architecture boundaries.
     // Aggregate-only, cached, and behavior-inert unless explicitly requested.
-    static const bool s_g298Profile = envFlagEnabled("DC2_G298_PROFILE");
+    // G523: FIXED-per-flush vs PER-ENTRY decomposition of the five `pre` passes. G429's law says an
+    // inclusive per-flush timer cannot say whether its bucket is conserved work or per-flush
+    // overhead, and the roadmap has carried "33.35 GPU flushes/frame x pre 0.140 ms = 4.67 ms/f,
+    // fixed share never separated" since G521. Entry counts per flush vary over three orders of
+    // magnitude on this route (`[G178:stat] lastBatch` reads 1, 8 and 17 draws on consecutive
+    // reports against a 298.6 mean), so a least-squares fit of each pass's per-flush nanoseconds
+    // against that flush's ENTRY COUNT recovers both numbers with no behaviour change:
+    //   intercept = the cost a flush pays carrying zero entries  => recoverable ONLY by having
+    //               fewer flushes;
+    //   slope     = the marginal cost per entry                  => conserved across any
+    //               re-batching, recoverable only by making the per-entry work cheaper.
+    // Reuses G298's seven timestamps and adds two laps inside `class` (whose 0.064 ms/flush is the
+    // largest single pass) so its per-flush PROLOGUE, its per-entry LOOP and its EPILOGUE are
+    // separated too. Behaviour-pure; implies G298's timestamps. Armed by DC2_G523_FIT=1.
+    static const bool s_g523Fit = envFlagEnabled("DC2_G523_FIT");
+    static const bool s_g298Profile = envFlagEnabled("DC2_G298_PROFILE") || s_g523Fit;
     // G323: split G298 T2->T3 dependency preparation into exclusive complete-operation families.
     // The empty arm takes the same cached scope timestamps but retains no counters, bounding timer
     // self-cost without changing renderer behavior or dependency ordering.
@@ -1127,8 +1142,20 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         }
         // 0x13b begins inside the physical 0x139 family. Match the existing CPU-replay
         // ownership edge before any FBO upload or texture decode can observe stale VRAM.
-        g261PrepareCpuReplay();
+        //
+        // G524 CEILING PROBE (DC2_G524_NO_TRNMAT=1, default-off, knowingly WRONG output): delete
+        // this one call. It is a CONSUMER edge (G492's law) — it publishes GPU-resident 0x139 rows
+        // into guest VRAM so the transient sprite's texture decode can read them — so deleting it
+        // yields stale texels, not a crash, and prices "what if this readback were free".
+        // [G279:mat] c0 = 1.031 ms per materialize x ~1.0/frame = 1.03 ms/f, and [G523:fit]
+        // pro0trn = 0.0323 ms/flush x 33.4 = 1.08 ms/f: the same number from two instruments.
+        static const bool s_g524NoTrnMat = envFlagEnabled("DC2_G524_NO_TRNMAT");
+        if (!s_g524NoTrnMat)
+            g261PrepareCpuReplay();
     }
+    // G523 prologue lap P0: the g286 transient-target admission (and its g261PrepareCpuReplay).
+    const auto g523P0 = s_g298Profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
     const bool g255Rtt = g255GpuRttOn() && g248TargetIndex(fbp) >= 0;
     // G261: GPU-resident RTT wave — this RTT batch renders with readback deferred to a real
     // CPU-consumer edge instead of the per-flush readPixels+swizzle-writeback round-trip.
@@ -1140,6 +1167,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // invariant/uploadFb/FBO-bind logic below reasons about them.
         g264FlushMirrorsAtFlush();
     }
+    // G523 prologue lap P1: the G261 wave setup, i.e. g264FlushMirrorsAtFlush's deferred
+    // VRAM->FBO mirror uploads. The only prologue stage that can do GL work.
+    const auto g523P1 = s_g298Profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
     if (g255Rtt)
         g255NoteAttempt(fbp);
     // G252: RTT band deferral is intentionally CPU-only during bring-up.  The CPU replay keeps
@@ -1201,6 +1232,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         }
     }
 
+    // G523 prologue lap P2: the g252/g255 RTT admission, the fbW bounds check, the g272 display
+    // -wave predicates and the G266 FBW residency reset (which can run a blocking g261Materialize).
+    const auto g523P2 = s_g298Profile ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
     // Pass 1: validate every entry + derive draw state. All-or-nothing.
     static std::vector<G178EntryState> s_states;
     s_states.clear();
@@ -1240,6 +1275,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const bool g511ClsProbe = g511ClsProbeActive();
     uint64_t g511ClsSink = 0u;
     uint64_t g510Eligible = 0u;
+    // G523 lap A: everything above is the `class` pass's per-flush PROLOGUE (transient/RTT/wave
+    // admission, the G266 FBW residency reset, the s_states reserve). Below is the per-entry loop.
+    const auto g523ClsA = s_g298Profile ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
     for (size_t g510i = 0; g510i < g_g144List.size(); ++g510i)
     {
         const G144Entry &e = g_g144List[g510i];
@@ -1370,6 +1409,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             }
         }
     }
+    // G523 lap B: the per-entry loop ends here. What follows (the G510/G511 census tails and the
+    // G289 owner-view build) is per-flush EPILOGUE.
+    const auto g523ClsB = s_g298Profile ? std::chrono::steady_clock::now()
+                                        : std::chrono::steady_clock::time_point{};
     // G511: one relaxed add per FLUSH (33.4/frame), never per entry (G502).
     if (g511ClsProbe)
         g_g511Sink.fetch_add(g511ClsSink, std::memory_order_relaxed);
@@ -3582,9 +3625,14 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // still resident → refresh the gen stamp and keep the GPU copy.
         const auto g511HashT0 = g511Split ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
+        // G513: `fast` selects the byte loop. Read ONCE per call (~23/frame) against ~9,200 loop
+        // iterations, so the accessor cannot pollute the loop it gates (G502).
+        const bool g513Fast = g513HashLaneActive();
+        uint64_t g513Bytes = 0u;
         const uint64_t hashNow = g178HashPages(vram, vramSize, ctx.tex0.tbp0, ctx.tex0.tbw,
                                                ctx.tex0.psm, static_cast<uint32_t>(st.texW),
-                                               static_cast<uint32_t>(st.texH), ctx.tex0.cbp);
+                                               static_cast<uint32_t>(st.texH), ctx.tex0.cbp,
+                                               g513Fast, &g513Bytes);
         if (g511Split)
         {
             g511HashNs += static_cast<uint64_t>(
@@ -3592,8 +3640,62 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     std::chrono::steady_clock::now() - g511HashT0).count());
             ++g511HashN;
             g511HashPx += static_cast<uint64_t>(st.texW) * static_cast<uint64_t>(st.texH);
+            g_g513HashBytes.fetch_add(g513Bytes, std::memory_order_relaxed);
         }
+        // G513 EXACTNESS ORACLE (DC2_G513_VERIFY=1, and NEVER inside a timed run — it runs the
+        // other body as well, i.e. it doubles the very bucket the phase is measuring). The two
+        // bodies return different values by construction, so value equality is not the property
+        // under test; DECISION equality is. For each texture key this compares "did the digest
+        // change since this key's previous call" under both bodies. A disagreement in which the
+        // FAST body says unchanged while the reference says changed is the false HIT that would
+        // leave a stale GPU texture on screen — the one failure mode the roadmap flags. A
+        // disagreement the other way is only a wasted decode. Both are counted separately, and
+        // the whole block is confined to the GS worker thread, which is the only thread that ever
+        // walks this pass (g_g178TexReg itself is an unsynchronised std::unordered_map).
+        if (g513VerifyOn())
+        {
+            static std::unordered_map<uint64_t, uint64_t> s_g513PrevRef;
+            static std::unordered_map<uint64_t, uint64_t> s_g513PrevFast;
+            uint64_t sinkBytes = 0u;
+            const uint64_t otherNow =
+                g178HashPages(vram, vramSize, ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm,
+                              static_cast<uint32_t>(st.texW), static_cast<uint32_t>(st.texH),
+                              ctx.tex0.cbp, !g513Fast, &sinkBytes);
+            const uint64_t refNow = g513Fast ? otherNow : hashNow;
+            const uint64_t fastNow = g513Fast ? hashNow : otherNow;
+            auto rIt = s_g513PrevRef.find(st.texKey);
+            auto fIt = s_g513PrevFast.find(st.texKey);
+            if (rIt != s_g513PrevRef.end() && fIt != s_g513PrevFast.end())
+            {
+                const bool refEq = (rIt->second == refNow);
+                const bool fastEq = (fIt->second == fastNow);
+                const uint64_t n =
+                    g_g513VerifyN.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (refEq == fastEq)
+                    g_g513VerifyAgree.fetch_add(1u, std::memory_order_relaxed);
+                else if (fastEq)
+                    g_g513VerifyFalseHit.fetch_add(1u, std::memory_order_relaxed);
+                else
+                    g_g513VerifyFalseMiss.fetch_add(1u, std::memory_order_relaxed);
+                if (n <= 4u || (n % 20000u) == 0u)
+                    std::fprintf(stderr,
+                                 "[G513:verify] n=%llu agree=%llu falseHit=%llu falseMiss=%llu\n",
+                                 static_cast<unsigned long long>(n),
+                                 static_cast<unsigned long long>(
+                                     g_g513VerifyAgree.load(std::memory_order_relaxed)),
+                                 static_cast<unsigned long long>(
+                                     g_g513VerifyFalseHit.load(std::memory_order_relaxed)),
+                                 static_cast<unsigned long long>(
+                                     g_g513VerifyFalseMiss.load(std::memory_order_relaxed)));
+            }
+            s_g513PrevRef[st.texKey] = refNow;
+            s_g513PrevFast[st.texKey] = fastNow;
+        }
+        // G513: the stamp must have been written by the SAME byte loop that just produced
+        // `hashNow`. Without this the paired A/B's arm switch would compare a reference digest
+        // against an 8-lane one — always a MISS, and on a collision a stale texture.
         if (!g401ForceDecode && it != g_g178TexReg.end() && backendHas &&
+            it->second.hashVar == static_cast<uint8_t>(g513Fast ? 1u : 0u) &&
             it->second.contentHash == hashNow)
         {
             it->second.genSum = genNow;
@@ -3648,7 +3750,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             }
         }
         s_batch.texUploads.push_back(std::move(up));
-        g_g178TexReg[st.texKey] = G178TexReg{genNow, hashNow, st.texW, st.texH};
+        g_g178TexReg[st.texKey] =
+            G178TexReg{genNow, hashNow, st.texW, st.texH,
+                       static_cast<uint8_t>(g513Fast ? 1u : 0u)};
         g_g178TexDecodes.fetch_add(1u, std::memory_order_relaxed);
     }
     // G511: one relaxed add per counter per FLUSH (33.4/frame), never per entry — a per-entry
@@ -3697,7 +3801,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                          "[G511:texsplit] flushes=%llu msPerFlush(loop=%.4f gen=%.4f hash=%.4f "
                          "decode=%.4f rest=%.4f) perFlush(gen=%.2f hash=%.2f decode=%.2f) "
                          "nsEach(gen=%.0f hash=%.0f decode=%.0f) "
-                         "avgPx(hash=%.0f decode=%.0f) nsPerPx(hash=%.2f decode=%.2f)\n",
+                         "avgPx(hash=%.0f decode=%.0f) nsPerPx(hash=%.2f decode=%.2f) "
+                         "hashKBEach=%.1f nsPerHashByte=%.3f\n",
                          static_cast<unsigned long long>(nf), loop, gen, hash, dec,
                          loop - gen - hash - dec,
                          static_cast<double>(g_g511TexGenN.load(std::memory_order_relaxed)) / n,
@@ -3708,7 +3813,17 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                          dec * 1.0e6 / std::max(1.0, decN / n),
                          hashPx / std::max(1.0, hashN), decPx / std::max(1.0, decN),
                          hash * n * 1.0e6 / std::max(1.0, hashPx),
-                         dec * n * 1.0e6 / std::max(1.0, decPx));
+                         dec * n * 1.0e6 / std::max(1.0, decPx),
+                         // G494's law applied to the hash: its item is a PAGE, not a texel, so
+                         // nsPerPx above divides by the wrong denominator. These two columns are
+                         // the rate the byte loop is actually paid at, and the only ones a
+                         // before/after on this phase's lever may be quoted from.
+                         static_cast<double>(
+                             g_g513HashBytes.load(std::memory_order_relaxed)) /
+                             std::max(1.0, hashN) / 1024.0,
+                         hash * n * 1.0e6 /
+                             std::max(1.0, static_cast<double>(
+                                 g_g513HashBytes.load(std::memory_order_relaxed))));
         }
     }
     if (g511Census)
@@ -4828,6 +4943,76 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                          static_cast<double>(s_vertsNs) / denom,
                          static_cast<double>(s_submitNs) / denom,
                          static_cast<double>(s_postNs) / denom);
+        }
+    }
+    if (s_g523Fit)
+    {
+        // y = a + b*n over the flushes seen so far, n = this flush's entry count.
+        //   b = (N*Sxy - Sx*Sy) / (N*Sxx - Sx*Sx)   marginal ns per entry
+        //   a = (Sy - b*Sx) / N                     fixed ns per flush
+        // `submit` is additionally fit against DRAW count, because a per-draw cost is conserved
+        // under re-batching in exactly the way a per-entry cost is and must not be read as fixed.
+        static constexpr int kG523N = 14;
+        static const char *const kG523Name[kG523N] = {
+            "pro0trn", "pro1mir", "pro2fbw", "pro3set",
+            "clsPro", "clsLoop", "clsEpi", "class", "fbz",
+            "deps",   "tex",     "verts",  "submit", "post"};
+        static double s_g523Sy[kG523N] = {}, s_g523Sxy[kG523N] = {};
+        static double s_g523N = 0.0, s_g523Sx = 0.0, s_g523Sxx = 0.0;
+        static double s_g523Sd = 0.0, s_g523Sdd = 0.0, s_g523Sdy = 0.0;
+        const auto g523T7 = std::chrono::steady_clock::now();
+        const auto g523ns = [](auto a, auto b) {
+            return static_cast<double>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+        };
+        const double g523Y[kG523N] = {
+            g523ns(g298T0, g523P0),   g523ns(g523P0, g523P1),     g523ns(g523P1, g523P2),
+            g523ns(g523P2, g523ClsA),
+            g523ns(g298T0, g523ClsA), g523ns(g523ClsA, g523ClsB), g523ns(g523ClsB, g298T1),
+            g523ns(g298T0, g298T1),   g523ns(g298T1, g298T2),     g523ns(g298T2, g298T3),
+            g523ns(g298T3, g298T4),   g523ns(g298T4, g298T5),     g523ns(g298T5, g298T6),
+            g523ns(g298T6, g523T7)};
+        const double g523Entries = static_cast<double>(g_g144List.size());
+        const double g523Draws = static_cast<double>(s_batch.draws.size());
+        s_g523N += 1.0;
+        s_g523Sx += g523Entries;
+        s_g523Sxx += g523Entries * g523Entries;
+        s_g523Sd += g523Draws;
+        s_g523Sdd += g523Draws * g523Draws;
+        static constexpr int kG523Submit = 12; // index of "submit" in kG523Name
+        s_g523Sdy += g523Draws * g523Y[kG523Submit];
+        for (int i = 0; i < kG523N; ++i)
+        {
+            s_g523Sy[i] += g523Y[i];
+            s_g523Sxy[i] += g523Entries * g523Y[i];
+        }
+        if ((nGpu % 600u) == 0u)
+        {
+            const double den = s_g523N * s_g523Sxx - s_g523Sx * s_g523Sx;
+            std::fprintf(stderr,
+                         "[G523:fit] gpu=%llu flushes=%.0f entries/flush=%.1f draws/flush=%.1f\n",
+                         static_cast<unsigned long long>(nGpu), s_g523N,
+                         s_g523Sx / s_g523N, s_g523Sd / s_g523N);
+            for (int i = 0; i < kG523N; ++i)
+            {
+                const double b =
+                    (den != 0.0) ? (s_g523N * s_g523Sxy[i] - s_g523Sx * s_g523Sy[i]) / den : 0.0;
+                const double a = (s_g523Sy[i] - b * s_g523Sx) / s_g523N;
+                const double mean = s_g523Sy[i] / s_g523N;
+                std::fprintf(stderr,
+                             "[G523:fit] %-7s meanMs=%.4f fixedMs=%.4f perEntryNs=%.1f "
+                             "fixedShare=%.0f%%\n",
+                             kG523Name[i], mean / 1.0e6, a / 1.0e6, b,
+                             (mean > 0.0) ? (100.0 * a / mean) : 0.0);
+            }
+            const double dden = s_g523N * s_g523Sdd - s_g523Sd * s_g523Sd;
+            const double bd =
+                (dden != 0.0)
+                    ? (s_g523N * s_g523Sdy - s_g523Sd * s_g523Sy[kG523Submit]) / dden
+                    : 0.0;
+            std::fprintf(stderr,
+                         "[G523:fit] submit-vs-draws fixedMs=%.4f perDrawNs=%.1f\n",
+                         (s_g523Sy[kG523Submit] - bd * s_g523Sd) / s_g523N / 1.0e6, bd);
         }
     }
     if (s_g273Profile)

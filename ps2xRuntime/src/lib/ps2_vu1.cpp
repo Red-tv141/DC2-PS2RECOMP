@@ -1,4 +1,7 @@
-﻿#include "ps2_vu1_parts/vu1_helpers_and_tables.inc"
+﻿// G520: `macscan` — g430ResolveAt (vu1_g421_fast_upper.inc) resolves the architectural MAC with a
+// branchless tree reduction instead of a serial branchy scan of the 8-slot history ring. Content
+// edit here forces MSBuild to consume the .inc (G359). revision: 3 (REFUTED, DC2_G520_MACARM 0)
+#include "ps2_vu1_parts/vu1_helpers_and_tables.inc"
 #include "ps2_vu1_parts/vu1_g370_store_watch.inc"
 #include "ps2_g480_packet_pool.inc"
 #include "ps2_vu1_parts/vu1_core_execution.inc"

@@ -121,6 +121,33 @@ static uint64_t g_g495LastRedFbpN = 0, g_g495LastRedGlobN = 0;
 static uint64_t g_g495LastRedFbpNs = 0, g_g495LastRedGlobNs = 0;
 static uint64_t g_g495TotN = 0, g_g495TotNs = 0, g_g495LastTotN = 0, g_g495LastTotNs = 0;
 
+// ===== G518: the SUBSUMPTION axis — the one thing G495's clock structurally cannot see ==========
+//
+// `g_g495LastRead` is keyed on (fbp, glY, rows), so a read is only ever compared against the
+// previous read carrying THE SAME WINDOW. On this route the frame's four 0x139 reads are NESTED —
+// `@480/32` is inside `@384/128` is inside `@64/448` — so a narrow read that follows a wider read of
+// the same surface with no intervening write returns bytes the wider read already had, and the
+// key-exact clock reports it as non-redundant because it never compares the two.
+//
+// This uses the SAME per-fbp write clock above; no per-row write range is needed, because
+// containment is a property of the two READ windows and cleanliness is a property of the surface.
+// Conservative in the safe direction: any unidentified output surface bumps `g_g495UnknownEpoch`,
+// which unproves every covering window, so a false SUBSUMED can only come from a writer that
+// `g495NoteWrite` mis-attributes to another fbp — the same trust boundary `redFbp` already has.
+//
+// `lo/hi` is the union of every read of that surface taken since the last write to it: two reads
+// that are individually clean can jointly cover a third.
+struct G518Cover
+{
+    uint64_t fbpSeq = 0, unknownEpoch = 0;
+    int lo = 0, hi = -1; // inclusive GL row span; hi < lo means "nothing covered"
+    bool seen = false;
+};
+static std::map<uint32_t, G518Cover> g_g518Cover;
+static uint64_t g_g518SubN = 0, g_g518SubNs = 0, g_g518SubRows = 0;
+static uint64_t g_g518LastSubN = 0, g_g518LastSubNs = 0, g_g518LastSubRows = 0;
+static std::map<uint32_t, uint64_t> g_g518SubByFbp, g_g518LastSubByFbp;
+
 static inline void g495NoteWrite(uint32_t fbp, bool unknown)
 {
     if (!g495RbCensusOn())
@@ -232,6 +259,25 @@ static void g495Report()
     g_g495LastRedGlobN = g_g495RedGlobN;
     g_g495LastRedFbpNs = g_g495RedFbpNs;
     g_g495LastRedGlobNs = g_g495RedGlobNs;
+    // G518: the subsumption axis, window-delta like everything else here.
+    if (totN > 0.0)
+    {
+        std::fprintf(stderr, " || SUB=%.1f%%/%.2fms rows=%.0f",
+                     100.0 * static_cast<double>(g_g518SubN - g_g518LastSubN) / totN,
+                     static_cast<double>(g_g518SubNs - g_g518LastSubNs) / 1.0e6,
+                     static_cast<double>(g_g518SubRows - g_g518LastSubRows));
+        for (auto &kv : g_g518SubByFbp)
+        {
+            const uint64_t d = kv.second - g_g518LastSubByFbp[kv.first];
+            if (d != 0ull)
+                std::fprintf(stderr, " 0x%x=%llu", kv.first,
+                             static_cast<unsigned long long>(d));
+        }
+        g_g518LastSubN = g_g518SubN;
+        g_g518LastSubNs = g_g518SubNs;
+        g_g518LastSubRows = g_g518SubRows;
+        g_g518LastSubByFbp = g_g518SubByFbp;
+    }
     g_g495LastTotN = g_g495TotN;
     g_g495LastTotNs = g_g495TotNs;
     std::fprintf(stderr, "\n");
@@ -276,6 +322,33 @@ static inline void g495NoteRead(uint32_t fbp, int glY, int rows, int px,
     r.globalSeq = g_g495GlobalSeq;
     r.unknownEpoch = g_g495UnknownEpoch;
     r.fbpSeq = g_g495FbpSeq[fbp];
+    // G518 subsumption, on the same per-fbp clock.
+    {
+        G518Cover &c = g_g518Cover[fbp];
+        const bool clean = c.seen && c.unknownEpoch == g_g495UnknownEpoch &&
+                           c.fbpSeq == g_g495FbpSeq[fbp];
+        const int lo = glY, hi = glY + rows - 1;
+        if (clean && c.hi >= c.lo && lo >= c.lo && hi <= c.hi)
+        {
+            ++g_g518SubN;
+            g_g518SubNs += costNs;
+            g_g518SubRows += static_cast<uint64_t>(rows);
+            ++g_g518SubByFbp[fbp];
+        }
+        if (clean && c.hi >= c.lo)
+        {
+            c.lo = std::min(c.lo, lo);
+            c.hi = std::max(c.hi, hi);
+        }
+        else
+        {
+            c.lo = lo;
+            c.hi = hi;
+        }
+        c.seen = true;
+        c.unknownEpoch = g_g495UnknownEpoch;
+        c.fbpSeq = g_g495FbpSeq[fbp];
+    }
     if ((++g_g495Reads % 600ull) == 0ull)
         g495Report();
 }

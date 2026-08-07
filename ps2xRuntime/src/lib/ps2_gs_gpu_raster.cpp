@@ -109,6 +109,10 @@ int g496GlStateArm();
 // G496: the GPU DERIVATIVE PROBE (g496_gpu_ballast.inc; DC2_G419_AB=gpuslow, calibration
 // DC2_G496_FORCE=1 DC2_G496_CAL=1). Identity-blend replay of each render batch's vertex range —
 // real fragment work, zero byte change. Diagnostic only, never promotable (force recompile v1).
+// G518: readback SUBSUMPTION census inside g495_readback_queue_census.inc (`SUB=` on the
+// [G495:rb] line, DC2_G495_RB=1). G495's redundancy clock is keyed on (fbp,glY,rows), so a read
+// contained in an earlier WIDER read of the same clean surface was never tested — and this
+// route's four 0x139 windows are nested 480/32 c 384/128 c 64/448 (force recompile v1).
 #else // !(_WIN32 && !PLATFORM_VITA)
 
 bool g158_gpu_raster_enabled() { return false; }

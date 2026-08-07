@@ -774,7 +774,24 @@
             // law has fired here. It was caught by `[G490:block] cover=76.98% avg=7.80` — the
             // pre-G500 figures — on the very first oracle run, i.e. by an invariant, not by the
             // gate. **Any new arm on this body must be added here in the same edit that adds it.**
-            if ((g499BlkArm == 3 || g499BlkArm == 6 || g499BlkArm == 7) &&
+            // G514: arms 8 (whole-vector store), 10 (+ whole-vector load) and 9 (their oracle) are
+            // arm 7's body and join the same family. FOURTH firing of the law, obeyed in the edit
+            // that added the arms — cross-checked by `[G490:block] cover=88.99% avg=9.15` being
+            // unchanged on every one of them.
+            // G515: arm 12 (the NOP peel) is arm 10's body and joins the same family. FIFTH firing,
+            // obeyed in the edit that adds the arm — same cross-check.
+            // G516: arms 13, 14 and 15 (the decode-time dispatch, each side and both) are arm 12's
+            // body and join the same family. SIXTH firing, obeyed in the edit that adds the arms —
+            // same cross-check (`[G490:block] cover=88.99% avg=9.15` must be unchanged on each).
+            // G517: arms 19, 20, 21 and 22 (the strength-reduced pair loop, each half, both, and
+            // its oracle) are arm 18's body and join the same family. SEVENTH firing of the law,
+            // obeyed in the edit that adds the arms — same cross-check (`[G490:block] cover=88.99%
+            // avg=9.15` must be unchanged on each).
+            if ((g499BlkArm == 3 || g499BlkArm == 6 || g499BlkArm == 7 || g499BlkArm == 8 ||
+                 g499BlkArm == 9 || g499BlkArm == 10 || g499BlkArm == 12 || g499BlkArm == 13 ||
+                 g499BlkArm == 14 || g499BlkArm == 15 || g499BlkArm == 16 ||
+                 g499BlkArm == 17 || g499BlkArm == 18 || g499BlkArm == 19 ||
+                 g499BlkArm == 20 || g499BlkArm == 21 || g499BlkArm == 22) &&
                 g490Count == g490Avail &&
                 (g490Count >= G490_MIN_RUN || g502Tail0))
             {
@@ -865,7 +882,74 @@
                 else
 #endif
 #if DC2_G506_QPSEG
-                if (g499BlkArm == 7)
+                // G514: arm 8 is the shipped default (arm 7's body with the whole-vector VU store);
+                // arm 9 is its ORACLE, reachable only via DC2_G514_VERIFY=1.
+#if DC2_G517_INDARM
+                // G517: REFUTED (see the DC2_G517_INDARM note in vu1_g490_block_run.inc). These four
+                // are compiled out, so the shipped dispatch below is byte-identical to G516's.
+                if (g499BlkArm == 21)
+                    g517ExecuteBlockTailInd(m_state, currentPc >> 3u, g490Count, vuData,
+                                            dataSize, s_qDelayP, s_pDelayP,
+                                            g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g499BlkArm == 22)
+                    g517ExecuteBlockTailVerify(m_state, currentPc >> 3u, g490Count, vuData,
+                                               dataSize, s_qDelayP, s_pDelayP,
+                                               g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g499BlkArm == 20)
+                    g517ExecuteBlockTailStampInd(m_state, currentPc >> 3u, g490Count, vuData,
+                                                 dataSize, s_qDelayP, s_pDelayP,
+                                                 g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g499BlkArm == 19)
+                    g517ExecuteBlockTailPtrInd(m_state, currentPc >> 3u, g490Count, vuData,
+                                               dataSize, s_qDelayP, s_pDelayP,
+                                               g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else
+#endif
+                if (g499BlkArm == 18)
+                    g516ExecuteBlockTailDisp(m_state, currentPc >> 3u, g490Count, vuData,
+                                             dataSize, s_qDelayP, s_pDelayP,
+                                             g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g499BlkArm == 17)
+                    g516ExecuteBlockTailPeel4(m_state, currentPc >> 3u, g490Count, vuData,
+                                              dataSize, s_qDelayP, s_pDelayP,
+                                              g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g499BlkArm == 16)
+                    g516ExecuteBlockTailVerify(m_state, currentPc >> 3u, g490Count, vuData,
+                                               dataSize, s_qDelayP, s_pDelayP,
+                                               g430Base + (int64_t)cycle, g436Hb, g500Tail);
+#if DC2_G516_UPDESC
+                else if (g499BlkArm == 15)
+                    g516ExecuteBlockTailDispDense(m_state, currentPc >> 3u, g490Count, vuData,
+                                                  dataSize, s_qDelayP, s_pDelayP,
+                                                  g430Base + (int64_t)cycle, g436Hb, g500Tail);
+#endif
+                else if (g499BlkArm == 14)
+                    g516ExecuteBlockTailLowDense(m_state, currentPc >> 3u, g490Count, vuData,
+                                                 dataSize, s_qDelayP, s_pDelayP,
+                                                 g430Base + (int64_t)cycle, g436Hb, g500Tail);
+#if DC2_G516_UPDESC
+                else if (g499BlkArm == 13)
+                    g516ExecuteBlockTailUpDesc(m_state, currentPc >> 3u, g490Count, vuData,
+                                               dataSize, s_qDelayP, s_pDelayP,
+                                               g430Base + (int64_t)cycle, g436Hb, g500Tail);
+#endif
+                else if (g499BlkArm == 12)
+                    g515ExecuteBlockTailNopPeel(m_state, currentPc >> 3u, g490Count, vuData,
+                                                dataSize, s_qDelayP, s_pDelayP,
+                                                g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g499BlkArm == 9)
+                    g514ExecuteBlockTailVerify(m_state, currentPc >> 3u, g490Count, vuData,
+                                               dataSize, s_qDelayP, s_pDelayP,
+                                               g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g499BlkArm == 10)
+                    g514ExecuteBlockTailVMem(m_state, currentPc >> 3u, g490Count, vuData,
+                                             dataSize, s_qDelayP, s_pDelayP,
+                                             g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g499BlkArm == 8)
+                    g514ExecuteBlockTailVStore(m_state, currentPc >> 3u, g490Count, vuData,
+                                               dataSize, s_qDelayP, s_pDelayP,
+                                               g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g499BlkArm == 7)
                     g506ExecuteBlockTailQpSeg(m_state, currentPc >> 3u, g490Count, vuData, dataSize,
                                               s_qDelayP, s_pDelayP, g430Base + (int64_t)cycle,
                                               g436Hb, g500Tail);

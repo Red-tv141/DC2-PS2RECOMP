@@ -1645,6 +1645,37 @@ static void g432ReportL2lEdge()
     std::fprintf(stderr, "\n");
 }
 
+// G522 fail-safe state. `armed` is true only between the skipped publication and the caller's
+// g144L2lLatePin() call, and only on the edge that skipped — every other path through
+// g144FlushPendingLocalTransferRange clears it at entry, so a stale replay is impossible.
+struct G522PinDeferred
+{
+    bool armed = false;
+    uint32_t sbp = 0u, ssax = 0u, ssay = 0u, dbp = 0u, dsax = 0u, dsay = 0u, rrw = 0u, rrh = 0u;
+    uint8_t sbw = 0u, spsm = 0u, dbw = 0u, dpsm = 0u;
+    G144BlockRange src{}, dst{};
+    bool srcUnknown = false, dstUnknown = false;
+};
+static thread_local G522PinDeferred t_g522Pin;
+
+// Called by GS::performLocalToLocalTransfer immediately after g289TryGpuLocalCopy returns FALSE.
+// A no-op unless this edge skipped its publication on the promise of an FBO->FBO blit that did not
+// happen; then it runs the two skipped calls verbatim, before the CPU pixel copy reads VRAM.
+void g144L2lLatePin()
+{
+    if (!t_g522Pin.armed)
+        return;
+    t_g522Pin.armed = false;
+    g_g522Late.fetch_add(1u, std::memory_order_relaxed);
+    const uint32_t consumed = g285PrepareL2lConsume(
+        t_g522Pin.sbp, t_g522Pin.sbw, t_g522Pin.spsm, t_g522Pin.ssax, t_g522Pin.ssay,
+        t_g522Pin.dbp, t_g522Pin.dbw, t_g522Pin.dpsm, t_g522Pin.dsax, t_g522Pin.dsay,
+        t_g522Pin.rrw, t_g522Pin.rrh, t_g522Pin.src, t_g522Pin.dst,
+        t_g522Pin.srcUnknown, t_g522Pin.dstUnknown);
+    g261MaterializeForRanges(t_g522Pin.src, t_g522Pin.dst, t_g522Pin.srcUnknown,
+                             t_g522Pin.dstUnknown, kG261MatLocal, consumed);
+}
+
 void g144FlushPendingLocalTransferRange(uint32_t sbp,
                                         uint8_t sbw,
                                         uint8_t spsm,
@@ -1658,6 +1689,7 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
                                         uint32_t rrw,
                                         uint32_t rrh)
 {
+    t_g522Pin.armed = false; // G522: every path below either re-arms it or leaves it disarmed
     // G434 workload invariant: count every l2l edge on BOTH arms of the deletion probe below.
     {
         extern std::atomic<uint64_t> g_g434L2lEdges;
@@ -1764,12 +1796,39 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
         (void)g278FlushPendingDepthForRanges(
             8, src, dst, srcUnknown, dstUnknown);
         g432s.lap(g_g432EdgeStageNs[1]);
-        const uint32_t g285Consumed = g285PrepareL2lConsume(
-            sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
-            src, dst, srcUnknown, dstUnknown);
+        // ===== G522: skip the guest-VRAM PUBLICATION when the blit will stay on the GPU =====
+        // g285PrepareL2lConsume and g261MaterializeForRanges both end in g261Materialize — a
+        // blocking glReadPixels of the target's dirty rows into guest VRAM — and together they own
+        // 4.73 of this edge's 4.90 ms/f (§3). They exist so the CPU pixel copy below can READ real
+        // VRAM bytes. When g289CanDeferLocalCopy holds, performLocalToLocalTransfer takes the
+        // FBO->FBO backend blit and returns at `if (g289GpuCopy) return;` WITHOUT reading or
+        // writing one guest-VRAM byte, so the publication is unobservable to this transfer.
+        // Fail-safe: g144L2lLatePin() below replays exactly these two calls if the blit is not
+        // taken after all, so the skip can only REORDER a publication, never delete a needed one.
+        const bool g522Skip = g522L2lSkipActive() &&
+                              g289CanDeferLocalCopy(sbp, sbw, spsm, ssax, ssay,
+                                                    dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        g522NoteEdge(g522Skip);
+        t_g522Pin.armed = g522Skip;
+        if (g522Skip)
+        {
+            t_g522Pin.sbp = sbp; t_g522Pin.sbw = sbw; t_g522Pin.spsm = spsm;
+            t_g522Pin.ssax = ssax; t_g522Pin.ssay = ssay;
+            t_g522Pin.dbp = dbp; t_g522Pin.dbw = dbw; t_g522Pin.dpsm = dpsm;
+            t_g522Pin.dsax = dsax; t_g522Pin.dsay = dsay;
+            t_g522Pin.rrw = rrw; t_g522Pin.rrh = rrh;
+            t_g522Pin.src = src; t_g522Pin.dst = dst;
+            t_g522Pin.srcUnknown = srcUnknown; t_g522Pin.dstUnknown = dstUnknown;
+        }
+        const uint32_t g285Consumed =
+            g522Skip ? 0u
+                     : g285PrepareL2lConsume(
+                           sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
+                           src, dst, srcUnknown, dstUnknown);
         g432s.lap(g_g432EdgeStageNs[2]);
-        g261MaterializeForRanges(src, dst, srcUnknown, dstUnknown, kG261MatLocal,
-                                 g285Consumed);
+        if (!g522Skip)
+            g261MaterializeForRanges(src, dst, srcUnknown, dstUnknown, kG261MatLocal,
+                                     g285Consumed);
         g432s.lap(g_g432EdgeStageNs[3]);
         if (g343On)
         {

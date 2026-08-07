@@ -60,6 +60,12 @@ void G512ReadRowP4HH(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t
 // same reason rasterizer_command_graph.inc:30-38 hoists `int g476PageBumpArm();` out of it.
 bool g512FastDecActive();
 bool g512VerifyOn();
+// G513: the 8-lane source-page hash's arm accessor, its decision oracle and its byte counter. Same
+// anonymous-namespace linkage trap as the four below — the call sites (g178HashPages and the
+// texture pass in rasterizer_vram_materialization.inc) are inside rasterizer_command_graph.inc's
+// unnamed namespace, where a forward declaration would name a never-defined symbol.
+bool g513HashLaneActive();
+bool g513VerifyOn();
 bool g512PsmCensusOn();
 void g512PsmNote(std::uint8_t psm, std::uint64_t pixels, bool fast, int texW, int texH, int lanes);
 

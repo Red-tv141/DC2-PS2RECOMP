@@ -242,6 +242,41 @@ namespace
         G260RangeSet rd; // texture + CLUT source pages
     };
 
+    // ===== G523: BATCH-MERGE HEADROOM CENSUS (DC2_G523_MERGE=1, read-only, behaviour-pure) =====
+    // [G523:fit] measured the upload-edge drain at 8.84 ms/f over 33.4 GPU flushes/frame, of which
+    // only 0.0078 ms/flush iterates ENTRIES — ~0.23 ms/flush is paid PER FLUSH regardless of what
+    // the flush carries. One GPU flush is exactly one closed G260Batch, and a batch closes only on
+    // an fbp switch, so adjacent batches NEVER share a target and no adjacent merge exists. The one
+    // remaining way to have fewer flushes is to coalesce a batch with an EARLIER same-(fbp,fbw)
+    // batch, which is legal only if every batch strictly between them is independent of it.
+    // This bounds that lever before anyone builds it (G502): it counts the batches that could
+    // legally merge, without reordering anything. Unknown range sets fail closed.
+    static bool g523CensusOn()
+    {
+        static const bool v = envFlagEnabled("DC2_G523_MERGE");
+        return v;
+    }
+    static bool g523SetsOverlap(const G260RangeSet &a, const G260RangeSet &b)
+    {
+        if (a.unknown || b.unknown)
+            return true; // fail closed, exactly as g260RangeSetsConflict does
+        for (int i = 0; i < a.n; ++i)
+            if (b.overlaps(a.r[i]))
+                return true;
+        return false;
+    }
+    // Independent = neither batch writes what the other reads or writes. Read/read is not a
+    // conflict. This is the same relation g260RangeSetsConflict applies to a VRAM event, lifted
+    // from (src,dst) ranges to a whole batch's recorded range sets.
+    static bool g523BatchesIndependent(const G260Batch &x, const G260Batch &y)
+    {
+        return !g523SetsOverlap(x.wr, y.wr) && !g523SetsOverlap(x.wr, y.rd) &&
+               !g523SetsOverlap(x.rd, y.wr);
+    }
+    // g523NoteMergeHeadroom is DEFINED further down, beside g260ExecuteAll: it walks g_g260Graph,
+    // which is declared after this point in the file.
+    static void g523NoteMergeHeadroom();
+
     // Before executing a recorded batch, resolve any dirty display FBO that the batch will sample
     // as ordinary VRAM, alias through another target, or reinterpret with a different FBW. A same-
     // layout write to the same display target may continue directly in its persistent FBO.
@@ -611,6 +646,74 @@ namespace
                      (unsigned long long)g_g260UploadSkips);
     }
 
+    // G523 batch-merge headroom (declaration + rationale are up beside g523BatchesIndependent).
+    // Read-only walk of the closed graph: nothing is reordered, nothing is consumed.
+    static void g523NoteMergeHeadroom()
+    {
+        if (!g523CensusOn())
+            return;
+        static uint64_t s_drains = 0, s_batches = 0, s_merge = 0, s_blocked = 0,
+                        s_nopair = 0, s_entries = 0, s_mergeEntries = 0;
+        ++s_drains;
+        const size_t nb = g_g260Graph.size();
+        for (size_t i = 0; i < nb; ++i)
+        {
+            const G260Batch &bi = g_g260Graph[i];
+            if (bi.entries.empty())
+                continue;
+            ++s_batches;
+            s_entries += bi.entries.size();
+            const uint32_t fbwI = bi.entries.front().ctx.frame.fbw;
+            size_t j = nb; // latest earlier batch on the same target
+            for (size_t k = i; k-- > 0;)
+            {
+                const G260Batch &bk = g_g260Graph[k];
+                if (bk.entries.empty())
+                    continue;
+                if (bk.fbp == bi.fbp && bk.entries.front().ctx.frame.fbw == fbwI)
+                {
+                    j = k;
+                    break;
+                }
+            }
+            if (j == nb)
+            {
+                ++s_nopair; // this target appears once in the drained graph — nothing to merge with
+                continue;
+            }
+            bool ok = true;
+            for (size_t k = j + 1; k < i && ok; ++k)
+                if (!g_g260Graph[k].entries.empty() &&
+                    !g523BatchesIndependent(g_g260Graph[k], bi))
+                    ok = false;
+            if (ok)
+            {
+                ++s_merge;
+                s_mergeEntries += bi.entries.size();
+            }
+            else
+            {
+                ++s_blocked;
+            }
+        }
+        if ((s_drains % 2000u) == 0u)
+        {
+            const double nb2 = static_cast<double>(std::max<uint64_t>(1u, s_batches));
+            std::fprintf(stderr,
+                         "[G523:merge] drains=%llu batches=%llu batches/drain=%.2f "
+                         "entries/batch=%.1f mergeable=%llu (%.1f%%) blocked=%llu (%.1f%%) "
+                         "nopair=%llu (%.1f%%) mergeEntries/batch=%.1f\n",
+                         static_cast<unsigned long long>(s_drains),
+                         static_cast<unsigned long long>(s_batches),
+                         nb2 / static_cast<double>(s_drains),
+                         static_cast<double>(s_entries) / nb2,
+                         static_cast<unsigned long long>(s_merge), 100.0 * s_merge / nb2,
+                         static_cast<unsigned long long>(s_blocked), 100.0 * s_blocked / nb2,
+                         static_cast<unsigned long long>(s_nopair), 100.0 * s_nopair / nb2,
+                         s_merge ? static_cast<double>(s_mergeEntries) / s_merge : 0.0);
+        }
+    }
+
     // Execute a submission-order prefix of the CLOSED graph. Each batch runs through the SAME
     // proven flush closure the immediate drain uses (whole-flush GPU attempt, else 8-lane band
     // CPU replay). Remaining suffix batches retain their original order and captured state.
@@ -705,6 +808,7 @@ namespace
         if (g_g260Graph.empty())
             return;
         ++g_g260ExecByCause[cause & 7];
+        g523NoteMergeHeadroom(); // G523: read-only, before any batch is consumed
         static const bool s_seqEnv = (std::getenv("DC2_G144_SEQ") != nullptr);
         const std::function<void()> &fn =
             (allowParallel && !s_seqEnv && g_g144FlushFn) ? g_g144FlushFn : g_g144FlushSeqFn;
@@ -1240,16 +1344,137 @@ struct G178TexReg
     uint64_t genSum = 0;
     uint64_t contentHash = 0;
     int w = 0, h = 0;
+    // G513: which hash BODY produced `contentHash`. The 8-lane body is a different (equally strong,
+    // not weaker) function of the same bytes, so its value differs from the reference body's. The
+    // A/B instrument alternates the two bodies WITHIN one process, and a stamp written by one body
+    // must never be compared against a digest computed by the other — that comparison is a
+    // guaranteed MISS at best and, if the two ever collided, a STALE texture at worst. Recording
+    // which body wrote the stamp turns an arm switch into one honest re-decode per key instead.
+    uint8_t hashVar = 0xFFu;
 };
 std::unordered_map<uint64_t, G178TexReg> g_g178TexReg;
+
+// ---------------------------------------------------------------------------------------------
+// G513 — the source-page hash's byte loop.
+//
+// The REFERENCE body, verbatim from G178. Its emitted inner loop (dc2_runner.exe 0x1404104e4,
+// read before this phase touched anything, per G505's law) is
+//     xor rax, [rsi+rcx] ; add rcx,8 ; imul rax,r10 ; cmp ; jb
+// i.e. a single loop-carried chain of xor(1c) -> imul(3c) = **4 host cycles per 8 bytes**, 0.5
+// B/cycle. Nothing about that is bandwidth: ~9 pages = ~74 KB per call sits in L2, which sustains
+// tens of bytes per cycle. The cost is the DEPENDENCY, and the lever is therefore ILP, not SIMD
+// and not fewer bytes.
+uint64_t g513HashMarkedRef(const uint8_t *vram, uint32_t vramSize, const bool *mark,
+                           uint64_t *bytesOut)
+{
+    uint64_t bytes = 0u;
+    uint64_t hsh = 1469598103934665603ull;
+    for (uint32_t pg = 0; pg < kG178PageCount; ++pg)
+    {
+        if (!mark[pg])
+            continue;
+        const size_t off = static_cast<size_t>(pg) * 8192u;
+        if (off + 8192u > vramSize)
+            continue;
+        const uint8_t *p = vram + off;
+        for (size_t i = 0; i < 8192u; i += 8)
+        {
+            uint64_t v;
+            std::memcpy(&v, p + i, 8);
+            hsh ^= v;
+            hsh *= 1099511628211ull;
+        }
+        bytes += 8192u;
+    }
+    if (bytesOut)
+        *bytesOut = bytes;
+    return hsh;
+}
+
+// The CANDIDATE body: eight INDEPENDENT FNV-1a chains, lane k taking the k-th 8-byte slot of every
+// 64-byte group, carried across the whole marked page set in the same ascending page order, folded
+// once at the end in a FIXED lane order.
+//
+// Why 8 and not 4 or 16: the binding resource is the 64-bit `imul` issue port (1/cycle) and its
+// 3-cycle latency. Eight in flight issue in 8 cycles while each lane only needs its own result
+// 4 cycles later, so 8 lanes exactly saturates the port at ~1 cycle per 8 bytes — the predicted
+// 4x. More lanes buy nothing (the port is already full) and start spilling; the memcpy loads fold
+// into the xor operand, so the lanes cost 8 GPRs and no scratch.
+//
+// EXACTNESS. This is a DIFFERENT digest of the SAME bytes, not the same digest computed faster —
+// FNV-1a's xor step is not affine over the multiply's ring, so it cannot be split without changing
+// the value. That is admissible here only because the digest is never compared against anything
+// but a stamp this same body wrote (see G178TexReg::hashVar), and because it is not WEAKER: every
+// byte still passes through a full 64-bit FNV chain, the folded state is 512 bits reduced to 64,
+// and the lanes are seeded distinctly so a permutation of the data between lane positions cannot
+// cancel. The false-HIT risk the roadmap flags is a STRENGTH question, and 8x64 folded to 64 is
+// not less discriminating than 1x64. `DC2_G513_VERIFY=1` tests exactly that claim at runtime, by
+// running both bodies and comparing the two hit/miss DECISIONS rather than the two values.
+uint64_t g513HashMarkedFast(const uint8_t *vram, uint32_t vramSize, const bool *mark,
+                            uint64_t *bytesOut)
+{
+    constexpr uint64_t kP = 1099511628211ull;
+    constexpr uint64_t kBasis = 1469598103934665603ull;
+    constexpr uint64_t kLaneSalt = 0x9E3779B97F4A7C15ull;
+    uint64_t h0 = kBasis ^ (0ull * kLaneSalt), h1 = kBasis ^ (1ull * kLaneSalt);
+    uint64_t h2 = kBasis ^ (2ull * kLaneSalt), h3 = kBasis ^ (3ull * kLaneSalt);
+    uint64_t h4 = kBasis ^ (4ull * kLaneSalt), h5 = kBasis ^ (5ull * kLaneSalt);
+    uint64_t h6 = kBasis ^ (6ull * kLaneSalt), h7 = kBasis ^ (7ull * kLaneSalt);
+    uint64_t bytes = 0u;
+    for (uint32_t pg = 0; pg < kG178PageCount; ++pg)
+    {
+        if (!mark[pg])
+            continue;
+        const size_t off = static_cast<size_t>(pg) * 8192u;
+        if (off + 8192u > vramSize)
+            continue;
+        const uint8_t *p = vram + off;
+        // 8192 is an exact multiple of 64, so there is no tail and no tail branch.
+        for (size_t i = 0; i < 8192u; i += 64)
+        {
+            uint64_t v0, v1, v2, v3, v4, v5, v6, v7;
+            std::memcpy(&v0, p + i + 0, 8);
+            std::memcpy(&v1, p + i + 8, 8);
+            std::memcpy(&v2, p + i + 16, 8);
+            std::memcpy(&v3, p + i + 24, 8);
+            std::memcpy(&v4, p + i + 32, 8);
+            std::memcpy(&v5, p + i + 40, 8);
+            std::memcpy(&v6, p + i + 48, 8);
+            std::memcpy(&v7, p + i + 56, 8);
+            h0 = (h0 ^ v0) * kP;
+            h1 = (h1 ^ v1) * kP;
+            h2 = (h2 ^ v2) * kP;
+            h3 = (h3 ^ v3) * kP;
+            h4 = (h4 ^ v4) * kP;
+            h5 = (h5 ^ v5) * kP;
+            h6 = (h6 ^ v6) * kP;
+            h7 = (h7 ^ v7) * kP;
+        }
+        bytes += 8192u;
+    }
+    uint64_t hsh = kBasis;
+    hsh = (hsh ^ h0) * kP;
+    hsh = (hsh ^ h1) * kP;
+    hsh = (hsh ^ h2) * kP;
+    hsh = (hsh ^ h3) * kP;
+    hsh = (hsh ^ h4) * kP;
+    hsh = (hsh ^ h5) * kP;
+    hsh = (hsh ^ h6) * kP;
+    hsh = (hsh ^ h7) * kP;
+    if (bytesOut)
+        *bytesOut = bytes;
+    return hsh;
+}
 
 // Collect the distinct VRAM page indices a texture's conservative range covers (same walk as
 // g178GenSumRect, deduped), then FNV-hash those pages' raw bytes. ~8-32 pages for title textures
 // — a sequential ~64-256KB hash, far cheaper than a swizzle+CLUT whole-texture decode.
+// G513: `fast` selects the byte loop; the PAGE SET and the page ORDER are identical either way, so
+// the only variable between the two arms is the inner loop's dependency structure.
 uint64_t g178HashPages(const uint8_t *vram, uint32_t vramSize,
                        uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
                        uint32_t w, uint32_t h,
-                       uint32_t clutBpBlocks)
+                       uint32_t clutBpBlocks, bool fast, uint64_t *bytesOut)
 {
     bool mark[kG178PageCount] = {};
     auto collect = [&](uint32_t bp, uint32_t bw, uint32_t p, uint32_t ww, uint32_t hh) {
@@ -1270,24 +1495,10 @@ uint64_t g178HashPages(const uint8_t *vram, uint32_t vramSize,
     collect(bpBlocks, bw64, psm, w, h);
     collect(clutBpBlocks, 1, GS_PSM_CT32, 64, 32);
 
-    uint64_t hsh = 1469598103934665603ull;
-    for (uint32_t pg = 0; pg < kG178PageCount; ++pg)
-    {
-        if (!mark[pg])
-            continue;
-        const size_t off = static_cast<size_t>(pg) * 8192u;
-        if (off + 8192u > vramSize)
-            continue;
-        const uint8_t *p = vram + off;
-        for (size_t i = 0; i < 8192u; i += 8)
-        {
-            uint64_t v;
-            std::memcpy(&v, p + i, 8);
-            hsh ^= v;
-            hsh *= 1099511628211ull;
-        }
-    }
-    return hsh;
+    if (bytesOut)
+        *bytesOut = 0u;
+    return fast ? g513HashMarkedFast(vram, vramSize, mark, bytesOut)
+                : g513HashMarkedRef(vram, vramSize, mark, bytesOut);
 }
 
 // Per-fbp framebuffer snapshot state: when the fb pages' gen sum is unchanged since our last

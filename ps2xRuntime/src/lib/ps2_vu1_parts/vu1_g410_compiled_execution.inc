@@ -199,6 +199,44 @@ namespace
     };
     static_assert(sizeof(G479FusedPair) == 16u);
 
+    // G516 - THE BLOCK LEAF'S DISPATCH INPUTS, RESOLVED AT DECODE TIME.
+    //
+    // WHY. G515 proved the block leaf's lower `switch` is a two-level jump table and peeled its
+    // dominant destination for -1.09%; the re-taken attribution (G516 §1) shows the SAME shape
+    // twice per pair, and both are LOAD -> LOAD chains whose second address depends on the first
+    // load's RESULT:
+    //
+    //   +0x15e  movzx eax,[rsi+9]            ; fp.pair.upperKind          3.79%
+    //   +0x178  mov   eax,[g421DescTableConst + rax*4]                    (skid 1.90% at +0x17f)
+    //   +0x57d  movzx eax,[rsi+0xe]          ; fp.pair.lowerKind          1.43%
+    //   +0x598  movzx eax,[table1 + rax]     ; MSVC's byte index          1.32%
+    //   +0x5a1  mov   ecx,[table2 + rax*4]                                2.00%
+    //
+    // Both are pure functions of a byte this cache already decodes ONCE per code write, so both
+    // can be resolved at decode time into a record indexed by the SAME pair index the leaf already
+    // has. The address of every load then depends only on the index, never on another load.
+    //
+    // `upperCls/Op/Src/Bc` are `g421DescTableConst.e[upperKind]` materialised (that table is
+    // link-time constant, so this is a copy of a constant, not a new decision), and `lowClass` is
+    // the DENSE 0..10 renumbering of the ten lower kinds the leaf's switch names - dense and
+    // all-distinct, which is exactly the condition under which MSVC drops the byte-index level.
+    //
+    // Filled in g490RebuildRunLengths(), which runs on BOTH invalidation paths (the full prepare
+    // and the precise MPG path) right after g410CompilePairSlow has rewritten the slots, so it can
+    // never describe a stale encoding - the same argument that covers g490RunLen / g500Tail.
+    // G516 v2 — TWO NARROW ARRAYS, NOT ONE WIDE RECORD. The v1 shape (one 8-byte record per pair,
+    // loaded once at the top of the iteration) measured **+1.67 ms/f (+8.26%), 0/7 favourable,
+    // t = 10.06** and is REFUTED. Two things were wrong with it and both are in the arc's law book:
+    //   * FOOTPRINT. `fused` is 16 B x 2,048 slots = 32 KB, i.e. the whole of this host's L1D, and
+    //     `[G490:armed]` says 1,366 of those slots are live. An 8 B/pair second stream adds 16 KB
+    //     to a working set that is already at capacity.
+    //   * LIVE VALUES (G483). Copying the record into a local at the top held a 64-bit value from
+    //     the pair fetch (+0x174) to the lower dispatch (+0x5bf), ~1,100 bytes of code later, in a
+    //     loop that already spills: stack references in the first 0x700 went 27 -> 36.
+    // v2 stores the two facts SEPARATELY, at their natural widths, and reads each one AT ITS POINT
+    // OF USE so neither is live across the upper. The lower class costs 1 B/pair (2 KB) and the
+    // upper descriptor 4 B/pair (8 KB), so each arm can be priced against its own footprint.
+
     struct G410CompiledCache
     {
         const uint8_t *codeBase = nullptr;
@@ -227,6 +265,12 @@ namespace
         // VNOP. Maintained by the same two call sites as g475RunLen, so precise invalidation
         // covers it identically.
         std::array<uint8_t, PS2_VU1_CODE_SIZE / 8u> g490RunLen{};
+        // G516: the pre-resolved dispatch inputs. `g516LowCls` is the dense 0..10 lower class
+        // (0 == none of the ten named kinds -> the leaf's `default:`); `g516UpDesc` is
+        // `g421DescTableConst.e[upperKind]` materialised, its four bytes packed in declaration
+        // order {cls, op, src, bc} so one 32-bit load reconstitutes the descriptor.
+        alignas(64) std::array<uint8_t, PS2_VU1_CODE_SIZE / 8u> g516LowCls{};
+        alignas(64) std::array<uint32_t, PS2_VU1_CODE_SIZE / 8u> g516UpDesc{};
         // G500: how many CONTROL-TRANSFER TAIL pairs a block may execute at this slot — 0 (this
         // slot is not an admissible branch terminator), 1 (the branch pair alone; its delay slot
         // is not block-eligible and stays with the pair loop) or 2 (the branch pair AND its delay

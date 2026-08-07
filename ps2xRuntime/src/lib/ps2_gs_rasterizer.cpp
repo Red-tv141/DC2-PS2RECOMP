@@ -1,4 +1,70 @@
-﻿// G511: two INFLATION prices on the flush's per-entry pre-work + one decomposition census, all in
+﻿// G524: the transient-target materialize DELETION CEILING PROBE, in
+// rasterizer_vram_materialization.inc — content edit here forces MSBuild to consume it (G359).
+// revision: 1
+//   * DC2_G524_NO_TRNMAT=1 (default-off, knowingly WRONG output) deletes the single
+//     g261PrepareCpuReplay() the g286 transient-target admission runs in the GPU flush prologue.
+//     That call is `pro0trn`, G523 §6b's named ⭐⭐ target: [G279:mat] c0 prices it at 1.031 ms per
+//     materialize x ~1.0 per frame (416 rows of 0x139 read back into guest VRAM), and [G523:fit]
+//     independently reads pro0trn = 0.0323 ms/flush x 33.4 flushes = 1.08 ms/f.
+//     It is a CONSUMER edge (G492), so the deletion is a valid ceiling: the transient sprite's
+//     texture decode then reads stale VRAM texels rather than crashing.
+// G523: the FIXED-per-flush vs PER-ENTRY fit census for the GPU flush's `pre` passes, in
+// rasterizer_vram_materialization.inc — content edit here forces MSBuild to consume it (G359).
+// revision: 2 (adds the four prologue laps + the batch-merge headroom census)
+//   * DC2_G523_MERGE=1 -> [G523:merge] (rasterizer_command_graph.inc). One GPU flush IS one closed
+//     G260Batch and a batch closes only on an fbp switch, so ADJACENT batches never share a target
+//     and no adjacent merge exists. This counts how many drained batches could legally coalesce
+//     with an EARLIER same-(fbp,fbw) batch — legal only when every batch strictly between them is
+//     independent of it (neither writes what the other reads or writes; unknown fails closed).
+//     Read-only: nothing is reordered. Bounds the flush-count lever before anyone builds it.
+//   * DC2_G523_FIT=1 -> [G523:fit]. Least-squares fit of each per-flush pass (clsPro/clsLoop/
+//     clsEpi/class/fbz/deps/tex/verts/submit/post) against that flush's ENTRY count, plus a second
+//     fit of `submit` against DRAW count. Intercept = the cost a flush pays carrying zero entries
+//     (recoverable ONLY by having fewer flushes); slope = the marginal per-entry cost (conserved
+//     under any re-batching). Behaviour-pure, implies DC2_G298_PROFILE's seven timestamps, adds
+//     two laps inside `class` (33.4 flushes/frame, so ~67 extra clock reads/frame).
+//     Answers the roadmap's standing "33.35 flushes/f x pre 0.140 ms = 4.67 ms/f, fixed share
+//     never separated" for every pass at once.
+// G521: the G144Entry ENTRY-SIZE INFLATION PROBE + the `capinplace` lever, in .inc parts (struct +
+// reporter in rasterizer_tilebinning_and_probes.inc, arm/oracle in g419_ab_instrument.inc, the
+// capture site in rasterizer_tilebin_capture.inc) — content edit here forces MSBuild to consume
+// them (G359). revision: 2 (probe default ABSENT; capinplace REFUTED, compiled out)
+//   * `capinplace` (kG521LeverCapInPlace) — build the captured G144Entry directly in g_g144List
+//     instead of filling a stack local and moving it in, deleting one 256-byte write per captured
+//     primitive (~9,927/frame on the pole thread). Exact: [G521:verify] entriesChecked=41000000
+//     mismatches=0. REFUTED at mean raw -0.065 ms/f (-0.30%, 3/4) but blocked -0.011 (2/4,
+//     SIGN-INCONSISTENT). Compiled out behind DC2_G521_INPLACEARM 0; the shipped capture is the
+//     pre-G521 aggregate stack local + G510's move-push, byte for byte.
+//     Rollback DC2_G521_NO_CAPINPLACE=1; oracle DC2_G521_VERIFY=1 (both inert at ARM 0).
+//   * DC2_G521_PADBYTES (compile-time, default 0) appends dead payload to G144Entry so the
+//     capture push and all five flush pre-passes stride over a larger entry with NO behaviour
+//     change. [G298:profile]'s five per-pass clocks on a padded build vs an unpadded one give
+//     the marginal ms/f PER BYTE of entry size — the ceiling for G510 §6's state-table refactor,
+//     which is a ~580-site edit and was priced off a bucket total, not off count x cost.
+//   * DC2_G521_SIZE=1 -> [G521:size], the one-shot measured layout (so the slope is divided by a
+//     number read from the binary, not hand-computed).
+// G520: the MAC-history resolve made branchless, in .inc parts (the arm/oracle accessors here in
+// g419_ab_instrument.inc, the lever itself in ps2_vu1_parts/vu1_g421_fast_upper.inc) — content
+// edit here forces MSBuild to consume them (G359). revision: 3 (REFUTED, compiled out)
+//   * `macscan` (kG520LeverMacScan) — g430ResolveAt's 8-slot linear scan over the MAC history
+//                ring becomes a branchless 8->4->2->1 max-reduction over an index-packed key.
+//                [G478:vu1prof] + /MAP put 4.47% of the VU1 WORKER (~0.8 ms/f, the pole thread in
+//                the LOW backend state) inside that 592-byte function, over ~33.4 k flag-reading
+//                pairs/frame. Exact by re-association; ties (all stamps init to -1) resolve
+//                identically via the `7 - i` low bits.
+//                Rollback DC2_G520_NO_MACSCAN=1; oracle DC2_G520_VERIFY=1 -> [G520:verify].
+// G519: delete the four CRT rounding calls in G458's per-draw scissor cull, all in .inc parts —
+// content edit here forces MSBuild to consume them (G359). revision: 3 (PROMOTED default-ON)
+//   * `cullcmp` (kG519LeverCullCmp) — rasterizer_tilebin_capture.inc decides `ceilf(a) < b` and
+//                `floorf(a) > b` by comparison against b-1 / b+1 instead of by rounding. Every b is
+//                a GSScissorReg uint16_t, so it is an exact integer and the substitution is exact
+//                for every float a including NaN and +/-Inf. The cull runs on EVERY drawPrimitive
+//                (14,600/f on lean MAP-0) and the G519 PC sampler measured ceilf 1.00% + floorf
+//                0.82% = 1.82% of the pole thread (~0.40 ms/f), the four calls being the only
+//                reason this path touches the CRT at all.
+//                Rollback DC2_G519_NO_CULLCMP=1; standalone DC2_G519_CULLCMP=1;
+//                decision oracle DC2_G519_VERIFY=1 -> [G519:verify].
+// G511: two INFLATION prices on the flush's per-entry pre-work + one decomposition census, all in
 // .inc parts — content edit here forces MSBuild to consume them (G359). revision: 2
 //   * `texprobe` (kG511LeverTexProbe) — G502 INFLATION price: arm 1 adds ONE extra s_batchKeys probe
 //                per probing entry. MEASURED -0.102 +/- 0.058 ms/f over 5,264 probes/f, i.e. the
@@ -61,6 +127,17 @@ int g498OwnPubArm();
 //       ps2_gs_rasterizer_parts/g512_fast_texdecode.inc (new, included from
 //       rasterizer_command_graph.inc), and the GSMem::G512ReadRow* global-scope declarations in
 //       rasterizer_headers_and_diagnostics.inc (force recompile v1).
+// G513: DC2_G419_AB=hashlane lever (kG513LeverHashLane = 76) + g513HashLaneArm/g513HashLaneActive/
+//       g513VerifyOn and the four verify counters in g419_ab_instrument.inc, the two byte-loop
+//       bodies (g513HashMarkedRef / g513HashMarkedFast) plus G178TexReg::hashVar in
+//       rasterizer_command_graph.inc, the decision oracle and the ns/byte columns in
+//       rasterizer_vram_materialization.inc, and the two global-scope declarations in
+//       rasterizer_headers_and_diagnostics.inc (force recompile v1).
+// G522: `l2lskip` (kG522LeverL2lSkip) — rasterizer_draw_sprite.inc elides the local->local edge's
+// guest-VRAM publication (g285PrepareL2lConsume + g261MaterializeForRanges, 4.73 of that edge's
+// 4.90 ms/f) whenever g289CanDeferLocalCopy proves the copy will be an FBO->FBO blit that never
+// touches guest VRAM; arm/rollback/census + g144L2lLatePin's counter in g419_ab_instrument.inc.
+// Content edit here forces MSBuild to consume both .inc files (G359). revision: 1
 
 #include <deque>
 

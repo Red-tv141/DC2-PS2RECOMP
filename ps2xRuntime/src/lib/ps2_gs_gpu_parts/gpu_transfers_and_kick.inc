@@ -13,6 +13,9 @@ extern void g144FlushPendingUploadRange(uint32_t dbp,
                                         uint32_t dsay,
                                         uint32_t rrw,
                                         uint32_t rrh);
+// G522: fail-safe replay of the local->local guest-VRAM publication that the range barrier skipped
+// on the promise of an FBO->FBO blit. A no-op unless that edge skipped AND the blit was not taken.
+extern void g144L2lLatePin();
 extern void g144FlushPendingLocalTransferRange(uint32_t sbp,
                                                uint8_t sbw,
                                                uint8_t spsm,
@@ -205,6 +208,11 @@ void GS::performLocalToLocalTransfer()
                                           sbp, sbw, spsm, ssax, ssay,
                                           dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
     }
+
+    // G522: the blit was not taken, so the CPU copy below WILL read guest VRAM. Replay the
+    // publication the range barrier skipped. No-op on every other path.
+    if (!g289GpuCopy)
+        g144L2lLatePin();
 
     {
         G432Scope sc(g432L2lArmed ? &s_g432LHook : nullptr, g432L2lPx);

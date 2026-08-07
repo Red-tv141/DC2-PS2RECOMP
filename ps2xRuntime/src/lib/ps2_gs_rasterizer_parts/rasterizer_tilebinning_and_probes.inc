@@ -8,8 +8,42 @@
 // stream (one dispatch, thousands of tris/thread) instead of one triangle — so it is not limited by
 // per-triangle size the way G143's intra-triangle row split is. A full POD snapshot of the exact GS
 // draw state drawTriangle reads (ctx/prim/texa/texclut/pabe/3 verts) makes each entry self-contained.
+// G521 ENTRY-SIZE INFLATION PROBE (compile-time, default 0 = ABSENT — the shipped struct is
+// byte-identical to G520's). Appends dead payload so the capture's push and all five flush
+// pre-passes stride over a LARGER entry while every behaviour, every field offset before the pad,
+// and every consumer stays identical. Reading [G298:profile]'s five per-pass clocks on a padded
+// build against an unpadded one gives the pre-passes' MARGINAL COST PER BYTE OF ENTRY SIZE — the
+// only honest ceiling for G510 §6's state-table refactor, which is otherwise a ~580-site edit
+// priced off a bucket total (G508's count x cost law, G520 §7a's fold law).
+// The pad is non-elidable (G496): std::vector really allocates it and the implicit move/copy
+// constructor really copies the array, so both the write side and the read stride move.
+#ifndef DC2_G521_PADBYTES
+#define DC2_G521_PADBYTES 0
+#endif
+// G521: tag type for constructing a G144Entry IN PLACE in g_g144List with DEFAULT-initialization.
+// `emplace_back()` with no arguments VALUE-initializes, and because G144Entry's default ctor is
+// implicit (non-trivial only via the shared_ptr member) that zero-fills all 256 bytes — a memset
+// the pre-G521 path never paid. This tag gives a user-provided ctor that default-initializes
+// instead, so the in-place arm writes each field exactly once and nothing more.
+// `G144Entry() = default;` is defaulted ON FIRST DECLARATION, so it is NOT user-provided and the
+// one `G144Entry e{}` site (rasterizer_g401_composite_probe.inc) keeps its zero-initialization.
+// G521 `capinplace` VERDICT: REFUTED (mean raw −0.065 ms/f / −0.30%, 3/4 signs; blocked −0.011,
+// **2/4** — sign-inconsistent on the blocked estimator, against an arc bar of 4/4 on both).
+// 0 = compiled out, and the shipped capture is then byte-identical to pre-G521: a plain aggregate
+// `G144Entry e;` stack local written at known rsp offsets, then G510's move-push. Set to 1 only to
+// re-gate. Full detail: plans/phase-G521-fix-log.md §6.
+#ifndef DC2_G521_INPLACEARM
+#define DC2_G521_INPLACEARM 0
+#endif
+struct G144NoInit {};
 struct G144Entry
 {
+#if DC2_G521_INPLACEARM
+    // These two make G144Entry a NON-AGGREGATE, so they are compiled out with the lever: the
+    // shipped struct must stay the exact aggregate every other phase measured.
+    G144Entry() = default;
+    explicit G144Entry(G144NoInit) {}
+#endif
     GSContext ctx;
     GSPrimReg prim;
     GSTexaReg texa;
@@ -21,7 +55,29 @@ struct G144Entry
     GSVertex v[3];
     int minY, maxY; // screen-space bbox rows (post-scissor) for band-overlap prefilter
     G149Buf decoded; // G149: pre-decoded texture buffer (null unless texcache eligible); kept alive here
+#if DC2_G521_PADBYTES > 0
+    uint8_t g521Pad[DC2_G521_PADBYTES];
+#endif
 };
+// G521: report the measured layout once, so the probe's slope is divided by a number that was
+// READ from the binary rather than hand-computed. Inert unless DC2_G521_SIZE=1.
+static void g521ReportEntrySize()
+{
+    static const bool s_on = (std::getenv("DC2_G521_SIZE") != nullptr);
+    if (!s_on)
+        return;
+    static std::atomic<bool> s_done{false};
+    bool expected = false;
+    if (!s_done.compare_exchange_strong(expected, true, std::memory_order_relaxed))
+        return;
+    std::fprintf(stderr,
+                 "[G521:size] G144Entry=%zu pad=%d ctx=%zu prim=%zu texa=%zu texclut=%zu "
+                 "vertex=%zu v3=%zu buf=%zu\n",
+                 sizeof(G144Entry), (int)DC2_G521_PADBYTES, sizeof(GSContext), sizeof(GSPrimReg),
+                 sizeof(GSTexaReg), sizeof(GSTexClutReg), sizeof(GSVertex), sizeof(GSVertex) * 3u,
+                 sizeof(G149Buf));
+    std::fflush(stderr);
+}
 static std::vector<G144Entry> g_g144List;       // reused across frames (clear keeps capacity)
 // G219 diagnostic snapshot buffer (see the [G219:cap]/[G219:dif] probes; inert unless
 // DC2_G219_SKYPX=1).

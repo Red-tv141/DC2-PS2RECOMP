@@ -4,7 +4,12 @@ int g473SimdMergeArm();
 // HERE, above every anonymous namespace, or it would bind to an internal-linkage symbol and fail to
 // link (the appendix's anon-namespace trap).
 int g508LockSkipArm();
-// G508: force-recompile marker — .inc edits do not trigger MSBuild (G359). revision: 1
+// G508: force-recompile marker — .inc edits do not trigger MSBuild (G359). revision: 2
+// G522: `g144L2lLatePin` — the fail-safe replay of the local->local guest-VRAM publication that the
+// range barrier skipped when g289CanDeferLocalCopy promised an FBO->FBO blit. Declared with the
+// other g144* externs at the top of gpu_transfers_and_kick.inc, called from
+// GS::performLocalToLocalTransfer the moment g289TryGpuLocalCopy returns false. Defined at global
+// scope in rasterizer_draw_sprite.inc (rasterizer TU).
 
 // G397: reserved A+D display-alias fix plus presentation diagnostics live in the parts below.
 // G412: force-recompile marker for immutable depth-two frame-boundary presentation snapshots.

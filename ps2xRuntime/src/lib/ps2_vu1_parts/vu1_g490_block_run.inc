@@ -197,6 +197,72 @@ extern int g504HistCurArm();
 // G506: the segmented Q/P-advance arm (DC2_G419_AB=qpseg, rollback DC2_G506_NO_QPSEG=1).
 extern int g506QpSegArm();
 
+// G514: the whole-vector VU-data-memory store arm (DC2_G419_AB=vstore, rollback
+// DC2_G514_NO_VSTORE=1, oracle DC2_G514_VERIFY=1) and its LOAD-side sibling
+// (DC2_G419_AB=vload, rollback DC2_G514_NO_VLOAD=1, same oracle).
+extern int g514VStoreArm();
+extern int g514VLoadArm();
+// G514 promotion gate: arm 10 (shipped) vs arm 7 (pre-G514). DC2_G419_AB=vmem.
+extern int g514VMemArm();
+
+// G515: the NOP peel arm (DC2_G419_AB=nopdisp, rollback DC2_G515_NO_NOPPEEL=1). Arm 12 against the
+// G514 shipped arm 10.
+extern int g515NopPeelArm();
+
+// G516: the three decode-time-dispatch arms (DC2_G419_AB=updesc / lowdense / dispdense, rollback
+// DC2_G516_NO_DISPDENSE=1). Arms 13 / 14 / 15 against the G515 shipped arm 12.
+extern int g516UpDescArm();
+extern int g516LowDenseArm();
+extern int g516DispDenseArm();
+extern int g516Peel4Arm();
+extern int g516DispArm();
+
+// G517: the pair-loop strength-reduction arms (DC2_G419_AB=fpind / stampind / g517ind, rollback
+// DC2_G517_NO_IND=1). Arms 19 / 20 / 21 against the G516 shipped arm 18.
+extern int g517PtrIndArm();
+extern int g517StampIndArm();
+extern int g517IndArm();
+
+// G516 3 — THE UPPER-DESCRIPTOR FAMILY IS REFUTED AND COMPILED OUT (`DC2_G516_UPDESC 0`).
+//
+// `updesc` resolved `g421DescTableConst.e[upperKind]` at decode time into a per-pair array so the
+// descriptor's address depended only on the pair index. Four paired A/Bs against the G515 shipped
+// body: **+1.980 ms/f (+9.9%), 0/4**, and `dispdense` (updesc + lowdense together) **+1.737, 0/4**
+// — bigger alone than combined, because the two shared one 8-byte record load.
+//
+// A load whose target is a SMALL PERMANENTLY-RESIDENT CONSTANT TABLE is two L1 hits, not a
+// dependency chain: `g421DescTableConst` is 1 KB of .rdata read by every non-VNOP block pair.
+// Replacing it with a per-item array trades that hot table for a cold stream on a working set
+// (`fused`, 16 B x 2,048 = 32 KB) that is already the whole of L1D. Kept, guarded, never
+// instantiated, so the measurement is reproducible by setting this to 1.
+#ifndef DC2_G516_UPDESC
+#define DC2_G516_UPDESC 0
+#endif
+
+// G517 — THE PAIR-LOOP STRENGTH REDUCTION IS REFUTED AND COMPILED OUT (`DC2_G517_INDARM 0`).
+//
+// The re-taken attribution put 9.4% of the VU1 worker on address arithmetic that is a pure function
+// of `j`, with every input SPILLED (29 stack references in the leaf's first 0x700). Iterating
+// pointers and a running stamp deleted ~7 instructions per pair and 5 of those 29 references — and
+// bought NOTHING, measured with the pole forced onto the VU1 worker so the conversion was ~1.0:
+//
+//   fpind    (arm 19, the two pointers)  -0.111 / -0.153 / -0.279 / +0.159 / -0.018 / +0.093
+//                                        => mean -0.052, 4/6, SIGN-INCONSISTENT = under the floor
+//   stampind (arm 20, the running stamp) +0.151 / +0.399 / +0.683 => +0.411, 0/3, MONOTONE WORSE
+//   g517ind  (arm 21, both)              +0.261 / +0.005 / +0.286 / +0.128 => +0.170, 0/4
+//
+// ⭐ A SPILL RELOAD IS NOT A LIVE VALUE. G483 named live-value pressure as this loop's binding
+// resource and every win since has come from reducing it; a *reload* of a spilled value is an L1
+// hit the out-of-order core hides, exactly like G516's `updesc` constant table. Deleting the
+// reloads while adding an induction variable is a wash at best, and the STAMP lost outright
+// because MSVC spilled it to `[rbp-0x71]` and wrote it back on every pair.
+//
+// Kept, guarded, never instantiated, so the shipped `g490BlockBody` is byte-identical to G516's and
+// the measurement reproduces by setting this to 1.
+#ifndef DC2_G517_INDARM
+#define DC2_G517_INDARM 0
+#endif
+
 // G499 §2 REFUTED and COMPILED OUT (`DC2_G499_QPLOCAL 0`). Four paired A/Bs on the same binary,
 // both arms confirmed built on every run (`[G499:blk] arm=1` and `arm=2`), read
 // **-0.050 / +0.191 / -0.057 / -0.031 ms/f: mean +0.013, signs disagree, |t| <= 1.14, blocked
@@ -468,6 +534,34 @@ namespace
                 return 6;
             if (std::strcmp(ab, "qpseg") == 0)
                 return 7;
+            if (std::strcmp(ab, "vstore") == 0)
+                return 8;
+            if (std::strcmp(ab, "vload") == 0)
+                return 10;
+            if (std::strcmp(ab, "vmem") == 0)
+                return 11;
+            if (std::strcmp(ab, "nopdisp") == 0)
+                return 12;
+#if DC2_G516_UPDESC
+            if (std::strcmp(ab, "updesc") == 0)
+                return 13;
+            if (std::strcmp(ab, "dispdense") == 0)
+                return 15;
+#endif
+            if (std::strcmp(ab, "lowdense") == 0)
+                return 14;
+            if (std::strcmp(ab, "peel4") == 0)
+                return 17;
+            if (std::strcmp(ab, "g516disp") == 0)
+                return 18;
+#if DC2_G517_INDARM
+            if (std::strcmp(ab, "fpind") == 0)
+                return 19;
+            if (std::strcmp(ab, "stampind") == 0)
+                return 20;
+            if (std::strcmp(ab, "g517ind") == 0)
+                return 21;
+#endif
             return 0;
         }();
         if (s_paired == 1)
@@ -500,6 +594,57 @@ namespace
         // two counters are tested once per PAIR or once per SEGMENT.
         if (s_paired == 7)
             return g506QpSegArm() > 0 ? 7 : 3;
+        // G514. 7 vs 8: prices the store staging alone. Control is the G506 shipped body, so both
+        // arms execute the identical pairs in the identical blocks and differ only in how the
+        // SQ/SQI/SQD bodies put their 16 bytes into VU RAM.
+        if (s_paired == 8)
+            return g514VStoreArm() > 0 ? 8 : 7;
+        // G514b. 8 vs 10: prices the LOAD side alone, on top of the store side.
+        if (s_paired == 10)
+            return g514VLoadArm() > 0 ? 10 : 8;
+        // G514 PROMOTION GATE. 7 vs 10: the shipped default against the pre-G514 body.
+        if (s_paired == 11)
+            return g514VMemArm() > 0 ? 10 : 7;
+        // G515. 10 vs 12: prices the NOP peel alone. Control is the G514 shipped body, so both arms
+        // execute the identical pairs in the identical blocks and differ only in whether the most
+        // common lower kind reaches its (empty) body through the two-level jump table or through
+        // one compare and one direct branch.
+        if (s_paired == 12)
+            return g515NopPeelArm() > 0 ? 12 : 10;
+        // G516. 12 vs 13 / 14 / 15: prices the upper chain alone, the lower chain alone, and both
+        // together. Control is the G515 shipped body in every case, so all three arms execute the
+        // identical pairs in the identical blocks and differ only in where the dispatch inputs are
+        // read from.
+#if DC2_G516_UPDESC
+        if (s_paired == 13)
+            return g516UpDescArm() > 0 ? 13 : 12;
+        if (s_paired == 15)
+            return g516DispDenseArm() > 0 ? 15 : 12;
+#endif
+        if (s_paired == 14)
+            return g516LowDenseArm() > 0 ? 14 : 12;
+        // G516 PROMOTION GATE. 12 vs 18: the shipped default against the G515 body. Measured
+        // rather than added — overlap does not compose (G493), and `peel4` and `lowdense` both
+        // touch the same dispatch.
+        if (s_paired == 18)
+            return g516DispArm() > 0 ? 18 : 12;
+        // G516b. 12 vs 17: prices peeling the four biggest remaining indirect-branch destinations,
+        // with no new array and no change to any load — the isolated branch variable.
+        if (s_paired == 17)
+            return g516Peel4Arm() > 0 ? 17 : 12;
+#if DC2_G517_INDARM
+        // G517. 18 vs 19 / 20 / 21: prices the two induction POINTERS alone, the running STAMP
+        // alone, and both. Control is the G516 shipped body in every case, so all three arms
+        // execute the identical pairs in the identical blocks and differ only in how the pair
+        // address, the class-byte address and the history stamp are formed. ALL THREE REFUTED —
+        // see the `DC2_G517_INDARM` note at the head of this file.
+        if (s_paired == 19)
+            return g517PtrIndArm() > 0 ? 19 : 18;
+        if (s_paired == 20)
+            return g517StampIndArm() > 0 ? 20 : 18;
+        if (s_paired == 21)
+            return g517IndArm() > 0 ? 21 : 18;
+#endif
 #endif
         // G500 §4 — THE ROLLBACK FLAGS ARE READ ONCE, NOT ONCE PER run().
         //
@@ -520,6 +665,42 @@ namespace
             if (f50_12_vu_env_flag("DC2_G499_NO_BLKLOWER"))
                 return 0;
 #if DC2_G506_QPSEG
+            // G514: the whole-vector store rides on the G506 body, so its rollback falls back to
+            // arm 7 exactly as G506's did to arm 3. The ORACLE copy (arm 9) is selected by its own
+            // flag and by nothing else, so it can never be reached by a timing run.
+            if (!f50_12_vu_env_flag("DC2_G500_NO_BLKBRANCH") &&
+                !f50_12_vu_env_flag("DC2_G506_NO_QPSEG") &&
+                !f50_12_vu_env_flag("DC2_G514_NO_VSTORE"))
+            {
+                if (f50_12_vu_env_flag("DC2_G514_VERIFY"))
+                    return 9;
+                if (f50_12_vu_env_flag("DC2_G514_NO_VLOAD"))
+                    return 8;
+                // G515: the NOP peel rides on the G514 body, so its rollback falls back to arm 10
+                // exactly as G514's did to arm 7.
+                if (f50_12_vu_env_flag("DC2_G515_NO_NOPPEEL"))
+                    return 10;
+                // G516: the decode-time dispatch rides on the G515 body, so its rollback falls
+                // back to arm 12 exactly as G515's did to arm 10.
+                // G516 BRING-UP: default is still 12 until the gate has run. `DC2_G516_DISPDENSE=1`
+                // selects arm 15 standalone for the oracle / disassembly checks; the promotion edit
+                // is the one line below.
+                if (f50_12_vu_env_flag("DC2_G516_VERIFY"))
+                    return 16;
+                // G516: the dispatch pair rides on the G515 body, so its rollback falls back to
+                // arm 12 exactly as G515's did to arm 10.
+                if (f50_12_vu_env_flag("DC2_G516_NO_DISP"))
+                    return 12;
+#if DC2_G517_INDARM
+                // G517: REFUTED. The default stays 18; these two only exist so the refutation
+                // reproduces when `DC2_G517_INDARM` is set to 1.
+                if (f50_12_vu_env_flag("DC2_G517_VERIFY"))
+                    return 22;
+                if (f50_12_vu_env_flag("DC2_G517_IND"))
+                    return 21;
+#endif
+                return 18;
+            }
             // G506: the segmented Q/P advance rides on the G500 tail body, so its rollback falls
             // back to arm 3 exactly as `histcur`'s did.
             if (!f50_12_vu_env_flag("DC2_G500_NO_BLKBRANCH") &&
@@ -613,11 +794,176 @@ namespace
         return g421DescTableConst.e[pair.upperKind].cls != 0u;
     }
 
+    // G516: the DENSE renumbering of the ten lower kinds the block leaf's switch names. Values are
+    // 1..10 with no gaps and each maps to its own case body, which is the condition under which
+    // MSVC emits a ONE-level jump table; the shipped switch is keyed on `lowerKind` (values
+    // 1,2,3,6,20,21,25,26,27,28 spread over a 28-wide range with 18 of the 28 sharing `default`),
+    // which is why MSVC compresses it into a byte-index table plus a rel32 table — two dependent
+    // loads where one would do.
+    //
+    // 0 means "none of the ten": the leaf's `default:` calls g422FastLower with the ORIGINAL
+    // `lowerKind`, read from the fused record on that path only.
+    enum : uint8_t
+    {
+        G516_BC_OTHER = 0u,
+        G516_BC_NOP = 1u,
+        G516_BC_IADDI = 2u,
+        G516_BC_IADDIU = 3u,
+        G516_BC_IAND = 4u,
+        G516_BC_SQ = 5u,
+        G516_BC_SQI = 6u,
+        G516_BC_SQD = 7u,
+        G516_BC_LQ = 8u,
+        G516_BC_LQI = 9u,
+        G516_BC_LQD = 10u,
+        G516_BC_COUNT = 11u,
+    };
+
+    uint8_t g516LowClass(uint8_t lowerKind)
+    {
+        switch (lowerKind)
+        {
+        case G422_LK_NOP:    return G516_BC_NOP;
+        case G422_LK_IADDI:  return G516_BC_IADDI;
+        case G422_LK_IADDIU: return G516_BC_IADDIU;
+        case G422_LK_IAND:   return G516_BC_IAND;
+        case G422_LK_SQ:     return G516_BC_SQ;
+        case G422_LK_SQI:    return G516_BC_SQI;
+        case G422_LK_SQD:    return G516_BC_SQD;
+        case G422_LK_LQ:     return G516_BC_LQ;
+        case G422_LK_LQI:    return G516_BC_LQI;
+        case G422_LK_LQD:    return G516_BC_LQD;
+        default:             return G516_BC_OTHER;
+        }
+    }
+
+    // G516 ORACLE (DC2_G516_VERIFY=1, arm 16, default OFF).
+    //
+    // The lever is exact by construction — `g516Blk[i]` is filled from the SAME link-time-constant
+    // table at the SAME index as the code it replaces, and `g490RebuildRunLengths()` is called on
+    // BOTH paths that can change `uppers[]` (the full prepare and the precise MPG invalidation),
+    // before any pair of the new encoding executes. What this oracle adds is the EXECUTION-TIME
+    // half of that argument: it re-derives the record from the fused sidecar for every pair of
+    // every executed block and aborts on the first disagreement. Combined with DC2_G490_VERIFY,
+    // which re-derives the sidecar itself from the LIVE code words, the chain
+    //     live code word -> fused sidecar -> G516 record -> dispatch
+    // is checked end to end.
+    thread_local uint64_t s_g516Verified = 0u;
+    thread_local uint64_t s_g516LastReport = 0u;
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g516VerifyFail(uint8_t gotLow, const G410CompiledUpper &pair)
+    {
+        std::fprintf(stderr,
+                     "[G516:verify] MISMATCH upperKind=0x%02x lowerKind=%u | got(low=%u)"
+                     " want(low=%u) after %llu ok\n",
+                     (unsigned)pair.upperKind, (unsigned)pair.lowerKind, (unsigned)gotLow,
+                     (unsigned)g516LowClass(pair.lowerKind),
+                     (unsigned long long)s_g516Verified);
+        std::fflush(stderr);
+        std::abort();
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g516VerifyReport()
+    {
+        std::fprintf(stderr, "[G516:verify] pairsChecked=%llu mismatches=0\n",
+                     (unsigned long long)s_g516Verified);
+        std::fflush(stderr);
+    }
+
+    static inline void g516CheckLow(uint8_t gotLow, const G410CompiledUpper &pair)
+    {
+        if (gotLow != g516LowClass(pair.lowerKind))
+            g516VerifyFail(gotLow, pair);
+        if (++s_g516Verified - s_g516LastReport >= 100000000ull)
+        {
+            s_g516LastReport = s_g516Verified;
+            g516VerifyReport();
+        }
+    }
+
+#if DC2_G517_INDARM
+    // ---------------------------------------------------------------------------------------
+    // G517: the induction-variable oracle (arm 22, DC2_G517_VERIFY=1).
+    //
+    // The lever replaces `fused[firstIndex + j]` with a pointer advanced once per pair and
+    // `stampBase + j` with a counter advanced once per pair. Both are identities the compiler
+    // cannot check for us and that a future `continue` inside the pair body would silently break —
+    // so re-derive both the OLD way on every pair of every executed block and compare. Lives in a
+    // copy its own flag selects, exactly like G516's (G489 §6).
+    // ---------------------------------------------------------------------------------------
+    thread_local uint64_t s_g517Verified = 0u;
+    thread_local uint64_t s_g517LastReport = 0u;
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g517VerifyFail(const void *gotFp, const void *wantFp, int64_t gotStamp, int64_t wantStamp)
+    {
+        std::fprintf(stderr,
+                     "[G517:verify] MISMATCH fp got=%p want=%p | stamp got=%lld want=%lld"
+                     " after %llu ok\n",
+                     gotFp, wantFp, (long long)gotStamp, (long long)wantStamp,
+                     (unsigned long long)s_g517Verified);
+        std::fflush(stderr);
+        std::abort();
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g517VerifyReport()
+    {
+        std::fprintf(stderr, "[G517:verify] pairsChecked=%llu mismatches=0\n",
+                     (unsigned long long)s_g517Verified);
+        std::fflush(stderr);
+    }
+
+    static inline void g517CheckInd(const G479FusedPair *gotFp, const G479FusedPair *wantFp,
+                                    int64_t gotStamp, int64_t wantStamp)
+    {
+        if (gotFp != wantFp || gotStamp != wantStamp)
+            g517VerifyFail(gotFp, wantFp, gotStamp, wantStamp);
+        if (++s_g517Verified - s_g517LastReport >= 100000000ull)
+        {
+            s_g517LastReport = s_g517Verified;
+            g517VerifyReport();
+        }
+    }
+#endif // DC2_G517_INDARM
+
     void g490RebuildRunLengths()
     {
         uint32_t run = 0u;
         for (size_t i = s_g410Cache.uppers.size(); i-- > 0u;)
         {
+            // G516: resolve this slot's dispatch inputs. Unconditional and present on EVERY arm —
+            // it runs once per slot per code write (2,048 slots, ~1 rebuild per program), never
+            // per pair, so it cannot bias a gate. `g421DescTableConst` is 0x100 entries with a
+            // zero tail, so 0x6f (VNOP) and 0xff (uncovered) both yield cls 0 without a test.
+            {
+                const G410CompiledUpper &g516p = s_g410Cache.uppers[i];
+#if DC2_G516_UPDESC
+                const G421UpperDesc g516d = g421DescTableConst.e[g516p.upperKind];
+                uint32_t g516bits = 0u;
+                std::memcpy(&g516bits, &g516d, sizeof(g516bits));
+                s_g410Cache.g516UpDesc[i] = g516bits;
+#endif
+                s_g410Cache.g516LowCls[i] = g516LowClass(g516p.lowerKind);
+            }
             if (g490BlockPairEligible(s_g410Cache.uppers[i]))
             {
                 if (run < 255u)
@@ -1261,8 +1607,209 @@ namespace
         bool pendingValid;
     };
 
+    // ------------------------------------------------------------------------------------------
+    // G514 ORACLE + POPULATION CENSUS.
+    //
+    // Lives ONLY in the oracle instantiation (`G514Verify`), which `DC2_G514_VERIFY=1` selects —
+    // the G490 §oracle-copy convention, so the verifier can never end up in a copy its own flag
+    // deselects, and the shipped body carries none of its live values (G504's lesson).
+    //
+    // `g514MakeRef` re-derives the address INDEPENDENTLY (it does not read anything the fast body
+    // computed) and reproduces the SCALAR staging body's 16 bytes from the pre-store state. That
+    // is the body being REPLACED, which is what G512 §5 requires of an oracle: a verifier that
+    // compares the fast path against itself agrees with a wrong fast path.
+    struct G514Ref
+    {
+        uint32_t addr = 0u;
+        bool guarded = false;
+        uint8_t dest = 0u;
+        uint8_t vfIdx = 0u; // load side: the VF register the reference was built for
+        float ref[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    };
+
+    static G514Ref g514MakeRef(const VU1State &st, uint32_t instr, uint8_t kind,
+                               const uint8_t *vuData, uint32_t dataSize)
+    {
+        G514Ref r;
+        const uint8_t it = LIT(instr);
+        const uint8_t is = LIS(instr);
+        r.dest = static_cast<uint8_t>((instr >> 21) & 0xFu);
+        uint32_t addr;
+        if (kind == G422_LK_SQ)
+        {
+            const int16_t imm = IMM11(instr);
+            addr = static_cast<uint32_t>(static_cast<int32_t>(st.vi[it] + imm)) * 16u;
+        }
+        else if (kind == G422_LK_SQI)
+        {
+            addr = static_cast<uint32_t>(static_cast<uint16_t>(st.vi[it])) * 16u;
+        }
+        else // SQD decrements BEFORE the address is formed, and VI0 is never written
+        {
+            int32_t v = st.vi[it];
+            if (it != 0)
+                v = static_cast<int16_t>(v - 1);
+            addr = static_cast<uint32_t>(static_cast<uint16_t>(v)) * 16u;
+        }
+        addr &= (dataSize - 1u);
+        r.addr = addr;
+        r.guarded = (addr + 16u <= dataSize);
+        if (r.guarded)
+        {
+            std::memcpy(r.ref, vuData + addr, 16);
+            if (r.dest & 0x8u)
+                r.ref[0] = st.vf[is][0];
+            if (r.dest & 0x4u)
+                r.ref[1] = st.vf[is][1];
+            if (r.dest & 0x2u)
+                r.ref[2] = st.vf[is][2];
+            if (r.dest & 0x1u)
+                r.ref[3] = st.vf[is][3];
+        }
+        return r;
+    }
+
+    // G514b LOAD-side reference: the 16 bytes the SCALAR body would have left in `st.vf[it]`.
+    // Built from a snapshot of the register taken BEFORE the fast body, so the lanes `dest` does
+    // not select carry their own pre-existing value — which is exactly what the whole-vector write
+    // must reproduce. The address is re-derived independently, including LQI's post-increment and
+    // LQD's PRE-decrement.
+    static G514Ref g514MakeLoadRef(const VU1State &st, uint32_t instr, uint8_t kind,
+                                   const uint8_t *vuData, uint32_t dataSize)
+    {
+        G514Ref r;
+        const uint8_t it = LIT(instr);
+        const uint8_t is = LIS(instr);
+        r.dest = static_cast<uint8_t>((instr >> 21) & 0xFu);
+        r.vfIdx = it;
+        uint32_t addr;
+        if (kind == G422_LK_LQ)
+        {
+            const int16_t imm = IMM11(instr);
+            addr = static_cast<uint32_t>(static_cast<int32_t>(st.vi[is] + imm)) * 16u;
+        }
+        else if (kind == G422_LK_LQI)
+        {
+            addr = static_cast<uint32_t>(static_cast<uint16_t>(st.vi[is])) * 16u;
+        }
+        else // LQD decrements BEFORE the address is formed, and VI0 is never written
+        {
+            int32_t v = st.vi[is];
+            if (is != 0)
+                v = static_cast<int16_t>(v - 1);
+            addr = static_cast<uint32_t>(static_cast<uint16_t>(v)) * 16u;
+        }
+        addr &= (dataSize - 1u);
+        r.addr = addr;
+        r.guarded = (addr + 16u <= dataSize);
+        std::memcpy(r.ref, st.vf[it], 16); // untouched lanes must survive
+        if (r.guarded)
+        {
+            float tmp[4];
+            std::memcpy(tmp, vuData + addr, 16);
+            if (r.dest & 0x8u)
+                r.ref[0] = tmp[0];
+            if (r.dest & 0x4u)
+                r.ref[1] = tmp[1];
+            if (r.dest & 0x2u)
+                r.ref[2] = tmp[2];
+            if (r.dest & 0x1u)
+                r.ref[3] = tmp[3];
+        }
+        return r;
+    }
+
+    // Population census + BYTE comparison. Counted per kind and per dest so the gate can be read
+    // against the population it actually moved (G511's law: decompose before pricing).
+    static uint64_t s_g514Checked = 0ull, s_g514Bad = 0ull, s_g514Skipped = 0ull;
+    static uint64_t s_g514ByKind[3] = {0ull, 0ull, 0ull};   // SQ, SQI, SQD
+    static uint64_t s_g514ByDest[16] = {};
+
+    static void g514Check(const G514Ref &r, uint8_t kind, uint32_t instr, const uint8_t *vuData)
+    {
+        (void)instr;
+        ++s_g514ByKind[kind == G422_LK_SQ ? 0 : (kind == G422_LK_SQI ? 1 : 2)];
+        ++s_g514ByDest[r.dest & 0xFu];
+        if (!r.guarded)
+        {
+            ++s_g514Skipped;
+            return;
+        }
+        ++s_g514Checked;
+        if (std::memcmp(vuData + r.addr, r.ref, 16) != 0)
+        {
+            if (++s_g514Bad <= 8ull)
+                std::fprintf(stderr,
+                             "[G514:verify-BAD] kind=%u dest=0x%x addr=0x%x\n",
+                             (unsigned)kind, (unsigned)r.dest, (unsigned)r.addr);
+        }
+        if ((s_g514Checked % 20000000ull) == 0ull)
+        {
+            std::fprintf(stderr,
+                         "[G514:verify] checked=%llu bad=%llu skipped=%llu | sq=%llu sqi=%llu "
+                         "sqd=%llu | dest 0f=%.1f%% 01=%.1f%% 0e=%.1f%% 0d=%.1f%% 0c=%.1f%% "
+                         "other=%.1f%%\n",
+                         (unsigned long long)s_g514Checked, (unsigned long long)s_g514Bad,
+                         (unsigned long long)s_g514Skipped,
+                         (unsigned long long)s_g514ByKind[0], (unsigned long long)s_g514ByKind[1],
+                         (unsigned long long)s_g514ByKind[2],
+                         100.0 * (double)s_g514ByDest[0xF] / (double)s_g514Checked,
+                         100.0 * (double)s_g514ByDest[0x1] / (double)s_g514Checked,
+                         100.0 * (double)s_g514ByDest[0xE] / (double)s_g514Checked,
+                         100.0 * (double)s_g514ByDest[0xD] / (double)s_g514Checked,
+                         100.0 * (double)s_g514ByDest[0xC] / (double)s_g514Checked,
+                         100.0 * (double)(s_g514Checked - s_g514ByDest[0xF] - s_g514ByDest[0x1] -
+                                          s_g514ByDest[0xE] - s_g514ByDest[0xD] -
+                                          s_g514ByDest[0xC]) / (double)s_g514Checked);
+            std::fflush(stderr);
+        }
+    }
+
+    // Load-side comparison. `st.vf[r.vfIdx]` is compared as BYTES, so a lane the dest mask did not
+    // select must still equal the value it held before the pair ran.
+    static uint64_t s_g514LdChecked = 0ull, s_g514LdBad = 0ull;
+    static uint64_t s_g514LdByKind[3] = {0ull, 0ull, 0ull}; // LQ, LQI, LQD
+    static uint64_t s_g514LdByDest[16] = {};
+
+    static void g514CheckLoad(const G514Ref &r, uint8_t kind, const VU1State &st)
+    {
+        ++s_g514LdByKind[kind == G422_LK_LQ ? 0 : (kind == G422_LK_LQI ? 1 : 2)];
+        ++s_g514LdByDest[r.dest & 0xFu];
+        ++s_g514LdChecked;
+        if (std::memcmp(st.vf[r.vfIdx], r.ref, 16) != 0)
+        {
+            if (++s_g514LdBad <= 8ull)
+                std::fprintf(stderr,
+                             "[G514:verify-BAD-load] kind=%u dest=0x%x vf=%u addr=0x%x\n",
+                             (unsigned)kind, (unsigned)r.dest, (unsigned)r.vfIdx,
+                             (unsigned)r.addr);
+        }
+        if ((s_g514LdChecked % 20000000ull) == 0ull)
+        {
+            std::fprintf(stderr,
+                         "[G514:verify-load] checked=%llu bad=%llu | lq=%llu lqi=%llu lqd=%llu "
+                         "| dest 0f=%.1f%% 01=%.1f%% 0e=%.1f%% 08=%.1f%% other=%.1f%%\n",
+                         (unsigned long long)s_g514LdChecked, (unsigned long long)s_g514LdBad,
+                         (unsigned long long)s_g514LdByKind[0],
+                         (unsigned long long)s_g514LdByKind[1],
+                         (unsigned long long)s_g514LdByKind[2],
+                         100.0 * (double)s_g514LdByDest[0xF] / (double)s_g514LdChecked,
+                         100.0 * (double)s_g514LdByDest[0x1] / (double)s_g514LdChecked,
+                         100.0 * (double)s_g514LdByDest[0xE] / (double)s_g514LdChecked,
+                         100.0 * (double)s_g514LdByDest[0x8] / (double)s_g514LdChecked,
+                         100.0 * (double)(s_g514LdChecked - s_g514LdByDest[0xF] -
+                                          s_g514LdByDest[0x1] - s_g514LdByDest[0xE] -
+                                          s_g514LdByDest[0x8]) / (double)s_g514LdChecked);
+            std::fflush(stderr);
+        }
+    }
+
     template <bool G499FastLower, bool G499QpLocal, bool G500Tail = false, bool G501Pin = false,
-              bool G502Chain = false, bool G504Cursor = false, bool G506QpSeg = false>
+              bool G502Chain = false, bool G504Cursor = false, bool G506QpSeg = false,
+              bool G514VStore = false, bool G514VLoad = false, bool G514Verify = false,
+              bool G515NopPeel = false, bool G516Up = false, bool G516Low = false,
+              bool G516Verify = false, bool G516Peel4 = false, bool G517PtrInd = false,
+              bool G517StampInd = false, bool G517Verify = false>
     void g490BlockBody(VU1State &st, uint32_t firstIndex, uint32_t count,
                               uint8_t *vuData, uint32_t dataSize,
                               int *qDelay, int *pDelay,
@@ -1272,6 +1819,39 @@ namespace
                               uint32_t g502CodeSize = 0u, uint32_t g502Budget = 0u)
     {
         const G479FusedPair *const fused = s_g410Cache.fused.data();
+        // G516: the pre-resolved dispatch record, hoisted exactly as `fused` is. Null and unread on
+        // every pre-existing instantiation, so their bodies are unchanged.
+        [[maybe_unused]] const uint32_t *g516UpBase = nullptr;
+        [[maybe_unused]] const uint8_t *g516LowBase = nullptr;
+        if constexpr (G516Up)
+            g516UpBase = s_g410Cache.g516UpDesc.data();
+        if constexpr (G516Low || G516Verify)
+            g516LowBase = s_g410Cache.g516LowCls.data();
+        // G516: the switch below is ONE body whose case labels are the arm's own encoding. The
+        // shipped arm keys on `lowerKind` (values 1,2,3,6,20,21,25,26,27,28 in a 28-wide range, 18
+        // of whose slots share `default`) and MSVC compresses that into a byte-index table feeding
+        // a rel32 table — two DEPENDENT loads. The G516 arm keys on the dense 1..10 class, whose
+        // ten targets are all distinct, so there is nothing to compress and one table remains.
+        constexpr uint8_t G516K_NOP =
+            G516Low ? static_cast<uint8_t>(G516_BC_NOP) : static_cast<uint8_t>(G422_LK_NOP);
+        constexpr uint8_t G516K_IADDI =
+            G516Low ? static_cast<uint8_t>(G516_BC_IADDI) : static_cast<uint8_t>(G422_LK_IADDI);
+        constexpr uint8_t G516K_IADDIU =
+            G516Low ? static_cast<uint8_t>(G516_BC_IADDIU) : static_cast<uint8_t>(G422_LK_IADDIU);
+        constexpr uint8_t G516K_IAND =
+            G516Low ? static_cast<uint8_t>(G516_BC_IAND) : static_cast<uint8_t>(G422_LK_IAND);
+        constexpr uint8_t G516K_SQ =
+            G516Low ? static_cast<uint8_t>(G516_BC_SQ) : static_cast<uint8_t>(G422_LK_SQ);
+        constexpr uint8_t G516K_SQI =
+            G516Low ? static_cast<uint8_t>(G516_BC_SQI) : static_cast<uint8_t>(G422_LK_SQI);
+        constexpr uint8_t G516K_SQD =
+            G516Low ? static_cast<uint8_t>(G516_BC_SQD) : static_cast<uint8_t>(G422_LK_SQD);
+        constexpr uint8_t G516K_LQ =
+            G516Low ? static_cast<uint8_t>(G516_BC_LQ) : static_cast<uint8_t>(G422_LK_LQ);
+        constexpr uint8_t G516K_LQI =
+            G516Low ? static_cast<uint8_t>(G516_BC_LQI) : static_cast<uint8_t>(G422_LK_LQI);
+        constexpr uint8_t G516K_LQD =
+            G516Low ? static_cast<uint8_t>(G516_BC_LQD) : static_cast<uint8_t>(G422_LK_LQD);
         // G506: the segmented form needs the two counters in block locals for the same reason
         // G499's arm 2 did — the segmentation is a statement about their values across the whole
         // run, not about one pair. Both arms write back exactly once, at the single exit.
@@ -1343,9 +1923,67 @@ namespace
             if (g499Pd > 1)
                 g499Pd -= static_cast<int>(g506Run);
         }
+        // G517 — STRENGTH-REDUCE THE THREE INDEX EXPRESSIONS THE INNER LOOP RE-FORMS EVERY PAIR.
+        //
+        // The re-taken attribution (G517 §1) puts 9.4% of the whole VU1 worker on address
+        // arithmetic that is a pure function of the loop counter, and every one of its inputs is on
+        // the STACK because the leaf is out of registers (G483's binding resource, 29 stack
+        // references in the shipped body's first 0x700):
+        //
+        //   +0x174  mov  r14d,eax / shl r14,4 / add r14,r9   ; &fused[firstIndex+j]   4.03%
+        //   +0x59c  mov  eax,0x8340 / add rax,[rbp-0x51]     ; &g516LowCls[...] base  1.14%
+        //   +0x1540 mov  esi,[rbp+0x4f] / mov r9,[rbp-0x59]  ; RELOAD firstIndex, fused  2.46%
+        //   +0x4b1  mov  ecx,r15d / add rcx,[rbp+0x7f]       ; stampBase + j          4.27%
+        //
+        // Iterating POINTERS and a running stamp trades five live values (`firstIndex`, `fused`,
+        // the cache base behind `g516LowBase`, `stampBase`, and the `firstIndex+j` scratch) for
+        // three, so the arithmetic disappears AND the pressure that spilled its inputs drops.
+        //
+        // EXACT BY CONSTRUCTION. `*g517Fp` IS `fused[firstIndex+j]` and `g517Stamp` IS
+        // `stampBase + j` at every iteration: all three are re-derived from `firstIndex`/`j` at
+        // each SEGMENT entry (so the G506 segment loop and the G502 chain restart cannot desync
+        // them) and advanced exactly once per pair at the bottom of a body that contains no
+        // `continue` and no jump out of the loop. Nothing else moves.
+        // ⚠️ NO INITIALISERS, and every use below goes through an `if constexpr` rather than a
+        // ternary. The first version of this hunk wrote `= nullptr` / `= 0` and read them through
+        // `G517PtrInd ? *g517Fp : …`; MSVC kept stack slots for all three on the CONTROL
+        // instantiation, whose frame grew `sub rsp,0x90` → `0xa0` and whose register allocation
+        // shuffled. That is G421's law — a change at a shared site is a change to the CONTROL ARM,
+        // and the A/B cannot see it. Written this way the discarded `if constexpr` branch is never
+        // instantiated and the control's disassembly is byte-identical to the shipped body.
+#if DC2_G517_INDARM
+        [[maybe_unused]] const G479FusedPair *g517Fp;
+        [[maybe_unused]] const uint8_t *g517Low;
+        [[maybe_unused]] int64_t g517Stamp;
+        if constexpr (G517PtrInd)
+        {
+            g517Fp = fused + firstIndex + j;
+            if constexpr (G516Low || G516Verify)
+                g517Low = g516LowBase + firstIndex + j;
+        }
+        if constexpr (G517StampInd)
+            g517Stamp = stampBase + static_cast<int64_t>(j);
+#endif
         for (; j < g506SegEnd; ++j)
         {
+            // G517 ORACLE (arm 22, DC2_G517_VERIFY=1). The lever's ONLY failure mode is the
+            // advance running a different number of times than `++j` — an identity that a future
+            // `continue` in this body would silently break. Check it where it can be caught, on
+            // every pair of every executed block, and let the arm's own flag select the copy that
+            // carries it (G489 §6).
+#if DC2_G517_INDARM
+            if constexpr (G517Verify)
+                g517CheckInd(g517Fp, fused + firstIndex + j, g517Stamp,
+                             stampBase + static_cast<int64_t>(j));
+            const G479FusedPair *g517P;
+            if constexpr (G517PtrInd)
+                g517P = g517Fp;
+            else
+                g517P = fused + firstIndex + j;
+            const G479FusedPair &fp = *g517P;
+#else
             const G479FusedPair &fp = fused[firstIndex + j];
+#endif
             const uint64_t src = fp.source;
             const uint32_t lower = static_cast<uint32_t>(src);
             const uint32_t upper = static_cast<uint32_t>(src >> 32);
@@ -1374,10 +2012,48 @@ namespace
             // true, shadow false, g430Hist true, and the hoisted history block. Eligibility
             // guarantees `cls != 0`, so the return value is always true and the legacy
             // execUpper fallback the macro carries is unreachable here.
-            if (fp.pair.upperKind != 0x6fu)
+            if constexpr (G516Verify)
+            {
+#if DC2_G517_INDARM
+                if constexpr (G517PtrInd)
+                    g516CheckLow(*g517Low, fp.pair);
+                else
+#endif
+                    g516CheckLow(g516LowBase[firstIndex + j], fp.pair);
+            }
+            if constexpr (G516Up)
+            {
+                // ONE 32-bit load whose address is the PAIR INDEX. `cls == 0` is `upperKind ==
+                // 0x6f` for a block-eligible pair (eligibility admits VNOP or `cls != 0`, and
+                // `e[0x6f]` is the zero entry), so this is the same predicate on the same pairs —
+                // with the descriptor already in a register instead of two dependent loads away.
+                const uint32_t g516Bits = g516UpBase[firstIndex + j];
+                if (static_cast<uint8_t>(g516Bits) != 0u)
+                    g421FastUpper<G501Pin, G504Cursor, true>(
+                        st, upper, 0u, true, false, true,
+                        stampBase + static_cast<int64_t>(j), hb, g504Slot, g516Bits);
+            }
+#if DC2_G517_INDARM
+            // G517: the ONE per-pair use of the stamp. Written as `if constexpr` and not as a
+            // ternary so the control instantiation never mentions `g517Stamp` (see the frame note
+            // at its declaration).
+            else if (fp.pair.upperKind != 0x6fu)
+            {
+                if constexpr (G517StampInd)
+                    g421FastUpper<G501Pin, G504Cursor>(st, upper, fp.pair.upperKind, true, false,
+                                                       true, g517Stamp, hb, g504Slot);
+                else
+                    g421FastUpper<G501Pin, G504Cursor>(st, upper, fp.pair.upperKind, true, false,
+                                                       true,
+                                                       stampBase + static_cast<int64_t>(j), hb,
+                                                       g504Slot);
+            }
+#else
+            else if (fp.pair.upperKind != 0x6fu)
                 g421FastUpper<G501Pin, G504Cursor>(st, upper, fp.pair.upperKind, true, false, true,
                                                    stampBase + static_cast<int64_t>(j), hb,
                                                    g504Slot);
+#endif
 
             if constexpr (G499FastLower)
             {
@@ -1385,24 +2061,220 @@ namespace
                 // G481: the three block-eligible hot integer kinds run inline; no call at all.
                 // (IBNE is the fourth kind the pair loop inlines and is a branch, i.e. never
                 // block-eligible, so it cannot appear here.) Same tokens as the callee's cases.
-                const uint8_t g499kind = fp.pair.lowerKind;
+                // G516: the selector is the arm's own encoding of the same ten kinds — the raw
+                // `lowerKind` for every pre-existing instantiation, the dense class for the G516
+                // arm. Read AT THE POINT OF USE, never hoisted: v1 copied an 8-byte record into a
+                // local at the pair fetch and held it to here, ~1,100 bytes of code later, and
+                // lost 8.26% to the extra live value (G483's law, measured).
+                uint8_t g499kind;
+#if DC2_G517_INDARM
+                if constexpr (G516Low && G517PtrInd)
+                    g499kind = *g517Low;
+                else
+#endif
+                if constexpr (G516Low)
+                    g499kind = g516LowBase[firstIndex + j];
+                else
+                    g499kind = fp.pair.lowerKind;
+                // G515: PEEL THE DOMINANT KIND OUT OF THE INDIRECT DISPATCH.
+                //
+                // MSVC compiles the switch below to a TWO-LEVEL jump table, and the shipped leaf's
+                // annotated disassembly (`tools/g504_disasm.py`, +0x57d..+0x5a3) puts 16.89% of the
+                // WHOLE VU1 worker on its seven instructions:
+                //
+                //   movzx edx,[rsi+0xe]                      ; fp.pair.lowerKind
+                //   lea   eax,[rdx-1] / cmp eax,0x1b / ja    ; kinds 1..28 only
+                //   movzx eax,[r8+rax+0x31014c]              ; table 1: index byte   <- depends on ^
+                //   mov   ecx,[r8+rax*4+0x310120]            ; table 2: rel32 target <- depends on ^
+                //   add   rcx,r8                             ; 7.17% of the thread
+                //   jmp   rcx                                ; 28-way indirect
+                //
+                // Three dependent L1 loads feeding a 28-way indirect branch, and `[G479:lk]` says
+                // the single most common destination — 40.2% of ALL pairs, ~44% of block-eligible
+                // ones once the never-eligible control transfers are excluded — is `G422_LK_NOP`,
+                // whose body is `break`. Roughly 630 k pairs per frame walk the whole chain and
+                // take the indirect jump to reach nothing.
+                //
+                // The peel replaces that, for those pairs, with one compare and one DIRECT branch
+                // off a byte the loop has already loaded. It also removes the loop's most frequent
+                // target from the indirect predictor's stream, which is why it can help the other
+                // 56% as well.
+                //
+                // EXACT BY CONSTRUCTION, no oracle needed: the guarded statement set for
+                // `g499kind == G422_LK_NOP` is `case G422_LK_NOP: break;`, i.e. empty. Nothing
+                // before the switch and nothing after it (the G425 zero-register re-pin) moves.
+                // `case G422_LK_NOP` deliberately STAYS in the switch, so the control arm's jump
+                // table is bit-identical to the shipped one and only the guard differs.
+                //
+                // The condition is written `!G515NopPeel || ...` so the control instantiation
+                // folds it to `true` and emits no test at all (G436: a selector inside the leaf
+                // would sit on both arms and bias the gate).
+                if (!G515NopPeel || g499kind != G516K_NOP)
+                {
+                // G516 `peel4` — THE DIRECT TEST OF WHAT G515 ACTUALLY WON.
+                //
+                // G515's account of its own win was "three dependent L1 loads feeding an indirect
+                // branch". G516's `lowdense` arm deleted one of those load levels and measured
+                // NOTHING, and `updesc` deleted the other chain outright and measured +9.9% — so
+                // the loads were never the mechanism. What is left is the 28-way INDIRECT BRANCH:
+                // G515 took 40.2% of all pairs out of it and gave them a direct, perfectly
+                // predicted one, and that is where its 2.0 host cycles per peeled pair came from.
+                //
+                // If that reading is right, peeling MORE of the branch must pay again. These are
+                // the four biggest remaining destinations by `[G479:lk]` share of ALL pairs —
+                // LQ 9.37 + SQI 8.16 + IADDI 6.99 + LQI 6.78 = **31.3%, ~507 k pairs/frame** —
+                // and at G515's realised rate that is worth ~0.22 ms/f.
+                //
+                // EXACT BY CONSTRUCTION, and with NO DUPLICATED BODY: each test branches to a
+                // label placed on the switch's own `case`, so the statements executed are the same
+                // statements in the same order, and `break` still leaves the switch. (G514's
+                // case-duplication trap is avoided for the same reason its `goto g514Slow` avoided
+                // it.) The tests are inside the `if constexpr` arm, so the control instantiation
+                // does not contain them at all.
+                if constexpr (G516Peel4)
+                {
+                    if (g499kind == G516K_LQ)
+                        goto g516PeelLQ;
+                    if (g499kind == G516K_SQI)
+                        goto g516PeelSQI;
+                    if (g499kind == G516K_IADDI)
+                        goto g516PeelIADDI;
+                    if (g499kind == G516K_LQI)
+                        goto g516PeelLQI;
+                }
                 switch (g499kind)
                 {
-                case G422_LK_NOP:
+                case G516K_NOP:
                     break;
-                case G422_LK_IADDI:
+                case G516K_IADDI:
+                g516PeelIADDI:
                     G481_LOWER_BODY_IADDI(st, lower);
                     break;
-                case G422_LK_IADDIU:
+                case G516K_IADDIU:
                     G481_LOWER_BODY_IADDIU(st, lower);
                     break;
-                case G422_LK_IAND:
+                case G516K_IAND:
                     G481_LOWER_BODY_IAND(st, lower);
                     break;
+                // G514: the three VU-data-memory STORE kinds. When the arm is off these three
+                // labels fall into exactly the `default:` statement below, so the control arm's
+                // jump table entries are unchanged and MSVC folds the labels away — the shipped
+                // and control instantiations are byte-identical (verified by /MAP size).
+                case G516K_SQ:
+                    if constexpr (G514Verify)
+                    {
+                        const G514Ref g514r = g514MakeRef(st, lower, G422_LK_SQ, vuData, dataSize);
+                        G514_LOWER_BODY_SQ(st, lower, vuData, dataSize);
+                        g514Check(g514r, G422_LK_SQ, lower, vuData);
+                        break;
+                    }
+                    else if constexpr (G514VStore)
+                    {
+                        G514_LOWER_BODY_SQ(st, lower, vuData, dataSize);
+                        break;
+                    }
+                    else
+                        goto g514Slow;
+                case G516K_SQI:
+                g516PeelSQI:
+                    if constexpr (G514Verify)
+                    {
+                        const G514Ref g514r = g514MakeRef(st, lower, G422_LK_SQI, vuData, dataSize);
+                        G514_LOWER_BODY_SQI(st, lower, vuData, dataSize);
+                        g514Check(g514r, G422_LK_SQI, lower, vuData);
+                        break;
+                    }
+                    else if constexpr (G514VStore)
+                    {
+                        G514_LOWER_BODY_SQI(st, lower, vuData, dataSize);
+                        break;
+                    }
+                    else
+                        goto g514Slow;
+                case G516K_SQD:
+                    if constexpr (G514Verify)
+                    {
+                        const G514Ref g514r = g514MakeRef(st, lower, G422_LK_SQD, vuData, dataSize);
+                        G514_LOWER_BODY_SQD(st, lower, vuData, dataSize);
+                        g514Check(g514r, G422_LK_SQD, lower, vuData);
+                        break;
+                    }
+                    else if constexpr (G514VStore)
+                    {
+                        G514_LOWER_BODY_SQD(st, lower, vuData, dataSize);
+                        break;
+                    }
+                    else
+                        goto g514Slow;
+                case G516K_LQ:
+                g516PeelLQ:
+                    if constexpr (G514Verify)
+                    {
+                        const G514Ref g514l =
+                            g514MakeLoadRef(st, lower, G422_LK_LQ, vuData, dataSize);
+                        G514_LOWER_BODY_LQ(st, lower, vuData, dataSize);
+                        g514CheckLoad(g514l, G422_LK_LQ, st);
+                        break;
+                    }
+                    else if constexpr (G514VLoad)
+                    {
+                        G514_LOWER_BODY_LQ(st, lower, vuData, dataSize);
+                        break;
+                    }
+                    else
+                        goto g514Slow;
+                case G516K_LQI:
+                g516PeelLQI:
+                    if constexpr (G514Verify)
+                    {
+                        const G514Ref g514l =
+                            g514MakeLoadRef(st, lower, G422_LK_LQI, vuData, dataSize);
+                        G514_LOWER_BODY_LQI(st, lower, vuData, dataSize);
+                        g514CheckLoad(g514l, G422_LK_LQI, st);
+                        break;
+                    }
+                    else if constexpr (G514VLoad)
+                    {
+                        G514_LOWER_BODY_LQI(st, lower, vuData, dataSize);
+                        break;
+                    }
+                    else
+                        goto g514Slow;
+                case G516K_LQD:
+                    if constexpr (G514Verify)
+                    {
+                        const G514Ref g514l =
+                            g514MakeLoadRef(st, lower, G422_LK_LQD, vuData, dataSize);
+                        G514_LOWER_BODY_LQD(st, lower, vuData, dataSize);
+                        g514CheckLoad(g514l, G422_LK_LQD, st);
+                        break;
+                    }
+                    else if constexpr (G514VLoad)
+                    {
+                        G514_LOWER_BODY_LQD(st, lower, vuData, dataSize);
+                        break;
+                    }
+                    else
+                        goto g514Slow;
+                // G514: the six labels above must share THIS tail, not get a copy of it each.
+                // With `g422FastLower(...); break;` written out three times MSVC emitted three
+                // copies and the CONTROL arm (G514VStore false) grew 1,728 bytes over the
+                // pre-G514 shipped body — 1,728 bytes of duplicated slow tail sitting on exactly
+                // the three paths the gate is measuring. The `goto` restores a single tail and
+                // makes the control instantiation byte-size-identical to what shipped before.
                 default:
-                    g422FastLower(st, lower, g499kind, vuData, dataSize);
+                g514Slow:
+                    // G516: the callee needs the REAL kind, and on this arm `g499kind` is the
+                    // dense class. The fused byte is loaded here and only here — on the ~24% of
+                    // block pairs that were going to pay an out-of-line call anyway, where one
+                    // more L1 hit in front of a `call` is not on any critical path.
+                    if constexpr (G516Low)
+                        g422FastLower(st, lower, fp.pair.lowerKind, vuData, dataSize);
+                    else
+                        g422FastLower(st, lower, g499kind, vuData, dataSize);
                     break;
                 }
+                } // G515: closes the NOP peel guard above.
             }
             else
                 g422FastLower(st, lower, fp.pair.lowerKind, vuData, dataSize);
@@ -1413,6 +2285,20 @@ namespace
                 _mm_storeu_ps(st.vf[0], _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f));
                 st.vi[0] = 0;
             }
+#if DC2_G517_INDARM
+            // G517: the induction step. Placed at the bottom rather than in the `for`'s iteration
+            // expression only because the latter would have to write `+= 0` on the control arm; the
+            // body has no `continue` and no jump that leaves it, so this runs exactly once per `++j`
+            // — the invariant the whole lever rests on. Absent from every other instantiation.
+            if constexpr (G517PtrInd)
+            {
+                ++g517Fp;
+                if constexpr (G516Low || G516Verify)
+                    ++g517Low;
+            }
+            if constexpr (G517StampInd)
+                ++g517Stamp;
+#endif
         }
         // G506: for every non-segmented instantiation this is an unconditional `break` closing a
         // `for(;;)`, which MSVC folds away entirely — the same shape, and the same guarantee, the
@@ -1768,6 +2654,267 @@ namespace
         g490BlockBody<true, false, true, true, false, false, true>(
             st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
     }
+
+    // G514: arm 7's body with the three VU-data-memory STORE kinds writing 16 bytes in one store
+    // instead of staging them through a `tmp[4]` stack buffer. A separate INSTANTIATION rather
+    // than a runtime `if` for the same reason as every other arm in this file (G436): a selector
+    // inside the leaf would sit on BOTH arms and bias the gate. The wrapper is `noinline` so
+    // run()'s own text is byte-identical between the two arms.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g514ExecuteBlockTailVStore(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                    uint8_t *vuData, uint32_t dataSize,
+                                    int *qDelay, int *pDelay,
+                                    int64_t stampBase, G430HistBlock *hb, uint32_t tailCount)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, false>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
+    }
+
+    // G514b: arm 8's body with the three VU-data-memory LOAD kinds writing `st.vf[it]` as ONE
+    // 16-byte store instead of up to four `movss` lane stores. Control arm is 8, so the load side
+    // is priced alone.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g514ExecuteBlockTailVMem(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                  uint8_t *vuData, uint32_t dataSize,
+                                  int *qDelay, int *pDelay,
+                                  int64_t stampBase, G430HistBlock *hb, uint32_t tailCount)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
+    }
+
+    // G514 ORACLE COPY — the candidate body with the per-store reference comparison
+    // (DC2_G514_VERIFY=1). Never a timing arm: its flag is what selects it, so it cannot end up in
+    // a copy the flag deselects (G489 §6), and the shipped body carries none of its live values.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g514ExecuteBlockTailVerify(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                    uint8_t *vuData, uint32_t dataSize,
+                                    int *qDelay, int *pDelay,
+                                    int64_t stampBase, G430HistBlock *hb, uint32_t tailCount)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, true>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
+    }
+
+    // G515: arm 12 — arm 10's body (the G514 shipped default) with `G422_LK_NOP` peeled out of the
+    // two-level jump table into one compare and one direct branch. Control arm is 10, so the two
+    // arms execute the identical pairs in the identical blocks and differ only in HOW the loop
+    // reaches the empty body of the single most common lower kind. Separate INSTANTIATION rather
+    // than a runtime `if` (G436), and a `noinline` wrapper so run()'s own text is byte-identical
+    // between the arms (G481's inline-budget cliff binds on run(), not on a leaf).
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g515ExecuteBlockTailNopPeel(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                     uint8_t *vuData, uint32_t dataSize,
+                                     int *qDelay, int *pDelay,
+                                     int64_t stampBase, G430HistBlock *hb, uint32_t tailCount)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
+    }
+
+    // G516: arms 13 / 14 / 15 — arm 12's body with the UPPER descriptor, the LOWER dense class, or
+    // both, read out of the decode-time G516 arrays instead of chased through a
+    // dependent table lookup. Separate INSTANTIATIONS rather than runtime `if`s for the same reason
+    // as every other arm in this file (G436), and `noinline` wrappers so run()'s own text is
+    // byte-identical between the arms.
+#if DC2_G516_UPDESC
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g516ExecuteBlockTailUpDesc(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                    uint8_t *vuData, uint32_t dataSize,
+                                    int *qDelay, int *pDelay,
+                                    int64_t stampBase, G430HistBlock *hb, uint32_t tailCount)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      true, false>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
+    }
+#endif // DC2_G516_UPDESC
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g516ExecuteBlockTailLowDense(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                      uint8_t *vuData, uint32_t dataSize,
+                                      int *qDelay, int *pDelay,
+                                      int64_t stampBase, G430HistBlock *hb, uint32_t tailCount)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, true>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
+    }
+
+    // G516 PROMOTION CANDIDATE — arm 18 = arm 12's body with BOTH surviving mechanisms: the dense
+    // 1..10 lower class (one jump-table level fewer) and the four peeled indirect-branch
+    // destinations. Exact by construction on both halves; oracle DC2_G516_VERIFY=1 (arm 16).
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g516ExecuteBlockTailDisp(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                  uint8_t *vuData, uint32_t dataSize,
+                                  int *qDelay, int *pDelay,
+                                  int64_t stampBase, G430HistBlock *hb, uint32_t tailCount)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, true, false, true>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
+    }
+
+#if DC2_G516_UPDESC
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g516ExecuteBlockTailDispDense(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                       uint8_t *vuData, uint32_t dataSize,
+                                       int *qDelay, int *pDelay,
+                                       int64_t stampBase, G430HistBlock *hb, uint32_t tailCount)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      true, true>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
+    }
+
+    // G516 ORACLE COPY — arm 15's body with the per-pair record comparison (DC2_G516_VERIFY=1).
+    // Never a timing arm: its flag is what selects it, so it cannot end up in a copy the flag
+    // deselects (G489 6), and the shipped body carries none of its live values.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+#endif // DC2_G516_UPDESC
+
+    // G516 ORACLE COPY — arm 18's body with the per-pair record comparison (DC2_G516_VERIFY=1).
+    // Never a timing arm: its flag is what selects it, so it cannot end up in a copy the flag
+    // deselects (G489 6), and the shipped body carries none of its live values.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g516ExecuteBlockTailVerify(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                    uint8_t *vuData, uint32_t dataSize,
+                                    int *qDelay, int *pDelay,
+                                    int64_t stampBase, G430HistBlock *hb, uint32_t tailCount)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, true, true, true>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
+    }
+
+    // G516b: arm 17 — arm 12's body with the four biggest remaining indirect-branch destinations
+    // peeled into direct compares. No new array, no load removed: the isolated BRANCH variable.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g516ExecuteBlockTailPeel4(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                   uint8_t *vuData, uint32_t dataSize,
+                                   int *qDelay, int *pDelay,
+                                   int64_t stampBase, G430HistBlock *hb, uint32_t tailCount)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, false, false, true>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
+    }
+
+#if DC2_G517_INDARM
+    // G517: arms 19 / 20 / 21 / 22 — arm 18's body with the pair loop's index expressions
+    // strength-reduced. One architectural variable per arm (G436, and G516 §3a's lesson that the
+    // halves of a combined lever must be priced alone before the pair is believed):
+    //   19 `fpind`    — the two POINTERS (`&fused[firstIndex+j]`, `&g516LowCls[firstIndex+j]`).
+    //   20 `stampind` — the running STAMP (`stampBase + j`).
+    //   21 `g517ind`  — both; the promotion gate. Overlap does not compose (G493): both mechanisms
+    //                   free registers in the same leaf, so the pair is measured, never summed.
+    //   22           — arm 21's body plus the induction oracle, selected only by DC2_G517_VERIFY=1.
+    // Control arm for all four is 18, the G516 shipped body, so every arm executes the identical
+    // pairs in the identical blocks and differs only in how three addresses are formed.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g517ExecuteBlockTailPtrInd(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                    uint8_t *vuData, uint32_t dataSize,
+                                    int *qDelay, int *pDelay,
+                                    int64_t stampBase, G430HistBlock *hb, uint32_t tailCount)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, true, false, true, true, false>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g517ExecuteBlockTailStampInd(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                      uint8_t *vuData, uint32_t dataSize,
+                                      int *qDelay, int *pDelay,
+                                      int64_t stampBase, G430HistBlock *hb, uint32_t tailCount)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, true, false, true, false, true>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g517ExecuteBlockTailInd(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                 uint8_t *vuData, uint32_t dataSize,
+                                 int *qDelay, int *pDelay,
+                                 int64_t stampBase, G430HistBlock *hb, uint32_t tailCount)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, true, false, true, true, true>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g517ExecuteBlockTailVerify(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                    uint8_t *vuData, uint32_t dataSize,
+                                    int *qDelay, int *pDelay,
+                                    int64_t stampBase, G430HistBlock *hb, uint32_t tailCount)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, true, false, true, true, true, true>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
+    }
+#endif // DC2_G517_INDARM
 #endif // DC2_G506_QPSEG
 
 #if DC2_G502_BLKCHAIN
@@ -1852,8 +2999,15 @@ namespace
         // would print and the run could not prove both bodies were built — the G457 failure this
         // helper exists to prevent. (G500's arms happened to be 1 and 3, which landed on different
         // slots by luck.)
-        static std::atomic<uint32_t> s_once[8] = {};
-        const int slot = (arm < 0 || arm > 7) ? 0 : arm;
+        // G516: SIXTEEN slots, not eight. With `s_once[8]` every arm above 7 folded onto slot 0, so
+        // a `vmem` / `nopdisp` / `dispdense` gate could print at most ONE `[G499:blk]` line and
+        // could not prove both bodies were built — the same G457 failure G501 fixed here by going
+        // from three slots to eight, one arc later and for the same reason.
+        // G517: TWENTY-FOUR slots, not sixteen. Arms 19–22 would all fold onto slot 0 and a
+        // `g517ind` gate could print at most ONE `[G499:blk]` line — the same G457 failure G501 and
+        // G516 already fixed here, third firing. Widen this in the SAME edit that adds an arm.
+        static std::atomic<uint32_t> s_once[24] = {};
+        const int slot = (arm < 0 || arm > 23) ? 0 : arm;
         if (s_once[slot].fetch_add(1u, std::memory_order_relaxed) != 0u)
             return;
         std::fprintf(stderr, "[G499:blk] arm=%d\n", arm);

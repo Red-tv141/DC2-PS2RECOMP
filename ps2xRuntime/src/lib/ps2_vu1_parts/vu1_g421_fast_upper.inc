@@ -1,3 +1,12 @@
+// G520 - the MAC-history resolve arm, its shipped default and its oracle's reporter. Declared at
+// GLOBAL scope, above this file's anonymous namespace, or they would bind to internal-linkage
+// symbols and fail to link against the definitions in g419_ab_instrument.inc (the anon-namespace
+// linkage trap, appendix-dc2-project.md 3).
+extern int g520MacScanArm();
+extern bool g520MacScanDefaultOn();
+extern bool g520MacVerifyOn();
+extern void g520NoteResolve(uint32_t fastVal, uint32_t legacyVal, long long target);
+
 // G421 - inline SIMD execution of the VU1 upper slot.
 //
 // PREMISE (current-binary, this phase). Lean MAP-0 is ~66-68 ms/f and the G303 thread
@@ -489,9 +498,18 @@ namespace
 
     // G430: the architectural MAC as of pair `target` = the newest recorded writer with a stamp
     // at or before it. Reached only at a flag-reading pair (2.06%) and at run() exit.
-    static inline uint32_t g430ResolveAt(int64_t target)
+    //
+    // G520 SPLIT THIS IN TWO. The body below is the SHIPPED SCAN, unchanged, and is the A/B's
+    // CONTROL arm; `g430ResolveFast` is the same reduction re-associated as a tree. See the
+    // kG520LeverMacScan comment in g419_ab_instrument.inc for the measurement that motivated it
+    // and for the exactness argument.
+    // FORCEINLINE on BOTH arms is load-bearing (G486 §4's asymmetry trap): left to MSVC the scan
+    // became an out-of-line TAIL CALL while the candidate stayed inlined, so the control arm paid a
+    // call the shipped pre-G520 body never paid and the gate would have credited the difference to
+    // the lever. Verified in the `/MAP` for the binary in hand — `__forceinline` is a request
+    // (G480).
+    static DC2_G330_FORCEINLINE uint32_t g430ResolveScan(G430HistBlock &H, int64_t target)
     {
-        G430HistBlock &H = s_g430HB;
         int best = -1;
         int64_t bestStamp = INT64_MIN;
         for (int i = 0; i < G430_HIST; ++i)
@@ -508,6 +526,117 @@ namespace
         if (H.kind[best] == G428_MK_PENDING)
             return g421MakeMacReg(_mm_load_ps(H.vec[best]), H.dest[best]);
         return H.mac[best];
+    }
+
+// ---------------------------------------------------------------------------------------------
+// G520 — REFUTED, AND COMPILED OUT. Four paired runs under the pole-forcing ballast (G517), which
+// was required because `[G332:gsw] backend` flipped LOW->HIGH between this phase's census and its
+// first gate (G518's law, second confirmation):
+//     raw     +0.064 / +0.053 / -0.016 / -0.080  =>  mean +0.005 ms/f, 2/4 positive
+//     blocked +0.074 / +0.067 / -0.011 / -0.065  =>  mean +0.016 ms/f, 2/4 positive
+// Sign-inconsistent on both estimators = a NULL, not a win. Exact (`[G520:verify]
+// resolvesChecked=119000000 mismatches=0` on the final binary), and it deletes seven branchy
+// updates per call — and it still does not pay, for two reasons worth keeping:
+//
+//   1. THE SUBJECT WAS OVER-PRICED BY A FOLD. The 4.47% the PC sampler charged `g430ResolveAt` is
+//      the share of the whole PDB bucket that STARTS at the nearest preceding public symbol; the
+//      bucket's hottest PC is inside `g430ResolveAt`, but the SHARE also covers `g436MaskRow`,
+//      `g475CloseRunway`, `g475ExecuteVnopTrace` and `g475NoteTrace`, which are statics with no
+//      public symbol of their own. G504's law says a row is a fold until the `/MAP` says otherwise
+//      — the `/MAP` names the hot PC's owner, it does NOT de-fold the row's percentage.
+//   2. THE BRANCHLESS FORM NEEDS EIGHT LIVE int64 KEYS AND SPILLS FIVE CALLEE-SAVED REGISTERS TO
+//      GET THEM (`mov [rsp+0x50], rbp` / `+0x58, rsi` / `+0x60, r12` / `+0x68, r14` / `+0x30, r15`
+//      in the shipped disassembly of the candidate). That is G483's live-value law again, in a
+//      function OUTSIDE the block leaf: a tree reduction only beats a serial scan while its width
+//      fits in the free registers, and eight int64 does not.
+//
+// Set DC2_G520_MACARM to 1 to re-instantiate the candidate, its arm and its oracle. At 0 the
+// shipped `g430ResolveAt` is the pre-G520 scan, force-inlined, and nothing below is emitted.
+// ---------------------------------------------------------------------------------------------
+#ifndef DC2_G520_MACARM
+#define DC2_G520_MACARM 0
+#endif
+#if DC2_G520_MACARM
+    // G520 candidate. `argmax{ stamp[i] : stamp[i] <= target }`, lowest index winning a tie, is
+    // `max` over `key[i] = (stamp[i] <= target) ? stamp[i]*8 + (7-i) : INT64_MIN` — the same
+    // total order, evaluated as a tree so the eight slots form four INDEPENDENT chains instead of
+    // one loop-carried compare, and every `?:` is a cmov rather than a data-dependent branch.
+    // Ties matter: all eight stamps initialise to -1 (vu1_helpers_and_tables.inc), and the scan
+    // above keeps the FIRST such slot because its update is strict (`s > bestStamp`), which
+    // `7 - i` reproduces exactly.
+    static_assert(G430_HIST == 8, "G520's packed key assumes an 8-slot MAC history ring");
+    static DC2_G330_FORCEINLINE uint32_t g430ResolveFast(G430HistBlock &H, int64_t target)
+    {
+        const int64_t s0 = H.stamp[0], s1 = H.stamp[1], s2 = H.stamp[2], s3 = H.stamp[3];
+        const int64_t s4 = H.stamp[4], s5 = H.stamp[5], s6 = H.stamp[6], s7 = H.stamp[7];
+        const int64_t k0 = (s0 <= target) ? (s0 * 8 + 7) : INT64_MIN;
+        const int64_t k1 = (s1 <= target) ? (s1 * 8 + 6) : INT64_MIN;
+        const int64_t k2 = (s2 <= target) ? (s2 * 8 + 5) : INT64_MIN;
+        const int64_t k3 = (s3 <= target) ? (s3 * 8 + 4) : INT64_MIN;
+        const int64_t k4 = (s4 <= target) ? (s4 * 8 + 3) : INT64_MIN;
+        const int64_t k5 = (s5 <= target) ? (s5 * 8 + 2) : INT64_MIN;
+        const int64_t k6 = (s6 <= target) ? (s6 * 8 + 1) : INT64_MIN;
+        const int64_t k7 = (s7 <= target) ? (s7 * 8 + 0) : INT64_MIN;
+        const int64_t a0 = (k0 > k1) ? k0 : k1;
+        const int64_t a1 = (k2 > k3) ? k2 : k3;
+        const int64_t a2 = (k4 > k5) ? k4 : k5;
+        const int64_t a3 = (k6 > k7) ? k6 : k7;
+        const int64_t b0 = (a0 > a1) ? a0 : a1;
+        const int64_t b1 = (a2 > a3) ? a2 : a3;
+        const int64_t best = (b0 > b1) ? b0 : b1;
+        if (best == INT64_MIN)
+            return 0u; // no writer has ever executed: the legacy pipe reads its zero init
+        const int bi = 7 - static_cast<int>(best & 7);
+        if (H.kind[bi] == G428_MK_PENDING)
+            return g421MakeMacReg(_mm_load_ps(H.vec[bi]), H.dest[bi]);
+        return H.mac[bi];
+    }
+
+    // G519's law, and it is LOAD-BEARING: this body contains the very scan the lever exists to
+    // delete, so it must not be inlined into the candidate's basic block — a never-executed copy
+    // costs real ms/f (G490) and G519's first gate measured its own oracle at +0.71 ms/f.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    static void g520VerifyResolve(G430HistBlock &H, int64_t target, uint32_t fastVal)
+    {
+        g520NoteResolve(fastVal, g430ResolveScan(H, target),
+                        static_cast<long long>(target));
+    }
+
+#endif // DC2_G520_MACARM
+
+    static inline uint32_t g430ResolveAt(int64_t target)
+    {
+        G430HistBlock &H = s_g430HB;
+#if !DC2_G520_MACARM
+        // G520 refuted: the shipped body is the pre-G520 scan, force-inlined here, and the
+        // candidate/arm/oracle above are not emitted at all.
+        return g430ResolveScan(H, target);
+#else
+        // G504's law: gate BEHAVIOUR on the arm VALUE, so -1 (not under the A/B) takes the
+        // shipped default and 0 takes the pre-G520 body exactly.
+        //
+        // Whether this run is under the `macscan` A/B at all is PROCESS-CONSTANT (`g419AbLever()`
+        // reads one cached env var), and so is the rollback flag — so both are resolved once into
+        // a magic static and the normal run pays a guard load and a predicted compare here, not
+        // two real calls per resolve. The first shipped build did pay them: `call g520MacScanArm`
+        // + `call g520MacScanDefaultOn` at +0x22/+0x2b of `g430ResolveAt`, ~33.4 k times a frame,
+        // against a 0.8 ms/f subject (G268/G500's cached-accessor law, applied one level up).
+        //   1 = not under the A/B, candidate shipped   2 = not under the A/B, DC2_G520_NO_MACSCAN
+        //   0 = under the A/B, ask per resolve (the accessor also marks the arm used per frame)
+        static const int s_g520Mode =
+            (g520MacScanArm() >= 0) ? 0 : (g520MacScanDefaultOn() ? 1 : 2);
+        const bool g520Fast = (s_g520Mode != 0) ? (s_g520Mode == 1) : (g520MacScanArm() != 0);
+        if (!g520Fast)
+            return g430ResolveScan(H, target);
+        const uint32_t r = g430ResolveFast(H, target);
+        if (g520MacVerifyOn())
+            g520VerifyResolve(H, target, r);
+        return r;
+#endif // DC2_G520_MACARM
     }
 
     // Convert the delay line OUT of the deferred representation: classify every parked entry and
@@ -596,17 +725,43 @@ namespace
     // G504: `G504Cursor` says the CALLER carries the G430 ring cursor in `g504Slot` (a local of
     // `g490BlockBody`) instead of in `H.head`. Defaults to false with the parameter bound to a
     // never-read global, so every pre-existing call site compiles to exactly the same code.
-    template <bool G501Pin = false, bool G504Cursor = false>
+    // G516: `G516Desc` says the CALLER has already resolved `g421DescTableConst.e[kind]` — the
+    // block leaf reads it out of the per-pair `G516BlockDesc` record instead, so the descriptor's
+    // address no longer depends on the result of the `upperKind` load. Exact by construction: the
+    // record is filled from the SAME link-time-constant table at the SAME index, once per code
+    // write, and `g490RebuildRunLengths` runs on both invalidation paths. Defaults to false, so
+    // every pre-existing call site compiles to exactly the same code.
+    template <bool G501Pin = false, bool G504Cursor = false, bool G516Desc = false>
     static DC2_G330_FORCEINLINE bool g421FastUpper(VU1State &st, uint32_t upper, uint8_t kind,
                                                    bool g428Defer, bool g428Shadow = false,
                                                    bool g430Hist = false, int64_t g430Stamp = 0,
                                                    G430HistBlock *g436Hb = nullptr,
-                                                   int &g504Slot = g504UnusedSlot)
+                                                   int &g504Slot = g504UnusedSlot,
+                                                   uint32_t g516DescBits = 0u)
     {
         // G436: a non-null history block also means "lean addressing" — the run() hoist is armed,
         // so the constant-initialised tables are used instead of the out-of-line accessors.
         const bool g436Lean = G501Pin ? true : (g436Hb != nullptr);
-        const G421UpperDesc d = g436Lean ? g421DescTableConst.e[kind] : g421Desc()[kind];
+        G421UpperDesc g516dTmp;
+        if constexpr (G516Desc)
+        {
+            // The caller passes the four bytes as ONE scalar and they are unpacked with shifts —
+            // never through a by-value struct or a `memcpy` temporary, either of which can put a
+            // stack round trip on the hottest path in the binary (G514's forwarding class). This
+            // is the same shape MSVC produces for the table load it replaces: one dword in a
+            // register, four `movzx`/`shr` extractions.
+            (void)kind;
+            g516dTmp.cls = static_cast<uint8_t>(g516DescBits);
+            g516dTmp.op = static_cast<uint8_t>(g516DescBits >> 8u);
+            g516dTmp.src = static_cast<uint8_t>(g516DescBits >> 16u);
+            g516dTmp.bc = static_cast<uint8_t>(g516DescBits >> 24u);
+        }
+        else
+        {
+            (void)g516DescBits;
+            g516dTmp = g436Lean ? g421DescTableConst.e[kind] : g421Desc()[kind];
+        }
+        const G421UpperDesc d = g516dTmp;
         if (d.cls == 0u)
             return false;
 
