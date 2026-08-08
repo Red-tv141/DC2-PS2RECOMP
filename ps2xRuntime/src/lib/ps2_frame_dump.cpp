@@ -5,6 +5,7 @@
 #include <fstream>
 #include <vector>
 #include <cstdio>
+#include <cstdlib>
 
 namespace dc2 {
 
@@ -49,7 +50,23 @@ bool dumpFramePpm(uint64_t tick, bool forceBlank, PS2Runtime* rt)
 
     std::filesystem::create_directories("D:/ps2r/dc2/captures");
     char filename[256];
-    std::snprintf(filename, sizeof(filename), "D:/ps2r/dc2/captures/frame_%06llu.ppm", static_cast<unsigned long long>(tick));
+    char safeTag[65]{};
+    if (const char* rawTag = std::getenv("DC2_FRAME_DUMP_TAG")) {
+        size_t n = 0;
+        for (; rawTag[n] != '\0' && n + 1 < sizeof(safeTag); ++n) {
+            const char c = rawTag[n];
+            safeTag[n] = ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                          (c >= '0' && c <= '9') || c == '_' || c == '-') ? c : '_';
+        }
+        safeTag[n] = '\0';
+    }
+    if (safeTag[0] != '\0') {
+        std::snprintf(filename, sizeof(filename), "D:/ps2r/dc2/captures/frame_%s_%06llu.ppm",
+                      safeTag, static_cast<unsigned long long>(tick));
+    } else {
+        std::snprintf(filename, sizeof(filename), "D:/ps2r/dc2/captures/frame_%06llu.ppm",
+                      static_cast<unsigned long long>(tick));
+    }
 
     std::ofstream out(filename, std::ios::binary);
     if (!out) return false;

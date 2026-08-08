@@ -16,6 +16,13 @@ void GSRasterizer::drawSprite(GS *gs)
     g400NoteDrawTarget(gs->m_vram, ctx.frame.fbp);
     g401NoteCompositeDraw(gs->m_vram, ctx, gs->m_prim, v0, v1);
     G248SpriteScope g248Scope(ctx.frame.fbp, gs->m_prim.tme, gs->m_prim.abe);
+    // G529: price a REPLAYED sprite by the path it takes. Inert unless DC2_G529_STAT=1 AND this
+    // call is inside a band replay — see [G529:spr] in g529_replay_dispatch.inc for why.
+    G529SprScope g529spr;
+    // G530: the SAME bracket as G529SprScope, but split at the pixel loop and paired with the
+    // lane's retired-cycle count — the two things `[G529:spr] ns/px` silently assumed. Inert unless
+    // DC2_G530_CYC=1 AND this call is inside a band replay.
+    G530CycScope g530cyc;
     // G248 state census (DEFAULT OFF): print each distinct RTT-sprite state once.  Kept separate
     // from DC2_G248_STAT because stderr I/O would distort the timing discriminator above.
     {
@@ -155,7 +162,16 @@ void GSRasterizer::drawSprite(GS *gs)
                     v0.x, v0.y, v1.x, v1.y, t_g144InReplay ? 1u : 0u);
         }
     }
+    // G530 decomposition probes — see g530_sprite_span.inc. Loop-invariant, default-off, and each
+    // one produces knowingly incorrect pixels; they price the per-pixel classes before any lever.
+    const bool g530NoZ    = g530ProbeNoZ();
+    const bool g530NoWr   = g530ProbeNoWr();
+    const bool g530NoUv   = g530ProbeNoUv();
+    const bool g530NoTex  = g530ProbeNoTex();
+    const bool g530NoComb = g530ProbeNoComb();
+    const bool g530NoPx   = g530ProbeNoPx();
     auto spriteZPass = [&](int px, int py) -> bool {
+        if (g530NoZ) return true; // ⛔ probe: deletes the guest-VRAM Z READ
         if (!sZActive) return true;
         const uint32_t zdst = g403DisplayZ
             ? g403DisplayZRead(px, py, sZFbp)
@@ -171,6 +187,7 @@ void GSRasterizer::drawSprite(GS *gs)
         }
     };
     auto spriteZStore = [&](int px, int py) {
+        if (g530NoZ) return; // ⛔ probe: deletes the guest-VRAM Z WRITE
         if (!sZWrite) return;
         if (g403DisplayZ) g403DisplayZWrite(px, py, sZFbp, sZi);
         else if (sZ16) GSMem::WriteZ16(gs->m_vram, sZbp, sZbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py), sZi);
@@ -280,8 +297,14 @@ void GSRasterizer::drawSprite(GS *gs)
         if (drawY1 > t_g144BandY1) drawY1 = t_g144BandY1;
     }
     if (drawX1 >= drawX0 && drawY1 >= drawY0)
+    {
         g248Scope.setPixels(static_cast<uint64_t>(drawX1 - drawX0 + 1) *
                             static_cast<uint64_t>(drawY1 - drawY0 + 1));
+        g529spr.setPx(static_cast<uint64_t>(drawX1 - drawX0 + 1) *
+                      static_cast<uint64_t>(drawY1 - drawY0 + 1));
+        g530cyc.setPx(static_cast<uint64_t>(drawX1 - drawX0 + 1) *
+                      static_cast<uint64_t>(drawY1 - drawY0 + 1));
+    }
 
     // G219 (default-off, DC2_G219_SKYPX=1): log any SPRITE touching Z inside the zoom black
     // rectangle (per-sprite, not per-pixel) — verifies the game's Z-clear sprite reaches
@@ -618,9 +641,23 @@ void GSRasterizer::drawSprite(GS *gs)
                 ? (std::getenv("DC2_G45_BILINEAR") == nullptr &&
                    std::getenv("DC2_G51_MINFILT") == nullptr)
                 : s_g248EnvFilterOff;
+        // G526: admission by property, not by address — see g526FastSpriteTarget. Identical to the
+        // pre-G526 predicate unless DC2_G526_ANYTGT=1, and the sampler never reads frame.fbp.
         const bool g248FastSampleSprite =
-            s_g248FastSprite && g248TargetIndex(ctx.frame.fbp) >= 0 && gs->m_prim.fst &&
+            s_g248FastSprite && g526FastSpriteTarget(ctx.frame.fbp) && gs->m_prim.fst &&
             g248FastPsm && tex.tbw != 0u && g248TraceOff && g248SpecialFilterOff;
+        // G529: book this replayed sprite to fast/slow and name the FIRST failing conjunct, in the
+        // same order the predicate evaluates them. Inert unless DC2_G529_STAT=1 and in a replay.
+        g529spr.classify(g248FastSampleSprite,
+                         !s_g248FastSprite            ? kG529SprROff
+                         : !g526FastSpriteTarget(ctx.frame.fbp) ? kG529SprRTarget
+                         : !gs->m_prim.fst            ? kG529SprRFst
+                         : !g248FastPsm               ? kG529SprRPsm
+                         : tex.tbw == 0u              ? kG529SprRTbw
+                         : !g248TraceOff              ? kG529SprRTrace
+                         : !g248SpecialFilterOff      ? kG529SprRFilter
+                                                      : kG529SprROk,
+                         tex1UsesLinearFilter(ctx.tex1), g248Psm);
         const uint8_t g248WrapU = static_cast<uint8_t>(ctx.clamp & 0x3u);
         const uint8_t g248WrapV = static_cast<uint8_t>((ctx.clamp >> 2u) & 0x3u);
         const int g248MinU = static_cast<int>((ctx.clamp >> 4u) & 0x3FFu);
@@ -662,10 +699,18 @@ void GSRasterizer::drawSprite(GS *gs)
         bool g248QValid = false;
         int g248QU0 = 0, g248QV0 = 0;
         uint32_t g248QC00 = 0, g248QC10 = 0, g248QC01 = 0, g248QC11 = 0;
+        // ⛔ G529 CEILING PROBE (DC2_G529_POINTONLY=1, default-off, KNOWINGLY INCORRECT OUTPUT,
+        // NEVER PROMOTE). `[G529:spr]` measured the fast sampler at 397.8 ns/px with 100% of its
+        // sprites BILINEAR — ~1,250 host cycles for one pixel, which no amount of arithmetic
+        // explains (DC2_G529_NOLERP deleted the entire lerp and moved the frame 0.00 ms). The two
+        // remaining candidates are the FOUR swizzled texel taps and the writePixel round trip, and
+        // they need different phases. Forcing the point branch cuts taps 4 -> 1 while leaving the
+        // write path untouched, so the paired frame delta separates them.
+        static const bool s_g529PointOnly = envFlagEnabled("DC2_G529_POINTONLY");
         auto g248FastSample = [&](uint16_t u, uint16_t v) -> uint32_t {
             const float texUf = static_cast<float>(u) / 16.0f;
             const float texVf = static_cast<float>(v) / 16.0f;
-            if (!g248Linear)
+            if (!g248Linear || s_g529PointOnly)
                 return g248SamplePoint(static_cast<int>(texUf), static_cast<int>(texVf));
 
             const float sampleU = texUf - 0.5f;
@@ -710,6 +755,388 @@ void GSRasterizer::drawSprite(GS *gs)
                    (static_cast<uint32_t>(bb) << 16) | (static_cast<uint32_t>(aa) << 24);
         };
 
+        // Everything above this line is the PROLOGUE the [G530:cyc] census books separately.
+        g530cyc.setFast(g248FastSampleSprite);
+        g530cyc.markLoop();
+        // ============================ G530: THE SPAN KERNEL ============================
+        // Full rationale + the exactness argument: g530_sprite_span.inc. Admission is by PROPERTY,
+        // never by address (G526/G527's law): the kernel runs when the draw is an axis-aligned
+        // textured sprite the G248 fast sampler already admitted, the destination is 32-bit, no
+        // sub-pixel/round override is active, no per-pixel diagnostic is armed, and no G529/G530
+        // probe is armed. Anything else falls through to the proven generic nest below, unchanged.
+        bool g530Handled = false;
+        if (g530SpanOn() && !g530AnyProbe() && g530Quiet() && g248FastSampleSprite &&
+            !s_g248Verify &&
+            (ctx.frame.psm == GS_PSM_CT32 || ctx.frame.psm == GS_PSM_CT24) &&
+            !g403DisplayZ && !(gs->m_prim.fge && g364FogEnabled()) &&
+            drawX1 >= drawX0 && drawY1 >= drawY0 && gs->m_vram != nullptr)
+        {
+            // --- the alpha test as an interval, verified exhaustively per distinct TEST value ---
+            const G530AlphaGate g530Gate = g530BuildAlphaGate(ctx.test);
+            bool g530GateOk = true;
+            {
+                static thread_local uint64_t s_seen[4] = {~0ull, ~0ull, ~0ull, ~0ull};
+                static thread_local int s_seenN = 0;
+                bool known = false;
+                for (int i = 0; i < 4; ++i)
+                    if (s_seen[i] == ctx.test) { known = true; break; }
+                if (!known)
+                {
+                    g530GateOk = g530AlphaGateAgrees(ctx.test);
+                    if (g530GateOk)
+                    {
+                        s_seen[s_seenN & 3] = ctx.test;
+                        ++s_seenN;
+                    }
+                    else
+                    {
+                        g_g530Reject.fetch_add(1u, std::memory_order_relaxed);
+                        std::fprintf(stderr, "[G530:gate] REJECT test=0x%llx (interval form "
+                                             "disagrees with classifyAlphaTest)\n",
+                                     static_cast<unsigned long long>(ctx.test));
+                    }
+                }
+            }
+            if (g530GateOk)
+            {
+            const bool g530Vfy = g530VerifyOn();
+            const int g530SpanW = drawX1 - drawX0 + 1;
+            // --- per-DRAW: the U schedule. U does not depend on Y, so the divide and the two
+            // std::lround calls the generic loop ran per PIXEL run here once per COLUMN, using the
+            // IDENTICAL expression (g407SubpixelPhase is excluded above, so sampleX0 ==
+            // unclippedX0). Bit-exact by construction, not by a rounding identity. ---
+            G530UTable &g530U = g530UTable();
+            if (static_cast<int>(g530U.sampleU.size()) < g530SpanW)
+            {
+                g530U.sampleU.resize(static_cast<size_t>(g530SpanW));
+                g530U.u0.resize(static_cast<size_t>(g530SpanW));
+                g530U.u1.resize(static_cast<size_t>(g530SpanW));
+                g530U.fx.resize(static_cast<size_t>(g530SpanW));
+            }
+            // g407SubpixelPhase and g406Round.active are per-DRAW selectors, so the kernel simply
+            // carries them into the schedule instead of refusing the draw — G406's accurate UV is
+            // DEFAULT-ON, so excluding it excluded every sprite on this route.
+            const float g530SampleX0 =
+                g407SubpixelPhase ? g407RawX0 : static_cast<float>(unclippedX0);
+            const float g530SampleY0 =
+                g407SubpixelPhase ? g407RawY0 : static_cast<float>(unclippedY0);
+            for (int i = 0; i < g530SpanW; ++i)
+            {
+                const int px = drawX0 + i;
+                const float tx = (static_cast<float>(px) - g530SampleX0 + s_uvBias) / spriteW;
+                const float tu = u0f + (u1f - u0f) * tx;
+                const uint16_t su16 = g406Round.active
+                    ? g406RoundUvFixed(tu, px, g406Round.originX, g406Round.flagsU, g248Linear)
+                    : static_cast<uint16_t>(
+                          clampInt(static_cast<int>(std::lround(tu * 16.0f)), 0, 0xFFFF));
+                g530U.sampleU[static_cast<size_t>(i)] = su16;
+                const float uf = static_cast<float>(su16) / 16.0f;
+                if (g248Linear)
+                {
+                    const float sU = uf - 0.5f;
+                    const int a0 = static_cast<int>(std::floor(sU));
+                    g530U.u0[static_cast<size_t>(i)] =
+                        wrapTextureCoordinate(a0, g248WrapU, texW, g248MinU, g248MaxU);
+                    g530U.u1[static_cast<size_t>(i)] =
+                        wrapTextureCoordinate(a0 + 1, g248WrapU, texW, g248MinU, g248MaxU);
+                    g530U.fx[static_cast<size_t>(i)] = sU - static_cast<float>(a0);
+                }
+                else
+                {
+                    const int a0 = wrapTextureCoordinate(static_cast<int>(uf), g248WrapU, texW,
+                                                         g248MinU, g248MaxU);
+                    g530U.u0[static_cast<size_t>(i)] = a0;
+                    g530U.u1[static_cast<size_t>(i)] = a0;
+                    g530U.fx[static_cast<size_t>(i)] = 0.0f;
+                }
+            }
+            // --- per-DRAW: everything writePixel re-derived per pixel ---
+            const uint32_t g530Block = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+            const uint32_t g530Fbw = (ctx.frame.fbw != 0u) ? ctx.frame.fbw : 1u;
+            const uint32_t g530Mask = ctx.frame.fbmsk;
+            const bool g530Fba = ((ctx.fba & 0x1ull) != 0ull) && ctx.frame.psm != GS_PSM_CT24;
+            const bool g530Abe = gs->m_prim.abe;
+            const bool g530Pabe = gs->m_pabe;
+            const uint8_t g530Asel = static_cast<uint8_t>(ctx.alpha & 3u);
+            const uint8_t g530Bsel = static_cast<uint8_t>((ctx.alpha >> 2) & 3u);
+            const uint8_t g530Csel = static_cast<uint8_t>((ctx.alpha >> 4) & 3u);
+            const uint8_t g530Dsel = static_cast<uint8_t>((ctx.alpha >> 6) & 3u);
+            const uint8_t g530Fix = static_cast<uint8_t>((ctx.alpha >> 32) & 0xFFu);
+            const uint32_t g530PageBwT8 =
+                ((tex.tbw >> 1u) != 0u) ? (tex.tbw >> 1u) : 1u;
+            const uint32_t g530TexTbw = (tex.tbw != 0u) ? tex.tbw : 1u;
+            // The post-wrap half of g248SamplePoint — the wrap itself is already in the U/V tables.
+            // For the 32-bit formats the address is computed INLINE with GSPSMCT32::addrPSMCT32,
+            // the same expression writePixel uses and the one this file's own F62 note records as
+            // byte-identical to GSMem's ("proven for 32-bit and the index formats"). That deletes
+            // two non-inlined calls per TAP — readTexelPSMCT32 plus the cross-TU GSMem::ReadCT32 —
+            // and DC2_G530_VERIFY re-reads through GSMem and compares, so the claim is checked and
+            // not merely cited.
+            auto g530Tap = [&](int su, int sv) -> uint32_t {
+                if (g248Psm == GS_PSM_CT32 || g248Psm == GS_PSM_CT24)
+                {
+                    // Mask exactly as GSMem's PixelStorageTraits::Read does
+                    // (`byte_addr = bits/8 & (MEMORY_SIZE - sizeof(PackedT))`), so an out-of-range
+                    // address WRAPS identically instead of reading zero. addrPSMCT32 is always
+                    // 4-aligned, so the low two bits the mask clears are already clear.
+                    const uint32_t toff = GSPSMCT32::addrPSMCT32(
+                        tex.tbp0, g530TexTbw, static_cast<uint32_t>(su), static_cast<uint32_t>(sv)) &
+                        static_cast<uint32_t>(GSMem::MEMORY_SIZE - 4u);
+                    uint32_t raw = 0u;
+                    std::memcpy(&raw, gs->m_vram + toff, 4);
+                    if (g530VerifyOn())
+                    {
+                        const uint32_t ref =
+                            GSMem::ReadCT32(gs->m_vram, tex.tbp0, g530TexTbw,
+                                            static_cast<uint32_t>(su), static_cast<uint32_t>(sv));
+                        if (ref != raw)
+                        {
+                            const uint64_t bad =
+                                g_g530Bad.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                            if (bad <= 16u)
+                                std::fprintf(stderr,
+                                    "[G530:vfy] TAP MISMATCH uv=(%d,%d) tbp=0x%x tbw=%u "
+                                    "ref=%08x fast=%08x off=0x%x\n",
+                                    su, sv, tex.tbp0, g530TexTbw, ref, raw, toff);
+                        }
+                    }
+                    return applyTexa(gs->m_texa, g248Psm, raw);
+                }
+                const uint8_t idx = static_cast<uint8_t>(
+                    GSMem::ReadP8(gs->m_vram, tex.tbp0, g530PageBwT8,
+                                  static_cast<uint32_t>(su), static_cast<uint32_t>(sv)));
+                return g248UseClutCache
+                    ? g248ClutLookup(idx)
+                    : lookupCLUT(gs, idx, tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
+            };
+            // writePixel's 32-bit tail, statement for statement, with every loop-invariant term
+            // hoisted and the (already-satisfied) scissor test and (already-computed) alpha-test
+            // classification removed.
+            auto g530Commit = [&](uint32_t off, uint8_t cr, uint8_t cg, uint8_t cb, uint8_t ca,
+                                  bool preserveA) -> uint32_t {
+                uint8_t rr = cr, gg = cg, bb = cb, aa = ca;
+                if (g530Abe)
+                {
+                    uint32_t existing = 0u;
+                    std::memcpy(&existing, gs->m_vram + off, 4);
+                    const uint8_t dr = static_cast<uint8_t>(existing & 0xFFu);
+                    const uint8_t dg = static_cast<uint8_t>((existing >> 8) & 0xFFu);
+                    const uint8_t db = static_cast<uint8_t>((existing >> 16) & 0xFFu);
+                    const uint8_t da = static_cast<uint8_t>((existing >> 24) & 0xFFu);
+                    if (!(g530Pabe && (ca & 0x80u) == 0u))
+                    {
+                        auto pick = [](uint8_t sel, int cs, int cd) -> int {
+                            if (sel == 0) return cs;
+                            if (sel == 1) return cd;
+                            return 0;
+                        };
+                        const int cAlpha = (g530Csel == 0) ? static_cast<int>(ca)
+                                         : (g530Csel == 1) ? static_cast<int>(da)
+                                                           : static_cast<int>(g530Fix);
+                        rr = clampU8(((pick(g530Asel, rr, dr) - pick(g530Bsel, rr, dr)) * cAlpha >> 7) +
+                                     pick(g530Dsel, rr, dr));
+                        gg = clampU8(((pick(g530Asel, gg, dg) - pick(g530Bsel, gg, dg)) * cAlpha >> 7) +
+                                     pick(g530Dsel, gg, dg));
+                        bb = clampU8(((pick(g530Asel, bb, db) - pick(g530Bsel, bb, db)) * cAlpha >> 7) +
+                                     pick(g530Dsel, bb, db));
+                    }
+                }
+                if (!preserveA && g530Fba)
+                    aa = static_cast<uint8_t>(aa | 0x80u);
+                uint32_t pixel = static_cast<uint32_t>(rr) | (static_cast<uint32_t>(gg) << 8) |
+                                 (static_cast<uint32_t>(bb) << 16) | (static_cast<uint32_t>(aa) << 24);
+                if (g530Mask != 0u)
+                {
+                    uint32_t existing = 0u;
+                    std::memcpy(&existing, gs->m_vram + off, 4);
+                    pixel = (pixel & ~g530Mask) | (existing & g530Mask);
+                }
+                if (preserveA)
+                {
+                    uint32_t existing = 0u;
+                    std::memcpy(&existing, gs->m_vram + off, 4);
+                    pixel = (pixel & 0x00FFFFFFu) | (existing & 0xFF000000u);
+                }
+                return pixel;
+            };
+
+            uint64_t g530PxDone = 0u;
+            for (int y = drawY0; y <= drawY1; ++y)
+            {
+                // --- per-ROW: V, the two source rows, the vertical weight, the dest page row ---
+                const float ty = (static_cast<float>(y) - g530SampleY0 + s_uvBias) / spriteH;
+                const float tv = v0f + (v1f - v0f) * ty;
+                const uint16_t sv16 = g406Round.active
+                    ? g406RoundUvFixed(tv, y, g406Round.originY, g406Round.flagsV, g248Linear)
+                    : static_cast<uint16_t>(
+                          clampInt(static_cast<int>(std::lround(tv * 16.0f)), 0, 0xFFFF));
+                const float vf = static_cast<float>(sv16) / 16.0f;
+                int g530V0 = 0, g530V1 = 0;
+                float g530Fy = 0.0f;
+                if (g248Linear)
+                {
+                    const float sV = vf - 0.5f;
+                    const int b0 = static_cast<int>(std::floor(sV));
+                    g530V0 = wrapTextureCoordinate(b0, g248WrapV, texH, g248MinV, g248MaxV);
+                    g530V1 = wrapTextureCoordinate(b0 + 1, g248WrapV, texH, g248MinV, g248MaxV);
+                    g530Fy = sV - static_cast<float>(b0);
+                }
+                else
+                {
+                    g530V0 = wrapTextureCoordinate(static_cast<int>(vf), g248WrapV, texH,
+                                                   g248MinV, g248MaxV);
+                    g530V1 = g530V0;
+                }
+                const G530RowAddr g530Row =
+                    g530RowAddr(g530Block, g530Fbw, static_cast<uint32_t>(y));
+                bool g530QuadValid = false;
+                int g530LastU0 = 0, g530LastU1 = 0;
+                uint32_t q00 = 0u, q10 = 0u, q01 = 0u, q11 = 0u;
+
+                int x = drawX0;
+                while (x <= drawX1)
+                {
+                    // --- per 8-PIXEL GROUP: the page/block half of the destination address ---
+                    const uint32_t g530GBase =
+                        g530GroupBase(g530Row, static_cast<uint32_t>(x));
+                    const int xEnd = (drawX1 < (x | 7)) ? drawX1 : (x | 7);
+                    for (; x <= xEnd; ++x)
+                    {
+                        const size_t i = static_cast<size_t>(x - drawX0);
+                        const int su0 = g530U.u0[i];
+                        const int su1 = g530U.u1[i];
+                        if (!g530QuadValid || su0 != g530LastU0 || su1 != g530LastU1)
+                        {
+                            q00 = g530Tap(su0, g530V0);
+                            if (g248Linear)
+                            {
+                                q10 = g530Tap(su1, g530V0);
+                                q01 = g530Tap(su0, g530V1);
+                                q11 = g530Tap(su1, g530V1);
+                            }
+                            g530LastU0 = su0;
+                            g530LastU1 = su1;
+                            g530QuadValid = true;
+                        }
+                        uint32_t texel;
+                        if (g248Linear)
+                        {
+                            const float fxv = g530U.fx[i];
+                            const uint8_t lr = lerpChannel(
+                                static_cast<uint8_t>(q00 & 0xFFu), static_cast<uint8_t>(q10 & 0xFFu),
+                                static_cast<uint8_t>(q01 & 0xFFu), static_cast<uint8_t>(q11 & 0xFFu),
+                                fxv, g530Fy);
+                            const uint8_t lg = lerpChannel(
+                                static_cast<uint8_t>((q00 >> 8) & 0xFFu), static_cast<uint8_t>((q10 >> 8) & 0xFFu),
+                                static_cast<uint8_t>((q01 >> 8) & 0xFFu), static_cast<uint8_t>((q11 >> 8) & 0xFFu),
+                                fxv, g530Fy);
+                            const uint8_t lb = lerpChannel(
+                                static_cast<uint8_t>((q00 >> 16) & 0xFFu), static_cast<uint8_t>((q10 >> 16) & 0xFFu),
+                                static_cast<uint8_t>((q01 >> 16) & 0xFFu), static_cast<uint8_t>((q11 >> 16) & 0xFFu),
+                                fxv, g530Fy);
+                            const uint8_t la = lerpChannel(
+                                static_cast<uint8_t>((q00 >> 24) & 0xFFu), static_cast<uint8_t>((q10 >> 24) & 0xFFu),
+                                static_cast<uint8_t>((q01 >> 24) & 0xFFu), static_cast<uint8_t>((q11 >> 24) & 0xFFu),
+                                fxv, g530Fy);
+                            texel = static_cast<uint32_t>(lr) | (static_cast<uint32_t>(lg) << 8) |
+                                    (static_cast<uint32_t>(lb) << 16) | (static_cast<uint32_t>(la) << 24);
+                        }
+                        else
+                        {
+                            texel = q00;
+                        }
+                        const TextureCombineResult color = combineTexture(
+                            tex, r, g, b, a,
+                            static_cast<uint8_t>(texel & 0xFFu),
+                            static_cast<uint8_t>((texel >> 8) & 0xFFu),
+                            static_cast<uint8_t>((texel >> 16) & 0xFFu),
+                            static_cast<uint8_t>((texel >> 24) & 0xFFu));
+                        // Z test — identical to spriteZPass, with the read skipped for the two
+                        // ZTST codes that provably ignore it (NEVER / ALWAYS). That skip is exact:
+                        // the generic lambda reads zdst and then never looks at it in those cases.
+                        bool zpass = true;
+                        if (sZActive)
+                        {
+                            if (sZtst == 0u)
+                                zpass = false;
+                            else if (sZtst != 1u)
+                            {
+                                const uint32_t zdst =
+                                    sZ16 ? GSMem::ReadZ16(gs->m_vram, sZbp, sZbw,
+                                                          static_cast<uint32_t>(x), static_cast<uint32_t>(y))
+                                    : sZ24 ? GSMem::ReadZ24(gs->m_vram, sZbp, sZbw,
+                                                            static_cast<uint32_t>(x), static_cast<uint32_t>(y))
+                                           : GSMem::ReadZ32(gs->m_vram, sZbp, sZbw,
+                                                            static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                                zpass = (sZtst == 2u) ? (sZi >= zdst) : (sZi > zdst);
+                            }
+                        }
+                        if (g530Vfy && zpass != spriteZPass(x, y))
+                        {
+                            const uint64_t bad = g_g530Bad.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                            if (bad <= 16u)
+                                std::fprintf(stderr, "[G530:vfy] ZPASS MISMATCH xy=(%d,%d) "
+                                                     "ztst=%u fast=%u\n",
+                                             x, y, sZtst, zpass ? 1u : 0u);
+                        }
+                        if (!zpass)
+                            continue;
+                        const bool pass = g530Gate.pass(color.a);
+                        const bool wfb = pass ? g530Gate.passFb : g530Gate.failFb;
+                        const bool wzb = pass ? g530Gate.passZ : g530Gate.failZ;
+                        const bool wpa = pass ? g530Gate.passPa : g530Gate.failPa;
+                        if (wfb)
+                        {
+                            const uint32_t off = g530GBase +
+                                static_cast<uint32_t>(g530Row.ct[x & 0x7u]) * 4u;
+                            if (off + 4u <= gs->m_vramSize)
+                            {
+                                const uint32_t pixel =
+                                    g530Commit(off, color.r, color.g, color.b, color.a, wpa);
+                                if (g530Vfy)
+                                {
+                                    // The PROVEN path performs the store; the kernel's word is
+                                    // compared against what it actually wrote.
+                                    writePixel(gs, x, y, color.r, color.g, color.b, color.a);
+                                    uint32_t after = 0u;
+                                    std::memcpy(&after, gs->m_vram + off, 4);
+                                    g_g530Px.fetch_add(1u, std::memory_order_relaxed);
+                                    if (after != pixel)
+                                    {
+                                        const uint64_t bad =
+                                            g_g530Bad.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                                        if (bad <= 16u)
+                                            std::fprintf(stderr,
+                                                "[G530:vfy] PIXEL MISMATCH xy=(%d,%d) off=0x%x "
+                                                "ref=%08x fast=%08x fbp=0x%x abe=%u mask=%08x\n",
+                                                x, y, off, after, pixel, ctx.frame.fbp,
+                                                g530Abe ? 1u : 0u, g530Mask);
+                                    }
+                                }
+                                else
+                                {
+                                    std::memcpy(gs->m_vram + off, &pixel, 4);
+                                }
+                            }
+                            else if (g530Vfy)
+                            {
+                                writePixel(gs, x, y, color.r, color.g, color.b, color.a);
+                            }
+                        }
+                        if (wzb)
+                            spriteZStore(x, y);
+                        ++g530PxDone;
+                    }
+                }
+            }
+            g_g530Px.fetch_add(g530Vfy ? 0u : g530PxDone, std::memory_order_relaxed);
+            g_g530Draws.fetch_add(1u, std::memory_order_relaxed);
+            g530SpanReport();
+            g530Handled = true;
+            }
+        }
+
+        if (!g530Handled)
         for (int y = drawY0; y <= drawY1; ++y)
         {
             g248QValid = false;
@@ -720,27 +1147,39 @@ void GSRasterizer::drawSprite(GS *gs)
 
             for (int x = drawX0; x <= drawX1; ++x)
             {
+                if (g530NoPx) continue; // ⛔ whole-body ceiling probe
                 const float sampleX0 =
                     g407SubpixelPhase ? g407RawX0 : static_cast<float>(unclippedX0);
-                float tx = (static_cast<float>(x) - sampleX0 + s_uvBias) / spriteW;
-                float texUf = u0f + (u1f - u0f) * tx;
+                // ⛔ G530 NOUV probe: skip the per-pixel divide + interpolate entirely.
+                float tx = g530NoUv
+                    ? 0.0f
+                    : (static_cast<float>(x) - sampleX0 + s_uvBias) / spriteW;
+                float texUf = g530NoUv ? u0f : (u0f + (u1f - u0f) * tx);
                 uint32_t texel = 0xFFFF00FFu;
                 uint16_t g258SampleU = 0u, g258SampleV = 0u;
                 if (gs->m_prim.fst)
                 {
+                    // ⛔ G530 NOUV probe: pin the interpolated coordinate to the row's first pixel,
+                    // deleting the per-pixel divide + two std::lround CRT calls (knowingly wrong).
+                    const float g530TexUf = g530NoUv ? (u0f) : texUf;
+                    const float g530TexVf = g530NoUv ? (v0f) : texVf;
                     uint16_t sampleU = g406Round.active
-                        ? g406RoundUvFixed(texUf, x, g406Round.originX,
+                        ? g406RoundUvFixed(g530TexUf, x, g406Round.originX,
                                           g406Round.flagsU, g248Linear)
                         : static_cast<uint16_t>(clampInt(
-                              static_cast<int>(std::lround(texUf * 16.0f)), 0, 0xFFFF));
+                              static_cast<int>(std::lround(g530TexUf * 16.0f)), 0, 0xFFFF));
                     uint16_t sampleV = g406Round.active
-                        ? g406RoundUvFixed(texVf, y, g406Round.originY,
+                        ? g406RoundUvFixed(g530TexVf, y, g406Round.originY,
                                           g406Round.flagsV, g248Linear)
                         : static_cast<uint16_t>(clampInt(
-                              static_cast<int>(std::lround(texVf * 16.0f)), 0, 0xFFFF));
+                              static_cast<int>(std::lround(g530TexVf * 16.0f)), 0, 0xFFFF));
                     g258SampleU = sampleU;
                     g258SampleV = sampleV;
-                    if (g248FastSampleSprite)
+                    if (g530NoTex)
+                    {
+                        texel = 0x80808080u; // ⛔ probe: deletes the whole sampler
+                    }
+                    else if (g248FastSampleSprite)
                     {
                         texel = g248FastSample(sampleU, sampleV);
                         if (s_g248Verify)
@@ -789,7 +1228,11 @@ void GSRasterizer::drawSprite(GS *gs)
                 uint8_t tb = static_cast<uint8_t>((texel >> 16) & 0xFF);
                 uint8_t ta = static_cast<uint8_t>((texel >> 24) & 0xFF);
 
-                const TextureCombineResult color = combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
+                // ⛔ G530 NOCOMB probe: delete the per-pixel combineTexture switch (the alpha-test
+                // classify below is deleted by the same flag). Knowingly wrong pixels.
+                const TextureCombineResult color = g530NoComb
+                    ? TextureCombineResult{tr, tg, tb, ta}
+                    : combineTexture(tex, r, g, b, a, tr, tg, tb, ta);
                 if (g258TraceOn() && g_g255Verify.pending && g_g255Verify.fbp == 0x146u &&
                     g_g255Verify.traceBatch <= 4u && x == 52 && y == 1 && gs->m_prim.fst)
                 {
@@ -849,7 +1292,9 @@ void GSRasterizer::drawSprite(GS *gs)
                 }
                 if (!spriteZPass(x, y)) // G203: guest Z test
                     continue;
-                const AlphaTestResult alphaTest = classifyAlphaTest(ctx.test, color.a);
+                const AlphaTestResult alphaTest = g530NoComb
+                    ? AlphaTestResult{true, true, false}
+                    : classifyAlphaTest(ctx.test, color.a);
                 // G364: fog the post-texture RGB (a sprite's F is flat = second vertex's).
                 uint8_t fr = color.r, fg = color.g, fb = color.b;
                 if (gs->m_prim.fge && g364FogEnabled())
@@ -874,7 +1319,7 @@ void GSRasterizer::drawSprite(GS *gs)
                                 v1.x, v1.y, (unsigned)v1.u, (unsigned)v1.v);
                     }
                 }
-                if (alphaTest.writeFramebuffer)
+                if (alphaTest.writeFramebuffer && !g530NoWr) // ⛔ NOWR probe deletes the commit
                     writePixel(gs, x, y, fr, fg, fb, color.a);
                 if (alphaTest.writeDepth)
                     spriteZStore(x, y); // G203: guest Z write (e.g. the game's clear-sprite)

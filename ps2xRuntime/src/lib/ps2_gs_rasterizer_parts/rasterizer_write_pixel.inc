@@ -187,6 +187,18 @@ void g407AutoScanPrevious(uint64_t tick)
     }
 }
 
+// G530: the SAME cached flag g407AutoRecord() tests first. Exposed so the per-pixel commit can
+// short-circuit BEFORE it pays for the extra `before` VRAM read and the call itself. G407's
+// auto-scan is a default-off diagnostic, so on the shipped path this deletes one dependent 4-byte
+// load and one non-inlined call from EVERY framebuffer commit in the rasterizer (sprites, triangles
+// and lines alike) with no behavioural surface at all: when the flag IS set the guarded block is
+// entered and runs exactly as before.
+bool g407AutoScanEnabled()
+{
+    static const bool enabled = envFlagEnabled("DC2_G407_AUTOSCAN");
+    return enabled;
+}
+
 void g407AutoRecord(const GSContext &ctx,
                     uint32_t primType,
                     bool primTme,
@@ -201,7 +213,7 @@ void g407AutoRecord(const GSContext &ctx,
                     uint8_t srcB,
                     uint8_t srcA)
 {
-    static const bool enabled = envFlagEnabled("DC2_G407_AUTOSCAN");
+    const bool enabled = g407AutoScanEnabled();
     if (!enabled ||
         x < kG407ScanX0 || x > kG407ScanX1 ||
         y < kG407ScanY0 || y > kG407ScanY1 ||
@@ -888,6 +900,9 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
         }
     }
 
+    // G530: guarded by the SAME cached flag g407AutoRecord() tests on entry — see
+    // g407AutoScanEnabled() above. Exact; deletes a dependent VRAM load + a call per commit.
+    if (g407AutoScanEnabled())
     {
         uint32_t before = 0u;
         std::memcpy(&before, gs->m_vram + off, 4);

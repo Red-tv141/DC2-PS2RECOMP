@@ -758,7 +758,13 @@ static void g261NoteCpuRttWrites(uint8_t *vram)
     for (const G144Entry &e : g_g144List)
     {
         const GSContext &c = e.ctx;
-        if (g248TargetIndex(c.frame.fbp) < 0)
+        // G527 (publication half of the registry — MUST stay the same predicate as the admission
+        // site in rasterizer_tilebin_capture.inc). A discovered target's deferred writes need the
+        // identical page-generation bump an inline draw performs at the end of drawPrimitive;
+        // without it a GPU-cached texture decoded from those pages stays stale — wrong pixels,
+        // silently. The scissor rect here is a superset of the inline path's clamped bbox, so this
+        // is conservative in the safe direction.
+        if (!g527DeferTarget(c.frame.fbp))
             continue;
         if (c.scissor.x1 >= c.scissor.x0 && c.scissor.y1 >= c.scissor.y0)
         {
@@ -1181,6 +1187,17 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                    ? (std::getenv("DC2_G252_GPU_RTT") != nullptr)
                                    : s_g252GpuRttEnv;
     if (g248TargetIndex(fbp) >= 0 && !g252GpuRttEnv && !g255Rtt)
+    {
+        g_g266FlushRej = kG266FrCpuOnlyRtt;
+        return false;
+    }
+    // G527: a DISCOVERED render target has no residency slot, no g_g310TargetPageGen row and no
+    // FBO — g255Rtt above is false for it (it keys on g248TargetIndex), and so is the legacy
+    // CPU-only return, so without this it would fall through the rest of this function as if it
+    // were a DISPLAY batch: framebuffer upload, alias/generation reasoning and readback all tuned
+    // for 0x0/0x68, applied to an arbitrary address. The value this lever buys is the 8-lane
+    // band-parallel CPU replay below, not the GPU. Route it there explicitly.
+    if (g527DiscoveredTarget(fbp))
     {
         g_g266FlushRej = kG266FrCpuOnlyRtt;
         return false;
@@ -4579,12 +4596,6 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // per-pixel address loop, kept byte-identical as the control arm; the fast arm is the exact
         // one-page address table with paired stores over disjoint guest rows.
         {
-            // G419: the ONE fixed per-frame sample point of the generalized instrument. Exactly one
-            // colour-readback unpack happens per frame, so the interval between consecutive ticks is
-            // a frame period sampled at a fixed point in the frame. Inert unless DC2_G419_AB is set;
-            // the frame counter itself is unconditional so every G419 census can normalise per frame.
-            g419NoteFrameTick();
-            g419AbTick();
             const bool g418Profile = g418ProfileOn();
             const int g418Ballast = g418AltBallast();
             const bool g418Pick = g418AlternatePick(g418FastUnpackOn());

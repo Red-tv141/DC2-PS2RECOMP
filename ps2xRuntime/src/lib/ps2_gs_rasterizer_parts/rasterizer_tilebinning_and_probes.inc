@@ -326,6 +326,48 @@ static int g248TargetIndex(uint32_t fbp)
     }
 }
 
+// ===== G526: FAST-PATH ADMISSION BY PROPERTY, NOT BY ADDRESS (PROMOTED DEFAULT-ON) =====
+// Rollback: DC2_G526_NO_ANYTGT=1 (or DC2_G526_ANYTGT=0). Oracle: DC2_G248_VERIFY=1 -> [G248:vfy].
+// Gate: Georama 46.26 -> 37.72 ms/f, mean -8.543 ms/f = -18.47%, 4/4 paired runs negative;
+// per-pixel oracle 263,192,576 texels compared on the newly admitted targets, bad=0.
+//
+// G526 attributed Georama's 31.2 ms/f "per-draw residual" — the quantity G525 ranked eleven scenes
+// by and could not explain with any workload term — to ~20 primitives per FRAME at ~1.4 ms each,
+// 100% CPU-occupied (cyc/ns 3.18 against a 3.15 GHz core, so G524's blocked-span discount does not
+// apply). Every one of them is a sprite to 0x181/0x18d/0x19f/0x1b7/0x1d7: five off-screen render
+// targets this table does not name. The "0.24 -> 8.90 us per draw" spread was an average over a
+// bimodal population — 99.7% of draws cost 0.06–0.36 us and a handful cost 300–1,450 us.
+//
+// The port gates THREE independent fast paths on this one five-address list, discovered on a
+// single route: deferral admission (g252RttTarget), the G260 command graph (g260RttTri), and the
+// G248 fast sprite sampler. A scene whose maps render to different addresses falls onto the
+// slowest path in all three at once, and nothing in the census makes that visible.
+//
+// This predicate widens the narrowest and safest of the three: the SAMPLER. g248FastSample reads
+// tex.* and guest VRAM and never reads frame.fbp — a destination address cannot change which texel
+// a sampler returns — so the target test there was G248's measurement SCOPE, not a safety
+// condition. The genuine safety conjuncts at that call site (fst, CT32/CT24/T8 psm, tbw != 0, no
+// diagnostic trace, no special filter) are untouched, and per-pixel exactness against the very
+// body it replaces is provable in-process with DC2_G248_VERIFY=1 ([G248:vfy] bad must stay 0).
+//
+// ⛔ Deferral admission and the G260 graph are deliberately NOT widened here. Both would need a
+// residency and write-generation-publication story for a target with no slot in the fixed 5-entry
+// G261 table (g_g261Res / g_g280ContentGen / g_g310TargetPageGen are all sized kG248TargetCount),
+// and the three deferred-publication sites all filter on this same index — so admitting a target
+// to deferral without giving it publication leaves a GPU-cached texture decoded from its pages
+// stale. That is a separate phase with its own parity gate.
+static bool g526AnyTargetSamplerOn()
+{
+    static const bool on = (std::getenv("DC2_G526_NO_ANYTGT") == nullptr) &&
+                           !envFlagDisabled("DC2_G526_ANYTGT");
+    return on;
+}
+
+static bool g526FastSpriteTarget(uint32_t fbp)
+{
+    return g248TargetIndex(fbp) >= 0 || g526AnyTargetSamplerOn();
+}
+
 // G255 (DEFAULT OFF): promote the already-isolated G252 RTT batches through the existing
 // all-or-nothing G178 GPU backend without crossing any upload, local-copy, or FBP boundary.
 // The important RTT ownership rule is that a GPU color write must advance the same page

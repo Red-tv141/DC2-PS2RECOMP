@@ -92,6 +92,7 @@
                              static_cast<unsigned long long>(s_culled[5].load(std::memory_order_relaxed)),
                              static_cast<unsigned long long>(s_culled[6].load(std::memory_order_relaxed)));
         }
+        g526SetExit(kG526Cull); // G526 exit 1
         return;
     }
 
@@ -263,16 +264,14 @@
                 }
                 // G272: CPU fallback consumes/writes guest VRAM. Any earlier display wave must be
                 // published first; the current failed batch has not been marked resident.
-                (void)g278FlushPendingDepth(3); // CPU replay needs authoritative guest Z
-                (void)g289MaterializeOwner(3);
-                g272MaterializeAll(3);
-                g277CensusHardEdge(3);
-                g276FlushPendingDisplay(3); // G276: publish deferred display readbacks first
                 // The proven CPU replay and its decoded textures consume guest VRAM directly.
                 // Publish any RTT rows left GPU-resident by a G261 wave (only where this list's
                 // target/Z/texture/CLUT pages actually touch them), then any GPU-owned depth.
-                g261PrepareCpuReplay();
-                g242PrepareVramReadAll(g_g144LastGs->m_vram);
+                // G528: the seven calls that used to sit inline here now live in g528FlushPrologue,
+                // which runs them UNCHANGED by default and — under DC2_G528_SCOPEDPUB=1 — scopes the
+                // four whole-state publications to this batch's own g_g528Rd/g_g528Wr page ranges.
+                // Census DC2_G528_PUB=1, oracle DC2_G528_VERIFY=1, ceiling probe DC2_G528_NO_PUB=1.
+                g528FlushPrologue(3, g_g144LastGs->m_vram, g_g144BlockFbp);
                 const auto g290T3 = g290P ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
                 if (g290P)
@@ -283,6 +282,15 @@
                 // G203: universal-Z uses no artificial clears — the game's own clear-sprite populates
                 // VRAM Z during the replay below (the g202 clear here is what stomped block 0x1a00 /
                 // the menu font staging into inventory/loading; skip it entirely under universal-Z).
+                // G529: `replay` (the bucket this whole tail is booked to by [G290:probe]) is
+                // 986 us per batch for 3.4 sprite entries. Lap the three things inside it that are
+                // not rasterization — the Z clears, the bbox scan, and the pool round trip — before
+                // believing any of it is pixels. Census DC2_G529_STAT=1, lever DC2_G529_INLINEREPLAY=1.
+                const bool g529On = g529StatOn();
+                std::chrono::steady_clock::time_point g529T = g529On
+                    ? std::chrono::steady_clock::now()
+                    : std::chrono::steady_clock::time_point{};
+                uint64_t g529ZclrNs = 0u, g529ScanNs = 0u;
                 if (!g203UniversalZEnabled())
                 {
                     if (g106TitleZPrivateEnabled())
@@ -293,16 +301,46 @@
                     g202TownZClearIfNeeded(g_g144LastGs->m_vram, c.frame.fbp, c.zbuf, c.frame.fbw);
                     t_g144TownDepthScopeOverride = false;
                 }
+                if (g529On)
+                {
+                    const auto t = std::chrono::steady_clock::now();
+                    g529ZclrNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                     t - g529T).count();
+                    g529T = t;
+                }
                 int y0 = 0x7fffffff, y1 = -0x7fffffff;
+                // G529: the scissor-bounded row-span area, accumulated in the loop that already
+                // walks every entry for the bbox. This is the quantity GSRowPool::run divides, so
+                // it — not the entry COUNT — is what says whether a split can pay for itself.
+                // Computed UNCONDITIONALLY so both A/B arms carry the identical per-entry work and
+                // the gate measures only the lane decision (g520_arm_symmetry_is_a_codegen_property).
+                uint64_t g529Px = 0u;
                 for (const auto &e : g_g144List)
                 {
                     if (e.minY < y0) y0 = e.minY;
                     if (e.maxY > y1) y1 = e.maxY;
+                    const int r0 = (e.minY > (int)e.ctx.scissor.y0) ? e.minY : (int)e.ctx.scissor.y0;
+                    const int r1 = (e.maxY < (int)e.ctx.scissor.y1) ? e.maxY : (int)e.ctx.scissor.y1;
+                    if (r1 >= r0 && e.ctx.scissor.x1 >= e.ctx.scissor.x0)
+                        g529Px += (uint64_t)(r1 - r0 + 1) *
+                                  (uint64_t)(e.ctx.scissor.x1 - e.ctx.scissor.x0 + 1);
                 }
                 if (y1 >= y0)
                 {
+                    const uint64_t g529Rows = (uint64_t)(y1 - y0 + 1);
+                    const size_t g529Entries = g_g144List.size();
+                    const int g529Lanes = g529ReplayLanes(g529Rows, g529Px, g_g144Threads);
+                    if (g529On)
+                    {
+                        const auto t = std::chrono::steady_clock::now();
+                        g529ScanNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         t - g529T).count();
+                        g529T = t;
+                        g529BeginDispatch();
+                    }
                     GS *rgs = g_g144LastGs;
-                    GSRowPool::instance().run(y0, y1, g_g144Threads, [self, rgs](int a, int b) {
+                    GSRowPool::instance().run(y0, y1, g529Lanes, [self, rgs](int a, int b) {
+                        G529LaneScope g529lane; // inert unless DC2_G529_STAT=1
                         static thread_local GS s_rg;
                         s_rg.m_vram = rgs->m_vram;
                         s_rg.m_vramSize = rgs->m_vramSize;
@@ -348,6 +386,15 @@
                         t_g144InReplay = false;
                         t_g144Banded = false;
                     });
+                    if (g529On)
+                    {
+                        g529EndDispatch();
+                        const uint64_t wallNs =
+                            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - g529T).count();
+                        g529NoteDispatch(g528ClassifyFbp(g_g144BlockFbp), wallNs, g529ZclrNs,
+                                         g529ScanNs, g529Entries, g529Rows, g529Px, g529Lanes);
+                    }
                 }
                 const auto g290T4 = g290P ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
@@ -390,13 +437,9 @@
                     g_g144List.clear();
                     return;
                 }
-                (void)g278FlushPendingDepth(3); // CPU replay needs authoritative guest Z
-                (void)g289MaterializeOwner(3);
-                g272MaterializeAll(3); // CPU replay boundary (see parallel closure)
-                g277CensusHardEdge(3);
-                g276FlushPendingDisplay(3); // G276: publish deferred display readbacks first
-                g261PrepareCpuReplay(); // G261: materialize touched GPU-resident RTT rows first
-                g242PrepareVramReadAll(g_g144LastGs->m_vram);
+                // G528: identical prologue to the parallel closure above (see its comment). Routing
+                // both through one function is what keeps DC2_G144_SEQ a pure parallelism bisect.
+                g528FlushPrologue(3, g_g144LastGs->m_vram, g_g144BlockFbp);
                 // G203: skip all artificial Z pre-clears under universal-Z (see the parallel closure).
                 if (!g203UniversalZEnabled())
                 {
@@ -501,8 +544,13 @@
         // order. GPU RTT (DC2_G252_GPU_RTT / G255/G256) remains separately disabled.
         static const bool s_g252RttDefer =
             !envFlagEnabled("DC2_G252_NO_RTT_DEFER") || g255GpuRttOn();
+        // G527: discover this render target if it is new (one relaxed byte load per draw when the
+        // address is already known), then admit by PROPERTY instead of by the five-address list.
+        // g527DeferTarget == `legacy five OR discovered`, so with the registry disarmed this is
+        // bit-identical to the pre-G527 predicate. See g527_target_registry.inc.
+        g527NoteTargetDraw(ctx.frame.fbp);
         const bool g252RttTarget =
-            s_g252RttDefer && isSprite144 && g248TargetIndex(ctx.frame.fbp) >= 0;
+            s_g252RttDefer && isSprite144 && g527DeferTarget(ctx.frame.fbp);
         // G286 admits only the measured opaque textured full-screen sprite class. Other 0x13b
         // shapes remain on the proven CPU path instead of silently widening shader semantics.
         const bool g286Transient =
@@ -515,8 +563,11 @@
         // banded replay, in submission order. Without DC2_G260_NR this bool is constant false
         // and the shipped eligibility is bit-identical.
         static const bool s_g260NoRttTri = envFlagEnabled("DC2_G260_NO_RTTTRI"); // bisect lever
+        // G527: same widening for the RTT-triangle class. DC2_G527_NO_TRI=1 bisects it back to the
+        // legacy five while leaving discovered SPRITES admitted.
         const bool g260RttTri = g260NrOn() && !s_g260NoRttTri && isTri144 && diagOff144 &&
-                                g248TargetIndex(ctx.frame.fbp) >= 0;
+                                (g248TargetIndex(ctx.frame.fbp) >= 0 ||
+                                 (g527TriOn() && g527DiscoveredTarget(ctx.frame.fbp)));
         const bool g270LineWave = g270LineWaveOn() && isLine144 && !gs->m_prim.tme &&
                                   diagOff144 &&
                                   (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u);
@@ -527,6 +578,36 @@
                                    g260RttTri || g270LineWave || g286Transient;
         if (g_g312SegStat)
             t_g312Seg2bEnd = std::chrono::steady_clock::now(); // G312 seg2b end (eligibility computed)
+        g526Lap(kG526Pro); // G526: entry -> eligibility decided (shared by defer and inline)
+        // G526 §2: name the inline population. The coarse pass proved ~20 primitives/frame carry
+        // the whole per-primitive residual on Georama; this records WHICH they are (target fbp,
+        // psm, tme/abe and scissor-clipped area) so the fix can be chosen rather than guessed.
+        if (g_g526Draw && !deferrable144)
+        {
+            const int g526ox = ctx.xyoffset.ofx >> 4;
+            const int g526oy = ctx.xyoffset.ofy >> 4;
+            const uint32_t g526nv = (pt144 == GS_PRIM_SPRITE || isLine144) ? 2u : 3u;
+            float g526x0 = 1e30f, g526x1 = -1e30f, g526y0 = 1e30f, g526y1 = -1e30f;
+            for (uint32_t i = 0; i < g526nv; ++i)
+            {
+                const float px = gs->m_vtxQueue[i].x - static_cast<float>(g526ox);
+                const float py = gs->m_vtxQueue[i].y - static_cast<float>(g526oy);
+                if (px < g526x0) g526x0 = px;
+                if (px > g526x1) g526x1 = px;
+                if (py < g526y0) g526y0 = py;
+                if (py > g526y1) g526y1 = py;
+            }
+            const int g526cx0 = clampInt(static_cast<int>(g526x0), ctx.scissor.x0, ctx.scissor.x1);
+            const int g526cx1 = clampInt(static_cast<int>(g526x1), ctx.scissor.x0, ctx.scissor.x1);
+            const int g526cy0 = clampInt(static_cast<int>(g526y0), ctx.scissor.y0, ctx.scissor.y1);
+            const int g526cy1 = clampInt(static_cast<int>(g526y1), ctx.scissor.y0, ctx.scissor.y1);
+            const uint64_t g526px =
+                static_cast<uint64_t>(g526cx1 >= g526cx0 ? (g526cx1 - g526cx0 + 1) : 0) *
+                static_cast<uint64_t>(g526cy1 >= g526cy0 ? (g526cy1 - g526cy0 + 1) : 0);
+            g526SetInlineKey(ctx.frame.fbp, static_cast<uint32_t>(ctx.frame.psm),
+                             gs->m_prim.tme ? 1u : 0u, gs->m_prim.abe ? 1u : 0u,
+                             g248TargetIndex(ctx.frame.fbp), g526px);
+        }
         // G156: count deferred vs inline tris + the non-deferrable reason (see g156Report). Report
         // fires from HERE (every tri) so a line prints even if 100% defer (inline=0) or 100% inline.
         if (g_g156Stat && isTri144)
@@ -643,6 +724,7 @@
                     g144TimedMidFlush(); // fbp changed → different target; drain before switching blocks
                 }
             }
+            g526Lap(kG526Sw); // G526: target-switch batch close / mid-flush drain
             g_g144BlockFbp = ctx.frame.fbp;
             // Screen bbox rows computed EXACTLY as drawTriangle/drawSprite (same ofy + scissor
             // clamp) so the band prefilter is tight and never narrower than the real coverage.
@@ -747,10 +829,12 @@
             e.townDepthScope = g_dc2TownDepthScope.load(std::memory_order_relaxed);
             e.minY = clampInt(crawMinY, ctx.scissor.y0, ctx.scissor.y1);
             e.maxY = clampInt(crawMaxY, ctx.scissor.y0, ctx.scissor.y1);
+            g526Lap(kG526Build); // G526: bbox + G144Entry field fill
             // G149: decode this tri's texture ONCE now (guest thread), so all band lanes read it
             // lock-free at replay. Null unless texcache-enabled + eligible. Sprites never use the
             // G149 texcache hook (drawSprite() samples VRAM directly, same as its inline path).
             e.decoded = isTri144 ? g149BuildDecoded(this, gs, ctx, gs->m_texa, gs->m_vram) : G149Buf{};
+            g526Lap(kG526Dec); // G526: per-triangle texture decode at capture time
             if (isTri144)
                 g161CensusEligibility(ctx, gs->m_prim.abe);
             // G219 (default-off, DC2_G219_SKYPX=1): fingerprint the 0x2720 work-page range at
@@ -780,6 +864,7 @@
             if (g260NrOn())
                 g260NoteAppend(e); // accumulate this entry's R/W block ranges (open batch)
             g336NoteConsumer(e); // G336: first next-frame consumer of boundary-published state (default-off)
+            g526Lap(kG526Note); // G526: g260NoteAppend page-range accumulation + g336
             // G510: `e` is a loop-local, fully assigned above and dead from here on (only the
             // g156 stat block and the `return` follow), so moving it into the list lands the
             // identical bytes in the identical slot and removes one whole G144Entry copy —
@@ -825,6 +910,8 @@
                         std::chrono::steady_clock::now() - g156CapT0)
                         .count(),
                     std::memory_order_relaxed);
+            g526Lap(kG526Push);      // G526: g_g144List.push_back
+            g526SetExit(kG526Defer); // G526 exit 2
             return; // deferred — rasterized later at flush
         }
         // Non-deferrable primitive (line/point/untextured-off-target/RTT sprite/etc — anything that
@@ -869,6 +956,7 @@
                                gs->m_prim.tme, gs->m_prim.abe);
             g144TimedMidFlush();
         }
+        g526Lap(kG526Drain); // G526: inline path — pending-graph drain before this primitive
         // This primitive will execute on the CPU (RTT/line/point/diagnostic path).  The preceding
         // drain may have left guest Z resident on the GPU, so restore authoritative bytes before
         // any CPU depth test, texture sample, or Z write.
@@ -925,6 +1013,7 @@
         g276FlushPendingDisplay(4); // G276: publish deferred display readbacks first
         g261PrepareInline(ctx, gs->m_prim, gs->m_texclut);
         g242PrepareVramReadAll(gs->m_vram);
+        g526Lap(kG526Edge); // G526: inline path — ownership/materialize/publish edge
     }
 
     switch (gs->m_prim.type)
@@ -967,6 +1056,7 @@
     default:
         break;
     }
+    g526Lap(kG526Raster); // G526: inline path — the actual CPU rasterization of this primitive
 
     // G178: an INLINE (non-deferred) draw just wrote guest VRAM directly (e.g. the costume RTT at
     // fbp=0x139). Bump the write generations of the pages its scissored frame region can touch so

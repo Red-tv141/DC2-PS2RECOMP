@@ -314,6 +314,14 @@ namespace
     std::vector<std::vector<G144Entry>> g_g260Pool;     // recycled entry storage
     G260RangeSet g_g260OpenWr;                          // aggregates of the OPEN batch (g_g144List)
     G260RangeSet g_g260OpenRd;
+
+    // G528: the EXECUTING batch's own page ranges, published for the duration of one `fn()` call so
+    // the flush prologue can scope its publications to what this batch actually reads and writes
+    // instead of publishing whole-state (see g528_flush_publish.inc). Same lifetime discipline and
+    // the same single-threaded flush-owner contract as g272SetDisplayBatch beside it. Null on any
+    // path that did not come through the graph — g528FlushPrologue fails closed on that.
+    const G260RangeSet *g_g528Wr = nullptr;
+    const G260RangeSet *g_g528Rd = nullptr;
     // stats (quiet unless DC2_G260_STAT=1)
     uint64_t g_g260ExecByCause[8] = {};
     uint64_t g_g260BatchesExecuted = 0;
@@ -738,6 +746,8 @@ namespace
             g_g144List.swap(b.entries);
             g_g144BlockFbp = b.fbp;
             g272SetDisplayBatch(b.fbp, g_g144List.front().ctx.frame.fbw);
+            g_g528Wr = &b.wr; // G528: scope the flush prologue to this batch (see the decls above)
+            g_g528Rd = &b.rd;
             ++g_g260BatchesExecuted;
             g_g260EntriesExecuted += g_g144List.size();
             // Ownership rule (the G255 lesson, applied to CPU replay): a replayed batch's color/Z
@@ -763,7 +773,9 @@ namespace
                     // GPU texture cache honest for the composite); deferred DISPLAY draws never
                     // bumped, and replicating a display bump here only churns the fb-snapshot
                     // gens into constant re-uploads (measured as a full perf giveback).
-                    if (g248TargetIndex(c.frame.fbp) < 0)
+                    // G527: publication half of the target registry — same predicate as the
+                    // admission site, in the same edit (see g527_target_registry.inc).
+                    if (!g527DeferTarget(c.frame.fbp))
                         continue;
                     if (c.scissor.x1 >= c.scissor.x0 && c.scissor.y1 >= c.scissor.y0)
                     {
@@ -789,6 +801,8 @@ namespace
             else
                 g_g144List.clear(); // cannot happen (entries imply assigned closures); fail safe
             g272SetDisplayBatch(0xFFFFFFFFu, 0u);
+            g_g528Wr = nullptr; // G528: the batch is no longer executing — fail closed again
+            g_g528Rd = nullptr;
             g_g144List.swap(b.entries); // reclaim the (now empty) storage's capacity
             g_g260Pool.push_back(std::move(b.entries));
         }
@@ -832,6 +846,8 @@ namespace
             g_g144List.swap(b.entries);
             g_g144BlockFbp = b.fbp;
             g272SetDisplayBatch(b.fbp, g_g144List.front().ctx.frame.fbw);
+            g_g528Wr = &b.wr; // G528: scope the flush prologue to this batch (see the decls above)
+            g_g528Rd = &b.rd;
             ++g_g260BatchesExecuted;
             g_g260EntriesExecuted += g_g144List.size();
             if (g178GpuOn() && !g261WaveOn())
@@ -841,7 +857,9 @@ namespace
                 {
                     const G144Entry &e = g_g144List[ei];
                     const GSContext &c = e.ctx;
-                    if (g248TargetIndex(c.frame.fbp) < 0)
+                    // G527: publication half of the target registry (second site) — same
+                    // predicate as the admission site, in the same edit.
+                    if (!g527DeferTarget(c.frame.fbp))
                         continue;
                     if (c.scissor.x1 >= c.scissor.x0 && c.scissor.y1 >= c.scissor.y0)
                     {
@@ -866,6 +884,8 @@ namespace
             else
                 g_g144List.clear();
             g272SetDisplayBatch(0xFFFFFFFFu, 0u);
+            g_g528Wr = nullptr; // G528: the batch is no longer executing — fail closed again
+            g_g528Rd = nullptr;
             g_g144List.swap(b.entries);
             g_g260Pool.push_back(std::move(b.entries));
         }

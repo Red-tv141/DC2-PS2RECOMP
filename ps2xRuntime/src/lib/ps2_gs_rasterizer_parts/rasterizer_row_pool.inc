@@ -197,11 +197,101 @@ bool passesAlphaTest(uint64_t testReg, uint8_t alpha)
         }
     }
 
+    // ===== G529: the bilinear lerp's final rounding is a CRT CALL, four per pixel =====
+    //
+    // THE MEASUREMENT (G529 §3). `[G529:spr]` books every sprite drawn inside a band replay to the
+    // path it took, with its own pixel count and elapsed time:
+    //
+    //   bucket   n        px        summed lane ms   ns/px   bilinear
+    //   fast     157,753  170.1 M   67,648           397.8   157,753  (100%)
+    //   slow      85,107   14.5 M    3,668           252.8         0
+    //   other     37,143   60.3 M    7,430           123.3         0
+    //
+    // The G248/G250 hoisted sampler is 86% of all replayed-sprite CPU on Georama, and EVERY sprite
+    // that reaches it is BILINEAR — so every pixel runs four g248SamplePoint taps and then four
+    // lerpChannel calls, and each of those ends in `std::lround`.
+    //
+    // `std::lround(float)` is `lroundf`: it must round HALF AWAY FROM ZERO, which SSE's
+    // cvtss2si (round-to-nearest-EVEN) does not do, so MSVC cannot fold it to one instruction and
+    // emits a CRT call. That is four CRT calls per pixel. G519 already established the law that a
+    // CRT/DLL leaf row IS a priceable call class in this rasterizer (it removed 58,400 ceilf/floorf
+    // per frame for -0.337 ms/f); this is the same class, two orders of magnitude more of it.
+    //
+    // ⭐ THE REPLACEMENT IS PROVABLY EXACT, not approximately equal.
+    // `top` and `bottom` are convex combinations of channel values in [0,255] with fx in [0,1), so
+    // both lie in [0,255]; `v = top + (bottom-top)*fy` is a convex combination of those with
+    // fy in [0,1), so v is in [0,255] and in particular **v >= 0**. For v >= 0, "round half away
+    // from zero" IS "round half up", i.e. floor(v + 1/2). Computing it as:
+    //
+    //     int n = (int)v;            // cvttss2si -- truncation, exact for 0 <= v <= 255
+    //     float frac = v - (float)n; // EXACT (Sterbenz: n <= v < n+1, same binade or adjacent)
+    //     if (frac >= 0.5f) ++n;
+    //
+    // reproduces lroundf bit-for-bit on this domain while never forming `v + 0.5f` (which could
+    // round UP across the tie and change the answer for values just below x.5). Four instructions,
+    // no call, no libm.
+    //
+    //   DC2_G529_FASTLERP=1  the lever (bring-up default: OFF)
+    //   DC2_G529_NO_FASTLERP=1  rollback once promoted
+    //   DC2_G529_LERPVFY=1   ORACLE. Runs BOTH forms per channel and counts disagreements. Any
+    //                        nonzero `bad` means the identity above is violated on this host.
+    //   DC2_G529_NOLERP=1    CEILING PROBE, KNOWINGLY INCORRECT OUTPUT, NEVER PROMOTE. Returns the
+    //                        c00 tap unfiltered, deleting the entire bilinear filter. Bounds every
+    //                        lever that could ever be built here (g511_probe_bounds_the_gate).
+    inline bool g529FastLerpOn()
+    {
+        static const bool on = envFlagEnabled("DC2_G529_FASTLERP") &&
+                               !envFlagEnabled("DC2_G529_NO_FASTLERP");
+        return on;
+    }
+    inline bool g529LerpVfyOn()
+    {
+        static const bool on = envFlagEnabled("DC2_G529_LERPVFY");
+        return on;
+    }
+    inline bool g529NoLerpOn()
+    {
+        static const bool on = envFlagEnabled("DC2_G529_NOLERP");
+        return on;
+    }
+    std::atomic<uint64_t> g_g529LerpTot{0}, g_g529LerpBad{0};
+
+    // floor(v + 1/2) for v >= 0, without ever forming v + 0.5f. See the derivation above.
+    inline int g529RoundHalfUpNonNeg(float v)
+    {
+        const int n = static_cast<int>(v);
+        return (v - static_cast<float>(n) >= 0.5f) ? (n + 1) : n;
+    }
+
     uint8_t lerpChannel(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, float fx, float fy)
     {
+        // ⛔ ceiling probe first: it must delete the work, not merely reorder it.
+        if (g529NoLerpOn())
+            return c00;
         const float top = static_cast<float>(c00) + (static_cast<float>(c10) - static_cast<float>(c00)) * fx;
         const float bottom = static_cast<float>(c01) + (static_cast<float>(c11) - static_cast<float>(c01)) * fx;
-        return clampU8(static_cast<int>(std::lround(top + (bottom - top) * fy)));
+        const float v = top + (bottom - top) * fy;
+        if (!g529FastLerpOn())
+            return clampU8(static_cast<int>(std::lround(v)));
+        const uint8_t fast = clampU8(g529RoundHalfUpNonNeg(v));
+        if (g529LerpVfyOn())
+        {
+            const uint8_t ref = clampU8(static_cast<int>(std::lround(v)));
+            g_g529LerpTot.fetch_add(1u, std::memory_order_relaxed);
+            if (ref != fast)
+            {
+                const uint64_t bad = g_g529LerpBad.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (bad <= 16u)
+                    std::fprintf(stderr, "[G529:lerpvfy] MISMATCH v=%.9g ref=%u fast=%u\n",
+                                 static_cast<double>(v), (unsigned)ref, (unsigned)fast);
+            }
+            if ((g_g529LerpTot.load(std::memory_order_relaxed) & 0x3FFFFFFull) == 0ull)
+                std::fprintf(stderr, "[G529:lerpvfy] tot=%llu bad=%llu\n",
+                             (unsigned long long)g_g529LerpTot.load(std::memory_order_relaxed),
+                             (unsigned long long)g_g529LerpBad.load(std::memory_order_relaxed));
+            return ref; // the oracle arm ships the REFERENCE value, so a defect cannot reach pixels
+        }
+        return fast;
     }
 }
 

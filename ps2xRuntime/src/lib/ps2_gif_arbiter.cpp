@@ -41,6 +41,10 @@ extern void g297CollectWindowPackets(std::vector<std::vector<uint8_t>> &out);
 // of the mechanism — the batch-buffer free list there and the packet-vector reuse in processWindow
 // here — must select the same arm on the same frame, so they share this one accessor.
 extern bool g497WinBufActive();
+
+// G531: universal once-per-guest-frame A/B tick (defined in the rasterizer TU). This replaces
+// the route-specific colour-readback tick, which heavy routes can bypass entirely.
+extern void g531FrameAbTick();
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -1881,6 +1885,9 @@ uint64_t g332_gs_worker_total_ns() { return g_g332WorkerTotalNs.load(std::memory
 
 void g150_frame_barrier(std::function<void()> latch)
 {
+    // Select the next randomized arm before this boundary returns and the EE produces the next
+    // frame. The tick also charges the just-finished guest-frame interval to the arm that ran it.
+    g531FrameAbTick();
     s_g175FrameBoundaryCount.fetch_add(1u, std::memory_order_relaxed);
     if (g150_mtgs_enabled())
     {

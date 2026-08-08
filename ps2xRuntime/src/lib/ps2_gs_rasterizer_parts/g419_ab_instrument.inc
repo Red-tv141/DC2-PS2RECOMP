@@ -7,9 +7,9 @@
 // "below the timing floor". G418's fix was an instrument bolted onto one call site. This part lifts
 // it into a lever-agnostic instrument so any shelved lever can be re-adjudicated:
 //
-//   * ONE fixed sample point per frame. Exactly one colour-readback unpack happens per frame, so the
-//     interval between consecutive unpacks IS a frame period sampled at a fixed point in the frame.
-//     g419AbTick() is called there and nowhere else.
+//   * ONE fixed sample point per frame. G531 moved the tick to g150_frame_barrier after heavy routes
+//     proved that the original colour-readback edge is not universal. The interval between guest
+//     frame boundaries is a frame period, and the next arm is published before next-frame production.
 //   * THE ARM IS CHOSEN AT THE TICK, but CHARGED BY THE CONSUMER. A consumer records which arm it
 //     actually used (g_g419AbUsed); the next tick charges the elapsed interval to that arm and
 //     clears the record. An interval with no consumer, or with both arms observed, is dropped. This
@@ -686,6 +686,22 @@ enum G419Lever
     // and cannot bias the delta (G486 §4). GS-WORKER thread lever => takes the G438 block hold.
     // Rollback DC2_G522_NO_L2LSKIP=1; census DC2_G522_STAT=1 -> [G522:l2lskip].
     kG522LeverL2lSkip = 92,
+    // G531: let an existing VU1 compiled block absorb the flag-consumer pair that terminates its
+    // ordinary run. The candidate publishes the exact G430 MAC-history value before executing the
+    // already-promoted G487 fast lower, preserving the generic loop's order. It does not create a
+    // new block or add a selector to ordinary block pairs. Thread-level code-shape lever: hold 16.
+    kG531LeverFlagTail = 93,
+    // G532: a typed flag consumer may also become the PROLOGUE of the ordinary block immediately
+    // after it. The candidate enters that already-existing block call one pair early; unlike G502's
+    // rejected tail-0 admission, it creates no singleton call. Exact MAC publication stays at the
+    // flag pair's original stamp. Thread-level code-shape lever: hold 16.
+    kG532LeverFlagHead = 94,
+    // G532b: compile the dominant uncovered scalar lower (DIV) into the existing G422 leaf.
+    // The pair loop's scalar pre-stall stays in place; only execLower's large call boundary moves.
+    kG532LeverDivLower = 95,
+    // G533: replace one exact immutable VU1 fragment with a static specialized handler. All other
+    // blocks retain G531's generic executor. VU1-thread code-shape lever: hold 16.
+    kG533LeverImageSpec = 96,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -890,6 +906,14 @@ static int g419AbLever()
             return static_cast<int>(kG521LeverCapInPlace);
         if (std::strcmp(value, "l2lskip") == 0)
             return static_cast<int>(kG522LeverL2lSkip);
+        if (std::strcmp(value, "flagtail") == 0)
+            return static_cast<int>(kG531LeverFlagTail);
+        if (std::strcmp(value, "flaghead") == 0)
+            return static_cast<int>(kG532LeverFlagHead);
+        if (std::strcmp(value, "divlower") == 0)
+            return static_cast<int>(kG532LeverDivLower);
+        if (std::strcmp(value, "imgspec") == 0)
+            return static_cast<int>(kG533LeverImageSpec);
         std::fprintf(stderr,
                      "[G419:ab] unknown DC2_G419_AB='%s' (expected "
                      "narrow|pack|lanes|all|zero|packlanes|pool|all420|narrowtouch|matunpack|"
@@ -901,7 +925,7 @@ static int g419AbLever()
                      "histcur|qpseg|lockskip|capmove|clsmemo|g510both|texrun|texprobe|clsprobe|"
                      "fastdec|hashlane|vstore|vload|vmem|nopdisp|updesc|lowdense|dispdense|"
                      "peel4|g516disp|fpind|stampind|g517ind|cullcmp|macscan|capinplace|"
-                     "l2lskip)\n",
+                     "l2lskip|flagtail|flaghead|divlower|imgspec)\n",
                      value);
         return static_cast<int>(kG419LeverNone);
     }();
@@ -1002,6 +1026,10 @@ static const char *g419AbLeverName(int lever)
     case kG520LeverMacScan: return "macscan";
     case kG521LeverCapInPlace: return "capinplace";
     case kG522LeverL2lSkip: return "l2lskip";
+    case kG531LeverFlagTail: return "flagtail";
+    case kG532LeverFlagHead: return "flaghead";
+    case kG532LeverDivLower: return "divlower";
+    case kG533LeverImageSpec: return "imgspec";
     default: return "none";
     }
 }
@@ -1149,6 +1177,8 @@ static uint64_t g438ArmHoldFrames()
                 // G521's, so it inherits the block hold for the same pipelined-runtime reason
                 // (G506's law: a new thread-level arm joins THIS predicate in the SAME edit).
                 sel == kG522LeverL2lSkip ||
+                sel == kG531LeverFlagTail || sel == kG532LeverFlagHead ||
+                sel == kG532LeverDivLower || sel == kG533LeverImageSpec ||
                 sel == kG439LeverCoalesce || sel == kG445LeverEarlyKick ||
                 sel == kG445LeverKickAll || sel == kG447LeverSpinWait || sel == kG447LeverWSpin ||
                 sel == kG447LeverSpinBoth || sel == kG452LeverAsyncOne ||
@@ -1707,6 +1737,75 @@ static int g517ArmFor(int lever)
 int g517PtrIndArm() { return g517ArmFor(static_cast<int>(kG517LeverPtrInd)); }
 int g517StampIndArm() { return g517ArmFor(static_cast<int>(kG517LeverStampInd)); }
 int g517IndArm() { return g517ArmFor(static_cast<int>(kG517LeverInd)); }
+
+// G531: VU1 compiled-block flag-consumer tail. Called once per run(), never per pair; the shared
+// helper marks the arm used once per frame on the VU1 worker just like the older block-body arms.
+int g531FlagTailArm()
+{
+    if (g419AbLever() != static_cast<int>(kG531LeverFlagTail))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G532: VU1 compiled-block flag-consumer head. Same once-per-run / once-per-frame attribution
+// contract as G531; only the selected noinline block body differs between the two buckets.
+int g532FlagHeadArm()
+{
+    if (g419AbLever() != static_cast<int>(kG532LeverFlagHead))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G532b: VU1 compiled DIV-lower cache arm. Like G487, this is sampled once per run and a flip
+// forces the whole pair cache to rebuild before execution. Hold 16 keeps one microprogram on one
+// decode shape and attributes both buckets to the VU1 worker correctly.
+int g532DivLowerArm()
+{
+    if (g419AbLever() != static_cast<int>(kG532LeverDivLower))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G533 immutable VU1 image-specialization arm. Sampled once per run; the exact fragment plan is
+// rebuilt only on microcode writes, while arm attribution remains once per frame on the VU1 worker.
+int g533ImageSpecArm()
+{
+    if (g419AbLever() != static_cast<int>(kG533LeverImageSpec))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
 
 // G519 per-draw scissor-cull comparison arm, read ONCE per drawPrimitive on the GS worker
 // (~14,600/f). The per-frame-sequence memo keyed on the SEQUENCE (never on the arm value — G501 §6)
@@ -2810,7 +2909,7 @@ static void g419NoteFrameTick()
     ++s_g419FrameTicks;
 }
 
-// Once-per-frame tick at the colour-readback unpack. Charges the elapsed interval to whichever arm a
+// Once-per-guest-frame tick at g150_frame_barrier. Charges the elapsed interval to whichever arm a
 // consumer reported, then draws the next frame's arm.
 static void g419AbTick()
 {
@@ -3252,4 +3351,15 @@ static void g419NotePack(uint32_t fbp, uint32_t fbw, int rows, uint64_t ns)
                      msF);
     }
     std::fprintf(stderr, " TOTmsF=%.3f\n", sumMsF);
+}
+
+// G531: universal once-per-guest-frame driver for the randomized A/B instrument. The old tick
+// lived in one colour-readback unpack and therefore never ran on heavy routes whose native target
+// topology bypassed that edge. g150_frame_barrier calls this before it publishes the boundary and
+// before the EE can produce the next frame, giving every route the same arm clock. External
+// linkage is deliberate: the barrier lives in the GIF-arbiter TU.
+void g531FrameAbTick()
+{
+    g419NoteFrameTick();
+    g419AbTick();
 }

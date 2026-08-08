@@ -15,6 +15,8 @@
 // G490: after vu1_g421_fast_upper.inc — its eligibility test reads `g421DescTableConst`, and its
 // block body calls the inlined g421FastUpper / g422FastLower directly.
 #include "ps2_vu1_parts/vu1_g490_block_run.inc"
+// G533: immutable microprogram-fragment plans and static exact-source specialization
+//       (v8 promoted default-on; direct exact-block gate with G531-canonical fallback).
 #include "ps2_vu1_parts/vu1_g483_run_cycles.inc"
 #include "ps2_vu1_parts/vu1_upper_opcodes.inc"
 #include "ps2_vu1_parts/vu1_lower_opcodes.inc"
@@ -144,3 +146,4 @@
 //       runs on the shipped link (-0.266 / +0.033 / -0.346 / -0.088, 3/4 negative, 20/32 windows)
 //       against -0.755 over 3 runs on the previous link. AT THE INSTRUMENT FLOOR — the scaffolding
 //       was removed and the fold kept (force recompile v3).
+// G531: typed flag-consumer block tail promoted default-on (force recompile v2).

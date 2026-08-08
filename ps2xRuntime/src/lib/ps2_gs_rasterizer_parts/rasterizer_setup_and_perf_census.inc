@@ -131,6 +131,10 @@ static bool g459TriScissorStatOn()
 
 void GSRasterizer::drawPrimitive(GS *gs)
 {
+    // G526: books this call's whole span to whichever of the four exits it takes (rej/cull/
+    // defer/inline). Inert unless DC2_G526_DRAW=1. Must be the FIRST thing in the function so the
+    // four columns sum to `[G147:gif] draw` and the split can be checked against it.
+    G526DrawScope g526Scope(static_cast<uint32_t>(gs->m_prim.type));
     g401NoteFrontDoor(this, gs, gs->m_vram, gs->m_vtxQueue[0],
                       gs->m_prim, gs->activeContext());
     static const bool s_g141PerfOn = (std::getenv("DC2_PERF") != nullptr);
@@ -184,7 +188,10 @@ void GSRasterizer::drawPrimitive(GS *gs)
     // G401 causal lever: the GS reserves undefined TEX0.PSM encodings. Do not let the
     // software fallback reinterpret them as black texels and destructively blend them.
     if (g401SkipReservedTexturePsm(gs->m_prim, ctx))
+    {
+        g526SetExit(kG526Rej); // G526 exit 0
         return;
+    }
     // G45: clear the costume model's PRIVATE Z buffer exactly once per costume frame, on the
     // fbp -> 0x139 transition (the first draw of each frame's model RTT pass). The old clear was
     // gated on the full-RTT black-sprite signature, which does NOT fire every frame in the

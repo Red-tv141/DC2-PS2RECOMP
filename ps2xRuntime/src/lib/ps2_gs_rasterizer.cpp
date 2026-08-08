@@ -152,12 +152,30 @@ int g498OwnPubArm();
 
 #include "ps2_gs_rasterizer_parts/rasterizer_tilebinning_and_probes.inc"
 
+// G527 revision: 1 — the runtime render-target registry. MUST follow tilebinning (it reads
+// g248TargetIndex to keep the legacy five out of the wide set) and MUST precede the command graph,
+// the VRAM materialization unit and the tile-bin capture, which hold the admission, GPU-routing and
+// publication sites it re-keys. Content edit here forces MSBuild to consume the .inc files (G359).
+#include "ps2_gs_rasterizer_parts/g527_target_registry.inc"
+
 // G400/G401: raw surface sampling must be visible at command-graph execution time. G400's
 // draw-entry hook remains below; G401 calls the helper before the composite batch executes.
 #include "ps2_gs_rasterizer_parts/rasterizer_g400_stage_probe.inc"
 #include "ps2_gs_rasterizer_parts/rasterizer_g401_composite_probe.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_draw_prim_probe.inc"
+
+// G526 revision: 3 (PROMOTED default-ON) — the `anytgt` lever (g526AnyTargetSamplerOn / g526FastSpriteTarget in
+// rasterizer_tilebinning_and_probes.inc, consumed at the g248FastSampleSprite predicate in
+// rasterizer_draw_sprite.inc). Content edit here forces MSBuild to consume both .inc files (G359).
+//   * DC2_G526_ANYTGT=1 (default-OFF) admits EVERY render target to the already-promoted G248 fast
+//     sprite sampler, instead of only the five hardcoded addresses G248 measured on MAP-0. The
+//     sampler reads tex.* and VRAM and never reads frame.fbp, so the target test was scope, not
+//     safety. Rollback DC2_G526_NO_ANYTGT=1; per-pixel oracle DC2_G248_VERIFY=1 -> [G248:vfy].
+// G526: per-primitive path attribution (DC2_G526_DRAW=1, default-off). Must precede
+// rasterizer_setup_and_perf_census.inc and rasterizer_tilebin_capture.inc, which hold the four
+// drawPrimitive exits it books against.
+#include "ps2_gs_rasterizer_parts/g526_draw_census.inc"
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_command_graph.inc"
@@ -225,6 +243,25 @@ int g498OwnPubArm();
 #include "ps2_gs_rasterizer_parts/rasterizer_vram_materialization.inc"
 
 
+// G528 revision: 1 — the flush prologue, scoped to the executing batch's own page ranges.
+// MUST follow rasterizer_gpu_alias_page_view.inc / rasterizer_vram_materialization.inc (it calls
+// g278FlushPendingDepth[ForRanges], g289MaterializeOwner / g289MaterializeForRanges,
+// g272MaterializeAll / g272MaterializeForRanges, g276FlushPendingDisplay[ForRanges],
+// g261PrepareCpuReplay and g242PrepareVramReadAll) and rasterizer_command_graph.inc (g_g528Wr /
+// g_g528Rd, G260RangeSet), and MUST precede rasterizer_tilebin_capture.inc, whose two flush
+// closures are its only call sites. ⚠️ It must also sit BEFORE rasterizer_setup_and_perf_census.inc:
+// that part and tilebin_capture are FRAGMENTS OF GSRasterizer::drawPrimitive's BODY, and a
+// namespace cannot be opened inside a function. Content edit forces MSBuild to consume it (G359).
+#include "ps2_gs_rasterizer_parts/g528_flush_publish.inc"
+
+// G529 revision: 1 — the CPU band replay's dispatch census + per-batch lane-count policy. MUST
+// follow g528_flush_publish.inc (it reuses g528ClassifyFbp so the two populations G527 created are
+// never averaged) and rasterizer_row_pool.inc (GSRowPool), and MUST precede
+// rasterizer_tilebin_capture.inc, whose parallel flush closure is its only call site. Same
+// namespace constraint as G528: it must sit BEFORE rasterizer_setup_and_perf_census.inc, which is
+// a FRAGMENT OF GSRasterizer::drawPrimitive's BODY. Content edit forces MSBuild to consume it (G359).
+#include "ps2_gs_rasterizer_parts/g529_replay_dispatch.inc"
+
 #include "ps2_gs_rasterizer_parts/rasterizer_setup_and_perf_census.inc"
 
 
@@ -237,6 +274,13 @@ int g498OwnPubArm();
 #include "ps2_gs_rasterizer_parts/rasterizer_g369_scene_census.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_write_pixel.inc"
+
+
+// G530 revision: 1 — the replayed sprite pixel, decomposed (ceiling probes) and then rewritten as a
+// span kernel. MUST follow rasterizer_write_pixel.inc (it reuses writePixel's exact commit
+// semantics) and MUST precede rasterizer_draw_sprite.inc, which is a FRAGMENT OF
+// GSRasterizer::drawSprite's BODY and therefore cannot open a namespace of its own.
+#include "ps2_gs_rasterizer_parts/g530_sprite_span.inc"
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_draw_sprite.inc"
@@ -282,3 +326,4 @@ int g498OwnPubArm();
 //       (force recompile v6).
 // G477: DC2_G419_AB=runwrite paired gate for the swizzle-row hoisted IMAGE run writers
 //       (GSMem::WriteRunCT32/Z32/P4 in ps2_gs_memory.cpp) (force recompile v1).
+// G533: DC2_G419_AB=imgspec VU1 immutable-fragment specialization arm (force recompile v1).
