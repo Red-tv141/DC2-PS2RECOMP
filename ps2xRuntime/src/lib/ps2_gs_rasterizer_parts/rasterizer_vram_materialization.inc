@@ -1598,6 +1598,35 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // layout retains G242's conservative slack. Ride the promoted native display-Z stack so
         // its master kill/oracle declines remain authoritative. Per-phase rollback accepts either
         // DC2_G273_NO_EXACT_COLORZ_ALIAS=1 or DC2_G273_EXACT_COLORZ_ALIAS=0.
+        // G534 RETIREMENT (2026-08-09) — ⛔ REVERSED BY G539, AND THE REASONING WAS WRONG.
+        // G534 made this relaxation default-OFF, blaming it for missing environment game-wide: the
+        // theory was that admitting fbp=0x68 puts BOTH display buffers on the GPU wave path against
+        // the shared G403/G411 private ZBP=0xd0 mirror that CPU draws also write, and that the
+        // mixed depth authority let sky win the depth test over the world.
+        //
+        // G535 refuted that: the defect was present with this flag BOTH ON (39.0%) and OFF (29.3%),
+        // so G273 was never the cause. The real cause was g411PrivateDepth deferring the mirror's
+        // publication past the CPU band replay that consumes it, which G535 fixed (default-ON) and
+        // G536 completed with page-ownership-aware publication.
+        //
+        // G534 also measured the retirement as FREE (51.82 vs 51.89 ms/f, null). That measurement
+        // was wrong, and it cost two phases to find: with the relaxation off, the display batch is
+        // rejected from the GPU flush as `rej=colorzalias` and its ~78 entries per batch fall to the
+        // CPU band replay — 32.7 ms/f over 2,078 entries/f on lean MAP-0 (G538 §3). Restoring it
+        // measures 18.13-19.28 ms/f against 49.4, i.e. the retirement was the entire ~3x lean MAP-0
+        // level regression carried from G534 to G538.
+        //
+        // ⭐ The lesson (G538): a NULL paired A/B is worthless without a counter proving the two arms
+        // took different code paths. `[G290:gpufail] rej=` is that counter here and it is free.
+        //
+        // G539 PROMOTION (2026-08-09): DEFAULT-ON, kill DC2_G273_NO_EXACT_COLORZ_ALIAS=1.
+        // Gated same-binary against the shipped default on: held golden title (211650 at every tick
+        // vs a 211648-211650 control, occupancy identical); map_4 adjacent-frame distribution
+        // (p90 386 vs 535, better on every quantile) and visual vs ref/dumps/map_4.png; map_4_zoom
+        // vs ref/dumps/map_4_zoom.png; MAP-15 sky 0 defective in 99 sky frames (p ~ 4e-8 against
+        // G536's 15.9% base rate); inventory character RTT intact on every frame.
+        // ⚠️ The `211646±4` frame_001500 smoke gate CANNOT gate this lever - it indexes a frame
+        // number, not a scene, so a 2.7x speed change lands the arms on different screens (G539 §1).
         static const bool s_g273ExactAlias = !envFlagEnabled("DC2_G273_NO_EXACT_COLORZ_ALIAS") &&
                                               !envFlagDisabled("DC2_G273_EXACT_COLORZ_ALIAS") &&
                                               g265DisplayZWaveOn();
@@ -2447,6 +2476,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     bool g411PrivateDepth = false;
     bool g278PendingSameKey = false;
     bool g278OwnerEligible = false;
+    // G535: restores the pre-G535 unconditional deferral of the G411 private-mirror depth owner.
+    // DIAGNOSTIC ONLY — setting it reproduces the game-wide missing-environment defect. The
+    // reasoning is at the eligibility site below.
+    static const bool s_g535PrivZDefer = envFlagEnabled("DC2_G535_PRIVZ_DEFER");
     G144BlockRange g278ColorWrite = g144RangeForRect(
         fbBlock, GS_PSM_CT32, fbw, 0u,
         static_cast<uint32_t>(rowLo), static_cast<uint32_t>(fbW),
@@ -2482,7 +2515,22 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             // G411: color and the shared depth mirror are separate authorities. Their historical
             // GS-page alias is intentionally absent, so deferring the Z publication cannot race
             // an immediate color writeback.
-            if (g411PrivateDepth)
+            //
+            // G535: that proof is true but covers only the COLOUR/Z page-alias race, and this
+            // admission shares more than one authority. The private mirror has a second consumer
+            // the deferral never accounted for: CPU-rasterized draws read AND write it directly
+            // via g403DisplayZRead/g403DisplayZWrite, gated on g203Uni && g404SharedZScope and
+            // therefore INDEPENDENT of G411. While a private-mirror owner is pending, the backend
+            // depth texture is the only current copy, yet those draws still depth-test against the
+            // stale mirror — and every ranged publication path deliberately skips privateMirror
+            // owners on the belief that they have no consumer ("no VRAM transfer consumer",
+            // g528_flush_publish.inc). The result is mixed CPU/GPU depth authority: environment
+            // geometry alternately wins and loses the depth test, so on ~25% of frames the near
+            // ground is replaced by the sky (map_4) and interior floors/walls by unrelated
+            // surfaces (game-wide). The unconditional override is retired; g278DeferDepth below
+            // refuses the private mirror outright, because g337WideEligible is a SECOND deferral
+            // path that this eligibility flag does not gate.
+            if (g411PrivateDepth && s_g535PrivZDefer)
                 g278OwnerEligible = true;
         }
         // G337: VRAM staleness is a property of the pending owner, not of this wave's own
@@ -2540,7 +2588,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 }
                 // Skip only when NOT a first-init (the resident texture already holds every row for
                 // this key) AND VRAM Z is provably unchanged. Bit-exact by construction.
-                if (g278PendingSameKey)
+                // G534 probe (default OFF): never skip the depth upload under the G411 private
+                // mirror. Isolates "the wave renders against a retained depth texture another
+                // target left behind" from the windowed-upload contents.
+                static const bool s_g534NoSkip = envFlagEnabled("DC2_G534_NOSKIP");
+                if (g278PendingSameKey && !(s_g534NoSkip && g411PrivateDepth))
                 {
                     // VRAM is intentionally stale while G278 owns this key. The backend texture
                     // is the sole current copy, so an upload would clobber newer depth. A pending
@@ -2557,6 +2609,22 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 else if (g274ZResidentOn() && !fullInit && unchanged && !g282Tight &&
                          !g290Seeded)
                     g274SkipUpload = true;
+            }
+            // G534 sequence probe (default OFF): one line per guest-depth wave — which colour
+            // target, which depth key, whether this wave uploads or rides the retained texture.
+            static const bool s_g534ZSeq = envFlagEnabled("DC2_G534_ZSEQ");
+            if (s_g534ZSeq)
+            {
+                static std::atomic<uint64_t> s_n{0};
+                const uint64_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (n <= 60u || (n % 500u) == 0u)
+                    std::fprintf(stderr,
+                                 "[G534:zseq] n=%llu fbp=%03x key=%llx priv=%u full=%u skip=%u "
+                                 "pend=%u rows=%d..%d drows=%d..%d\n",
+                                 (unsigned long long)n, fbp, (unsigned long long)depthKey,
+                                 g411PrivateDepth ? 1u : 0u, fullInit ? 1u : 0u,
+                                 g274SkipUpload ? 1u : 0u, g278PendingSameKey ? 1u : 0u,
+                                 rowLo, rowHi, depthRowLo, depthRowHi);
             }
             if (g290PartialSeed)
             {
@@ -2595,15 +2663,54 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             }
             else
             {
-                const int upLoZ = fullInit ? 0 : depthRowLo;
-                const int upHiZ = fullInit ? (kFbH - 1) : depthRowHi;
+                // G534 probe (default OFF): force a whole-target depth upload on every wave.
+                // If the missing-environment defect disappears under this, the GPU depth texture
+                // was carrying rows the windowed upload never refreshed.
+                static const bool s_g534FullZ = envFlagEnabled("DC2_G534_FULLZ");
+                const bool forceFull = fullInit || s_g534FullZ;
+                const int upLoZ = forceFull ? 0 : depthRowLo;
+                const int upHiZ = forceFull ? (kFbH - 1) : depthRowHi;
                 depthRows = upHiZ - upLoZ + 1;
                 depthGlY = kFbH - 1 - upHiZ;
                 s_depthUpload.resize(static_cast<size_t>(fbW) * depthRows);
                 constexpr float kZToDepth = 1.0f / 4294967296.0f;
                 const auto g274ZUpT0 = g274ZTimeOn() ? std::chrono::steady_clock::now()
                                                      : std::chrono::steady_clock::time_point{};
+                // G534 probes (default OFF).
+                //   DC2_G534_ZSRC_VRAM=1 — upload guest VRAM Z even under the G411 private mirror,
+                //     leaving the readback/CPU authority untouched. Separates "the mirror is stale"
+                //     from "the readback is wrong".
+                //   DC2_G534_ZDIFF=1 — census only: report how far the mirror and guest VRAM Z
+                //     diverge over the uploaded window.
+                static const bool s_g534ZSrcVram = envFlagEnabled("DC2_G534_ZSRC_VRAM");
+                static const bool s_g534ZDiff = envFlagEnabled("DC2_G534_ZDIFF");
+                const bool g534ProbeArm =
+                    g411PrivateDepth && (s_g534ZSrcVram || s_g534ZDiff);
+                std::atomic<uint64_t> g534Diff{0}, g534Total{0};
                 const auto packDepthRows = [&](int laneLo, int laneHi) {
+                    if (g534ProbeArm)
+                    {
+                        uint64_t diff = 0u, total = 0u;
+                        for (int y = laneLo; y <= laneHi; ++y)
+                        {
+                            const size_t dstRow = static_cast<size_t>(upHiZ - y) * fbW;
+                            for (int x = 0; x < fbW; ++x)
+                            {
+                                const uint32_t zv = GSMem::ReadZ24(
+                                    vram, zbpBlock, fbw,
+                                    static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                                const uint32_t zm = g403DisplayZRead(x, y, fbp);
+                                ++total;
+                                if (zm != zv)
+                                    ++diff;
+                                s_depthUpload[dstRow + x] =
+                                    static_cast<float>(s_g534ZSrcVram ? zv : zm) * kZToDepth;
+                            }
+                        }
+                        g534Diff.fetch_add(diff, std::memory_order_relaxed);
+                        g534Total.fetch_add(total, std::memory_order_relaxed);
+                        return;
+                    }
                     for (int y = laneLo; y <= laneHi; ++y)
                     {
                         const size_t dstRow = static_cast<size_t>(upHiZ - y) * fbW;
@@ -2624,6 +2731,17 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     depthRows >= 8 ? g275ZSwizzleLanes() : 1;
                 GSRowPool::instance().run(upLoZ, upHiZ, swizzleLanes,
                                           packDepthRows);
+                if (s_g534ZDiff && g534Total.load(std::memory_order_relaxed) != 0u)
+                {
+                    static std::atomic<uint64_t> s_n{0};
+                    const uint64_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    if (n <= 8u || (n % 240u) == 0u)
+                        std::fprintf(stderr,
+                                     "[G534:zdiff] n=%llu fbp=%03x rows=%d..%d diff=%llu/%llu\n",
+                                     (unsigned long long)n, fbp, upLoZ, upHiZ,
+                                     (unsigned long long)g534Diff.load(std::memory_order_relaxed),
+                                     (unsigned long long)g534Total.load(std::memory_order_relaxed));
+                }
                 if (!g411PrivateDepth && (g282Tight || g290Seeded))
                 {
                     // The batch's leading black CT32 clear writes physical blocks 313..319,
@@ -4155,7 +4273,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const bool g278DeferDepth =
         g278DepthRbOn() && g262WaveDepth &&
         (g278OwnerEligible || g337WideEligible) && guestDepthWrites &&
-        !g275FusedZReadOn();
+        !g275FusedZReadOn() &&
+        // G535: a private-mirror owner has a CPU-rasterizer consumer that no publication edge
+        // covers, so it must publish in-wave instead of deferring. Gating g278OwnerEligible alone
+        // would leave g337WideEligible as an open second path. See the note at that site.
+        // g535EdgePubOn() is the cheaper candidate: it restores the deferral and instead closes the
+        // consumer edge itself in g528PublishScoped.
+        (!g411PrivateDepth || s_g535PrivZDefer || g535EdgePubOn());
     if (g278DeferDepth && !g278OwnerEligible)
         g_g337WideDefer.fetch_add(1u, std::memory_order_relaxed);
     if (g337ZAuthOn() && g262WaveDepth && guestDepthWrites && !g278DeferDepth)

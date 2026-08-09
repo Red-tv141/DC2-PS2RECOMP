@@ -270,6 +270,18 @@ static void g528PublishWhole(int cause)
 static void g528PublishScoped(int cause, const G260RangeSet &rd, const G260RangeSet &wr)
 {
     const G144BlockRange none{};
+    // G535 (DEFAULT-ON; kill DC2_G535_NO_EDGEPUB=1): the CPU band replay this prologue guards
+    // reads AND writes the
+    // G411 private depth mirror through g403DisplayZRead/g403DisplayZWrite, so it is a consumer of
+    // any pending private-mirror owner. Every ranged publication below skips those owners because
+    // they carry no VRAM transfer range — correct for transfers, wrong for the replay — which left
+    // the replay depth-testing against a mirror the GPU had already superseded. Publish them here,
+    // at the same semantic edge g278FlushPendingDepthForInline already uses for single primitives.
+    // Range-scoping cannot apply: the mirror has no guest-VRAM range to intersect rd/wr against.
+    if (g535EdgePubOn())
+        for (int i = 0; i < kG278PendSlots; ++i)
+            if (s_g278PendTab[i].active && s_g278PendTab[i].privateMirror)
+                (void)g278FlushPendSlot(s_g278PendTab[i], cause);
     for (int i = 0; i < rd.n; ++i)
     {
         (void)g278FlushPendingDepthForRanges(cause, rd.r[i], none, false, false);

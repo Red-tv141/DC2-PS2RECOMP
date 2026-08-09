@@ -54,6 +54,16 @@ static std::atomic<uint64_t> g_g280Binds{0}, g_g280Copies{0}, g_g280CopyFail{0},
     g_g280Restores{0}, g_g280RestoreFail{0}, g_g280Drops{0}, g_g280SibSkips{0},
     g_g280RejFoot{0}, g_g280RejTuple{0}, g_g280RejPage{0}, g_g280VerifyBad{0};
 
+// G536: page-ownership-aware publication — gate and counters. Declared up here because
+// g261Report (below) prints them while the implementation sits beside g261UpdateWindow.
+static bool g536PageOwnOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G536_NO_PAGEOWN") &&
+                           !envFlagDisabled("DC2_G536_PAGEOWN");
+    return on;
+}
+static std::atomic<uint64_t> g_g536PubTotal{0}, g_g536PubGuarded{0}, g_g536PagesKept{0};
+
 // G455 is included here because its ownership proof needs G261/G276 state declared earlier in
 // this translation unit and the G280 overlay state declared immediately above.
 #include "rasterizer_g455_readback_runway.inc"
@@ -817,6 +827,28 @@ static bool g278DepthRbOn()
                              !envFlagDisabled("DC2_G278_Z_RB_COALESCE");
     return s_on && g261WaveOn() && !g277CensusOn();
 }
+// G535 PROMOTION (2026-08-09): DEFAULT-ON. Publishes a pending G411 private-mirror depth owner at
+// the CPU band replay's semantic consumer edge (g528PublishScoped) instead of refusing the deferral
+// outright. That replay reads AND writes the mirror through g403DisplayZRead/g403DisplayZWrite, so
+// it is a consumer — but every ranged publication path skipped privateMirror owners because they
+// carry no VRAM transfer range. The INLINE edge (g278FlushPendingDepthForInline) already published
+// them for exactly this reason; the batched replay is the same consumer one level up, and it was
+// the last one left uncovered.
+//
+// Measured on lean MAP-0, same binary, 8 windows per arm:
+//   pre-G535 (broken)          58.74 ms/f   24.8% of map_4 frames defective
+//   this arm  (correct)        60.80 ms/f   +3.51%, 0/671 defective, 0 alternation events
+//   in-wave publish (correct)  84.12 ms/f   +42.9%  — the conservative fallback below
+// Rollback to the conservative form: DC2_G535_NO_EDGEPUB=1 (private-mirror owners never defer, so
+// they publish in-wave). DC2_G535_PRIVZ_DEFER=1 restores the pre-G535 defect for diagnosis and
+// therefore also disables this edge publication.
+static bool g535EdgePubOn()
+{
+    static const bool s_on = !envFlagEnabled("DC2_G535_NO_EDGEPUB") &&
+                             !envFlagDisabled("DC2_G535_EDGEPUB") &&
+                             !envFlagEnabled("DC2_G535_PRIVZ_DEFER");
+    return s_on;
+}
 // G337 persistent depth authority. G474 PROMOTION (2026-08-02): default-on after the current
 // uncapped binary repriced the frame-boundary publication at 0.74-1.14 ms/f, with zero owner
 // failures/evictions/overlap flushes and the affected route matrix clean. Rides G278, so every
@@ -1064,6 +1096,12 @@ static void g261Report()
 {
     if (!g261StatOn() && !g279ProfileOn() && !g310StatOn() && !g340CensusOn())
         return;
+    std::fprintf(stderr,
+                 "[G536:pageown] on=%d publications=%llu guarded=%llu pagesKept=%llu\n",
+                 g536PageOwnOn() ? 1 : 0,
+                 (unsigned long long)g_g536PubTotal.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g536PubGuarded.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g536PagesKept.load(std::memory_order_relaxed));
     if (g291StatOn())
         std::fprintf(stderr,
                      "[G291:stat] skips=%llu mats=%llu covSetPx=%llu covClrPx=%llu "
@@ -1450,6 +1488,10 @@ static void g266Report()
 // OUTSIDE the window belong to VRAM alone (never uploaded to or read back from the FBO), so
 // writes there are free — no materialize, no invariant. The gen baseline is scoped to the same
 // window so unrelated same-fbp-page-range traffic cannot trip it falsely.
+// G536: per-page twin of `genAtSkip`, anchored at the same instant (defined below with the rest
+// of the page-ownership guard).
+static void g536SnapshotPageGens(G261Res &r, uint32_t fbp);
+
 static void g261UpdateWindow(int ti)
 {
     G261Res &r = g_g261Res[ti];
@@ -1472,11 +1514,13 @@ static void g261UpdateWindow(int ti)
                                      static_cast<uint32_t>(lo),
                                      static_cast<uint32_t>(r.fbW),
                                      static_cast<uint32_t>(hi - lo + 1));
+        g536SnapshotPageGens(r, kG261Fbp[ti]); // G536: per-page twin of genAtSkip
     }
     else
     {
         r.range = G144BlockRange{};
         r.genAtSkip = 0;
+        r.g536PageGenFbw = 0;
     }
 }
 
@@ -1488,6 +1532,132 @@ static uint64_t g261WindowGenNow(const G261Res &r, uint32_t fbp)
                           static_cast<uint32_t>(r.winLo),
                           static_cast<uint32_t>(r.fbW),
                           static_cast<uint32_t>(r.winHi - r.winLo + 1));
+}
+
+// ===== G536 probe (default-OFF, DC2_G536_MATCHK=1): is guest VRAM NEWER at publication time? =====
+// The residency contract's escaped-writer invariant (genAtSkip vs g261WindowGenNow) is tested only
+// where a NEW wave decides uploadFb. It is never re-tested at g261Materialize, i.e. at the moment
+// the FBO is written back OVER guest VRAM. If a guest writer touched the claimed window between
+// the GPU render and that publication, the publication silently overwrites the newer guest bytes.
+// On MAP-15 target 0x139 is resident at fbw=8 cov=0..447, so its claim spans ~blocks 0x2720..0x3520
+// and swallows the T8 cloud texture at 0x2720 plus several streaming-texture pages.
+// Counters only; no behaviour change.
+static std::atomic<uint64_t> g_g536MatTotal{0}, g_g536MatMoved{0};
+static bool g536MatChkOn()
+{
+    static const bool on = envFlagEnabled("DC2_G536_MATCHK");
+    return on;
+}
+// ===== G536 FIX (default-ON, kill DC2_G536_NO_PAGEOWN=1): page-ownership-aware publication =====
+// The residency claims a full-width row window, so on MAP-15 target 0x139 (fbw=8, cov=0..447)
+// its claim spans ~blocks 0x2720..0x3520 and swallows the T8 cloud texture at 0x2720 plus several
+// per-frame streaming-texture pages. `g261Materialize` then writes that window back from the FBO
+// at FULL WIDTH. That round trip is only the identity while every guest write inside the window
+// has been reconciled into the FBO (the G264 mirror does that for the CT32 host->local uploads it
+// accepts, and re-anchors the baseline afterwards). Any OTHER guest write leaves guest VRAM newer,
+// and the publication silently overwrites it with render-target pixels — which the sky's T8 cloud
+// draw then decodes as achromatic garbage, one PSMT8 page at a time.
+//
+// The rule: publish the FBO only for pages the FBO still owns. A page whose write generation moved
+// since the anchor is owned by the guest; its bytes are saved before the unpack and restored after,
+// so the publication becomes exact per page instead of correct-per-window.
+// Snapshot the per-page generations of the target's claimed pages. Called wherever `genAtSkip`
+// is anchored, so the two always describe the same instant.
+static void g536SnapshotPageGens(G261Res &r, uint32_t fbp)
+{
+    if (r.fbw == 0u || r.fbw > 8u)
+    {
+        r.g536PageGenFbw = 0u;
+        return;
+    }
+    const uint32_t basePage = fbp; // FRAME fbp is already a GS page index (block = fbp * 32)
+    const uint32_t pages = 16u * r.fbw;
+    for (uint32_t p = 0; p < pages && p < r.g536PageGen.size(); ++p)
+    {
+        const uint32_t page = basePage + p;
+        r.g536PageGen[p] = page < kG178PageCount
+                               ? g_g178PageGen[page].load(std::memory_order_relaxed)
+                               : 0u;
+    }
+    r.g536PageGenFbw = r.fbw;
+}
+
+// Bytes of one 8 KB GS page, saved so a publication cannot destroy guest-owned content.
+struct G536PageSave
+{
+    uint32_t page;
+    std::array<uint8_t, 8192> bytes;
+};
+
+// Collect every page inside the rows about to be published whose generation moved since the
+// anchor. Fails CLOSED in the safe direction: if the snapshot is missing or the layout changed,
+// nothing is protected and the legacy publication runs unchanged.
+static void g536CollectGuestOwnedPages(const G261Res &r, uint32_t fbp, int rowLo, int rowHi,
+                                       const uint8_t *vram, uint32_t vramSize,
+                                       std::vector<G536PageSave> &out)
+{
+    out.clear();
+    if (!g536PageOwnOn() || r.g536PageGenFbw == 0u || r.g536PageGenFbw != r.fbw ||
+        r.fbw == 0u || r.fbw > 8u || vram == nullptr || rowHi < rowLo)
+        return;
+    const uint32_t basePage = fbp;
+    const uint32_t pageRowLo = static_cast<uint32_t>(std::max(0, rowLo)) / 32u;
+    const uint32_t pageRowHi = static_cast<uint32_t>(std::min(511, rowHi)) / 32u;
+    for (uint32_t py = pageRowLo; py <= pageRowHi && py < 16u; ++py)
+        for (uint32_t px = 0; px < r.fbw; ++px)
+        {
+            const uint32_t p = py * r.fbw + px;
+            if (p >= r.g536PageGen.size())
+                continue;
+            const uint32_t page = basePage + p;
+            if (page >= kG178PageCount)
+                continue;
+            const uint64_t now = g_g178PageGen[page].load(std::memory_order_relaxed);
+            if (now == r.g536PageGen[p])
+                continue; // FBO still owns this page
+            const uint64_t off = static_cast<uint64_t>(page) * 8192ull;
+            if (off + 8192ull > vramSize)
+                continue;
+            out.emplace_back();
+            out.back().page = page;
+            std::memcpy(out.back().bytes.data(), vram + off, 8192);
+        }
+}
+
+static void g536RestoreGuestOwnedPages(const std::vector<G536PageSave> &saved, uint8_t *vram,
+                                       uint32_t vramSize)
+{
+    for (const G536PageSave &s : saved)
+    {
+        const uint64_t off = static_cast<uint64_t>(s.page) * 8192ull;
+        if (off + 8192ull <= vramSize)
+            std::memcpy(vram + off, s.bytes.data(), 8192);
+    }
+    if (!saved.empty())
+        g_g536PagesKept.fetch_add(saved.size(), std::memory_order_relaxed);
+}
+
+static void g536NoteMaterialize(const G261Res &r, uint32_t fbp, int cause)
+{
+    if (!g536MatChkOn())
+        return;
+    const uint64_t total = g_g536MatTotal.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    const uint64_t now = g261WindowGenNow(r, fbp);
+    if ((total % 2048u) == 0u)
+        std::fprintf(stderr, "[G536:matchk] total=%llu moved=%llu\n",
+                     (unsigned long long)total,
+                     (unsigned long long)g_g536MatMoved.load(std::memory_order_relaxed));
+    if (now == r.genAtSkip)
+        return;
+    const uint64_t moved = g_g536MatMoved.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (moved <= 24u || (moved % 512u) == 0u)
+        std::fprintf(stderr,
+                     "[G536:matchk] VRAM MOVED UNDER PUBLICATION fbp=0x%x cause=%d "
+                     "dirty=%d..%d cov=%d..%d win=%d..%d genAtSkip=%llu genNow=%llu "
+                     "moved=%llu/%llu\n",
+                     fbp, cause, r.dirtyLo, r.dirtyHi, r.covLo, r.covHi, r.winLo, r.winHi,
+                     (unsigned long long)r.genAtSkip, (unsigned long long)now,
+                     (unsigned long long)moved, (unsigned long long)total);
 }
 
 // G264 (default-on since G266): route guest re-uploads INTO the resident FBO instead of
@@ -1776,6 +1946,7 @@ static void g261Materialize(int ti, int cause)
     const auto g279T0 = g279Profile ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
     const uint32_t fbp = kG261Fbp[ti];
+    g536NoteMaterialize(r, fbp, cause); // G536 probe: has guest VRAM moved since the GPU render?
     const int rows = r.dirtyHi - r.dirtyLo + 1;
     if (g345StatOn() && g345FamilyFbp(fbp) && rows > 0)
         g345NoteFamReadbackFbp(fbp, static_cast<uint64_t>(rows));
@@ -1884,9 +2055,18 @@ static void g261Materialize(int ti, int cause)
                                               : std::chrono::steady_clock::time_point{};
             const bool g432Fast =
                 g419AbArmFor(kG432MatUnpackLeverId, g432MatUnpackOn());
+            // G536: save any page inside these rows that the guest has written since this
+            // residency anchored, so the full-width publication below cannot destroy it.
+            static std::vector<G536PageSave> s_g536Saved; // flush-owner thread only
+            g536CollectGuestOwnedPages(r, fbp, r.dirtyLo, r.dirtyHi, vram, g_g261VramSize,
+                                       s_g536Saved);
+            g_g536PubTotal.fetch_add(1u, std::memory_order_relaxed);
+            if (!s_g536Saved.empty())
+                g_g536PubGuarded.fetch_add(1u, std::memory_order_relaxed);
             g418UnpackColorRows(vram, g_g261VramSize, s_g261Px, fbBlock, r.fbw, r.fbW,
                                 r.dirtyHi + 1, r.dirtyLo, r.dirtyHi,
                                 /*legacy=*/!g432Fast);
+            g536RestoreGuestOwnedPages(s_g536Saved, vram, g_g261VramSize);
             if (g432MatCensus)
             {
                 g_g432MatUnpackNs += static_cast<uint64_t>(

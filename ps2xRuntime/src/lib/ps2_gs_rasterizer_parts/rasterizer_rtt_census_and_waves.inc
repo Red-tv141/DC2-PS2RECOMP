@@ -1033,6 +1033,15 @@ struct G261Res
     // on any residency reset/width flip, and are meaningful only while g291CovFbw == fbw.
     std::array<std::array<uint64_t, 8>, 512> g291Cov{};
     uint32_t g291CovFbw = 0;
+    // G536: PER-PAGE write generation at the moment this residency last claimed its window
+    // (the same instant `genAtSkip` is anchored). `genAtSkip` is a SUM over the whole window and
+    // is only ever compared where a NEW wave decides `uploadFb` — it is never re-tested at
+    // g261Materialize, i.e. where the FBO is written back OVER guest VRAM. A page whose gen has
+    // moved since the anchor holds a guest write that was never reconciled into the FBO, so for
+    // THAT page guest VRAM is the newer copy and publishing the FBO over it destroys real bytes.
+    // Index: p = pageRow * fbw + pageCol, matching g291PagesCurrent's page walk.
+    std::array<uint64_t, 16 * 8> g536PageGen{};
+    uint32_t g536PageGenFbw = 0;
 };
 static constexpr uint32_t kG261Fbp[kG248TargetCount] = {0x139u, 0x13cu, 0x143u, 0x146u, 0x155u};
 static G261Res g_g261Res[kG248TargetCount];

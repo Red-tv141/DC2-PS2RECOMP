@@ -189,6 +189,15 @@ int g498OwnPubArm();
 #include "ps2_gs_rasterizer_parts/g345_closure.inc"
 
 // G399: DC2_G399_SURFDUMP joins the raw-VRAM diag flag set in the part below.
+// G535 revision: 3 — PROMOTES the consumer-edge publication to DEFAULT-ON (g535EdgePubOn):
+// deferral is kept and the private-mirror owner is published in g528PublishScoped. +3.51% on lean
+// MAP-0 vs the broken pre-G535 path, against +42.9% for the in-wave form kept as
+// DC2_G535_NO_EDGEPUB=1.
+// G535 revision: 1 — the G411 private-mirror depth owner no longer defers its publication
+// (rasterizer_vram_materialization.inc: the g278OwnerEligible override and the g278DeferDepth
+// predicate). CPU-rasterized draws consume that mirror through g403DisplayZRead/Write and no
+// publication edge covered them, which is the game-wide missing-environment defect. Content edit
+// here forces MSBuild to consume the .inc (G359). Diagnostic restore: DC2_G535_PRIVZ_DEFER=1.
 #include "ps2_gs_rasterizer_parts/rasterizer_gpu_alias_page_view.inc"
 
 
@@ -327,3 +336,7 @@ int g498OwnPubArm();
 // G477: DC2_G419_AB=runwrite paired gate for the swizzle-row hoisted IMAGE run writers
 //       (GSMem::WriteRunCT32/Z32/P4 in ps2_gs_memory.cpp) (force recompile v1).
 // G533: DC2_G419_AB=imgspec VU1 immutable-fragment specialization arm (force recompile v1).
+// G536: page-ownership-aware residency publication (default-ON, kill DC2_G536_NO_PAGEOWN=1) plus
+//       the DC2_G536_MATCHK=1 probe that proved the invariant is violated at publication time.
+//       g261Materialize must not overwrite pages the guest wrote since the residency anchored.
+//       (force recompile v1)
