@@ -1,3 +1,4 @@
+// G545: incremental CPU-authoritative VU1 worker -> persistent GPU shadow stream (v2 trace).
 // G478: runtime_mtvu_and_env.inc now arms the G446 PC sampler on the MTVU worker thread.
 // G483: it also splits [G441:kick]'s exec bucket by kick kind ([G483:kind]) and by stop reason
 // ([G483:stop]).
@@ -10,3 +11,4 @@
 // G438: VU1-worker derivative spin gated by the G419 per-frame arm (force recompile v1).
 // G482: runtime_g482_memo_census.inc added — memo-key price arm + full-identity census (force
 // recompile v2; MSBuild does not track .inc dependencies).
+// G541: exact VU1 kick corpus + asynchronous GPU compute transport prototype (force recompile v1).

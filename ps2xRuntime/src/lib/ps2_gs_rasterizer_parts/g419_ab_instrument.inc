@@ -702,6 +702,10 @@ enum G419Lever
     // G533: replace one exact immutable VU1 fragment with a static specialized handler. All other
     // blocks retain G531's generic executor. VU1-thread code-shape lever: hold 16.
     kG533LeverImageSpec = 96,
+    // G541: diagnostic-only GPU transport prototype. Candidate submits one logical command per
+    // completed CPU VU1 kick; commands coalesce while queued into sequential shared-FIFO compute
+    // batches. It never waits/reads back; CPU VU1 packets remain authoritative. Hold 16.
+    kG541LeverVuNull = 97,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -914,6 +918,8 @@ static int g419AbLever()
             return static_cast<int>(kG532LeverDivLower);
         if (std::strcmp(value, "imgspec") == 0)
             return static_cast<int>(kG533LeverImageSpec);
+        if (std::strcmp(value, "vu1null") == 0)
+            return static_cast<int>(kG541LeverVuNull);
         std::fprintf(stderr,
                      "[G419:ab] unknown DC2_G419_AB='%s' (expected "
                      "narrow|pack|lanes|all|zero|packlanes|pool|all420|narrowtouch|matunpack|"
@@ -925,7 +931,7 @@ static int g419AbLever()
                      "histcur|qpseg|lockskip|capmove|clsmemo|g510both|texrun|texprobe|clsprobe|"
                      "fastdec|hashlane|vstore|vload|vmem|nopdisp|updesc|lowdense|dispdense|"
                      "peel4|g516disp|fpind|stampind|g517ind|cullcmp|macscan|capinplace|"
-                     "l2lskip|flagtail|flaghead|divlower|imgspec)\n",
+                      "l2lskip|flagtail|flaghead|divlower|imgspec|vu1null)\n",
                      value);
         return static_cast<int>(kG419LeverNone);
     }();
@@ -1030,6 +1036,7 @@ static const char *g419AbLeverName(int lever)
     case kG532LeverFlagHead: return "flaghead";
     case kG532LeverDivLower: return "divlower";
     case kG533LeverImageSpec: return "imgspec";
+    case kG541LeverVuNull: return "vu1null";
     default: return "none";
     }
 }
@@ -1178,7 +1185,8 @@ static uint64_t g438ArmHoldFrames()
                 // (G506's law: a new thread-level arm joins THIS predicate in the SAME edit).
                 sel == kG522LeverL2lSkip ||
                 sel == kG531LeverFlagTail || sel == kG532LeverFlagHead ||
-                sel == kG532LeverDivLower || sel == kG533LeverImageSpec ||
+                 sel == kG532LeverDivLower || sel == kG533LeverImageSpec ||
+                 sel == kG541LeverVuNull ||
                 sel == kG439LeverCoalesce || sel == kG445LeverEarlyKick ||
                 sel == kG445LeverKickAll || sel == kG447LeverSpinWait || sel == kG447LeverWSpin ||
                 sel == kG447LeverSpinBoth || sel == kG452LeverAsyncOne ||
@@ -1795,6 +1803,23 @@ int g532DivLowerArm()
 int g533ImageSpecArm()
 {
     if (g419AbLever() != static_cast<int>(kG533LeverImageSpec))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G541 asynchronous GPU-transport arm. Read once per kick on the VU1 worker; attribution is one
+// relaxed RMW per frame through the sequence memo. A 16-frame hold contains shared-GL FIFO lag.
+int g541VuNullArm()
+{
+    if (g419AbLever() != static_cast<int>(kG541LeverVuNull))
         return -1;
     const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
     const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);

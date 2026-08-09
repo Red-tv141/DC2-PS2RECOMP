@@ -732,6 +732,119 @@
                 static_cast<uint32_t>(s_g410Cache.g490RunLen[currentPc >> 3u]);
             const uint32_t g490Budget = maxCycles - cycle;
             uint32_t g490Count = g490Avail < g490Budget ? g490Avail : g490Budget;
+#if DC2_G532_FLAGHEAD
+            // G532: a typed flag consumer followed by an ordinary run enters the SAME block call
+            // that the next pair would already have made. This scoped prologue adds no live state
+            // across the normal block dispatch. Sidecar value 3 is G531's precisely-invalidated
+            // eligibility proof; the next slot's run length proves an existing block follows.
+            if (g490Avail == 0u && (g499BlkArm == 25 || g499BlkArm == 26) &&
+                g490Budget > G490_MIN_RUN && currentPc + 16u <= codeSize &&
+                s_g410Cache.g502TailAt[currentPc >> 3u] == G531_FLAG_TAIL)
+            {
+                const uint32_t g532BlockPc = currentPc + 8u;
+                const uint32_t g532Avail = static_cast<uint32_t>(
+                    s_g410Cache.g490RunLen[g532BlockPc >> 3u]);
+                const uint32_t g532Budget = g490Budget - 1u;
+                const uint32_t g532Count =
+                    g532Avail < g532Budget ? g532Avail : g532Budget;
+                if (g532Count >= G490_MIN_RUN)
+                {
+                    // Preserve the following block's existing G500/G531 tail. A budget-clamped
+                    // ordinary run cannot reach its tail, exactly as in the normal hook below.
+                    uint32_t g532Tail = 0u;
+                    uint32_t g532BPc = 0u;
+                    if (g532Count == g532Avail)
+                    {
+                        uint32_t g532T = static_cast<uint32_t>(
+                            s_g410Cache.g502TailAt[g532BlockPc >> 3u]);
+                        if (g532T != 0u)
+                        {
+                            g532BPc = g532BlockPc + 8u * g532Avail;
+                            if (g532BPc + 8u > codeSize)
+                                g532T = 0u;
+                            else
+                            {
+                                if (g532T == 2u && g532BPc + 16u > codeSize)
+                                    g532T = 1u;
+                                const uint32_t g532TailPairs0 =
+                                    (g532T == G531_FLAG_TAIL) ? 1u : g532T;
+                                if (g532Avail + g532TailPairs0 > g532Budget)
+                                    g532T = 0u;
+                            }
+                            g532Tail = g532T;
+                        }
+                    }
+                    const uint32_t g532TailPairs =
+                        (g532Tail == G531_FLAG_TAIL) ? 1u : g532Tail;
+                    const uint32_t g532Consumed = 1u + g532Count + g532TailPairs;
+
+#if DC2_G490_VERIFY_BLOCK
+                    g490VerifyBlock(vuCode, g532BlockPc >> 3u, g532Count);
+                    if (g532Tail != 0u && g532Tail != G531_FLAG_TAIL)
+                        g500VerifyTail(vuCode, g532BPc >> 3u, g532Tail);
+#endif
+#if DC2_G506_QPSEG
+                    const bool g532QpVerify = g506VerifyOn();
+                    const int g532QEntry = g532QpVerify ? *s_qDelayP : 0;
+                    const int g532PEntry = g532QpVerify ? *s_pDelayP : 0;
+#endif
+                    if (g499BlkArm == 26)
+                        g532ExecuteBlockHeadVerify(
+                            m_state, g532BlockPc >> 3u, g532Count, vuData, dataSize,
+                            s_qDelayP, s_pDelayP, g430Base + static_cast<int64_t>(cycle) + 1,
+                            g436Hb, g532Tail);
+                    else
+                        g532ExecuteBlockHeadFlag(
+                            m_state, g532BlockPc >> 3u, g532Count, vuData, dataSize,
+                            s_qDelayP, s_pDelayP, g430Base + static_cast<int64_t>(cycle) + 1,
+                            g436Hb, g532Tail);
+#if DC2_G506_QPSEG
+                    if (g532QpVerify)
+                        g506VerifyBlockQp(g532QEntry, g532PEntry, g532Consumed,
+                                          *s_qDelayP, *s_pDelayP, g499BlkArm);
+#endif
+
+                    uint32_t g532Next;
+                    bool g532Taken = false;
+                    if (g532Tail == 0u)
+                        g532Next = g532BlockPc + 8u * g532Count;
+                    else if (g532Tail == G531_FLAG_TAIL)
+                        g532Next = g532BPc + 8u;
+                    else
+                    {
+                        g532Taken = (m_state.pc != g532BPc);
+                        if (g532Tail == 2u)
+                            g532Next = g532Taken ? (m_state.pc + 8u) : (g532BPc + 16u);
+                        else
+                        {
+                            if (g532Taken)
+                            {
+                                pendingBranchTarget = m_state.pc + 8u;
+                                if (pendingBranchTarget >= codeSize)
+                                    pendingBranchTarget = 0u;
+                            }
+                            g532Next = g532BPc + 8u;
+                        }
+                    }
+                    if (g532Next >= codeSize)
+                        g532Next = 0u;
+                    if (g500Stat)
+                        g500NoteBlock(g500InvArm, g532Count + 1u,
+                                      g532TailPairs, g532Taken);
+                    if (g502Census)
+                        g502NoteBlock(g532Count + 1u, g532TailPairs, g532Taken,
+                                      g532Count + 1u, g532Next,
+                                      maxCycles - (cycle + g532Consumed),
+                                      pendingBranchTarget != DC2_G442_NO_BRANCH, codeSize);
+                    m_state.pc = g532Next;
+                    G483_PC_SET(g532Next);
+                    if (g490Stat)
+                        g490NoteBlock(g532Consumed);
+                    cycle += g532Consumed - 1u;
+                    continue;
+                }
+            }
+#endif
             // G502 CEILING PROBE (`DC2_G419_AB=blksplit`) — it has ANSWERED and is COMPILED OUT
             // (`DC2_G502_SPLIT_PROBE 0`), so `g502Split` is a `constexpr 0` and this folds away.
             // It cut every block whose clamped length reaches 2*MIN_RUN exactly in half, so the SAME
@@ -791,7 +904,13 @@
                  g499BlkArm == 9 || g499BlkArm == 10 || g499BlkArm == 12 || g499BlkArm == 13 ||
                  g499BlkArm == 14 || g499BlkArm == 15 || g499BlkArm == 16 ||
                  g499BlkArm == 17 || g499BlkArm == 18 || g499BlkArm == 19 ||
-                 g499BlkArm == 20 || g499BlkArm == 21 || g499BlkArm == 22) &&
+                 g499BlkArm == 20 || g499BlkArm == 21 || g499BlkArm == 22 ||
+                 g499BlkArm == 23 || g499BlkArm == 24 || g499BlkArm == 27 ||
+                 g499BlkArm == 28 || g499BlkArm == 29
+#if DC2_G532_FLAGHEAD
+                 || g499BlkArm == 25 || g499BlkArm == 26
+#endif
+                 ) &&
                 g490Count == g490Avail &&
                 (g490Count >= G490_MIN_RUN || g502Tail0))
             {
@@ -801,6 +920,15 @@
                 // both clamps below run only when there really is a tail.
                 uint32_t g500T =
                     static_cast<uint32_t>(s_g410Cache.g502TailAt[currentPc >> 3u]);
+                const bool g531FlagArm =
+                    (g499BlkArm == 23 || g499BlkArm == 24 || g499BlkArm == 27 ||
+                     g499BlkArm == 28 || g499BlkArm == 29
+#if DC2_G532_FLAGHEAD
+                     || g499BlkArm == 25 || g499BlkArm == 26
+#endif
+                     );
+                if (g500T == G531_FLAG_TAIL && !g531FlagArm)
+                    g500T = 0u;
                 if (g500T != 0u)
                 {
                     g500BPc = currentPc + 8u * g490Avail;
@@ -810,12 +938,18 @@
                     {
                         if (g500T == 2u && g500BPc + 16u > codeSize)
                             g500T = 1u;
-                        if (g490Avail + g500T > g490Budget)
+                        const uint32_t g531TailPairs =
+                            (g500T == G531_FLAG_TAIL) ? 1u : g500T;
+                        if (g490Avail + g531TailPairs > g490Budget)
                             g500T = 0u;
                     }
                     g500Tail = g500T;
                 }
             }
+            // Sidecar value 3 denotes one G531 flag-consumer pair, not three branch-tail pairs.
+            // Keep one normalized count for every caller-side budget/stat/cycle calculation.
+            const uint32_t g531TailPairs =
+                (g500Tail == G531_FLAG_TAIL) ? 1u : g500Tail;
             // `g500Tail != 0` already implies at least one pair, so a lone control transfer forms
             // a one-pair block: it saves the ~7 ns/pair envelope and costs one 1.89 ns round trip.
             // A lone ELIGIBLE pair (`count == 1`, `tail == 0`) is deliberately NOT admitted — G490's
@@ -827,7 +961,7 @@
                 // copy — never a timing arm. G489 §6's rule (a verifier must not sit in a copy its
                 // own flag deselects) is satisfied by construction: the flag selects THIS copy.
                 g490VerifyBlock(vuCode, currentPc >> 3u, g490Count);
-                if (g500Tail != 0u)
+                if (g500Tail != 0u && g500Tail != G531_FLAG_TAIL)
                     g500VerifyTail(vuCode, g500BPc >> 3u, g500Tail);
 #endif
                 // G499: which block executor. The bodies differ ONLY inside the (noinline) block —
@@ -905,7 +1039,39 @@
                                                g430Base + (int64_t)cycle, g436Hb, g500Tail);
                 else
 #endif
-                if (g499BlkArm == 18)
+                // G533 v8: arm 27's single exact block bypasses G531 here. Every miss was
+                // canonicalised to arm 23 once per run(), so it follows the shipped call path
+                // below with no candidate wrapper/function-return tax.
+                if (g533StaticRun &&
+                    g533Hot3088Runnable(currentPc >> 3u, g490Count, g500Tail,
+                                         vuData, dataSize, g436Hb))
+                    g533ExecuteHot3088(m_state, vuData, s_qDelayP, s_pDelayP,
+                                       g430Base + (int64_t)cycle, g436Hb);
+                else if (g499BlkArm == 29)
+                    g533ExecuteBlockTailStat(m_state, currentPc >> 3u, g490Count, vuData,
+                                              dataSize, s_qDelayP, s_pDelayP,
+                                              g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g499BlkArm == 28)
+                    g533ExecuteBlockTailVerify(m_state, currentPc >> 3u, g490Count, vuData,
+                                                dataSize, s_qDelayP, s_pDelayP,
+                                                g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g499BlkArm == 24
+#if DC2_G532_FLAGHEAD
+                    || g499BlkArm == 26
+#endif
+                    )
+                    g531ExecuteBlockTailVerify(m_state, currentPc >> 3u, g490Count, vuData,
+                                               dataSize, s_qDelayP, s_pDelayP,
+                                               g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g499BlkArm == 23
+#if DC2_G532_FLAGHEAD
+                         || g499BlkArm == 25
+#endif
+                         )
+                    g531ExecuteBlockTailFlag(m_state, currentPc >> 3u, g490Count, vuData,
+                                             dataSize, s_qDelayP, s_pDelayP,
+                                             g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g499BlkArm == 18)
                     g516ExecuteBlockTailDisp(m_state, currentPc >> 3u, g490Count, vuData,
                                              dataSize, s_qDelayP, s_pDelayP,
                                              g430Base + (int64_t)cycle, g436Hb, g500Tail);
@@ -977,7 +1143,7 @@
                                      s_qDelayP, s_pDelayP, g430Base + (int64_t)cycle, g436Hb);
 #if DC2_G506_QPSEG
                 if (g506Verify)
-                    g506VerifyBlockQp(g506QEntry, g506PEntry, g490Count + g500Tail,
+                    g506VerifyBlockQp(g506QEntry, g506PEntry, g490Count + g531TailPairs,
                                       *s_qDelayP, *s_pDelayP, g499BlkArm);
 #endif
                 uint32_t g490Next;
@@ -987,6 +1153,12 @@
                     // pc (G489's complete branch/jump set), so this is `currentPc + 8 * count`
                     // with the same wrap the tail applies.
                     g490Next = currentPc + 8u * g490Count;
+                }
+                else if (g500Tail == G531_FLAG_TAIL)
+                {
+                    // G531 flag consumers cannot write PC. The typed tail consumed exactly one
+                    // sequential pair, so no pending branch state is created.
+                    g490Next = g500BPc + 8u;
                 }
                 else
                 {
@@ -1017,20 +1189,20 @@
                 if (g490Next >= codeSize)
                     g490Next = 0u;
                 if (g500Stat)
-                    g500NoteBlock(g500InvArm, g490Count, g500Tail, g500Taken);
+                    g500NoteBlock(g500InvArm, g490Count, g531TailPairs, g500Taken);
                 // G502: block-entry census. Once per BLOCK, out of line, behind a bool cached once
                 // per run() — `chain=` is what a chaining executor could have kept, `split=` is the
                 // denominator the ceiling probe's frame delta is divided by.
                 if (g502Census)
-                    g502NoteBlock(g490Count, g500Tail, g500Taken,
+                    g502NoteBlock(g490Count, g531TailPairs, g500Taken,
                                   g490Avail < g490Budget ? g490Avail : g490Budget,
-                                  g490Next, maxCycles - (cycle + g490Count + g500Tail),
+                                  g490Next, maxCycles - (cycle + g490Count + g531TailPairs),
                                   pendingBranchTarget != DC2_G442_NO_BRANCH, codeSize);
                 m_state.pc = g490Next;
                 G483_PC_SET(g490Next);
                 if (g490Stat)
-                    g490NoteBlock(g490Count + g500Tail);
-                cycle += (g490Count + g500Tail) - 1u;
+                    g490NoteBlock(g490Count + g531TailPairs);
+                cycle += (g490Count + g531TailPairs) - 1u;
                 continue;
             }
         }
@@ -1041,8 +1213,15 @@
         // of magnitude more often than the cold ones (the roadmap's own warning on task 2). One
         // test of a loop-invariant bool plus a never-taken call (G421 law 17).
         if (g502Census)
-            g502NotePlain(g410Pair, s_g410Cache.g490RunLen[currentPc >> 3u], maxCycles - cycle,
-                          pendingBranchTarget != DC2_G442_NO_BRANCH, m_state.ebit);
+        {
+            const uint32_t g502NextAvail =
+                (currentPc + 16u <= codeSize)
+                    ? static_cast<uint32_t>(s_g410Cache.g490RunLen[(currentPc >> 3u) + 1u])
+                    : 0u;
+            g502NotePlain(g410Pair, s_g410Cache.g490RunLen[currentPc >> 3u], g502NextAvail,
+                          maxCycles - cycle, pendingBranchTarget != DC2_G442_NO_BRANCH,
+                          m_state.ebit);
+        }
 #endif // DC2_G490_BLOCKRUN
 
 #if DC2_VU1_LOOP_DIAG
@@ -1558,6 +1737,17 @@
                     std::abort();
                 }
                 *s_macVisP = g430Mac;
+                if (currentPc == 0x2f08u && std::getenv("DC2_G545_CPU_TRACE") != nullptr)
+                {
+                    static std::atomic<uint32_t> s_g545TraceCount{0u};
+                    if (s_g545TraceCount.fetch_add(1u, std::memory_order_relaxed) < 128u)
+                        std::fprintf(stderr,
+                                     "[G545:cpu-pair-fmand] stamp=%lld mac=%04x vi10=%04x mask=%04x\n",
+                                     static_cast<long long>(g430Base + static_cast<int64_t>(cycle)),
+                                     g430Mac & 0xffffu,
+                                     static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[10])),
+                                     static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[7])));
+                }
                 if (g430Shadow)
                     ++s_g430VerifyOk;
             }
@@ -1892,11 +2082,45 @@
             }
             } // G295 diag region C end
 #endif // DC2_VU1_LOOP_DIAG
+            // G545 v21 default-off parity trace: record the CPU-authoritative writes to the
+            // qword later consumed by the first divergent Dungeon LQs. The three PC tests are
+            // exact store sites; the atomic sequence read is therefore absent from other pairs.
+            uint32_t g545StoreQ = 0xffffffffu;
+            uint32_t g545StoreSource = 0xffffffffu;
+            uint32_t g545StoreSourceBits[4]{};
+            if ((currentPc == 0x2870u || currentPc == 0x31e0u || currentPc == 0x2e38u) &&
+                g_g545CpuTraceSequence.load(std::memory_order_relaxed) == 784u)
+            {
+                const uint32_t g545LowerOp = (lower >> 25u) & 0x7fu;
+                if (g545LowerOp == 0x01u)
+                {
+                    const uint32_t g545Base = (lower >> 16u) & 31u;
+                    g545StoreSource = (lower >> 11u) & 31u;
+                    const int32_t g545Imm = static_cast<int32_t>(lower << 21u) >> 21u;
+                    g545StoreQ = static_cast<uint32_t>(m_state.vi[g545Base] + g545Imm) & 0x3ffu;
+                }
+                else if (g545LowerOp == 0x40u && S2_FUNC(lower) == 0x35u)
+                {
+                    const uint32_t g545Base = (lower >> 16u) & 31u;
+                    g545StoreSource = (lower >> 11u) & 31u;
+                    g545StoreQ = static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[g545Base])) & 0x3ffu;
+                }
+                if (g545StoreSource < 32u)
+                    std::memcpy(g545StoreSourceBits, m_state.vf[g545StoreSource], 16u);
+            }
 #if DC2_G479_QPREG
             // Same two arms the macro expands to under g443Fixed, with the local Q/P counters
             // spilled around the ONLY callee that can write them.
             if (g410Pair->lowerKind != G422_LK_NONE)
+            {
+                // G532b: DIV is the first covered lower that writes the Q-pipeline counters.
+                // This copy is currently compiled out, but keep its register-local contract exact.
+                if (g410Pair->lowerKind == G422_LK_DIV)
+                    G479_QP_SYNC();
                 g422FastLower(m_state, lower, g410Pair->lowerKind, vuData, dataSize);
+                if (g410Pair->lowerKind == G422_LK_DIV)
+                    G479_QP_RELOAD();
+            }
             else
             {
                 G479_QP_SYNC();
@@ -1906,6 +2130,20 @@
 #else
             DC2_G422_RUN_LOWER();
 #endif
+            if (g545StoreQ == 860u && vuData != nullptr && g545StoreQ * 16u + 16u <= dataSize)
+            {
+                uint32_t g545StoredBits[4]{};
+                std::memcpy(g545StoredBits, vuData + g545StoreQ * 16u, 16u);
+                static std::atomic<uint32_t> s_g545StoreTraceCount{0u};
+                if (s_g545StoreTraceCount.fetch_add(1u, std::memory_order_relaxed) < 16u)
+                    std::fprintf(stderr,
+                                 "[G545:cpu-ramstore] seq=784 pc=%04x instr=%08x q=%u vf=%u source=%08x,%08x,%08x,%08x after=%08x,%08x,%08x,%08x\n",
+                                 currentPc, lower, g545StoreQ, g545StoreSource,
+                                 g545StoreSourceBits[0], g545StoreSourceBits[1],
+                                 g545StoreSourceBits[2], g545StoreSourceBits[3],
+                                 g545StoredBits[0], g545StoredBits[1],
+                                 g545StoredBits[2], g545StoredBits[3]);
+            }
             // G436: `true` is only ever written to this thread_local inside the
             // `if (s_g106ParallelFlags)` block above, so when that lever is off the store is the
             // identity — and it was costing a TLS materialisation plus a store on every pair.
@@ -2289,6 +2527,11 @@
                 static std::atomic<uint64_t> s_e21b0{0}, s_e23e8{0}, s_e2740{0}, s_k2d88{0}, s_k2f38{0};
                 static std::atomic<uint64_t> s_fcandHit{0}, s_fcandMiss{0}, s_fcorRej{0}, s_fanVerts{0};
                 static std::atomic<uint32_t> s_rep{0}, s_samp{0};
+                // G545 v10: retain the two cross-product operands/result until the delayed MAC
+                // consumer. Only the existing default-off G140 diagnostic copy reaches this.
+                static thread_local uint32_t s_g545OpmulaA = 0u, s_g545OpmulaB = 0u;
+                static thread_local uint32_t s_g545AccZ = 0u, s_g545OpmsubA = 0u;
+                static thread_local uint32_t s_g545OpmsubB = 0u, s_g545ResultZ = 0u;
                 switch (currentPc)
                 {
                 case 0x21b0u: s_e21b0.fetch_add(1u, std::memory_order_relaxed); break;
@@ -2392,6 +2635,29 @@
                     }
                     break;
                 }
+                case 0x2ee0u:
+                    std::memcpy(&s_g545OpmulaA, &m_state.vf[21][0], sizeof(uint32_t));
+                    std::memcpy(&s_g545OpmulaB, &m_state.vf[20][1], sizeof(uint32_t));
+                    std::memcpy(&s_g545AccZ, &m_state.acc[2], sizeof(uint32_t));
+                    break;
+                case 0x2ee8u:
+                    std::memcpy(&s_g545OpmsubA, &m_state.vf[20][0], sizeof(uint32_t));
+                    std::memcpy(&s_g545OpmsubB, &m_state.vf[21][1], sizeof(uint32_t));
+                    std::memcpy(&s_g545ResultZ, &m_state.vf[23][2], sizeof(uint32_t));
+                    break;
+                case 0x2f08u:
+                    if ((s_g545ResultZ & 0x7f800000u) == 0x7f800000u)
+                    {
+                        static std::atomic<uint32_t> s_g545MacGateSamples{0u};
+                        if (s_g545MacGateSamples.fetch_add(1u, std::memory_order_relaxed) < 128u)
+                            std::fprintf(stderr,
+                                "[G545:cpu-macgate] accZ=%08x resultZ=%08x visible=%04x expected=%04x mask=%04x opmula=%08x*%08x opmsub=%08x*%08x\n",
+                                s_g545AccZ, s_g545ResultZ, s_vuMacVisible & 0xffffu,
+                                (uint32_t)(uint16_t)m_state.vi[10],
+                                (uint32_t)(uint16_t)m_state.vi[7], s_g545OpmulaA,
+                                s_g545OpmulaB, s_g545OpmsubA, s_g545OpmsubB);
+                    }
+                    break;
                 default: break;
                 }
                 if ((s_rep.fetch_add(1u, std::memory_order_relaxed) % 400000u) == 0u)

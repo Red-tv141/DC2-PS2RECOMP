@@ -29,6 +29,9 @@ std::atomic<uint64_t> g_g141Vu1RunNs{0};
 // single-writer / EE-only). Null on the EE thread → the legacy synchronous submit path is used, so
 // the default (MTVU-off) build is byte-identical. thread_local: only the worker sees it set.
 thread_local std::vector<std::vector<uint8_t>> *g_g297KickCapture = nullptr;
+// G541 corpus sidecar. Non-null only for a bounded, explicitly armed capture; the ordered address
+// identifies which resident VU-data bytes an eventual GPU-resident GS handoff consumes.
+thread_local std::vector<uint32_t> *g_g541KickAddresses = nullptr;
 // G297: the double-buffer DATA top (VIF1 TOPS latched at the kick's MSCAL) snapshotted on the EE at
 // enqueue time. The interpreter reads XTOP live from memory->vif1_regs.top, which the EE mutates at
 // the NEXT MSCAL — on the worker that would read the wrong buffer half. When g_g297KickCapture is

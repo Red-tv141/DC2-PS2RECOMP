@@ -21,9 +21,10 @@
 //   * VU-memory    LQ/SQ/ILW/ISW/LQI/SQI/LQD/SQD/ILWR/ISWR   (SQI 8.2% + LQI 6.8% of all pairs)
 //   * moves        MOVE/MR32/MTIR/MFIR
 //   * branches     B/BAL/JR/JALR/IBEQ/IBNE/IBLTZ/IBGTZ/IBLEZ/IBGEZ
-// Everything else (DIV/SQRT/RSQRT and the whole Q/P pipeline, XGKICK, WAITQ/WAITP, the EFU
-// group, the flag ops FCxx/FSxx/FMxx, RNEXT/RGET/RINIT/RXOR, MFP, XTOP/XITOP) keeps the legacy
-// execLower() path untouched, so no scalar-pipeline, flag-pipeline or GS-kick semantics move.
+// Everything else (SQRT/RSQRT and the remaining Q/P pipeline, XGKICK, WAITQ/WAITP, the EFU
+// group, the non-covered flag ops, RNEXT/RGET/RINIT/RXOR, MFP, XTOP/XITOP) keeps the legacy
+// execLower() path untouched. G532 later moved DIV's body into this leaf while preserving its
+// scalar pre-stall and seven-cycle Q pipeline in the main pair loop.
 //
 // EXACTNESS is by construction: each covered body below is a verbatim transcription of the
 // corresponding case in VU1Interpreter::execLower (vu1_dispatch_and_sync.inc), including the
@@ -47,6 +48,8 @@
 extern int g480NopSkipArm();
 // G481 hot-kind inline paired gate (same file). -1 = not selected, 0 = control, 1 = candidate.
 extern int g481HotLowerArm();
+// G532b compiled DIV-lower paired gate. -1 = not selected, 0 = legacy execLower, 1 = G422 leaf.
+extern int g532DivLowerArm();
 
 namespace
 {
@@ -86,10 +89,12 @@ namespace
         G422_LK_MFIR,
         G422_LK_ILWR,
         G422_LK_ISWR,
-        // G487: the FLAG CONSUMERS. `[G486:uncov]` measured the population that still crosses
-        // execLower's call boundary and it is only two things — these four (2.54% of all pairs,
-        // ~41 k/frame) and DIV (1.68%, which carries the Q-latency staging and is therefore not
-        // a candidate). Their bodies are three or four instructions on values the pair loop has
+        // G532b: scalar DIV. This remains outside every trace/block body because its existing
+        // G426 pre-stall and seven-cycle Q pipeline must execute once per pair in the main loop.
+        // Only the legacy execLower call boundary is replaced by the smaller G422 leaf call.
+        G422_LK_DIV,
+        // G487: the FLAG CONSUMERS. `[G486:uncov]` measured these four at 2.54% of all pairs
+        // (~41 k/frame). Their bodies are three or four instructions on values the pair loop has
         // ALREADY resolved: `m_state.clip` for FCAND/FCOR/FCGET and `s_vuMacVisible` for FMAND,
         // which the loop publishes exactly for these pairs (G427_PF_FLAGREAD).
         // These four MUST stay after every kind above: `g475TracePairEligible` and the census's
@@ -118,7 +123,7 @@ namespace
     //     does not reproduce.
     // Either one non-default and every flag consumer decodes to G422_LK_NONE, i.e. straight back
     // onto the interpreter. Note this is deliberately NOT gated on g422LowerDiagFree(): none of
-    // the eight probe envs listed there lives in a flag-consumer body, and any of them already
+    // the probe envs listed there lives in a flag-consumer body, and any of them already
     // forces the whole slot back through execLower at the caller.
     bool g487FlagLowerSupported()
     {
@@ -132,7 +137,7 @@ namespace
     // census), never in the hot loop — which is exactly why the arm has to be a property of the
     // CACHE and not an in-loop compare (G486 §4: an extra per-pair test would sit on the control
     // arm on 59.9% of pairs and bias the gate toward the candidate).
-    uint8_t g422DecodeLowerKind(uint32_t lower, bool flagLower)
+    uint8_t g422DecodeLowerKind(uint32_t lower, bool flagLower, bool divLower)
     {
         if (lower == 0x00000000u || lower == 0x8000033Cu)
             return G422_LK_NOP;
@@ -183,6 +188,7 @@ namespace
                 case 0x3Du: return G422_LK_MFIR;
                 case 0x3Eu: return G422_LK_ILWR;
                 case 0x3Fu: return G422_LK_ISWR;
+                case 0x38u: return divLower ? G422_LK_DIV : G422_LK_NONE;
                 default: return G422_LK_NONE;
                 }
             default: return G422_LK_NONE;
@@ -208,6 +214,14 @@ namespace
     bool g422VerifyOn()
     {
         static const bool s_on = f50_12_vu_env_flag("DC2_G422_VERIFY");
+        return s_on;
+    }
+
+    // G532b: focused oracle. Unlike DC2_G422_VERIFY it shadows only DIV, so long route replays
+    // can reach a second uploaded microprogram while still checking every new leaf execution.
+    bool g532VerifyDivOn()
+    {
+        static const bool s_on = f50_12_vu_env_flag("DC2_G532_VERIFY_DIV");
         return s_on;
     }
 
@@ -254,6 +268,7 @@ namespace
                 "DC2_G133_COPY_QSKIP",// execLower prologue capture + SQI ADC override
                 "DC2_G370_VUSTORE",   // SQ/SQI/SQD store watch
                 "DC2_G370_VULOAD",    // LQ/LQD load watch
+                "DC2_G370_DIV0",      // DIV denominator watch
                 "DC2_G63_GATE",       // IAND gate census
                 "DC2_G64_FORCE_ENABLE_FIX"}; // IAND gate repair
             for (const char *n : k)
@@ -588,6 +603,34 @@ namespace
                     std::memcpy(vuData + addr + 8u, &value, 4);
                 if (dest & 0x1)
                     std::memcpy(vuData + addr + 12u, &value, 4);
+            }
+            return;
+        }
+        case G422_LK_DIV:
+        {
+            // G532b: verbatim default-path transcription of execLower special2 0x38. The pair
+            // loop has already advanced Q, applied an older-producer stall, executed the upper,
+            // and restored any same-pair VF hazard before this leaf stages the new result.
+            const uint8_t is = LIS(instr);
+            const uint8_t it = LIT(instr);
+            const int fsf = (instr >> 21) & 0x3;
+            const int ftf = (instr >> 23) & 0x3;
+            const float num = st.vf[is][fsf];
+            const float den = st.vf[it][ftf];
+            const float qv = (den != 0.0f)
+                ? (num / den)
+                : ((num >= 0.0f) ? std::numeric_limits<float>::max()
+                                 : -std::numeric_limits<float>::max());
+            if (g87_q_latency_enabled())
+            {
+                if (g200_qstall_enabled() && s_vuQDelay > 0)
+                    st.q = s_vuQPending;
+                s_vuQPending = qv;
+                s_vuQDelay = 7;
+            }
+            else
+            {
+                st.q = qv;
             }
             return;
         }

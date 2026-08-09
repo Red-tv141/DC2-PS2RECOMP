@@ -222,6 +222,16 @@ extern int g516DispArm();
 extern int g517PtrIndArm();
 extern int g517StampIndArm();
 extern int g517IndArm();
+extern int g531FlagTailArm();
+extern int g533ImageSpecArm();
+#ifndef DC2_G532_FLAGHEAD
+// G532a REFUTED: four Georama gates were 4/4 slower. Keep the source for audit/reproduction,
+// but compile every arm, oracle, wrapper, and pair-loop hook out of the shipping binary.
+#define DC2_G532_FLAGHEAD 0
+#endif
+#if DC2_G532_FLAGHEAD
+extern int g532FlagHeadArm();
+#endif
 
 // G516 3 — THE UPPER-DESCRIPTOR FAMILY IS REFUTED AND COMPILED OUT (`DC2_G516_UPDESC 0`).
 //
@@ -439,6 +449,10 @@ namespace
 {
     // Minimum run length worth the call boundary. 2 mirrors G475 so the two are comparable.
     constexpr uint32_t G490_MIN_RUN = 2u;
+    // G531 reuses the existing one-byte branch-tail sidecar instead of growing the hot
+    // thread_local compiled cache. Values 0/1/2 retain their G500 meaning; 3 is one compiled
+    // flag-consumer pair. Control arms sanitize 3 back to zero before entering a block.
+    constexpr uint8_t G531_FLAG_TAIL = 3u;
 
     bool g490BlockRequested()
     {
@@ -516,6 +530,13 @@ namespace
     //       carried in a block local instead of in `H.head`. Control arm is 3, so the two arms
     //       execute the identical pairs in the identical blocks and differ only in where four
     //       stores get their index from.
+    //  23 = + G531 FLAG TAIL: arm 18's shipped body absorbs one compiled flag consumer after an
+    //       existing ordinary run. 24 is its standalone oracle copy.
+    //  25 = + G532 FLAG HEAD: arm 23 also absorbs a flag consumer immediately before an existing
+    //       ordinary block. 26 is its standalone oracle copy.
+    //  27 = + G533 immutable-image specialization: exact-source static handler for one recurring
+    //       nine-pair block plus its typed flag tail. 28 is its full-state/history oracle copy;
+    //       29 is the isolated occupancy-census copy.
     int g499BlkArmRun()
     {
         static const int s_paired = [] {
@@ -554,6 +575,14 @@ namespace
                 return 17;
             if (std::strcmp(ab, "g516disp") == 0)
                 return 18;
+            if (std::strcmp(ab, "flagtail") == 0)
+                return 23;
+            if (std::strcmp(ab, "imgspec") == 0)
+                return 27;
+#if DC2_G532_FLAGHEAD
+            if (std::strcmp(ab, "flaghead") == 0)
+                return 25;
+#endif
 #if DC2_G517_INDARM
             if (std::strcmp(ab, "fpind") == 0)
                 return 19;
@@ -628,6 +657,21 @@ namespace
         // touch the same dispatch.
         if (s_paired == 18)
             return g516DispArm() > 0 ? 18 : 12;
+        // G531. 18 vs 23: same shipped block body; candidate alone consumes typed sidecar value 3
+        // and publishes the delayed MAC line before running the G487 fast lower.
+        if (s_paired == 23)
+            return g531FlagTailArm() > 0 ? 23 : 18;
+        // G533. 23 vs 27: both arms keep the promoted typed flag tail. The candidate substitutes
+        // one exact-source static handler at one immutable block identity; every other block uses
+        // the same generic G531 body.
+        if (s_paired == 27)
+            return g533ImageSpecArm() > 0 ? 27 : 23;
+        // G532. 23 vs 25: both arms keep the promoted typed tail; the candidate additionally
+        // consumes a typed flag prologue before the next already-existing ordinary block.
+#if DC2_G532_FLAGHEAD
+        if (s_paired == 25)
+            return g532FlagHeadArm() > 0 ? 25 : 23;
+#endif
         // G516b. 12 vs 17: prices peeling the four biggest remaining indirect-branch destinations,
         // with no new array and no change to any load — the isolated branch variable.
         if (s_paired == 17)
@@ -691,6 +735,24 @@ namespace
                 // arm 12 exactly as G515's did to arm 10.
                 if (f50_12_vu_env_flag("DC2_G516_NO_DISP"))
                     return 12;
+                // G531 promoted default-on after four Georama paired wins. Its oracle has a
+                // separate instantiation; the one rollback restores arm 18 exactly.
+                if (f50_12_vu_env_flag("DC2_G531_VERIFY"))
+                    return 24;
+                if (f50_12_vu_env_flag("DC2_G531_NO_FLAGTAIL"))
+                    return 18;
+                if (f50_12_vu_env_flag("DC2_G533_VERIFY"))
+                    return 28;
+                if (f50_12_vu_env_flag("DC2_G533_STAT"))
+                    return 29;
+#if DC2_G532_FLAGHEAD
+                // G532 rides on G531. Its verifier is a separate noinline body; rollback restores
+                // arm 23 exactly, while G531's rollback above still restores arm 18.
+                if (f50_12_vu_env_flag("DC2_G532_VERIFY"))
+                    return 26;
+                if (f50_12_vu_env_flag("DC2_G532_NO_FLAGHEAD"))
+                    return 23;
+#endif
 #if DC2_G517_INDARM
                 // G517: REFUTED. The default stays 18; these two only exist so the refutation
                 // reproduces when `DC2_G517_INDARM` is set to 1.
@@ -699,7 +761,11 @@ namespace
                 if (f50_12_vu_env_flag("DC2_G517_IND"))
                     return 21;
 #endif
-                return 18;
+                // G533 promoted default-on after the refined exact-source handler won four of
+                // four Georama paired trials. One rollback restores G531 arm 23 exactly.
+                if (f50_12_vu_env_flag("DC2_G533_NO_STATIC"))
+                    return 23;
+                return 27;
             }
             // G506: the segmented Q/P advance rides on the G500 tail body, so its rollback falls
             // back to arm 3 exactly as `histcur`'s did.
@@ -764,6 +830,25 @@ namespace
             return false;                                   // per-pair machinery is live
         if (pair.upperKind == 0x6fu)
             return true;                                    // VNOP: the loop skips the upper
+        return g421DescTableConst.e[pair.upperKind].cls != 0u;
+    }
+
+    // G531: a flag consumer may terminate an EXISTING block. It cannot be an ordinary member,
+    // because the generic pair loop publishes the delayed MAC line before executing either slot.
+    // The typed tail reproduces that publication at its exact stamp, then executes the already-
+    // verified G487 fast lower. Every other per-pair mechanism remains required to be inert.
+    bool g531FlagTailEligible(const G410CompiledUpper &pair)
+    {
+        if (pair.pairFlags != 0u)
+            return false;
+        if (pair.lowerKind < G422_LK_FIRST_FLAG || pair.lowerKind >= G422_LK_COUNT)
+            return false;
+        if ((pair.g425Flags & G427_PF_FLAGREAD) == 0u)
+            return false;
+        if ((pair.g425Flags & (G426_PF_PRESTALL | G426_PF_HAZ)) != 0u)
+            return false;
+        if (pair.upperKind == 0x6fu)
+            return true;
         return g421DescTableConst.e[pair.upperKind].cls != 0u;
     }
 
@@ -945,6 +1030,20 @@ namespace
     }
 #endif // DC2_G517_INDARM
 
+    // G533 immutable plan. This is rebuilt through the same precise MPG/code-write funnel as every
+    // G410 sidecar. The source words are compared exactly (not sampled and not hash-only), so a
+    // static handler is admitted only for the byte-identical fragment it implements.
+    constexpr uint32_t G533_HOT_3088_INDEX = 0x3088u / 8u;
+    constexpr uint32_t G533_HOT_3088_COUNT = 9u;
+    constexpr uint32_t G533_HOT_3088_TAIL = G531_FLAG_TAIL;
+    constexpr uint64_t G533_HOT_3088_SOURCE[] = {
+        0x01e0ac5b81f5437cull, 0x01e0b49b81f6437cull, 0x01e0bcdb81f7437cull,
+        0x000002ff8000033cull, 0x01d189ff8000033cull, 0x01d5a9ff8000033cull,
+        0x000002ff8000033cull, 0x000002ff8000033cull, 0x000002ff8000033cull,
+        0x000002ff38010000ull,
+    };
+    uint8_t s_g533Hot3088Plan = 0u;
+
     void g490RebuildRunLengths()
     {
         uint32_t run = 0u;
@@ -987,6 +1086,8 @@ namespace
                     s_g410Cache.g490RunLen[i + 1u] != 0u)
                     tail = 2u;
             }
+            else if (g531FlagTailEligible(s_g410Cache.uppers[i]))
+                tail = G531_FLAG_TAIL;
             s_g410Cache.g500Tail[i] = tail;
             // G502: pre-join the tail the block STARTING at this slot would find, so the hook is a
             // single byte load at the slot it is already indexing. `i + g490RunLen[i] > i`, so the
@@ -994,6 +1095,69 @@ namespace
             const size_t g502At = i + static_cast<size_t>(s_g410Cache.g490RunLen[i]);
             s_g410Cache.g502TailAt[i] =
                 (g502At < s_g410Cache.g500Tail.size()) ? s_g410Cache.g500Tail[g502At] : 0u;
+        }
+
+        bool g533Match =
+            s_g410Cache.g490RunLen[G533_HOT_3088_INDEX] == G533_HOT_3088_COUNT &&
+            s_g410Cache.g502TailAt[G533_HOT_3088_INDEX] == G533_HOT_3088_TAIL &&
+            g531FlagTailEligible(
+                s_g410Cache.uppers[G533_HOT_3088_INDEX + G533_HOT_3088_COUNT]);
+        for (size_t i = 0u; i < sizeof(G533_HOT_3088_SOURCE) /
+                                      sizeof(G533_HOT_3088_SOURCE[0]); ++i)
+            g533Match = g533Match &&
+                s_g410Cache.sources[G533_HOT_3088_INDEX + i] == G533_HOT_3088_SOURCE[i];
+        s_g533Hot3088Plan = g533Match ? 1u : 0u;
+
+        // G533: price static microprogram-fragment specialization from immutable rebuild state,
+        // never from the hot pair loop. This diagnostic emits exact source identity, decoded
+        // operands, and block/tail boundaries for the shared Georama fragment. It is quiet by
+        // default and runs only when a newly observed fragment is installed.
+        static const bool s_g533PlanDump = f50_12_vu_env_flag("DC2_G533_PLAN_DUMP");
+        if (s_g533PlanDump)
+        {
+            constexpr size_t kFirst = 0x3000u / 8u;
+            constexpr size_t kLast = 0x3300u / 8u;
+            uint64_t hash = 1469598103934665603ull;
+            for (size_t i = kFirst; i < kLast; ++i)
+            {
+                const uint64_t source = s_g410Cache.sources[i];
+                for (unsigned byte = 0u; byte < 8u; ++byte)
+                {
+                    hash ^= static_cast<uint8_t>(source >> (byte * 8u));
+                    hash *= 1099511628211ull;
+                }
+            }
+
+            static thread_local uint64_t s_g533LastHash = 0u;
+            if (hash != s_g533LastHash)
+            {
+                s_g533LastHash = hash;
+                std::fprintf(stderr,
+                             "[G533:plan] region=3000-32ff fnv64=%016llx hot3088=%u\n",
+                             static_cast<unsigned long long>(hash),
+                             static_cast<unsigned>(s_g533Hot3088Plan));
+                for (size_t i = kFirst; i < kLast; ++i)
+                {
+                    const G410CompiledUpper &p = s_g410Cache.uppers[i];
+                    const uint64_t source = s_g410Cache.sources[i];
+                    std::fprintf(stderr,
+                                 "[G533:slot] pc=%04x lo=%08x up=%08x uk=%02x lk=%02x"
+                                 " fs=%02x ft=%02x s2=%02x pf=%02x g425=%02x run=%u tail=%u\n",
+                                 static_cast<unsigned>(i * 8u),
+                                 static_cast<unsigned>(source),
+                                 static_cast<unsigned>(source >> 32u),
+                                 static_cast<unsigned>(p.upperKind),
+                                 static_cast<unsigned>(p.lowerKind),
+                                 static_cast<unsigned>(p.lowerFs),
+                                 static_cast<unsigned>(p.lowerFt),
+                                 static_cast<unsigned>(p.lowerS2),
+                                 static_cast<unsigned>(p.pairFlags),
+                                 static_cast<unsigned>(p.g425Flags),
+                                 static_cast<unsigned>(s_g410Cache.g490RunLen[i]),
+                                 static_cast<unsigned>(s_g410Cache.g502TailAt[i]));
+                }
+                std::fflush(stderr);
+            }
         }
     }
 
@@ -1250,6 +1414,12 @@ namespace
         uint64_t taken = 0u;
         uint64_t plain = 0u;        // pairs executed by the pair loop
         uint64_t excl[G502_X_COUNT] = {};
+        // G532 premise census: a typed flag consumer at the current pair followed by an ordinary
+        // run can join that ALREADY-EXISTING block call. This is deliberately separate from
+        // `flaglow`: the latter includes consumers with no following run, which would require the
+        // singleton block G502 proved slower.
+        uint64_t flagHead = 0u;
+        uint64_t flagHeadKind[G422_LK_COUNT - G422_LK_FIRST_FLAG] = {};
     };
     // [0] = geometry kick, [1] = resume kick. Never keyed on a BOOLEAN OF AN ARM (G501 §6) — this
     // index is the KICK KIND, which is what the split is about.
@@ -1289,6 +1459,17 @@ namespace
                              100.0 * static_cast<double>(w.excl[r]) / pl,
                              100.0 * static_cast<double>(w.excl[r]) / tot);
             std::fprintf(stderr, "\n");
+            std::fprintf(stderr,
+                         "[G502:join] kind=%s flaghead=%llu plain=%.2f%% all=%.2f%% "
+                         "fcand=%llu fcor=%llu fmand=%llu fcget=%llu\n",
+                         k ? "res" : "geo",
+                         static_cast<unsigned long long>(w.flagHead),
+                         100.0 * static_cast<double>(w.flagHead) / pl,
+                         100.0 * static_cast<double>(w.flagHead) / tot,
+                         static_cast<unsigned long long>(w.flagHeadKind[0]),
+                         static_cast<unsigned long long>(w.flagHeadKind[1]),
+                         static_cast<unsigned long long>(w.flagHeadKind[2]),
+                         static_cast<unsigned long long>(w.flagHeadKind[3]));
         }
         std::fflush(stderr);
     }
@@ -1332,11 +1513,17 @@ namespace
 #if defined(_MSC_VER)
     __declspec(noinline)
 #endif
-    void g502NotePlain(const G410CompiledUpper *p, uint32_t avail, uint32_t budget,
-                       bool pending, bool ebit)
+    void g502NotePlain(const G410CompiledUpper *p, uint32_t avail, uint32_t nextAvail,
+                       uint32_t budget, bool pending, bool ebit)
     {
         G502Win &w = s_g502Win[s_g502Resume ? 1 : 0];
         ++w.plain;
+        if (!pending && !ebit && budget > G490_MIN_RUN && nextAvail >= G490_MIN_RUN &&
+            g531FlagTailEligible(*p))
+        {
+            ++w.flagHead;
+            ++w.flagHeadKind[p->lowerKind - G422_LK_FIRST_FLAG];
+        }
         int r;
         if (pending)
             r = G502_X_PENDING;
@@ -1804,12 +1991,75 @@ namespace
         }
     }
 
+    std::atomic<uint64_t> s_g531Verified{0u};
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g531VerifyFail(uint32_t pc, uint8_t cachedKind, uint8_t liveKind, uint32_t mac)
+    {
+        std::fprintf(stderr,
+                     "[G531:verify-BAD] pc=0x%x cached=%u live=%u mac=%08x after=%llu\n",
+                     pc, static_cast<unsigned>(cachedKind), static_cast<unsigned>(liveKind), mac,
+                     static_cast<unsigned long long>(s_g531Verified.load(std::memory_order_relaxed)));
+        std::fflush(stderr);
+        std::abort();
+    }
+
+    void g531VerifyPass()
+    {
+        const uint64_t n = s_g531Verified.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n == 1u || (n % 10000000u) == 0u)
+        {
+            std::fprintf(stderr, "[G531:verify] tails=%llu bad=0\n",
+                         static_cast<unsigned long long>(n));
+            std::fflush(stderr);
+        }
+    }
+
+#if DC2_G532_FLAGHEAD
+    // G532's oracle is deliberately separate from G531's. The new claim is not the flag leaf;
+    // G531 already proved that. It is that the same pair can execute one stamp before an ordinary
+    // block without changing the live decode, delayed MAC value, or any VI result.
+    std::atomic<uint64_t> s_g532Verified{0u};
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g532VerifyFail(uint32_t pc, uint8_t cachedKind, uint8_t liveKind, uint32_t mac)
+    {
+        std::fprintf(stderr,
+                     "[G532:verify-BAD] pc=0x%x cached=%u live=%u mac=%08x after=%llu\n",
+                     pc, static_cast<unsigned>(cachedKind), static_cast<unsigned>(liveKind), mac,
+                     static_cast<unsigned long long>(s_g532Verified.load(std::memory_order_relaxed)));
+        std::fflush(stderr);
+        std::abort();
+    }
+
+    void g532VerifyPass()
+    {
+        const uint64_t n = s_g532Verified.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n == 1u || (n % 10000000u) == 0u)
+        {
+            std::fprintf(stderr, "[G532:verify] heads=%llu bad=0\n",
+                         static_cast<unsigned long long>(n));
+            std::fflush(stderr);
+        }
+    }
+#endif
+
     template <bool G499FastLower, bool G499QpLocal, bool G500Tail = false, bool G501Pin = false,
               bool G502Chain = false, bool G504Cursor = false, bool G506QpSeg = false,
               bool G514VStore = false, bool G514VLoad = false, bool G514Verify = false,
               bool G515NopPeel = false, bool G516Up = false, bool G516Low = false,
               bool G516Verify = false, bool G516Peel4 = false, bool G517PtrInd = false,
-              bool G517StampInd = false, bool G517Verify = false>
+              bool G517StampInd = false, bool G517Verify = false,
+              bool G531FlagTail = false, bool G531Verify = false,
+              bool G532FlagHead = false, bool G532Verify = false>
     void g490BlockBody(VU1State &st, uint32_t firstIndex, uint32_t count,
                               uint8_t *vuData, uint32_t dataSize,
                               int *qDelay, int *pDelay,
@@ -1876,6 +2126,113 @@ namespace
             g504Entry = g504Slot;
 #endif
         }
+#if DC2_G532_FLAGHEAD
+        if constexpr (G532FlagHead)
+        {
+            // G532: execute the typed flag consumer at `firstIndex - 1` as a PROLOGUE. The caller
+            // passes the following ordinary run as `firstIndex/count`, so that run keeps exactly
+            // the same noinline call count, address expressions, and branch/flag tail it had under
+            // G531. Only this one generic pair-loop iteration disappears.
+            const uint32_t g532Idx = firstIndex - 1u;
+            const G479FusedPair &g532p = fused[g532Idx];
+            const uint64_t g532src = g532p.source;
+            const uint32_t g532lower = static_cast<uint32_t>(g532src);
+            const uint32_t g532upper = static_cast<uint32_t>(g532src >> 32u);
+
+            // Generic-loop order from `vu1_g435_pair_loop.inc`: Q advance, P advance, delayed-MAC
+            // publication, upper, lower, zero-register re-pin. The ordinary run begins at the next
+            // stamp and observes the counters/history left here.
+            if constexpr (G506Local)
+            {
+                if (g499Qd > 0 && --g499Qd == 0)
+                    st.q = s_vuQPending;
+                if (g499Pd > 0 && --g499Pd == 0)
+                    st.p = s_vuPPending;
+            }
+            else
+            {
+                if (*qDelay > 0 && --(*qDelay) == 0)
+                    st.q = s_vuQPending;
+                if (*pDelay > 0 && --(*pDelay) == 0)
+                    st.p = s_vuPPending;
+            }
+
+            const int64_t g532Stamp = stampBase - 1;
+            const uint32_t g532Mac = g430ResolveAt(g532Stamp - 4);
+            s_vuMacVisible = g532Mac;
+            if (g532lower == 0x34093800u && std::getenv("DC2_G545_CPU_TRACE") != nullptr)
+            {
+                static std::atomic<uint32_t> s_g545TraceCount{0u};
+                if (s_g545TraceCount.fetch_add(1u, std::memory_order_relaxed) < 128u)
+                    std::fprintf(stderr,
+                                 "[G545:cpu-block-fmand] stamp=%lld mac=%04x vi10=%04x mask=%04x\n",
+                                 static_cast<long long>(g532Stamp), g532Mac & 0xffffu,
+                                 static_cast<uint32_t>(static_cast<uint16_t>(st.vi[10])),
+                                 static_cast<uint32_t>(static_cast<uint16_t>(st.vi[7])));
+            }
+
+            if (g532p.pair.upperKind != 0x6fu)
+                g421FastUpper<G501Pin, G504Cursor>(st, g532upper, g532p.pair.upperKind,
+                                                   true, false, true, g532Stamp, hb, g504Slot);
+
+            int32_t g532Expected[16] = {};
+            if constexpr (G532Verify)
+            {
+                const uint8_t g532LiveKind = g422DecodeLowerKind(
+                    g532lower, true, (s_g410Cache.decodeArmState & 2u) != 0u);
+                if (g532LiveKind != g532p.pair.lowerKind ||
+                    !g531FlagTailEligible(g532p.pair))
+                    g532VerifyFail(g532Idx * 8u, g532p.pair.lowerKind, g532LiveKind, g532Mac);
+                std::memcpy(g532Expected, st.vi, sizeof(g532Expected));
+                switch (g532p.pair.lowerKind)
+                {
+                case G422_LK_FCAND:
+                    g532Expected[1] = ((st.clip & (g532lower & 0xFFFFFFu)) != 0u) ? 1 : 0;
+                    break;
+                case G422_LK_FCOR:
+                    g532Expected[1] =
+                        ((st.clip | (g532lower & 0xFFFFFFu)) == 0xFFFFFFu) ? 1 : 0;
+                    break;
+                case G422_LK_FMAND:
+                {
+                    const uint8_t it = LIT(g532lower);
+                    const uint8_t is = LIS(g532lower);
+                    if (it != 0u)
+                        g532Expected[it] = static_cast<int32_t>(
+                            g532Mac & static_cast<uint32_t>(
+                                static_cast<uint16_t>(g532Expected[is])));
+                    break;
+                }
+                case G422_LK_FCGET:
+                {
+                    const uint8_t it = LIT(g532lower);
+                    if (it != 0u)
+                        g532Expected[it] = static_cast<int32_t>(st.clip & 0xFFFu);
+                    break;
+                }
+                default:
+                    g532VerifyFail(g532Idx * 8u, g532p.pair.lowerKind,
+                                   g532LiveKind, g532Mac);
+                }
+            }
+
+            g422FastLower(st, g532lower, g532p.pair.lowerKind, vuData, dataSize);
+
+            if constexpr (G532Verify)
+            {
+                if (std::memcmp(g532Expected, st.vi, sizeof(g532Expected)) != 0)
+                    g532VerifyFail(g532Idx * 8u, g532p.pair.lowerKind,
+                                   g532p.pair.lowerKind, g532Mac);
+                g532VerifyPass();
+            }
+
+            if ((g532p.pair.g425Flags & G425_PF_TOUCHES_ZERO) != 0u)
+            {
+                _mm_storeu_ps(st.vf[0], _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f));
+                st.vi[0] = 0;
+            }
+        }
+#endif
         // G502: exactly ONE iteration unless `G502Chain`, in which case the `break` below is
         // replaced by the chain step. For every pre-existing instantiation this is a `for(;;)`
         // whose body ends in an unconditional `break`, which MSVC folds away entirely — the
@@ -2279,6 +2636,81 @@ namespace
             else
                 g422FastLower(st, lower, fp.pair.lowerKind, vuData, dataSize);
 
+            // G545 v22 default-off parity trace for the three qword-860 store encodings seen in
+            // Dungeon record 8. Stores do not modify their VF source, so sampling after the lower
+            // keeps the source bits exact; SQI's post-increment is reversed only for its address.
+            if ((lower == 0x03e89000u || lower == 0x81e98b7du || lower == 0x81e9cb7du ||
+                 lower == 0x03e28800u) &&
+                g_g545CpuTraceSequence.load(std::memory_order_relaxed) == 784u)
+            {
+                const uint32_t g545Op = (lower >> 25u) & 0x7fu;
+                const uint32_t g545Base = (lower >> 16u) & 31u;
+                const uint32_t g545Source = (lower >> 11u) & 31u;
+                uint32_t g545Q = 0xffffffffu;
+                if (g545Op == 0x01u)
+                {
+                    const int32_t g545Imm = static_cast<int32_t>(lower << 21u) >> 21u;
+                    g545Q = static_cast<uint32_t>(st.vi[g545Base] + g545Imm) & 0x3ffu;
+                }
+                else if (g545Op == 0x40u && S2_FUNC(lower) == 0x35u)
+                {
+                    g545Q = static_cast<uint32_t>(
+                                  static_cast<uint16_t>(st.vi[g545Base] - 1)) &
+                              0x3ffu;
+                }
+                if ((g545Q == 860u || g545Q == 920u) && vuData != nullptr &&
+                    g545Q * 16u + 16u <= dataSize)
+                {
+                    uint32_t g545SourceBits[4]{}, g545StoredBits[4]{};
+                    std::memcpy(g545SourceBits, st.vf[g545Source], 16u);
+                    std::memcpy(g545StoredBits, vuData + g545Q * 16u, 16u);
+                    static std::atomic<uint32_t> s_g545BlockStoreTraceCount{0u};
+                    if (s_g545BlockStoreTraceCount.fetch_add(1u, std::memory_order_relaxed) < 64u)
+                        std::fprintf(stderr,
+                                     "[G545:cpu-block-ramstore] seq=784 pc=%04x instr=%08x q=%u vf=%u source=%08x,%08x,%08x,%08x after=%08x,%08x,%08x,%08x\n",
+                                     (firstIndex + j) * 8u, lower, g545Q, g545Source,
+                                     g545SourceBits[0], g545SourceBits[1],
+                                     g545SourceBits[2], g545SourceBits[3],
+                                     g545StoredBits[0], g545StoredBits[1],
+                                     g545StoredBits[2], g545StoredBits[3]);
+                }
+            }
+            if ((lower == 0x01f54000u || lower == 0x81f5437cu) &&
+                g_g545CpuTraceSequence.load(std::memory_order_relaxed) == 784u)
+            {
+                const uint32_t g545Op = (lower >> 25u) & 0x7fu;
+                const uint32_t g545It = (lower >> 16u) & 31u;
+                const uint32_t g545Is = (lower >> 11u) & 31u;
+                uint32_t g545Q = 0xffffffffu;
+                if (g545Op == 0x00u)
+                {
+                    const int32_t g545Imm = static_cast<int32_t>(lower << 21u) >> 21u;
+                    g545Q = static_cast<uint32_t>(st.vi[g545Is] + g545Imm) & 0x3ffu;
+                }
+                else if (g545Op == 0x40u && S2_FUNC(lower) == 0x34u)
+                {
+                    g545Q = static_cast<uint32_t>(
+                                  static_cast<uint16_t>(st.vi[g545Is] - 1)) &
+                              0x3ffu;
+                }
+                if (g545It == 21u && g545Q == 920u && vuData != nullptr &&
+                    g545Q * 16u + 16u <= dataSize)
+                {
+                    uint32_t g545LoadedBits[4]{}, g545RamBits[4]{};
+                    std::memcpy(g545LoadedBits, st.vf[21], 16u);
+                    std::memcpy(g545RamBits, vuData + g545Q * 16u, 16u);
+                    static std::atomic<uint32_t> s_g545BlockLq21TraceCount{0u};
+                    if (s_g545BlockLq21TraceCount.fetch_add(1u, std::memory_order_relaxed) < 32u)
+                        std::fprintf(stderr,
+                                     "[G545:cpu-block-lq21] seq=784 pc=%04x instr=%08x q=%u loaded=%08x,%08x,%08x,%08x ram=%08x,%08x,%08x,%08x\n",
+                                     (firstIndex + j) * 8u, lower, g545Q,
+                                     g545LoadedBits[0], g545LoadedBits[1],
+                                     g545LoadedBits[2], g545LoadedBits[3],
+                                     g545RamBits[0], g545RamBits[1],
+                                     g545RamBits[2], g545RamBits[3]);
+                }
+            }
+
             if ((fp.pair.g425Flags & G425_PF_TOUCHES_ZERO) != 0u)
             {
                 // G484's promoted wide form, byte-for-byte with the pair loop's re-pin.
@@ -2306,6 +2738,115 @@ namespace
         if constexpr (!G506QpSeg)
             break;
         }
+        if constexpr (G531FlagTail)
+        {
+            // G531: typed tail 3 is one of G487's four compiled flag consumers. The generic loop
+            // advances Q/P, publishes the delayed MAC line, executes upper, then lower. Reproduce
+            // that order exactly; ordinary block pairs and G500 branch tails keep their old body.
+            if (g500TailCount == G531_FLAG_TAIL)
+            {
+                const uint32_t g531Idx = firstIndex + count;
+                const G479FusedPair &g531p = fused[g531Idx];
+                const uint64_t g531src = g531p.source;
+                const uint32_t g531lower = static_cast<uint32_t>(g531src);
+                const uint32_t g531upper = static_cast<uint32_t>(g531src >> 32u);
+
+                if constexpr (G506Local)
+                {
+                    if (g499Qd > 0 && --g499Qd == 0)
+                        st.q = s_vuQPending;
+                    if (g499Pd > 0 && --g499Pd == 0)
+                        st.p = s_vuPPending;
+                }
+                else
+                {
+                    if (*qDelay > 0 && --(*qDelay) == 0)
+                        st.q = s_vuQPending;
+                    if (*pDelay > 0 && --(*pDelay) == 0)
+                        st.p = s_vuPPending;
+                }
+
+                // This executor is reachable only through g443Fixed, whose gate proves the
+                // promoted MAC-history depth is four. Use the TLS object directly: adding a
+                // pointer/depth argument would grow every block call for a one-pair tail.
+                const uint32_t g531Mac =
+                    g430ResolveAt(stampBase + static_cast<int64_t>(count) - 4);
+                s_vuMacVisible = g531Mac;
+                if (g531lower == 0x34093800u &&
+                    g_g545CpuTraceSequence.load(std::memory_order_relaxed) == 784u)
+                {
+                    static std::atomic<uint32_t> s_g545TraceCount{0u};
+                    if (s_g545TraceCount.fetch_add(1u, std::memory_order_relaxed) < 32u)
+                        std::fprintf(stderr,
+                                     "[G545:cpu-g531-fmand] seq=784 stamp=%lld mac=%04x vi10=%04x mask=%04x\n",
+                                     static_cast<long long>(stampBase + static_cast<int64_t>(count)),
+                                     g531Mac & 0xffffu,
+                                     static_cast<uint32_t>(static_cast<uint16_t>(st.vi[10])),
+                                     static_cast<uint32_t>(static_cast<uint16_t>(st.vi[7])));
+                }
+
+                if (g531p.pair.upperKind != 0x6fu)
+                    g421FastUpper<G501Pin, G504Cursor>(
+                        st, g531upper, g531p.pair.upperKind, true, false, true,
+                        stampBase + static_cast<int64_t>(count), hb, g504Slot);
+
+                int32_t g531Expected[16] = {};
+                if constexpr (G531Verify)
+                {
+                    const uint8_t g531LiveKind = g422DecodeLowerKind(
+                        g531lower, true, (s_g410Cache.decodeArmState & 2u) != 0u);
+                    if (g531LiveKind != g531p.pair.lowerKind ||
+                        !g531FlagTailEligible(g531p.pair))
+                        g531VerifyFail(g531Idx * 8u, g531p.pair.lowerKind, g531LiveKind, g531Mac);
+                    std::memcpy(g531Expected, st.vi, sizeof(g531Expected));
+                    switch (g531p.pair.lowerKind)
+                    {
+                    case G422_LK_FCAND:
+                        g531Expected[1] = ((st.clip & (g531lower & 0xFFFFFFu)) != 0u) ? 1 : 0;
+                        break;
+                    case G422_LK_FCOR:
+                        g531Expected[1] =
+                            ((st.clip | (g531lower & 0xFFFFFFu)) == 0xFFFFFFu) ? 1 : 0;
+                        break;
+                    case G422_LK_FMAND:
+                    {
+                        const uint8_t it = LIT(g531lower);
+                        const uint8_t is = LIS(g531lower);
+                        if (it != 0u)
+                            g531Expected[it] = static_cast<int32_t>(
+                                g531Mac & static_cast<uint32_t>(
+                                    static_cast<uint16_t>(g531Expected[is])));
+                        break;
+                    }
+                    case G422_LK_FCGET:
+                    {
+                        const uint8_t it = LIT(g531lower);
+                        if (it != 0u)
+                            g531Expected[it] = static_cast<int32_t>(st.clip & 0xFFFu);
+                        break;
+                    }
+                    default:
+                        g531VerifyFail(g531Idx * 8u, g531p.pair.lowerKind, g531LiveKind, g531Mac);
+                    }
+                }
+
+                g422FastLower(st, g531lower, g531p.pair.lowerKind, vuData, dataSize);
+
+                if constexpr (G531Verify)
+                {
+                    if (std::memcmp(g531Expected, st.vi, sizeof(g531Expected)) != 0)
+                        g531VerifyFail(g531Idx * 8u, g531p.pair.lowerKind,
+                                       g531p.pair.lowerKind, g531Mac);
+                    g531VerifyPass();
+                }
+
+                if ((g531p.pair.g425Flags & G425_PF_TOUCHES_ZERO) != 0u)
+                {
+                    _mm_storeu_ps(st.vf[0], _mm_setr_ps(0.0f, 0.0f, 0.0f, 1.0f));
+                    st.vi[0] = 0;
+                }
+            }
+        }
         if constexpr (G500Tail)
         {
             // G500. `g500TailCount` is 0, 1 or 2 and the caller has already proved, from the
@@ -2313,7 +2854,7 @@ namespace
             // control transfer and (for 2) that slot `firstIndex + count + 1` is a plain eligible
             // pair. Statement order is the plain pair's, and the two additions are the pair loop's
             // own branch protocol — see the exactness note at the head of this file.
-            if (g500TailCount != 0u)
+            if (g500TailCount != 0u && (!G531FlagTail || g500TailCount != G531_FLAG_TAIL))
             {
                 const uint32_t g500Idx = firstIndex + count;
                 const G479FusedPair &bp = fused[g500Idx];
@@ -2493,6 +3034,10 @@ namespace
                         {
                             g502T = static_cast<uint32_t>(
                                 s_g410Cache.g500Tail[g502TPc >> 3u]);
+                            // G531's typed tail is supported only by arms 23/24. The retired G502
+                            // chain body is arm 5 and interprets nonzero values as branch tails.
+                            if (g502T == G531_FLAG_TAIL)
+                                g502T = 0u;
                             if (g502T == 2u && g502TPc + 16u > g502CodeSize)
                                 g502T = 1u;
                             if (g502Avail + g502T > g502Rem)
@@ -2783,6 +3328,301 @@ namespace
             st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCount);
     }
 
+    // G531 arm 23: the G516 shipped body plus one typed flag-consumer tail. Arm 24 is the same
+    // executor with an independent live-word decode and VI-state oracle; it is never a timing arm.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g531ExecuteBlockTailFlag(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                  uint8_t *vuData, uint32_t dataSize,
+                                  int *qDelay, int *pDelay,
+                                  int64_t stampBase, G430HistBlock *hb, uint32_t tailCode)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, true, false, true, false, false, false, true, false>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCode);
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g531ExecuteBlockTailVerify(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                    uint8_t *vuData, uint32_t dataSize,
+                                    int *qDelay, int *pDelay,
+                                    int64_t stampBase, G430HistBlock *hb, uint32_t tailCode)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, true, false, true, false, false, false, true, true>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCode);
+    }
+
+    // G533 arms 27/28: immutable-image specialization. Admission is one rebuild-time exact-source
+    // plan bit plus the block identity already live at this call site. No per-pair plan stream, hash,
+    // function pointer, or runtime code generation enters the hot loop; all non-matching code uses
+    // G531 unchanged.
+    static DC2_G330_FORCEINLINE bool g533Hot3088Match(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode)
+    {
+        // Test the caller-live identity first. Ordinary blocks then avoid even loading the plan bit.
+        return firstIndex == G533_HOT_3088_INDEX && count == G533_HOT_3088_COUNT &&
+               tailCode == G533_HOT_3088_TAIL && s_g533Hot3088Plan != 0u;
+    }
+
+    static DC2_G330_FORCEINLINE bool g533Hot3088Runnable(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode,
+        const uint8_t *vuData, uint32_t dataSize, const G430HistBlock *hb)
+    {
+        return g533Hot3088Match(firstIndex, count, tailCode) && vuData != nullptr &&
+               dataSize == PS2_VU1_DATA_SIZE && hb != nullptr;
+    }
+
+    template <unsigned Vf>
+    static DC2_G330_FORCEINLINE void g533LqiFullVi8(VU1State &st, const uint8_t *vuData)
+    {
+        static_assert(Vf < 32u);
+        const uint32_t addr =
+            (static_cast<uint32_t>(static_cast<uint16_t>(st.vi[8])) * 16u) &
+            (PS2_VU1_DATA_SIZE - 1u);
+        _mm_storeu_ps(st.vf[Vf], _mm_loadu_ps(reinterpret_cast<const float *>(vuData + addr)));
+        st.vi[8] = static_cast<int16_t>(st.vi[8] + 1);
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g533ExecuteHot3088(VU1State &st, uint8_t *vuData,
+                            int *qDelay, int *pDelay, int64_t stampBase,
+                            G430HistBlock *hb)
+    {
+        int qd = *qDelay;
+        int pd = *pDelay;
+
+        // 0x3088..0x3098: three fixed FMAC uppers paired with three full-vector LQI loads.
+        // Literal words make descriptor class, operands, masks and lower dispatch compile-time
+        // constants while preserving upper-before-lower issue order and one history stamp per pair.
+        g421FastUpper<true, false, true>(st, 0x01e0ac5bu, 0x1bu, true, false, true,
+                                         stampBase + 0, hb, g504UnusedSlot, 0x03000401u);
+        g533LqiFullVi8<21u>(st, vuData);
+
+        g421FastUpper<true, false, true>(st, 0x01e0b49bu, 0x1bu, true, false, true,
+                                         stampBase + 1, hb, g504UnusedSlot, 0x03000401u);
+        g533LqiFullVi8<22u>(st, vuData);
+
+        g421FastUpper<true, false, true>(st, 0x01e0bcdbu, 0x1bu, true, false, true,
+                                         stampBase + 2, hb, g504UnusedSlot, 0x03000401u);
+        g533LqiFullVi8<23u>(st, vuData);
+
+        // 0x30a0..0x30c8: fixed NOP lowers, with only the two non-VNOP uppers retained.
+        g421FastUpper<true, false, true>(st, 0x01d189ffu, 0x5fu, true, false, true,
+                                         stampBase + 4, hb, g504UnusedSlot, 0x00000008u);
+        g421FastUpper<true, false, true>(st, 0x01d5a9ffu, 0x5fu, true, false, true,
+                                         stampBase + 5, hb, g504UnusedSlot, 0x00000008u);
+
+        // 0x30d0 typed tail: publish the exact four-cycle MAC history point before fixed FCGET.
+        s_vuMacVisible = g430ResolveAt(stampBase + 5);
+        st.vi[1] = static_cast<int32_t>(st.clip & 0xFFFu);
+
+        // All ten exact pairs are scalar-pipe-free and none reads Q/P. Collapse the same G506
+        // countdown contract to one span update; publication timing inside this fragment is
+        // unobservable, while the architectural value and remaining delay at exit stay exact.
+        if (qd > 0)
+        {
+            if (qd <= 10)
+            {
+                qd = 0;
+                st.q = s_vuQPending;
+            }
+            else
+                qd -= 10;
+        }
+        if (pd > 0)
+        {
+            if (pd <= 10)
+            {
+                pd = 0;
+                st.p = s_vuPPending;
+            }
+            else
+                pd -= 10;
+        }
+
+        *qDelay = qd;
+        *pDelay = pd;
+    }
+
+    thread_local uint64_t s_g533Hits = 0u;
+    thread_local uint64_t s_g533Fallbacks = 0u;
+    thread_local uint64_t s_g533LastReport = 0u;
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#endif
+    void g533NotePlan(bool hit)
+    {
+        if (hit)
+            ++s_g533Hits;
+        else
+            ++s_g533Fallbacks;
+        const uint64_t total = s_g533Hits + s_g533Fallbacks;
+        if (total - s_g533LastReport >= 10000000ull)
+        {
+            s_g533LastReport = total;
+            std::fprintf(stderr,
+                         "[G533:stat] blocks=%llu hits=%llu fallback=%llu hitPct=%.3f pairs=%llu\n",
+                         static_cast<unsigned long long>(total),
+                         static_cast<unsigned long long>(s_g533Hits),
+                         static_cast<unsigned long long>(s_g533Fallbacks),
+                         total != 0u ? 100.0 * static_cast<double>(s_g533Hits) /
+                                           static_cast<double>(total) : 0.0,
+                         static_cast<unsigned long long>(s_g533Hits * 10u));
+            std::fflush(stderr);
+        }
+    }
+
+    // Census is a separate arm: the candidate priced by paired A/B never pays counters,
+    // report-threshold checks, or a runtime flag branch in its per-block leaf.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g533ExecuteBlockTailStat(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                  uint8_t *vuData, uint32_t dataSize,
+                                  int *qDelay, int *pDelay,
+                                  int64_t stampBase, G430HistBlock *hb, uint32_t tailCode)
+    {
+        const bool hot = g533Hot3088Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        g533NotePlan(hot);
+        if (hot)
+        {
+            g533ExecuteHot3088(st, vuData, qDelay, pDelay, stampBase, hb);
+            return;
+        }
+        g531ExecuteBlockTailFlag(st, firstIndex, count, vuData, dataSize,
+                                 qDelay, pDelay, stampBase, hb, tailCode);
+    }
+
+    std::atomic<uint64_t> s_g533Verified{0u};
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g533ExecuteBlockTailVerify(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                    uint8_t *vuData, uint32_t dataSize,
+                                    int *qDelay, int *pDelay,
+                                    int64_t stampBase, G430HistBlock *hb, uint32_t tailCode)
+    {
+        if (!g533Hot3088Runnable(firstIndex, count, tailCode, vuData, dataSize, hb))
+        {
+            g531ExecuteBlockTailFlag(st, firstIndex, count, vuData, dataSize,
+                                     qDelay, pDelay, stampBase, hb, tailCode);
+            return;
+        }
+
+        const VU1State before = st;
+        const G430HistBlock histBefore = *hb;
+        const int qBefore = *qDelay;
+        const int pBefore = *pDelay;
+        const uint32_t macBefore = s_vuMacVisible;
+        // The exact fragment contains only three VU-memory LOADS. Register/history/pipeline state
+        // is shadowed on every hit; sample the structurally read-only RAM image every 1,024 hits so
+        // the oracle does not copy 48 KiB at the fragment's very high dynamic frequency.
+        const uint64_t verifyOrdinal =
+            s_g533Verified.load(std::memory_order_relaxed) / 10u;
+        const bool hasMem = vuData != nullptr && dataSize <= PS2_VU1_DATA_SIZE &&
+                            (verifyOrdinal & 1023u) == 0u;
+        if (hasMem)
+            std::memcpy(s_g422VerMemBefore, vuData, dataSize);
+
+        g531ExecuteBlockTailFlag(st, firstIndex, count, vuData, dataSize,
+                                 qDelay, pDelay, stampBase, hb, tailCode);
+        const VU1State expected = st;
+        const G430HistBlock histExpected = *hb;
+        const int qExpected = *qDelay;
+        const int pExpected = *pDelay;
+        const uint32_t macExpected = s_vuMacVisible;
+        if (hasMem)
+            std::memcpy(s_g422VerMemFast, vuData, dataSize);
+
+        st = before;
+        *hb = histBefore;
+        *qDelay = qBefore;
+        *pDelay = pBefore;
+        s_vuMacVisible = macBefore;
+        if (hasMem)
+            std::memcpy(vuData, s_g422VerMemBefore, dataSize);
+
+        g533ExecuteHot3088(st, vuData, qDelay, pDelay, stampBase, hb);
+
+        const bool badState = !g422StatesEqual(expected, st);
+        const bool badHist = std::memcmp(&histExpected, hb, sizeof(histExpected)) != 0;
+        const bool badPipe = qExpected != *qDelay || pExpected != *pDelay;
+        const bool badMac = macExpected != s_vuMacVisible;
+        const bool badMem = hasMem && std::memcmp(s_g422VerMemFast, vuData, dataSize) != 0;
+        if (badState || badHist || badPipe || badMac || badMem)
+        {
+            std::fprintf(stderr,
+                         "[G533:verify-BAD] state=%d hist=%d pipe=%d mac=%d mem=%d"
+                         " q=%d/%d p=%d/%d\n",
+                         static_cast<int>(badState), static_cast<int>(badHist),
+                         static_cast<int>(badPipe), static_cast<int>(badMac),
+                         static_cast<int>(badMem), qExpected, *qDelay, pExpected, *pDelay);
+            std::fflush(stderr);
+            std::abort();
+        }
+
+        const uint64_t n = s_g533Verified.fetch_add(10u, std::memory_order_relaxed) + 10u;
+        if (n == 10u || n % 10000000u == 0u)
+        {
+            std::fprintf(stderr, "[G533:verify] pairs=%llu bad=0\n",
+                         static_cast<unsigned long long>(n));
+            std::fflush(stderr);
+        }
+    }
+
+#if DC2_G532_FLAGHEAD
+    // G532 arms 25/26: the G531 body with one typed flag-consumer prologue. `firstIndex` names the
+    // ordinary run, while the prologue is `firstIndex - 1`; the caller advances stampBase by one.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g532ExecuteBlockHeadFlag(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                  uint8_t *vuData, uint32_t dataSize,
+                                  int *qDelay, int *pDelay,
+                                  int64_t stampBase, G430HistBlock *hb, uint32_t tailCode)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, true, false, true, false, false, false, true, false, true, false>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCode);
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g532ExecuteBlockHeadVerify(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                    uint8_t *vuData, uint32_t dataSize,
+                                    int *qDelay, int *pDelay,
+                                    int64_t stampBase, G430HistBlock *hb, uint32_t tailCode)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, true, false, true, false, false, false, true, true, true, true>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCode);
+    }
+#endif
+
 #if DC2_G516_UPDESC
 #if defined(_MSC_VER)
     __declspec(noinline)
@@ -3006,8 +3846,10 @@ namespace
         // G517: TWENTY-FOUR slots, not sixteen. Arms 19–22 would all fold onto slot 0 and a
         // `g517ind` gate could print at most ONE `[G499:blk]` line — the same G457 failure G501 and
         // G516 already fixed here, third firing. Widen this in the SAME edit that adds an arm.
-        static std::atomic<uint32_t> s_once[24] = {};
-        const int slot = (arm < 0 || arm > 23) ? 0 : arm;
+        // G531: TWENTY-FIVE slots. Arm 24 is the flag-tail oracle; folding it onto slot 0 would
+        // hide proof that the verifier copy was selected.
+        static std::atomic<uint32_t> s_once[25] = {};
+        const int slot = (arm < 0 || arm > 24) ? 0 : arm;
         if (s_once[slot].fetch_add(1u, std::memory_order_relaxed) != 0u)
             return;
         std::fprintf(stderr, "[G499:blk] arm=%d\n", arm);

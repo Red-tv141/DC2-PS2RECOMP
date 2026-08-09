@@ -219,15 +219,18 @@ namespace
         // G475: G422's dense covered kinds 8..17 are control transfers. All other covered
         // kinds are branch-free and scalar-pipe/flag-reader-free by G422's contract.
         const uint8_t g475LowerKind =
-            g422DecodeLowerKind(lower, s_g410Cache.decodeFlagLower);
+            g422DecodeLowerKind(lower, s_g410Cache.decodeFlagLower,
+                                (s_g410Cache.decodeArmState & 2u) != 0u);
         const bool g475Control = g475LowerKind >= G422_LK_B &&
                                  g475LowerKind <= G422_LK_IBGEZ;
         // G487: a flag consumer is covered but NOT trace-safe — same exclusion as
         // g475TracePairEligible, made in the same edit so the two cannot drift.
         const bool g475Flag = g475LowerKind >= (uint8_t)G422_LK_FIRST_FLAG;
+        const bool g475Scalar = g475LowerKind == (uint8_t)G422_LK_DIV;
         const bool g475Safe = traceEntrySafe && kind == 0x6fu &&
                               ((upper >> 30u) & 3u) == 0u &&
-                              g475LowerKind != G422_LK_NONE && !g475Control && !g475Flag;
+                              g475LowerKind != G422_LK_NONE && !g475Control && !g475Flag &&
+                              !g475Scalar;
         if (g475Safe)
         {
             if (s_g421.g475Cur != 0u && pc != s_g421.g475PrevPc + 8u)
@@ -261,7 +264,8 @@ namespace
         }
         // G487: decode under the arm the G410 pair cache was actually built with, so
         // `[G422:cover]` / `[G479:lk]` / `[G486:uncov]` report the dispatch that RAN.
-        const uint8_t lk = g422DecodeLowerKind(lower, s_g410Cache.decodeFlagLower);
+        const uint8_t lk = g422DecodeLowerKind(lower, s_g410Cache.decodeFlagLower,
+                                               (s_g410Cache.decodeArmState & 2u) != 0u);
         if (lk < (uint8_t)G422_LK_COUNT)
             ++s_g421.lowerKind[lk];
         // G486: name the uncovered lowers (see the uncovHist comment).

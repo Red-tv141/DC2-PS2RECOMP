@@ -252,7 +252,9 @@ namespace
         // G489: the pc-skip arm this cache's `G489_PF_CANBRANCH` bits were decoded under. Same
         // contract as the two above — sampled once, in g410PreparePairs, and a flip rebuilds.
         bool decodePcSkip = false;
-        bool decodeArmValid = false;
+        // G532b: preserve this byte and every following cache offset. Bit 0 is the old validity
+        // bool; bit 1 records whether DIV was decoded into the compiled-lower kind.
+        uint8_t decodeArmState = 0u;
         std::array<G410CompiledUpper, PS2_VU1_CODE_SIZE / 8u> uppers{};
         std::array<uint64_t, PS2_VU1_CODE_SIZE / 8u> sources{};
         // G479: the same two words, interleaved. 16-byte aligned so one record is never split
@@ -387,9 +389,9 @@ namespace
     // `execLower`'s call boundary is the largest in the pair loop by a wide margin — its prologue
     // is 8 GPR pushes, `sub rsp,0x728`, TEN `movaps` spills of xmm6-xmm15 and a /GS cookie, all
     // mirrored on return, before the two-level opcode switch is even reached. `[G422:cover]` says
-    // 4.61% of pairs (~75 k/frame) cross it, and `[G486:uncov]` says the only coverable mass in
-    // that population is the four flag consumers (2.54% of pairs, ~41 k/frame); the rest is DIV
-    // (Q-latency staging), XGKICK and the EFU/WAIT scalar pipe, none of which can move.
+    // 4.61% of pairs (~75 k/frame) cross it, and `[G486:uncov]` says the first coverable mass in
+    // that population is the four flag consumers (2.54% of pairs, ~41 k/frame). G532 later showed
+    // that DIV can also move when its Q timing stays in the main loop and only its body enters the leaf.
     //
     // WHY THIS SHAPE. `g421FastUpper` and `g422FastLower` are both FULLY INLINED into
     // `VU1Interpreter::run()` in this binary (confirmed from the /MAP: run() contains no call to
@@ -412,9 +414,8 @@ namespace
     // prologue/epilogue the /MAP predicted. The prediction and the measurement agree, which is why
     // this is a call-boundary result and not a code-shape accident.
     // `[G422:cover]` moved 92.29% → **96.52%** covered and `[G486:uncov]` 4.61% → **2.08%** of
-    // cycles, with the four flag opcodes gone from the histogram and only DIV (80.8% of the
-    // residue), XGKICK, WAITQ/WAITP, XTOP, MFP, ERLENG and RSQRT left — all structurally
-    // non-coverable. The compiled LOWER slot is closed after this phase.
+    // cycles, with the four flag opcodes gone from the histogram. G532 subsequently compiled DIV,
+    // which was 80.8% of that residue, without aggregating it across its scalar-pipeline boundary.
     //
     // Default:  ON.  Rollback DC2_G487_NO_FLAG_LOWER=1 (restores the execLower path exactly).
     //           Paired gate DC2_G419_AB=flaglower, proof DC2_G487_STAT=1,
@@ -430,6 +431,28 @@ namespace
         if (s_paired)
             return g487FlagLowerArm() > 0;
         static const bool s_on = !f50_12_vu_env_flag("DC2_G487_NO_FLAG_LOWER");
+        return s_on;
+    }
+
+    // G532b: compile DIV into the G422 leaf. This is a cache property, not a hot-loop branch:
+    // an arm flip re-decodes all lowerKind bytes before this run executes. The existing scalar
+    // pre-stall remains in the pair loop, and DIV stays excluded from trace/block aggregation.
+    bool g532DivLowerRequested()
+    {
+        static const bool s_paired = [] {
+            const char *ab = std::getenv("DC2_G419_AB");
+            return ab != nullptr && std::strcmp(ab, "divlower") == 0;
+        }();
+        if (s_paired)
+        {
+            const bool on = g532DivLowerArm() > 0;
+            static std::atomic<uint32_t> s_seen{0u};
+            const uint32_t bit = on ? 2u : 1u;
+            if ((s_seen.fetch_or(bit, std::memory_order_relaxed) & bit) == 0u)
+                std::fprintf(stderr, "[G532:armed] divlower=%d compiled=1\n", on ? 1 : 0);
+            return on;
+        }
+        static const bool s_on = !f50_12_vu_env_flag("DC2_G532_NO_DIVLOWER");
         return s_on;
     }
 
@@ -634,7 +657,8 @@ namespace
         return static_cast<uint8_t>(0x40u + func);
     }
 
-    G410CompiledUpper g410DecodePair(uint64_t source, bool flagLower, bool fastOp, bool pcSkip)
+    G410CompiledUpper g410DecodePair(
+        uint64_t source, bool flagLower, bool divLower, bool fastOp, bool pcSkip)
     {
         const uint32_t upper = static_cast<uint32_t>(source >> 32u);
         const uint32_t lower = static_cast<uint32_t>(source);
@@ -650,7 +674,7 @@ namespace
             pair.lowerS2 = S2_FUNC(lower);
         // G422: predecode the lower slot's inline-execution kind here, so the hot loop never
         // decodes it. The cache verifier's whole-struct memcmp covers this field too.
-        pair.lowerKind = g422DecodeLowerKind(lower, flagLower);
+        pair.lowerKind = g422DecodeLowerKind(lower, flagLower, divLower);
 
         const uint8_t upperOp = static_cast<uint8_t>(upper & 0x3fu);
         if (upperOp < 0x3cu)
@@ -780,8 +804,9 @@ namespace
         // G487: decode under the arm THIS cache was built with, never under a freshly sampled one,
         // so an MPG write that lands mid-block cannot mix two decodes into one cache.
         const G410CompiledUpper pair =
-            g410DecodePair(source, s_g410Cache.decodeFlagLower, s_g410Cache.decodeFastOp,
-                           s_g410Cache.decodePcSkip);
+            g410DecodePair(source, s_g410Cache.decodeFlagLower,
+                           (s_g410Cache.decodeArmState & 2u) != 0u,
+                           s_g410Cache.decodeFastOp, s_g410Cache.decodePcSkip);
         // G428: keep the whole-code-store reader tallies exact across precise invalidation.
         const uint8_t oldFlags = s_g410Cache.uppers[index].g425Flags;
         if ((oldFlags & G428_PF_STATUSREAD) != 0u)
@@ -815,8 +840,9 @@ namespace
         // delay line per pair. The four flag consumers break that half of the contract, so they
         // are excluded here and in the census's `g475Safe` (same edit, as G486 §4 required).
         const bool lowerFlag = pair.lowerKind >= G422_LK_FIRST_FLAG;
+        const bool lowerScalar = pair.lowerKind == G422_LK_DIV;
         return pair.upperKind == 0x6fu && pair.pairFlags == 0u &&
-               pair.lowerKind != G422_LK_NONE && !lowerControl && !lowerFlag;
+               pair.lowerKind != G422_LK_NONE && !lowerControl && !lowerFlag && !lowerScalar;
     }
 
     // G490: defined in vu1_g490_block_run.inc, which must be included after vu1_g421_fast_upper.inc
@@ -849,15 +875,18 @@ namespace
         // 2,048-slot cache before a single pair of this run() executes, which is what makes the
         // arm a property of the cache instead of a per-pair test in the loop.
         const bool flagLower = g487FlagLowerRequested();
+        const bool divLower = g532DivLowerRequested();
         const bool fastOp = g488FastOpRequested();
         const bool pcSkip = g489PcSkipRequested();
-        if (!s_g410Cache.decodeArmValid || s_g410Cache.decodeFlagLower != flagLower ||
+        const bool cachedDivLower = (s_g410Cache.decodeArmState & 2u) != 0u;
+        if ((s_g410Cache.decodeArmState & 1u) == 0u ||
+            s_g410Cache.decodeFlagLower != flagLower || cachedDivLower != divLower ||
             s_g410Cache.decodeFastOp != fastOp || s_g410Cache.decodePcSkip != pcSkip)
         {
             s_g410Cache.decodeFlagLower = flagLower;
             s_g410Cache.decodeFastOp = fastOp;
             s_g410Cache.decodePcSkip = pcSkip;
-            s_g410Cache.decodeArmValid = true;
+            s_g410Cache.decodeArmState = static_cast<uint8_t>(1u | (divLower ? 2u : 0u));
             s_g410Cache.codeBase = nullptr; // force the full rebuild below
         }
         if (s_g410Cache.codeBase != codeBase)
@@ -917,8 +946,9 @@ namespace
         if (s_g410Cache.sources[index] != liveSource)
             g410MissedInvalidation(pc, s_g410Cache.sources[index], liveSource);
         const G410CompiledUpper expected =
-            g410DecodePair(liveSource, s_g410Cache.decodeFlagLower, s_g410Cache.decodeFastOp,
-                           s_g410Cache.decodePcSkip);
+            g410DecodePair(liveSource, s_g410Cache.decodeFlagLower,
+                           (s_g410Cache.decodeArmState & 2u) != 0u,
+                           s_g410Cache.decodeFastOp, s_g410Cache.decodePcSkip);
         if (std::memcmp(&pair, &expected, sizeof(pair)) != 0)
             g410MismatchedPredecode(pc, pair, expected);
     }

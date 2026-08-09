@@ -1,6 +1,10 @@
 // G433: blocking colour-readback ceiling probe in lle_gpu_raster_backend.inc
 // (DC2_G433_NO_RB=1 skips only glReadPixels; DC2_G433_RBSTAT=1 times it). Content edit here
 // forces MSBuild to consume the .inc.
+// G545: batched live VU1 GPU shadow, persistent workspace + delayed checkpoints (v27 PC-32b8 SUB trace).
+// G544: one-dispatch persistent VU1 chain + bounded ordered XGKICK packet-ring oracle (v4).
+// G543: exact default-off GPU VU1 semantic replay + one-readback corpus oracle (v6 denorm repair).
+// G541: coalesced async no-readback VU1 null transport; timed gather refuted/removed (v4).
 // G431: T8 resident-view GL storage reuse in lle_gpu_raster_backend.inc — measured NEUTRAL,
 // opt-in only (DC2_G431_VIEW_REUSE=1). Content edit here forces MSBuild to consume the .inc.
 // G158a: GPU-raster infrastructure prototype (default-off, DC2_G158_GPURASTER=1).
@@ -126,6 +130,7 @@ bool g162DecodeT8Batch(int, const uint32_t *, const uint32_t *, const int *, con
                        const uint32_t *, const uint8_t *, size_t, uint32_t **) { return false; }
 bool g178_backend_ready() { return false; }
 bool g178_backend_submit(G178Batch &) { return false; }
+bool g541_backend_null_compute() { return false; }
 bool g178_backend_submit_async(G178Batch &) { return false; }
 bool g178_backend_drain_async(bool &ok) { ok = true; return false; }
 bool g242_backend_submit_depth(G178Batch &, uint64_t, const std::vector<float> *, int, int) { return false; }

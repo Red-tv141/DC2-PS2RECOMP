@@ -2098,6 +2098,8 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
 
             auto g96Submit = [&](const uint8_t *pkt, uint32_t bytes)
             {
+                if (g_g541KickAddresses != nullptr)
+                    g_g541KickAddresses->push_back(addr);
                 extern std::atomic<bool> g_dc2TitleRockScope;
                 // G138: publish the packer PC for the PATH1 record the GS-stream dump is
                 // about to write (see g138DumpSubmit in ps2_memory.cpp).

@@ -4,6 +4,51 @@ bool g178EnvEnabled()
     return on;
 }
 
+// G541 is diagnostic-only. Startup must provision compute for either the standalone arm or the
+// paired within-process selector; neither form changes the CPU-authoritative VU1/GS result.
+bool g541NullComputeRequested()
+{
+    static const bool on = [] {
+        if (g158EnvFlag("DC2_G541_NULL_GPU"))
+            return true;
+        const char *ab = std::getenv("DC2_G419_AB");
+        return ab != nullptr && std::strcmp(ab, "vu1null") == 0;
+    }();
+    return on;
+}
+
+// G542 offline ABI replay is explicit and default-off. It never changes the CPU-authoritative VU
+// or GS path; it only provisions compute long enough to validate a saved G541 corpus.
+bool g542AbiReplayRequested()
+{
+    static const bool on = g158EnvFlag("DC2_G542_ABI_REPLAY");
+    return on;
+}
+
+// G543 executes saved VU1 records on the GPU, but is still an offline, default-off oracle. CPU
+// state, VU RAM, packets, and the live graphics path remain authoritative.
+bool g543SemanticReplayRequested()
+{
+    static const bool on = g158EnvFlag("DC2_G543_VU_REPLAY");
+    return on;
+}
+
+// G544 chains every saved record through one persistent GPU invocation and ordered packet ring.
+// It remains a default-off offline oracle; gameplay still consumes only the CPU executor's state.
+bool g544ChainReplayRequested()
+{
+    static const bool on = g158EnvFlag("DC2_G544_CHAIN_REPLAY");
+    return on;
+}
+
+// G545 executes the real worker stream as a persistent, batched GPU shadow. It is default-off;
+// CPU VU state and packets remain authoritative and any mismatch permanently disables the shadow.
+bool g545LiveShadowRequested()
+{
+    static const bool on = g158EnvFlag("DC2_G545_LIVE_SHADOW");
+    return on;
+}
+
 // G324 diagnostics mirror the front-end armed/census split. They time only the existing logical
 // composite and T8-view QueueItems; default runs pay cached-boolean branches only.
 bool g324BackendCensusOn()
@@ -371,6 +416,7 @@ typedef void(APIENTRY *PFN178UNIFORM2F)(GLint, GLfloat, GLfloat);
 typedef void(APIENTRY *PFN178BINDIMAGETEXTURE)(GLuint, GLuint, GLint, GLboolean, GLint, GLenum, GLenum);
 typedef void(APIENTRY *PFN178MEMORYBARRIER)(GLbitfield);
 typedef void(APIENTRY *PFN178GETINTERNALFORMATIV)(GLenum, GLenum, GLenum, GLsizei, GLint *);
+typedef void(APIENTRY *PFN541DISPATCHCOMPUTE)(GLuint, GLuint, GLuint);
 
 struct G178GLExt
 {
@@ -385,6 +431,7 @@ struct G178GLExt
     PFN178BINDIMAGETEXTURE glBindImageTexture_ = nullptr;
     PFN178MEMORYBARRIER glMemoryBarrier_ = nullptr;
     PFN178GETINTERNALFORMATIV glGetInternalformativ_ = nullptr;
+    PFN541DISPATCHCOMPUTE glDispatchCompute_ = nullptr;
 };
 
 bool g178LoadGLExt(G178GLExt &e)
@@ -404,6 +451,18 @@ bool g178LoadGLExt(G178GLExt &e)
         ok &= loadProc(e.glMemoryBarrier_, "glMemoryBarrier");
         ok &= loadProc(e.glGetInternalformativ_, "glGetInternalformativ");
     }
+    else if (g541NullComputeRequested() || g542AbiReplayRequested() ||
+             g543SemanticReplayRequested() || g544ChainReplayRequested() ||
+             g545LiveShadowRequested())
+    {
+        // Optional prototype: missing compute support must not disable the proven graphics backend.
+        (void)loadProc(e.glBindImageTexture_, "glBindImageTexture");
+        (void)loadProc(e.glMemoryBarrier_, "glMemoryBarrier");
+    }
+    if (g541NullComputeRequested() || g542AbiReplayRequested() ||
+        g543SemanticReplayRequested() || g544ChainReplayRequested() ||
+        g545LiveShadowRequested())
+        (void)loadProc(e.glDispatchCompute_, "glDispatchCompute");
     return ok;
 }
 
@@ -418,8 +477,15 @@ constexpr GLbitfield GL178_SHADER_IMAGE_ACCESS_BARRIER_BIT = 0x00000020;
 constexpr GLbitfield GL178_TEXTURE_FETCH_BARRIER_BIT = 0x00000008;
 constexpr GLbitfield GL178_TEXTURE_UPDATE_BARRIER_BIT = 0x00000100;
 constexpr GLbitfield GL178_FRAMEBUFFER_BARRIER_BIT = 0x00000400;
+constexpr GLenum GL541_COMPUTE_SHADER = 0x91B9;
+constexpr GLenum GL541_R32UI = 0x8236;
+constexpr GLenum GL541_RED_INTEGER = 0x8D94;
 constexpr GLenum GL257_SHADER_IMAGE_LOAD = 0x82A4;
 constexpr GLenum GL257_SHADER_IMAGE_STORE = 0x82A5;
+#include "g542_vu_gpu_abi.inc"
+#include "g543_vu_gpu_semantics.inc"
+#include "g544_vu_gpu_chain.inc"
+#include "g545_vu_gpu_live.inc"
 // GPU texture-cache residency cap (bytes of decoded RGBA8). Title uses a handful of ≤512²
 // textures (~1-4MB); the cap only matters on texture-heavy routes. LRU by last-used batch.
 constexpr size_t kG178TexCacheCapBytes = 256ull * 1024 * 1024;
@@ -442,6 +508,14 @@ std::atomic<uint64_t> g_g415NarrowBatches{0};
 std::atomic<uint64_t> g_g415NarrowRows{0};
 std::atomic<uint64_t> g_g415FullBatches{0};
 std::atomic<uint64_t> g_g415FullRows{0};
+
+// G541: one queued GL command can absorb every logical VU1 kick submitted before that command is
+// popped. The count is mutated only while m_mtx is held; after pop, the worker owns it exclusively.
+// This is the prototype form of a sequential GPU command buffer: many ordered kicks, one dispatch.
+struct G541NullBatch
+{
+    uint64_t kicks = 0ull;
+};
 
 class G178Backend
 {
@@ -496,6 +570,116 @@ public:
     }
 
     bool ready() const { return m_ready.load(std::memory_order_acquire); }
+
+    // G541: enqueue-only transport. The VU1 worker never waits and the GL worker never reads its
+    // persistent image back. Logical kicks coalesce into the one still-queued command; once the GL
+    // worker pops it, the next kick creates a successor command before publishing its CPU packets.
+    // Therefore every kick still has a compute command ahead of its dependent GS work in the same
+    // FIFO, without paying one host queue item and one driver dispatch per kick.
+    bool submitG541NullCompute()
+    {
+        if (!g541NullComputeRequested() || !m_ready.load(std::memory_order_acquire) ||
+            !m_g541Available)
+        {
+            m_g541Rejected.fetch_add(1u, std::memory_order_relaxed);
+            return false;
+        }
+        size_t depth = 0u;
+        bool pushed = false;
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+            {
+                m_g541Rejected.fetch_add(1u, std::memory_order_relaxed);
+                return false;
+            }
+            std::shared_ptr<G541NullBatch> batch = m_g541QueuedBatch.lock();
+            if (!batch)
+            {
+                if (m_queue.size() >= 8192u)
+                {
+                    m_g541Rejected.fetch_add(1u, std::memory_order_relaxed);
+                    return false;
+                }
+                batch = std::make_shared<G541NullBatch>();
+                QueueItem item;
+                item.g541NullBatch = batch;
+                m_queue.push_back(std::move(item));
+                m_g541QueuedBatch = batch;
+                pushed = true;
+            }
+            ++batch->kicks;
+            depth = m_queue.size();
+        }
+        m_g541Submitted.fetch_add(1u, std::memory_order_relaxed);
+        if (pushed)
+        {
+            uint64_t peak = m_g541HighWater.load(std::memory_order_relaxed);
+            while (peak < depth && !m_g541HighWater.compare_exchange_weak(
+                       peak, depth, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+            m_submitSeq.fetch_add(1u, std::memory_order_release);
+            m_cvWork.notify_one();
+        }
+        return true;
+    }
+
+    // G545: move-owned, enqueue-only live command. Commands coalesce only while their queue item
+    // has not been popped; the mutex therefore makes each batch immutable before the GL worker
+    // reads it. A size boundary creates a FIFO successor instead of rejecting or blocking VU1.
+    bool submitG545Live(std::vector<uint8_t> &&command)
+    {
+        std::string why;
+        if (!g545LiveShadowRequested() || !m_ready.load(std::memory_order_acquire) ||
+            !m_g545Available || m_g545Disabled.load(std::memory_order_acquire) ||
+            !g545ValidateBlob(command, why))
+        {
+            m_g545Rejected.fetch_add(1u, std::memory_order_relaxed);
+            return false;
+        }
+
+        size_t depth = 0u;
+        bool pushed = false;
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire) ||
+                m_g545Disabled.load(std::memory_order_relaxed))
+            {
+                m_g545Rejected.fetch_add(1u, std::memory_order_relaxed);
+                return false;
+            }
+            std::shared_ptr<G545LiveBatch> batch = m_g545QueuedBatch.lock();
+            if (batch && (batch->blobs.size() >= G545_LIVE_MAX_BATCH_COMMANDS ||
+                          batch->bytes + command.size() > G545_LIVE_MAX_BATCH_BYTES))
+                batch.reset();
+            if (!batch)
+            {
+                if (m_queue.size() >= 8192u)
+                {
+                    m_g545Rejected.fetch_add(1u, std::memory_order_relaxed);
+                    return false;
+                }
+                batch = std::make_shared<G545LiveBatch>();
+                QueueItem item;
+                item.g545LiveBatch = batch;
+                m_queue.push_back(std::move(item));
+                m_g545QueuedBatch = batch;
+                pushed = true;
+            }
+            batch->bytes += command.size();
+            batch->blobs.push_back(std::move(command));
+            depth = m_queue.size();
+        }
+        m_g545Submitted.fetch_add(1u, std::memory_order_relaxed);
+        if (pushed)
+        {
+            uint64_t peak = m_g545HighWater.load(std::memory_order_relaxed);
+            while (peak < depth && !m_g545HighWater.compare_exchange_weak(
+                       peak, depth, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+            m_submitSeq.fetch_add(1u, std::memory_order_release);
+            m_cvWork.notify_one();
+        }
+        return true;
+    }
 
     bool hasTex(uint64_t key)
     {
@@ -978,6 +1162,8 @@ private:
 
     struct QueueItem
     {
+        std::shared_ptr<G541NullBatch> g541NullBatch;
+        std::shared_ptr<G545LiveBatch> g545LiveBatch;
         G178Batch *batch = nullptr;
         uint64_t depthKey = 0u;
         const std::vector<float> *depthUpload = nullptr;
@@ -1097,6 +1283,25 @@ private:
             m_cvReady.notify_all();
             return;
         }
+        if (g541NullComputeRequested())
+        {
+            m_g541Available = setupG541NullCompute();
+            std::fprintf(stderr, "[G541:null] compute transport %s (async, no readback)\n",
+                         m_g541Available ? "READY" : "UNAVAILABLE; CPU path unchanged");
+        }
+        if (g545LiveShadowRequested())
+        {
+            m_g545Available = setupG545LiveShadow();
+            std::fprintf(stderr,
+                         "[G545:live] persistent semantic shadow %s (batched, delayed readback)\n",
+                         m_g545Available ? "READY" : "UNAVAILABLE; CPU path unchanged");
+        }
+        if (g542AbiReplayRequested())
+            (void)g542RunAbiReplay(m_f, m_e);
+        if (g543SemanticReplayRequested())
+            (void)g543RunSemanticReplay(m_f, m_e);
+        if (g544ChainReplayRequested())
+            (void)g544RunChainReplay(m_f, m_e);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         m_ready.store(true, std::memory_order_release);
@@ -1132,7 +1337,81 @@ private:
                 if (m_stop && m_queue.empty())
                     break;
                 item = std::move(m_queue.front());
+                if (item.g541NullBatch)
+                {
+                    const std::shared_ptr<G541NullBatch> queued = m_g541QueuedBatch.lock();
+                    if (queued.get() == item.g541NullBatch.get())
+                        m_g541QueuedBatch.reset();
+                }
+                if (item.g545LiveBatch)
+                {
+                    const std::shared_ptr<G545LiveBatch> queued = m_g545QueuedBatch.lock();
+                    if (queued.get() == item.g545LiveBatch.get())
+                        m_g545QueuedBatch.reset();
+                }
                 m_queue.pop_front();
+            }
+            if (item.g545LiveBatch)
+            {
+                if (m_g545Available && !m_g545Disabled.load(std::memory_order_acquire))
+                    (void)runG545LiveBatch(*item.g545LiveBatch);
+                else
+                    m_g545Rejected.fetch_add(item.g545LiveBatch->blobs.size(),
+                                             std::memory_order_relaxed);
+                continue;
+            }
+            if (item.g541NullBatch)
+            {
+                const uint64_t batchKicks = item.g541NullBatch->kicks;
+                if (m_g541Available && batchKicks != 0ull)
+                {
+                    // One GPU-resident dependency word models persistent cross-kick VU state. A
+                    // queued batch is one sequential command-buffer dispatch in the normal case.
+                    // The barrier orders the following GS consumer on-GPU; no CPU wait/readback.
+                    m_f.glUseProgram_(m_g541NullProg);
+                    m_e.glBindImageTexture_(7u, m_g541StateTex, 0, GL_FALSE, 0,
+                                            GL178_READ_WRITE, GL541_R32UI);
+                    uint64_t remaining = batchKicks;
+                    uint64_t dispatches = 0ull;
+                    while (remaining != 0ull)
+                    {
+                        const uint32_t chunk = static_cast<uint32_t>(
+                            std::min<uint64_t>(remaining, 0x7fffffffull));
+                        m_f.glUniform1i_(m_locG541KickCount, static_cast<GLint>(chunk));
+                        m_e.glDispatchCompute_(1u, 1u, 1u);
+                        m_e.glMemoryBarrier_(GL178_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+                        remaining -= chunk;
+                        ++dispatches;
+                    }
+                    m_g541Batches.fetch_add(dispatches, std::memory_order_relaxed);
+                    uint64_t maxBatch = m_g541MaxBatch.load(std::memory_order_relaxed);
+                    while (maxBatch < batchKicks && !m_g541MaxBatch.compare_exchange_weak(
+                               maxBatch, batchKicks, std::memory_order_relaxed,
+                               std::memory_order_relaxed)) {}
+                    const uint64_t n = m_g541Executed.fetch_add(
+                        batchKicks, std::memory_order_relaxed) + batchKicks;
+                    if (n >= m_g541NextReport)
+                    {
+                        m_g541NextReport = ((n >> 16u) + 1ull) << 16u;
+                        std::fprintf(stderr,
+                                     "[G541:null] kicks(sub=%llu exec=%llu reject=%llu) "
+                                     "batches=%llu maxBatch=%llu qPeak=%llu\n",
+                                     static_cast<unsigned long long>(
+                                         m_g541Submitted.load(std::memory_order_relaxed)),
+                                     static_cast<unsigned long long>(n),
+                                     static_cast<unsigned long long>(
+                                         m_g541Rejected.load(std::memory_order_relaxed)),
+                                     static_cast<unsigned long long>(
+                                         m_g541Batches.load(std::memory_order_relaxed)),
+                                     static_cast<unsigned long long>(
+                                         m_g541MaxBatch.load(std::memory_order_relaxed)),
+                                     static_cast<unsigned long long>(
+                                         m_g541HighWater.load(std::memory_order_relaxed)));
+                    }
+                }
+                else
+                    m_g541Rejected.fetch_add(batchKicks, std::memory_order_relaxed);
+                continue;
             }
             // G472 premise census: price how many synchronous render round trips could collapse
             // into one worker item without crossing an observable backend dependency.  Restrict the
@@ -1678,6 +1957,8 @@ private:
             item.promise->set_value(ok);
         }
 
+        if (m_g545Available)
+            reportG545Status(true);
         m_ready.store(false, std::memory_order_release);
         for (auto &kv : m_fbos)
             destroyFbo(kv.second);
@@ -1703,6 +1984,18 @@ private:
             m_f.glDeleteProgram_(m_prog);
         if (m_progExact != 0)
             m_f.glDeleteProgram_(m_progExact);
+        if (m_g541NullProg != 0)
+            m_f.glDeleteProgram_(m_g541NullProg);
+        if (m_g541StateTex != 0)
+            glDeleteTextures(1, &m_g541StateTex);
+        if (m_g545Prog != 0)
+            m_f.glDeleteProgram_(m_g545Prog);
+        if (m_g545CommandTex != 0)
+            glDeleteTextures(1, &m_g545CommandTex);
+        if (m_g545PayloadTex != 0)
+            glDeleteTextures(1, &m_g545PayloadTex);
+        if (m_g545WorkspaceTex != 0)
+            glDeleteTextures(1, &m_g545WorkspaceTex);
         if (m_g281Prog != 0)
             m_f.glDeleteProgram_(m_g281Prog);
         if (m_g281MapTex != 0)
@@ -1719,6 +2012,239 @@ private:
             glDeleteTextures(1, &m_g309BaseTex);
         wglMakeCurrent(nullptr, nullptr);
         wglDeleteContext(rc);
+    }
+
+    bool setupG545LiveShadow()
+    {
+        if (m_e.glDispatchCompute_ == nullptr || m_e.glBindImageTexture_ == nullptr ||
+            m_e.glMemoryBarrier_ == nullptr)
+            return false;
+
+        std::string why;
+        if (!g545LinkProgram(m_f, m_g545Prog, m_locG545CommandCount, why))
+        {
+            std::fprintf(stderr, "[G545:live] setup failed: %s\n", why.c_str());
+            if (m_g545Prog != 0u)
+                m_f.glDeleteProgram_(m_g545Prog);
+            m_g545Prog = 0u;
+            return false;
+        }
+
+        while (glGetError() != GL_NO_ERROR) {}
+        const uint32_t rows = (G545_LIVE_WORKSPACE_WORDS + G542_IMAGE_WIDTH - 1u) /
+                              G542_IMAGE_WIDTH;
+        std::vector<uint32_t> zero(static_cast<size_t>(rows) * G542_IMAGE_WIDTH, 0u);
+        glGenTextures(1, &m_g545WorkspaceTex);
+        glBindTexture(GL_TEXTURE_2D, m_g545WorkspaceTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(GL541_R32UI),
+                     static_cast<GLsizei>(G542_IMAGE_WIDTH), static_cast<GLsizei>(rows), 0,
+                     GL541_RED_INTEGER, GL_UNSIGNED_INT, zero.data());
+        const GLenum err = glGetError();
+        if (m_g545WorkspaceTex == 0u || err != GL_NO_ERROR)
+        {
+            std::fprintf(stderr, "[G545:live] workspace setup failed gl=0x%x\n",
+                         static_cast<unsigned>(err));
+            return false;
+        }
+
+        m_g545CheckInterval = [] {
+            const char *v = std::getenv("DC2_G545_STATUS_CHECK_KICKS");
+            if (v == nullptr || v[0] == '\0')
+                return 16384ull;
+            char *end = nullptr;
+            const unsigned long long parsed = std::strtoull(v, &end, 0);
+            if (end == v)
+                return 16384ull;
+            return std::max<unsigned long long>(256ull,
+                std::min<unsigned long long>(1048576ull, parsed));
+        }();
+        m_g545NextCheck = m_g545CheckInterval;
+        return true;
+    }
+
+    void reportG545Status(bool final)
+    {
+        const uint64_t executed = m_g545Executed.load(std::memory_order_relaxed);
+        if (executed == 0ull || (final && executed == m_g545Verified))
+            return;
+        const uint32_t rows = (G545_LIVE_WORKSPACE_WORDS + G542_IMAGE_WIDTH - 1u) /
+                              G542_IMAGE_WIDTH;
+        std::vector<uint32_t> image(static_cast<size_t>(rows) * G542_IMAGE_WIDTH, 0u);
+        while (glGetError() != GL_NO_ERROR) {}
+        glBindTexture(GL_TEXTURE_2D, m_g545WorkspaceTex);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL541_RED_INTEGER, GL_UNSIGNED_INT, image.data());
+        const GLenum err = glGetError();
+        ++m_g545Readbacks;
+        if (err != GL_NO_ERROR || image[0] != G545_LIVE_STATUS_MAGIC || image[1] != 1u)
+        {
+            std::fprintf(stderr,
+                         "[G545:live] CHECK FAIL status/readback gl=0x%x magic=%08x version=%u; shadow disabled, CPU path unchanged\n",
+                         static_cast<unsigned>(err), image[0], image[1]);
+            m_g545Disabled.store(true, std::memory_order_release);
+            return;
+        }
+        const uint64_t gpuExecuted = static_cast<uint64_t>(image[8]) |
+                                     (static_cast<uint64_t>(image[9]) << 32u);
+        const uint64_t lastSequence = static_cast<uint64_t>(image[10]) |
+                                      (static_cast<uint64_t>(image[11]) << 32u);
+        if (image[2] != 0u || gpuExecuted != executed)
+        {
+            const uint64_t failSequence = static_cast<uint64_t>(image[3]) |
+                                          (static_cast<uint64_t>(image[4]) << 32u);
+            std::fprintf(stderr,
+                         "[G545:live] CHECK FAIL errors=%08x failSeq=%llu batchRec=%u pc=%04x word=%08x gpuExec=%llu hostExec=%llu; shadow disabled, CPU path unchanged\n",
+                         image[2], static_cast<unsigned long long>(failSequence), image[5],
+                          image[6], image[7], static_cast<unsigned long long>(gpuExecuted),
+                          static_cast<unsigned long long>(executed));
+            if ((image[2] & 0x20u) != 0u)
+            {
+                std::fprintf(stderr,
+                             "[G545:live] packet detail gpu=%02x cpu=%02x offset=%u\n",
+                             (image[7] >> 24u) & 0xffu, (image[7] >> 16u) & 0xffu,
+                             image[7] & 0xffffu);
+            }
+            m_g545Disabled.store(true, std::memory_order_release);
+            return;
+        }
+
+        m_g545Verified = executed;
+        std::fprintf(stderr,
+                     "[G545:live] %s PASS kicks=%llu lastSeq=%llu batches=%llu maxBatch=%llu packets=%u dataChecks=%u seeds=%u readbacks=%llu qPeak=%llu CPU-authoritative=1\n",
+                     final ? "FINAL" : "CHECK", static_cast<unsigned long long>(executed),
+                     static_cast<unsigned long long>(lastSequence),
+                     static_cast<unsigned long long>(m_g545Batches),
+                     static_cast<unsigned long long>(m_g545MaxBatch), image[13], image[14],
+                     image[15], static_cast<unsigned long long>(m_g545Readbacks),
+                     static_cast<unsigned long long>(m_g545HighWater.load(std::memory_order_relaxed)));
+    }
+
+    bool runG545LiveBatch(const G545LiveBatch &batch)
+    {
+        std::vector<uint32_t> commands;
+        std::vector<uint32_t> payload;
+        std::string why;
+        if (!g545PackBatch(batch, commands, payload, why))
+        {
+            std::fprintf(stderr, "[G545:live] batch rejected: %s; shadow disabled\n", why.c_str());
+            m_g545Disabled.store(true, std::memory_order_release);
+            return false;
+        }
+        if (m_g545Batches == 0ull)
+            std::fprintf(stderr,
+                         "[G545:live] first dispatch commands=%zu payloadWords=%zu watchdogCap=%zu\n",
+                         batch.blobs.size(), payload.size(), G545_LIVE_MAX_BATCH_COMMANDS);
+        while (glGetError() != GL_NO_ERROR) {}
+        if (!g545UploadImage(m_g545CommandTex, m_g545CommandRows, commands, why) ||
+            !g545UploadImage(m_g545PayloadTex, m_g545PayloadRows, payload, why))
+        {
+            std::fprintf(stderr, "[G545:live] upload failed: %s; shadow disabled\n", why.c_str());
+            m_g545Disabled.store(true, std::memory_order_release);
+            return false;
+        }
+
+        m_f.glUseProgram_(m_g545Prog);
+        m_e.glBindImageTexture_(2u, m_g545CommandTex, 0, GL_FALSE, 0,
+                                GL542_READ_ONLY, GL541_R32UI);
+        m_e.glBindImageTexture_(3u, m_g545PayloadTex, 0, GL_FALSE, 0,
+                                GL542_READ_ONLY, GL541_R32UI);
+        m_e.glBindImageTexture_(4u, m_g545WorkspaceTex, 0, GL_FALSE, 0,
+                                GL178_READ_WRITE, GL541_R32UI);
+        m_f.glUniform1i_(m_locG545CommandCount, static_cast<GLint>(batch.blobs.size()));
+        m_e.glDispatchCompute_(1u, 1u, 1u);
+        m_e.glMemoryBarrier_(GL178_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                             GL178_TEXTURE_UPDATE_BARRIER_BIT);
+        const GLenum err = glGetError();
+        if (err != GL_NO_ERROR)
+        {
+            std::fprintf(stderr,
+                         "[G545:live] dispatch failed gl=0x%x; shadow disabled, CPU path unchanged\n",
+                         static_cast<unsigned>(err));
+            m_g545Disabled.store(true, std::memory_order_release);
+            return false;
+        }
+
+        ++m_g545Batches;
+        m_g545MaxBatch = std::max<uint64_t>(m_g545MaxBatch, batch.blobs.size());
+        const uint64_t executed = m_g545Executed.fetch_add(batch.blobs.size(),
+            std::memory_order_relaxed) + batch.blobs.size();
+        if (executed >= m_g545NextCheck)
+        {
+            reportG545Status(false);
+            m_g545NextCheck = executed + m_g545CheckInterval;
+        }
+        return !m_g545Disabled.load(std::memory_order_acquire);
+    }
+
+    bool setupG541NullCompute()
+    {
+        if (m_e.glDispatchCompute_ == nullptr || m_e.glBindImageTexture_ == nullptr ||
+            m_e.glMemoryBarrier_ == nullptr)
+            return false;
+
+        static const char *kCS =
+            "#version 430 core\n"
+            "layout(local_size_x=1, local_size_y=1, local_size_z=1) in;\n"
+            "layout(r32ui, binding=7) uniform coherent uimage2D gState;\n"
+            "uniform int uKickCount;\n"
+            "void main(){\n"
+            "  uint v = imageLoad(gState, ivec2(0,0)).r;\n"
+            "  imageStore(gState, ivec2(0,0), uvec4(v + uint(uKickCount), 0u, 0u, 0u));\n"
+            "}\n";
+        GLuint cs = 0u;
+        std::string log;
+        if (!g158CompileShader(m_f, GL541_COMPUTE_SHADER, kCS, cs, log))
+        {
+            std::fprintf(stderr, "[G541:null] compute compile failed: %s\n", log.c_str());
+            return false;
+        }
+        m_g541NullProg = m_f.glCreateProgram_();
+        m_f.glAttachShader_(m_g541NullProg, cs);
+        m_f.glLinkProgram_(m_g541NullProg);
+        GLint linked = 0;
+        m_f.glGetProgramiv_(m_g541NullProg, GL158_LINK_STATUS, &linked);
+        m_f.glDeleteShader_(cs);
+        if (!linked)
+        {
+            GLint len = 0;
+            m_f.glGetProgramiv_(m_g541NullProg, GL158_INFO_LOG_LENGTH, &len);
+            std::vector<char> buf(len > 0 ? static_cast<size_t>(len) : 1u);
+            m_f.glGetProgramInfoLog_(m_g541NullProg, static_cast<GLsizei>(buf.size()),
+                                     nullptr, buf.data());
+            std::fprintf(stderr, "[G541:null] compute link failed: %s\n", buf.data());
+            m_f.glDeleteProgram_(m_g541NullProg);
+            m_g541NullProg = 0u;
+            return false;
+        }
+        m_locG541KickCount = m_f.glGetUniformLocation_(m_g541NullProg, "uKickCount");
+        if (m_locG541KickCount < 0)
+        {
+            std::fprintf(stderr, "[G541:null] missing uKickCount uniform\n");
+            m_f.glDeleteProgram_(m_g541NullProg);
+            m_g541NullProg = 0u;
+            return false;
+        }
+
+        while (glGetError() != GL_NO_ERROR) {}
+        const uint32_t zero = 0u;
+        glGenTextures(1, &m_g541StateTex);
+        glBindTexture(GL_TEXTURE_2D, m_g541StateTex);
+        glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(GL541_R32UI), 1, 1, 0,
+                     GL541_RED_INTEGER, GL_UNSIGNED_INT, &zero);
+        const GLenum err = glGetError();
+        if (m_g541StateTex == 0u || err != GL_NO_ERROR)
+        {
+            std::fprintf(stderr, "[G541:null] state image setup failed gl=0x%x\n",
+                         static_cast<unsigned>(err));
+            if (m_g541StateTex != 0u)
+                glDeleteTextures(1, &m_g541StateTex);
+            m_g541StateTex = 0u;
+            m_f.glDeleteProgram_(m_g541NullProg);
+            m_g541NullProg = 0u;
+            return false;
+        }
+        return true;
     }
 
     bool setupProgram()
@@ -4611,6 +5137,31 @@ private:
     GLFns m_f;
     G178GLExt m_e;
     GLuint m_prog = 0, m_progExact = 0, m_g281Prog = 0, m_g309Prog = 0;
+    GLuint m_g541NullProg = 0, m_g541StateTex = 0;
+    GLint m_locG541KickCount = -1;
+    bool m_g541Available = false;
+    std::weak_ptr<G541NullBatch> m_g541QueuedBatch;
+    std::atomic<uint64_t> m_g541Submitted{0ull};
+    std::atomic<uint64_t> m_g541Executed{0ull};
+    std::atomic<uint64_t> m_g541Batches{0ull};
+    std::atomic<uint64_t> m_g541MaxBatch{0ull};
+    std::atomic<uint64_t> m_g541Rejected{0ull};
+    std::atomic<uint64_t> m_g541HighWater{0ull};
+    uint64_t m_g541NextReport = 65536ull; // GL-worker only
+    GLuint m_g545Prog = 0, m_g545CommandTex = 0, m_g545PayloadTex = 0;
+    GLuint m_g545WorkspaceTex = 0;
+    GLint m_locG545CommandCount = -1;
+    uint32_t m_g545CommandRows = 0u, m_g545PayloadRows = 0u;
+    bool m_g545Available = false;
+    std::atomic<bool> m_g545Disabled{false};
+    std::weak_ptr<G545LiveBatch> m_g545QueuedBatch;
+    std::atomic<uint64_t> m_g545Submitted{0ull};
+    std::atomic<uint64_t> m_g545Executed{0ull};
+    std::atomic<uint64_t> m_g545Rejected{0ull};
+    std::atomic<uint64_t> m_g545HighWater{0ull};
+    uint64_t m_g545Batches = 0ull, m_g545MaxBatch = 0ull;
+    uint64_t m_g545CheckInterval = 16384ull, m_g545NextCheck = 16384ull;
+    uint64_t m_g545Readbacks = 0ull, m_g545Verified = 0ull;
     GLuint m_g338Prog = 0;
     GLint m_locG338SrcH = -1, m_locG338Ta0 = -1, m_locG338Aem = -1;
     GLuint m_vao = 0, m_vbo = 0;

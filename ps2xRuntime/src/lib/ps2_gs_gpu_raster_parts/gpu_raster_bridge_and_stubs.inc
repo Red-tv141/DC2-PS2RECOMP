@@ -8,6 +8,19 @@ bool g178_backend_submit(G178Batch &batch)
     return G178Backend::instance().submit(batch);
 }
 
+// G541: asynchronous, no-readback VU1 transport probe. Private cpp-to-cpp bridge keeps the frozen
+// runtime headers untouched.
+bool g541_backend_null_compute()
+{
+    return G178Backend::instance().submitG541NullCompute();
+}
+
+// G545: move-owned live VU1 shadow command. Private bridge preserves frozen public headers.
+bool g545_backend_live_submit(std::vector<uint8_t> &&command)
+{
+    return G178Backend::instance().submitG545Live(std::move(command));
+}
+
 // G305: one-slot move-owned async submit / drain (default-off). See G178Backend::submitAsync.
 bool g178_backend_submit_async(G178Batch &batch)
 {

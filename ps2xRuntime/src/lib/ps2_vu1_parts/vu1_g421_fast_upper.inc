@@ -834,7 +834,44 @@ namespace
         switch (d.op)
         {
         case 0u: r = _mm_add_ps(vs, b); break;
-        case 1u: r = _mm_sub_ps(vs, b); break;
+        case 1u:
+        {
+            r = _mm_sub_ps(vs, b);
+            if ((upper == 0x01ef852cu || upper == 0x01ef8d6cu) &&
+                g_g545CpuTraceSequence.load(std::memory_order_relaxed) == 784u)
+            {
+                static std::atomic<uint32_t> s_g545SubTraceCount{0u};
+                if (s_g545SubTraceCount.fetch_add(1u, std::memory_order_relaxed) < 24u)
+                {
+                    alignas(16) uint32_t vsBits[4], bBits[4], resultBits[4];
+                    _mm_store_si128(reinterpret_cast<__m128i *>(vsBits), _mm_castps_si128(vs));
+                    _mm_store_si128(reinterpret_cast<__m128i *>(bBits), _mm_castps_si128(b));
+                    _mm_store_si128(reinterpret_cast<__m128i *>(resultBits), _mm_castps_si128(r));
+                    std::fprintf(stderr,
+                                 "[G545:cpu-sub] seq=784 stamp=%lld upper=%08x vs=%08x,%08x vt=%08x,%08x result=%08x,%08x\n",
+                                 static_cast<long long>(g430Stamp), upper, vsBits[0], vsBits[1],
+                                 bBits[0], bBits[1], resultBits[0], resultBits[1]);
+                }
+            }
+            if (upper == 0x01f1ae6cu &&
+                g_g545CpuTraceSequence.load(std::memory_order_relaxed) == 784u)
+            {
+                static std::atomic<uint32_t> s_g545Sub32b8TraceCount{0u};
+                if (s_g545Sub32b8TraceCount.fetch_add(1u, std::memory_order_relaxed) < 64u)
+                {
+                    alignas(16) uint32_t vsBits[4], bBits[4], resultBits[4];
+                    _mm_store_si128(reinterpret_cast<__m128i *>(vsBits), _mm_castps_si128(vs));
+                    _mm_store_si128(reinterpret_cast<__m128i *>(bBits), _mm_castps_si128(b));
+                    _mm_store_si128(reinterpret_cast<__m128i *>(resultBits), _mm_castps_si128(r));
+                    std::fprintf(stderr,
+                                 "[G545:cpu-sub32b8] seq=784 stamp=%lld vs=%08x,%08x,%08x,%08x vt=%08x,%08x,%08x,%08x result=%08x,%08x,%08x,%08x\n",
+                                 static_cast<long long>(g430Stamp), vsBits[0], vsBits[1],
+                                 vsBits[2], vsBits[3], bBits[0], bBits[1], bBits[2], bBits[3],
+                                 resultBits[0], resultBits[1], resultBits[2], resultBits[3]);
+                }
+            }
+            break;
+        }
         case 2u: r = _mm_add_ps(_mm_loadu_ps(st.acc), _mm_mul_ps(vs, b)); break;
         case 3u: r = _mm_sub_ps(_mm_loadu_ps(st.acc), _mm_mul_ps(vs, b)); break;
         case 4u: r = _mm_mul_ps(vs, b); break;
@@ -854,6 +891,25 @@ namespace
             r = _mm_and_ps(
                 _mm_sub_ps(_mm_loadu_ps(st.acc), _mm_mul_ps(g488a, g488b)),
                 _mm_castsi128_ps(_mm_setr_epi32(-1, -1, -1, 0)));
+            const uint64_t g545TraceSequence =
+                g_g545CpuTraceSequence.load(std::memory_order_relaxed);
+            if (upper == 0x01d5a5eeu && g545TraceSequence == 784u)
+            {
+                static std::atomic<uint32_t> s_g545TraceCount{0u};
+                if (s_g545TraceCount.fetch_add(1u, std::memory_order_relaxed) < 128u)
+                {
+                    uint32_t a = 0u, bb = 0u, acc = 0u;
+                    std::memcpy(&a, &st.vf[20][0], sizeof(a));
+                    std::memcpy(&bb, &st.vf[21][1], sizeof(bb));
+                    std::memcpy(&acc, &st.acc[2], sizeof(acc));
+                    alignas(16) uint32_t out[4];
+                    _mm_store_si128(reinterpret_cast<__m128i *>(out), _mm_castps_si128(r));
+                    std::fprintf(stderr,
+                                 "[G545:cpu-block-opmsub] seq=%llu stamp=%lld accZ=%08x resultZ=%08x operands=%08x*%08x\n",
+                                 static_cast<unsigned long long>(g545TraceSequence),
+                                 static_cast<long long>(g430Stamp), acc, out[2], a, bb);
+                }
+            }
             break;
         }
         case 8u: // OPMULA : (vs x vt) -> ACC, w lane keeps the CURRENT ACC.w
@@ -867,6 +923,24 @@ namespace
             const __m128 g488acc = _mm_loadu_ps(st.acc);
             r = _mm_shuffle_ps(g488p, _mm_unpackhi_ps(g488p, g488acc),
                                _MM_SHUFFLE(3, 0, 1, 0));
+            const uint64_t g545TraceSequence =
+                g_g545CpuTraceSequence.load(std::memory_order_relaxed);
+            if (upper == 0x01d4aafeu && g545TraceSequence == 784u)
+            {
+                static std::atomic<uint32_t> s_g545TraceCount{0u};
+                if (s_g545TraceCount.fetch_add(1u, std::memory_order_relaxed) < 128u)
+                {
+                    uint32_t a = 0u, bb = 0u;
+                    std::memcpy(&a, &st.vf[21][0], sizeof(a));
+                    std::memcpy(&bb, &st.vf[20][1], sizeof(bb));
+                    alignas(16) uint32_t out[4];
+                    _mm_store_si128(reinterpret_cast<__m128i *>(out), _mm_castps_si128(r));
+                    std::fprintf(stderr,
+                                 "[G545:cpu-block-opmula] seq=%llu stamp=%lld resultZ=%08x operands=%08x*%08x\n",
+                                 static_cast<unsigned long long>(g545TraceSequence),
+                                 static_cast<long long>(g430Stamp), out[2], a, bb);
+                }
+            }
             break;
         }
         default: r = _mm_min_ps(vs, b); break;

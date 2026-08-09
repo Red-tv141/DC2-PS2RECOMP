@@ -16,6 +16,11 @@
 // -1 = this probe is not the selected DC2_G419_AB lever, 0 = control frame, 1 = candidate frame.
 extern int g438SlowArm(int which);
 
+// G541 GPU-transport paired arm and no-wait GL-backend bridge. CPU VU1 remains authoritative.
+extern int g541VuNullArm();
+extern bool g541_backend_null_compute();
+extern std::atomic<uint64_t> g_g545CpuTraceSequence;
+
 // G478 VU1-worker PC sampler (defined in ps2_gif_arbiter_parts/g446_gsworker_pcsample.inc).
 // No-op unless DC2_G478_VU1PROF=1.
 extern void g478RegisterVu1WorkerThread();
@@ -70,6 +75,11 @@ extern uint32_t dc2_g483_last_stop_reason();
 #include <vector>
 #include <immintrin.h>
 
+// G541 stable hidden-pipeline serializer, defined in ps2_vu1.cpp after all implementation parts.
+extern void dc2_g541_vu_pipe_snapshot(std::vector<uint8_t> &out);
+// G545 private cpp-to-cpp handoff. The backend takes ownership and returns without waiting for GL.
+extern bool g545_backend_live_submit(std::vector<uint8_t> &&command);
+
 namespace ps2_stubs
 {
     void resetSifState();
@@ -105,6 +115,7 @@ bool (*g_f66_drive_dungeon_pad_hook)(uint32_t) = nullptr;
 // ============================================================================
 extern thread_local std::vector<std::vector<uint8_t>> *g_g297KickCapture; // defined in ps2_vu1.cpp
 extern thread_local uint32_t g_g297KickTop;                              // defined in ps2_vu1.cpp
+extern thread_local std::vector<uint32_t> *g_g541KickAddresses;          // defined in ps2_vu1.cpp
 extern bool g150_mtgs_enabled();                                          // defined in ps2_gif_arbiter.cpp
 extern void dc2_g410_vu_code_written(const uint8_t *codeBase, uint32_t offset, uint32_t sizeBytes);
 extern std::atomic<uint64_t> g_dc2PresentTick;  // global scope (defined in dc2_game_override.cpp); this
@@ -136,9 +147,13 @@ struct G297KickItem
     uint32_t budget = 0u;
     bool isResume = false;
     std::vector<std::vector<uint8_t>> packets;     // XGKICK Path1 output (worker-filled)
+    std::vector<uint32_t> packetAddrs;             // G541: ordered XGKICK VU-data addresses
     std::atomic<bool> ready{false};
 };
 using G297KickPtr = std::shared_ptr<G297KickItem>;
+
+#include "runtime_g541_vu_corpus.inc"
+#include "runtime_g545_vu_shadow.inc"
 
 // ---------------------------------------------------------------------------
 // G478 kick-item RECYCLING POOL (MEASURED NEUTRAL — default OFF, opt-in DC2_G478_KICKPOOL=1).
@@ -271,6 +286,7 @@ inline G297KickPtr g478AcquireKickItem()
         raw->writes.clear();
         raw->writeBytes.clear();
         raw->packets.clear();
+        raw->packetAddrs.clear();
         raw->startPC = 0u;
         raw->itop = 0u;
         raw->top = 0u;
@@ -776,6 +792,7 @@ private:
                                            : std::chrono::steady_clock::time_point{};
             g_g297KickCapture = &item->packets; // redirect this kick's XGKICKs into item->packets
             g_g297KickTop = item->top;          // captured XTOP (double-buffer top) for this kick
+            g_g541KickAddresses = nullptr;
             // G301: replay this kick's ordered VU-RAM writes onto the PERSISTENT worker buffers, in
             // program order, BEFORE running the kick. A previous kick's VU-program writes (SQ/SQI/SQD)
             // already sit in these buffers and persist here — the fix for the G297 per-kick-snapshot
@@ -807,6 +824,12 @@ private:
                     m_g441WriteBytes += run;
                 }
             }
+            const bool g541CorpusKick =
+                m_g541Corpus.begin(*item, m_vu1->state(), m_workerVuCode, m_workerVuData);
+            const bool g545ShadowKick =
+                m_g545Shadow.begin(*item, m_vu1->state(), m_workerVuCode, m_workerVuData);
+            if (g541CorpusKick || g545ShadowKick)
+                g_g541KickAddresses = &item->packetAddrs;
             if (s_g441Kick)
             {
                 const auto g441T2 = std::chrono::steady_clock::now();
@@ -899,6 +922,23 @@ private:
                 m_workerKicksRun.fetch_add(1ull, std::memory_order_relaxed);
             }
             g_g297KickCapture = nullptr;
+            g_g541KickAddresses = nullptr;
+            if (g541CorpusKick)
+                m_g541Corpus.finish(*item, m_vu1->state(), m_workerVuData,
+                                    dc2_g483_last_run_cycles(), dc2_g483_last_stop_reason());
+            if (g545ShadowKick)
+                m_g545Shadow.finish(*item, m_vu1->state(), m_workerVuData,
+                                    dc2_g483_last_run_cycles(), dc2_g483_last_stop_reason());
+            // G541 transport prototype. Submit one logical command before `ready`; the backend
+            // coalesces all still-queued commands into one sequential compute dispatch. The queued
+            // batch stays ahead of the GS work these packets unlock. No per-kick wait/fence/readback;
+            // CPU output remains the sole graphics authority and failures fail closed.
+            {
+                const int g541Arm = g541VuNullArm();
+                static const bool s_g541Standalone = envSet("DC2_G541_NULL_GPU");
+                if (g541Arm == 1 || (g541Arm < 0 && s_g541Standalone))
+                    (void)g541_backend_null_compute();
+            }
             // G482 census tail: post-state key + intra-frame table. `item->packets` is final here,
             // so its byte count is exactly what a memo hit would have to replay.
             if (g482Census && !item->isResume)
@@ -1150,6 +1190,8 @@ private:
     // (verified: no memory-mapped guest Store path writes m_vu1Data/m_vu1Code in this runtime).
     uint8_t m_workerVuCode[PS2_VU1_CODE_SIZE] = {};
     uint8_t m_workerVuData[PS2_VU1_DATA_SIZE] = {};
+    G541VuCorpus m_g541Corpus;
+    G545VuLiveShadow m_g545Shadow;
     // G301: EE-local accumulator of VU-RAM writes for the current (not-yet-enqueued) kick.
     std::vector<G297VuWrite> m_pendWrites;
     std::vector<uint8_t> m_pendWriteBytes;

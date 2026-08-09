@@ -1,7 +1,8 @@
 ﻿// G520: `macscan` — g430ResolveAt (vu1_g421_fast_upper.inc) resolves the architectural MAC with a
 // branchless tree reduction instead of a serial branchy scan of the 8-slot history ring. Content
-// edit here forces MSBuild to consume the .inc (G359). revision: 3 (REFUTED, DC2_G520_MACARM 0)
+// edit here forces MSBuild to consume the .inc (G359). revision: 15 (G545 PC-32b8 SUB operand trace)
 #include "ps2_vu1_parts/vu1_helpers_and_tables.inc"
+std::atomic<uint64_t> g_g545CpuTraceSequence{UINT64_MAX};
 #include "ps2_vu1_parts/vu1_g370_store_watch.inc"
 #include "ps2_g480_packet_pool.inc"
 #include "ps2_vu1_parts/vu1_core_execution.inc"
@@ -21,7 +22,9 @@
 #include "ps2_vu1_parts/vu1_upper_opcodes.inc"
 #include "ps2_vu1_parts/vu1_lower_opcodes.inc"
 #include "ps2_vu1_parts/vu1_dispatch_and_sync.inc"
+#include "ps2_vu1_parts/vu1_g541_pipeline_snapshot.inc"
 // G360: item-slot UV-loss XGKICK probe added in vu1_dispatch_and_sync.inc (force recompile v2).
+// G541: stable hidden-pipeline snapshots + ordered XGKICK addresses for the VU1 GPU corpus (v1).
 // G370: VU1 store-watch probe added (force recompile).
 // G410: default-on cached compiled VU1 execution (force recompile v16).
 // G413: default-on G328 circular MAC delay + G330 fused MAC classifier (force recompile).

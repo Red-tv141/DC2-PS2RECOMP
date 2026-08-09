@@ -364,6 +364,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool g422FastLowerRun =
         g422FastLowerRequested() && g410CompiledRun && !g410VerifyRun && g422LowerDiagFree();
     const bool g422VerifyRun = g422FastLowerRun && g422VerifyOn();
+    const bool g532VerifyDivRun = g422FastLowerRun && g532VerifyDivOn();
     // G480: skip the g422FastLower CALL on a NOP lower slot.
     //
     // G422 was built on the premise that "NOP -> the call disappears entirely (39.3% of pairs)",
@@ -393,6 +394,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool g481VerifyRun = g422FastLowerRun && !g422VerifyRun && g481VerifyOn();
     const bool g481HotLower = g422FastLowerRun && !g422VerifyRun && g481HotLowerRun();
     static std::atomic<uint64_t> s_g422Verified{0ull};
+    static std::atomic<uint64_t> s_g532DivVerified{0ull};
     static std::atomic<uint64_t> s_g481Verified{0ull};
     // Cold shadow-verify path (DC2_G422_VERIFY): run the fast path, restore both the register
     // state AND all 16 KB of VU data memory, re-run the legacy execLower from the same
@@ -400,30 +402,49 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     auto g422VerifyLowerSlow = [&](uint32_t lowerWord, uint32_t upperWord, uint8_t lowerKind) {
         const bool touchesMem = g422KindStores(lowerKind);
         s_g422VerBefore = m_state;
+        const float qPendingBefore = s_vuQPending;
+        const int qDelayBefore = s_vuQDelay;
         if (touchesMem && vuData != nullptr && dataSize <= PS2_VU1_DATA_SIZE)
             std::memcpy(s_g422VerMemBefore, vuData, dataSize);
         g422FastLower(m_state, lowerWord, lowerKind, vuData, dataSize);
         s_g422VerFast = m_state;
+        const float qPendingFast = s_vuQPending;
+        const int qDelayFast = s_vuQDelay;
         if (touchesMem && vuData != nullptr && dataSize <= PS2_VU1_DATA_SIZE)
         {
             std::memcpy(s_g422VerMemFast, vuData, dataSize);
             std::memcpy(vuData, s_g422VerMemBefore, dataSize);
         }
         m_state = s_g422VerBefore;
+        s_vuQPending = qPendingBefore;
+        s_vuQDelay = qDelayBefore;
         execLower(lowerWord, vuData, dataSize, gs, memory, upperWord);
         const bool badState = !g422StatesEqual(s_g422VerFast, m_state);
+        const bool badQPipe = std::memcmp(&qPendingFast, &s_vuQPending, sizeof(qPendingFast)) != 0 ||
+                              qDelayFast != s_vuQDelay;
         const bool badMem = touchesMem && vuData != nullptr && dataSize <= PS2_VU1_DATA_SIZE &&
                             std::memcmp(s_g422VerMemFast, vuData, dataSize) != 0;
-        if (badState || badMem)
+        if (badState || badQPipe || badMem)
         {
+            const char *const verifyTag =
+                (g532VerifyDivRun && lowerKind == G422_LK_DIV) ? "G532" : "G422";
             std::fprintf(stderr,
-                         "[G422:verify] mismatch pc=0x%x lower=%08x kind=%u state=%d mem=%d "
-                         "pc=%08x/%08x\n",
-                         s_g422VerBefore.pc, lowerWord, (unsigned)lowerKind,
-                         (int)badState, (int)badMem, s_g422VerFast.pc, m_state.pc);
+                         "[%s:verify] mismatch pc=0x%x lower=%08x kind=%u state=%d qpipe=%d "
+                         "mem=%d pc=%08x/%08x qdelay=%d/%d\n",
+                         verifyTag, s_g422VerBefore.pc, lowerWord, (unsigned)lowerKind,
+                         (int)badState, (int)badQPipe, (int)badMem,
+                         s_g422VerFast.pc, m_state.pc, qDelayFast, s_vuQDelay);
             std::abort();
         }
-        if ((s_g422Verified.fetch_add(1ull, std::memory_order_relaxed) % 50000000ull) == 0ull)
+        if (g532VerifyDivRun && lowerKind == G422_LK_DIV)
+        {
+            const uint64_t n = s_g532DivVerified.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+            if (n == 1ull || (n % 10000000ull) == 0ull)
+                std::fprintf(stderr, "[G532:verify] divs=%llu bad=0\n",
+                             (unsigned long long)n);
+        }
+        if (g422VerifyRun &&
+            (s_g422Verified.fetch_add(1ull, std::memory_order_relaxed) % 50000000ull) == 0ull)
             std::fprintf(stderr, "[G422:verify] ok=%llu bad=0\n",
                          (unsigned long long)s_g422Verified.load(std::memory_order_relaxed));
     };
@@ -499,7 +520,8 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             }                                                                         \
             if (g422kind != G422_LK_NONE)                                             \
             {                                                                         \
-                if (g422VerifyRun)                                                    \
+                if (g422VerifyRun ||                                                 \
+                    (g532VerifyDivRun && g422kind == G422_LK_DIV))                  \
                     g422VerifyLowerSlow(lower, upper, g422kind);                      \
                 else                                                                  \
                     g422FastLower(m_state, lower, g422kind, vuData, dataSize);        \
@@ -1016,7 +1038,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     // which the pair loop has had since G481 and the block body never got). Read ONCE per run()
     // like every other thread-level arm, and only meaningful when the block copy is the one
     // selected — see vu1_g490_block_run.inc.
-    const int g499BlkArm = g490BlockRun ? g499BlkArmRun() : 0;
+    const int g499BlkArmRaw = g490BlockRun ? g499BlkArmRun() : 0;
+    // G533 v8: arm 27 changes only the one immutable 0x3088 fragment. Canonicalise its ordinary
+    // blocks to the shipped G531 arm here, once per run(), so a miss enters the byte-identical
+    // dispatch/body instead of paying a candidate wrapper on every block. The direct exact-source
+    // gate lives at the block call site; verifier/census arms retain their distinct leaves.
+    const bool g533StaticRun = g499BlkArmRaw == 27;
+    const int g499BlkArm = g533StaticRun ? 23 : g499BlkArmRaw;
     // G502: the block-round-trip ceiling probe's arm and the block-entry census. Read ONCE per
     // run() like every other thread-level arm (G479's rule), and both memoised behind a
     // function-local `static const` on their default paths (G500 §4's blind spot).
@@ -1042,7 +1070,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     // and because DC2_G419_AB arms exactly one lever at a time each new gate extends the same
     // space: 4 = the `blksplit` candidate, 6 = the `blktail0` candidate, and the control arm of
     // both is 3 (the G500 shipped body with the G500 admission test).
-    const int g500InvArm = g502Split ? 4 : (g502Tail0 ? 6 : g499BlkArm);
+    const int g500InvArm = g502Split ? 4 : (g502Tail0 ? 6 : g499BlkArmRaw);
     if (g490BlockRun)
         g499ReportArmed(g500InvArm);
     // G500: the per-arm workload-invariant census (DC2_G500_STAT=1). Read ONCE per run() like every
