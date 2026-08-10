@@ -224,13 +224,16 @@
 | **Static function DB (`ref/functions/`)** | `14-static-analysis-navigation.md` | §2 Per-Function Files |
 | **Index JSONs / call graph / globals** | `14-static-analysis-navigation.md` | §3–§4 Indexes & Recipes |
 | **Export staleness (`elf_hash`)** | `14-static-analysis-navigation.md` | §6 Staleness |
-| **VU1 interpreter correctness** | `15-vu1-gs-debugging.md` | §2 VU1 Checklist |
-| **GS state / texture / CLUT bugs** | `15-vu1-gs-debugging.md` | §3 GS State Checklist |
-| **Diagnostic-lever / kill-switch doctrine** | `15-vu1-gs-debugging.md` | §5 Lever Doctrine |
+| **VU1 interpreter correctness** | `15-vu1-interpreter-correctness.md` | §2 VU1 Checklist |
+| **GS state / texture / CLUT bugs** | `15b-gs-state-and-capture-ab.md` | §1 GS State Checklist |
+| **Diagnostic-lever / kill-switch doctrine** | `15b-gs-state-and-capture-ab.md` | §3 Lever Doctrine |
+| **Packet-level `.gs` capture A/B** | `15b-gs-state-and-capture-ab.md` | §2.0 |
 | **Guest-execution lock model** | `16-runtime-concurrency-threading.md` | §1–§2 |
 | **ABBA deadlock / wake handoff** | `16-runtime-concurrency-threading.md` | §3–§4 |
 | **Hang triage table** | `16-runtime-concurrency-threading.md` | §5 Diagnosis |
-| **Performance / low FPS / profiling** | `17-performance-optimization.md` | §2–§3 Measure & Hotspots |
+| **Performance / low FPS / profiling** | `17-performance-optimization.md` → `17a-perf-measurement.md` | Router, then Measure |
+| **Perf: what lever to build** | `17b-perf-levers.md` | §1 Hotspots, §2 Laws |
+| **Perf: GS rasterizer / GPU LLE / native renderer** | `17c-perf-gs-pipeline.md` | §1–§3 |
 | **Audio triage (silence/SFX/crackle/pitch)** | `18-audio-spu2-iop-debugging.md` | §2 Symptom Triage |
 | **VAG/ADPCM verification** | `18-audio-spu2-iop-debugging.md` | §3 Data Verification |
 | **ENDX / sound completion contract** | `18-audio-spu2-iop-debugging.md` | §4 |
@@ -265,13 +268,18 @@
 | `12-pcsx2-mcp-playbook.md` | ~12 KB | 2026-07-02 | PCSX2 DebugServer tools, A/B comparison, recipes |
 | `13-decisional-brain.md` | ~14 KB | 2026-07-02 | Reasoning loop, diagnosis escalation, anti-patterns |
 | `14-static-analysis-navigation.md` | ~9 KB | 2026-07-02 | Static function DB + index JSONs + graphify navigation |
-| `15-vu1-gs-debugging.md` | ~20 KB | 2026-07-02 | VU1 correctness checklist, GS state checklist, lever doctrine |
+| `15-vu1-interpreter-correctness.md` | ~19 KB | 2026-07-31 | VU1 correctness checklist + PCSX2 oracle values (the GEOMETRY half) |
+| `15b-gs-state-and-capture-ab.md` | ~27 KB | 2026-07-31 | GS state + swizzle authority, capture A/B, lever doctrine (the PIXELS half) |
 | `16-runtime-concurrency-threading.md` | ~7 KB | 2026-07-02 | Guest-lock model, ABBA, wake handoff, hang triage |
-| `17-performance-optimization.md` | ~7 KB | 2026-07-02 | Correctness-first perf doctrine, hotspot classes, verification |
+| `17-performance-optimization.md` | ~5 KB | 2026-07-31 | Perf entry: doctrine + router |
+| `17a-perf-measurement.md` | ~26 KB | 2026-07-31 | Instruments, premise gate, thread ranking, probes, A/B power |
+| `17b-perf-levers.md` | ~13 KB | 2026-07-31 | Hotspot classes, lever-design laws, what not to do |
+| `17c-perf-gs-pipeline.md` | ~19 KB | 2026-07-31 | GS rasterizer parallelism, GPU LLE, native renderer |
 | `18-audio-spu2-iop-debugging.md` | ~8 KB | 2026-07-02 | Audio path triage, VAG/ADPCM, ENDX contract, stub tiers |
 | `19-memcard-pads-fileio.md` | ~8 KB | 2026-07-02 | Memory cards/saves, pad input, disc file I/O (LSN/ISO) |
 | `20-fmv-ipu-cutscenes.md` | ~5 KB | 2026-07-02 | FMV/.PSS/IPU playback, skip strategy, cutscene hangs |
-| `appendix-dc2-project.md` | ~11 KB | 2026-07-02 | EXAMPLE project appendix — Dark Cloud 2 concrete paths/facts |
+| `appendix-dc2-project.md` | ~20 KB | 2026-07-31 | EXAMPLE project appendix — DC2 paths, build, harnesses, regen rules (always-read half) |
+| `appendix-dc2-graphics-facts.md` | ~37 KB | 2026-07-31 | DC2 diagnosed graphics defects + historical renderer snapshots (lookup only) |
 | `db-ps2-architecture.md` | ~40 KB | 2026-03-13 | System diagrams (mermaid), pipelines, data flow |
 | `db-ps2-index.md` | ~12 KB | 2026-03-21 | THIS FILE — master topic → file+section map |
 | `db-isa.md` | ~24 KB | 2026-03-13 | R5900 instruction tables (630 lines) |

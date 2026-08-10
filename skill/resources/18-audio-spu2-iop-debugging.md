@@ -178,4 +178,4 @@ Every tier: env-gated (`<PREFIX>_NO_AUDIO`, `<PREFIX>_AUDIO_TIER=n`) per the lev
 
 Cross-refs: stalls-on-sound `16-runtime-concurrency-threading.md` §6; file/stream reads
 `19-memcard-pads-fileio.md`; FMV audio `20-fmv-ipu-cutscenes.md`; register truth `09-ps2tek.md`;
-lever doctrine `15-vu1-gs-debugging.md` §5.
+lever doctrine `15b-gs-state-and-capture-ab.md` §3.

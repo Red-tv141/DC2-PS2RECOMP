@@ -86,4 +86,4 @@ After ANY skip/stub, verify the handoff, not just "no hang":
 Cross-refs: disc streaming `19-memcard-pads-fileio.md` §3; audio stream + completion
 `18-audio-spu2-iop-debugging.md`; hang model `16-runtime-concurrency-threading.md`; DMA channels
 `01-ps2-hardware-bible.md`; IPU registers `db-registers.md` + `09-ps2tek.md`; lever doctrine
-`15-vu1-gs-debugging.md` §5.
+`15b-gs-state-and-capture-ab.md` §3.

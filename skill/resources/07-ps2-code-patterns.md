@@ -97,7 +97,7 @@ Knowing the shape turns a 2000-line VU disasm into a 20-minute read:
   the copy packer writes fog only (its ADC is structurally 0). A per-vertex **draw gate** is
   typically an FMAND mask cascade over guard-plane `SUB` MAC flags + an `OPMSUB` winding bit,
   compared with `IBEQ` against the expected mask — scheduled exactly 4 instruction pairs after
-  each producing FMAC (see `15-vu1-gs-debugging.md §2/§2.1` for the full decoded example and
+  each producing FMAC (see `15-vu1-interpreter-correctness.md §2/§2.1` for the full decoded example and
   the interpreter hazards that silently break it).
 - **Buffering:** packers write to double-buffered output at `VI` base pointers and `XGKICK` per
   batch; `ISWR`/`ILWR` around the kick save/restore loop registers to a tiny stack at `VI14`.
