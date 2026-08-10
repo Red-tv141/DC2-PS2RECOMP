@@ -59,7 +59,7 @@ namespace
         return disabled;
     }
 
-    // G394's early-stop deferral, kept default-ON but no longer a permanent leak.
+    // G394's early-stop deferral is now rollback-only.
     //
     // G394 reads a `SetPortVolume(port, 0)` + `Stop(port)` pair arriving within
     // 100 ms of a Play as a stale stop and drops both, keeping the source alive.
@@ -67,26 +67,21 @@ namespace
     // really is: `TitleInit@0x29F1F0` calls `LoadSound@0x2A6D70` — which
     // auto-plays the env BGM through `PlayEnvBgm@0x2A6840` — at `0x29FD54`, then
     // `StopEnvBGM@0x2A67C0` at `0x29FD5C`, two guest instructions later. The
-    // sequence that survives is what is heard at the title, because the guest's
-    // own restart (`TitleModeInit@0x2A1020`, whose first instruction is an
-    // unconditional `PlayEnvBgm`) is SKIPPED on the boot path: `TitleInit`
-    // branches at `0x29FE90` on `gp-0x7ba0`, set from `gp-0x7530 > 0` at
-    // `0x29F2E4`, into the memory-card-check arm that leaves at `0x29FED4`.
-    // Obeying the Stop therefore leaves the title silent (measured: 62 s of
-    // exactly zero mixer output), so the deferral stays until that root is
-    // fixed — but it now EXPIRES at the next BGM start (see dc2G392BgmStart)
-    // instead of keeping the source alive forever, which is what produced
-    // `active-bgm=2` and the user-reported "audio doesn't stop" symptom.
-    // `DC2_G394_LEGACY_ASYNC_STOP=1` still obeys every Stop literally.
+    // G451 found the missing restart was caused by F21's obsolete mode-3 title
+    // seed, not by the guest: it bypassed the native 3 -> 4 -> 1 transition and
+    // therefore skipped `TitleModeInit`.  The seed is retired, TitleModeInit
+    // restarts the title BGM, and every guest Stop is authoritative by default.
+    // `DC2_G451_LEGACY_EARLY_STOP_GUARD=1` restores the old deferral for A/B.
     bool g394AsyncStopGuardDisabled()
     {
         static const bool disabled = []()
         {
-            const char *value = std::getenv("DC2_G394_LEGACY_ASYNC_STOP");
-            return value != nullptr && value[0] != '\0' &&
-                   std::strcmp(value, "0") != 0 &&
-                   std::strcmp(value, "false") != 0 &&
-                   std::strcmp(value, "FALSE") != 0;
+            const char *value = std::getenv("DC2_G451_LEGACY_EARLY_STOP_GUARD");
+            const bool legacyGuard = value != nullptr && value[0] != '\0' &&
+                                     std::strcmp(value, "0") != 0 &&
+                                     std::strcmp(value, "false") != 0 &&
+                                     std::strcmp(value, "FALSE") != 0;
+            return !legacyGuard;
         }();
         return disabled;
     }

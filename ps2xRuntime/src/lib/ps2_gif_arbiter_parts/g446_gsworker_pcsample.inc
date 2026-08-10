@@ -108,6 +108,19 @@ namespace
         return s_s;
     }
 
+    // G563: postpone sampling until a route's known heavy window. This keeps a long scripted
+    // lead-in from diluting the VU-worker distribution with queue-idle samples. Diagnosis only;
+    // the sampler is already opt-in and a zero/missing value preserves its old start time.
+    unsigned g563SampleDelaySec()
+    {
+        static const unsigned s_s = [] {
+            const char *v = std::getenv("DC2_G446_GSPROF_DELAY_SEC");
+            const unsigned u = (v != nullptr) ? static_cast<unsigned>(std::strtoul(v, nullptr, 10)) : 0u;
+            return (u <= 600u) ? u : 0u;
+        }();
+        return s_s;
+    }
+
     constexpr size_t kG446Slots = 8192;   // open-addressed rip -> count, power of two
     struct G446Bucket
     {
@@ -270,8 +283,77 @@ namespace
         return rip;
     }
 
+    bool g563RawPcOnlyOn()
+    {
+        static const bool s_on = (std::getenv("DC2_G563_RAWPC_ONLY") != nullptr);
+        return s_on;
+    }
+
+    // G563: DbgHelp folding/line lookup can consume tens of seconds on this 155 MB map/PDB image.
+    // A delayed route capture only needs preferred-base PCs, so provide a raw-only report which
+    // performs no symbol calls. Same counters and top-64 selection as G483's normal raw section.
+    void g563ReportRawPcOnly()
+    {
+        std::fprintf(stderr,
+                     "[G446:%s] samples=%llu distinctPc=%llu dropped=%llu periodUs=%u rawOnly=1\n",
+                     g_g446Label,
+                     static_cast<unsigned long long>(g_g446Total),
+                     static_cast<unsigned long long>(g_g446Distinct),
+                     static_cast<unsigned long long>(g_g446Failed), g446SampleUs());
+        const double denom = (g_g446Total > 0) ? static_cast<double>(g_g446Total) : 1.0;
+        for (int s = 0; s <= 7; ++s)
+        {
+            if (g_g446StageCount[s] == 0)
+                continue;
+            std::fprintf(stderr,
+                         "[G446:stage]   %-15s %5.2f%% n=%llu ofWhichKernelWait=%5.2f%%\n",
+                         g446StageName(s),
+                         100.0 * static_cast<double>(g_g446StageCount[s]) / denom,
+                         static_cast<unsigned long long>(g_g446StageCount[s]),
+                         100.0 * static_cast<double>(g_g446StageWait[s]) /
+                             static_cast<double>(g_g446StageCount[s]));
+        }
+
+        static G446Bucket raw[64];
+        size_t nRaw = 0;
+        for (size_t i = 0; i < kG446Slots; ++i)
+        {
+            const G446Bucket &b = g_g446Table[i];
+            if (b.count == 0)
+                continue;
+            if (nRaw < 64)
+                raw[nRaw++] = b;
+            else
+            {
+                size_t worst = 0;
+                for (size_t j = 1; j < 64; ++j)
+                    if (raw[j].count < raw[worst].count)
+                        worst = j;
+                if (raw[worst].count < b.count)
+                    raw[worst] = b;
+            }
+        }
+        std::sort(raw, raw + nRaw,
+                  [](const G446Bucket &a, const G446Bucket &b) { return a.count > b.count; });
+        for (size_t i = 0; i < nRaw; ++i)
+        {
+            const uint64_t pref = raw[i].rip >= g_g446ExeLo && raw[i].rip < g_g446ExeHi
+                                      ? raw[i].rip - g_g446ExeLo + 0x140000000ull
+                                      : 0ull;
+            std::fprintf(stderr, "[G483:rawpc]   %5.2f%% n=%llu pref=0x%llx\n",
+                         100.0 * static_cast<double>(raw[i].count) / denom,
+                         static_cast<unsigned long long>(raw[i].count),
+                         static_cast<unsigned long long>(pref));
+        }
+    }
+
     void g446Report()
     {
+        if (g563RawPcOnlyOn())
+        {
+            g563ReportRawPcOnly();
+            return;
+        }
         // Fold every sampled PC into its containing FUNCTION before ranking. Ranking raw PCs
         // manufactures a flat distribution out of a concentrated one: a single hot loop spreads
         // its samples over 20-40 distinct rips, so no row clears 1% even when the function owns
@@ -508,6 +590,10 @@ namespace
         // a two-line setter. One missing option cost the arc six phases of "the pole thread is flat".
         SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS | SYMOPT_LOAD_LINES);
         SymInitialize(GetCurrentProcess(), nullptr, TRUE);
+
+        const unsigned delaySec = g563SampleDelaySec();
+        if (delaySec != 0u)
+            std::this_thread::sleep_for(std::chrono::seconds(delaySec));
 
         const unsigned periodUs = g446SampleUs();
         const auto reportEvery = std::chrono::seconds(g446ReportSec());
