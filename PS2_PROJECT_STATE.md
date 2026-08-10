@@ -90,11 +90,6 @@ cmake --build D:\ps2r\dc2\build64 --config Release --target dc2_runner -- /m:1 /
 ## Open Technical Gaps & Known Issues (ACTIVE)
 
 1. **Native Renderer Performance Floor (Thread Pole)**
-   - **⚠️ G568 baseline correction — READ FIRST.** `DC2_G553_RTT159` / `DC2_G556_RTT181` /
-     `DC2_G557_RTT13A` / `DC2_G558_13B_SOLID` are **DEFAULT-OFF in code** (`envFlagEnabled` in
-     `g248TargetIndex`, set by nothing in the tree), so every "G553/G557/G558 promoted default-ON"
-     claim below and the **`s05` 95.8 → 30.4 ms/f** headline describe a **flags-ON** run, not the
-     shipped default. `kG248TargetCount = 8`; all eight slots are consumed.
    - **Current Baseline**: route3 (palace battle + Palm Brinks rain) on the shipped default after
      **G569** is **30.55 ms/f mean, p50 28.58, p90 46.14, 32.9% of frames over the 33.33 ms
      budget** (pre-G568: 37.30 / 34.39 / 59.14 / 51.8%). Lean MAP-0 after G539 is **18.71
