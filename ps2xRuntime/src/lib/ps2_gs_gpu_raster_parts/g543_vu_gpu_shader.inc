@@ -59,7 +59,9 @@ uint Rstatus;
 uint Rebit;
 uint Ritop;
 uint Rxitop;
+#ifndef G545_WORKSPACE_RAM
 uvec4 Rram[1024];
+#endif
 
 uint Qpending;
 int Qdelay;
@@ -78,15 +80,6 @@ int Hhead;
 uvec2 PairBase;
 bool HistArmed;
 
-// G545 v27 default-off offline diagnostics: four visits to the Dungeon clipper's
-// OPMSUB/FMAND sign-bit gate, plus a ring of the last eight VF25 changes before its first
-// divergent SQI. Kept in invocation-private shader storage and published only in G543 status.
-uint DebugWords[160];
-uint DebugCount;
-uint DebugVf25Count;
-uint DebugOpmulaA;
-uint DebugOpmulaB;
-
 void fail(uint bit, uint word)
 {
     if (gErrors == 0u) {
@@ -101,6 +94,44 @@ int sx11(uint v) { return int(v << 21u) >> 21; }
 uint u16(int v) { return uint(v) & 0xffffu; }
 uint s2func(uint v) { return (((v >> 6u) & 31u) << 2u) | (v & 3u); }
 bool laneOn(uint d, int lane) { return (d & (8u >> uint(lane))) != 0u; }
+
+uvec4 g543LoadRamQuad(uint q)
+{
+#ifdef G545_WORKSPACE_RAM
+    uint at = 4431u + q * 4u;
+    return uvec4(ow(at), ow(at + 1u), ow(at + 2u), ow(at + 3u));
+#else
+    return Rram[q];
+#endif
+}
+
+void g543StoreRamQuad(uint q, uvec4 value)
+{
+#ifdef G545_WORKSPACE_RAM
+    uint at = 4431u + q * 4u;
+    sw(at, value.x); sw(at + 1u, value.y); sw(at + 2u, value.z); sw(at + 3u, value.w);
+#else
+    Rram[q] = value;
+#endif
+}
+
+uint g543LoadRamLane(uint q, int lane)
+{
+#ifdef G545_WORKSPACE_RAM
+    return ow(4431u + q * 4u + uint(lane));
+#else
+    return Rram[q][lane];
+#endif
+}
+
+void g543StoreRamLane(uint q, int lane, uint value)
+{
+#ifdef G545_WORKSPACE_RAM
+    sw(4431u + q * 4u + uint(lane), value);
+#else
+    Rram[q][lane] = value;
+#endif
+}
 
 uvec2 add64s(uvec2 a, int delta)
 {
@@ -227,11 +258,13 @@ uint roundDoubleToF32(double value, uint nativeZero)
 
 uint fmulBits(uint aBits, uint bBits)
 {
-    // SSE arithmetic returns the first NaN operand (quieted), preserving sign/payload. NVIDIA
-    // GLSL canonicalizes these lanes to a driver-specific payload. Its invalid-operation NaN is
-    // also different, so spell out the CPU oracle's 0xffc00000 result before native arithmetic.
-    if (f32NaN(aBits)) return quietSseNaN(aBits);
+    // G546: the promoted CPU fast-upper emits its commutative MUL with logical `b` as the SSE
+    // destination (`movaps result,b; mulps result,a`). When both operands are NaNs, SSE preserves
+    // that destination NaN. NVIDIA GLSL canonicalizes it, so select `b` first here; the one-NaN
+    // cases still return whichever operand is NaN. Release trace + disassembly proved the order.
+    if (f32NaN(aBits) && f32NaN(bBits)) return quietSseNaN(bBits);
     if (f32NaN(bBits)) return quietSseNaN(bBits);
+    if (f32NaN(aBits)) return quietSseNaN(aBits);
     if ((f32Inf(aBits) && f32Zero(bBits)) || (f32Zero(aBits) && f32Inf(bBits)))
         return 0xffc00000u;
     uint native = floatBitsToUint(fmul(uintBitsToFloat(aBits), uintBitsToFloat(bBits)));
@@ -242,8 +275,12 @@ uint fmulBits(uint aBits, uint bBits)
 
 uint faddBits(uint aBits, uint bBits)
 {
-    if (f32NaN(aBits)) return quietSseNaN(aBits);
+    // MSVC's Release SSE2 body selects logical `b` as the destructive ADDPS destination. When
+    // both logical operands are NaNs, preserve that destination payload/sign just as fmulBits
+    // does for the same two-register code shape. One-NaN cases still select the NaN operand.
+    if (f32NaN(aBits) && f32NaN(bBits)) return quietSseNaN(bBits);
     if (f32NaN(bBits)) return quietSseNaN(bBits);
+    if (f32NaN(aBits)) return quietSseNaN(aBits);
     if (f32Inf(aBits) && f32Inf(bBits) && ((aBits ^ bBits) & 0x80000000u) != 0u)
         return 0xffc00000u;
     uint native = floatBitsToUint(fadd(uintBitsToFloat(aBits), uintBitsToFloat(bBits)));
@@ -577,7 +614,7 @@ uint ramByte(uint byteAddr)
     uint q = a >> 4u;
     uint lane = (a >> 2u) & 3u;
     uint shift = (a & 3u) * 8u;
-    return (Rram[q][int(lane)] >> shift) & 255u;
+    return (g543LoadRamLane(q, int(lane)) >> shift) & 255u;
 }
 
 void storeOutByte(uint byteAddr, uint value)
@@ -661,17 +698,22 @@ void execLower(uint instr)
         int imm = sx11(instr);
         int baseReg = (op == 0x01u) ? it : isr;
         uint q = uint(Rvi[baseReg] + imm) & 0x3ffu;
-        if (op == 0x00u) applyBits(Rvf[it], Rram[q], dest);
+        if (op == 0x00u) {
+            uvec4 source = g543LoadRamQuad(q);
+            applyBits(Rvf[it], source, dest);
+        }
         else if (op == 0x01u) {
             uvec4 source = Rvf[isr];
-            applyBits(Rram[q], source, dest);
+            uvec4 target = g543LoadRamQuad(q);
+            applyBits(target, source, dest);
+            g543StoreRamQuad(q, target);
         }
         else if (op == 0x04u) {
             int comp = (dest & 8u) != 0u ? 0 : ((dest & 4u) != 0u ? 1 : ((dest & 2u) != 0u ? 2 : 3));
-            if (it != 0) Rvi[it] = sx16(Rram[q][comp]);
+            if (it != 0) Rvi[it] = sx16(g543LoadRamLane(q, comp));
         } else {
             uint v = u16(Rvi[it]);
-            for (int n = 0; n < 4; ++n) if (laneOn(dest, n)) Rram[q][n] = v;
+            for (int n = 0; n < 4; ++n) if (laneOn(dest, n)) g543StoreRamLane(q, n, v);
         }
         return;
     }
@@ -736,10 +778,12 @@ void execLower(uint instr)
         int ar = load ? isr : it;
         if (predec && ar != 0) Rvi[ar] = sx16(uint(Rvi[ar] - 1));
         uint q = u16(Rvi[ar]) & 0x3ffu;
-        if (load) applyBits(Rvf[it], Rram[q], dest);
+        if (load) applyBits(Rvf[it], g543LoadRamQuad(q), dest);
         else {
             uvec4 source = Rvf[isr];
-            applyBits(Rram[q], source, dest);
+            uvec4 target = g543LoadRamQuad(q);
+            applyBits(target, source, dest);
+            g543StoreRamQuad(q, target);
         }
         if (!predec && ar != 0) Rvi[ar] = sx16(uint(Rvi[ar] + 1));
         return;
@@ -766,14 +810,14 @@ void execLower(uint instr)
     if (fn == 0x3eu) {
         if (it != 0) {
             uint q = u16(Rvi[isr]) & 0x3ffu; uint v = 0u;
-            for (int n = 0; n < 4; ++n) if (laneOn(dest, n)) v = Rram[q][n];
+            for (int n = 0; n < 4; ++n) if (laneOn(dest, n)) v = g543LoadRamLane(q, n);
             Rvi[it] = sx16(v);
         }
         return;
     }
     if (fn == 0x3fu) {
         uint q = u16(Rvi[isr]) & 0x3ffu; uint v = u16(Rvi[it]);
-        for (int n = 0; n < 4; ++n) if (laneOn(dest, n)) Rram[q][n] = v;
+        for (int n = 0; n < 4; ++n) if (laneOn(dest, n)) g543StoreRamLane(q, n, v);
         return;
     }
     if (fn >= 0x40u && fn <= 0x43u) return;
@@ -844,10 +888,13 @@ void loadRecord()
     PairBase = uvec2(pw(prePipe + 155u), pw(prePipe + 156u));
     HistArmed = pw(prePipe + 157u) != 0u;
 
+#ifndef G545_WORKSPACE_RAM
     uint preData = gPreDataByte >> 2u;
     for (int q = 0; q < 1024; ++q)
-        Rram[q] = uvec4(pw(preData + uint(q*4+0)), pw(preData + uint(q*4+1)),
-                        pw(preData + uint(q*4+2)), pw(preData + uint(q*4+3)));
+        g543StoreRamQuad(uint(q),
+            uvec4(pw(preData + uint(q*4+0)), pw(preData + uint(q*4+1)),
+                  pw(preData + uint(q*4+2)), pw(preData + uint(q*4+3))));
+#endif
 }
 
 void storeRecord()
@@ -877,7 +924,8 @@ void storeRecord()
 
     uint postData = gPostDataByte >> 2u;
     for (int q = 0; q < 1024; ++q)
-        for (int n = 0; n < 4; ++n) sw(postData + uint(q*4+n), Rram[q][n]);
+        for (int n = 0; n < 4; ++n)
+            sw(postData + uint(q*4+n), g543LoadRamLane(uint(q), n));
 }
 
 void main()
@@ -886,11 +934,6 @@ void main()
     gCmd = rec * 32u;
     gErrors = 0u; gFailPc = 0xffffffffu; gFailWord = 0u;
     gPacketCount = 0u; gPacketBytes = 0u;
-    DebugCount = 0u;
-    DebugVf25Count = 0u;
-    for (int d = 0; d < 160; ++d) DebugWords[d] = 0xffffffffu;
-    DebugOpmulaA = 0xffffffffu;
-    DebugOpmulaB = 0xffffffffu;
     Rpc = 0xffffffffu;
 
     if (cw(gCmd) != ABI_MAGIC || cw(gCmd + 1u) != 1u || cw(gCmd + 2u) != 32u) gErrors |= 1u;
@@ -921,7 +964,6 @@ void main()
     uint pendingBranch = 0xffffffffu;
     for (; cycle < budget; ++cycle) {
         uint currentPc = Rpc;
-        uint debugSlot = 0xffffffffu;
         if (currentPc + 8u > 16384u) { stop = 1u; break; }
         uint codeWord = (gCodeByte + currentPc) >> 2u;
         uint lower = pw(codeWord);
@@ -947,41 +989,6 @@ void main()
         if (!iBit && lowerReadsStatus(lowerOp)) fail(F_PIPE, lower);
         if (!iBit && lowerReadsMac(lowerOp)) MacVisible = resolveMac(add64s(add64u(PairBase, cycle), -4));
 
-        if (currentPc == 0x2f08u && DebugCount != 0u) {
-            uint db = (DebugCount - 1u) * 12u;
-            DebugWords[db + 5u] = MacVisible;
-            DebugWords[db + 6u] = u16(Rvi[10]);
-            DebugWords[db + 7u] = u16(Rvi[7]);
-        }
-
-        if (currentPc == 0x2ee0u) {
-            DebugOpmulaA = Rvf[21].x;
-            DebugOpmulaB = Rvf[20].y;
-        }
-        if (currentPc == 0x2ee8u && DebugCount < 4u) {
-            debugSlot = DebugCount++;
-            uint db = debugSlot * 12u;
-            DebugWords[db + 0u] = cycle;
-            DebugWords[db + 1u] = Racc.z;
-            DebugWords[db + 2u] = fmulBits(Rvf[20].x, Rvf[21].y);
-            DebugWords[db + 8u] = DebugOpmulaA;
-            DebugWords[db + 9u] = DebugOpmulaB;
-            DebugWords[db + 10u] = Rvf[20].x;
-            DebugWords[db + 11u] = Rvf[21].y;
-        }
-        if (currentPc == 0x32b8u && DebugWords[144] == 0xffffffffu) {
-            DebugWords[144] = cycle;
-            DebugWords[145] = upper;
-            DebugWords[146] = Rvf[21].x;
-            DebugWords[147] = Rvf[21].y;
-            DebugWords[148] = Rvf[21].z;
-            DebugWords[149] = Rvf[21].w;
-            DebugWords[150] = Rvf[17].x;
-            DebugWords[151] = Rvf[17].y;
-            DebugWords[152] = Rvf[17].z;
-            DebugWords[153] = Rvf[17].w;
-        }
-        uvec4 debugVf25Before = Rvf[25];
         uvec2 stamp = add64u(PairBase, cycle);
         if (iBit) {
             Ri = lower;
@@ -1000,35 +1007,6 @@ void main()
             if (hazard >= 0) { newV = Rvf[hazard]; Rvf[hazard] = oldV; }
             if (gErrors == 0u) execLower(lower);
             if (hazard >= 0) applyBits(Rvf[hazard], newV, (upper >> 21u) & 15u);
-        }
-        if (cycle >= 800u && cycle <= 1246u && any(notEqual(debugVf25Before, Rvf[25]))) {
-            uint db = 48u + (DebugVf25Count & 7u) * 12u;
-            DebugWords[db + 0u] = cycle;
-            DebugWords[db + 1u] = currentPc;
-            DebugWords[db + 2u] = lower;
-            DebugWords[db + 3u] = upper;
-            DebugWords[db + 4u] = debugVf25Before.x;
-            DebugWords[db + 5u] = debugVf25Before.y;
-            DebugWords[db + 6u] = debugVf25Before.z;
-            DebugWords[db + 7u] = debugVf25Before.w;
-            DebugWords[db + 8u] = Rvf[25].x;
-            DebugWords[db + 9u] = Rvf[25].y;
-            DebugWords[db + 10u] = Rvf[25].z;
-            DebugWords[db + 11u] = Rvf[25].w;
-            ++DebugVf25Count;
-        }
-        if (currentPc == 0x32b8u && DebugWords[154] == 0xffffffffu) {
-            DebugWords[154] = Rvf[25].x;
-            DebugWords[155] = Rvf[25].y;
-            DebugWords[156] = Rvf[25].z;
-            DebugWords[157] = Rvf[25].w;
-            DebugWords[158] = Racc.x;
-            DebugWords[159] = (upper >> 21u) & 15u;
-        }
-        if (debugSlot != 0xffffffffu) {
-            uint db = debugSlot * 12u;
-            DebugWords[db + 3u] = Rvf[23].z;
-            DebugWords[db + 4u] = makeMac(Rvf[23], 0xeu);
         }
         if (gErrors != 0u) { stop = 3u; break; }
 
@@ -1067,7 +1045,6 @@ void main()
     sw(statusAt + 5u, stop);
     sw(statusAt + 6u, gPacketCount);
     sw(statusAt + 7u, gPacketBytes);
-    for (uint d = 0u; d < 160u; ++d) sw(statusAt + 8u + d, DebugWords[d]);
 }
 )G543D";
 }

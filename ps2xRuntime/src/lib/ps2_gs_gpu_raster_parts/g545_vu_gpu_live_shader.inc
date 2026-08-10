@@ -5,13 +5,44 @@ static std::string g545LiveShaderSource(std::string &why)
     std::string source = g544ChainShaderSource(why);
     if (source.empty())
         return {};
+    if (!g544ReplaceShaderPart(source, "#version 430 core\n",
+                               "#version 430 core\n#define G545_WORKSPACE_RAM 1\n",
+                               why))
+        return {};
+
+    // G546: these are G544 offline-main helpers. G545 replaces that main and never references
+    // them. Leaving the bodies in the monolithic source can push NVIDIA's compiler over its
+    // register/code-size cliff even after dead-code elimination, so remove them before linking.
+    const auto eraseBefore = [&](const char *beginText, const char *endText) -> bool {
+        const size_t begin = source.find(beginText);
+        const size_t end = begin == std::string::npos
+            ? std::string::npos : source.find(endText, begin);
+        if (begin == std::string::npos || end == std::string::npos || end <= begin)
+            return false;
+        source.erase(begin, end - begin);
+        return true;
+    };
+    if (!eraseBefore("void verifyChainPre()", "void setupRecord()") ||
+        !eraseBefore("void setupRecord()", "void executeChainRecord") ||
+        !eraseBefore("void writeRecordStatus", "void storePersistentWorkspace"))
+    {
+        why = "G544 live-only prune anchor not found";
+        return {};
+    }
 
     const std::string extraGlobals =
+        "layout(r32ui, binding=5) coherent uniform uimage2D gG566Output;\n"
         "const uint F_RING = 0x00000100u;\n"
         "const uint F_LIVE_ABI = 0x00000200u;\n"
         "const uint F_LIVE_SEQUENCE = 0x00000400u;\n"
         "const uint F_LIVE_STATE = 0x00000800u;\n"
         "const uint F_LIVE_DATA = 0x00001000u;\n"
+        "const uint G566_OUTPUT_WORDS = 262144u;\n"
+        "bool gAuthorityMode;\n"
+        "uint gAuthorityCursor;\n"
+        "ivec2 g566lc(uint i) { return ivec2(int(i & 4095u), int(i >> 12u)); }\n"
+        "uint g566ow(uint i) { return imageLoad(gG566Output, g566lc(i)).r; }\n"
+        "void g566sw(uint i, uint v) { imageStore(gG566Output, g566lc(i), uvec4(v,0u,0u,0u)); }\n"
         "uniform int uG545CommandCount;\n";
     if (!g544ReplaceShaderPart(source, "const uint F_RING = 0x00000100u;\n",
                                extraGlobals, why))
@@ -51,9 +82,33 @@ static std::string g545LiveShaderSource(std::string &why)
         off = (off + size) & 0x3fffu;
         done = ((lo >> 15u) & 1u) != 0u;
     }
-    if (!done || gPacketCount >= gExpectedPackets ||
-        total > gExpectedPacketBytes - min(gPacketBytes, gExpectedPacketBytes)) {
+    if (!done || (!gAuthorityMode &&
+        (gPacketCount >= gExpectedPackets ||
+         total > gExpectedPacketBytes - min(gPacketBytes, gExpectedPacketBytes)))) {
         fail(F_PACKET | F_RING, instr);
+        return;
+    }
+    if (gAuthorityMode) {
+        uint dataWords = (total + 3u) >> 2u;
+        uint need = 2u + dataWords;
+        if (gAuthorityCursor > G566_OUTPUT_WORDS ||
+            need > G566_OUTPUT_WORDS - min(gAuthorityCursor, G566_OUTPUT_WORDS)) {
+            fail(F_PACKET | F_RING, 0x4f564652u);
+            return;
+        }
+        g566sw(gAuthorityCursor + 0u, addr);
+        g566sw(gAuthorityCursor + 1u, total);
+        for (uint w = 0u; w < dataWords; ++w) {
+            uint packedWord = 0u;
+            for (uint n = 0u; n < 4u; ++n) {
+                uint b = w * 4u + n;
+                if (b < total) packedWord |= ramByte(addr + b) << (n * 8u);
+            }
+            g566sw(gAuthorityCursor + 2u + w, packedWord);
+        }
+        gAuthorityCursor += need;
+        ++gPacketCount;
+        gPacketBytes += total;
         return;
     }
     uint desc = gPacketDescByte + gPacketCount * 8u;
@@ -124,12 +179,14 @@ void loadLiveWorkspace()
     Rebit=ow(base+155u); Ritop=ow(base+156u); Rxitop=ow(base+157u);
     for (uint w=0u; w<161u; ++w) Rpipe[w]=ow(LIVE_PIPE_WORD+w);
     loadLivePrivatePipe();
+#ifndef G545_WORKSPACE_RAM
     for (int q=0; q<1024; ++q) {
         Rcode[q]=uvec4(ow(LIVE_CODE_WORD+uint(q*4+0)), ow(LIVE_CODE_WORD+uint(q*4+1)),
                        ow(LIVE_CODE_WORD+uint(q*4+2)), ow(LIVE_CODE_WORD+uint(q*4+3)));
         Rram[q]=uvec4(ow(LIVE_DATA_WORD+uint(q*4+0)), ow(LIVE_DATA_WORD+uint(q*4+1)),
                       ow(LIVE_DATA_WORD+uint(q*4+2)), ow(LIVE_DATA_WORD+uint(q*4+3)));
     }
+#endif
 }
 
 void publishLiveStatus(uint errors, uvec2 failSeq, uint failRec, uvec2 total,
@@ -161,7 +218,7 @@ bool verifyLivePost(bool checkpoint)
         uint data = cw(gCmd + 21u) >> 2u;
         for (int q=0; q<1024; ++q) for (int n=0; n<4; ++n) {
             uint w=uint(q*4+n);
-            if (Rram[q][n] != pw(data+w)) {
+            if (g543LoadRamLane(uint(q), n) != pw(data+w)) {
                 fail(F_LIVE_DATA, 0x44000000u | w); return false;
             }
         }
@@ -175,6 +232,15 @@ void main()
     if (gl_GlobalInvocationID.x != 0u) return;
     uint commandCount = uint(max(uG545CommandCount, 0));
     if (commandCount == 0u) return;
+
+    bool authorityBatch = cw(0u) == 0x36435556u;
+    gAuthorityMode = authorityBatch;
+    gAuthorityCursor = 4u + commandCount * 8u;
+    if (authorityBatch) {
+        for (uint w=0u; w<gAuthorityCursor; ++w) g566sw(w, 0u);
+        g566sw(0u, 0x36554156u); // little-endian "VAU6"
+        g566sw(1u, 1u); g566sw(2u, commandCount); g566sw(3u, gAuthorityCursor);
+    }
 
     bool initialized = ow(0u) == LIVE_MAGIC && ow(1u) == LIVE_VERSION;
     if (initialized && ow(2u) != 0u) return;
@@ -192,10 +258,13 @@ void main()
         gPacketCount=0u; gPacketBytes=0u;
         Rpc=initialized ? Rpc : 0xffffffffu;
         uint flags=cw(gCmd+3u);
+        bool recordAuthority=cw(gCmd+0u) == 0x36435556u;
         bool seed=(flags & 2u) != 0u;
         bool checkpoint=(flags & 4u) != 0u;
         uvec2 seq=uvec2(cw(gCmd+4u), cw(gCmd+5u));
-        if (cw(gCmd+0u) != 0x35435556u || cw(gCmd+1u) != 1u ||
+        uint expectedMagic=authorityBatch ? 0x36435556u : 0x35435556u;
+        if (cw(gCmd+0u) != expectedMagic || recordAuthority != authorityBatch ||
+            cw(gCmd+1u) != 1u ||
             cw(gCmd+2u) != 32u || cw(gCmd+14u) != cw(gCmd+31u))
             fail(F_LIVE_ABI, 0x41424935u);
         if (!seed) {
@@ -223,19 +292,35 @@ void main()
             applyIncomingWrites();
         }
         if (gErrors != 0u) {
+            if (authorityBatch) {
+                uint h=4u+rec*8u;
+                g566sw(h+0u,seq.x); g566sw(h+1u,seq.y); g566sw(h+2u,gPacketCount);
+                g566sw(h+3u,gAuthorityCursor); g566sw(h+4u,0u); g566sw(h+5u,gPacketBytes);
+                g566sw(h+6u,gErrors); g566sw(h+7u,0u); g566sw(3u,gAuthorityCursor);
+            }
             publishLiveStatus(gErrors, seq, rec, total, lastSeq, dispatches,
                               packets, checkpoints, seeds);
             return;
         }
 
+        uint authorityStart=gAuthorityCursor;
         uint cycle=0u, stop=0u;
         executeChainRecord(cycle, stop);
-        if (cycle != cw(gCmd+10u) || cw(gCmd+11u) != 0u || stop != cw(gCmd+12u))
+        if (!authorityBatch &&
+            (cycle != cw(gCmd+10u) || cw(gCmd+11u) != 0u || stop != cw(gCmd+12u)))
             gErrors |= F_RESULT;
-        if (gPacketCount != gExpectedPackets || gPacketBytes != gExpectedPacketBytes)
+        if (!authorityBatch &&
+            (gPacketCount != gExpectedPackets || gPacketBytes != gExpectedPacketBytes))
             gErrors |= F_PACKET;
         syncPipeArray();
-        if (gErrors == 0u) verifyLivePost(checkpoint);
+        if (!authorityBatch && gErrors == 0u) verifyLivePost(checkpoint);
+        if (authorityBatch) {
+            uint h=4u+rec*8u;
+            g566sw(h+0u,seq.x); g566sw(h+1u,seq.y); g566sw(h+2u,gPacketCount);
+            g566sw(h+3u,authorityStart); g566sw(h+4u,gAuthorityCursor-authorityStart);
+            g566sw(h+5u,gPacketBytes); g566sw(h+6u,gErrors); g566sw(h+7u,cycle);
+            g566sw(3u,gAuthorityCursor);
+        }
         if (gErrors != 0u) {
             publishLiveStatus(gErrors, seq, rec, total, lastSeq, dispatches,
                               packets, checkpoints, seeds);
@@ -247,6 +332,7 @@ void main()
     }
 
     storePersistentWorkspace(LIVE_STATE_WORD);
+    if (authorityBatch) g566sw(3u,gAuthorityCursor);
     publishLiveStatus(0u, lastSeq, 0xffffffffu, total, lastSeq, dispatches,
                       packets, checkpoints, seeds);
 }

@@ -38,6 +38,29 @@ static bool g280DirtyTargetOwnsPage(int ti, uint32_t pageBlock,
     return true;
 }
 
+// G556: reproduce the winner left by g261MaterializeAllDirty after G536's per-page guard.
+// Materialization is ascending. The FIRST dirty target covering a page either publishes its FBO,
+// or preserves the already-authoritative guest page; either operation bumps the page generation,
+// so every higher overlapping target subsequently preserves that first result. The old atlas rule
+// selected the highest target and was therefore stale once G536 became default-on.
+static int g310LegacyPageWinner(uint32_t pageBlock,
+                                uint32_t *pageRow = nullptr,
+                                uint32_t *pageCol = nullptr)
+{
+    for (uint32_t t = 0u; t < kG248TargetCount; ++t)
+    {
+        uint32_t row = 0u, col = 0u;
+        if (!g280DirtyTargetOwnsPage(static_cast<int>(t), pageBlock, &row, &col))
+            continue;
+        if (g536GuestOwnsTargetPage(g_g261Res[t], kG261Fbp[t], row, col))
+            return -1;
+        if (pageRow) *pageRow = row;
+        if (pageCol) *pageCol = col;
+        return static_cast<int>(t);
+    }
+    return -1;
+}
+
 struct G309PageSnapshot
 {
     uint32_t pageBlock = 0u;
@@ -86,17 +109,7 @@ static bool g309BuildPageMap(std::vector<uint32_t> &pageMap,
             const uint32_t pageBlock = 0x2720u + static_cast<uint32_t>(index) * 32u;
             int sourceTi = -1;
             uint32_t srcRow = 0u, srcCol = 0u;
-            // Deliberately do not break: the highest target index is the final legacy publisher.
-            for (uint32_t t = 0u; t < kG248TargetCount; ++t)
-            {
-                uint32_t row = 0u, col = 0u;
-                if (g280DirtyTargetOwnsPage(static_cast<int>(t), pageBlock, &row, &col))
-                {
-                    sourceTi = static_cast<int>(t);
-                    srcRow = row;
-                    srcCol = col;
-                }
-            }
+            sourceTi = g310LegacyPageWinner(pageBlock, &srcRow, &srcCol);
             const bool gpuSource = sourceTi >= 0;
             if (gpuSource && (srcRow >= 16u || srcCol >= 8u))
             {
@@ -136,10 +149,7 @@ static bool g309SnapshotCurrent(const std::array<G309PageSnapshot, 128> &snapsho
 {
     for (const G309PageSnapshot &s : snapshot)
     {
-        int sourceTi = -1;
-        for (uint32_t t = 0u; t < kG248TargetCount; ++t)
-            if (g280DirtyTargetOwnsPage(static_cast<int>(t), s.pageBlock))
-                sourceTi = static_cast<int>(t);
+        const int sourceTi = g310LegacyPageWinner(s.pageBlock);
         if ((sourceTi >= 0) != s.gpuSource || sourceTi != s.sourceTi)
             return false;
         if (sourceTi >= 0 &&
@@ -305,23 +315,24 @@ static bool g310BuildDesired(std::array<G310DesiredPage, 128> &desired,
         const uint32_t pageBlock =
             0x2720u + static_cast<uint32_t>(page) * 32u;
         G310DesiredPage d{};
-        // Ascending legacy publication makes the highest still-dirty target the final winner.
-        for (uint32_t t = 0u; t < kG248TargetCount; ++t)
+        const int winner = g310LegacyPageWinner(pageBlock);
+        if (winner >= 0)
         {
             uint32_t row = 0u, col = 0u;
-            if (g280DirtyTargetOwnsPage(
-                    static_cast<int>(t), pageBlock, &row, &col))
+            if (!g280DirtyTargetOwnsPage(winner, pageBlock, &row, &col))
             {
-                if (row >= 16u || col >= 8u)
-                {
-                    g_g310FailLayout.fetch_add(1u, std::memory_order_relaxed);
-                    return false;
-                }
-                d.sourceTi = static_cast<int8_t>(t);
-                d.sourceRow = static_cast<uint8_t>(row);
-                d.sourceCol = static_cast<uint8_t>(col);
-                d.sourceGen = g_g310TargetPageGen[t][page];
+                g_g310FailLayout.fetch_add(1u, std::memory_order_relaxed);
+                return false;
             }
+            if (row >= 16u || col >= 8u)
+            {
+                g_g310FailLayout.fetch_add(1u, std::memory_order_relaxed);
+                return false;
+            }
+            d.sourceTi = static_cast<int8_t>(winner);
+            d.sourceRow = static_cast<uint8_t>(row);
+            d.sourceCol = static_cast<uint8_t>(col);
+            d.sourceGen = g_g310TargetPageGen[static_cast<uint32_t>(winner)][page];
         }
         desired[page] = d;
         if (g310StatOn())

@@ -87,7 +87,7 @@ struct G282Fanout
 static std::atomic<uint64_t> g_g282Candidates{0}, g_g282TightBatches{0},
     g_g282AliasSaved{0}, g_g282FanoutPages{0}, g_g282FanoutFail{0},
     g_g282RejShape{0}, g_g282RejOwner{0}, g_g282VerifyBad{0};
-// G309: authoritative-page multi-source atlas consumer. The timing path samples five live target
+// G309: authoritative-page multi-source atlas consumer. The timing path samples live target
 // textures through an 8x16 page map; the exact verifier alone builds a transient 512x512 reference.
 // All behavior stays default-off because the end-to-end payoff gate did not pass.
 static constexpr uint32_t kG309CompositeToken = 0xfffffff7u;
@@ -101,13 +101,13 @@ static bool g309VerifyOn();
 static bool g309StatOn();
 static void g309Report();
 // G310: persistent logical-vs-physical framebuffer split. The private logical FBO carries the
-// downstream 0x2720/tbw=8 atlas while the five physical FRAME/FBW views remain producer-owned.
+// downstream 0x2720/tbw=8 atlas while physical FRAME/FBW views remain producer-owned.
 // Default-on after exact, normal-presentation, and >=10% same-binary payoff gates passed.
 static constexpr uint32_t kG310LogicalFbp = 0xfffffff5u;
 static constexpr uint32_t kG310LogicalCt24Token = 0xfffffff4u;
 struct G310PageState
 {
-    int8_t sourceTi = -1; // -1 guest VRAM; 0..4 resident producer
+    int8_t sourceTi = -1; // -1 guest VRAM; otherwise resident-target index
     uint64_t sourceGen = 0u;
     uint64_t guestGen = 0u;
     uint64_t guestHash = 0u;
@@ -1589,6 +1589,26 @@ struct G536PageSave
     std::array<uint8_t, 8192> bytes;
 };
 
+// True exactly when G536's publication guard will preserve this target-local CT32 page instead
+// of allowing the FBO readback to replace it. Atlas composition uses the same predicate so its
+// source winner matches the bytes left by the legacy ascending materialization sequence.
+static bool g536GuestOwnsTargetPage(const G261Res &r, uint32_t fbp,
+                                    uint32_t pageRow, uint32_t pageCol)
+{
+    if (!g536PageOwnOn() || r.g536PageGenFbw == 0u ||
+        r.g536PageGenFbw != r.fbw || r.fbw == 0u || r.fbw > 8u ||
+        pageRow >= 16u || pageCol >= r.fbw || g_g144LastVram == nullptr)
+        return false;
+    const uint32_t p = pageRow * r.fbw + pageCol;
+    if (p >= r.g536PageGen.size())
+        return false;
+    const uint32_t page = fbp + p;
+    const uint64_t off = static_cast<uint64_t>(page) * 8192ull;
+    if (page >= kG178PageCount || off + 8192ull > g_g261VramSize)
+        return false;
+    return g_g178PageGen[page].load(std::memory_order_relaxed) != r.g536PageGen[p];
+}
+
 // Collect every page inside the rows about to be published whose generation moved since the
 // anchor. Fails CLOSED in the safe direction: if the snapshot is missing or the layout changed,
 // nothing is protected and the legacy publication runs unchanged.
@@ -1607,13 +1627,8 @@ static void g536CollectGuestOwnedPages(const G261Res &r, uint32_t fbp, int rowLo
         for (uint32_t px = 0; px < r.fbw; ++px)
         {
             const uint32_t p = py * r.fbw + px;
-            if (p >= r.g536PageGen.size())
-                continue;
             const uint32_t page = basePage + p;
-            if (page >= kG178PageCount)
-                continue;
-            const uint64_t now = g_g178PageGen[page].load(std::memory_order_relaxed);
-            if (now == r.g536PageGen[p])
+            if (!g536GuestOwnsTargetPage(r, fbp, py, px))
                 continue; // FBO still owns this page
             const uint64_t off = static_cast<uint64_t>(page) * 8192ull;
             if (off + 8192ull > vramSize)

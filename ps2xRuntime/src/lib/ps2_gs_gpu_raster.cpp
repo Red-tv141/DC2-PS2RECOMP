@@ -1,7 +1,10 @@
+// G566: GPU-authoritative VU1 packet publication and one-readback-per-16-kick prototype (v3).
 // G433: blocking colour-readback ceiling probe in lle_gpu_raster_backend.inc
 // (DC2_G433_NO_RB=1 skips only glReadPixels; DC2_G433_RBSTAT=1 times it). Content edit here
 // forces MSBuild to consume the .inc.
-// G545: batched live VU1 GPU shadow, persistent workspace + delayed checkpoints (v27 PC-32b8 SUB trace).
+// G546: CPU dead-history MAX/MIN + image-resident live VU code/RAM workspace (v31).
+// G545: batched live VU1 GPU shadow, persistent workspace + delayed checkpoints.
+// G565: clean rebuild of the resumed G545 exact semantic source.
 // G544: one-dispatch persistent VU1 chain + bounded ordered XGKICK packet-ring oracle (v4).
 // G543: exact default-off GPU VU1 semantic replay + one-readback corpus oracle (v6 denorm repair).
 // G541: coalesced async no-readback VU1 null transport; timed gather refuted/removed (v4).
@@ -44,6 +47,10 @@
 #include "ps2_gs_gpu_lle.h" // G178: private front-end<->backend interface (both build branches)
 
 #if defined(_WIN32) && !defined(PLATFORM_VITA)
+
+// G566 result ABI must live at global scope in both translation units; including it from a parts
+// file inside the backend's anonymous namespace changes the C++ type and therefore the bridge name.
+#include "ps2_gs_gpu_raster_parts/g566_vu_authority_shared.inc"
 
 // G445: within-process A/B arm selector for the G418 early command kick. Defined at global scope in
 // ps2_gs_rasterizer_parts/g419_ab_instrument.inc; declared here (outside the parts' anonymous
@@ -131,6 +138,9 @@ bool g162DecodeT8Batch(int, const uint32_t *, const uint32_t *, const int *, con
 bool g178_backend_ready() { return false; }
 bool g178_backend_submit(G178Batch &) { return false; }
 bool g541_backend_null_compute() { return false; }
+bool g545_backend_live_submit(std::vector<uint8_t> &&) { return false; }
+bool g566_backend_authority_submit(
+    std::vector<uint8_t> &&, const std::shared_ptr<G566VuAuthorityResult> &) { return false; }
 bool g178_backend_submit_async(G178Batch &) { return false; }
 bool g178_backend_drain_async(bool &ok) { ok = true; return false; }
 bool g242_backend_submit_depth(G178Batch &, uint64_t, const std::vector<float> *, int, int) { return false; }

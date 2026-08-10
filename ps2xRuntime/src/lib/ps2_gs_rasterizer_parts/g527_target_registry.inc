@@ -105,10 +105,27 @@ static bool g527RegistryOn()
 // That contract already governs the legacy five and is unchanged by this phase — but the measured
 // inline population on Georama is 100% sprites + linestrips, so admitting triangles buys nothing
 // on the route the payoff is claimed from while widening the class of entries subject to it.
-// DC2_G527_TRI=1 turns it on for a future phase that prices it with its own gate.
+// DC2_G527_TRI=1 turns it on standalone. G552 prices the same one-variable change with the paired
+// `rtttri` gate; the selection test is cached so ordinary/default draws pay no new call.
+int g552RttTriArm();
 static bool g527TriOn()
 {
-    static const bool on = envFlagEnabled("DC2_G527_TRI") && !envFlagEnabled("DC2_G527_NO_TRI");
+    static const bool paired = []()
+    {
+        const char *value = std::getenv("DC2_G419_AB");
+        return value != nullptr && std::strcmp(value, "rtttri") == 0;
+    }();
+    if (paired)
+        return g552RttTriArm() > 0;
+    // ⭐ G568 — PROMOTED DEFAULT-ON. G527's "admitting triangles buys nothing" above is a property
+    // of GEORAMA, not of the lever. On route3 (palace battle + Palm Brinks rain) `[G526:type]`
+    // measures the inline population as tri=2,327,386 + tristrip=7,167,325 of 9,721,135 =
+    // 97.7% TRIANGLES, where Georama's was 100% sprites + linestrips. Those 9.72 M inline
+    // primitives cost 84.3 s of a 97.8 s drawPrimitive path (86%) at 8.67 us each, of which
+    // `[G526:split]` books drain=3.18 us + edge=1.94 us = 59% pure per-primitive DRAIN/EDGE
+    // overhead rather than raster. Paired `rtttri` gate on route3, 4 runs: see the G568 fix log.
+    // Rollback: DC2_G527_NO_TRI=1.
+    static const bool on = !envFlagEnabled("DC2_G527_NO_TRI") && !envFlagDisabled("DC2_G527_TRI");
     return on;
 }
 

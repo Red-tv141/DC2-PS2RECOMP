@@ -7,7 +7,7 @@
 #include "g543_vu_gpu_shader.inc"
 
 constexpr uint32_t G543_STATUS_MAGIC = 0x4d455347u; // little-endian "GSEM"
-constexpr uint32_t G543_STATUS_WORDS = 168u;
+constexpr uint32_t G543_STATUS_WORDS = 8u;
 
 static bool g543LinkProgram(GLFns &f, GLuint &program, std::string &why)
 {
@@ -48,6 +48,23 @@ struct G543Mismatch
     uint32_t actualWord = 0u;
 };
 
+// A deferred history vector is consumed only through makeMac(value, dest). Lanes excluded by its
+// recorded destination mask are never observed, never become architectural state, and never affect
+// packets. NVIDIA may flush a denormal in such a dead lane while Release SSE2 preserves its bits;
+// compare the semantic pipeline rather than forcing that inert payload through a shader spill cliff.
+static bool g543HistoryPipeByteObservable(const uint8_t *expected, uint32_t pipeByteOffset,
+                                          uint32_t relativeByte)
+{
+    const uint32_t word = relativeByte >> 2u;
+    if (word < 82u || word >= 114u)
+        return true;
+    const uint32_t relative = word - 82u;
+    const uint32_t slot = relative >> 2u;
+    const uint32_t lane = relative & 3u;
+    const uint32_t dest = g542ReadU32(expected + pipeByteOffset + (138u + slot) * 4u);
+    return (dest & (8u >> lane)) != 0u;
+}
+
 static bool g543CompareSection(const G542AbiCorpus &corpus,
                                const std::vector<uint32_t> &output,
                                uint32_t record, const char *section,
@@ -67,8 +84,11 @@ static bool g543CompareSection(const G542AbiCorpus &corpus,
     }
     const auto *expected = reinterpret_cast<const uint8_t *>(corpus.payload.data());
     const auto *actual = reinterpret_cast<const uint8_t *>(output.data());
+    const bool semanticPipe = std::strcmp(section, "postPipe") == 0;
     for (uint32_t b = 0u; b < byteCount; ++b)
     {
+        if (semanticPipe && !g543HistoryPipeByteObservable(expected, byteOffset, b))
+            continue;
         if (expected[byteOffset + b] == actual[byteOffset + b])
             continue;
         mismatch.section = section;
@@ -232,42 +252,6 @@ static bool g543RunSemanticReplay(GLFns &f, G178GLExt &e)
                              "[G543:packet] record=%u packet=%u expected=%04x/%u actual=%04x/%u\n",
                              r, p, expectedAddr, expectedSize, actualAddr, actualSize);
             }
-            for (uint32_t d = 0u; d < 4u; ++d)
-            {
-                const size_t db = s + 8u + static_cast<size_t>(d) * 12u;
-                if (db + 12u > output.size() || output[db] == 0xffffffffu)
-                    continue;
-                std::fprintf(stderr,
-                             "[G543:macgate] record=%u visit=%u cycle=%u accZ=%08x productZ=%08x resultZ=%08x mac=%04x visible=%04x expected=%04x mask=%04x opmula=%08x*%08x opmsub=%08x*%08x\n",
-                             r, d, output[db], output[db + 1u], output[db + 2u],
-                             output[db + 3u], output[db + 4u] & 0xffffu,
-                             output[db + 5u] & 0xffffu, output[db + 6u] & 0xffffu,
-                             output[db + 7u] & 0xffffu, output[db + 8u], output[db + 9u],
-                             output[db + 10u], output[db + 11u]);
-            }
-            for (uint32_t d = 0u; d < 8u; ++d)
-            {
-                const size_t db = s + 8u + 48u + static_cast<size_t>(d) * 12u;
-                if (db + 12u > output.size() || output[db] == 0xffffffffu)
-                    continue;
-                std::fprintf(stderr,
-                             "[G543:vf25track] record=%u slot=%u cycle=%u pc=%04x lower=%08x upper=%08x before=%08x,%08x,%08x,%08x after=%08x,%08x,%08x,%08x\n",
-                             r, d, output[db], output[db + 1u], output[db + 2u], output[db + 3u],
-                             output[db + 4u], output[db + 5u], output[db + 6u], output[db + 7u],
-                             output[db + 8u], output[db + 9u], output[db + 10u], output[db + 11u]);
-            }
-            const size_t subDb = s + 8u + 144u;
-            if (subDb + 16u <= output.size() && output[subDb] != 0xffffffffu)
-            {
-                std::fprintf(stderr,
-                             "[G543:sub32b8] record=%u cycle=%u upper=%08x vs=%08x,%08x,%08x,%08x vt=%08x,%08x,%08x,%08x result=%08x,%08x,%08x,%08x accX=%08x dest=%x\n",
-                             r, output[subDb], output[subDb + 1u], output[subDb + 2u],
-                             output[subDb + 3u], output[subDb + 4u], output[subDb + 5u],
-                             output[subDb + 6u], output[subDb + 7u], output[subDb + 8u],
-                             output[subDb + 9u], output[subDb + 10u], output[subDb + 11u],
-                             output[subDb + 12u], output[subDb + 13u], output[subDb + 14u],
-                             output[subDb + 15u]);
-            }
         }
 
         G543Mismatch mismatch;
@@ -332,7 +316,7 @@ static bool g543RunSemanticReplay(GLFns &f, G178GLExt &e)
     }
 
     std::fprintf(stderr,
-                 "[G543:sem] PASS records=%u payload=%lluB exactStatePipeRamPackets=1 oneReadback=1 CPU-authoritative=1\n",
+                 "[G543:sem] PASS records=%u payload=%lluB exactStateSemanticPipeRamPackets=1 deadHistoryLanesMasked=1 oneReadback=1 CPU-authoritative=1\n",
                  corpus.records, static_cast<unsigned long long>(corpus.payloadBytes));
     return true;
 }

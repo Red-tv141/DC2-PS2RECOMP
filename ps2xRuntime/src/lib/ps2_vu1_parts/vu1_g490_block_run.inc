@@ -224,6 +224,13 @@ extern int g517StampIndArm();
 extern int g517IndArm();
 extern int g531FlagTailArm();
 extern int g533ImageSpecArm();
+extern int g547Hot0c70Arm();
+extern int g548Hot0e00Arm();
+extern int g549Hot30d8Arm();
+extern int g550Hot1be8Arm();
+extern int g551Hot1c00Arm();
+extern int g554Hot0900Arm();
+extern int g555Hot1110Arm();
 #ifndef DC2_G532_FLAGHEAD
 // G532a REFUTED: four Georama gates were 4/4 slower. Keep the source for audit/reproduction,
 // but compile every arm, oracle, wrapper, and pair-loop hook out of the shipping binary.
@@ -579,6 +586,20 @@ namespace
                 return 23;
             if (std::strcmp(ab, "imgspec") == 0)
                 return 27;
+            if (std::strcmp(ab, "hot0c70") == 0)
+                return 30;
+            if (std::strcmp(ab, "hot0e00") == 0)
+                return 31;
+            if (std::strcmp(ab, "hot30d8") == 0)
+                return 32;
+            if (std::strcmp(ab, "hot1be8") == 0)
+                return 33;
+            if (std::strcmp(ab, "hot1c00") == 0)
+                return 34;
+            if (std::strcmp(ab, "hot0900") == 0)
+                return 35;
+            if (std::strcmp(ab, "hot1110") == 0)
+                return 36;
 #if DC2_G532_FLAGHEAD
             if (std::strcmp(ab, "flaghead") == 0)
                 return 25;
@@ -666,6 +687,29 @@ namespace
         // the same generic G531 body.
         if (s_paired == 27)
             return g533ImageSpecArm() > 0 ? 27 : 23;
+        // G547. 27 vs 30: both arms retain G533's exact 0x3088 specialization; candidate alone
+        // admits and executes the exact 0x0c70 fragment.
+        if (s_paired == 30)
+            return g547Hot0c70Arm() > 0 ? 30 : 27;
+        // G548. 30 vs 31: candidate adds only the exact 0x0e00 fragment.
+        if (s_paired == 31)
+            return g548Hot0e00Arm() > 0 ? 31 : 30;
+        // G549. 31 vs 32: candidate adds only exact 0x30d8.
+        if (s_paired == 32)
+            return g549Hot30d8Arm() > 0 ? 32 : 31;
+        // G550. 32 vs 33: candidate adds only exact 0x1be8.
+        if (s_paired == 33)
+            return g550Hot1be8Arm() > 0 ? 33 : 32;
+        // G551. 33 vs 34: candidate adds only exact 0x1c00.
+        if (s_paired == 34)
+            return g551Hot1c00Arm() > 0 ? 34 : 33;
+        // G554. 34 vs 35: candidate adds only exact 0x0900.
+        if (s_paired == 35)
+            return g554Hot0900Arm() > 0 ? 35 : 34;
+        // G555. G554 was refuted, so control is the shipped G551 set (34); candidate adds only
+        // exact 0x1110 and deliberately does not inherit arm 35's 0x0900 handler.
+        if (s_paired == 36)
+            return g555Hot1110Arm() > 0 ? 36 : 34;
         // G532. 23 vs 25: both arms keep the promoted typed tail; the candidate additionally
         // consumes a typed flag prologue before the next already-existing ordinary block.
 #if DC2_G532_FLAGHEAD
@@ -765,7 +809,28 @@ namespace
                 // four Georama paired trials. One rollback restores G531 arm 23 exactly.
                 if (f50_12_vu_env_flag("DC2_G533_NO_STATIC"))
                     return 23;
-                return 27;
+                // G547 extends that immutable set by one exact-source fragment. Its narrow
+                // rollback keeps G533's 0x3088 handler and removes only 0x0c70.
+                if (f50_12_vu_env_flag("DC2_G547_NO_0C70"))
+                    return 27;
+                if (f50_12_vu_env_flag("DC2_G548_NO_0E00"))
+                    return 30;
+                if (f50_12_vu_env_flag("DC2_G549_NO_30D8"))
+                    return 31;
+                if (f50_12_vu_env_flag("DC2_G550_NO_1BE8"))
+                    return 32;
+                if (f50_12_vu_env_flag("DC2_G551_NO_1C00"))
+                    return 33;
+                // G554: REFUTED. The 36-pair 0x0900 unroll is exact but expands the VU hot loop
+                // enough to lose ~5.9 ms/f on s05. Keep arm 34 shipped; opt-in arm 35 only for
+                // reproducing the oracle/gate, with the narrow rollback taking precedence.
+                if (f50_12_vu_env_flag("DC2_G554_0900") &&
+                    !f50_12_vu_env_flag("DC2_G554_NO_0900"))
+                    return 35;
+                if (f50_12_vu_env_flag("DC2_G555_1110") &&
+                    !f50_12_vu_env_flag("DC2_G555_NO_1110"))
+                    return 36;
+                return 34;
             }
             // G506: the segmented Q/P advance rides on the G500 tail body, so its rollback falls
             // back to arm 3 exactly as `histcur`'s did.
@@ -1042,7 +1107,85 @@ namespace
         0x000002ff8000033cull, 0x000002ff8000033cull, 0x000002ff8000033cull,
         0x000002ff38010000ull,
     };
+    // G547: first census-selected expansion. This exact six-pair fragment is shared by the
+    // Georama and Dungeon-6 images (6.0% and 10.2% of all executed blocks respectively).
+    constexpr uint32_t G547_HOT_0C70_INDEX = 0x0c70u / 8u;
+    constexpr uint32_t G547_HOT_0C70_COUNT = 4u;
+    constexpr uint32_t G547_HOT_0C70_TAIL = 2u;
+    constexpr uint64_t G547_HOT_0C70_SOURCE[] = {
+        0x01c0a55c01f43801ull, 0x01f058bd81d38b3cull, 0x01f060be81e8937dull,
+        0x01f06c4b01f04002ull, 0x000002ff520907f9ull, 0x000002ff81e7ab7dull,
+    };
+    // G548: second shared census-selected expansion (4.8% Georama, 7.8% Dungeon-6).
+    constexpr uint32_t G548_HOT_0E00_INDEX = 0x0e00u / 8u;
+    constexpr uint32_t G548_HOT_0E00_COUNT = 8u;
+    constexpr uint32_t G548_HOT_0E00_TAIL = 2u;
+    constexpr uint64_t G548_HOT_0E00_SOURCE[] = {
+        0x01f638be8000033cull, 0x01f645cb8000033cull, 0x01e0ad908000033cull,
+        0x01f411bc8000033cull, 0x01f418bd8000033cull, 0x01eebe1580094ff2ull,
+        0x01f4254a01f44003ull, 0x01e049bf8000033cull, 0x01f628bc520907f7ull,
+        0x01f630bd81e8c37dull,
+    };
+    // G549: tiny shared loop fragment (8.7% Georama, 3.1% Dungeon-6).
+    constexpr uint32_t G549_HOT_30D8_INDEX = 0x30d8u / 8u;
+    constexpr uint32_t G549_HOT_30D8_COUNT = 2u;
+    constexpr uint32_t G549_HOT_30D8_TAIL = 2u;
+    constexpr uint64_t G549_HOT_30D8_SOURCE[] = {
+        0x000002ff80050934ull, 0x000002ff8000033cull,
+        0x000002ff5004000full, 0x000002ff8000033cull,
+    };
+    // G550: two-pair shared store loop (2.3% Georama, 6.6% Dungeon-6).
+    constexpr uint32_t G550_HOT_1BE8_INDEX = 0x1be8u / 8u;
+    constexpr uint32_t G550_HOT_1BE8_COUNT = 2u;
+    constexpr uint32_t G550_HOT_1BE8_TAIL = 0u;
+    constexpr uint64_t G550_HOT_1BE8_SOURCE[] = {
+        0x003dde9280094ff2ull, 0x0030ef0b81e6cb7dull,
+    };
+    // G551: six-pair copy/pack loop shared by Dungeon-6 (7.4%) and Georama (2.3%).
+    constexpr uint32_t G551_HOT_1C00_INDEX = 0x1c00u / 8u;
+    constexpr uint32_t G551_HOT_1C00_COUNT = 4u;
+    constexpr uint32_t G551_HOT_1C00_TAIL = 2u;
+    constexpr uint64_t G551_HOT_1C00_SOURCE[] = {
+        0x000002ff81f4237cull, 0x01f1d17d81f92b7cull, 0x003de6d581da833cull,
+        0x003d01bc81f0137cull, 0x000002ff520907f8ull, 0x000002ff81e68b7dull,
+    };
+    // G554: s05's next census-selected fragment. This 36-pair matrix/load/store block is 3.39%
+    // of all full block entries but carries far more pair work than every remaining candidate.
+    constexpr uint32_t G554_HOT_0900_INDEX = 0x0900u / 8u;
+    constexpr uint32_t G554_HOT_0900_COUNT = 34u;
+    constexpr uint32_t G554_HOT_0900_TAIL = 2u;
+    constexpr uint64_t G554_HOT_0900_SOURCE[] = {
+        0x01f19eda01e3383eull, 0x01f195db01e4383full, 0x01f19f1b01e5403cull,
+        0x01f409bc01e6403dull, 0x01f410bd01e7403eull, 0x01f418be01e8403full,
+        0x01f420bf01e9483cull, 0x01f528bc01ea483dull, 0x01f530bd01eb483eull,
+        0x01f538be01ec483full, 0x01f540bf01ed503cull, 0x01f648bc01ee503dull,
+        0x01f650bd01ef503eull, 0x01f658be01f0503full, 0x01f660bf8000033cull,
+        0x01f768bc800318b2ull, 0x01f770bd8000033cull, 0x01f778be01f11801ull,
+        0x01f7878b01f21001ull, 0x01f909bc01f32001ull, 0x01f910bd8000033cull,
+        0x01f918be81071bfeull, 0x01fa28bc80881bfeull, 0x01fa30bd80491bfeull,
+        0x01fa38be802a1bfeull, 0x01fb48bc01e1383cull, 0x01fb50bd01e2383dull,
+        0x01fb58be8000033cull, 0x01fc68bc8000033cull, 0x01fc70bd8000033cull,
+        0x01fc77ca8000033cull, 0x01f1951881e2f37dull, 0x01f19e58800b5ff2ull,
+        0x01f195598000033cull, 0x01f19e99520b07ddull, 0x01f1959a81e4fb7dull,
+    };
+    // G555: s05's next compact candidate after G554's oversized unroll was refuted.
+    constexpr uint32_t G555_HOT_1110_INDEX = 0x1110u / 8u;
+    constexpr uint32_t G555_HOT_1110_COUNT = 4u;
+    constexpr uint32_t G555_HOT_1110_TAIL = 2u;
+    constexpr uint64_t G555_HOT_1110_SOURCE[] = {
+        0x000002ff01f93801ull, 0x01eead9501f44001ull,
+        0x000002ff80094ff2ull, 0x000002ff80073872ull,
+        0x000002ff520907fbull, 0x01f9a56a81e8b37dull,
+    };
     uint8_t s_g533Hot3088Plan = 0u;
+    uint8_t s_g547Hot0c70Plan = 0u;
+    uint8_t s_g548Hot0e00Plan = 0u;
+    uint8_t s_g549Hot30d8Plan = 0u;
+    uint8_t s_g550Hot1be8Plan = 0u;
+    uint8_t s_g551Hot1c00Plan = 0u;
+    uint8_t s_g554Hot0900Plan = 0u;
+    uint8_t s_g555Hot1110Plan = 0u;
+    void g547RefreshSignatures();
 
     void g490RebuildRunLengths()
     {
@@ -1108,6 +1251,84 @@ namespace
                 s_g410Cache.sources[G533_HOT_3088_INDEX + i] == G533_HOT_3088_SOURCE[i];
         s_g533Hot3088Plan = g533Match ? 1u : 0u;
 
+        bool g547Match =
+            s_g410Cache.g490RunLen[G547_HOT_0C70_INDEX] == G547_HOT_0C70_COUNT &&
+            s_g410Cache.g502TailAt[G547_HOT_0C70_INDEX] == G547_HOT_0C70_TAIL &&
+            g500BranchTailEligible(
+                s_g410Cache.uppers[G547_HOT_0C70_INDEX + G547_HOT_0C70_COUNT]);
+        for (size_t i = 0u; i < sizeof(G547_HOT_0C70_SOURCE) /
+                                      sizeof(G547_HOT_0C70_SOURCE[0]); ++i)
+            g547Match = g547Match &&
+                s_g410Cache.sources[G547_HOT_0C70_INDEX + i] == G547_HOT_0C70_SOURCE[i];
+        s_g547Hot0c70Plan = g547Match ? 1u : 0u;
+
+        bool g548Match =
+            s_g410Cache.g490RunLen[G548_HOT_0E00_INDEX] == G548_HOT_0E00_COUNT &&
+            s_g410Cache.g502TailAt[G548_HOT_0E00_INDEX] == G548_HOT_0E00_TAIL &&
+            g500BranchTailEligible(
+                s_g410Cache.uppers[G548_HOT_0E00_INDEX + G548_HOT_0E00_COUNT]);
+        for (size_t i = 0u; i < sizeof(G548_HOT_0E00_SOURCE) /
+                                      sizeof(G548_HOT_0E00_SOURCE[0]); ++i)
+            g548Match = g548Match &&
+                s_g410Cache.sources[G548_HOT_0E00_INDEX + i] == G548_HOT_0E00_SOURCE[i];
+        s_g548Hot0e00Plan = g548Match ? 1u : 0u;
+
+        bool g549Match =
+            s_g410Cache.g490RunLen[G549_HOT_30D8_INDEX] == G549_HOT_30D8_COUNT &&
+            s_g410Cache.g502TailAt[G549_HOT_30D8_INDEX] == G549_HOT_30D8_TAIL &&
+            g500BranchTailEligible(
+                s_g410Cache.uppers[G549_HOT_30D8_INDEX + G549_HOT_30D8_COUNT]);
+        for (size_t i = 0u; i < sizeof(G549_HOT_30D8_SOURCE) /
+                                      sizeof(G549_HOT_30D8_SOURCE[0]); ++i)
+            g549Match = g549Match &&
+                s_g410Cache.sources[G549_HOT_30D8_INDEX + i] == G549_HOT_30D8_SOURCE[i];
+        s_g549Hot30d8Plan = g549Match ? 1u : 0u;
+
+        bool g550Match =
+            s_g410Cache.g490RunLen[G550_HOT_1BE8_INDEX] == G550_HOT_1BE8_COUNT &&
+            s_g410Cache.g502TailAt[G550_HOT_1BE8_INDEX] == G550_HOT_1BE8_TAIL;
+        for (size_t i = 0u; i < sizeof(G550_HOT_1BE8_SOURCE) /
+                                      sizeof(G550_HOT_1BE8_SOURCE[0]); ++i)
+            g550Match = g550Match &&
+                s_g410Cache.sources[G550_HOT_1BE8_INDEX + i] == G550_HOT_1BE8_SOURCE[i];
+        s_g550Hot1be8Plan = g550Match ? 1u : 0u;
+
+        bool g551Match =
+            s_g410Cache.g490RunLen[G551_HOT_1C00_INDEX] == G551_HOT_1C00_COUNT &&
+            s_g410Cache.g502TailAt[G551_HOT_1C00_INDEX] == G551_HOT_1C00_TAIL &&
+            g500BranchTailEligible(
+                s_g410Cache.uppers[G551_HOT_1C00_INDEX + G551_HOT_1C00_COUNT]) &&
+            !f50_12_vu_env_flag("DC2_G133_COPY_QSKIP");
+        for (size_t i = 0u; i < sizeof(G551_HOT_1C00_SOURCE) /
+                                      sizeof(G551_HOT_1C00_SOURCE[0]); ++i)
+            g551Match = g551Match &&
+                s_g410Cache.sources[G551_HOT_1C00_INDEX + i] == G551_HOT_1C00_SOURCE[i];
+        // G133's opt-in near-plane diagnostic observes PC 0x1c10 inside execLower. Keep that
+        // diagnostic on the generic executor; the default graphics path uses this exact handler.
+        s_g551Hot1c00Plan = g551Match ? 1u : 0u;
+
+        bool g554Match =
+            s_g410Cache.g490RunLen[G554_HOT_0900_INDEX] == G554_HOT_0900_COUNT &&
+            s_g410Cache.g502TailAt[G554_HOT_0900_INDEX] == G554_HOT_0900_TAIL &&
+            g500BranchTailEligible(
+                s_g410Cache.uppers[G554_HOT_0900_INDEX + G554_HOT_0900_COUNT]);
+        for (size_t i = 0u; i < sizeof(G554_HOT_0900_SOURCE) /
+                                      sizeof(G554_HOT_0900_SOURCE[0]); ++i)
+            g554Match = g554Match &&
+                s_g410Cache.sources[G554_HOT_0900_INDEX + i] == G554_HOT_0900_SOURCE[i];
+        s_g554Hot0900Plan = g554Match ? 1u : 0u;
+
+        bool g555Match =
+            s_g410Cache.g490RunLen[G555_HOT_1110_INDEX] == G555_HOT_1110_COUNT &&
+            s_g410Cache.g502TailAt[G555_HOT_1110_INDEX] == G555_HOT_1110_TAIL &&
+            g500BranchTailEligible(
+                s_g410Cache.uppers[G555_HOT_1110_INDEX + G555_HOT_1110_COUNT]);
+        for (size_t i = 0u; i < sizeof(G555_HOT_1110_SOURCE) /
+                                      sizeof(G555_HOT_1110_SOURCE[0]); ++i)
+            g555Match = g555Match &&
+                s_g410Cache.sources[G555_HOT_1110_INDEX + i] == G555_HOT_1110_SOURCE[i];
+        s_g555Hot1110Plan = g555Match ? 1u : 0u;
+
         // G533: price static microprogram-fragment specialization from immutable rebuild state,
         // never from the hot pair loop. This diagnostic emits exact source identity, decoded
         // operands, and block/tail boundaries for the shared Georama fragment. It is quiet by
@@ -1159,6 +1380,7 @@ namespace
                 std::fflush(stderr);
             }
         }
+        g547RefreshSignatures();
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2160,16 +2382,6 @@ namespace
             const int64_t g532Stamp = stampBase - 1;
             const uint32_t g532Mac = g430ResolveAt(g532Stamp - 4);
             s_vuMacVisible = g532Mac;
-            if (g532lower == 0x34093800u && std::getenv("DC2_G545_CPU_TRACE") != nullptr)
-            {
-                static std::atomic<uint32_t> s_g545TraceCount{0u};
-                if (s_g545TraceCount.fetch_add(1u, std::memory_order_relaxed) < 128u)
-                    std::fprintf(stderr,
-                                 "[G545:cpu-block-fmand] stamp=%lld mac=%04x vi10=%04x mask=%04x\n",
-                                 static_cast<long long>(g532Stamp), g532Mac & 0xffffu,
-                                 static_cast<uint32_t>(static_cast<uint16_t>(st.vi[10])),
-                                 static_cast<uint32_t>(static_cast<uint16_t>(st.vi[7])));
-            }
 
             if (g532p.pair.upperKind != 0x6fu)
                 g421FastUpper<G501Pin, G504Cursor>(st, g532upper, g532p.pair.upperKind,
@@ -2636,81 +2848,6 @@ namespace
             else
                 g422FastLower(st, lower, fp.pair.lowerKind, vuData, dataSize);
 
-            // G545 v22 default-off parity trace for the three qword-860 store encodings seen in
-            // Dungeon record 8. Stores do not modify their VF source, so sampling after the lower
-            // keeps the source bits exact; SQI's post-increment is reversed only for its address.
-            if ((lower == 0x03e89000u || lower == 0x81e98b7du || lower == 0x81e9cb7du ||
-                 lower == 0x03e28800u) &&
-                g_g545CpuTraceSequence.load(std::memory_order_relaxed) == 784u)
-            {
-                const uint32_t g545Op = (lower >> 25u) & 0x7fu;
-                const uint32_t g545Base = (lower >> 16u) & 31u;
-                const uint32_t g545Source = (lower >> 11u) & 31u;
-                uint32_t g545Q = 0xffffffffu;
-                if (g545Op == 0x01u)
-                {
-                    const int32_t g545Imm = static_cast<int32_t>(lower << 21u) >> 21u;
-                    g545Q = static_cast<uint32_t>(st.vi[g545Base] + g545Imm) & 0x3ffu;
-                }
-                else if (g545Op == 0x40u && S2_FUNC(lower) == 0x35u)
-                {
-                    g545Q = static_cast<uint32_t>(
-                                  static_cast<uint16_t>(st.vi[g545Base] - 1)) &
-                              0x3ffu;
-                }
-                if ((g545Q == 860u || g545Q == 920u) && vuData != nullptr &&
-                    g545Q * 16u + 16u <= dataSize)
-                {
-                    uint32_t g545SourceBits[4]{}, g545StoredBits[4]{};
-                    std::memcpy(g545SourceBits, st.vf[g545Source], 16u);
-                    std::memcpy(g545StoredBits, vuData + g545Q * 16u, 16u);
-                    static std::atomic<uint32_t> s_g545BlockStoreTraceCount{0u};
-                    if (s_g545BlockStoreTraceCount.fetch_add(1u, std::memory_order_relaxed) < 64u)
-                        std::fprintf(stderr,
-                                     "[G545:cpu-block-ramstore] seq=784 pc=%04x instr=%08x q=%u vf=%u source=%08x,%08x,%08x,%08x after=%08x,%08x,%08x,%08x\n",
-                                     (firstIndex + j) * 8u, lower, g545Q, g545Source,
-                                     g545SourceBits[0], g545SourceBits[1],
-                                     g545SourceBits[2], g545SourceBits[3],
-                                     g545StoredBits[0], g545StoredBits[1],
-                                     g545StoredBits[2], g545StoredBits[3]);
-                }
-            }
-            if ((lower == 0x01f54000u || lower == 0x81f5437cu) &&
-                g_g545CpuTraceSequence.load(std::memory_order_relaxed) == 784u)
-            {
-                const uint32_t g545Op = (lower >> 25u) & 0x7fu;
-                const uint32_t g545It = (lower >> 16u) & 31u;
-                const uint32_t g545Is = (lower >> 11u) & 31u;
-                uint32_t g545Q = 0xffffffffu;
-                if (g545Op == 0x00u)
-                {
-                    const int32_t g545Imm = static_cast<int32_t>(lower << 21u) >> 21u;
-                    g545Q = static_cast<uint32_t>(st.vi[g545Is] + g545Imm) & 0x3ffu;
-                }
-                else if (g545Op == 0x40u && S2_FUNC(lower) == 0x34u)
-                {
-                    g545Q = static_cast<uint32_t>(
-                                  static_cast<uint16_t>(st.vi[g545Is] - 1)) &
-                              0x3ffu;
-                }
-                if (g545It == 21u && g545Q == 920u && vuData != nullptr &&
-                    g545Q * 16u + 16u <= dataSize)
-                {
-                    uint32_t g545LoadedBits[4]{}, g545RamBits[4]{};
-                    std::memcpy(g545LoadedBits, st.vf[21], 16u);
-                    std::memcpy(g545RamBits, vuData + g545Q * 16u, 16u);
-                    static std::atomic<uint32_t> s_g545BlockLq21TraceCount{0u};
-                    if (s_g545BlockLq21TraceCount.fetch_add(1u, std::memory_order_relaxed) < 32u)
-                        std::fprintf(stderr,
-                                     "[G545:cpu-block-lq21] seq=784 pc=%04x instr=%08x q=%u loaded=%08x,%08x,%08x,%08x ram=%08x,%08x,%08x,%08x\n",
-                                     (firstIndex + j) * 8u, lower, g545Q,
-                                     g545LoadedBits[0], g545LoadedBits[1],
-                                     g545LoadedBits[2], g545LoadedBits[3],
-                                     g545RamBits[0], g545RamBits[1],
-                                     g545RamBits[2], g545RamBits[3]);
-                }
-            }
-
             if ((fp.pair.g425Flags & G425_PF_TOUCHES_ZERO) != 0u)
             {
                 // G484's promoted wide form, byte-for-byte with the pair loop's re-pin.
@@ -2772,18 +2909,6 @@ namespace
                 const uint32_t g531Mac =
                     g430ResolveAt(stampBase + static_cast<int64_t>(count) - 4);
                 s_vuMacVisible = g531Mac;
-                if (g531lower == 0x34093800u &&
-                    g_g545CpuTraceSequence.load(std::memory_order_relaxed) == 784u)
-                {
-                    static std::atomic<uint32_t> s_g545TraceCount{0u};
-                    if (s_g545TraceCount.fetch_add(1u, std::memory_order_relaxed) < 32u)
-                        std::fprintf(stderr,
-                                     "[G545:cpu-g531-fmand] seq=784 stamp=%lld mac=%04x vi10=%04x mask=%04x\n",
-                                     static_cast<long long>(stampBase + static_cast<int64_t>(count)),
-                                     g531Mac & 0xffffu,
-                                     static_cast<uint32_t>(static_cast<uint16_t>(st.vi[10])),
-                                     static_cast<uint32_t>(static_cast<uint16_t>(st.vi[7])));
-                }
 
                 if (g531p.pair.upperKind != 0x6fu)
                     g421FastUpper<G501Pin, G504Cursor>(
@@ -3380,6 +3505,111 @@ namespace
                dataSize == PS2_VU1_DATA_SIZE && hb != nullptr;
     }
 
+    static DC2_G330_FORCEINLINE bool g547Hot0c70Match(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode)
+    {
+        return firstIndex == G547_HOT_0C70_INDEX && count == G547_HOT_0C70_COUNT &&
+               tailCode == G547_HOT_0C70_TAIL && s_g547Hot0c70Plan != 0u;
+    }
+
+    static DC2_G330_FORCEINLINE bool g547Hot0c70Runnable(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode,
+        const uint8_t *vuData, uint32_t dataSize, const G430HistBlock *hb)
+    {
+        return g547Hot0c70Match(firstIndex, count, tailCode) && vuData != nullptr &&
+               dataSize == PS2_VU1_DATA_SIZE && hb != nullptr;
+    }
+
+    static DC2_G330_FORCEINLINE bool g548Hot0e00Match(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode)
+    {
+        return firstIndex == G548_HOT_0E00_INDEX && count == G548_HOT_0E00_COUNT &&
+               tailCode == G548_HOT_0E00_TAIL && s_g548Hot0e00Plan != 0u;
+    }
+
+    static DC2_G330_FORCEINLINE bool g548Hot0e00Runnable(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode,
+        const uint8_t *vuData, uint32_t dataSize, const G430HistBlock *hb)
+    {
+        return g548Hot0e00Match(firstIndex, count, tailCode) && vuData != nullptr &&
+               dataSize == PS2_VU1_DATA_SIZE && hb != nullptr;
+    }
+
+    static DC2_G330_FORCEINLINE bool g549Hot30d8Match(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode)
+    {
+        return firstIndex == G549_HOT_30D8_INDEX && count == G549_HOT_30D8_COUNT &&
+               tailCode == G549_HOT_30D8_TAIL && s_g549Hot30d8Plan != 0u;
+    }
+
+    static DC2_G330_FORCEINLINE bool g549Hot30d8Runnable(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode,
+        const uint8_t *vuData, uint32_t dataSize, const G430HistBlock *hb)
+    {
+        return g549Hot30d8Match(firstIndex, count, tailCode) && vuData != nullptr &&
+               dataSize == PS2_VU1_DATA_SIZE && hb != nullptr;
+    }
+
+    static DC2_G330_FORCEINLINE bool g550Hot1be8Match(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode)
+    {
+        return firstIndex == G550_HOT_1BE8_INDEX && count == G550_HOT_1BE8_COUNT &&
+               tailCode == G550_HOT_1BE8_TAIL && s_g550Hot1be8Plan != 0u;
+    }
+
+    static DC2_G330_FORCEINLINE bool g550Hot1be8Runnable(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode,
+        const uint8_t *vuData, uint32_t dataSize, const G430HistBlock *hb)
+    {
+        return g550Hot1be8Match(firstIndex, count, tailCode) && vuData != nullptr &&
+               dataSize == PS2_VU1_DATA_SIZE && hb != nullptr;
+    }
+
+    static DC2_G330_FORCEINLINE bool g551Hot1c00Match(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode)
+    {
+        return firstIndex == G551_HOT_1C00_INDEX && count == G551_HOT_1C00_COUNT &&
+               tailCode == G551_HOT_1C00_TAIL && s_g551Hot1c00Plan != 0u;
+    }
+
+    static DC2_G330_FORCEINLINE bool g551Hot1c00Runnable(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode,
+        const uint8_t *vuData, uint32_t dataSize, const G430HistBlock *hb)
+    {
+        return g551Hot1c00Match(firstIndex, count, tailCode) && vuData != nullptr &&
+               dataSize == PS2_VU1_DATA_SIZE && hb != nullptr;
+    }
+
+    static DC2_G330_FORCEINLINE bool g554Hot0900Match(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode)
+    {
+        return firstIndex == G554_HOT_0900_INDEX && count == G554_HOT_0900_COUNT &&
+               tailCode == G554_HOT_0900_TAIL && s_g554Hot0900Plan != 0u;
+    }
+
+    static DC2_G330_FORCEINLINE bool g554Hot0900Runnable(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode,
+        const uint8_t *vuData, uint32_t dataSize, const G430HistBlock *hb)
+    {
+        return g554Hot0900Match(firstIndex, count, tailCode) && vuData != nullptr &&
+               dataSize == PS2_VU1_DATA_SIZE && hb != nullptr;
+    }
+
+    static DC2_G330_FORCEINLINE bool g555Hot1110Match(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode)
+    {
+        return firstIndex == G555_HOT_1110_INDEX && count == G555_HOT_1110_COUNT &&
+               tailCode == G555_HOT_1110_TAIL && s_g555Hot1110Plan != 0u;
+    }
+
+    static DC2_G330_FORCEINLINE bool g555Hot1110Runnable(
+        uint32_t firstIndex, uint32_t count, uint32_t tailCode,
+        const uint8_t *vuData, uint32_t dataSize, const G430HistBlock *hb)
+    {
+        return g555Hot1110Match(firstIndex, count, tailCode) && vuData != nullptr &&
+               dataSize == PS2_VU1_DATA_SIZE && hb != nullptr;
+    }
+
     template <unsigned Vf>
     static DC2_G330_FORCEINLINE void g533LqiFullVi8(VU1State &st, const uint8_t *vuData)
     {
@@ -3456,17 +3686,1020 @@ namespace
         *pDelay = pd;
     }
 
+    template <unsigned Vf, unsigned Vi, int Imm>
+    static DC2_G330_FORCEINLINE void g547LqFull(VU1State &st, const uint8_t *vuData)
+    {
+        static_assert(Vf < 32u && Vi < 16u);
+        const uint32_t addr =
+            (static_cast<uint32_t>(static_cast<int32_t>(st.vi[Vi] + Imm)) * 16u) &
+            (PS2_VU1_DATA_SIZE - 1u);
+        _mm_storeu_ps(st.vf[Vf],
+                      _mm_loadu_ps(reinterpret_cast<const float *>(vuData + addr)));
+    }
+
+    template <unsigned Vf, unsigned Vi>
+    static DC2_G330_FORCEINLINE void g547SqiFull(VU1State &st, uint8_t *vuData)
+    {
+        static_assert(Vf < 32u && Vi < 16u && Vi != 0u);
+        const uint32_t addr =
+            (static_cast<uint32_t>(static_cast<uint16_t>(st.vi[Vi])) * 16u) &
+            (PS2_VU1_DATA_SIZE - 1u);
+        _mm_storeu_ps(reinterpret_cast<float *>(vuData + addr), _mm_loadu_ps(st.vf[Vf]));
+        st.vi[Vi] = static_cast<int16_t>(st.vi[Vi] + 1);
+    }
+
+    template <unsigned Vf, unsigned Vi>
+    static DC2_G330_FORCEINLINE void g551LqiFull(VU1State &st, const uint8_t *vuData)
+    {
+        static_assert(Vf < 32u && Vi < 16u && Vi != 0u);
+        const uint32_t addr =
+            (static_cast<uint32_t>(static_cast<uint16_t>(st.vi[Vi])) * 16u) &
+            (PS2_VU1_DATA_SIZE - 1u);
+        _mm_storeu_ps(st.vf[Vf], _mm_loadu_ps(reinterpret_cast<const float *>(vuData + addr)));
+        st.vi[Vi] = static_cast<int16_t>(st.vi[Vi] + 1);
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g547ExecuteHot0c70(VU1State &st, uint8_t *vuData,
+                            int *qDelay, int *pDelay, int64_t stampBase,
+                            G430HistBlock *hb)
+    {
+        int qd = *qDelay;
+        int pd = *pDelay;
+
+        // Q is observed by the first upper. Publish its pending value at the exact pair boundary;
+        // P and the remaining five Q boundaries are unobserved inside this immutable fragment.
+        if (qd > 0 && --qd == 0)
+            st.q = s_vuQPending;
+        if (pd > 0 && --pd == 0)
+            st.p = s_vuPPending;
+
+        // 0x0c70: MULq.xyzw vf20, vf20 followed by full LQ vf20, 1(vi7).
+        g421FastUpper<true, false, true>(st, 0x01c0a55cu, 0x1cu, true, false, true,
+                                         stampBase + 0, hb, g504UnusedSlot, 0x00010401u);
+        g547LqFull<20u, 7u, 1>(st, vuData);
+
+        // 0x0c78: MADDAy.xyzw, then MOVE.xyz vf19, vf17 (w remains untouched).
+        g421FastUpper<true, false, true>(st, 0x01f058bdu, 0x49u, true, false, true,
+                                         stampBase + 1, hb, g504UnusedSlot, 0x01000202u);
+        g421StoreMasked(st.vf[19], _mm_loadu_ps(st.vf[17]), G481_MASKROW(0xEu));
+
+        // 0x0c80: MADDAz.xyzw, then full SQI vf18, (vi8++).
+        g421FastUpper<true, false, true>(st, 0x01f060beu, 0x4au, true, false, true,
+                                         stampBase + 2, hb, g504UnusedSlot, 0x02000202u);
+        g547SqiFull<18u, 8u>(st, vuData);
+
+        // 0x0c88: MADDw.xyzw followed by full LQ vf16, 2(vi8).
+        g421FastUpper<true, false, true>(st, 0x01f06c4bu, 0x0bu, true, false, true,
+                                         stampBase + 3, hb, g504UnusedSlot, 0x03000201u);
+        g547LqFull<16u, 8u, 2>(st, vuData);
+
+        // 0x0c90 branch and 0x0c98 delay slot. The generic block tail publishes this pair PC
+        // before IBNE; its macro leaves that value in place when the branch is not taken.
+        st.pc = 0x0c90u;
+        G481_LOWER_BODY_IBNE(st, 0x520907f9u);
+        g547SqiFull<21u, 7u>(st, vuData);
+
+        // Advance the five unobserved boundaries exactly. No instruction above produces Q/P.
+        if (qd > 0)
+        {
+            if (qd <= 5)
+            {
+                qd = 0;
+                st.q = s_vuQPending;
+            }
+            else
+                qd -= 5;
+        }
+        if (pd > 0)
+        {
+            if (pd <= 5)
+            {
+                pd = 0;
+                st.p = s_vuPPending;
+            }
+            else
+                pd -= 5;
+        }
+
+        *qDelay = qd;
+        *pDelay = pd;
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g548ExecuteHot0e00(VU1State &st, uint8_t *vuData,
+                            int *qDelay, int *pDelay, int64_t stampBase,
+                            G430HistBlock *hb)
+    {
+        // Eight ordinary pairs. Fixed NOP lowers disappear; the one IADDI and one full LQ retain
+        // upper-before-lower issue order and their original history stamps.
+        g421FastUpper<true, false, true>(st, 0x01f638beu, 0x4au, true, false, true,
+                                         stampBase + 0, hb, g504UnusedSlot, 0x02000202u);
+        g421FastUpper<true, false, true>(st, 0x01f645cbu, 0x0bu, true, false, true,
+                                         stampBase + 1, hb, g504UnusedSlot, 0x03000201u);
+        g421FastUpper<true, false, true>(st, 0x01e0ad90u, 0x10u, true, false, true,
+                                         stampBase + 2, hb, g504UnusedSlot, 0x00000501u);
+        g421FastUpper<true, false, true>(st, 0x01f411bcu, 0x58u, true, false, true,
+                                         stampBase + 3, hb, g504UnusedSlot, 0x00000402u);
+        g421FastUpper<true, false, true>(st, 0x01f418bdu, 0x49u, true, false, true,
+                                         stampBase + 4, hb, g504UnusedSlot, 0x01000202u);
+        g421FastUpper<true, false, true>(st, 0x01eebe15u, 0x15u, true, false, true,
+                                         stampBase + 5, hb, g504UnusedSlot, 0x01000601u);
+        G481_LOWER_BODY_IADDI(st, 0x80094ff2u);
+        g421FastUpper<true, false, true>(st, 0x01f4254au, 0x0au, true, false, true,
+                                         stampBase + 6, hb, g504UnusedSlot, 0x02000201u);
+        g547LqFull<20u, 8u, 3>(st, vuData);
+        g421FastUpper<true, false, true>(st, 0x01e049bfu, 0x5bu, true, false, true,
+                                         stampBase + 7, hb, g504UnusedSlot, 0x03000402u);
+
+        // Fixed IBNE tail and its fixed full-SQI delay slot, both with live FMAC uppers.
+        g421FastUpper<true, false, true>(st, 0x01f628bcu, 0x48u, true, false, true,
+                                         stampBase + 8, hb, g504UnusedSlot, 0x00000202u);
+        st.pc = 0x0e40u;
+        G481_LOWER_BODY_IBNE(st, 0x520907f7u);
+        g421FastUpper<true, false, true>(st, 0x01f630bdu, 0x49u, true, false, true,
+                                         stampBase + 9, hb, g504UnusedSlot, 0x01000202u);
+        g547SqiFull<24u, 8u>(st, vuData);
+
+        // No instruction in the exact ten-pair span reads or produces Q/P, so only exit state is
+        // observable and the ten per-pair decrements collapse to one exact span update.
+        int qd = *qDelay;
+        int pd = *pDelay;
+        if (qd > 0)
+        {
+            if (qd <= 10)
+            {
+                qd = 0;
+                st.q = s_vuQPending;
+            }
+            else
+                qd -= 10;
+        }
+        if (pd > 0)
+        {
+            if (pd <= 10)
+            {
+                pd = 0;
+                st.p = s_vuPPending;
+            }
+            else
+                pd -= 10;
+        }
+        *qDelay = qd;
+        *pDelay = pd;
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g549ExecuteHot30d8(VU1State &st, uint8_t *vuData,
+                            int *qDelay, int *pDelay, int64_t stampBase,
+                            G430HistBlock *hb)
+    {
+        (void)vuData;
+        (void)stampBase;
+        (void)hb;
+
+        // Four VNOP uppers: IAND, NOP, fixed IBEQ tail, NOP delay slot.
+        G481_LOWER_BODY_IAND(st, 0x80050934u);
+        st.pc = 0x30e8u;
+        G481_LOWER_BODY_IBEQ(st, 0x5004000fu);
+
+        int qd = *qDelay;
+        int pd = *pDelay;
+        if (qd > 0)
+        {
+            if (qd <= 4)
+            {
+                qd = 0;
+                st.q = s_vuQPending;
+            }
+            else
+                qd -= 4;
+        }
+        if (pd > 0)
+        {
+            if (pd <= 4)
+            {
+                pd = 0;
+                st.p = s_vuPPending;
+            }
+            else
+                pd -= 4;
+        }
+        *qDelay = qd;
+        *pDelay = pd;
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g550ExecuteHot1be8(VU1State &st, uint8_t *vuData,
+                            int *qDelay, int *pDelay, int64_t stampBase,
+                            G430HistBlock *hb)
+    {
+        g421FastUpper<true, false, true>(st, 0x003dde92u, 0x12u, true, false, true,
+                                         stampBase + 0, hb, g504UnusedSlot, 0x02000501u);
+        G481_LOWER_BODY_IADDI(st, 0x80094ff2u);
+        g421FastUpper<true, false, true>(st, 0x0030ef0bu, 0x0bu, true, false, true,
+                                         stampBase + 1, hb, g504UnusedSlot, 0x03000201u);
+        g547SqiFull<25u, 6u>(st, vuData);
+
+        int qd = *qDelay;
+        int pd = *pDelay;
+        if (qd > 0)
+        {
+            if (qd <= 2)
+            {
+                qd = 0;
+                st.q = s_vuQPending;
+            }
+            else
+                qd -= 2;
+        }
+        if (pd > 0)
+        {
+            if (pd <= 2)
+            {
+                pd = 0;
+                st.p = s_vuPPending;
+            }
+            else
+                pd -= 2;
+        }
+        *qDelay = qd;
+        *pDelay = pd;
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g551ExecuteHot1c00(VU1State &st, uint8_t *vuData,
+                            int *qDelay, int *pDelay, int64_t stampBase,
+                            G430HistBlock *hb)
+    {
+        // 0x1c00: VNOP + full LQI vf20,(vi4++).
+        g551LqiFull<20u, 4u>(st, vuData);
+
+        // 0x1c08: FTOI4.xyzw vf17,vf26 + full LQI vf25,(vi5++).
+        g421FastUpper<true, false, true>(st, 0x01f1d17du, 0x55u, true, false, true,
+                                         stampBase + 1, hb, g504UnusedSlot, 0x01000004u);
+        g551LqiFull<25u, 5u>(st, vuData);
+
+        // 0x1c10: MINIy.w vf27,vf28,vf29 + MOVE.xyz vf26,vf16.
+        g421FastUpper<true, false, true>(st, 0x003de6d5u, 0x15u, true, false, true,
+                                         stampBase + 2, hb, g504UnusedSlot, 0x01000601u);
+        g421StoreMasked(st.vf[26], _mm_loadu_ps(st.vf[16]), G481_MASKROW(0xEu));
+
+        // 0x1c18: MULAx.w ACC,vf0,vf29 + full LQI vf16,(vi2++).
+        g421FastUpper<true, false, true>(st, 0x003d01bcu, 0x58u, true, false, true,
+                                         stampBase + 3, hb, g504UnusedSlot, 0x00000402u);
+        g551LqiFull<16u, 2u>(st, vuData);
+
+        // Fixed IBNE tail and full SQI delay slot.
+        st.pc = 0x1c20u;
+        G481_LOWER_BODY_IBNE(st, 0x520907f8u);
+        g547SqiFull<17u, 6u>(st, vuData);
+
+        // None of the six exact pairs reads or produces Q/P.
+        int qd = *qDelay;
+        int pd = *pDelay;
+        if (qd > 0)
+        {
+            if (qd <= 6)
+            {
+                qd = 0;
+                st.q = s_vuQPending;
+            }
+            else
+                qd -= 6;
+        }
+        if (pd > 0)
+        {
+            if (pd <= 6)
+            {
+                pd = 0;
+                st.p = s_vuPPending;
+            }
+            else
+                pd -= 6;
+        }
+        *qDelay = qd;
+        *pDelay = pd;
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g554ExecuteHot0900(VU1State &st, uint8_t *vuData,
+                            int *qDelay, int *pDelay, int64_t stampBase,
+                            G430HistBlock *hb)
+    {
+        // Literal source words keep every descriptor, operand, mask and lower kind compile-time
+        // constant. The sequence is still upper-before-lower for each of the exact 36 pairs.
+#define G554_UP(n, word, kind, desc)                                                       \
+        g421FastUpper<true, false, true>(st, (word), (kind), true, false, true,            \
+                                         stampBase + (n), hb, g504UnusedSlot, (desc))
+
+        G554_UP(0,  0x01f19edau, 0x1au, 0x02000401u);
+        G481_LOWER_BODY_LQ(st, 0x01e3383eu, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(1,  0x01f195dbu, 0x1bu, 0x03000401u);
+        G481_LOWER_BODY_LQ(st, 0x01e4383fu, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(2,  0x01f19f1bu, 0x1bu, 0x03000401u);
+        G481_LOWER_BODY_LQ(st, 0x01e5403cu, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(3,  0x01f409bcu, 0x58u, 0x00000402u);
+        G481_LOWER_BODY_LQ(st, 0x01e6403du, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(4,  0x01f410bdu, 0x49u, 0x01000202u);
+        G481_LOWER_BODY_LQ(st, 0x01e7403eu, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(5,  0x01f418beu, 0x4au, 0x02000202u);
+        G481_LOWER_BODY_LQ(st, 0x01e8403fu, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(6,  0x01f420bfu, 0x4bu, 0x03000202u);
+        G481_LOWER_BODY_LQ(st, 0x01e9483cu, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(7,  0x01f528bcu, 0x48u, 0x00000202u);
+        G481_LOWER_BODY_LQ(st, 0x01ea483du, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(8,  0x01f530bdu, 0x49u, 0x01000202u);
+        G481_LOWER_BODY_LQ(st, 0x01eb483eu, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(9,  0x01f538beu, 0x4au, 0x02000202u);
+        G481_LOWER_BODY_LQ(st, 0x01ec483fu, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(10, 0x01f540bfu, 0x4bu, 0x03000202u);
+        G481_LOWER_BODY_LQ(st, 0x01ed503cu, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(11, 0x01f648bcu, 0x48u, 0x00000202u);
+        G481_LOWER_BODY_LQ(st, 0x01ee503du, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(12, 0x01f650bdu, 0x49u, 0x01000202u);
+        G481_LOWER_BODY_LQ(st, 0x01ef503eu, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(13, 0x01f658beu, 0x4au, 0x02000202u);
+        G481_LOWER_BODY_LQ(st, 0x01f0503fu, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(14, 0x01f660bfu, 0x4bu, 0x03000202u);
+
+        G554_UP(15, 0x01f768bcu, 0x48u, 0x00000202u);
+        G481_LOWER_BODY_IADDI(st, 0x800318b2u);
+        G554_UP(16, 0x01f770bdu, 0x49u, 0x01000202u);
+        G554_UP(17, 0x01f778beu, 0x4au, 0x02000202u);
+        G481_LOWER_BODY_LQ(st, 0x01f11801u, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(18, 0x01f7878bu, 0x0bu, 0x03000201u);
+        G481_LOWER_BODY_LQ(st, 0x01f21001u, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(19, 0x01f909bcu, 0x58u, 0x00000402u);
+        G481_LOWER_BODY_LQ(st, 0x01f32001u, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(20, 0x01f910bdu, 0x49u, 0x01000202u);
+
+        G554_UP(21, 0x01f918beu, 0x4au, 0x02000202u);
+        g422FastLower(st, 0x81071bfeu, G422_LK_ILWR, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(22, 0x01fa28bcu, 0x48u, 0x00000202u);
+        g422FastLower(st, 0x80881bfeu, G422_LK_ILWR, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(23, 0x01fa30bdu, 0x49u, 0x01000202u);
+        g422FastLower(st, 0x80491bfeu, G422_LK_ILWR, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(24, 0x01fa38beu, 0x4au, 0x02000202u);
+        g422FastLower(st, 0x802a1bfeu, G422_LK_ILWR, vuData, PS2_VU1_DATA_SIZE);
+
+        G554_UP(25, 0x01fb48bcu, 0x48u, 0x00000202u);
+        G481_LOWER_BODY_LQ(st, 0x01e1383cu, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(26, 0x01fb50bdu, 0x49u, 0x01000202u);
+        G481_LOWER_BODY_LQ(st, 0x01e2383du, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(27, 0x01fb58beu, 0x4au, 0x02000202u);
+        G554_UP(28, 0x01fc68bcu, 0x48u, 0x00000202u);
+        G554_UP(29, 0x01fc70bdu, 0x49u, 0x01000202u);
+        G554_UP(30, 0x01fc77cau, 0x0au, 0x02000201u);
+
+        G554_UP(31, 0x01f19518u, 0x18u, 0x00000401u);
+        G481_LOWER_BODY_SQI(st, 0x81e2f37du, vuData, PS2_VU1_DATA_SIZE);
+        G554_UP(32, 0x01f19e58u, 0x18u, 0x00000401u);
+        G481_LOWER_BODY_IADDI(st, 0x800b5ff2u);
+        G554_UP(33, 0x01f19559u, 0x19u, 0x01000401u);
+
+        G554_UP(34, 0x01f19e99u, 0x19u, 0x01000401u);
+        st.pc = 0x0a10u;
+        G481_LOWER_BODY_IBNE(st, 0x520b07ddu);
+        G554_UP(35, 0x01f1959au, 0x1au, 0x02000401u);
+        G481_LOWER_BODY_SQI(st, 0x81e4fb7du, vuData, PS2_VU1_DATA_SIZE);
+
+#undef G554_UP
+
+        // No exact instruction in this span reads or produces Q/P. Preserve the generic block's
+        // externally observable countdown/publication result with one 36-pair update.
+        int qd = *qDelay;
+        int pd = *pDelay;
+        if (qd > 0)
+        {
+            if (qd <= 36)
+            {
+                qd = 0;
+                st.q = s_vuQPending;
+            }
+            else
+                qd -= 36;
+        }
+        if (pd > 0)
+        {
+            if (pd <= 36)
+            {
+                pd = 0;
+                st.p = s_vuPPending;
+            }
+            else
+                pd -= 36;
+        }
+        *qDelay = qd;
+        *pDelay = pd;
+    }
+
+#if 0 // G563/G564 REFUTED: exact, but the added all-block admission cost is ~+5.5 ms/f on s05.
+    // G563: compact exact executor for G554's 0x0900 image. G554 proved that eliminating the
+    // generic dispatch is useful work but its 36 literal g421FastUpper expansions made the hot
+    // text too large. This record keeps only the fields the exact image can observe: every upper
+    // is a full-destination FMAC, every source is VF, and the only arithmetic forms are MUL and
+    // MADD. The high nibble selects one of the six exact lower bodies; the low nibble is
+    // bc[1:0] | vf-destination[2] | madd[3]. One eight-byte record replaces the fused source,
+    // upper descriptor and lower-class streams used by the generic block body.
+    enum : uint8_t
+    {
+        G563_LO_NOP = 0u,
+        G563_LO_LQ = 1u,
+        G563_LO_IADDI = 2u,
+        G563_LO_ILWR = 3u,
+        G563_LO_SQI = 4u,
+        G563_LO_IBNE = 5u,
+    };
+
+    struct G563CompactPair
+    {
+        uint32_t lower;
+        uint8_t fs;
+        uint8_t ft;
+        uint8_t fd;
+        uint8_t ops;
+    };
+    static_assert(sizeof(G563CompactPair) == 8u);
+
+    constexpr G563CompactPair g563MakeCompactPair(size_t index, uint8_t upperOps,
+                                                   uint8_t lowerOp)
+    {
+        const uint64_t source = G554_HOT_0900_SOURCE[index];
+        const uint32_t upper = static_cast<uint32_t>(source >> 32u);
+        return {
+            static_cast<uint32_t>(source),
+            static_cast<uint8_t>((upper >> 11u) & 31u),
+            static_cast<uint8_t>((upper >> 16u) & 31u),
+            static_cast<uint8_t>((upper >> 6u) & 31u),
+            static_cast<uint8_t>(upperOps | (lowerOp << 4u)),
+        };
+    }
+
+    // Upper low nibble: bc | VF-destination | MADD. The exact-source rebuild predicate above is
+    // the authority for every word; this table is only a compact execution form of those words.
+    constexpr G563CompactPair G563_HOT_0900_PAIRS[] = {
+        g563MakeCompactPair(0,  0x6u, G563_LO_LQ),
+        g563MakeCompactPair(1,  0x7u, G563_LO_LQ),
+        g563MakeCompactPair(2,  0x7u, G563_LO_LQ),
+        g563MakeCompactPair(3,  0x0u, G563_LO_LQ),
+        g563MakeCompactPair(4,  0x9u, G563_LO_LQ),
+        g563MakeCompactPair(5,  0xau, G563_LO_LQ),
+        g563MakeCompactPair(6,  0xbu, G563_LO_LQ),
+        g563MakeCompactPair(7,  0x8u, G563_LO_LQ),
+        g563MakeCompactPair(8,  0x9u, G563_LO_LQ),
+        g563MakeCompactPair(9,  0xau, G563_LO_LQ),
+        g563MakeCompactPair(10, 0xbu, G563_LO_LQ),
+        g563MakeCompactPair(11, 0x8u, G563_LO_LQ),
+        g563MakeCompactPair(12, 0x9u, G563_LO_LQ),
+        g563MakeCompactPair(13, 0xau, G563_LO_LQ),
+        g563MakeCompactPair(14, 0xbu, G563_LO_NOP),
+        g563MakeCompactPair(15, 0x8u, G563_LO_IADDI),
+        g563MakeCompactPair(16, 0x9u, G563_LO_NOP),
+        g563MakeCompactPair(17, 0xau, G563_LO_LQ),
+        g563MakeCompactPair(18, 0xfu, G563_LO_LQ),
+        g563MakeCompactPair(19, 0x0u, G563_LO_LQ),
+        g563MakeCompactPair(20, 0x9u, G563_LO_NOP),
+        g563MakeCompactPair(21, 0xau, G563_LO_ILWR),
+        g563MakeCompactPair(22, 0x8u, G563_LO_ILWR),
+        g563MakeCompactPair(23, 0x9u, G563_LO_ILWR),
+        g563MakeCompactPair(24, 0xau, G563_LO_ILWR),
+        g563MakeCompactPair(25, 0x8u, G563_LO_LQ),
+        g563MakeCompactPair(26, 0x9u, G563_LO_LQ),
+        g563MakeCompactPair(27, 0xau, G563_LO_NOP),
+        g563MakeCompactPair(28, 0x8u, G563_LO_NOP),
+        g563MakeCompactPair(29, 0x9u, G563_LO_NOP),
+        g563MakeCompactPair(30, 0xeu, G563_LO_NOP),
+        g563MakeCompactPair(31, 0x4u, G563_LO_SQI),
+        g563MakeCompactPair(32, 0x4u, G563_LO_IADDI),
+        g563MakeCompactPair(33, 0x5u, G563_LO_NOP),
+        g563MakeCompactPair(34, 0x5u, G563_LO_IBNE),
+        g563MakeCompactPair(35, 0x6u, G563_LO_SQI),
+    };
+    static_assert(sizeof(G563_HOT_0900_PAIRS) / sizeof(G563_HOT_0900_PAIRS[0]) == 36u);
+
+    // Volatile blocks LTCG from turning the compact loop back into G554's refuted full unroll.
+    // It is read once per matching block, never per pair.
+    volatile uint32_t s_g563Hot0900PairCount = 36u;
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g563ExecuteHot0900Compact(VU1State &st, uint8_t *vuData,
+                                   int *qDelay, int *pDelay, int64_t stampBase,
+                                   G430HistBlock *hb)
+    {
+        int histSlot = hb->head;
+        // No pre-tail instruction in this exact image reads PC. Establishing the branch pair's
+        // architectural PC here keeps the loop single-copy; IBNE at pair 34 observes 0x0a10 just
+        // as it does in the generic and G554 bodies.
+        st.pc = 0x0a10u;
+
+        const uint32_t pairCount = s_g563Hot0900PairCount;
+        for (uint32_t n = 0u; n < pairCount; ++n)
+        {
+            const G563CompactPair &pair = G563_HOT_0900_PAIRS[n];
+            const uint8_t upperOps = static_cast<uint8_t>(pair.ops & 0x0fu);
+            const __m128 vs = _mm_loadu_ps(st.vf[pair.fs]);
+            const __m128 vt = _mm_loadu_ps(st.vf[pair.ft]);
+            __m128 b;
+            switch (upperOps & 3u)
+            {
+            case 0u: b = _mm_shuffle_ps(vt, vt, _MM_SHUFFLE(0, 0, 0, 0)); break;
+            case 1u: b = _mm_shuffle_ps(vt, vt, _MM_SHUFFLE(1, 1, 1, 1)); break;
+            case 2u: b = _mm_shuffle_ps(vt, vt, _MM_SHUFFLE(2, 2, 2, 2)); break;
+            default: b = _mm_shuffle_ps(vt, vt, _MM_SHUFFLE(3, 3, 3, 3)); break;
+            }
+            __m128 r = _mm_mul_ps(vs, b);
+            if ((upperOps & 0x8u) != 0u)
+                r = _mm_add_ps(_mm_loadu_ps(st.acc), r);
+
+            // No lower in this image can inspect G430 history. Carrying the cursor therefore
+            // leaves every entry byte-identical while removing 35 load/store-forwarded head hops.
+            g430PushPendingAt<true>(hb, histSlot, stampBase + static_cast<int64_t>(n), r, 0x0fu);
+            if ((upperOps & 0x4u) != 0u)
+                _mm_storeu_ps(st.vf[pair.fd], r);
+            else
+                _mm_storeu_ps(st.acc, r);
+
+            switch (pair.ops >> 4u)
+            {
+            case G563_LO_NOP:
+                break;
+            case G563_LO_LQ:
+            {
+                // Every exact LQ has dest=0xf. Use G514's promoted whole-vector transfer without
+                // retaining the generic masked-lane arm that can never be reached for this image.
+                const uint8_t it = LIT(pair.lower);
+                const uint8_t is = LIS(pair.lower);
+                const int16_t imm = IMM11(pair.lower);
+                uint32_t addr =
+                    static_cast<uint32_t>(static_cast<int32_t>(st.vi[is] + imm)) * 16u;
+                addr &= (PS2_VU1_DATA_SIZE - 1u);
+                if (addr + 16u <= PS2_VU1_DATA_SIZE)
+                    _mm_storeu_ps(st.vf[it],
+                                  _mm_loadu_ps(reinterpret_cast<const float *>(vuData + addr)));
+                break;
+            }
+            case G563_LO_IADDI:
+                G481_LOWER_BODY_IADDI(st, pair.lower);
+                break;
+            case G563_LO_ILWR:
+                g422FastLower(st, pair.lower, G422_LK_ILWR, vuData, PS2_VU1_DATA_SIZE);
+                break;
+            case G563_LO_SQI:
+            {
+                // Both exact SQIs also have dest=0xf.
+                const uint8_t it = LIT(pair.lower);
+                const uint8_t is = LIS(pair.lower);
+                uint32_t addr = static_cast<uint32_t>(static_cast<uint16_t>(st.vi[it])) * 16u;
+                addr &= (PS2_VU1_DATA_SIZE - 1u);
+                if (addr + 16u <= PS2_VU1_DATA_SIZE)
+                    _mm_storeu_ps(reinterpret_cast<float *>(vuData + addr),
+                                  _mm_loadu_ps(st.vf[is]));
+                if (it != 0u)
+                    st.vi[it] = static_cast<int16_t>(st.vi[it] + 1);
+                break;
+            }
+            case G563_LO_IBNE:
+                G481_LOWER_BODY_IBNE(st, pair.lower);
+                break;
+            default:
+                break;
+            }
+        }
+        hb->head = histSlot;
+
+        int qd = *qDelay;
+        int pd = *pDelay;
+        if (qd > 0)
+        {
+            if (qd <= 36)
+            {
+                qd = 0;
+                st.q = s_vuQPending;
+            }
+            else
+                qd -= 36;
+        }
+        if (pd > 0)
+        {
+            if (pd <= 36)
+            {
+                pd = 0;
+                st.p = s_vuPPending;
+            }
+            else
+                pd -= 36;
+        }
+        *qDelay = qd;
+        *pDelay = pd;
+    }
+
+    // G564: the middle shape between G554's 5.8 KiB expansion and G563's refuted compact
+    // interpreter. Every operand, broadcast, destination and lower word is a native constant,
+    // but the image is split into three noinline segments so the compiler sees only the narrow
+    // MUL/MADD + full-destination contract rather than expanding g421FastUpper's generic body 36
+    // times. Each segment carries G430's cursor locally and commits it before the next segment.
+#define G564_UP(n, fs, ft, fd, bc, vfDest, madd)                                          \
+        {                                                                                 \
+            const __m128 g564Vs = _mm_loadu_ps(st.vf[(fs)]);                              \
+            const __m128 g564Vt = _mm_loadu_ps(st.vf[(ft)]);                              \
+            const __m128 g564B = _mm_shuffle_ps(                                          \
+                g564Vt, g564Vt, _MM_SHUFFLE((bc), (bc), (bc), (bc)));                    \
+            __m128 g564R = _mm_mul_ps(g564Vs, g564B);                                     \
+            if constexpr ((madd) != 0)                                                    \
+                g564R = _mm_add_ps(_mm_loadu_ps(st.acc), g564R);                          \
+            g430PushPendingAt<true>(hb, histSlot, stampBase + (n), g564R, 0x0fu);          \
+            if constexpr ((vfDest) != 0)                                                  \
+                _mm_storeu_ps(st.vf[(fd)], g564R);                                        \
+            else                                                                          \
+                _mm_storeu_ps(st.acc, g564R);                                             \
+        }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g564ExecuteHot0900Segment0(VU1State &st, uint8_t *vuData, int64_t stampBase,
+                                    G430HistBlock *hb)
+    {
+        int histSlot = hb->head;
+        G564_UP(0, 19, 17, 27, 2, 1, 0);
+        G514_LOWER_BODY_LQ(st, 0x01e3383eu, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(1, 18, 17, 23, 3, 1, 0);
+        G514_LOWER_BODY_LQ(st, 0x01e4383fu, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(2, 19, 17, 28, 3, 1, 0);
+        G514_LOWER_BODY_LQ(st, 0x01e5403cu, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(3, 1, 20, 0, 0, 0, 0);
+        G514_LOWER_BODY_LQ(st, 0x01e6403du, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(4, 2, 20, 0, 1, 0, 1);
+        G514_LOWER_BODY_LQ(st, 0x01e7403eu, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(5, 3, 20, 0, 2, 0, 1);
+        G514_LOWER_BODY_LQ(st, 0x01e8403fu, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(6, 4, 20, 0, 3, 0, 1);
+        G514_LOWER_BODY_LQ(st, 0x01e9483cu, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(7, 5, 21, 0, 0, 0, 1);
+        G514_LOWER_BODY_LQ(st, 0x01ea483du, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(8, 6, 21, 0, 1, 0, 1);
+        G514_LOWER_BODY_LQ(st, 0x01eb483eu, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(9, 7, 21, 0, 2, 0, 1);
+        G514_LOWER_BODY_LQ(st, 0x01ec483fu, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(10, 8, 21, 0, 3, 0, 1);
+        G514_LOWER_BODY_LQ(st, 0x01ed503cu, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(11, 9, 22, 0, 0, 0, 1);
+        G514_LOWER_BODY_LQ(st, 0x01ee503du, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(12, 10, 22, 0, 1, 0, 1);
+        G514_LOWER_BODY_LQ(st, 0x01ef503eu, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(13, 11, 22, 0, 2, 0, 1);
+        G514_LOWER_BODY_LQ(st, 0x01f0503fu, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(14, 12, 22, 0, 3, 0, 1);
+        hb->head = histSlot;
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g564ExecuteHot0900Segment1(VU1State &st, uint8_t *vuData, int64_t stampBase,
+                                    G430HistBlock *hb)
+    {
+        int histSlot = hb->head;
+        G564_UP(15, 13, 23, 0, 0, 0, 1);
+        G481_LOWER_BODY_IADDI(st, 0x800318b2u);
+        G564_UP(16, 14, 23, 0, 1, 0, 1);
+        G564_UP(17, 15, 23, 0, 2, 0, 1);
+        G514_LOWER_BODY_LQ(st, 0x01f11801u, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(18, 16, 23, 30, 3, 1, 1);
+        G514_LOWER_BODY_LQ(st, 0x01f21001u, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(19, 1, 25, 0, 0, 0, 0);
+        G514_LOWER_BODY_LQ(st, 0x01f32001u, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(20, 2, 25, 0, 1, 0, 1);
+        G564_UP(21, 3, 25, 0, 2, 0, 1);
+        g422FastLower(st, 0x81071bfeu, G422_LK_ILWR, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(22, 5, 26, 0, 0, 0, 1);
+        g422FastLower(st, 0x80881bfeu, G422_LK_ILWR, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(23, 6, 26, 0, 1, 0, 1);
+        g422FastLower(st, 0x80491bfeu, G422_LK_ILWR, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(24, 7, 26, 0, 2, 0, 1);
+        g422FastLower(st, 0x802a1bfeu, G422_LK_ILWR, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(25, 9, 27, 0, 0, 0, 1);
+        G514_LOWER_BODY_LQ(st, 0x01e1383cu, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(26, 10, 27, 0, 1, 0, 1);
+        G514_LOWER_BODY_LQ(st, 0x01e2383du, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(27, 11, 27, 0, 2, 0, 1);
+        G564_UP(28, 13, 28, 0, 0, 0, 1);
+        G564_UP(29, 14, 28, 0, 1, 0, 1);
+        G564_UP(30, 14, 28, 31, 2, 1, 1);
+        hb->head = histSlot;
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g564ExecuteHot0900Segment2(VU1State &st, uint8_t *vuData, int64_t stampBase,
+                                    G430HistBlock *hb)
+    {
+        int histSlot = hb->head;
+        G564_UP(31, 18, 17, 20, 0, 1, 0);
+        G514_LOWER_BODY_SQI(st, 0x81e2f37du, vuData, PS2_VU1_DATA_SIZE);
+        G564_UP(32, 19, 17, 25, 0, 1, 0);
+        G481_LOWER_BODY_IADDI(st, 0x800b5ff2u);
+        G564_UP(33, 18, 17, 21, 1, 1, 0);
+        G564_UP(34, 19, 17, 26, 1, 1, 0);
+        st.pc = 0x0a10u;
+        G481_LOWER_BODY_IBNE(st, 0x520b07ddu);
+        G564_UP(35, 18, 17, 22, 2, 1, 0);
+        G514_LOWER_BODY_SQI(st, 0x81e4fb7du, vuData, PS2_VU1_DATA_SIZE);
+        hb->head = histSlot;
+    }
+
+#undef G564_UP
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g564ExecuteHot0900Narrow(VU1State &st, uint8_t *vuData,
+                                  int *qDelay, int *pDelay, int64_t stampBase,
+                                  G430HistBlock *hb)
+    {
+        g564ExecuteHot0900Segment0(st, vuData, stampBase, hb);
+        g564ExecuteHot0900Segment1(st, vuData, stampBase, hb);
+        g564ExecuteHot0900Segment2(st, vuData, stampBase, hb);
+
+        int qd = *qDelay;
+        int pd = *pDelay;
+        if (qd > 0)
+        {
+            if (qd <= 36)
+            {
+                qd = 0;
+                st.q = s_vuQPending;
+            }
+            else
+                qd -= 36;
+        }
+        if (pd > 0)
+        {
+            if (pd <= 36)
+            {
+                pd = 0;
+                st.p = s_vuPPending;
+            }
+            else
+                pd -= 36;
+        }
+        *qDelay = qd;
+        *pDelay = pd;
+    }
+
+#endif
+
+// G555's compact six-pair exact fragment. Keep it out of line: unlike G554, this adds only two
+// live upper bodies and four small lower bodies to the selected path.
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g555ExecuteHot1110(VU1State &st, uint8_t *vuData,
+                            int *qDelay, int *pDelay, int64_t stampBase,
+                            G430HistBlock *hb)
+    {
+        // 0x1110: VNOP + full LQ vf25, 1(vi7).
+        G481_LOWER_BODY_LQ(st, 0x01f93801u, vuData, PS2_VU1_DATA_SIZE);
+
+        // 0x1118: MINIy.xyzw vf18,vf21,vf26 + full LQ vf20, 1(vi8).
+        g421FastUpper<true, false, true>(st, 0x01eead95u, 0x15u, true, false, true,
+                                         stampBase + 1, hb, g504UnusedSlot, 0x01000601u);
+        G481_LOWER_BODY_LQ(st, 0x01f44001u, vuData, PS2_VU1_DATA_SIZE);
+
+        // 0x1120/0x1128: two self IADDIs; both uppers are VNOP.
+        G481_LOWER_BODY_IADDI(st, 0x80094ff2u);
+        G481_LOWER_BODY_IADDI(st, 0x80073872u);
+
+        // Fixed IBNE tail and its live-upper full-SQI delay slot.
+        st.pc = 0x1130u;
+        G481_LOWER_BODY_IBNE(st, 0x520907fbu);
+        g421FastUpper<true, false, true>(st, 0x01f9a56au, 0x2au, true, false, true,
+                                         stampBase + 5, hb, g504UnusedSlot, 0x00030401u);
+        G481_LOWER_BODY_SQI(st, 0x81e8b37du, vuData, PS2_VU1_DATA_SIZE);
+
+        // This exact span neither reads nor produces Q/P.
+        int qd = *qDelay;
+        int pd = *pDelay;
+        if (qd > 0)
+        {
+            if (qd <= 6)
+            {
+                qd = 0;
+                st.q = s_vuQPending;
+            }
+            else
+                qd -= 6;
+        }
+        if (pd > 0)
+        {
+            if (pd <= 6)
+            {
+                pd = 0;
+                st.p = s_vuPPending;
+            }
+            else
+                pd -= 6;
+        }
+        *qDelay = qd;
+        *pDelay = pd;
+    }
+
+    // G547: dynamic exact-fragment census, carried only by G533's isolated stat arm (29). The
+    // shipped arm never calls this code. Count full structural hits separately: only those can be
+    // replaced by a fixed static handler without changing block boundaries or budget behavior.
+    struct G547BlockRow
+    {
+        uint64_t blocks = 0u;
+        uint64_t full = 0u;
+        uint64_t pairs = 0u;
+        uint32_t count = 0u;
+        uint32_t tail = 0u;
+        uint32_t mixed = 0u;
+        uint64_t signature = 0u;
+        uint64_t sourceMixed = 0u;
+    };
+    thread_local std::array<G547BlockRow, PS2_VU1_CODE_SIZE / 8u> s_g547Blocks{};
+    thread_local std::array<uint64_t, PS2_VU1_CODE_SIZE / 8u> s_g547Signatures{};
+    thread_local uint64_t s_g547TotalBlocks = 0u;
+    thread_local uint64_t s_g547LastReport = 0u;
+
+    void g547RefreshSignatures()
+    {
+        static const bool s_on = f50_12_vu_env_flag("DC2_G533_STAT");
+        if (!s_on)
+            return;
+        for (size_t index = 0u; index < s_g547Signatures.size(); ++index)
+        {
+            const uint32_t count = s_g410Cache.g490RunLen[index];
+            const uint32_t tail = s_g410Cache.g502TailAt[index];
+            const uint32_t tailPairs = tail == G531_FLAG_TAIL ? 1u : tail;
+            const uint32_t span = count + tailPairs;
+            uint64_t hash = 1469598103934665603ull;
+            for (uint32_t n = 0u; n < span && index + n < s_g410Cache.sources.size(); ++n)
+            {
+                const uint64_t source = s_g410Cache.sources[index + n];
+                for (unsigned byte = 0u; byte < 8u; ++byte)
+                {
+                    hash ^= static_cast<uint8_t>(source >> (byte * 8u));
+                    hash *= 1099511628211ull;
+                }
+            }
+            s_g547Signatures[index] = hash;
+        }
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g547NoteBlock(uint32_t firstIndex, uint32_t count, uint32_t tailCode)
+    {
+        if (firstIndex >= s_g547Blocks.size())
+            return;
+        G547BlockRow &row = s_g547Blocks[firstIndex];
+        const uint32_t tailPairs = tailCode == G531_FLAG_TAIL ? 1u : tailCode;
+        ++row.blocks;
+        row.pairs += count + tailPairs;
+        if (row.blocks == 1u)
+        {
+            row.count = count;
+            row.tail = tailCode;
+            row.signature = s_g547Signatures[firstIndex];
+        }
+        else if (row.count != count || row.tail != tailCode)
+            ++row.mixed;
+        if (row.signature != s_g547Signatures[firstIndex])
+            ++row.sourceMixed;
+
+        const uint32_t plannedCount = s_g410Cache.g490RunLen[firstIndex];
+        const uint32_t plannedTail = s_g410Cache.g502TailAt[firstIndex];
+        if (count == plannedCount && tailCode == plannedTail)
+            ++row.full;
+
+        ++s_g547TotalBlocks;
+        if (s_g547TotalBlocks - s_g547LastReport < 10000000ull)
+            return;
+        s_g547LastReport = s_g547TotalBlocks;
+
+        std::array<uint16_t, PS2_VU1_CODE_SIZE / 8u> order{};
+        for (size_t i = 0u; i < order.size(); ++i)
+            order[i] = static_cast<uint16_t>(i);
+        std::partial_sort(order.begin(), order.begin() + 16u, order.end(),
+            [](uint16_t a, uint16_t b) {
+                return s_g547Blocks[a].full > s_g547Blocks[b].full;
+            });
+        std::fprintf(stderr, "[G547:block] total=%llu top=16 exactSource=1\n",
+                     static_cast<unsigned long long>(s_g547TotalBlocks));
+        for (size_t rank = 0u; rank < 16u; ++rank)
+        {
+            const uint32_t index = order[rank];
+            const G547BlockRow &r = s_g547Blocks[index];
+            if (r.blocks == 0u)
+                break;
+            const uint32_t plannedCount = s_g410Cache.g490RunLen[index];
+            const uint32_t plannedTail = s_g410Cache.g502TailAt[index];
+            const uint32_t plannedTailPairs = plannedTail == G531_FLAG_TAIL ? 1u : plannedTail;
+            const uint32_t span = plannedCount + plannedTailPairs;
+            uint64_t hash = 1469598103934665603ull;
+            for (uint32_t n = 0u; n < span && index + n < s_g410Cache.sources.size(); ++n)
+            {
+                const uint64_t source = s_g410Cache.sources[index + n];
+                for (unsigned byte = 0u; byte < 8u; ++byte)
+                {
+                    hash ^= static_cast<uint8_t>(source >> (byte * 8u));
+                    hash *= 1099511628211ull;
+                }
+            }
+            std::fprintf(stderr,
+                         "[G547:rank] n=%zu pc=%04x blocks=%llu full=%llu fullPct=%.3f"
+                         " pairs=%llu shape=%u+%u mixed=%u srcMix=%llu fnv=%016llx src=",
+                         rank + 1u, index * 8u,
+                         static_cast<unsigned long long>(r.blocks),
+                         static_cast<unsigned long long>(r.full),
+                         100.0 * static_cast<double>(r.full) /
+                             static_cast<double>(s_g547TotalBlocks ? s_g547TotalBlocks : 1u),
+                         static_cast<unsigned long long>(r.pairs), plannedCount, plannedTail,
+                         r.mixed, static_cast<unsigned long long>(r.sourceMixed),
+                         static_cast<unsigned long long>(hash));
+            for (uint32_t n = 0u; n < span && index + n < s_g410Cache.sources.size(); ++n)
+            {
+                const size_t slot = index + n;
+                const G410CompiledUpper &pair = s_g410Cache.uppers[slot];
+                const G421UpperDesc desc = g421DescTableConst.e[pair.upperKind];
+                std::fprintf(stderr,
+                             "%s%04x:%016llx/u%02x/l%02x/d%u.%u.%u.%u/p%02x/g%02x",
+                             n == 0u ? "" : ",", static_cast<unsigned>(slot * 8u),
+                             static_cast<unsigned long long>(s_g410Cache.sources[slot]),
+                             static_cast<unsigned>(pair.upperKind),
+                             static_cast<unsigned>(pair.lowerKind),
+                             static_cast<unsigned>(desc.cls),
+                             static_cast<unsigned>(desc.op),
+                             static_cast<unsigned>(desc.src),
+                             static_cast<unsigned>(desc.bc),
+                             static_cast<unsigned>(pair.pairFlags),
+                             static_cast<unsigned>(pair.g425Flags));
+            }
+            std::fprintf(stderr, "\n");
+        }
+        std::fflush(stderr);
+    }
+
     thread_local uint64_t s_g533Hits = 0u;
     thread_local uint64_t s_g533Fallbacks = 0u;
+    thread_local uint64_t s_g533HitPairs = 0u;
     thread_local uint64_t s_g533LastReport = 0u;
 
 #if defined(_MSC_VER)
     __declspec(noinline)
 #endif
-    void g533NotePlan(bool hit)
+    void g533NotePlan(bool hit, uint32_t pairs)
     {
         if (hit)
+        {
             ++s_g533Hits;
+            s_g533HitPairs += pairs;
+        }
         else
             ++s_g533Fallbacks;
         const uint64_t total = s_g533Hits + s_g533Fallbacks;
@@ -3480,7 +4713,7 @@ namespace
                          static_cast<unsigned long long>(s_g533Fallbacks),
                          total != 0u ? 100.0 * static_cast<double>(s_g533Hits) /
                                            static_cast<double>(total) : 0.0,
-                         static_cast<unsigned long long>(s_g533Hits * 10u));
+                         static_cast<unsigned long long>(s_g533HitPairs));
             std::fflush(stderr);
         }
     }
@@ -3497,12 +4730,67 @@ namespace
                                   int *qDelay, int *pDelay,
                                   int64_t stampBase, G430HistBlock *hb, uint32_t tailCode)
     {
-        const bool hot = g533Hot3088Runnable(
+        g547NoteBlock(firstIndex, count, tailCode);
+        const bool hot3088 = g533Hot3088Runnable(
             firstIndex, count, tailCode, vuData, dataSize, hb);
-        g533NotePlan(hot);
-        if (hot)
+        const bool hot0c70 = g547Hot0c70Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        const bool hot0e00 = g548Hot0e00Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        const bool hot30d8 = g549Hot30d8Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        const bool hot1be8 = g550Hot1be8Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        const bool hot1c00 = g551Hot1c00Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        const bool hot0900 = g554Hot0900Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        const bool hot1110 = g555Hot1110Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        const uint32_t hotPairs = hot0900 ? 36u : hot1110 ? 6u :
+            hot3088 ? 10u : hot0c70 ? 6u : hot0e00 ? 10u :
+            hot30d8 ? 4u : hot1be8 ? 2u : hot1c00 ? 6u : 0u;
+        g533NotePlan(hot3088 || hot0c70 || hot0e00 || hot30d8 || hot1be8 || hot1c00 ||
+                         hot0900 || hot1110,
+                     hotPairs);
+        if (hot3088)
         {
             g533ExecuteHot3088(st, vuData, qDelay, pDelay, stampBase, hb);
+            return;
+        }
+        if (hot0c70)
+        {
+            g547ExecuteHot0c70(st, vuData, qDelay, pDelay, stampBase, hb);
+            return;
+        }
+        if (hot0e00)
+        {
+            g548ExecuteHot0e00(st, vuData, qDelay, pDelay, stampBase, hb);
+            return;
+        }
+        if (hot30d8)
+        {
+            g549ExecuteHot30d8(st, vuData, qDelay, pDelay, stampBase, hb);
+            return;
+        }
+        if (hot1be8)
+        {
+            g550ExecuteHot1be8(st, vuData, qDelay, pDelay, stampBase, hb);
+            return;
+        }
+        if (hot1c00)
+        {
+            g551ExecuteHot1c00(st, vuData, qDelay, pDelay, stampBase, hb);
+            return;
+        }
+        if (hot0900)
+        {
+            g554ExecuteHot0900(st, vuData, qDelay, pDelay, stampBase, hb);
+            return;
+        }
+        if (hot1110)
+        {
+            g555ExecuteHot1110(st, vuData, qDelay, pDelay, stampBase, hb);
             return;
         }
         g531ExecuteBlockTailFlag(st, firstIndex, count, vuData, dataSize,
@@ -3521,7 +4809,24 @@ namespace
                                     int *qDelay, int *pDelay,
                                     int64_t stampBase, G430HistBlock *hb, uint32_t tailCode)
     {
-        if (!g533Hot3088Runnable(firstIndex, count, tailCode, vuData, dataSize, hb))
+        const bool hot3088 = g533Hot3088Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        const bool hot0c70 = g547Hot0c70Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        const bool hot0e00 = g548Hot0e00Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        const bool hot30d8 = g549Hot30d8Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        const bool hot1be8 = g550Hot1be8Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        const bool hot1c00 = g551Hot1c00Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        const bool hot0900 = g554Hot0900Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        const bool hot1110 = g555Hot1110Runnable(
+            firstIndex, count, tailCode, vuData, dataSize, hb);
+        if (!hot3088 && !hot0c70 && !hot0e00 && !hot30d8 && !hot1be8 && !hot1c00 &&
+            !hot0900 && !hot1110)
         {
             g531ExecuteBlockTailFlag(st, firstIndex, count, vuData, dataSize,
                                      qDelay, pDelay, stampBase, hb, tailCode);
@@ -3533,13 +4838,34 @@ namespace
         const int qBefore = *qDelay;
         const int pBefore = *pDelay;
         const uint32_t macBefore = s_vuMacVisible;
-        // The exact fragment contains only three VU-memory LOADS. Register/history/pipeline state
-        // is shadowed on every hit; sample the structurally read-only RAM image every 1,024 hits so
-        // the oracle does not copy 48 KiB at the fragment's very high dynamic frequency.
-        const uint64_t verifyOrdinal =
-            s_g533Verified.load(std::memory_order_relaxed) / 10u;
+        // Register/history/pipeline state is shadowed on every hit. Sample RAM every 1,024 hits;
+        // 0x3088 only loads; 0x0c70, 0x1c00, 0x0900, and 0x1110 also contain fixed stores.
+        const uint64_t verifyOrdinal = s_g533Verified.load(std::memory_order_relaxed) / 6u;
         const bool hasMem = vuData != nullptr && dataSize <= PS2_VU1_DATA_SIZE &&
                             (verifyOrdinal & 1023u) == 0u;
+        // G554/G555 SQIs can alias an earlier LQ source. Even on non-full-RAM samples, restore
+        // their exact aligned quads between generic and static execution so both start from
+        // byte-identical RAM. No preceding lower instruction writes these entry base registers.
+        const uint32_t targetMemCount = vuData == nullptr ? 0u :
+            (hot0900 ? 2u : (hot1110 ? 1u : 0u));
+        uint32_t targetMemAddr[2] = {};
+        uint8_t targetMemBefore[2][16] = {};
+        uint8_t targetMemExpected[2][16] = {};
+        if (hot0900 && targetMemCount != 0u)
+        {
+            targetMemAddr[0] =
+                (static_cast<uint32_t>(static_cast<uint16_t>(before.vi[2])) * 16u) &
+                (PS2_VU1_DATA_SIZE - 1u);
+            targetMemAddr[1] =
+                (static_cast<uint32_t>(static_cast<uint16_t>(before.vi[4])) * 16u) &
+                (PS2_VU1_DATA_SIZE - 1u);
+        }
+        else if (hot1110 && targetMemCount != 0u)
+            targetMemAddr[0] =
+                (static_cast<uint32_t>(static_cast<uint16_t>(before.vi[8])) * 16u) &
+                (PS2_VU1_DATA_SIZE - 1u);
+        for (uint32_t i = 0u; i < targetMemCount; ++i)
+            std::memcpy(targetMemBefore[i], vuData + targetMemAddr[i], 16u);
         if (hasMem)
             std::memcpy(s_g422VerMemBefore, vuData, dataSize);
 
@@ -3550,6 +4876,8 @@ namespace
         const int qExpected = *qDelay;
         const int pExpected = *pDelay;
         const uint32_t macExpected = s_vuMacVisible;
+        for (uint32_t i = 0u; i < targetMemCount; ++i)
+            std::memcpy(targetMemExpected[i], vuData + targetMemAddr[i], 16u);
         if (hasMem)
             std::memcpy(s_g422VerMemFast, vuData, dataSize);
 
@@ -3560,28 +4888,93 @@ namespace
         s_vuMacVisible = macBefore;
         if (hasMem)
             std::memcpy(vuData, s_g422VerMemBefore, dataSize);
+        else
+            for (uint32_t i = 0u; i < targetMemCount; ++i)
+                std::memcpy(vuData + targetMemAddr[i], targetMemBefore[i], 16u);
 
-        g533ExecuteHot3088(st, vuData, qDelay, pDelay, stampBase, hb);
+        if (hot3088)
+            g533ExecuteHot3088(st, vuData, qDelay, pDelay, stampBase, hb);
+        else if (hot0c70)
+            g547ExecuteHot0c70(st, vuData, qDelay, pDelay, stampBase, hb);
+        else if (hot0e00)
+            g548ExecuteHot0e00(st, vuData, qDelay, pDelay, stampBase, hb);
+        else if (hot30d8)
+            g549ExecuteHot30d8(st, vuData, qDelay, pDelay, stampBase, hb);
+        else if (hot1be8)
+            g550ExecuteHot1be8(st, vuData, qDelay, pDelay, stampBase, hb);
+        else if (hot1c00)
+            g551ExecuteHot1c00(st, vuData, qDelay, pDelay, stampBase, hb);
+        else if (hot0900)
+            g554ExecuteHot0900(st, vuData, qDelay, pDelay, stampBase, hb);
+        else
+            g555ExecuteHot1110(st, vuData, qDelay, pDelay, stampBase, hb);
 
         const bool badState = !g422StatesEqual(expected, st);
         const bool badHist = std::memcmp(&histExpected, hb, sizeof(histExpected)) != 0;
         const bool badPipe = qExpected != *qDelay || pExpected != *pDelay;
         const bool badMac = macExpected != s_vuMacVisible;
-        const bool badMem = hasMem && std::memcmp(s_g422VerMemFast, vuData, dataSize) != 0;
+        bool badTargetMem = false;
+        for (uint32_t i = 0u; i < targetMemCount; ++i)
+            badTargetMem = badTargetMem ||
+                std::memcmp(targetMemExpected[i], vuData + targetMemAddr[i], 16u) != 0;
+        const bool badMem = badTargetMem ||
+            (hasMem && std::memcmp(s_g422VerMemFast, vuData, dataSize) != 0);
         if (badState || badHist || badPipe || badMac || badMem)
         {
+            int badVf = -1, badVfLane = -1, badVi = -1, badAcc = -1;
+            for (int vf = 0; vf < 32 && badVf < 0; ++vf)
+                for (int lane = 0; lane < 4; ++lane)
+                    if (std::memcmp(&expected.vf[vf][lane], &st.vf[vf][lane],
+                                    sizeof(float)) != 0)
+                    {
+                        badVf = vf;
+                        badVfLane = lane;
+                        break;
+                    }
+            for (int vi = 0; vi < 16 && badVi < 0; ++vi)
+                if (expected.vi[vi] != st.vi[vi])
+                    badVi = vi;
+            for (int lane = 0; lane < 4 && badAcc < 0; ++lane)
+                if (std::memcmp(&expected.acc[lane], &st.acc[lane], sizeof(float)) != 0)
+                    badAcc = lane;
+            auto fbits = [](float v) {
+                uint32_t bits = 0u;
+                std::memcpy(&bits, &v, sizeof(bits));
+                return bits;
+            };
             std::fprintf(stderr,
                          "[G533:verify-BAD] state=%d hist=%d pipe=%d mac=%d mem=%d"
-                         " q=%d/%d p=%d/%d\n",
+                         " q=%d/%d p=%d/%d\n"
+                         "[G533:verify-state] vf=%d.%d:%08x/%08x vi=%d:%08x/%08x"
+                         " acc=%d:%08x/%08x q=%08x/%08x p=%08x/%08x i=%08x/%08x"
+                         " pc=%04x/%04x mac=%08x/%08x clip=%08x/%08x status=%08x/%08x"
+                         " ebit=%d/%d itop=%08x/%08x xitop=%08x/%08x\n",
                          static_cast<int>(badState), static_cast<int>(badHist),
                          static_cast<int>(badPipe), static_cast<int>(badMac),
-                         static_cast<int>(badMem), qExpected, *qDelay, pExpected, *pDelay);
+                         static_cast<int>(badMem), qExpected, *qDelay, pExpected, *pDelay,
+                         badVf, badVfLane,
+                         badVf >= 0 ? fbits(expected.vf[badVf][badVfLane]) : 0u,
+                         badVf >= 0 ? fbits(st.vf[badVf][badVfLane]) : 0u,
+                         badVi, badVi >= 0 ? static_cast<uint32_t>(expected.vi[badVi]) : 0u,
+                         badVi >= 0 ? static_cast<uint32_t>(st.vi[badVi]) : 0u,
+                         badAcc, badAcc >= 0 ? fbits(expected.acc[badAcc]) : 0u,
+                         badAcc >= 0 ? fbits(st.acc[badAcc]) : 0u,
+                         fbits(expected.q), fbits(st.q), fbits(expected.p), fbits(st.p),
+                         fbits(expected.i), fbits(st.i), expected.pc, st.pc,
+                         expected.mac, st.mac, expected.clip, st.clip,
+                         expected.status, st.status, static_cast<int>(expected.ebit),
+                         static_cast<int>(st.ebit), expected.itop, st.itop,
+                         expected.xitop, st.xitop);
             std::fflush(stderr);
             std::abort();
         }
 
-        const uint64_t n = s_g533Verified.fetch_add(10u, std::memory_order_relaxed) + 10u;
-        if (n == 10u || n % 10000000u == 0u)
+        const uint64_t pairCount = hot0900 ? 36u : hot1110 ? 6u :
+            hot1be8 ? 2u : hot30d8 ? 4u :
+            (hot0c70 || hot1c00) ? 6u : 10u;
+        const uint64_t n =
+            s_g533Verified.fetch_add(pairCount, std::memory_order_relaxed) + pairCount;
+        if (n == pairCount || n / 10000000u != (n - pairCount) / 10000000u)
         {
             std::fprintf(stderr, "[G533:verify] pairs=%llu bad=0\n",
                          static_cast<unsigned long long>(n));
@@ -3846,10 +5239,10 @@ namespace
         // G517: TWENTY-FOUR slots, not sixteen. Arms 19–22 would all fold onto slot 0 and a
         // `g517ind` gate could print at most ONE `[G499:blk]` line — the same G457 failure G501 and
         // G516 already fixed here, third firing. Widen this in the SAME edit that adds an arm.
-        // G531: TWENTY-FIVE slots. Arm 24 is the flag-tail oracle; folding it onto slot 0 would
-        // hide proof that the verifier copy was selected.
-        static std::atomic<uint32_t> s_once[25] = {};
-        const int slot = (arm < 0 || arm > 24) ? 0 : arm;
+        // G555: THIRTY-SEVEN slots. Arm 36 is the 0x1110 immutable fragment expansion; folding it
+        // onto slot 0 would hide proof that both paired bodies were selected.
+        static std::atomic<uint32_t> s_once[37] = {};
+        const int slot = (arm < 0 || arm > 36) ? 0 : arm;
         if (s_once[slot].fetch_add(1u, std::memory_order_relaxed) != 0u)
             return;
         std::fprintf(stderr, "[G499:blk] arm=%d\n", arm);

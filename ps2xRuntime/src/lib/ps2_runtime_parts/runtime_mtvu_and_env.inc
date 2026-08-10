@@ -19,7 +19,6 @@ extern int g438SlowArm(int which);
 // G541 GPU-transport paired arm and no-wait GL-backend bridge. CPU VU1 remains authoritative.
 extern int g541VuNullArm();
 extern bool g541_backend_null_compute();
-extern std::atomic<uint64_t> g_g545CpuTraceSequence;
 
 // G478 VU1-worker PC sampler (defined in ps2_gif_arbiter_parts/g446_gsworker_pcsample.inc).
 // No-op unless DC2_G478_VU1PROF=1.
@@ -75,10 +74,15 @@ extern uint32_t dc2_g483_last_stop_reason();
 #include <vector>
 #include <immintrin.h>
 
+#include "../ps2_gs_gpu_raster_parts/g566_vu_authority_shared.inc"
+
 // G541 stable hidden-pipeline serializer, defined in ps2_vu1.cpp after all implementation parts.
 extern void dc2_g541_vu_pipe_snapshot(std::vector<uint8_t> &out);
 // G545 private cpp-to-cpp handoff. The backend takes ownership and returns without waiting for GL.
 extern bool g545_backend_live_submit(std::vector<uint8_t> &&command);
+// G566 private exact GPU-authority handoff. One result is published asynchronously per kick.
+extern bool g566_backend_authority_submit(
+    std::vector<uint8_t> &&command, const std::shared_ptr<G566VuAuthorityResult> &result);
 
 namespace ps2_stubs
 {
@@ -148,12 +152,14 @@ struct G297KickItem
     bool isResume = false;
     std::vector<std::vector<uint8_t>> packets;     // XGKICK Path1 output (worker-filled)
     std::vector<uint32_t> packetAddrs;             // G541: ordered XGKICK VU-data addresses
+    std::shared_ptr<G566VuAuthorityResult> g566Authority;
     std::atomic<bool> ready{false};
 };
 using G297KickPtr = std::shared_ptr<G297KickItem>;
 
 #include "runtime_g541_vu_corpus.inc"
 #include "runtime_g545_vu_shadow.inc"
+#include "runtime_g566_vu_authority.inc"
 
 // ---------------------------------------------------------------------------
 // G478 kick-item RECYCLING POOL (MEASURED NEUTRAL — default OFF, opt-in DC2_G478_KICKPOOL=1).
@@ -287,6 +293,7 @@ inline G297KickPtr g478AcquireKickItem()
         raw->writeBytes.clear();
         raw->packets.clear();
         raw->packetAddrs.clear();
+        raw->g566Authority.reset();
         raw->startPC = 0u;
         raw->itop = 0u;
         raw->top = 0u;
@@ -498,6 +505,8 @@ public:
         item->top = top;
         item->budget = budget;
         item->isResume = isResume;
+        if (g566VuAuthorityRequested())
+            item->g566Authority = std::make_shared<G566VuAuthorityResult>();
         m_curBatch.push_back(item);                    // EE-only accumulator (issue order)
         ++m_kicksEnq;
         g331KickCensus(item->startPC, item->itop, item->top, item->writeBytes, item->isResume);
@@ -624,6 +633,24 @@ public:
         }
         for (auto &item : batch)
         {
+            if (item->g566Authority)
+            {
+                const std::shared_ptr<G566VuAuthorityResult> result = item->g566Authority;
+                if (!result->ready.load(std::memory_order_acquire))
+                {
+                    std::unique_lock<std::mutex> lk(result->mutex);
+                    result->cv.wait(lk, [&] {
+                        return m_stop || result->ready.load(std::memory_order_acquire);
+                    });
+                }
+                if (m_stop)
+                    return;
+                std::lock_guard<std::mutex> lk(result->mutex);
+                if (result->ok)
+                    for (auto &pk : result->packets)
+                        out.push_back(std::move(pk));
+                continue;
+            }
             // Fast path: VU1 worker runs ahead (deep backlog), so this kick is usually already
             // ready — a lock-free atomic load, NO mutex. Only a genuinely-not-yet-produced kick
             // takes the done mutex to block. This is what keeps the GS worker and VU1 worker from
@@ -824,9 +851,12 @@ private:
                     m_g441WriteBytes += run;
                 }
             }
-            const bool g541CorpusKick =
+            const bool g566AuthorityKick = item->g566Authority &&
+                m_g566Authority.submit(*item, m_vu1->state(), m_workerVuCode, m_workerVuData,
+                                       item->g566Authority);
+            const bool g541CorpusKick = !g566AuthorityKick &&
                 m_g541Corpus.begin(*item, m_vu1->state(), m_workerVuCode, m_workerVuData);
-            const bool g545ShadowKick =
+            const bool g545ShadowKick = !g566AuthorityKick &&
                 m_g545Shadow.begin(*item, m_vu1->state(), m_workerVuCode, m_workerVuData);
             if (g541CorpusKick || g545ShadowKick)
                 g_g541KickAddresses = &item->packetAddrs;
@@ -892,12 +922,16 @@ private:
             const bool instr = g303InstrOn();
             const auto twBusy0 = instr ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
-            if (item->isResume)
-                m_vu1->resume(m_workerVuCode, PS2_VU1_CODE_SIZE, m_workerVuData, PS2_VU1_DATA_SIZE,
-                              *m_gs, m_mem, item->itop, item->budget);
-            else
-                m_vu1->execute(m_workerVuCode, PS2_VU1_CODE_SIZE, m_workerVuData, PS2_VU1_DATA_SIZE,
-                               *m_gs, m_mem, item->startPC, item->itop, item->budget);
+            if (!g566AuthorityKick)
+            {
+                if (item->isResume)
+                    m_vu1->resume(m_workerVuCode, PS2_VU1_CODE_SIZE, m_workerVuData,
+                                  PS2_VU1_DATA_SIZE, *m_gs, m_mem, item->itop, item->budget);
+                else
+                    m_vu1->execute(m_workerVuCode, PS2_VU1_CODE_SIZE, m_workerVuData,
+                                   PS2_VU1_DATA_SIZE, *m_gs, m_mem, item->startPC, item->itop,
+                                   item->budget);
+            }
             // G438: when DC2_G419_AB=vu1slow is armed the spin runs on CANDIDATE frames only, so the
             // probe becomes a within-process paired measurement instead of a difference of two run
             // means (whose run-level spread is ~4.5 ms here — larger than the effect). The spin
@@ -936,12 +970,13 @@ private:
             {
                 const int g541Arm = g541VuNullArm();
                 static const bool s_g541Standalone = envSet("DC2_G541_NULL_GPU");
-                if (g541Arm == 1 || (g541Arm < 0 && s_g541Standalone))
+                if (!g566AuthorityKick &&
+                    (g541Arm == 1 || (g541Arm < 0 && s_g541Standalone)))
                     (void)g541_backend_null_compute();
             }
             // G482 census tail: post-state key + intra-frame table. `item->packets` is final here,
             // so its byte count is exactly what a memo hit would have to replay.
-            if (g482Census && !item->isResume)
+            if (g482Census && !item->isResume && !g566AuthorityKick)
             {
                 const auto e1 = std::chrono::steady_clock::now();
                 const uint64_t execNs = (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -982,6 +1017,7 @@ private:
             }
             const auto g441T3 = s_g441Kick ? std::chrono::steady_clock::now()
                                            : std::chrono::steady_clock::time_point{};
+            if (!g566AuthorityKick)
             {
                 // G482: SKIP THE PUBLISH LOCK AND NOTIFY WHEN NOBODY IS WAITING.
                 //
@@ -1192,6 +1228,7 @@ private:
     uint8_t m_workerVuData[PS2_VU1_DATA_SIZE] = {};
     G541VuCorpus m_g541Corpus;
     G545VuLiveShadow m_g545Shadow;
+    G566VuAuthority m_g566Authority;
     // G301: EE-local accumulator of VU-RAM writes for the current (not-yet-enqueued) kick.
     std::vector<G297VuWrite> m_pendWrites;
     std::vector<uint8_t> m_pendWriteBytes;

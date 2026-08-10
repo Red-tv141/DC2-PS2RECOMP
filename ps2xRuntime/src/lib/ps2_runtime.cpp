@@ -1,3 +1,4 @@
+// G566: exact GPU-authoritative VU1 command producer and asynchronous packet-result handoff (v1).
 // G545: incremental CPU-authoritative VU1 worker -> persistent GPU shadow stream (v2 trace).
 // G478: runtime_mtvu_and_env.inc now arms the G446 PC sampler on the MTVU worker thread.
 // G483: it also splits [G441:kick]'s exec bucket by kick kind ([G483:kind]) and by stop reason

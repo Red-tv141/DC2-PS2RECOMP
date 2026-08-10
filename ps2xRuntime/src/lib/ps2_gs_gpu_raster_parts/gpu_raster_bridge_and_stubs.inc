@@ -21,6 +21,12 @@ bool g545_backend_live_submit(std::vector<uint8_t> &&command)
     return G178Backend::instance().submitG545Live(std::move(command));
 }
 
+bool g566_backend_authority_submit(
+    std::vector<uint8_t> &&command, const std::shared_ptr<G566VuAuthorityResult> &result)
+{
+    return G178Backend::instance().submitG566Authority(std::move(command), result);
+}
+
 // G305: one-slot move-owned async submit / drain (default-off). See G178Backend::submitAsync.
 bool g178_backend_submit_async(G178Batch &batch)
 {

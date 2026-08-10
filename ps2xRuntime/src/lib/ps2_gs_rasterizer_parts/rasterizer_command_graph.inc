@@ -137,6 +137,22 @@ bool g286TransientTarget(uint32_t fbp)
     return g286TransientTargetOn() && fbp == 0x13bu;
 }
 
+// G558 experiment: S05's remaining 0x13b pole is the same transient target, but its terminal
+// full-screen sprite is an opaque SOLID fill (TME=0).  G286 only admitted textured sprites even
+// though the transient backend already supports the untextured draw state and preserves the same
+// immediate readback/publication contract.  Keep the widening independently bisectable until the
+// exact G286 oracle and route gates pass.
+bool g558Solid13bOn()
+{
+    // G569 promoted to DEFAULT-ON alongside the G553/G556/G557 residency slots — it shipped as an
+    // `envFlagEnabled` opt-in that nothing set, while the docs described it as default-ON. Gated on
+    // `s05` with those three: -22.0% route-aligned, and four correctness routes clean (held title
+    // 211650, MAP-15 0 defects, s05 + Dungeon 6 scene-aligned pixel comparison unbiased).
+    static const bool s_on = !envFlagEnabled("DC2_G558_NO_13B_SOLID") &&
+                             !envFlagDisabled("DC2_G558_13B_SOLID");
+    return s_on && g286TransientTargetOn();
+}
+
 static bool g286StatOn()
 {
     static const bool s_on =

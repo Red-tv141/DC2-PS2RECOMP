@@ -551,11 +551,12 @@
         g527NoteTargetDraw(ctx.frame.fbp);
         const bool g252RttTarget =
             s_g252RttDefer && isSprite144 && g527DeferTarget(ctx.frame.fbp);
-        // G286 admits only the measured opaque textured full-screen sprite class. Other 0x13b
-        // shapes remain on the proven CPU path instead of silently widening shader semantics.
+        // G286 admits the measured opaque textured full-screen sprite class. G558 optionally adds
+        // the measured opaque solid (TME=0) S05 terminal sprite; other 0x13b shapes remain on the
+        // proven CPU path instead of silently widening shader semantics.
         const bool g286Transient =
             g286TransientTarget(ctx.frame.fbp) && diagOff144 && isSprite144 &&
-            gs->m_prim.tme && !gs->m_prim.abe;
+            (gs->m_prim.tme || g558Solid13bOn()) && !gs->m_prim.abe;
         // G260 (opt-in): under the native-renderer command graph, RTT-family TRIANGLES (both
         // textured and untextured — the census shows both) become recordable too, closing the
         // G247 structural exclusion that rasterized them inline scalar on the GS thread. They

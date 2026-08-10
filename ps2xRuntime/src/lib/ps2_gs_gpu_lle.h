@@ -28,6 +28,10 @@ struct G178Vtx
     // G364: GS per-vertex FOG byte (F). Interpolated by the FS and blended towards G178Draw::fogCol
     // when the draw's fge flag is set. pad keeps the 4-byte attribute alignment explicit.
     uint8_t fog, pad0, pad1, pad2;
+    // G561: flat per-triangle draw state for ordered same-texture runs. Values are integer-packed
+    // into floats below 2^24, hence lossless through the GL_FLOAT vertex attribute. The legacy
+    // shader ignores this private tail entirely.
+    float drawState0, drawState1, drawState2, drawState3;
 };
 
 // One state-batched draw run over a contiguous vertex range (triangles, 3 verts each).

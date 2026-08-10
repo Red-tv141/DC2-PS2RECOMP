@@ -20,13 +20,12 @@ public:
     {
         if (!m_enabled || m_inFlight)
             return false;
-        if (std::getenv("DC2_G545_CPU_TRACE") != nullptr)
-            g_g545CpuTraceSequence.store(m_sequence, std::memory_order_relaxed);
         m_seedThisKick = m_needSeed;
         if (m_seedThisKick)
         {
             encodeState(state, m_seedState);
             dc2_g541_vu_pipe_snapshot(m_seedPipe);
+            canonicalizeSeedHistoryPipe(m_seedPipe);
             m_seedCode.assign(code, code + PS2_VU1_CODE_SIZE);
             m_seedData.assign(data, data + PS2_VU1_DATA_SIZE);
         }
@@ -45,7 +44,7 @@ public:
         std::vector<uint8_t> postPipe;
         encodeState(state, postState);
         dc2_g541_vu_pipe_snapshot(postPipe);
-        const bool checkpoint = m_seedThisKick || ((m_sequence % m_dataInterval) == 0u);
+        const bool checkpoint = (m_sequence % m_dataInterval) == 0u;
 
         std::vector<uint8_t> payload;
         payload.reserve((m_seedThisKick ? 34044u : 2048u) + item.writeBytes.size());
@@ -172,6 +171,25 @@ private:
     }
 
     static uint32_t narrow(size_t n) { return static_cast<uint32_t>(n); }
+    static void canonicalizeSeedHistoryPipe(std::vector<uint8_t> &pipe)
+    {
+        if (pipe.size() != 644u)
+            return;
+        for (uint32_t slot = 0u; slot < 8u; ++slot)
+        {
+            uint32_t dest = 0u;
+            std::memcpy(&dest, pipe.data() + (138u + slot) * 4u, sizeof(dest));
+            for (uint32_t lane = 0u; lane < 4u; ++lane)
+                if ((dest & (8u >> lane)) == 0u)
+                {
+                    uint32_t value = 0u;
+                    uint8_t *const at = pipe.data() + (82u + slot * 4u + lane) * 4u;
+                    std::memcpy(&value, at, sizeof(value));
+                    if ((value & 0x7f800000u) == 0u && (value & 0x007fffffu) != 0u)
+                        std::memset(at, 0, sizeof(value));
+                }
+        }
+    }
     static void align4(std::vector<uint8_t> &out)
     {
         while ((out.size() & 3u) != 0u)

@@ -277,6 +277,42 @@ namespace
         return z | (s << 4u) | (u << 8u) | (o << 12u);
     }
 
+    // G546: NVIDIA compares subnormal MAX/MIN inputs as signed zero, but the uint ternary in the
+    // GPU executor preserves the raw bits of whichever operand wins. MSVC SSE compares the real
+    // subnormal value. The difference is observable only in masked-off G430 history lanes: active
+    // lanes are written to VF/ACC and remain exact-or-fail. Store NVIDIA's native selection in
+    // those dead history lanes so persistent CPU/GPU pipe snapshots have one stable representation
+    // without adding any instruction to the spill-sensitive live shader.
+    static DC2_G330_FORCEINLINE __m128 g546FlushCompareSubnormals(__m128 value)
+    {
+        const __m128i bits = _mm_castps_si128(value);
+        const __m128i zero = _mm_setzero_si128();
+        const __m128i absBits = _mm_and_si128(bits, _mm_set1_epi32(0x7fffffffu));
+        const __m128i expBits = _mm_and_si128(absBits, _mm_set1_epi32(0x7f800000u));
+        const __m128i expZero = _mm_cmpeq_epi32(expBits, zero);
+        const __m128i valueZero = _mm_cmpeq_epi32(absBits, zero);
+        const __m128i subnormal = _mm_andnot_si128(valueZero, expZero);
+        const __m128i signedZero = _mm_and_si128(bits, _mm_set1_epi32(0x80000000u));
+        return _mm_castsi128_ps(_mm_or_si128(_mm_andnot_si128(subnormal, bits),
+                                             _mm_and_si128(subnormal, signedZero)));
+    }
+
+    static DC2_G330_FORCEINLINE __m128 g546CanonicalHistoryMinMax(__m128 a, __m128 b,
+                                                                  __m128 cpuResult,
+                                                                  uint8_t dest, bool isMax)
+    {
+        const __m128 compareA = g546FlushCompareSubnormals(a);
+        const __m128 compareB = g546FlushCompareSubnormals(b);
+        const __m128 chooseA = isMax ? _mm_cmpgt_ps(compareA, compareB)
+                                     : _mm_cmplt_ps(compareA, compareB);
+        const __m128 gpuResult = _mm_or_ps(_mm_and_ps(chooseA, a),
+                                           _mm_andnot_ps(chooseA, b));
+        const __m128 active = _mm_load_ps(reinterpret_cast<const float *>(
+            g421MaskTableConst.m[dest]));
+        return _mm_or_ps(_mm_and_ps(active, cpuResult),
+                         _mm_andnot_ps(active, gpuResult));
+    }
+
     // Bit-select the dest lanes; masked-off lanes are rewritten with their own bits, so this is
     // value-identical to applyDest()'s four conditional stores.
     static inline void g421StoreMasked(float *dst, __m128 value, __m128 mask)
@@ -834,44 +870,7 @@ namespace
         switch (d.op)
         {
         case 0u: r = _mm_add_ps(vs, b); break;
-        case 1u:
-        {
-            r = _mm_sub_ps(vs, b);
-            if ((upper == 0x01ef852cu || upper == 0x01ef8d6cu) &&
-                g_g545CpuTraceSequence.load(std::memory_order_relaxed) == 784u)
-            {
-                static std::atomic<uint32_t> s_g545SubTraceCount{0u};
-                if (s_g545SubTraceCount.fetch_add(1u, std::memory_order_relaxed) < 24u)
-                {
-                    alignas(16) uint32_t vsBits[4], bBits[4], resultBits[4];
-                    _mm_store_si128(reinterpret_cast<__m128i *>(vsBits), _mm_castps_si128(vs));
-                    _mm_store_si128(reinterpret_cast<__m128i *>(bBits), _mm_castps_si128(b));
-                    _mm_store_si128(reinterpret_cast<__m128i *>(resultBits), _mm_castps_si128(r));
-                    std::fprintf(stderr,
-                                 "[G545:cpu-sub] seq=784 stamp=%lld upper=%08x vs=%08x,%08x vt=%08x,%08x result=%08x,%08x\n",
-                                 static_cast<long long>(g430Stamp), upper, vsBits[0], vsBits[1],
-                                 bBits[0], bBits[1], resultBits[0], resultBits[1]);
-                }
-            }
-            if (upper == 0x01f1ae6cu &&
-                g_g545CpuTraceSequence.load(std::memory_order_relaxed) == 784u)
-            {
-                static std::atomic<uint32_t> s_g545Sub32b8TraceCount{0u};
-                if (s_g545Sub32b8TraceCount.fetch_add(1u, std::memory_order_relaxed) < 64u)
-                {
-                    alignas(16) uint32_t vsBits[4], bBits[4], resultBits[4];
-                    _mm_store_si128(reinterpret_cast<__m128i *>(vsBits), _mm_castps_si128(vs));
-                    _mm_store_si128(reinterpret_cast<__m128i *>(bBits), _mm_castps_si128(b));
-                    _mm_store_si128(reinterpret_cast<__m128i *>(resultBits), _mm_castps_si128(r));
-                    std::fprintf(stderr,
-                                 "[G545:cpu-sub32b8] seq=784 stamp=%lld vs=%08x,%08x,%08x,%08x vt=%08x,%08x,%08x,%08x result=%08x,%08x,%08x,%08x\n",
-                                 static_cast<long long>(g430Stamp), vsBits[0], vsBits[1],
-                                 vsBits[2], vsBits[3], bBits[0], bBits[1], bBits[2], bBits[3],
-                                 resultBits[0], resultBits[1], resultBits[2], resultBits[3]);
-                }
-            }
-            break;
-        }
+        case 1u: r = _mm_sub_ps(vs, b); break;
         case 2u: r = _mm_add_ps(_mm_loadu_ps(st.acc), _mm_mul_ps(vs, b)); break;
         case 3u: r = _mm_sub_ps(_mm_loadu_ps(st.acc), _mm_mul_ps(vs, b)); break;
         case 4u: r = _mm_mul_ps(vs, b); break;
@@ -891,25 +890,6 @@ namespace
             r = _mm_and_ps(
                 _mm_sub_ps(_mm_loadu_ps(st.acc), _mm_mul_ps(g488a, g488b)),
                 _mm_castsi128_ps(_mm_setr_epi32(-1, -1, -1, 0)));
-            const uint64_t g545TraceSequence =
-                g_g545CpuTraceSequence.load(std::memory_order_relaxed);
-            if (upper == 0x01d5a5eeu && g545TraceSequence == 784u)
-            {
-                static std::atomic<uint32_t> s_g545TraceCount{0u};
-                if (s_g545TraceCount.fetch_add(1u, std::memory_order_relaxed) < 128u)
-                {
-                    uint32_t a = 0u, bb = 0u, acc = 0u;
-                    std::memcpy(&a, &st.vf[20][0], sizeof(a));
-                    std::memcpy(&bb, &st.vf[21][1], sizeof(bb));
-                    std::memcpy(&acc, &st.acc[2], sizeof(acc));
-                    alignas(16) uint32_t out[4];
-                    _mm_store_si128(reinterpret_cast<__m128i *>(out), _mm_castps_si128(r));
-                    std::fprintf(stderr,
-                                 "[G545:cpu-block-opmsub] seq=%llu stamp=%lld accZ=%08x resultZ=%08x operands=%08x*%08x\n",
-                                 static_cast<unsigned long long>(g545TraceSequence),
-                                 static_cast<long long>(g430Stamp), acc, out[2], a, bb);
-                }
-            }
             break;
         }
         case 8u: // OPMULA : (vs x vt) -> ACC, w lane keeps the CURRENT ACC.w
@@ -923,24 +903,6 @@ namespace
             const __m128 g488acc = _mm_loadu_ps(st.acc);
             r = _mm_shuffle_ps(g488p, _mm_unpackhi_ps(g488p, g488acc),
                                _MM_SHUFFLE(3, 0, 1, 0));
-            const uint64_t g545TraceSequence =
-                g_g545CpuTraceSequence.load(std::memory_order_relaxed);
-            if (upper == 0x01d4aafeu && g545TraceSequence == 784u)
-            {
-                static std::atomic<uint32_t> s_g545TraceCount{0u};
-                if (s_g545TraceCount.fetch_add(1u, std::memory_order_relaxed) < 128u)
-                {
-                    uint32_t a = 0u, bb = 0u;
-                    std::memcpy(&a, &st.vf[21][0], sizeof(a));
-                    std::memcpy(&bb, &st.vf[20][1], sizeof(bb));
-                    alignas(16) uint32_t out[4];
-                    _mm_store_si128(reinterpret_cast<__m128i *>(out), _mm_castps_si128(r));
-                    std::fprintf(stderr,
-                                 "[G545:cpu-block-opmula] seq=%llu stamp=%lld resultZ=%08x operands=%08x*%08x\n",
-                                 static_cast<unsigned long long>(g545TraceSequence),
-                                 static_cast<long long>(g430Stamp), out[2], a, bb);
-                }
-            }
             break;
         }
         default: r = _mm_min_ps(vs, b); break;
@@ -960,10 +922,14 @@ namespace
             // G430: record (stamp, result, dest). No head advance, no tag, no carry: the consumer
             // finds this entry by stamp.
             // G504: same four stores; only where the ring cursor lives differs.
+            const __m128 historyResult =
+                (dest != 0xFu && (d.op == 5u || d.op == 6u))
+                    ? g546CanonicalHistoryMinMax(vs, b, r, dest, d.op == 5u)
+                    : r;
             if constexpr (G504Cursor)
-                g430PushPendingAt<G501Pin>(g436Hb, g504Slot, g430Stamp, r, dest);
+                g430PushPendingAt<G501Pin>(g436Hb, g504Slot, g430Stamp, historyResult, dest);
             else
-                g430PushPending<G501Pin>(g436Hb, g430Stamp, r, dest);
+                g430PushPending<G501Pin>(g436Hb, g430Stamp, historyResult, dest);
             if (g428Shadow)
             {
                 const uint32_t mac = g421MakeMacReg(r, dest);

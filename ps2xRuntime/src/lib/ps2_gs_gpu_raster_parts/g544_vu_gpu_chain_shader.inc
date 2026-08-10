@@ -17,8 +17,10 @@ static std::string g544ChainShaderSource(std::string &why)
 {
     std::string source(g543SemanticShaderSource());
     const std::string globals =
+        "#ifndef G545_WORKSPACE_RAM\n"
         "uvec4 Rram[1024];\n"
         "uvec4 Rcode[1024];\n"
+        "#endif\n"
         "uint Rpipe[161];\n"
         "uint gRingPacketCapacity;\n"
         "uint gRingByteCapacity;\n"
@@ -26,7 +28,11 @@ static std::string g544ChainShaderSource(std::string &why)
         "uint gRingConsumerBytes;\n"
         "const uint F_CHAIN = 0x00000080u;\n"
         "const uint F_RING = 0x00000100u;\n";
-    if (!g544ReplaceShaderPart(source, "uvec4 Rram[1024];\n", globals, why))
+    if (!g544ReplaceShaderPart(source,
+                               "#ifndef G545_WORKSPACE_RAM\n"
+                               "uvec4 Rram[1024];\n"
+                               "#endif\n",
+                               globals, why))
         return {};
 
     const size_t kickBegin = source.find("void emitKick(int isReg, uint instr)");
@@ -100,10 +106,48 @@ static std::string g544ChainShaderSource(std::string &why)
         return {};
     }
     source.resize(mainAt);
-    source += R"G544A(uint payloadByte(uint byteAddr)
+source += R"G544A(uint payloadByte(uint byteAddr)
 {
     uint word = pw(byteAddr >> 2u);
     return (word >> ((byteAddr & 3u) * 8u)) & 255u;
+}
+
+uvec4 g544LoadCodeQuad(uint q)
+{
+#ifdef G545_WORKSPACE_RAM
+    uint at = 335u + q * 4u;
+    return uvec4(ow(at), ow(at + 1u), ow(at + 2u), ow(at + 3u));
+#else
+    return Rcode[q];
+#endif
+}
+
+void g544StoreCodeQuad(uint q, uvec4 value)
+{
+#ifdef G545_WORKSPACE_RAM
+    uint at = 335u + q * 4u;
+    sw(at, value.x); sw(at + 1u, value.y); sw(at + 2u, value.z); sw(at + 3u, value.w);
+#else
+    Rcode[q] = value;
+#endif
+}
+
+uint g544LoadCodeLane(uint q, int lane)
+{
+#ifdef G545_WORKSPACE_RAM
+    return ow(335u + q * 4u + uint(lane));
+#else
+    return Rcode[q][lane];
+#endif
+}
+
+void g544StoreCodeLane(uint q, int lane, uint value)
+{
+#ifdef G545_WORKSPACE_RAM
+    sw(335u + q * 4u + uint(lane), value);
+#else
+    Rcode[q][lane] = value;
+#endif
 }
 
 void storeRamByte(uint byteAddr, uint value)
@@ -113,7 +157,8 @@ void storeRamByte(uint byteAddr, uint value)
     int lane = int((a >> 2u) & 3u);
     uint shift = (a & 3u) * 8u;
     uint mask = 255u << shift;
-    Rram[q][lane] = (Rram[q][lane] & ~mask) | ((value & 255u) << shift);
+    uint old = g543LoadRamLane(q, lane);
+    g543StoreRamLane(q, lane, (old & ~mask) | ((value & 255u) << shift));
 }
 
 void storeCodeByte(uint byteAddr, uint value)
@@ -123,13 +168,14 @@ void storeCodeByte(uint byteAddr, uint value)
     int lane = int((a >> 2u) & 3u);
     uint shift = (a & 3u) * 8u;
     uint mask = 255u << shift;
-    Rcode[q][lane] = (Rcode[q][lane] & ~mask) | ((value & 255u) << shift);
+    uint old = g544LoadCodeLane(q, lane);
+    g544StoreCodeLane(q, lane, (old & ~mask) | ((value & 255u) << shift));
 }
 
 uint chainCodeWord(uint byteAddr)
 {
     uint a = byteAddr & 0x3fffu;
-    return Rcode[a >> 4u][int((a >> 2u) & 3u)];
+    return g544LoadCodeLane(a >> 4u, int((a >> 2u) & 3u));
 }
 
 uint currentStateWord(uint word)
@@ -169,10 +215,13 @@ void loadChainInitial()
     loadRecord();
     uint prePipe = cw(gCmd + 17u) >> 2u;
     for (uint n = 0u; n < 161u; ++n) Rpipe[n] = pw(prePipe + n);
+#ifndef G545_WORKSPACE_RAM
     uint code = cw(gCmd + 19u) >> 2u;
     for (int q = 0; q < 1024; ++q)
-        Rcode[q] = uvec4(pw(code + uint(q*4+0)), pw(code + uint(q*4+1)),
-                             pw(code + uint(q*4+2)), pw(code + uint(q*4+3)));
+        g544StoreCodeQuad(uint(q),
+            uvec4(pw(code + uint(q*4+0)), pw(code + uint(q*4+1)),
+                  pw(code + uint(q*4+2)), pw(code + uint(q*4+3))));
+#endif
 }
 
 void applyIncomingWrites()
@@ -212,8 +261,8 @@ void verifyChainPre()
     for (int q = 0; q < 1024; ++q) {
         for (int n = 0; n < 4; ++n) {
             uint w = uint(q*4+n);
-            if (Rcode[q][n] != pw(code + w)) { fail(F_CHAIN, 0x43000000u | w); return; }
-            if (Rram[q][n] != pw(data + w)) { fail(F_CHAIN, 0x44000000u | w); return; }
+            if (g544LoadCodeLane(uint(q), n) != pw(code + w)) { fail(F_CHAIN, 0x43000000u | w); return; }
+            if (g543LoadRamLane(uint(q), n) != pw(data + w)) { fail(F_CHAIN, 0x44000000u | w); return; }
         }
     }
 }
@@ -332,11 +381,15 @@ void storePersistentWorkspace(uint base)
     base += 158u;
     for (uint w = 0u; w < 161u; ++w) sw(base + w, Rpipe[w]);
     base += 161u;
+#ifndef G545_WORKSPACE_RAM
     for (int q = 0; q < 1024; ++q)
-        for (int n = 0; n < 4; ++n) sw(base + uint(q*4+n), Rcode[q][n]);
+        for (int n = 0; n < 4; ++n)
+            sw(base + uint(q*4+n), g544LoadCodeLane(uint(q), n));
     base += 4096u;
     for (int q = 0; q < 1024; ++q)
-        for (int n = 0; n < 4; ++n) sw(base + uint(q*4+n), Rram[q][n]);
+        for (int n = 0; n < 4; ++n)
+            sw(base + uint(q*4+n), g543LoadRamLane(uint(q), n));
+#endif
 }
 )G544B";
     source += R"G544C(

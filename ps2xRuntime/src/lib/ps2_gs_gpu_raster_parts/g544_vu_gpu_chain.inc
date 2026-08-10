@@ -77,8 +77,13 @@ static bool g544CompareAt(const G542AbiCorpus &corpus,
 
     const auto *expected = reinterpret_cast<const uint8_t *>(corpus.payload.data());
     const auto *actual = reinterpret_cast<const uint8_t *>(output.data());
+    const bool semanticPipe = std::strcmp(section, "postPipe") == 0 ||
+                              std::strcmp(section, "tailPipe") == 0;
     for (uint32_t b = 0u; b < byteCount; ++b)
     {
+        if (semanticPipe &&
+            !g543HistoryPipeByteObservable(expected, expectedByteOffset, b))
+            continue;
         if (expected[expectedByteOffset + b] == actual[actualByteOffset + b])
             continue;
         mismatch.section = section;
@@ -141,6 +146,8 @@ static bool g544RunChainReplay(GLFns &f, G178GLExt &e)
         return false;
     }
 
+    // NVIDIA's scalar MAX flushes a positive denormal comparison input to +0. Normalize that
+    // representation only in Hvec lanes excluded by Hdest; observable lanes remain bit-exact.
     uint64_t totalPackets64 = 0u;
     uint64_t totalPacketBytes64 = 0u;
     uint64_t totalWrites = 0u;
@@ -331,7 +338,7 @@ static bool g544RunChainReplay(GLFns &f, G178GLExt &e)
     }
 
     std::fprintf(stderr,
-                 "[G544:chain] PASS records=%u writes=%llu packets=%u bytes=%u packetCap=%u byteCap=%u oneDispatch=1 oneReadback=1 persistentStatePipeCodeData=1 CPU-authoritative=1\n",
+                 "[G544:chain] PASS records=%u writes=%llu packets=%u bytes=%u packetCap=%u byteCap=%u oneDispatch=1 oneReadback=1 persistentStateSemanticPipeCodeData=1 deadHistoryLanesMasked=1 CPU-authoritative=1\n",
                  corpus.records, static_cast<unsigned long long>(totalWrites),
                  static_cast<uint32_t>(totalPackets64),
                  static_cast<uint32_t>(totalPacketBytes64), packetCapacity, byteCapacity);

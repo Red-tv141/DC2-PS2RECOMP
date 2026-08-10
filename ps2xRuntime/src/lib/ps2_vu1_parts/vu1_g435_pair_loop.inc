@@ -1039,13 +1039,48 @@
                                                g430Base + (int64_t)cycle, g436Hb, g500Tail);
                 else
 #endif
-                // G533 v8: arm 27's single exact block bypasses G531 here. Every miss was
-                // canonicalised to arm 23 once per run(), so it follows the shipped call path
-                // below with no candidate wrapper/function-return tax.
+                // G533/G547: arm 27's exact blocks bypass G531 here. Every miss was canonicalised
+                // to arm 23 once per run(), so it follows the shipped call path below with no
+                // candidate wrapper/function-return tax.
                 if (g533StaticRun &&
                     g533Hot3088Runnable(currentPc >> 3u, g490Count, g500Tail,
                                          vuData, dataSize, g436Hb))
                     g533ExecuteHot3088(m_state, vuData, s_qDelayP, s_pDelayP,
+                                       g430Base + (int64_t)cycle, g436Hb);
+                else if (g549Hot30d8Run &&
+                         g549Hot30d8Runnable(currentPc >> 3u, g490Count, g500Tail,
+                                             vuData, dataSize, g436Hb))
+                    g549ExecuteHot30d8(m_state, vuData, s_qDelayP, s_pDelayP,
+                                       g430Base + (int64_t)cycle, g436Hb);
+                else if (g547Hot0c70Run &&
+                         g547Hot0c70Runnable(currentPc >> 3u, g490Count, g500Tail,
+                                             vuData, dataSize, g436Hb))
+                    g547ExecuteHot0c70(m_state, vuData, s_qDelayP, s_pDelayP,
+                                       g430Base + (int64_t)cycle, g436Hb);
+                else if (g548Hot0e00Run &&
+                         g548Hot0e00Runnable(currentPc >> 3u, g490Count, g500Tail,
+                                             vuData, dataSize, g436Hb))
+                    g548ExecuteHot0e00(m_state, vuData, s_qDelayP, s_pDelayP,
+                                       g430Base + (int64_t)cycle, g436Hb);
+                else if (g551Hot1c00Run &&
+                         g551Hot1c00Runnable(currentPc >> 3u, g490Count, g500Tail,
+                                             vuData, dataSize, g436Hb))
+                    g551ExecuteHot1c00(m_state, vuData, s_qDelayP, s_pDelayP,
+                                       g430Base + (int64_t)cycle, g436Hb);
+                else if (g554Hot0900Run &&
+                         g554Hot0900Runnable(currentPc >> 3u, g490Count, g500Tail,
+                                             vuData, dataSize, g436Hb))
+                    g554ExecuteHot0900(m_state, vuData, s_qDelayP, s_pDelayP,
+                                       g430Base + (int64_t)cycle, g436Hb);
+                else if (g555Hot1110Run &&
+                         g555Hot1110Runnable(currentPc >> 3u, g490Count, g500Tail,
+                                             vuData, dataSize, g436Hb))
+                    g555ExecuteHot1110(m_state, vuData, s_qDelayP, s_pDelayP,
+                                       g430Base + (int64_t)cycle, g436Hb);
+                else if (g550Hot1be8Run &&
+                         g550Hot1be8Runnable(currentPc >> 3u, g490Count, g500Tail,
+                                             vuData, dataSize, g436Hb))
+                    g550ExecuteHot1be8(m_state, vuData, s_qDelayP, s_pDelayP,
                                        g430Base + (int64_t)cycle, g436Hb);
                 else if (g499BlkArm == 29)
                     g533ExecuteBlockTailStat(m_state, currentPc >> 3u, g490Count, vuData,
@@ -1737,17 +1772,6 @@
                     std::abort();
                 }
                 *s_macVisP = g430Mac;
-                if (currentPc == 0x2f08u && std::getenv("DC2_G545_CPU_TRACE") != nullptr)
-                {
-                    static std::atomic<uint32_t> s_g545TraceCount{0u};
-                    if (s_g545TraceCount.fetch_add(1u, std::memory_order_relaxed) < 128u)
-                        std::fprintf(stderr,
-                                     "[G545:cpu-pair-fmand] stamp=%lld mac=%04x vi10=%04x mask=%04x\n",
-                                     static_cast<long long>(g430Base + static_cast<int64_t>(cycle)),
-                                     g430Mac & 0xffffu,
-                                     static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[10])),
-                                     static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[7])));
-                }
                 if (g430Shadow)
                     ++s_g430VerifyOk;
             }
@@ -2082,32 +2106,6 @@
             }
             } // G295 diag region C end
 #endif // DC2_VU1_LOOP_DIAG
-            // G545 v21 default-off parity trace: record the CPU-authoritative writes to the
-            // qword later consumed by the first divergent Dungeon LQs. The three PC tests are
-            // exact store sites; the atomic sequence read is therefore absent from other pairs.
-            uint32_t g545StoreQ = 0xffffffffu;
-            uint32_t g545StoreSource = 0xffffffffu;
-            uint32_t g545StoreSourceBits[4]{};
-            if ((currentPc == 0x2870u || currentPc == 0x31e0u || currentPc == 0x2e38u) &&
-                g_g545CpuTraceSequence.load(std::memory_order_relaxed) == 784u)
-            {
-                const uint32_t g545LowerOp = (lower >> 25u) & 0x7fu;
-                if (g545LowerOp == 0x01u)
-                {
-                    const uint32_t g545Base = (lower >> 16u) & 31u;
-                    g545StoreSource = (lower >> 11u) & 31u;
-                    const int32_t g545Imm = static_cast<int32_t>(lower << 21u) >> 21u;
-                    g545StoreQ = static_cast<uint32_t>(m_state.vi[g545Base] + g545Imm) & 0x3ffu;
-                }
-                else if (g545LowerOp == 0x40u && S2_FUNC(lower) == 0x35u)
-                {
-                    const uint32_t g545Base = (lower >> 16u) & 31u;
-                    g545StoreSource = (lower >> 11u) & 31u;
-                    g545StoreQ = static_cast<uint32_t>(static_cast<uint16_t>(m_state.vi[g545Base])) & 0x3ffu;
-                }
-                if (g545StoreSource < 32u)
-                    std::memcpy(g545StoreSourceBits, m_state.vf[g545StoreSource], 16u);
-            }
 #if DC2_G479_QPREG
             // Same two arms the macro expands to under g443Fixed, with the local Q/P counters
             // spilled around the ONLY callee that can write them.
@@ -2130,20 +2128,6 @@
 #else
             DC2_G422_RUN_LOWER();
 #endif
-            if (g545StoreQ == 860u && vuData != nullptr && g545StoreQ * 16u + 16u <= dataSize)
-            {
-                uint32_t g545StoredBits[4]{};
-                std::memcpy(g545StoredBits, vuData + g545StoreQ * 16u, 16u);
-                static std::atomic<uint32_t> s_g545StoreTraceCount{0u};
-                if (s_g545StoreTraceCount.fetch_add(1u, std::memory_order_relaxed) < 16u)
-                    std::fprintf(stderr,
-                                 "[G545:cpu-ramstore] seq=784 pc=%04x instr=%08x q=%u vf=%u source=%08x,%08x,%08x,%08x after=%08x,%08x,%08x,%08x\n",
-                                 currentPc, lower, g545StoreQ, g545StoreSource,
-                                 g545StoreSourceBits[0], g545StoreSourceBits[1],
-                                 g545StoreSourceBits[2], g545StoreSourceBits[3],
-                                 g545StoredBits[0], g545StoredBits[1],
-                                 g545StoredBits[2], g545StoredBits[3]);
-            }
             // G436: `true` is only ever written to this thread_local inside the
             // `if (s_g106ParallelFlags)` block above, so when that lever is off the store is the
             // identity — and it was costing a TLS materialisation plus a store on every pair.
@@ -2527,11 +2511,6 @@
                 static std::atomic<uint64_t> s_e21b0{0}, s_e23e8{0}, s_e2740{0}, s_k2d88{0}, s_k2f38{0};
                 static std::atomic<uint64_t> s_fcandHit{0}, s_fcandMiss{0}, s_fcorRej{0}, s_fanVerts{0};
                 static std::atomic<uint32_t> s_rep{0}, s_samp{0};
-                // G545 v10: retain the two cross-product operands/result until the delayed MAC
-                // consumer. Only the existing default-off G140 diagnostic copy reaches this.
-                static thread_local uint32_t s_g545OpmulaA = 0u, s_g545OpmulaB = 0u;
-                static thread_local uint32_t s_g545AccZ = 0u, s_g545OpmsubA = 0u;
-                static thread_local uint32_t s_g545OpmsubB = 0u, s_g545ResultZ = 0u;
                 switch (currentPc)
                 {
                 case 0x21b0u: s_e21b0.fetch_add(1u, std::memory_order_relaxed); break;
@@ -2635,29 +2614,6 @@
                     }
                     break;
                 }
-                case 0x2ee0u:
-                    std::memcpy(&s_g545OpmulaA, &m_state.vf[21][0], sizeof(uint32_t));
-                    std::memcpy(&s_g545OpmulaB, &m_state.vf[20][1], sizeof(uint32_t));
-                    std::memcpy(&s_g545AccZ, &m_state.acc[2], sizeof(uint32_t));
-                    break;
-                case 0x2ee8u:
-                    std::memcpy(&s_g545OpmsubA, &m_state.vf[20][0], sizeof(uint32_t));
-                    std::memcpy(&s_g545OpmsubB, &m_state.vf[21][1], sizeof(uint32_t));
-                    std::memcpy(&s_g545ResultZ, &m_state.vf[23][2], sizeof(uint32_t));
-                    break;
-                case 0x2f08u:
-                    if ((s_g545ResultZ & 0x7f800000u) == 0x7f800000u)
-                    {
-                        static std::atomic<uint32_t> s_g545MacGateSamples{0u};
-                        if (s_g545MacGateSamples.fetch_add(1u, std::memory_order_relaxed) < 128u)
-                            std::fprintf(stderr,
-                                "[G545:cpu-macgate] accZ=%08x resultZ=%08x visible=%04x expected=%04x mask=%04x opmula=%08x*%08x opmsub=%08x*%08x\n",
-                                s_g545AccZ, s_g545ResultZ, s_vuMacVisible & 0xffffu,
-                                (uint32_t)(uint16_t)m_state.vi[10],
-                                (uint32_t)(uint16_t)m_state.vi[7], s_g545OpmulaA,
-                                s_g545OpmulaB, s_g545OpmsubA, s_g545OpmsubB);
-                    }
-                    break;
                 default: break;
                 }
                 if ((s_rep.fetch_add(1u, std::memory_order_relaxed) % 400000u) == 0u)

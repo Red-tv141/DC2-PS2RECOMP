@@ -253,7 +253,18 @@ static inline void g364ApplyFog(uint32_t f, uint8_t &r, uint8_t &g, uint8_t &b)
 // clipped loop rectangle; no per-pixel instrumentation is added.  This keeps the discriminator
 // quiet and cheap enough to answer whether G248 should target fill work or flush fragmentation.
 static const bool g_g248Stat = (std::getenv("DC2_G248_STAT") != nullptr);
-static constexpr uint32_t kG248TargetCount = 5u;
+// G553/G556/G557 reserve diagnostic residency slots for the dominant discovered targets on s05
+// (0x159/0x13a) and Georama (0x181). Each slot is inert unless its phase lever is enabled; appending
+// preserves every legacy index and lets the fixed-size residency machinery remain compile-time.
+//
+// G569 appends SIX MORE for route3's discovered targets (0x13d/0x157/0x14b/0x151/0x13f/0x141).
+// ⭐ APPEND-ONLY IS THE WHOLE SAFETY ARGUMENT: every array in the residency machinery is declared
+// `[kG248TargetCount]` (g_g261Res, g_g280ContentGen/g_g280Ovl, g_g310TargetPageGen,
+// g_g310ProducerN/ProducerPages/SourcePages, g_g261MatByTarget, g_g248Sprite*, the T8 atlas and
+// resolver), so raising the constant resizes all of them with no per-array edit, and indices 0..7
+// keep their exact meaning — including G557's compositor slot 6. The ONE hand-written table that
+// must grow in the same edit is kG261Fbp (rasterizer_rtt_census_and_waves.inc).
+static constexpr uint32_t kG248TargetCount = 14u;
 static constexpr uint32_t kG248StateCount = 4u; // bit0=tme, bit1=abe
 static constexpr uint32_t kG248BucketCount = kG248TargetCount * kG248StateCount;
 static std::atomic<uint64_t> g_g248SpriteCalls[kG248BucketCount]{};
@@ -311,6 +322,69 @@ static bool g400NoResident(uint32_t fbp)
     }
 }
 
+// ===== G569: GPU residency for route3's discovered render targets =====
+//
+// After G568 promoted discovered-target TRIANGLE deferral, route3's triangles are correctly batched
+// and then the WHOLE batch is rejected `cpuonlyrtt` and CPU-replayed by construction, because
+// `g255Rtt = g255GpuRttOn() && g248TargetIndex(fbp) >= 0` and none of route3's targets is named
+// here. `[G290:gpufail]` on the G568 binary: `fbp=13d ent=1015`, `157 ent=327`, `14b ent=241/233/169`.
+// All six are fbw=8, CT32, and share zbp=0x0d0.
+//
+// ⚠️ THE ADMISSION HAS MORE THAN ONE QUESTION (g534_admission_proof_true_but_insufficient). What was
+// checked before writing this:
+//   * guest DEPTH — `if (g255Rtt && guestDepth && !g262WideOn())` returns kG266FrRttDepth. These
+//     batches all carry guest Z, so admission would merely trade `cpuonlyrtt` for `rttdepth` if the
+//     G262 per-wave Z round trip were off. `g262WideOn()` is DEFAULT-ON whenever waves are on, so
+//     the depth authority is the non-persistent per-wave one, not a new persistent claim.
+//   * PAGE OVERLAP — with fbw=8 one page-row is 8 pages, so these targets (0x139=313 … 0x157=343,
+//     spaced 2..6 pages apart) alias each other's VRAM. That is NOT new: the legacy five already
+//     contain 0x139 and 0x13c three pages apart, and the alias/page-authority machinery
+//     (rasterizer_alias_page_state / _page_authority / _target_page_authority) exists to arbitrate
+//     exactly this. It is, however, the reason this lever ships DEFAULT-OFF with a bisect mask.
+//   * ⚠️ 0x14b IS IN THE OPEN DUNGEON-6 ALIAS FAMILY. g400NoResident's own comment names
+//     "0x139 + the post-process targets 0x13b/0x13c/0x14b that render inside its VRAM footprint"
+//     as the split-ownership suspect for the STILL-OPEN Dungeon 6 darkening (G397–G400). It is slot
+//     10 = mask bit 2 so it can be dropped alone; the Dungeon 6 route is a required gate.
+//
+// ⭐ PROMOTED DEFAULT-ON (G569). Route-ALIGNED gate on route3 (buckets of 200 scriptFrames, 3 whole
+// runs per arm, only buckets where both arms have matched sample counts — 17,358 frames each):
+// OFF 33.00 -> ON 29.74 ms/f, **-3.26 ms/f = -9.9%**, over-budget frames 46.9% -> 30.9%,
+// 52/64 buckets favour ON, and the per-run means do not overlap (OFF 33.64/32.79/32.56 vs
+// ON 30.35/29.70/29.17). `[G290:probe]`: failed flushes fell to 1,267 of 184,840 (0.7%) and the
+// publication bucket from 8,015 to 676 ms. Four deterministic pixel gates clean — see the fix log.
+//
+// Levers: DC2_G569_NO_RTTWIDE=1 is the rollback · DC2_G569_RTTWIDE_MASK=<hex> arms a subset
+// (bit i = slot 8+i, e.g. 0x3B drops 0x14b) · DC2_G569_RTTWIDE=1 is now redundant.
+//
+// ⛔ NOT gated by a DC2_G419_AB arm, deliberately. Residency is not a per-frame speed knob: a target
+// admitted while arm=1 leaves GPU-owned rows in g_g261Res that an arm=0 window would never
+// materialize, i.e. the two arms would render from different authorities and the "control" frames
+// would show stale pixels. This lever must be measured with alternating WHOLE RUNS.
+static uint32_t g569RttWideMask()
+{
+    static const uint32_t mask = []() -> uint32_t {
+        if (envFlagEnabled("DC2_G569_NO_RTTWIDE"))
+            return 0u;
+        const char *m = std::getenv("DC2_G569_RTTWIDE_MASK");
+        if (m && *m)
+            return static_cast<uint32_t>(std::strtoul(m, nullptr, 16)) & 0x3Fu;
+        // ⛔ G569 DEMOTED TO DEFAULT-OFF (user-verified visual defect, 2026-08-10). Admitting these
+        // targets produces a GRAPHICAL BUG on every player jump/dash; DC2_G569_NO_RTTWIDE=1 fixes
+        // it. The mechanism is the `[G261:invariant] escaped writer` storm this file's header
+        // already described as a PERF cost (2,505/run on route2, 0 with the rollback) — an escaped
+        // guest write to a page the GPU owns is a CORRECTNESS event first and a materialize cost
+        // second, and the escape rate spikes exactly on the animation changes a jump/dash causes.
+        // Re-arming requires fixing the escape, not re-running the gate.
+        return envFlagEnabled("DC2_G569_RTTWIDE") ? 0x3Fu : 0u;
+    }();
+    return mask;
+}
+// slot 8..13 -> bit 0..5. Immutable for the process lifetime (see the ⛔ note above).
+static inline int g569WideSlot(uint32_t bit, int slot)
+{
+    return (g569RttWideMask() & (1u << bit)) != 0u ? slot : -1;
+}
+
 static int g248TargetIndex(uint32_t fbp)
 {
     if (g400NoResident(fbp))
@@ -322,6 +396,37 @@ static int g248TargetIndex(uint32_t fbp)
     case 0x143u: return 2;
     case 0x146u: return 3;
     case 0x155u: return 4;
+    // G569 promoted slots 5/6/7 to DEFAULT-ON. They shipped as `envFlagEnabled` opt-ins under
+    // G553/G556/G557 and nothing in the tree ever set them, so the `s05` 95.8 -> 30.4 ms/f headline
+    // in the docs had been describing a flags-ON run for six phases (G568 caught the discrepancy).
+    // Measured properly on `s05`, route-ALIGNED (bucketed by scriptFrame, matched sample counts,
+    // 3 whole runs per arm, 14,106 frames each): 39.74 -> 31.01 ms/f, **-8.73 ms/f = -22.0%**, with
+    // non-overlapping per-run means (39.77/39.68/39.77 vs 30.86/31.51/30.66).
+    case 0x159u:
+    {
+        static const bool g553On = !envFlagEnabled("DC2_G553_NO_RTT159") &&
+                                   !envFlagDisabled("DC2_G553_RTT159");
+        return g553On ? 5 : -1;
+    }
+    case 0x181u:
+    {
+        static const bool g556On = !envFlagEnabled("DC2_G556_NO_RTT181") &&
+                                   !envFlagDisabled("DC2_G556_RTT181");
+        return g556On ? 6 : -1;
+    }
+    case 0x13au:
+    {
+        static const bool g557On = !envFlagEnabled("DC2_G557_NO_RTT13A") &&
+                                   !envFlagDisabled("DC2_G557_RTT13A");
+        return g557On ? 7 : -1;
+    }
+    // G569 route3 targets, ordered by CPU-replayed ENTRY weight. Mask bit = slot - 8.
+    case 0x13du: return g569WideSlot(0u,  8);
+    case 0x157u: return g569WideSlot(1u,  9);
+    case 0x14bu: return g569WideSlot(2u, 10); // ⚠️ open Dungeon-6 alias family — bisect me first
+    case 0x151u: return g569WideSlot(3u, 11);
+    case 0x13fu: return g569WideSlot(4u, 12);
+    case 0x141u: return g569WideSlot(5u, 13);
     default:     return -1;
     }
 }
@@ -397,7 +502,10 @@ static bool g261WaveOn()
             return false;
         // Exact same-run oracles compare VRAM after every flush — residency would break their
         // contract, so they force the readback path (G255 semantics) instead of engaging waves.
-        if (envFlagEnabled("DC2_G255_VERIFY") || envFlagEnabled("DC2_G248_VERIFY"))
+        if ((envFlagEnabled("DC2_G255_VERIFY") &&
+             !envFlagEnabled("DC2_G553_VERIFY_HEAVY") &&
+             !envFlagEnabled("DC2_G557_VERIFY_HEAVY")) ||
+            envFlagEnabled("DC2_G248_VERIFY"))
             return false;
         // Separate architecture arms with their own ownership models.
         if (envFlagEnabled("DC2_G242_GPU_DEPTH") || envFlagEnabled("DC2_G256_EXACT_RTT"))
@@ -546,6 +654,34 @@ static std::atomic<uint64_t> g_g255Checks[kG248TargetCount]{};
 static std::atomic<uint64_t> g_g255Bad[kG248TargetCount]{};
 static std::atomic<uint64_t> g_g286VerifyChecks{0}, g_g286VerifyBad{0};
 
+static bool g553HeavyVerifyOn()
+{
+    static const bool on = envFlagEnabled("DC2_G553_VERIFY_HEAVY");
+    return on;
+}
+
+static bool g557HeavyVerifyOn()
+{
+    static const bool on = envFlagEnabled("DC2_G557_VERIFY_HEAVY");
+    return on;
+}
+
+static bool g553VerifySelected(uint32_t fbp)
+{
+    // s05's early 0x159 batches are also one-entry batches. Activate by observed route progress,
+    // not shape: the measured dense cutscene is well established after attempt 10,000.
+    return g553HeavyVerifyOn() && fbp == 0x159u &&
+           g_g255Attempts[5].load(std::memory_order_relaxed) >= 10000u;
+}
+
+static bool g557VerifySelected(uint32_t fbp)
+{
+    // G557's 0x13a population is already the compact dense batch the lever targets. Narrowing
+    // from its first occurrence avoids the unrelated legacy 0x139 sampler-rounding differences
+    // while checking every GPU batch admitted by the new slot.
+    return g557HeavyVerifyOn() && fbp == 0x13au;
+}
+
 static void g255Report()
 {
     static const bool s_stat = envFlagEnabled("DC2_G255_STAT") || g255VerifyOn();
@@ -553,7 +689,7 @@ static void g255Report()
         return;
     std::fprintf(stderr, "[G255:stat]");
     static constexpr uint32_t kFbp[kG248TargetCount] = {
-        0x139u, 0x13cu, 0x143u, 0x146u, 0x155u
+        0x139u, 0x13cu, 0x143u, 0x146u, 0x155u, 0x159u, 0x181u, 0x13au
     };
     for (uint32_t i = 0; i < kG248TargetCount; ++i)
         std::fprintf(stderr, " %03x(a=%llu gpu=%llu chk=%llu bad=%llu)", kFbp[i],
@@ -578,6 +714,16 @@ static void g255BeginVerify(uint8_t *vram, uint32_t vramSize, uint32_t fbp, uint
                             int fbW, int rowLo, int rowHi)
 {
     g_g255Verify.pending = false;
+    // G553 diagnostic: reach s05's heavy triangle population without comparing a full 512x416
+    // target after every one-entry sprite batch. Existing G255 verification is unchanged unless
+    // explicitly narrowed; clearing both buffers makes the later staging hook fail closed.
+    if ((g553HeavyVerifyOn() || g557HeavyVerifyOn()) &&
+        !g553VerifySelected(fbp) && !g557VerifySelected(fbp))
+    {
+        g_g255Verify.before.clear();
+        g_g255Verify.gpu.clear();
+        return;
+    }
     if (!(g255VerifyOn() || (g286VerifyOn() && fbp == 0x13bu)) ||
         !vram || rowHi < rowLo)
         return;
@@ -857,7 +1003,7 @@ static void g248Report()
         return;
 
     static constexpr uint32_t kTargets[kG248TargetCount] = {
-        0x139u, 0x13cu, 0x143u, 0x146u, 0x155u
+        0x139u, 0x13cu, 0x143u, 0x146u, 0x155u, 0x159u, 0x181u, 0x13au
     };
     uint64_t totalCalls = 0u, totalPixels = 0u, totalNs = 0u;
     for (uint32_t target = 0u; target < kG248TargetCount; ++target)

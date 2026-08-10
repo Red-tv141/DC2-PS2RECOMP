@@ -1039,11 +1039,30 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     // like every other thread-level arm, and only meaningful when the block copy is the one
     // selected — see vu1_g490_block_run.inc.
     const int g499BlkArmRaw = g490BlockRun ? g499BlkArmRun() : 0;
-    // G533 v8: arm 27 changes only the one immutable 0x3088 fragment. Canonicalise its ordinary
-    // blocks to the shipped G531 arm here, once per run(), so a miss enters the byte-identical
-    // dispatch/body instead of paying a candidate wrapper on every block. The direct exact-source
-    // gate lives at the block call site; verifier/census arms retain their distinct leaves.
-    const bool g533StaticRun = g499BlkArmRaw == 27;
+    // G533/G547..G551/G554/G555: static-fragment timing arms. G555 arm 36 branches from
+    // shipped G551 arm 34 because G554 arm 35 was refuted.
+    // ordinary blocks to shipped G531 once per run(), so every miss enters its exact path.
+    const bool g533StaticRun =
+        g499BlkArmRaw == 27 || g499BlkArmRaw == 30 || g499BlkArmRaw == 31 ||
+        g499BlkArmRaw == 32 || g499BlkArmRaw == 33 || g499BlkArmRaw == 34 ||
+        g499BlkArmRaw == 35 || g499BlkArmRaw == 36;
+    const bool g547Hot0c70Run =
+        g499BlkArmRaw == 30 || g499BlkArmRaw == 31 || g499BlkArmRaw == 32 ||
+        g499BlkArmRaw == 33 || g499BlkArmRaw == 34 || g499BlkArmRaw == 35 ||
+        g499BlkArmRaw == 36;
+    const bool g548Hot0e00Run =
+        g499BlkArmRaw == 31 || g499BlkArmRaw == 32 || g499BlkArmRaw == 33 ||
+        g499BlkArmRaw == 34 || g499BlkArmRaw == 35 || g499BlkArmRaw == 36;
+    const bool g549Hot30d8Run =
+        g499BlkArmRaw == 32 || g499BlkArmRaw == 33 || g499BlkArmRaw == 34 ||
+        g499BlkArmRaw == 35 || g499BlkArmRaw == 36;
+    const bool g550Hot1be8Run =
+        g499BlkArmRaw == 33 || g499BlkArmRaw == 34 || g499BlkArmRaw == 35 ||
+        g499BlkArmRaw == 36;
+    const bool g551Hot1c00Run =
+        g499BlkArmRaw == 34 || g499BlkArmRaw == 35 || g499BlkArmRaw == 36;
+    const bool g554Hot0900Run = g499BlkArmRaw == 35;
+    const bool g555Hot1110Run = g499BlkArmRaw == 36;
     const int g499BlkArm = g533StaticRun ? 23 : g499BlkArmRaw;
     // G502: the block-round-trip ceiling probe's arm and the block-entry census. Read ONCE per
     // run() like every other thread-level arm (G479's rule), and both memoised behind a

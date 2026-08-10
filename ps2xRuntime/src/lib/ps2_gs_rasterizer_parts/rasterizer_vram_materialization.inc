@@ -1163,22 +1163,34 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const auto g523P0 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
     const bool g255Rtt = g255GpuRttOn() && g248TargetIndex(fbp) >= 0;
+    if (g255Rtt)
+        g255NoteAttempt(fbp);
     // G261: GPU-resident RTT wave — this RTT batch renders with readback deferred to a real
     // CPU-consumer edge instead of the per-flush readPixels+swizzle-writeback round-trip.
-    const bool g261Wave = g255Rtt && g261WaveOn();
-    if (g261WaveOn())
+    const bool g255HeavyVerify = g553HeavyVerifyOn() || g557HeavyVerifyOn();
+    const bool g255HeavyVerifyThis = g553VerifySelected(fbp) || g557VerifySelected(fbp);
+    const bool g255VerifyThis = g255VerifyOn() && (!g255HeavyVerify || g255HeavyVerifyThis);
+    const bool g261GlobalWave = g261WaveOn();
+    const bool g261Wave = g255Rtt && g261GlobalWave && !g255HeavyVerifyThis;
+    if (g261GlobalWave)
     {
         g_g261VramSize = vramSize; // materialize needs the size; GS::m_vramSize is private
         // G264: bring resident FBOs current with any deferred upload mirrors before the
         // invariant/uploadFb/FBO-bind logic below reasons about them.
         g264FlushMirrorsAtFlush();
+        // G553/G557 oracle boundary: publish any earlier resident wave before this one batch
+        // switches to G255's immediate readback + CPU replay comparison contract.
+        if (g255HeavyVerifyThis)
+        {
+            const int ti = g248TargetIndex(fbp);
+            if (ti >= 0 && g_g261Res[ti].dirty)
+                g261Materialize(ti, kG261MatResync);
+        }
     }
     // G523 prologue lap P1: the G261 wave setup, i.e. g264FlushMirrorsAtFlush's deferred
     // VRAM->FBO mirror uploads. The only prologue stage that can do GL work.
     const auto g523P1 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
-    if (g255Rtt)
-        g255NoteAttempt(fbp);
     // G252: RTT band deferral is intentionally CPU-only during bring-up.  The CPU replay keeps
     // the proven sampler/blend/Z implementation and merely partitions disjoint rows.  A future
     // GPU RTT phase must opt in separately after explicit write->sample barrier verification.
@@ -3702,7 +3714,14 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 zbpBlock, fbw, GS_PSM_Z24, 0u, static_cast<uint32_t>(depthRowLo),
                 static_cast<uint32_t>(fbW),
                 static_cast<uint32_t>(depthRowHi - depthRowLo + 1));
-            if (texAliasesZ || clutAliasesZ)
+            // G568: a PSMT8H/T4HL/T4HH texture over a PSMZ24 buffer shares pages and words with
+            // the live Z window but never shares a BIT — every Z write in this port is a
+            // read-modify-write that preserves bits 24..31 (GSMem::WriteZ24 for the CPU raster,
+            // g242SyncDepthState for the GPU publication). The page-overlap verdict alone is
+            // therefore too strong for that pair. See g568_bitalias_admission.inc.
+            const bool g568Disjoint = g568TexAliasIsBitDisjoint(
+                texAliasesZ, clutAliasesZ, ctx.tex0.psm, guestZpsm);
+            if ((texAliasesZ || clutAliasesZ) && !g568Disjoint)
             {
                 static std::atomic<uint32_t> s_aliasTexLog{0};
                 const uint32_t n = s_aliasTexLog.fetch_add(1u, std::memory_order_relaxed);
@@ -4332,14 +4351,14 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const bool g305Async =
         (g305AsyncOn() || g444AsyncOn() || g452Async) && !g_g305ForceSync && s_batch.skipReadback && !guestDepth &&
         !g275FuseReadback && !g262WaveDepth && !g286Transient && !g282Tight &&
-        !(g255Rtt && g255VerifyOn()) &&
+        !(g255Rtt && g255VerifyThis) &&
         (!g310On() || g444AsyncOn() || g452Async);
     // G324 premise only: this is the existing G305 pure-epilogue contract with G310 admitted as
     // the missing completion-ordered state family. No submission behavior changes here.
     const bool g324TxnEligible =
         g324Diag.hadProducer && g310Freeze.active && s_batch.skipReadback && !guestDepth &&
         !g275FuseReadback && !g262WaveDepth && !g286Transient && !g282Tight &&
-        !(g255Rtt && g255VerifyOn());
+        !(g255Rtt && g255VerifyThis);
     if (g305StatOn())
     {
         static std::atomic<uint64_t> nF{0}, nSkip{0}, nNoD{0}, nElig{0};
@@ -5193,7 +5212,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             (unsigned long long)g_g178RejectBlend.load(std::memory_order_relaxed),
             (unsigned long long)g_g178RejectTex.load(std::memory_order_relaxed),
             s_batch.verts.size(), s_batch.draws.size(), s_batch.texUploads.size(), rows);
-    if (g255Rtt && !guestDepth && g255VerifyOn())
+    if (g255Rtt && !guestDepth && g255VerifyThis)
     {
         // Leave the proven CPU replay authoritative in verification mode. The GPU result is kept
         // only as the comparison oracle; invalidate this FBO snapshot so the next GPU submission

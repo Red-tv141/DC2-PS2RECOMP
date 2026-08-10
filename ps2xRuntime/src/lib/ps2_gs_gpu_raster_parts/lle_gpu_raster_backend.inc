@@ -49,6 +49,14 @@ bool g545LiveShadowRequested()
     return on;
 }
 
+// G566 consumes the same exact persistent executor but publishes generated XGKICK bytes and skips
+// the CPU VU interpreter. It is experimental/default-off until every route and visual gate passes.
+bool g566VuAuthorityRequested()
+{
+    static const bool on = g158EnvFlag("DC2_G566_GPU_VU");
+    return on;
+}
+
 // G324 diagnostics mirror the front-end armed/census split. They time only the existing logical
 // composite and T8-view QueueItems; default runs pay cached-boolean branches only.
 bool g324BackendCensusOn()
@@ -351,6 +359,15 @@ static constexpr uint32_t kG289WorkCt24Token = 0xfffffff9u;
 static constexpr uint32_t kG289WorkCt32Token = 0xfffffff8u;
 static constexpr uint32_t kG309CompositeToken = 0xfffffff7u;
 static constexpr uint32_t kG309CompositeFbp = 0xfffffff6u;
+// G556/G557: G310's page map stores the resident-target index plus one. Keep the backend's
+// sampler ordering identical to kG261Fbp so appended opt-in targets can participate in the
+// exact logical-atlas composite without forcing their FBOs to exist in unrelated scenes.
+static constexpr uint32_t kG309SourceCount = 8u;
+static constexpr uint32_t kG309Sources[kG309SourceCount] = {
+    0x139u, 0x13cu, 0x143u, 0x146u, 0x155u, 0x159u, 0x181u, 0x13au
+};
+static constexpr uint32_t kG309PageMapUnit = kG309SourceCount;
+static constexpr uint32_t kG309BaseUnit = kG309SourceCount + 1u;
 // G310: one persistent 512x512 logical CT32 backing for the physical 0x2720/tbw=8 atlas.
 // It is an ordinary private FBO source (not a shader token): producer-time page copies and
 // guest-authoritative page uploads keep it current, so the display draw performs one normal
@@ -373,6 +390,24 @@ static bool g349DecolOn()
 {
     static const bool on = g158EnvFlag("DC2_G349_DECOL") && !g158EnvDisabled("DC2_G349_DECOL") &&
                            !g158EnvFlag("DC2_G349_NO_DECOL");
+    return on;
+}
+
+// G560: adjacent draws whose complete raster state differs only by GS blend mode can share one
+// ordered glDrawArrays call.  Flat G178Vtx draw state and a dual-source fragment output supply the
+// per-primitive shader inputs and source/destination factors.  Default-off until the route and
+// exact-output gates are complete; DC2_G560_NO_MULTI_DRAW is the one-flag rollback.
+static bool g560MultiDrawRequested()
+{
+    static const bool on = g158EnvFlag("DC2_G560_MULTI_DRAW") &&
+                           !g158EnvFlag("DC2_G560_NO_MULTI_DRAW");
+    return on;
+}
+
+static bool g561TextureRunsRequested()
+{
+    static const bool on = g158EnvFlag("DC2_G561_TEXTURE_RUNS") &&
+                           !g158EnvFlag("DC2_G561_NO_TEXTURE_RUNS");
     return on;
 }
 static uint32_t g349FboKey(uint32_t fbp, int w)
@@ -453,7 +488,7 @@ bool g178LoadGLExt(G178GLExt &e)
     }
     else if (g541NullComputeRequested() || g542AbiReplayRequested() ||
              g543SemanticReplayRequested() || g544ChainReplayRequested() ||
-             g545LiveShadowRequested())
+             g545LiveShadowRequested() || g566VuAuthorityRequested())
     {
         // Optional prototype: missing compute support must not disable the proven graphics backend.
         (void)loadProc(e.glBindImageTexture_, "glBindImageTexture");
@@ -461,13 +496,15 @@ bool g178LoadGLExt(G178GLExt &e)
     }
     if (g541NullComputeRequested() || g542AbiReplayRequested() ||
         g543SemanticReplayRequested() || g544ChainReplayRequested() ||
-        g545LiveShadowRequested())
+        g545LiveShadowRequested() || g566VuAuthorityRequested())
         (void)loadProc(e.glDispatchCompute_, "glDispatchCompute");
     return ok;
 }
 
 constexpr GLenum GL178_FUNC_ADD = 0x8006;
 constexpr GLenum GL178_FUNC_REVERSE_SUBTRACT = 0x800B;
+constexpr GLenum GL178_SRC1_COLOR = 0x88F9;
+constexpr GLenum GL178_SRC1_ALPHA = 0x8589;
 constexpr GLenum GL178_RENDERBUFFER = 0x8D41;
 constexpr GLenum GL178_DEPTH_ATTACHMENT = 0x8D00;
 constexpr GLenum GL178_DEPTH_COMPONENT32F = 0x8CAC;
@@ -648,7 +685,8 @@ public:
                 return false;
             }
             std::shared_ptr<G545LiveBatch> batch = m_g545QueuedBatch.lock();
-            if (batch && (batch->blobs.size() >= G545_LIVE_MAX_BATCH_COMMANDS ||
+            if (batch && (!batch->authorityResults.empty() ||
+                          batch->blobs.size() >= G545_LIVE_MAX_BATCH_COMMANDS ||
                           batch->bytes + command.size() > G545_LIVE_MAX_BATCH_BYTES))
                 batch.reset();
             if (!batch)
@@ -667,6 +705,65 @@ public:
             }
             batch->bytes += command.size();
             batch->blobs.push_back(std::move(command));
+            depth = m_queue.size();
+        }
+        m_g545Submitted.fetch_add(1u, std::memory_order_relaxed);
+        if (pushed)
+        {
+            uint64_t peak = m_g545HighWater.load(std::memory_order_relaxed);
+            while (peak < depth && !m_g545HighWater.compare_exchange_weak(
+                       peak, depth, std::memory_order_relaxed, std::memory_order_relaxed)) {}
+            m_submitSeq.fetch_add(1u, std::memory_order_release);
+            m_cvWork.notify_one();
+        }
+        return true;
+    }
+
+    bool submitG566Authority(std::vector<uint8_t> &&command,
+                             const std::shared_ptr<G566VuAuthorityResult> &result)
+    {
+        std::string why;
+        if (!g566VuAuthorityRequested() || !result ||
+            !m_ready.load(std::memory_order_acquire) || !m_g545Available ||
+            m_g545Disabled.load(std::memory_order_acquire) ||
+            !g545ValidateBlob(command, why))
+        {
+            m_g545Rejected.fetch_add(1u, std::memory_order_relaxed);
+            return false;
+        }
+
+        size_t depth = 0u;
+        bool pushed = false;
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire) ||
+                m_g545Disabled.load(std::memory_order_relaxed))
+            {
+                m_g545Rejected.fetch_add(1u, std::memory_order_relaxed);
+                return false;
+            }
+            std::shared_ptr<G545LiveBatch> batch = m_g545QueuedBatch.lock();
+            if (batch && ((batch->blobs.size() != batch->authorityResults.size()) ||
+                          batch->blobs.size() >= G545_LIVE_MAX_BATCH_COMMANDS ||
+                          batch->bytes + command.size() > G545_LIVE_MAX_BATCH_BYTES))
+                batch.reset();
+            if (!batch)
+            {
+                if (m_queue.size() >= 8192u)
+                {
+                    m_g545Rejected.fetch_add(1u, std::memory_order_relaxed);
+                    return false;
+                }
+                batch = std::make_shared<G545LiveBatch>();
+                QueueItem item;
+                item.g545LiveBatch = batch;
+                m_queue.push_back(std::move(item));
+                m_g545QueuedBatch = batch;
+                pushed = true;
+            }
+            batch->bytes += command.size();
+            batch->blobs.push_back(std::move(command));
+            batch->authorityResults.push_back(result);
             depth = m_queue.size();
         }
         m_g545Submitted.fetch_add(1u, std::memory_order_relaxed);
@@ -1022,7 +1119,7 @@ public:
         return wait.wait();
     }
 
-    // G309: synchronously prepare five live target FBOs plus the measured 8x16 authority map.
+    // G309: synchronously prepare live target FBOs plus the measured 8x16 authority map.
     // The timing path samples them directly; only the verifier builds/reads a 512x512 reference.
     // Caller-owned staging remains live until this job completes.
     bool buildAuthoritativeComposite(const std::vector<uint32_t> &pageMap,
@@ -1198,7 +1295,7 @@ private:
         // texKey/srcFbp/dims/verify; distinguished by g338Ct24View).
         bool g338Ct24View = false;
         int g338Ta0 = 0, g338Aem = 0;
-        // G309 one-pass five-source authoritative CT32 atlas composite.
+        // G309 one-pass resident-source authoritative CT32 atlas composite.
         const std::vector<uint32_t> *g309PageMap = nullptr;
         const std::vector<uint32_t> *g309BasePixels = nullptr;
         std::vector<uint32_t> *g309Readback = nullptr;
@@ -1289,12 +1386,17 @@ private:
             std::fprintf(stderr, "[G541:null] compute transport %s (async, no readback)\n",
                          m_g541Available ? "READY" : "UNAVAILABLE; CPU path unchanged");
         }
-        if (g545LiveShadowRequested())
+        if (g545LiveShadowRequested() || g566VuAuthorityRequested())
         {
             m_g545Available = setupG545LiveShadow();
-            std::fprintf(stderr,
-                         "[G545:live] persistent semantic shadow %s (batched, delayed readback)\n",
-                         m_g545Available ? "READY" : "UNAVAILABLE; CPU path unchanged");
+            if (g566VuAuthorityRequested())
+                std::fprintf(stderr,
+                             "[G566:authority] persistent exact executor %s (batched packet publication)\n",
+                             m_g545Available ? "READY" : "UNAVAILABLE");
+            else
+                std::fprintf(stderr,
+                             "[G545:live] persistent semantic shadow %s (batched, delayed readback)\n",
+                             m_g545Available ? "READY" : "UNAVAILABLE; CPU path unchanged");
         }
         if (g542AbiReplayRequested())
             (void)g542RunAbiReplay(m_f, m_e);
@@ -1356,8 +1458,11 @@ private:
                 if (m_g545Available && !m_g545Disabled.load(std::memory_order_acquire))
                     (void)runG545LiveBatch(*item.g545LiveBatch);
                 else
+                {
                     m_g545Rejected.fetch_add(item.g545LiveBatch->blobs.size(),
-                                             std::memory_order_relaxed);
+                                              std::memory_order_relaxed);
+                    g566PublishBatchFailure(*item.g545LiveBatch);
+                }
                 continue;
             }
             if (item.g541NullBatch)
@@ -1957,7 +2062,7 @@ private:
             item.promise->set_value(ok);
         }
 
-        if (m_g545Available)
+        if (m_g545Available && !g566VuAuthorityRequested())
             reportG545Status(true);
         m_ready.store(false, std::memory_order_release);
         for (auto &kv : m_fbos)
@@ -1982,6 +2087,8 @@ private:
             m_f.glDeleteVertexArrays_(1, &m_vao);
         if (m_prog != 0)
             m_f.glDeleteProgram_(m_prog);
+        if (m_progG560 != 0)
+            m_f.glDeleteProgram_(m_progG560);
         if (m_progExact != 0)
             m_f.glDeleteProgram_(m_progExact);
         if (m_g541NullProg != 0)
@@ -1996,6 +2103,8 @@ private:
             glDeleteTextures(1, &m_g545PayloadTex);
         if (m_g545WorkspaceTex != 0)
             glDeleteTextures(1, &m_g545WorkspaceTex);
+        if (m_g566OutputTex != 0)
+            glDeleteTextures(1, &m_g566OutputTex);
         if (m_g281Prog != 0)
             m_f.glDeleteProgram_(m_g281Prog);
         if (m_g281MapTex != 0)
@@ -2048,6 +2157,25 @@ private:
                          static_cast<unsigned>(err));
             return false;
         }
+
+        const uint32_t g566Rows = (G566_OUTPUT_WORDS + G542_IMAGE_WIDTH - 1u) /
+                                  G542_IMAGE_WIDTH;
+        std::vector<uint32_t> g566Zero(static_cast<size_t>(g566Rows) * G542_IMAGE_WIDTH, 0u);
+        glGenTextures(1, &m_g566OutputTex);
+        glBindTexture(GL_TEXTURE_2D, m_g566OutputTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(GL541_R32UI),
+                     static_cast<GLsizei>(G542_IMAGE_WIDTH), static_cast<GLsizei>(g566Rows), 0,
+                     GL541_RED_INTEGER, GL_UNSIGNED_INT, g566Zero.data());
+        const GLenum g566Err = glGetError();
+        if (m_g566OutputTex == 0u || g566Err != GL_NO_ERROR)
+        {
+            std::fprintf(stderr, "[G566:authority] output setup failed gl=0x%x\n",
+                         static_cast<unsigned>(g566Err));
+            return false;
+        }
+        m_g566Readback.resize(static_cast<size_t>(g566Rows) * G542_IMAGE_WIDTH);
 
         m_g545CheckInterval = [] {
             const char *v = std::getenv("DC2_G545_STATUS_CHECK_KICKS");
@@ -2122,6 +2250,9 @@ private:
 
     bool runG545LiveBatch(const G545LiveBatch &batch)
     {
+        const bool authority = !batch.authorityResults.empty();
+        const auto g566T0 = authority ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
         std::vector<uint32_t> commands;
         std::vector<uint32_t> payload;
         std::string why;
@@ -2129,11 +2260,13 @@ private:
         {
             std::fprintf(stderr, "[G545:live] batch rejected: %s; shadow disabled\n", why.c_str());
             m_g545Disabled.store(true, std::memory_order_release);
+            g566PublishBatchFailure(batch);
             return false;
         }
         if (m_g545Batches == 0ull)
-            std::fprintf(stderr,
-                         "[G545:live] first dispatch commands=%zu payloadWords=%zu watchdogCap=%zu\n",
+            std::fprintf(stderr, authority
+                         ? "[G566:authority] first dispatch commands=%zu payloadWords=%zu watchdogCap=%zu\n"
+                         : "[G545:live] first dispatch commands=%zu payloadWords=%zu watchdogCap=%zu\n",
                          batch.blobs.size(), payload.size(), G545_LIVE_MAX_BATCH_COMMANDS);
         while (glGetError() != GL_NO_ERROR) {}
         if (!g545UploadImage(m_g545CommandTex, m_g545CommandRows, commands, why) ||
@@ -2141,7 +2274,37 @@ private:
         {
             std::fprintf(stderr, "[G545:live] upload failed: %s; shadow disabled\n", why.c_str());
             m_g545Disabled.store(true, std::memory_order_release);
+            g566PublishBatchFailure(batch);
             return false;
+        }
+
+        std::vector<uint32_t> seedWorkspace;
+        if (!g545BuildSeedWorkspace(commands, payload, seedWorkspace, why))
+        {
+            std::fprintf(stderr, "[G545:live] seed rejected: %s; shadow disabled\n", why.c_str());
+            m_g545Disabled.store(true, std::memory_order_release);
+            g566PublishBatchFailure(batch);
+            return false;
+        }
+        if (!seedWorkspace.empty())
+        {
+            const uint32_t rows = (G545_LIVE_WORKSPACE_WORDS + G542_IMAGE_WIDTH - 1u) /
+                                  G542_IMAGE_WIDTH;
+            glBindTexture(GL_TEXTURE_2D, m_g545WorkspaceTex);
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                            static_cast<GLsizei>(G542_IMAGE_WIDTH),
+                            static_cast<GLsizei>(rows), GL541_RED_INTEGER,
+                            GL_UNSIGNED_INT, seedWorkspace.data());
+            const GLenum seedErr = glGetError();
+            if (seedErr != GL_NO_ERROR)
+            {
+                std::fprintf(stderr,
+                             "[G545:live] seed upload failed gl=0x%x; shadow disabled\n",
+                             static_cast<unsigned>(seedErr));
+                m_g545Disabled.store(true, std::memory_order_release);
+                g566PublishBatchFailure(batch);
+                return false;
+            }
         }
 
         m_f.glUseProgram_(m_g545Prog);
@@ -2151,25 +2314,64 @@ private:
                                 GL542_READ_ONLY, GL541_R32UI);
         m_e.glBindImageTexture_(4u, m_g545WorkspaceTex, 0, GL_FALSE, 0,
                                 GL178_READ_WRITE, GL541_R32UI);
+        m_e.glBindImageTexture_(5u, m_g566OutputTex, 0, GL_FALSE, 0,
+                                GL178_READ_WRITE, GL541_R32UI);
         m_f.glUniform1i_(m_locG545CommandCount, static_cast<GLint>(batch.blobs.size()));
         m_e.glDispatchCompute_(1u, 1u, 1u);
         m_e.glMemoryBarrier_(GL178_SHADER_IMAGE_ACCESS_BARRIER_BIT |
                              GL178_TEXTURE_UPDATE_BARRIER_BIT);
         const GLenum err = glGetError();
+        const auto g566T1 = authority ? std::chrono::steady_clock::now()
+                                      : std::chrono::steady_clock::time_point{};
         if (err != GL_NO_ERROR)
         {
             std::fprintf(stderr,
                          "[G545:live] dispatch failed gl=0x%x; shadow disabled, CPU path unchanged\n",
                          static_cast<unsigned>(err));
             m_g545Disabled.store(true, std::memory_order_release);
+            g566PublishBatchFailure(batch);
             return false;
+        }
+
+        if (authority)
+        {
+            const uint32_t outputRows = (G566_OUTPUT_WORDS + G542_IMAGE_WIDTH - 1u) /
+                                        G542_IMAGE_WIDTH;
+            if (m_g566Readback.size() != static_cast<size_t>(outputRows) * G542_IMAGE_WIDTH)
+                m_g566Readback.resize(static_cast<size_t>(outputRows) * G542_IMAGE_WIDTH);
+            while (glGetError() != GL_NO_ERROR) {}
+            glBindTexture(GL_TEXTURE_2D, m_g566OutputTex);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL541_RED_INTEGER, GL_UNSIGNED_INT,
+                          m_g566Readback.data());
+            const GLenum readErr = glGetError();
+            if (readErr != GL_NO_ERROR ||
+                !g566DecodeAuthorityBatch(batch, m_g566Readback, m_g566Packets,
+                                          m_g566PacketBytes, why))
+            {
+                std::fprintf(stderr,
+                             "[G566:authority] output failure gl=0x%x %s; disabled\n",
+                             static_cast<unsigned>(readErr), why.c_str());
+                m_g545Disabled.store(true, std::memory_order_release);
+                g566PublishBatchFailure(batch);
+                return false;
+            }
+            const auto g566T2 = std::chrono::steady_clock::now();
+            if (m_g545Batches < 12ull)
+                std::fprintf(stderr,
+                             "[G566:batch] n=%zu dispatchMs=%.3f readMs=%.3f usedWords=%u packets=%llu bytes=%llu\n",
+                             batch.blobs.size(),
+                             std::chrono::duration<double, std::milli>(g566T1 - g566T0).count(),
+                             std::chrono::duration<double, std::milli>(g566T2 - g566T1).count(),
+                             m_g566Readback[3],
+                             static_cast<unsigned long long>(m_g566Packets),
+                             static_cast<unsigned long long>(m_g566PacketBytes));
         }
 
         ++m_g545Batches;
         m_g545MaxBatch = std::max<uint64_t>(m_g545MaxBatch, batch.blobs.size());
         const uint64_t executed = m_g545Executed.fetch_add(batch.blobs.size(),
             std::memory_order_relaxed) + batch.blobs.size();
-        if (executed >= m_g545NextCheck)
+        if (!authority && executed >= m_g545NextCheck)
         {
             reportG545Status(false);
             m_g545NextCheck = executed + m_g545CheckInterval;
@@ -2314,6 +2516,9 @@ private:
             "uniform sampler2D uG309Src2;\n"
             "uniform sampler2D uG309Src3;\n"
             "uniform sampler2D uG309Src4;\n"
+            "uniform sampler2D uG309Src5;\n"
+            "uniform sampler2D uG309Src6;\n"
+            "uniform sampler2D uG309Src7;\n"
             "uniform sampler2D uG309PageMap;\n"
             "uniform sampler2D uG309Base;\n"
             "uniform int uMode;\n"
@@ -2335,14 +2540,20 @@ private:
             "    if (owner == 1) return texelFetch(uG309Src1, p, 0);\n"
             "    if (owner == 2) return texelFetch(uG309Src2, p, 0);\n"
             "    if (owner == 3) return texelFetch(uG309Src3, p, 0);\n"
-            "    return texelFetch(uG309Src4, p, 0);\n"
+            "    if (owner == 4) return texelFetch(uG309Src4, p, 0);\n"
+            "    if (owner == 5) return texelFetch(uG309Src5, p, 0);\n"
+            "    if (owner == 6) return texelFetch(uG309Src6, p, 0);\n"
+            "    return texelFetch(uG309Src7, p, 0);\n"
             "}\n"
-            "vec4 g309Filtered(int owner, vec2 uv){\n"
-            "    if (owner == 0) return texture(uTex, uv);\n"
-            "    if (owner == 1) return texture(uG309Src1, uv);\n"
-            "    if (owner == 2) return texture(uG309Src2, uv);\n"
-            "    if (owner == 3) return texture(uG309Src3, uv);\n"
-            "    return texture(uG309Src4, uv);\n"
+            "vec4 g309Filtered(int owner, vec2 p){\n"
+            "    if (owner == 0) return texture(uTex, p / vec2(textureSize(uTex,0)));\n"
+            "    if (owner == 1) return texture(uG309Src1, p / vec2(textureSize(uG309Src1,0)));\n"
+            "    if (owner == 2) return texture(uG309Src2, p / vec2(textureSize(uG309Src2,0)));\n"
+            "    if (owner == 3) return texture(uG309Src3, p / vec2(textureSize(uG309Src3,0)));\n"
+            "    if (owner == 4) return texture(uG309Src4, p / vec2(textureSize(uG309Src4,0)));\n"
+            "    if (owner == 5) return texture(uG309Src5, p / vec2(textureSize(uG309Src5,0)));\n"
+            "    if (owner == 6) return texture(uG309Src6, p / vec2(textureSize(uG309Src6,0)));\n"
+            "    return texture(uG309Src7, p / vec2(textureSize(uG309Src7,0)));\n"
             "}\n"
             "vec4 g309Pixel(ivec2 p){\n"
             "    p = clamp(p, ivec2(0), ivec2(511));\n"
@@ -2366,8 +2577,7 @@ private:
             "        int owner=m.r-1; ivec2 local=ivec2(p.x&63,gsY&31);\n"
             "        ivec2 srcGs=ivec2(m.g*64+local.x,m.b*32+local.y);\n"
             "        ivec2 srcGl=ivec2(srcGs.x,511-srcGs.y);\n"
-            "        float sw=(owner==0)?512.0:((owner==1||owner==3)?128.0:64.0);\n"
-            "        return g309Filtered(owner,(vec2(srcGl)+f+vec2(0.5))/vec2(sw,512.0));\n"
+            "        return g309Filtered(owner,vec2(srcGl)+f+vec2(0.5));\n"
             "    }\n"
             "    vec4 a = mix(g309Pixel(p), g309Pixel(p + ivec2(1,0)), f.x);\n"
             "    vec4 b = mix(g309Pixel(p + ivec2(0,1)), g309Pixel(p + ivec2(1,1)), f.x);\n"
@@ -2547,8 +2757,148 @@ private:
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Src2"), 2);
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Src3"), 3);
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Src4"), 4);
-        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309PageMap"), 5);
-        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Base"), 6);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Src5"), 5);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Src6"), 6);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Src7"), 7);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309PageMap"),
+                         static_cast<GLint>(kG309PageMapUnit));
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Base"),
+                         static_cast<GLint>(kG309BaseUnit));
+
+        if (g560MultiDrawRequested() || g561TextureRunsRequested())
+        {
+            // Keep the proven program independent: a driver without dual-source output support
+            // simply leaves G560 unavailable and continues on the byte-identical legacy path.
+            const auto setupG560 = [&]() -> bool {
+                static const char *kG560VS =
+                    "#version 330 core\n"
+                    "layout(location=0) in vec3 aPos;\n"
+                    "layout(location=1) in vec3 aSTQ;\n"
+                    "layout(location=2) in vec4 aColor;\n"
+                    "layout(location=3) in vec4 aFog;\n"
+                    "layout(location=4) in vec4 aDrawState;\n"
+                    "uniform vec2 uFbSize;\n"
+                    "noperspective out vec3 vSTQ;\n"
+                    "noperspective out vec4 vColor;\n"
+                    "noperspective out float vZ;\n"
+                    "noperspective out float vFog;\n"
+                    "flat out ivec4 vG560State;\n"
+                    "void main(){\n"
+                    "    vSTQ = aSTQ;\n"
+                    "    vColor = aColor;\n"
+                    "    vFog = aFog.x;\n"
+                    "    vG560State = ivec4(aDrawState + vec4(0.5));\n"
+                    "    vZ = aPos.z;\n"
+                    "    float ndcX = aPos.x / uFbSize.x * 2.0 - 1.0;\n"
+                    "    float ndcY = 1.0 - aPos.y / uFbSize.y * 2.0;\n"
+                    "    gl_Position = vec4(ndcX, ndcY, 0.0, 1.0);\n"
+                    "}\n";
+
+                std::string g560Fs(kFS);
+                const auto replaceOne = [](std::string &s, const char *from, const char *to) {
+                    const size_t p = s.find(from);
+                    if (p == std::string::npos)
+                        return false;
+                    s.replace(p, std::strlen(from), to);
+                    return true;
+                };
+                if (!replaceOne(g560Fs,
+                                "noperspective in float vFog;\nout vec4 o;\n",
+                                "noperspective in float vFog;\n"
+                                "flat in ivec4 vG560State;\n"
+                                "layout(location=0,index=0) out vec4 o;\n"
+                                "layout(location=0,index=1) out vec4 oG560Factor;\n") ||
+                    !replaceOne(g560Fs,
+                                "int wrapCoord(int p, int n, int mode){\n",
+                                "#define uMode (vG560State.x & 65535)\n"
+                                "#define uFogCol vG560State.y\n"
+                                "#define uUvOriginX (vG560State.z & 65535)\n"
+                                "#define uUvRoundU ((vG560State.z >> 16) & 15)\n"
+                                "#define uUvOriginY (vG560State.w & 65535)\n"
+                                "#define uUvRoundV ((vG560State.w >> 16) & 15)\n"
+                                "int wrapCoord(int p, int n, int mode){\n") ||
+                    !replaceOne(g560Fs,
+                                "void main(){\n",
+                                "void g560Factors(float blendA){\n"
+                                "    int b = (vG560State.x >> 16) & 7;\n"
+                                "    float sf = (b == 1 || b == 2) ? blendA : (b == 5 ? 0.0 : 1.0);\n"
+                                "    float df = b == 0 ? 0.0 : ((b == 1 || b == 5) ? 1.0-blendA : 1.0);\n"
+                                "    oG560Factor = vec4(sf, sf, sf, df);\n"
+                                "}\n"
+                                "void main(){\n") ||
+                    !replaceOne(g560Fs,
+                                "        o = vec4(ec) * (1.0 / 255.0);\n",
+                                "        g560Factors(float(ec.a) * (1.0 / 255.0));\n"
+                                "        o = vec4(ec) * (1.0 / 255.0);\n") ||
+                    !replaceOne(g560Fs,
+                                "    o = vec4(c.rgb, outA);\n",
+                                "    g560Factors(min(c.a * 1.9921875, 1.0));\n"
+                                "    o = vec4(c.rgb, outA);\n"))
+                {
+                    std::fprintf(stderr, "[G560:backend] shader transform failed; legacy path kept\n");
+                    return false;
+                }
+
+                GLuint g560Vs = 0u, g560FsId = 0u;
+                std::string g560Log;
+                if (!g158CompileShader(m_f, GL158_VERTEX_SHADER, kG560VS, g560Vs, g560Log))
+                {
+                    std::fprintf(stderr, "[G560:backend] VS unavailable: %s\n", g560Log.c_str());
+                    return false;
+                }
+                if (!g158CompileShader(m_f, GL158_FRAGMENT_SHADER, g560Fs.c_str(),
+                                       g560FsId, g560Log))
+                {
+                    std::fprintf(stderr, "[G560:backend] FS unavailable: %s\n", g560Log.c_str());
+                    m_f.glDeleteShader_(g560Vs);
+                    return false;
+                }
+                m_progG560 = m_f.glCreateProgram_();
+                m_f.glAttachShader_(m_progG560, g560Vs);
+                m_f.glAttachShader_(m_progG560, g560FsId);
+                m_f.glLinkProgram_(m_progG560);
+                GLint g560Linked = 0;
+                m_f.glGetProgramiv_(m_progG560, GL158_LINK_STATUS, &g560Linked);
+                m_f.glDeleteShader_(g560Vs);
+                m_f.glDeleteShader_(g560FsId);
+                if (!g560Linked)
+                {
+                    std::fprintf(stderr, "[G560:backend] program link unavailable; legacy path kept\n");
+                    m_f.glDeleteProgram_(m_progG560);
+                    m_progG560 = 0u;
+                    return false;
+                }
+
+                m_f.glUseProgram_(m_progG560);
+                m_locG560FbSize = m_f.glGetUniformLocation_(m_progG560, "uFbSize");
+                m_locG560Mode = m_f.glGetUniformLocation_(m_progG560, "uMode");
+                m_locG560FogCol = m_f.glGetUniformLocation_(m_progG560, "uFogCol");
+                m_locG560Linear = m_f.glGetUniformLocation_(m_progG560, "uLinear");
+                m_locG560WrapU = m_f.glGetUniformLocation_(m_progG560, "uWrapU");
+                m_locG560WrapV = m_f.glGetUniformLocation_(m_progG560, "uWrapV");
+                m_locG560UvOriginX = m_f.glGetUniformLocation_(m_progG560, "uUvOriginX");
+                m_locG560UvOriginY = m_f.glGetUniformLocation_(m_progG560, "uUvOriginY");
+                m_locG560UvRoundU = m_f.glGetUniformLocation_(m_progG560, "uUvRoundU");
+                m_locG560UvRoundV = m_f.glGetUniformLocation_(m_progG560, "uUvRoundV");
+                m_f.glUniform1i_(m_f.glGetUniformLocation_(m_progG560, "uTex"), 0);
+                m_f.glUniform1i_(m_f.glGetUniformLocation_(m_progG560, "uG309Src1"), 1);
+                m_f.glUniform1i_(m_f.glGetUniformLocation_(m_progG560, "uG309Src2"), 2);
+                m_f.glUniform1i_(m_f.glGetUniformLocation_(m_progG560, "uG309Src3"), 3);
+                m_f.glUniform1i_(m_f.glGetUniformLocation_(m_progG560, "uG309Src4"), 4);
+                m_f.glUniform1i_(m_f.glGetUniformLocation_(m_progG560, "uG309Src5"), 5);
+                m_f.glUniform1i_(m_f.glGetUniformLocation_(m_progG560, "uG309Src6"), 6);
+                m_f.glUniform1i_(m_f.glGetUniformLocation_(m_progG560, "uG309Src7"), 7);
+                m_f.glUniform1i_(m_f.glGetUniformLocation_(m_progG560, "uG309PageMap"),
+                                 static_cast<GLint>(kG309PageMapUnit));
+                m_f.glUniform1i_(m_f.glGetUniformLocation_(m_progG560, "uG309Base"),
+                                 static_cast<GLint>(kG309BaseUnit));
+                return true;
+            };
+            m_g560Available = setupG560();
+            std::fprintf(stderr, "[G560:backend] flat-state ordered runs %s mode=%s\n",
+                         m_g560Available ? "READY" : "UNAVAILABLE; legacy path kept",
+                         g561TextureRunsRequested() ? "same-texture" : "blend-only");
+        }
         return true;
     }
 
@@ -2869,6 +3219,9 @@ private:
             "uniform sampler2D uSrc2;\n"
             "uniform sampler2D uSrc3;\n"
             "uniform sampler2D uSrc4;\n"
+            "uniform sampler2D uSrc5;\n"
+            "uniform sampler2D uSrc6;\n"
+            "uniform sampler2D uSrc7;\n"
             "uniform sampler2D uPageMap;\n"
             "uniform sampler2D uBase;\n"
             "vec4 fetchOwner(int owner, ivec2 p){\n"
@@ -2876,7 +3229,10 @@ private:
             "    if (owner == 1) return texelFetch(uSrc1, p, 0);\n"
             "    if (owner == 2) return texelFetch(uSrc2, p, 0);\n"
             "    if (owner == 3) return texelFetch(uSrc3, p, 0);\n"
-            "    return texelFetch(uSrc4, p, 0);\n"
+            "    if (owner == 4) return texelFetch(uSrc4, p, 0);\n"
+            "    if (owner == 5) return texelFetch(uSrc5, p, 0);\n"
+            "    if (owner == 6) return texelFetch(uSrc6, p, 0);\n"
+            "    return texelFetch(uSrc7, p, 0);\n"
             "}\n"
             "void main(){\n"
             "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
@@ -2927,8 +3283,13 @@ private:
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uSrc2"), 2);
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uSrc3"), 3);
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uSrc4"), 4);
-        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uPageMap"), 5);
-        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uBase"), 6);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uSrc5"), 5);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uSrc6"), 6);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uSrc7"), 7);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uPageMap"),
+                         static_cast<GLint>(kG309PageMapUnit));
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uBase"),
+                         static_cast<GLint>(kG309BaseUnit));
         std::fprintf(stderr, "[G309:backend] PASS: authoritative-page composite program ready\n");
         return true;
     }
@@ -3076,8 +3437,8 @@ private:
         m_f.glBindVertexArray_(m_vao);
         m_f.glGenBuffers_(1, &m_vbo);
         m_f.glBindBuffer_(GL158_ARRAY_BUFFER, m_vbo);
-        static_assert(sizeof(G178Vtx) == 32,
-                      "G178Vtx must be tightly packed (6 floats + RGBA + G364 fog/pad)");
+        static_assert(sizeof(G178Vtx) == 48,
+                      "G178Vtx must be tightly packed (6 floats + RGBA/fog + G561 state)");
         m_f.glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, sizeof(G178Vtx),
                                    reinterpret_cast<const void *>(0));
         m_f.glVertexAttribPointer_(1, 3, GL_FLOAT, GL_FALSE, sizeof(G178Vtx),
@@ -3087,10 +3448,13 @@ private:
         // G364: per-vertex fog byte (normalized; .x carries F, .yzw are the struct padding).
         m_f.glVertexAttribPointer_(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(G178Vtx),
                                    reinterpret_cast<const void *>(28));
+        m_f.glVertexAttribPointer_(4, 4, GL_FLOAT, GL_FALSE, sizeof(G178Vtx),
+                                   reinterpret_cast<const void *>(32));
         m_f.glEnableVertexAttribArray_(0);
         m_f.glEnableVertexAttribArray_(1);
         m_f.glEnableVertexAttribArray_(2);
         m_f.glEnableVertexAttribArray_(3);
+        m_f.glEnableVertexAttribArray_(4);
         return true;
     }
 
@@ -3687,22 +4051,27 @@ private:
             basePixels.size() != 512u * 512u)
             return fail("args");
 
-        static constexpr uint32_t kSources[5] =
-            {0x139u, 0x13cu, 0x143u, 0x146u, 0x155u};
-        GLuint sourceTex[5] = {};
-        int sourceW[5] = {};
-        for (uint32_t t = 0u; t < 5u; ++t)
+        GLuint sourceTex[kG309SourceCount] = {};
+        int sourceW[kG309SourceCount] = {};
+        bool sourceUsed[kG309SourceCount] = {};
+        for (const uint32_t m : pageMap)
         {
-            const auto it = m_fbos.find(kSources[t]);
+            const uint32_t owner1 = m & 0xFFu;
+            if (owner1 > kG309SourceCount)
+                return fail("map-owner");
+            if (owner1 != 0u)
+                sourceUsed[owner1 - 1u] = true;
+        }
+        for (uint32_t t = 0u; t < kG309SourceCount; ++t)
+        {
+            if (!sourceUsed[t])
+                continue;
+            const auto it = m_fbos.find(kG309Sources[t]);
             if (it == m_fbos.end() || it->second.colorTex == 0u ||
                 it->second.w <= 0 || it->second.h != 512)
                 return fail("source");
             sourceTex[t] = it->second.colorTex;
             sourceW[t] = it->second.w;
-            m_f.glActiveTexture_(GL158_TEXTURE0 + t);
-            glBindTexture(GL_TEXTURE_2D, sourceTex[t]);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         }
         for (const uint32_t m : pageMap)
         {
@@ -3711,7 +4080,7 @@ private:
             const uint32_t srcRow = (m >> 16u) & 0xFFu;
             if (owner1 == 0u)
                 continue;
-            if (owner1 > 5u || srcRow >= 16u ||
+            if (owner1 > kG309SourceCount || srcRow >= 16u ||
                 srcCol * 64u + 64u > static_cast<uint32_t>(sourceW[owner1 - 1u]))
                 return fail("map");
         }
@@ -3721,7 +4090,7 @@ private:
             glGenTextures(1, &m_g309MapTex);
         if (m_g309MapTex == 0u)
             return fail("map-object");
-        m_f.glActiveTexture_(GL158_TEXTURE0 + 5u);
+        m_f.glActiveTexture_(GL158_TEXTURE0 + kG309PageMapUnit);
         glBindTexture(GL_TEXTURE_2D, m_g309MapTex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, 8, 16, 0,
                      GL_RGBA, GL_UNSIGNED_BYTE, pageMap.data());
@@ -3736,7 +4105,7 @@ private:
             glGenTextures(1, &m_g309BaseTex);
         if (m_g309BaseTex == 0u)
             return fail("base-object");
-        m_f.glActiveTexture_(GL158_TEXTURE0 + 6u);
+        m_f.glActiveTexture_(GL158_TEXTURE0 + kG309BaseUnit);
         glBindTexture(GL_TEXTURE_2D, m_g309BaseTex);
         if (allocateBase)
             glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, 512, 512, 0,
@@ -3776,6 +4145,21 @@ private:
         }
         glPixelStorei(kG309UnpackRowLength, 0);
 
+        GLuint fallbackTex = m_g309BaseTex;
+        for (uint32_t t = 0u; t < kG309SourceCount; ++t)
+            if (sourceTex[t] != 0u)
+            {
+                fallbackTex = sourceTex[t];
+                break;
+            }
+        for (uint32_t t = 0u; t < kG309SourceCount; ++t)
+        {
+            m_f.glActiveTexture_(GL158_TEXTURE0 + t);
+            glBindTexture(GL_TEXTURE_2D, sourceTex[t] != 0u ? sourceTex[t] : fallbackTex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        }
+
         FboEntry &out = ensureFbo(outputFbp, 512, 512);
         if (out.fbo == 0u || out.colorTex == 0u)
             return fail("output");
@@ -3794,10 +4178,10 @@ private:
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         m_f.glUseProgram_(m_g309Prog);
         m_f.glBindVertexArray_(m_vao);
-        for (uint32_t t = 0u; t < 5u; ++t)
+        for (uint32_t t = 0u; t < kG309SourceCount; ++t)
         {
             m_f.glActiveTexture_(GL158_TEXTURE0 + t);
-            glBindTexture(GL_TEXTURE_2D, sourceTex[t]);
+            glBindTexture(GL_TEXTURE_2D, sourceTex[t] != 0u ? sourceTex[t] : fallbackTex);
         }
         glDrawArrays(GL_TRIANGLES, 0, 3);
         g496PassBallast(); // G496 GPU derivative probe, `pass` site (idempotent re-issue)
@@ -4502,16 +4886,6 @@ private:
         }
         g415Note(); // 4: depth attach / clear
 
-        m_f.glUseProgram_(m_prog);
-        m_f.glBindVertexArray_(m_vao);
-        m_f.glBindBuffer_(GL158_ARRAY_BUFFER, m_vbo);
-        m_f.glBufferData_(GL158_ARRAY_BUFFER,
-                          static_cast<GLsizeiptrLocal>(b.verts.size() * sizeof(G178Vtx)),
-                          b.verts.data(), GL178_STREAM_DRAW);
-        m_e.glUniform2f_(m_locFbSize, static_cast<GLfloat>(b.fbW), static_cast<GLfloat>(b.fbH));
-        m_f.glActiveTexture_(GL158_TEXTURE0);
-        glEnable(GL_SCISSOR_TEST);
-
         // G268: was a raw getenv() per submitted batch; env is process-constant
         // (DC2_G268_LIVE_ENVREAD=1 restores the per-call read for A/B).
         static const bool s_g255GpuRttEnvLive = g158EnvFlag("DC2_G268_LIVE_ENVREAD");
@@ -4525,6 +4899,95 @@ private:
         const bool g256Exact = g256ExactRttOn() && m_progExact != 0u &&
             (b.fbp == 0x139u || b.fbp == 0x13cu || b.fbp == 0x143u ||
              b.fbp == 0x146u || b.fbp == 0x155u) && !guestDepth;
+        const bool g561TextureRuns = g561TextureRunsRequested() && m_g560Available && !g256Exact;
+        const bool g560MultiDraw = (g560MultiDrawRequested() || g561TextureRuns) &&
+                                   m_g560Available && !g256Exact;
+
+        // G561: snapshot every shader-varying piece of G178Draw into four exactly-representable
+        // packed floats.  Texture/sampler, scissor, low depth state, and blend equation remain fixed
+        // across a run; everything else is flat per triangle.  This duplicates the mode construction
+        // in the legacy loop deliberately so its program and rollback remain independent.
+        if (g560MultiDraw)
+        {
+            static const bool s_g561NoGuard = g158EnvFlag("DC2_G362_NO_UVGUARD");
+            const auto packMode = [&](const G178Draw &d) {
+                int mode = 0;
+                const bool g286Exact = b.fbp == 0x13bu && d.texKey != 0u;
+                const bool pointGuard = !s_g561NoGuard && !g286Exact && !d.bilinear;
+                if ((d.depthFunc & 0x10u) != 0u)
+                    mode |= 16;
+                if ((d.depthFunc & 0x20u) != 0u)
+                    mode |= 64;
+                mode |= (static_cast<int>((d.depthFunc >> 6u) & 3u) << 7u);
+                if (d.srcFbp != 0u)
+                {
+                    if (d.srcFbp == kG309CompositeToken)
+                        mode |= 2048;
+                    mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
+                    if (g289SourceIsCt24(d.srcFbp))
+                        mode |= 1024;
+                    if (pointGuard && (mode & 2048) == 0)
+                        mode |= 4096;
+                }
+                if (g286Exact)
+                {
+                    mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0) | 512;
+                }
+                else if (d.texKey != 0u)
+                {
+                    mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
+                    if (pointGuard)
+                        mode |= 4096;
+                }
+                const bool accurateUv = ((d.uvRoundU | d.uvRoundV) & 8u) != 0u;
+                if (accurateUv && (mode & 1) != 0 && (mode & 512) == 0)
+                    mode |= 4096;
+                if (d.fge != 0u)
+                    mode |= 8192;
+                if (d.uvRoundU != 0u || d.uvRoundV != 0u)
+                    mode |= 16384;
+                if (g255RttAlpha)
+                    mode |= 32;
+                return static_cast<uint32_t>(mode);
+            };
+            for (const G178Draw &d : b.draws)
+            {
+                const uint32_t state0 = packMode(d) | (static_cast<uint32_t>(d.blend & 7u) << 16u);
+                const uint32_t state1 = d.fogCol & 0x00FFFFFFu;
+                const uint32_t state2 = static_cast<uint32_t>(d.uvOriginX) |
+                                        (static_cast<uint32_t>(d.uvRoundU & 15u) << 16u);
+                const uint32_t state3 = static_cast<uint32_t>(d.uvOriginY) |
+                                        (static_cast<uint32_t>(d.uvRoundV & 15u) << 16u);
+                for (int v = 0; v < d.vtxCount; ++v)
+                {
+                    G178Vtx &out = b.verts[static_cast<size_t>(d.firstVtx + v)];
+                    out.drawState0 = static_cast<float>(state0);
+                    out.drawState1 = static_cast<float>(state1);
+                    out.drawState2 = static_cast<float>(state2);
+                    out.drawState3 = static_cast<float>(state3);
+                }
+            }
+        }
+
+        m_f.glUseProgram_(g560MultiDraw ? m_progG560 : m_prog);
+        m_f.glBindVertexArray_(m_vao);
+        m_f.glBindBuffer_(GL158_ARRAY_BUFFER, m_vbo);
+        m_f.glBufferData_(GL158_ARRAY_BUFFER,
+                          static_cast<GLsizeiptrLocal>(b.verts.size() * sizeof(G178Vtx)),
+                          b.verts.data(), GL178_STREAM_DRAW);
+        const GLint locFbSize = g560MultiDraw ? m_locG560FbSize : m_locFbSize;
+        const GLint locMode = g560MultiDraw ? m_locG560Mode : m_locMode;
+        const GLint locFogCol = g560MultiDraw ? m_locG560FogCol : m_locFogCol;
+        const GLint locLinear = g560MultiDraw ? m_locG560Linear : m_locLinear;
+        const GLint locWrapU = g560MultiDraw ? m_locG560WrapU : m_locWrapU;
+        const GLint locWrapV = g560MultiDraw ? m_locG560WrapV : m_locWrapV;
+        const GLint locUvOriginX = g560MultiDraw ? m_locG560UvOriginX : m_locUvOriginX;
+        const GLint locUvOriginY = g560MultiDraw ? m_locG560UvOriginY : m_locUvOriginY;
+        const GLint locUvRoundU = g560MultiDraw ? m_locG560UvRoundU : m_locUvRoundU;
+        const GLint locUvRoundV = g560MultiDraw ? m_locG560UvRoundV : m_locUvRoundV;
+        m_e.glUniform2f_(locFbSize, static_cast<GLfloat>(b.fbW), static_cast<GLfloat>(b.fbH));
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        glEnable(GL_SCISSOR_TEST);
         const bool g257RealDiagnostic = g256Exact && g257ImageStoreTestOn() &&
                                         m_g257RealBatches < 32u;
         const bool g258Trace = g256Exact && g258TraceOn() && b.fbp == 0x146u &&
@@ -4592,9 +5055,119 @@ private:
             (g496GlArm >= 0) ? (g496GlArm == 1) : g496GlCacheDefaultOn();
         g496GlReset();
         const auto g496Uni = [&](GLint loc, int value) { m_f.glUniform1i_(loc, value); };
+
+        const auto g560StateEqual = [](const G178Draw &a, const G178Draw &z) {
+            return a.firstVtx + a.vtxCount == z.firstVtx &&
+                   (a.blend == 4u) == (z.blend == 4u) &&
+                   a.texKey == z.texKey && a.srcFbp == z.srcFbp &&
+                   a.tfx == z.tfx && a.tcc == z.tcc && a.fge == z.fge &&
+                   a.fogCol == z.fogCol && a.depthFunc == z.depthFunc &&
+                   a.depthWrite == z.depthWrite && a.bilinear == z.bilinear &&
+                   a.wrapU == z.wrapU && a.wrapV == z.wrapV &&
+                   a.uvOriginX == z.uvOriginX && a.uvOriginY == z.uvOriginY &&
+                   a.uvRoundU == z.uvRoundU && a.uvRoundV == z.uvRoundV &&
+                   a.scX0 == z.scX0 && a.scY0 == z.scY0 &&
+                   a.scX1 == z.scX1 && a.scY1 == z.scY1;
+        };
+        const auto g561StateEqual = [](const G178Draw &a, const G178Draw &z) {
+            return a.firstVtx + a.vtxCount == z.firstVtx &&
+                   (a.depthFunc & 0x0fu) == (z.depthFunc & 0x0fu) &&
+                   a.depthWrite == z.depthWrite &&
+                   (a.blend == 4u) == (z.blend == 4u) &&
+                   a.scX0 == z.scX0 && a.scY0 == z.scY0 &&
+                   a.scX1 == z.scX1 && a.scY1 == z.scY1 &&
+                   a.texKey == z.texKey && a.srcFbp == z.srcFbp &&
+                   a.bilinear == z.bilinear && a.wrapU == z.wrapU && a.wrapV == z.wrapV;
+        };
+
+        // G559 premise gate (DC2_G559_DRAW_RUN_CENSUS=1, diagnostic only): price the draw-call
+        // reduction available from a future multi-draw shader before building it.  The existing
+        // front end already merges fully-identical adjacent draws; these progressively ignore
+        // state that can travel through gl_DrawID while retaining state that must remain fixed for
+        // one ordered multi-draw command:
+        //   noblend  - exact current state except blend (dual-source blending can select 0/1/2/3/5)
+        //   mdtex    - same bound texture/sampler + fixed scissor/depth/equation
+        //   bindless - fixed scissor/depth/equation only (texture handle also travels per draw)
+        // Blend mode 4 remains its own reverse-subtract equation class.  `physical` includes the
+        // second alpha-only draw currently issued by raw-alpha RTT waves.  No GL state or output is
+        // changed by this census.
+        static const bool s_g559DrawRuns = g158EnvFlag("DC2_G559_DRAW_RUN_CENSUS");
+        if (s_g559DrawRuns && !g256Exact && !b.draws.empty())
+        {
+            struct G559RunAcc
+            {
+                uint64_t batches = 0u, logical = 0u, physical = 0u;
+                uint64_t noblend = 0u, mdtex = 0u, bindless = 0u;
+            };
+            static G559RunAcc s_acc{}, s_last{};
+            auto eqFixed = [](const G178Draw &a, const G178Draw &z) {
+                return (a.depthFunc & 0x0fu) == (z.depthFunc & 0x0fu) &&
+                       a.depthWrite == z.depthWrite &&
+                       (a.blend == 4u) == (z.blend == 4u) &&
+                       a.scX0 == z.scX0 && a.scY0 == z.scY0 &&
+                       a.scX1 == z.scX1 && a.scY1 == z.scY1;
+            };
+            auto eqSampler = [](const G178Draw &a, const G178Draw &z) {
+                return a.texKey == z.texKey && a.srcFbp == z.srcFbp &&
+                       a.bilinear == z.bilinear && a.wrapU == z.wrapU && a.wrapV == z.wrapV;
+            };
+            uint64_t noBlendRuns = 1u, mdTexRuns = 1u, bindlessRuns = 1u;
+            uint64_t physicalDraws = b.draws.size();
+            for (size_t i = 0; i < b.draws.size(); ++i)
+            {
+                const G178Draw &d = b.draws[i];
+                if (g255RttAlpha && d.blend != 0u)
+                    ++physicalDraws;
+                if (i == 0u)
+                    continue;
+                const G178Draw &p = b.draws[i - 1u];
+                if (!g560StateEqual(p, d))
+                    ++noBlendRuns;
+                if (!eqFixed(p, d) || !eqSampler(p, d))
+                    ++mdTexRuns;
+                if (!eqFixed(p, d))
+                    ++bindlessRuns;
+            }
+            ++s_acc.batches;
+            s_acc.logical += b.draws.size();
+            s_acc.physical += physicalDraws;
+            s_acc.noblend += noBlendRuns;
+            s_acc.mdtex += mdTexRuns;
+            s_acc.bindless += bindlessRuns;
+            if ((s_acc.batches % 512u) == 0u)
+            {
+                const G559RunAcc d{
+                    s_acc.batches - s_last.batches, s_acc.logical - s_last.logical,
+                    s_acc.physical - s_last.physical, s_acc.noblend - s_last.noblend,
+                    s_acc.mdtex - s_last.mdtex, s_acc.bindless - s_last.bindless};
+                std::fprintf(stderr,
+                             "[G559:runs] batches=%llu logical=%llu physical=%llu "
+                             "noblend=%llu(%.1f%%) mdtex=%llu(%.1f%%) bindless=%llu(%.1f%%)\n",
+                             (unsigned long long)d.batches, (unsigned long long)d.logical,
+                             (unsigned long long)d.physical, (unsigned long long)d.noblend,
+                             d.physical ? 100.0 * (double)d.noblend / (double)d.physical : 0.0,
+                             (unsigned long long)d.mdtex,
+                             d.physical ? 100.0 * (double)d.mdtex / (double)d.physical : 0.0,
+                             (unsigned long long)d.bindless,
+                             d.physical ? 100.0 * (double)d.bindless / (double)d.physical : 0.0);
+                std::fflush(stderr);
+                s_last = s_acc;
+            }
+        }
         for (size_t drawIndex = 0; drawIndex < b.draws.size(); ++drawIndex)
         {
             const G178Draw &d = b.draws[drawIndex];
+            size_t g560RunEnd = drawIndex + 1u;
+            if (g560MultiDraw)
+                while (g560RunEnd < b.draws.size() &&
+                       (g561TextureRuns
+                            ? g561StateEqual(b.draws[g560RunEnd - 1u], b.draws[g560RunEnd])
+                            : g560StateEqual(b.draws[g560RunEnd - 1u], b.draws[g560RunEnd])))
+                    ++g560RunEnd;
+            const int g560VtxCount = g560MultiDraw
+                                         ? (b.draws[g560RunEnd - 1u].firstVtx +
+                                            b.draws[g560RunEnd - 1u].vtxCount - d.firstVtx)
+                                         : d.vtxCount;
             // GS scissor is inclusive, top-origin; GL is bottom-origin.
             const int scH = d.scY1 - d.scY0 + 1;
             g496Scissor(d.scX0, b.fbH - 1 - d.scY1, d.scX1 - d.scX0 + 1, scH, g496GlCache);
@@ -4650,7 +5223,20 @@ private:
                 }
                 continue;
             }
-            if (d.blend == 0)
+            if (g560MultiDraw)
+            {
+                // Every primitive supplies its own factors through the secondary fragment output.
+                // Only reverse-subtract remains fixed GL state, so G560's run splitter keeps mode 4
+                // separate while modes 0/1/2/3/5 can coexist in submission order.
+                g496BlendOn([&](GLenum eqRgb, GLenum eqA)
+                            { m_e.glBlendEquationSeparate_(eqRgb, eqA); },
+                            [&](GLenum sRgb, GLenum dRgb, GLenum sA, GLenum dA)
+                            { m_e.glBlendFuncSeparate_(sRgb, dRgb, sA, dA); },
+                            d.blend == 4 ? GL178_FUNC_REVERSE_SUBTRACT : GL178_FUNC_ADD,
+                            GL178_FUNC_ADD, GL178_SRC1_COLOR, GL178_SRC1_ALPHA,
+                            GL_ONE, GL_ZERO, g496GlCache);
+            }
+            else if (d.blend == 0)
             {
                 g496BlendOff(g496GlCache);
             }
@@ -4676,7 +5262,10 @@ private:
                             GL_ONE, GL_ZERO, g496GlCache);
             }
             int mode = 0;
-            const bool g286Exact = b.fbp == 0x13bu;
+            // G558: 0x13b also carries an opaque SOLID terminal sprite.  G286's integer sampler
+            // is a property of its textured batches, not of the framebuffer address itself;
+            // selecting it for TME=0 made the backend demand a texture and reject the batch.
+            const bool g286Exact = b.fbp == 0x13bu && d.texKey != 0u;
             // G362: point-sampled draws on the legacy shader path take the guarded fixed-point
             // fetch (uMode bit 12) instead of GL_NEAREST's float floor(). Default-ON; roll back
             // with DC2_G362_NO_UVGUARD=1. Bilinear draws keep texture()'s filtered path, and the
@@ -4699,12 +5288,13 @@ private:
                 // and only admits in-range UVs — CLAMP here is inert insurance, never wrap.
                 if (d.srcFbp == kG309CompositeToken)
                 {
-                    static constexpr uint32_t kSources[5] =
-                        {0x139u, 0x13cu, 0x143u, 0x146u, 0x155u};
-                    for (uint32_t t = 0u; t < 5u; ++t)
+                    for (uint32_t t = 0u; t < kG309SourceCount; ++t)
                     {
                         m_f.glActiveTexture_(GL158_TEXTURE0 + t);
-                        const GLuint g496Src = m_fbos.find(kSources[t])->second.colorTex;
+                        const auto it = m_fbos.find(kG309Sources[t]);
+                        const GLuint g496Src =
+                            it != m_fbos.end() && it->second.colorTex != 0u
+                                ? it->second.colorTex : m_g309BaseTex;
                         // G496b: only unit 0 is cached - it is the unit every other draw in this
                         // loop binds through, and this branch leaves kSources[0] resident on it.
                         if (t == 0u)
@@ -4712,9 +5302,9 @@ private:
                         else
                             glBindTexture(GL_TEXTURE_2D, g496Src);
                     }
-                    m_f.glActiveTexture_(GL158_TEXTURE0 + 5u);
+                    m_f.glActiveTexture_(GL158_TEXTURE0 + kG309PageMapUnit);
                     glBindTexture(GL_TEXTURE_2D, m_g309MapTex);
-                    m_f.glActiveTexture_(GL158_TEXTURE0 + 6u);
+                    m_f.glActiveTexture_(GL158_TEXTURE0 + kG309BaseUnit);
                     glBindTexture(GL_TEXTURE_2D, m_g309BaseTex);
                     m_f.glActiveTexture_(GL158_TEXTURE0);
                     mode |= 2048;
@@ -4766,10 +5356,10 @@ private:
                               g496GlCache);
                 mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
                 mode |= 512;
-                g496Uniform1i(g496Uni, kG496ULinear, m_locLinear, d.bilinear ? 1 : 0, g496GlCache);
-                g496Uniform1i(g496Uni, kG496UWrapU, m_locWrapU, static_cast<int>(d.wrapU),
+                g496Uniform1i(g496Uni, kG496ULinear, locLinear, d.bilinear ? 1 : 0, g496GlCache);
+                g496Uniform1i(g496Uni, kG496UWrapU, locWrapU, static_cast<int>(d.wrapU),
                               g496GlCache);
-                g496Uniform1i(g496Uni, kG496UWrapV, m_locWrapV, static_cast<int>(d.wrapV),
+                g496Uniform1i(g496Uni, kG496UWrapV, locWrapV, static_cast<int>(d.wrapV),
                               g496GlCache);
             }
             else if (d.texKey != 0)
@@ -4794,10 +5384,10 @@ private:
             {
                 // Accurate UV uses exact 12.4 point/bilinear taps. The wrap mode travels as a
                 // uniform because integer taps do not use the GL sampler's addressing state.
-                g496Uniform1i(g496Uni, kG496ULinear, m_locLinear, d.bilinear ? 1 : 0, g496GlCache);
-                g496Uniform1i(g496Uni, kG496UWrapU, m_locWrapU, static_cast<int>(d.wrapU),
+                g496Uniform1i(g496Uni, kG496ULinear, locLinear, d.bilinear ? 1 : 0, g496GlCache);
+                g496Uniform1i(g496Uni, kG496UWrapU, locWrapU, static_cast<int>(d.wrapU),
                               g496GlCache);
-                g496Uniform1i(g496Uni, kG496UWrapV, m_locWrapV, static_cast<int>(d.wrapV),
+                g496Uniform1i(g496Uni, kG496UWrapV, locWrapV, static_cast<int>(d.wrapV),
                               g496GlCache);
                 m_g362GuardDraws += 1u;
             }
@@ -4811,35 +5401,35 @@ private:
             if (d.fge != 0u)
             {
                 mode |= 8192;
-                g496Uniform1i(g496Uni, kG496UFogCol, m_locFogCol,
+                g496Uniform1i(g496Uni, kG496UFogCol, locFogCol,
                               static_cast<int>(d.fogCol & 0x00FFFFFFu), g496GlCache);
             }
             if (d.uvRoundU != 0u || d.uvRoundV != 0u)
             {
                 mode |= 16384;
-                g496Uniform1i(g496Uni, kG496UOriginX, m_locUvOriginX,
+                g496Uniform1i(g496Uni, kG496UOriginX, locUvOriginX,
                               static_cast<int>(d.uvOriginX), g496GlCache);
-                g496Uniform1i(g496Uni, kG496UOriginY, m_locUvOriginY,
+                g496Uniform1i(g496Uni, kG496UOriginY, locUvOriginY,
                               static_cast<int>(d.uvOriginY), g496GlCache);
-                g496Uniform1i(g496Uni, kG496URoundU, m_locUvRoundU,
+                g496Uniform1i(g496Uni, kG496URoundU, locUvRoundU,
                               static_cast<int>(d.uvRoundU), g496GlCache);
-                g496Uniform1i(g496Uni, kG496URoundV, m_locUvRoundV,
+                g496Uniform1i(g496Uni, kG496URoundV, locUvRoundV,
                               static_cast<int>(d.uvRoundV), g496GlCache);
             }
-            if (g255RttAlpha && d.blend != 0u)
+            if (!g560MultiDraw && g255RttAlpha && d.blend != 0u)
             {
                 // Fixed-function blending needs As/128 in the shader alpha channel, while PS2
                 // framebuffer alpha stores the unblended source A byte. Preserve RGB blending in
                 // pass one with alpha masked, then overwrite alpha only with the raw source value.
                 glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
-                g496Uniform1i(g496Uni, kG496UMode, m_locMode, mode, g496GlCache);
+                g496Uniform1i(g496Uni, kG496UMode, locMode, mode, g496GlCache);
                 glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
                 // Routed through the cache so the record tracks the real GL state: this branch
                 // disables blending after g496BlendOn enabled it, and the next draw must not
                 // believe blending is still on.
                 g496BlendOff(g496GlCache);
                 glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
-                g496Uniform1i(g496Uni, kG496UMode, m_locMode, mode | 32, g496GlCache);
+                g496Uniform1i(g496Uni, kG496UMode, locMode, mode | 32, g496GlCache);
                 glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
                 glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
             }
@@ -4847,9 +5437,11 @@ private:
             {
                 if (g255RttAlpha)
                     mode |= 32;
-                g496Uniform1i(g496Uni, kG496UMode, m_locMode, mode, g496GlCache);
-                glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
+                g496Uniform1i(g496Uni, kG496UMode, locMode, mode, g496GlCache);
+                glDrawArrays(GL_TRIANGLES, d.firstVtx, g560VtxCount);
             }
+            if (g560MultiDraw)
+                drawIndex = g560RunEnd - 1u;
         }
 
         // G496 GPU DERIVATIVE PROBE (diagnostic only — DC2_G419_AB=gpuslow / DC2_G496_FORCE=1).
@@ -5136,7 +5728,8 @@ private:
 
     GLFns m_f;
     G178GLExt m_e;
-    GLuint m_prog = 0, m_progExact = 0, m_g281Prog = 0, m_g309Prog = 0;
+    GLuint m_prog = 0, m_progG560 = 0, m_progExact = 0, m_g281Prog = 0, m_g309Prog = 0;
+    bool m_g560Available = false;
     GLuint m_g541NullProg = 0, m_g541StateTex = 0;
     GLint m_locG541KickCount = -1;
     bool m_g541Available = false;
@@ -5149,7 +5742,7 @@ private:
     std::atomic<uint64_t> m_g541HighWater{0ull};
     uint64_t m_g541NextReport = 65536ull; // GL-worker only
     GLuint m_g545Prog = 0, m_g545CommandTex = 0, m_g545PayloadTex = 0;
-    GLuint m_g545WorkspaceTex = 0;
+    GLuint m_g545WorkspaceTex = 0, m_g566OutputTex = 0;
     GLint m_locG545CommandCount = -1;
     uint32_t m_g545CommandRows = 0u, m_g545PayloadRows = 0u;
     bool m_g545Available = false;
@@ -5162,6 +5755,8 @@ private:
     uint64_t m_g545Batches = 0ull, m_g545MaxBatch = 0ull;
     uint64_t m_g545CheckInterval = 16384ull, m_g545NextCheck = 16384ull;
     uint64_t m_g545Readbacks = 0ull, m_g545Verified = 0ull;
+    std::vector<uint32_t> m_g566Readback;
+    uint64_t m_g566Packets = 0ull, m_g566PacketBytes = 0ull;
     GLuint m_g338Prog = 0;
     GLint m_locG338SrcH = -1, m_locG338Ta0 = -1, m_locG338Aem = -1;
     GLuint m_vao = 0, m_vbo = 0;
@@ -5169,6 +5764,10 @@ private:
     GLuint m_g309MapTex = 0, m_g309BaseTex = 0;
     GLint m_locFbSize = -1, m_locMode = -1, m_locLinear = -1, m_locFogCol = -1;
     GLint m_locWrapU = -1, m_locWrapV = -1;
+    GLint m_locG560FbSize = -1, m_locG560Mode = -1, m_locG560Linear = -1;
+    GLint m_locG560FogCol = -1, m_locG560WrapU = -1, m_locG560WrapV = -1;
+    GLint m_locG560UvOriginX = -1, m_locG560UvOriginY = -1;
+    GLint m_locG560UvRoundU = -1, m_locG560UvRoundV = -1;
     GLint m_locExactFbSize = -1, m_locExactMode = -1, m_locExactLinear = -1;
     GLint m_locExactWrapU = -1, m_locExactWrapV = -1;
     GLint m_locUvOriginX = -1, m_locUvOriginY = -1;

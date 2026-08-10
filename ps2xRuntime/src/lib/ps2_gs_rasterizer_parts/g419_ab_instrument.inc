@@ -706,6 +706,26 @@ enum G419Lever
     // completed CPU VU1 kick; commands coalesce while queued into sequential shared-FIFO compute
     // batches. It never waits/reads back; CPU VU1 packets remain authoritative. Hold 16.
     kG541LeverVuNull = 97,
+    // G547: add the exact 0x0c70 VU1 fragment to G533's already-shipped 0x3088 handler set.
+    // Control keeps 0x3088; candidate enables both. VU1-thread code-shape lever: hold 16.
+    kG547LeverHot0c70 = 98,
+    // G548: add exact 0x0e00 after the promoted 0x3088 + 0x0c70 set. Hold 16.
+    kG548LeverHot0e00 = 99,
+    // G549: add exact 0x30d8 after the first three immutable fragments. Hold 16.
+    kG549LeverHot30d8 = 100,
+    // G550: add exact 0x1be8 two-pair store loop. Hold 16.
+    kG550LeverHot1be8 = 101,
+    // G551: add exact 0x1c00 six-pair copy/pack loop. Hold 16.
+    kG551LeverHot1c00 = 102,
+    // G552: admit discovered render targets for triangle capture. GS-worker lever: hold 16.
+    kG552LeverRttTri = 103,
+    // G554: add exact 0x0900 36-pair VU1 fragment after the G551 immutable set. Hold 16.
+    kG554LeverHot0900 = 104,
+    // G555: add exact 0x1110 six-pair VU1 fragment to the shipped G551 set. Hold 16.
+    kG555LeverHot1110 = 105,
+    // G568: admit a GPU flush whose texture pages alias the live Z window when the texture PSM
+    // reads ONLY bits the Z PSM never writes (T8H/T4HL/T4HH over PSMZ24). GS-worker lever: hold 16.
+    kG568LeverBitAlias = 106,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -918,6 +938,24 @@ static int g419AbLever()
             return static_cast<int>(kG532LeverDivLower);
         if (std::strcmp(value, "imgspec") == 0)
             return static_cast<int>(kG533LeverImageSpec);
+        if (std::strcmp(value, "hot0c70") == 0)
+            return static_cast<int>(kG547LeverHot0c70);
+        if (std::strcmp(value, "hot0e00") == 0)
+            return static_cast<int>(kG548LeverHot0e00);
+        if (std::strcmp(value, "hot30d8") == 0)
+            return static_cast<int>(kG549LeverHot30d8);
+        if (std::strcmp(value, "hot1be8") == 0)
+            return static_cast<int>(kG550LeverHot1be8);
+        if (std::strcmp(value, "hot1c00") == 0)
+            return static_cast<int>(kG551LeverHot1c00);
+        if (std::strcmp(value, "hot0900") == 0)
+            return static_cast<int>(kG554LeverHot0900);
+        if (std::strcmp(value, "hot1110") == 0)
+            return static_cast<int>(kG555LeverHot1110);
+        if (std::strcmp(value, "rtttri") == 0)
+            return static_cast<int>(kG552LeverRttTri);
+        if (std::strcmp(value, "bitalias") == 0)
+            return static_cast<int>(kG568LeverBitAlias);
         if (std::strcmp(value, "vu1null") == 0)
             return static_cast<int>(kG541LeverVuNull);
         std::fprintf(stderr,
@@ -931,7 +969,8 @@ static int g419AbLever()
                      "histcur|qpseg|lockskip|capmove|clsmemo|g510both|texrun|texprobe|clsprobe|"
                      "fastdec|hashlane|vstore|vload|vmem|nopdisp|updesc|lowdense|dispdense|"
                      "peel4|g516disp|fpind|stampind|g517ind|cullcmp|macscan|capinplace|"
-                      "l2lskip|flagtail|flaghead|divlower|imgspec|vu1null)\n",
+                      "l2lskip|flagtail|flaghead|divlower|imgspec|hot0c70|hot0e00|hot30d8|"
+                      "hot1be8|hot1c00|hot0900|hot1110|rtttri|vu1null)\n",
                      value);
         return static_cast<int>(kG419LeverNone);
     }();
@@ -1036,6 +1075,15 @@ static const char *g419AbLeverName(int lever)
     case kG532LeverFlagHead: return "flaghead";
     case kG532LeverDivLower: return "divlower";
     case kG533LeverImageSpec: return "imgspec";
+    case kG547LeverHot0c70: return "hot0c70";
+    case kG548LeverHot0e00: return "hot0e00";
+    case kG549LeverHot30d8: return "hot30d8";
+    case kG550LeverHot1be8: return "hot1be8";
+    case kG551LeverHot1c00: return "hot1c00";
+    case kG554LeverHot0900: return "hot0900";
+    case kG555LeverHot1110: return "hot1110";
+    case kG552LeverRttTri: return "rtttri";
+    case kG568LeverBitAlias: return "bitalias";
     case kG541LeverVuNull: return "vu1null";
     default: return "none";
     }
@@ -1186,6 +1234,11 @@ static uint64_t g438ArmHoldFrames()
                 sel == kG522LeverL2lSkip ||
                 sel == kG531LeverFlagTail || sel == kG532LeverFlagHead ||
                  sel == kG532LeverDivLower || sel == kG533LeverImageSpec ||
+                 sel == kG547LeverHot0c70 || sel == kG548LeverHot0e00 ||
+                 sel == kG549LeverHot30d8 || sel == kG550LeverHot1be8 ||
+                 sel == kG551LeverHot1c00 || sel == kG554LeverHot0900 ||
+                 sel == kG555LeverHot1110 || sel == kG552LeverRttTri ||
+                 sel == kG568LeverBitAlias ||
                  sel == kG541LeverVuNull ||
                 sel == kG439LeverCoalesce || sel == kG445LeverEarlyKick ||
                 sel == kG445LeverKickAll || sel == kG447LeverSpinWait || sel == kG447LeverWSpin ||
@@ -1803,6 +1856,151 @@ int g532DivLowerArm()
 int g533ImageSpecArm()
 {
     if (g419AbLever() != static_cast<int>(kG533LeverImageSpec))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G547 expansion arm. Sampled once per run exactly like G533; the control keeps the existing
+// immutable 0x3088 handler and the candidate adds only 0x0c70.
+int g547Hot0c70Arm()
+{
+    if (g419AbLever() != static_cast<int>(kG547LeverHot0c70))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g548Hot0e00Arm()
+{
+    if (g419AbLever() != static_cast<int>(kG548LeverHot0e00))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g549Hot30d8Arm()
+{
+    if (g419AbLever() != static_cast<int>(kG549LeverHot30d8))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g550Hot1be8Arm()
+{
+    if (g419AbLever() != static_cast<int>(kG550LeverHot1be8))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g551Hot1c00Arm()
+{
+    if (g419AbLever() != static_cast<int>(kG551LeverHot1c00))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G554 expansion arm. Control retains the complete G551 fragment set; candidate adds only the
+// exact 0x0900 fragment. Sampled once per VU1 run, matching every earlier static-fragment gate.
+int g554Hot0900Arm()
+{
+    if (g419AbLever() != static_cast<int>(kG554LeverHot0900))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G555 expansion arm. Control is the shipped G551 set (G554 was refuted); candidate adds only
+// the exact six-pair 0x1110 fragment. Sampled once per VU1 run.
+int g555Hot1110Arm()
+{
+    if (g419AbLever() != static_cast<int>(kG555LeverHot1110))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G568 bit-field-disjoint texture/Z alias admission runs on the GS worker, once per aliasing
+// texture inside g178TryFlushGpu. Same sequence memo as g552RttTriArm: one relaxed RMW per frame.
+int g568BitAliasArm()
+{
+    if (g419AbLever() != static_cast<int>(kG568LeverBitAlias))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G552 discovered-target triangle admission runs on the GS worker. The sequence memo keeps
+// paired attribution to one relaxed RMW per frame even though the arm is queried per triangle.
+int g552RttTriArm()
+{
+    if (g419AbLever() != static_cast<int>(kG552LeverRttTri))
         return -1;
     const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
     const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);

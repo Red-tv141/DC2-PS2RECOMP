@@ -158,6 +158,16 @@ int g498OwnPubArm();
 // publication sites it re-keys. Content edit here forces MSBuild to consume the .inc files (G359).
 #include "ps2_gs_rasterizer_parts/g527_target_registry.inc"
 
+// G568: bit-field-disjoint texture/Z alias admission. It must sit HERE, beside g527, and not later:
+// rasterizer_draw_prim_probe.inc below opens an anonymous namespace that stays open until
+// rasterizer_rtt_census_and_waves.inc closes it, so an include placed between the two would put
+// this file's forward declaration of g568BitAliasArm() in the anonymous namespace while
+// g419_ab_instrument.inc defines it at GLOBAL scope — an unresolved external at exe link (the
+// declaration of g552RttTriArm in g527_target_registry.inc is global for exactly this reason).
+// It must still precede rasterizer_vram_materialization.inc, which holds the single `texAliasesZ`
+// rejection site it re-keys. Content edit here forces MSBuild to consume the .inc file (G359).
+#include "ps2_gs_rasterizer_parts/g568_bitalias_admission.inc"
+
 // G400/G401: raw surface sampling must be visible at command-graph execution time. G400's
 // draw-entry hook remains below; G401 calls the helper before the composite batch executes.
 #include "ps2_gs_rasterizer_parts/rasterizer_g400_stage_probe.inc"
@@ -336,6 +346,17 @@ int g498OwnPubArm();
 // G477: DC2_G419_AB=runwrite paired gate for the swizzle-row hoisted IMAGE run writers
 //       (GSMem::WriteRunCT32/Z32/P4 in ps2_gs_memory.cpp) (force recompile v1).
 // G533: DC2_G419_AB=imgspec VU1 immutable-fragment specialization arm (force recompile v1).
+// G547: DC2_G419_AB=hot0c70 isolates the second exact VU1 fragment (force recompile v1).
+// G548: DC2_G419_AB=hot0e00 isolates the third exact VU1 fragment (force recompile v1).
+// G549: DC2_G419_AB=hot30d8 isolates the fourth exact VU1 fragment (force recompile v1).
+// G550: DC2_G419_AB=hot1be8 isolates the fifth exact VU1 fragment (force recompile v1).
+// G551: DC2_G419_AB=hot1c00 isolates the sixth exact VU1 fragment (force recompile v1).
+// G552: DC2_G419_AB=rtttri isolates discovered-target triangle deferral (force recompile v1).
+// G553: DC2_G553_RTT159=1 gives s05 target 0x159 a sixth GPU-residency slot; the
+//       DC2_G553_VERIFY_HEAVY=1 oracle narrows G255 verification to late-route 0x159 batches
+//       after attempt 10,000 while ordinary batches retain resident waves (force recompile v5).
+// G556: DC2_G556_RTT181=1 gives Georama target 0x181 a seventh GPU-residency slot
+//       (force recompile v1).
 // G536: page-ownership-aware residency publication (default-ON, kill DC2_G536_NO_PAGEOWN=1) plus
 //       the DC2_G536_MATCHK=1 probe that proved the invariant is violated at publication time.
 //       g261Materialize must not overwrite pages the guest wrote since the residency anchored.

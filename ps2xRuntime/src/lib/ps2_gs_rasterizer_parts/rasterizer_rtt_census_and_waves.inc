@@ -520,6 +520,8 @@ void g178PushVertex(std::vector<G178Vtx> &out, const GSVertex &v, int ofx, int o
     // G364: F rides the GEOMETRIC vertex (a real GS interpolator, independent of IIP). Sprite
     // callers pre-copy the flat second-vertex F onto their corner vertices, mirroring `z`.
     o.fog = v.fog; o.pad0 = 0; o.pad1 = 0; o.pad2 = 0;
+    o.drawState0 = 0.0f; o.drawState1 = 0.0f;
+    o.drawState2 = 0.0f; o.drawState3 = 0.0f;
     if (!tme)
     {
         o.sq = 0.0f; o.tq = 0.0f; o.iq = 1.0f;
@@ -1043,7 +1045,13 @@ struct G261Res
     std::array<uint64_t, 16 * 8> g536PageGen{};
     uint32_t g536PageGenFbw = 0;
 };
-static constexpr uint32_t kG261Fbp[kG248TargetCount] = {0x139u, 0x13cu, 0x143u, 0x146u, 0x155u};
+static constexpr uint32_t kG261Fbp[kG248TargetCount] = {
+    // 0..4 legacy five (G248) | 5 G553 | 6 G556 | 7 G557
+    0x139u, 0x13cu, 0x143u, 0x146u, 0x155u, 0x159u, 0x181u, 0x13au,
+    // 8..13 G569 route3 targets, ordered by CPU-replayed ENTRY weight (the ranking that matters —
+    // see g568_rank_fallback_by_entries_not_events), so DC2_G569_RTTWIDE_MASK bisects usefully.
+    0x13du, 0x157u, 0x14bu, 0x151u, 0x13fu, 0x141u
+};
 static G261Res g_g261Res[kG248TargetCount];
 static uint32_t g_g261VramSize = 0; // set beside the wave flush (GS::m_vramSize is private)
 enum G261MatCause : int
