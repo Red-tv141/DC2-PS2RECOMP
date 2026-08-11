@@ -108,6 +108,9 @@ static bool g527RegistryOn()
 // DC2_G527_TRI=1 turns it on standalone. G552 prices the same one-variable change with the paired
 // `rtttri` gate; the selection test is cached so ordinary/default draws pay no new call.
 int g552RttTriArm();
+// G573 uses the same global declaration pattern: this file is included before the anonymous
+// rasterizer namespace, while g419_ab_instrument.inc defines the paired selector at global scope.
+int g573Tri13bArm();
 static bool g527TriOn()
 {
     static const bool paired = []()

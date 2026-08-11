@@ -31,6 +31,9 @@
 // fwd (defined later in this file): replayed-batch write notes need it before its definition.
 void g178NoteVramWriteRect(uint8_t *vram, uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
                            uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+void g178NoteVramWriteRectTagged(uint8_t *vram, uint32_t bpBlocks, uint32_t bw64,
+                                 uint32_t psm, uint32_t x, uint32_t y, uint32_t w,
+                                 uint32_t h, uint32_t g570Source);
 // G476 paired A/B arm for the run-weighted page walk. Defined with EXTERNAL linkage in
 // g419_ab_instrument.inc, which this TU includes after this file. It must be declared in this
 // GLOBAL-scope gap: a declaration inside the anonymous namespace below names a different,
@@ -137,6 +140,99 @@ bool g286TransientTarget(uint32_t fbp)
     return g286TransientTargetOn() && fbp == 0x13bu;
 }
 
+// ===== G573: RIDEPOD TRANSIENT 0x13b TRIANGLE ADMISSION =====
+//
+// G286/G287 proved the immediate-readback transient target, but capture deliberately admitted only
+// opaque sprites. Ridepod's boss mesh is the same CT32 target and is almost entirely textured,
+// blended TRIANGLE/TRISTRIP draws. Those primitives currently force one graph drain + ownership
+// edge each before scalar inline rasterization. This gate changes admission only: the existing
+// whole-flush classifier still fails closed to exact banded CPU replay, and a successful GPU flush
+// retains G286's immediate readback/page-publication contract.
+//
+// Bring-up is default-OFF. G573 promotion flips the standalone default only after paired timing,
+// G286 same-run pixel verification, ownership invariants and normal Ridepod motion all pass.
+static bool g573Tri13bOn()
+{
+    static const bool paired = []()
+    {
+        const char *value = std::getenv("DC2_G419_AB");
+        return value != nullptr && std::strcmp(value, "tri13b") == 0;
+    }();
+    if (paired)
+        return g573Tri13bArm() > 0;
+    static const bool on = envFlagEnabled("DC2_G573_TRI_13B") &&
+                           !envFlagEnabled("DC2_G573_NO_TRI_13B") &&
+                           !envFlagDisabled("DC2_G573_TRI_13B");
+    return on && g286TransientTargetOn();
+}
+
+static bool g573Tri13bStatOn()
+{
+    static const bool on = envFlagEnabled("DC2_G573_STAT");
+    return on;
+}
+
+static void g573NoteTri13bAdmission(uint32_t prim)
+{
+    if (!g573Tri13bStatOn())
+        return;
+    // GS-worker only. Plain counters keep diagnostics out of paired/default timing.
+    static uint64_t total = 0u, tri = 0u, strip = 0u;
+    ++total;
+    tri += prim == GS_PRIM_TRIANGLE ? 1u : 0u;
+    strip += prim == GS_PRIM_TRISTRIP ? 1u : 0u;
+    if (total <= 8u || (total % 65536u) == 0u)
+        std::fprintf(stderr,
+                     "[G573:admit] n=%llu tri=%llu strip=%llu\n",
+                     static_cast<unsigned long long>(total),
+                     static_cast<unsigned long long>(tri),
+                     static_cast<unsigned long long>(strip));
+}
+
+// ===== G570: transient GPU execution for the route2 0x13d combat target =====
+//
+// G569 made 0x13d persistent and removed its large CPU replay, but that target physically
+// overlaps the resident 0x139 family. A later 0x139 texture materialization then advanced pages
+// underneath dirty 0x13d residency, producing the jump/dash escaped-writer defect. G570 keeps
+// guest VRAM authoritative instead: materialize aliases before the batch, render into the normal
+// backend FBO, read color back in the same flush, and publish page generations immediately.
+// Nothing is added to g248TargetIndex and no G261 ownership survives the flush.
+//
+// Bring-up is opt-in until the exact same-run oracle and route gates pass. The verifier implies
+// the path so DC2_G570_VERIFY_13D=1 cannot accidentally compare the CPU path with itself.
+bool g570Transient13dOn()
+{
+    static const bool s_on =
+        (envFlagEnabled("DC2_G570_TRANSIENT_13D") || g570Verify13dOn()) &&
+        !envFlagEnabled("DC2_G570_NO_TRANSIENT_13D") &&
+        !envFlagDisabled("DC2_G570_TRANSIENT_13D");
+    return s_on && g260NrOn();
+}
+
+bool g570Transient13dTarget(uint32_t fbp)
+{
+    return g570Transient13dOn() && fbp == 0x13du;
+}
+
+// G570: the large combat/jump 0x139 batch was still rejected as a physical color/Z alias even
+// though G403/G411 deliberately moved ZBP=0xd0 into a private mirror.  Bring up the narrow
+// private-depth admission independently; its same-run verifier implies the path.
+bool g570Private139On()
+{
+    static const bool s_on =
+        (envFlagEnabled("DC2_G570_PRIVATE_139") || g570Verify139On()) &&
+        !envFlagEnabled("DC2_G570_NO_PRIVATE_139") &&
+        !envFlagDisabled("DC2_G570_PRIVATE_139");
+    return s_on && g260NrOn();
+}
+
+static bool g570Transient13dStatOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G570_TRANSIENT_STAT") ||
+                             g570Verify13dOn();
+    return s_on;
+}
+
 // G558 experiment: S05's remaining 0x13b pole is the same transient target, but its terminal
 // full-screen sprite is an opaque SOLID fill (TME=0).  G286 only admitted textured sprites even
 // though the transient backend already supports the untextured draw state and preserves the same
@@ -170,6 +266,8 @@ static bool g289CensusOn()
 
 static std::atomic<uint64_t> g_g286Captured{0}, g_g286GpuAttempts{0},
     g_g286GpuSuccess{0}, g_g286RowsPublished{0};
+static std::atomic<uint64_t> g_g570TransientAttempts{0}, g_g570TransientSuccess{0},
+    g_g570TransientRejectShape{0}, g_g570TransientRowsPublished{0};
 
 // G272 display-color residency helpers are defined after the G178 framebuffer snapshot state.
 // The nested G260 scheduler namespace uses these .cpp-local bridges without a public header.
@@ -1132,6 +1230,17 @@ static bool g476VerifyOn()
     return on;
 }
 
+// G572 (default-ON, rollback DC2_G572_NO_EXACT_ALIGNED_GEN=1): FRAME bases are page units and many transfer bases also happen to
+// be exactly page aligned.  For those bases g471PageRect already names the complete physical-page
+// set, so the historical +1 neighbour is pure over-coverage.  Keep the neighbour for genuinely
+// block-offset bases until the same exact mapping can be proven for them.
+static inline bool g572ExactAlignedGenOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G572_NO_EXACT_ALIGNED_GEN") &&
+                           !envFlagDisabled("DC2_G572_EXACT_ALIGNED_GEN");
+    return on;
+}
+
 // The weight page `s + j` receives from one row's walk over px0..px1: 1 at each end, 2 inside.
 // (px1 >= px0 always, so a single-page row yields weights 1 and 1 over pages s+px0 and s+px0+1 —
 // exactly what the old loop's single iteration did.)
@@ -1152,6 +1261,18 @@ uint64_t g178GenSumRect(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
     const uint32_t py0 = pr.py0, py1 = pr.py1, px0 = pr.px0, px1 = pr.px1;
     const uint32_t basePage = pr.basePage;
     uint64_t sum = 0;
+    const bool exactAligned = g572ExactAlignedGenOn() && (bpBlocks & 31u) == 0u;
+    if (exactAligned)
+    {
+        for (uint32_t py = py0; py <= py1; ++py)
+            for (uint32_t px = px0; px <= px1; ++px)
+            {
+                const uint32_t pg = basePage + py * widthPages + px;
+                sum += g_g178PageGen[pg & (kG178PageCount - 1)].load(
+                    std::memory_order_relaxed);
+            }
+        return sum;
+    }
     if (g476PageRunOn())
     {
         // G476: same multiset of contributions, one load per distinct page (see g476RowWeight).
@@ -1209,8 +1330,50 @@ struct G276PendDisplay
 };
 static G276PendDisplay s_g276Pend;
 
+// G570 diagnostic (default-off, DC2_G570_BUMP_TRACE=1): remember the last generation publisher
+// that touched each physical GS page.  The G569-expanded RTT set packs several 512x416 CT32
+// surfaces only a few pages apart; when the residency invariant moves, this identifies whether
+// the writer was guest CPU traffic or publication of an aliased resident FBO.  The trace mirrors
+// g178BumpRectImpl's exact page walk, including its conservative +1 slack page, but never changes
+// generations or ownership state.
+struct G570BumpTrace
+{
+    uint64_t seq = 0u;
+    uint32_t source = 0u;
+    uint32_t bpBlocks = 0u, bw64 = 0u, psm = 0u;
+    uint32_t x = 0u, y = 0u, w = 0u, h = 0u;
+};
+static std::array<G570BumpTrace, kG178PageCount> g_g570LastBump{};
+static std::atomic<uint64_t> g_g570BumpSeq{0u};
+
+static bool g570BumpTraceOn()
+{
+    static const bool on = envFlagEnabled("DC2_G570_BUMP_TRACE");
+    return on;
+}
+
+static void g570TraceBump(const G471PageRect &pr,
+                          uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
+                          uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                          uint32_t source)
+{
+    if (!g570BumpTraceOn())
+        return;
+    const uint64_t seq = g_g570BumpSeq.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    const G570BumpTrace trace{seq, source, bpBlocks, bw64, psm, x, y, w, h};
+    const uint32_t slack =
+        (g572ExactAlignedGenOn() && (bpBlocks & 31u) == 0u) ? 0u : 1u;
+    for (uint32_t py = pr.py0; py <= pr.py1; ++py)
+    {
+        const uint32_t row = pr.basePage + py * pr.widthPages;
+        for (uint32_t px = pr.px0; px <= pr.px1 + slack; ++px)
+            g_g570LastBump[(row + px) & (kG178PageCount - 1u)] = trace;
+    }
+}
+
 void g178BumpRectImpl(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
-                      uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+                      uint32_t x, uint32_t y, uint32_t w, uint32_t h,
+                      uint32_t g570Source = 0u)
 {
     // G272 diagnostic: identify every generation publisher that touches a display range while its
     // FBO is ahead of VRAM. This is required to distinguish conservative page-range noise from an
@@ -1242,6 +1405,8 @@ void g178BumpRectImpl(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
     const uint32_t widthPages = pr.widthPages;
     const uint32_t py0 = pr.py0, py1 = pr.py1, px0 = pr.px0, px1 = pr.px1;
     const uint32_t basePage = pr.basePage;
+    const bool exactAligned = g572ExactAlignedGenOn() && (bpBlocks & 31u) == 0u;
+    g570TraceBump(pr, bpBlocks, bw64, psm, x, y, w, h, g570Source);
     // G277-R mover probe: report every bump whose page walk (incl. the +1 slack) can touch the
     // 0x68 display chunk-12 pages 200..207 — pins the writer that trips publish-before-upload.
     {
@@ -1249,7 +1414,8 @@ void g178BumpRectImpl(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
         if (s_g277gm)
         {
             const uint32_t pgLo = basePage + py0 * widthPages + px0;
-            const uint32_t pgHi = basePage + py1 * widthPages + px1 + 1u; // +1 slack
+            const uint32_t pgHi = basePage + py1 * widthPages + px1 +
+                                  (exactAligned ? 0u : 1u);
             if (pgLo <= 207u && pgHi >= 200u)
             {
                 // Split the census: the frequent full-scissor inline-hook bump (pgLo=104) vs any
@@ -1268,6 +1434,17 @@ void g178BumpRectImpl(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
                                  bpBlocks, bw64, psm, x, y, w, h, pgLo, pgHi);
             }
         }
+    }
+    if (exactAligned)
+    {
+        for (uint32_t py = py0; py <= py1; ++py)
+            for (uint32_t px = px0; px <= px1; ++px)
+            {
+                const uint32_t pg = basePage + py * widthPages + px;
+                g_g178PageGen[pg & (kG178PageCount - 1)].fetch_add(
+                    1u, std::memory_order_relaxed);
+            }
+        return;
     }
     if (g476PageRunOn())
     {

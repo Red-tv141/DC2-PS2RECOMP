@@ -65,6 +65,38 @@
 namespace
 {
 
+// G570 declarations.  The implementation lives after G530's CT32 row-address helpers, but the
+// replay dispatcher must bracket each lane so the exact 0x139 triangle kernel can operate on one
+// linear color band instead of paying the GS swizzle for every accepted fragment.
+static bool g570Cpu139LinearBatchCandidate();
+static void g570Cpu139LinearBegin(uint8_t *vram, size_t vramSize, int y0, int y1);
+static void g570Cpu139LinearEnd(uint8_t *vram, size_t vramSize);
+static bool g570Cpu139BatchOn();
+static void g570Cpu139PrepareDepthTiles();
+static int g570Cpu139DepthClass(int x0, int y0, int x1, int y1,
+                                float z0, float z1, float z2);
+static bool g570Batch139Prepare();
+static int g570Batch139LastReject();
+static uint64_t g570Batch139ReplayBand(uint8_t *vram, size_t vramSize, int y0, int y1);
+static uint64_t g570Batch139ReplayTri(uint8_t *vram, size_t vramSize,
+                                     int y0, int y1, size_t triIndex);
+static size_t g570Batch139TriCount();
+static void g570Batch139ReadBand(const uint8_t *vram, size_t vramSize,
+                                 int y0, int y1, std::vector<uint32_t> &out);
+static void g570Batch139WriteBand(uint8_t *vram, size_t vramSize,
+                                  int y0, int y1, const std::vector<uint32_t> &in);
+static void g570Batch139NoteVerify(uint64_t pixels, uint64_t bad);
+static bool g570Batch139VerifyOn();
+static bool g570Batch139GpuOn();
+static bool g570Batch139GpuVerifyOn();
+static bool g570Batch139ReplayGpu(const std::vector<uint32_t> &color,
+                                  std::vector<uint32_t> &out);
+static void g570Batch139NoteGpuVerify(uint64_t pixels, uint64_t bad);
+static void g570Batch139ResetCpuDebug();
+static uint32_t g570Batch139GpuDebugAt(size_t index);
+static uint32_t g570Batch139CpuDebugAt(size_t index);
+static uint32_t g570Batch139PackedCoverageHash(int x, int y);
+
 static bool g529StatOn()
 {
     static const bool on = envFlagEnabled("DC2_G529_STAT");
@@ -213,8 +245,9 @@ static int g529ReplayLanes(uint64_t rows, uint64_t px, int constantLanes)
     return static_cast<int>(lanes < 1u ? 1u : lanes);
 }
 
-static void g529NoteDispatch(uint32_t cls, uint64_t wallNs, uint64_t zclrNs, uint64_t scanNs,
-                             size_t entries, uint64_t rows, uint64_t px, int lanes)
+static void g529NoteDispatch(uint32_t cls, uint32_t fbp, uint64_t wallNs,
+                             uint64_t zclrNs, uint64_t scanNs, size_t entries,
+                             uint64_t rows, uint64_t px, int lanes)
 {
     if (!g529StatOn())
         return;
@@ -229,6 +262,25 @@ static void g529NoteDispatch(uint32_t cls, uint64_t wallNs, uint64_t zclrNs, uin
     t_g529.lanesAsked[c] += static_cast<uint64_t>(lanes);
     if (lanes <= 1)
         ++t_g529.inlined[c];
+
+    // G570: the jump/dash stalls are isolated, while the cumulative class means below mix their
+    // 80-180 ms CPU replays with hundreds of sub-millisecond batches. Name the exact framebuffer
+    // of each slow replay before changing admission. This remains under DC2_G529_STAT and is
+    // therefore silent in normal runs.
+    if (wallNs >= 20000000ull)
+    {
+        static uint64_t s_g570SlowReplay = 0u;
+        const uint64_t n = ++s_g570SlowReplay;
+        if (n <= 128u)
+            std::fprintf(stderr,
+                         "[G570:slowreplay] n=%llu fbp=%03x cls=%s wall=%.2fms entries=%zu "
+                         "rows=%llu px=%llu lanes=%d zclr=%.3fms scan=%.3fms\n",
+                         (unsigned long long)n, fbp, kG529ClsName[c],
+                         static_cast<double>(wallNs) / 1e6, entries,
+                         (unsigned long long)rows, (unsigned long long)px, lanes,
+                         static_cast<double>(zclrNs) / 1e6,
+                         static_cast<double>(scanNs) / 1e6);
+    }
 
     uint64_t total = 0;
     for (int i = 0; i < kG529ClsN; ++i)

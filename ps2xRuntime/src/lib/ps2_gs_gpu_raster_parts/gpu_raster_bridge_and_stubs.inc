@@ -8,6 +8,18 @@ bool g178_backend_submit(G178Batch &batch)
     return G178Backend::instance().submit(batch);
 }
 
+bool g570_backend_shadow139(const std::vector<uint32_t> &color,
+                            const std::vector<uint32_t> &depth,
+                            const std::vector<uint32_t> &triWords,
+                            const std::vector<uint32_t> &spanWords,
+                            const std::vector<uint32_t> &tileOffsets,
+                            const std::vector<uint32_t> &tileTris,
+                            std::vector<uint32_t> &out)
+{
+    return G178Backend::instance().submitG570Shadow139(
+        color, depth, triWords, spanWords, tileOffsets, tileTris, out);
+}
+
 // G541: asynchronous, no-readback VU1 transport probe. Private cpp-to-cpp bridge keeps the frozen
 // runtime headers untouched.
 bool g541_backend_null_compute()

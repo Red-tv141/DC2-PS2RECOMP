@@ -19,6 +19,7 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <sstream>
 #include <map>
 #include <unordered_map>
@@ -32,6 +33,17 @@
 #include <vector>
 
 using namespace GSInternal;
+
+// G570 private .cpp-to-.cpp bridge. The validated 0x139 shadow batch is packed into plain word
+// vectors so the GPU worker ABI stays out of the generated runtime headers. Submission is
+// synchronous; every caller-owned vector therefore remains live until the worker has read it.
+bool g570_backend_shadow139(const std::vector<uint32_t> &color,
+                            const std::vector<uint32_t> &depth,
+                            const std::vector<uint32_t> &triWords,
+                            const std::vector<uint32_t> &spanWords,
+                            const std::vector<uint32_t> &tileOffsets,
+                            const std::vector<uint32_t> &tileTris,
+                            std::vector<uint32_t> &out);
 
 // Private live PSMT8 address helper (implemented in ps2_gs_memory.cpp, intentionally absent
 // from the public generated-target header).

@@ -314,10 +314,12 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         else if (a == 0u && b == 2u && c == 0u && d == 1u)
             st.blend = 2; // Cs*As + Cd
         else if (a == 0u && b == 2u && c == 2u && d == 1u && ((al >> 32) & 0xFFull) == 128ull &&
-                 g262WideOn() && g248TargetIndex(ctx.frame.fbp) >= 0)
+                 g262WideOn() && (g248TargetIndex(ctx.frame.fbp) >= 0 ||
+                                  g570Transient13dTarget(ctx.frame.fbp)))
             st.blend = 3; // (Cs-0)*(FIX=128)>>7 + Cd == Cs + Cd (G262 census shape, RTT waves only)
         else if (a == 2u && b == 0u && c == 2u && d == 1u && ((al >> 32) & 0xFFull) == 128ull &&
-                 g262WideOn() && g248TargetIndex(ctx.frame.fbp) >= 0)
+                 g262WideOn() && (g248TargetIndex(ctx.frame.fbp) >= 0 ||
+                                  g570Transient13dTarget(ctx.frame.fbp)))
             st.blend = 4; // (0-Cs)*(FIX=128)>>7 + Cd == Cd - Cs (G262 census shape, RTT waves only)
         else if (a == 2u && b == 1u && c == 0u && d == 1u &&
                  g265DisplayZWaveOn() && g265DisplayTarget(ctx.frame.fbp))
@@ -355,8 +357,10 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         // classes. Looking at MMAG alone made the T8 RTT downsample/effect sprites point-sampled
         // on GPU while their proven CPU replay was bilinear.
         const bool g286ExactEntry = g286TransientTarget(ctx.frame.fbp);
+        const bool g570ExactEntry = g570Transient13dTarget(ctx.frame.fbp);
         const bool g255RttEntry =
-            (g255GpuRttOn() && g248TargetIndex(ctx.frame.fbp) >= 0) || g286ExactEntry;
+            (g255GpuRttOn() && g248TargetIndex(ctx.frame.fbp) >= 0) ||
+            g286ExactEntry || g570ExactEntry;
         st.bilinear = g255RttEntry
             ? tex1UsesLinearFilter(ctx.tex1)
             : (((ctx.tex1 >> 5u) & 1u) != 0u);
@@ -371,7 +375,8 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         // sampling. Bilinear-sampled REPEAT textures (tiled background art) are unaffected.
         // G256's explicit texel fetch applies the CPU sampler's wrap mode itself, including point
         // samples.  Preserve G179's clamp-at-the-normalized-seam convention for the legacy shader.
-        const bool exactSampler = (g256ExactRttOn() && g255RttEntry) || g286ExactEntry;
+        const bool exactSampler = (g256ExactRttOn() && g255RttEntry) ||
+                                  g286ExactEntry || g570ExactEntry;
         st.wrapU = exactSampler ? wu : (st.bilinear ? wu : 1u);
         st.wrapV = exactSampler ? wv : (st.bilinear ? wv : 1u);
     }
@@ -430,7 +435,11 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
             }
             // G262: widened RTT-family entries take the same guestDepth derivation as G242, but
             // the flush executes it as a NON-PERSISTENT per-wave Z round-trip (no ownership).
-            const bool g262Rtt = g262WideOn() && g248TargetIndex(ctx.frame.fbp) >= 0;
+            // G570's 0x13d path uses this same non-persistent guest-depth attachment, but keeps
+            // COLOR transient too: both authorities return to CPU/VRAM before the flush ends.
+            const bool g262Rtt =
+                g262WideOn() && (g248TargetIndex(ctx.frame.fbp) >= 0 ||
+                                 g570Transient13dTarget(ctx.frame.fbp));
             const bool g265Display = g265DisplayZWaveOn() && g265DisplayTarget(ctx.frame.fbp);
             if (g242GpuDepthOn() || g262Rtt || g265Display)
             {
@@ -986,14 +995,21 @@ void g242PrepareVramReadRect(uint8_t *vram, uint32_t bpBlocks, uint32_t bw64, ui
 // Extern hook called immediately before upload/local-transfer writes and immediately after CPU
 // raster writes.  Pre-write callers materialize aliased GPU-owned depth; every caller bumps the
 // page generations so a clean persistent depth texture is re-uploaded on its next use.
-void g178NoteVramWriteRect(uint8_t *vram, uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
-                           uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+void g178NoteVramWriteRectTagged(uint8_t *vram, uint32_t bpBlocks, uint32_t bw64,
+                                 uint32_t psm, uint32_t x, uint32_t y, uint32_t w,
+                                 uint32_t h, uint32_t g570Source)
 {
     if (!g178GpuOn())
         return;
     if (g242WriteOverlapsDirtyDepth(bpBlocks, bw64, psm, x, y, w, h))
         g242PrepareVramReadRect(vram, bpBlocks, bw64, psm, x, y, w, h);
-    g178BumpRectImpl(bpBlocks, bw64, psm, x, y, w, h);
+    g178BumpRectImpl(bpBlocks, bw64, psm, x, y, w, h, g570Source);
+}
+
+void g178NoteVramWriteRect(uint8_t *vram, uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
+                           uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    g178NoteVramWriteRectTagged(vram, bpBlocks, bw64, psm, x, y, w, h, 0u);
 }
 
 // ===== G261 GPU-RESIDENT RTT WAVES (DEFAULT-ON since G266; see g261WaveOn above) =====

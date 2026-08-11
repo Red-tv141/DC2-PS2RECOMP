@@ -57,6 +57,24 @@ bool g566VuAuthorityRequested()
     return on;
 }
 
+// G570: exact compute authority for the narrowly validated FBP 0x139 shadow-volume batch.
+// Provision the worker for either the candidate or its full-surface CPU oracle.
+bool g570Shadow139Requested()
+{
+    // G571 promotion: provision exact 0x139 compute by default.  The legacy arm remains harmless;
+    // DC2_G570_NO_GPU_139=1 is the single backend/front-end rollback.
+    static const bool on = !g158EnvFlag("DC2_G570_NO_GPU_139");
+    return on;
+}
+
+// G571: diagnostic-only exclusive split for the G570 synchronous compute job.  This remains
+// default-off because the extra clocks and stderr traffic perturb the motion window it measures.
+bool g571ShadowSplitOn()
+{
+    static const bool on = g158EnvFlag("DC2_G571_SPLIT");
+    return on;
+}
+
 // G324 diagnostics mirror the front-end armed/census split. They time only the existing logical
 // composite and T8-view QueueItems; default runs pay cached-boolean branches only.
 bool g324BackendCensusOn()
@@ -410,6 +428,17 @@ static bool g561TextureRunsRequested()
                            !g158EnvFlag("DC2_G561_NO_TEXTURE_RUNS");
     return on;
 }
+
+// G570: the G560 shader already carries every per-primitive state field needed by an
+// untextured draw. Sampler/UV state is dead when both adjacent draws have no texture source,
+// so it must not split an otherwise ordered run. Keep this narrowly opt-in while the combat
+// spike and full-frame gates are evaluated.
+static bool g570UntexturedRunsRequested()
+{
+    static const bool on = g158EnvFlag("DC2_G570_UNTEXTURED_RUNS") &&
+                           !g158EnvFlag("DC2_G570_NO_UNTEXTURED_RUNS");
+    return on;
+}
 static uint32_t g349FboKey(uint32_t fbp, int w)
 {
     return (g349DecolOn() && fbp == 0x139u && w != 512) ? kG349Narrow139 : fbp;
@@ -488,7 +517,8 @@ bool g178LoadGLExt(G178GLExt &e)
     }
     else if (g541NullComputeRequested() || g542AbiReplayRequested() ||
              g543SemanticReplayRequested() || g544ChainReplayRequested() ||
-             g545LiveShadowRequested() || g566VuAuthorityRequested())
+             g545LiveShadowRequested() || g566VuAuthorityRequested() ||
+             g570Shadow139Requested())
     {
         // Optional prototype: missing compute support must not disable the proven graphics backend.
         (void)loadProc(e.glBindImageTexture_, "glBindImageTexture");
@@ -496,7 +526,8 @@ bool g178LoadGLExt(G178GLExt &e)
     }
     if (g541NullComputeRequested() || g542AbiReplayRequested() ||
         g543SemanticReplayRequested() || g544ChainReplayRequested() ||
-        g545LiveShadowRequested() || g566VuAuthorityRequested())
+        g545LiveShadowRequested() || g566VuAuthorityRequested() ||
+        g570Shadow139Requested())
         (void)loadProc(e.glDispatchCompute_, "glDispatchCompute");
     return ok;
 }
@@ -782,6 +813,48 @@ public:
     {
         std::lock_guard<std::mutex> lk(m_residentMtx);
         return m_resident.count(key) != 0;
+    }
+
+    bool submitG570Shadow139(const std::vector<uint32_t> &color,
+                             const std::vector<uint32_t> &depth,
+                             const std::vector<uint32_t> &triWords,
+                             const std::vector<uint32_t> &spanWords,
+                             const std::vector<uint32_t> &tileOffsets,
+                             const std::vector<uint32_t> &tileTris,
+                             std::vector<uint32_t> &out)
+    {
+        constexpr size_t surfacePixels = 512u * 512u;
+        if (!g570Shadow139Requested() || !m_g570Available ||
+            !m_ready.load(std::memory_order_acquire) ||
+            color.size() != surfacePixels || depth.size() != surfacePixels ||
+            triWords.empty() || spanWords.empty() || tileOffsets.size() < 1025u ||
+            tileTris.empty() || (triWords.size() % 1024u) != 0u ||
+            (spanWords.size() % 1024u) != 0u ||
+            (tileOffsets.size() % 1024u) != 0u || (tileTris.size() % 1024u) != 0u)
+            return false;
+        SyncWait wait;
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.g570Color = &color;
+            item.g570Depth = &depth;
+            item.g570TriWords = &triWords;
+            item.g570SpanWords = &spanWords;
+            item.g570TileOffsets = &tileOffsets;
+            item.g570TileTris = &tileTris;
+            item.g570Out = &out;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
+            if (g571ShadowSplitOn())
+                item.g571Enqueue = std::chrono::steady_clock::now();
+            m_queue.push_back(std::move(item));
+        }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
+        m_cvWork.notify_one();
+        G447WaitScope g447Scope(4);
+        return wait.wait();
     }
 
     // Synchronous: blocks the calling (EE or MTGS-worker) thread until the batch is rendered and
@@ -1301,6 +1374,14 @@ private:
         std::vector<uint32_t> *g309Readback = nullptr;
         bool g309ForceDraw = false;
         uint32_t g309OutputFbp = kG309CompositeFbp;
+        // G570 exact shadow-volume compute job. All vectors are caller-owned and synchronous.
+        const std::vector<uint32_t> *g570Color = nullptr;
+        const std::vector<uint32_t> *g570Depth = nullptr;
+        const std::vector<uint32_t> *g570TriWords = nullptr;
+        const std::vector<uint32_t> *g570SpanWords = nullptr;
+        const std::vector<uint32_t> *g570TileOffsets = nullptr;
+        const std::vector<uint32_t> *g570TileTris = nullptr;
+        std::vector<uint32_t> *g570Out = nullptr;
         std::shared_ptr<std::promise<bool>> promise;
         // G447: optional caller-owned completion flag, stored (release) by the worker IMMEDIATELY
         // BEFORE promise->set_value so a spinning caller can never observe completion earlier than
@@ -1312,6 +1393,7 @@ private:
         std::chrono::steady_clock::time_point g299Enqueue{};
         uint8_t g324Class = 0u; // 1=G310 T8 view, 2=G310 logical composite
         std::chrono::steady_clock::time_point g324Enqueue{};
+        std::chrono::steady_clock::time_point g571Enqueue{};
     };
     struct TexEntry
     {
@@ -1385,6 +1467,12 @@ private:
             m_g541Available = setupG541NullCompute();
             std::fprintf(stderr, "[G541:null] compute transport %s (async, no readback)\n",
                          m_g541Available ? "READY" : "UNAVAILABLE; CPU path unchanged");
+        }
+        if (g570Shadow139Requested())
+        {
+            m_g570Available = setupG570Shadow139();
+            std::fprintf(stderr, "[G570:gpu139] exact shadow compute %s\n",
+                         m_g570Available ? "READY" : "UNAVAILABLE; CPU path unchanged");
         }
         if (g545LiveShadowRequested() || g566VuAuthorityRequested())
         {
@@ -1771,7 +1859,16 @@ private:
             {
                 uint64_t g495Draws = 0ull, g495Verts = 0ull, g495TexN = 0ull;
                 uint64_t g495TexBytes = 0ull, g495FbBytes = 0ull;
-                if (item.g309PageMap != nullptr)
+                if (item.g570TriWords != nullptr)
+                {
+                    g495Cls = kG495ClsRenderRb;
+                    g495Fence = true;
+                    g495TexBytes = static_cast<uint64_t>(
+                        item.g570Color->size() + item.g570Depth->size() +
+                        item.g570TriWords->size() + item.g570SpanWords->size() +
+                        item.g570TileOffsets->size() + item.g570TileTris->size()) * 4ull;
+                }
+                else if (item.g309PageMap != nullptr)
                     g495Cls = kG495ClsComposite;
                 else if (item.g281Map != nullptr)
                     g495Cls = kG495ClsT8;
@@ -1812,7 +1909,28 @@ private:
             g495GpuBegin(g495Cls);
             try
             {
-                if (item.g309PageMap != nullptr)
+                if (item.g570TriWords != nullptr)
+                {
+                    const bool g571On = g571ShadowSplitOn();
+                    const auto g571WorkStart = g571On ? std::chrono::steady_clock::now()
+                                                      : std::chrono::steady_clock::time_point{};
+                    ok = runG570Shadow139OnWorker(
+                        *item.g570Color, *item.g570Depth, *item.g570TriWords,
+                        *item.g570SpanWords, *item.g570TileOffsets,
+                        *item.g570TileTris, *item.g570Out);
+                    if (g571On)
+                    {
+                        const auto done = std::chrono::steady_clock::now();
+                        const double queueMs = std::chrono::duration<double, std::milli>(
+                            g571WorkStart - item.g571Enqueue).count();
+                        const double workerMs = std::chrono::duration<double, std::milli>(
+                            done - g571WorkStart).count();
+                        std::fprintf(stderr,
+                                     "[G571:gpuqueue] queue=%.3fms worker=%.3fms ok=%u\n",
+                                     queueMs, workerMs, ok ? 1u : 0u);
+                    }
+                }
+                else if (item.g309PageMap != nullptr)
                     ok = buildAuthoritativeCompositeOnWorker(
                         *item.g309PageMap, *item.g309BasePixels,
                         item.g309Readback, item.g309ForceDraw,
@@ -1960,7 +2078,8 @@ private:
             // every cached window. T8/CT24 views write a texture object, not a target FBO.
             if (g495RbCensusOn())
             {
-                if (g495Cls == kG495ClsRenderSkip || g495Cls == kG495ClsRenderRb)
+                if ((g495Cls == kG495ClsRenderSkip || g495Cls == kG495ClsRenderRb) &&
+                    item.batch != nullptr)
                     g495NoteWrite(item.batch->fbp, item.batch->fboKey != 0u);
                 else if (g495Cls == kG495ClsCopy || g495Cls == kG495ClsWriteColor)
                     g495NoteWrite(item.colorFbp, false);
@@ -2095,6 +2214,15 @@ private:
             m_f.glDeleteProgram_(m_g541NullProg);
         if (m_g541StateTex != 0)
             glDeleteTextures(1, &m_g541StateTex);
+        if (m_g570Prog != 0)
+            m_f.glDeleteProgram_(m_g570Prog);
+        const GLuint g570Textures[] = {
+            m_g570ColorTex, m_g570DepthTex, m_g570TriTex,
+            m_g570SpanTex, m_g570TileOffsetTex, m_g570TileTriTex
+        };
+        for (GLuint tex : g570Textures)
+            if (tex != 0u)
+                glDeleteTextures(1, &tex);
         if (m_g545Prog != 0)
             m_f.glDeleteProgram_(m_g545Prog);
         if (m_g545CommandTex != 0)
@@ -2377,6 +2505,260 @@ private:
             m_g545NextCheck = executed + m_g545CheckInterval;
         }
         return !m_g545Disabled.load(std::memory_order_acquire);
+    }
+
+    bool setupG570Shadow139()
+    {
+        if (m_e.glDispatchCompute_ == nullptr || m_e.glBindImageTexture_ == nullptr ||
+            m_e.glMemoryBarrier_ == nullptr)
+            return false;
+
+        static const char *kCS = R"GLSL(#version 430 core
+layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
+layout(r32ui, binding=0) uniform uimage2D gColor;
+layout(r32ui, binding=1) uniform uimage2D gDepth;
+layout(r32ui, binding=2) readonly uniform uimage2D gTris;
+layout(r32ui, binding=3) readonly uniform uimage2D gSpans;
+layout(r32ui, binding=4) readonly uniform uimage2D gTileOffsets;
+layout(r32ui, binding=5) readonly uniform uimage2D gTileTris;
+
+ivec2 dataCoord(uint i) { return ivec2(int(i & 1023u), int(i >> 10u)); }
+uint triWord(uint i) { return imageLoad(gTris, dataCoord(i)).r; }
+uint spanWord(uint i) { return imageLoad(gSpans, dataCoord(i)).r; }
+uint offsetWord(uint i) { return imageLoad(gTileOffsets, dataCoord(i)).r; }
+uint tileTriWord(uint i) { return imageLoad(gTileTris, dataCoord(i)).r; }
+void main()
+{
+    ivec2 ip = ivec2(gl_GlobalInvocationID.xy);
+    if (ip.x >= 512 || ip.y >= 512)
+        return;
+    uint tile = uint(ip.y >> 4) * 32u + uint(ip.x >> 4);
+    uint first = offsetWord(tile);
+    uint last = offsetWord(tile + 1u);
+    uint color = imageLoad(gColor, ip).r;
+    uint zdst = imageLoad(gDepth, ip).r;
+    for (uint ref = first; ref < last; ++ref)
+    {
+        uint tri = tileTriWord(ref);
+        uint b = tri * 20u;
+        int minY = int(triWord(b + 2u));
+        int maxY = int(triWord(b + 3u));
+        if (ip.y < minY || ip.y > maxY)
+            continue;
+        uint spanBase = (triWord(b + 4u) + uint(ip.y - minY)) * 4u;
+        uint packedSpan = spanWord(spanBase);
+        int xStart = int(packedSpan << 16u) >> 16;
+        int xEnd = int(packedSpan) >> 16;
+        if (ip.x < xStart || ip.x > xEnd)
+            continue;
+
+        int dx = ip.x - xStart;
+        int e0 = int(spanWord(spanBase + 1u)) + int(triWord(b + 5u)) * dx;
+        int e1 = int(spanWord(spanBase + 2u)) + int(triWord(b + 6u)) * dx;
+        int e2 = int(spanWord(spanBase + 3u)) + int(triWord(b + 7u)) * dx;
+        uint mode = triWord(b + 8u);
+        if (e0 < 0 || (e0 == 0 && (mode & 1u) == 0u) ||
+            e1 < 0 || (e1 == 0 && (mode & 2u) == 0u) ||
+            e2 < 0 || (e2 == 0 && (mode & 4u) == 0u))
+            continue;
+
+        precise float a0 = uintBitsToFloat(triWord(b + 9u));
+        precise float b0 = uintBitsToFloat(triWord(b + 10u));
+        precise float a1 = uintBitsToFloat(triWord(b + 11u));
+        precise float b1 = uintBitsToFloat(triWord(b + 12u));
+        precise float lx2 = uintBitsToFloat(triWord(b + 13u));
+        precise float ly2 = uintBitsToFloat(triWord(b + 14u));
+        precise float winding = uintBitsToFloat(triWord(b + 15u));
+        precise float invDenom = uintBitsToFloat(triWord(b + 16u));
+        precise float px = float(ip.x);
+        precise float py = float(ip.y);
+        precise float px2 = px - lx2;
+        precise float py2 = py - ly2;
+        precise float w0m0 = a0 * px2;
+        precise float w0m1 = b0 * py2;
+        precise float w0a = w0m0 + w0m1;
+        precise float w0w = w0a * winding;
+        precise float w0 = w0w * invDenom;
+        precise float w1m0 = a1 * px2;
+        precise float w1m1 = b1 * py2;
+        precise float w1a = w1m0 + w1m1;
+        precise float w1w = w1a * winding;
+        precise float w1 = w1w * invDenom;
+        precise float oneMinusW0 = 1.0 - w0;
+        precise float w2 = oneMinusW0 - w1;
+        precise float z0 = uintBitsToFloat(triWord(b + 17u));
+        precise float z1 = uintBitsToFloat(triWord(b + 18u));
+        precise float z2 = uintBitsToFloat(triWord(b + 19u));
+        precise float zm0 = z0 * w0;
+        precise float zm1 = z1 * w1;
+        precise float za = zm0 + zm1;
+        precise float zm2 = z2 * w2;
+        precise float zf = za + zm2;
+        zf = clamp(zf, 0.0, 16777215.0);
+        if (uint(zf) < zdst)
+            continue;
+        uint r = color & 255u;
+        uint g = (color >> 8u) & 255u;
+        uint bl = (color >> 16u) & 255u;
+        if ((mode & 0x100u) != 0u)
+        {
+            r = min(r + 1u, 255u);
+            g = min(g + 1u, 255u);
+            bl = min(bl + 1u, 255u);
+        }
+        else
+        {
+            r = r == 0u ? 0u : r - 1u;
+            g = g == 0u ? 0u : g - 1u;
+            bl = bl == 0u ? 0u : bl - 1u;
+        }
+        color = 0x40000000u | r | (g << 8u) | (bl << 16u);
+    }
+    imageStore(gColor, ip, uvec4(color, 0u, 0u, 0u));
+}
+)GLSL";
+
+        GLuint cs = 0u;
+        std::string log;
+        if (!g158CompileShader(m_f, GL541_COMPUTE_SHADER, kCS, cs, log))
+        {
+            std::fprintf(stderr, "[G570:gpu139] compute compile failed: %s\n", log.c_str());
+            return false;
+        }
+        m_g570Prog = m_f.glCreateProgram_();
+        m_f.glAttachShader_(m_g570Prog, cs);
+        m_f.glLinkProgram_(m_g570Prog);
+        GLint linked = 0;
+        m_f.glGetProgramiv_(m_g570Prog, GL158_LINK_STATUS, &linked);
+        m_f.glDeleteShader_(cs);
+        if (!linked)
+        {
+            GLint len = 0;
+            m_f.glGetProgramiv_(m_g570Prog, GL158_INFO_LOG_LENGTH, &len);
+            std::vector<char> buf(len > 0 ? static_cast<size_t>(len) : 1u, 0);
+            m_f.glGetProgramInfoLog_(m_g570Prog, static_cast<GLsizei>(buf.size()),
+                                     nullptr, buf.data());
+            std::fprintf(stderr, "[G570:gpu139] compute link failed: %s\n", buf.data());
+            m_f.glDeleteProgram_(m_g570Prog);
+            m_g570Prog = 0u;
+            return false;
+        }
+        return true;
+    }
+
+    bool g570UploadWords(GLuint &tex, uint32_t &allocatedRows, uint32_t width,
+                         const std::vector<uint32_t> &words)
+    {
+        if (width == 0u || words.empty() || (words.size() % width) != 0u)
+            return false;
+        const uint32_t rows = static_cast<uint32_t>(words.size() / width);
+        if (tex == 0u)
+        {
+            glGenTextures(1, &tex);
+            if (tex == 0u)
+                return false;
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        }
+        else
+            glBindTexture(GL_TEXTURE_2D, tex);
+        if (allocatedRows < rows)
+        {
+            glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(GL541_R32UI),
+                         static_cast<GLsizei>(width), static_cast<GLsizei>(rows), 0,
+                         GL541_RED_INTEGER, GL_UNSIGNED_INT, words.data());
+            allocatedRows = rows;
+        }
+        else
+        {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0,
+                            static_cast<GLsizei>(width), static_cast<GLsizei>(rows),
+                            GL541_RED_INTEGER, GL_UNSIGNED_INT, words.data());
+        }
+        return true;
+    }
+
+    bool runG570Shadow139OnWorker(const std::vector<uint32_t> &color,
+                                  const std::vector<uint32_t> &depth,
+                                  const std::vector<uint32_t> &triWords,
+                                  const std::vector<uint32_t> &spanWords,
+                                  const std::vector<uint32_t> &tileOffsets,
+                                  const std::vector<uint32_t> &tileTris,
+                                  std::vector<uint32_t> &out)
+    {
+        if (!m_g570Available || m_g570Prog == 0u)
+            return false;
+
+        const bool g571On = g571ShadowSplitOn();
+        auto g571Mark = std::chrono::steady_clock::now();
+        const auto g571LapUs = [&]() {
+            const auto now = std::chrono::steady_clock::now();
+            const uint64_t us = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(now - g571Mark).count());
+            g571Mark = now;
+            return us;
+        };
+        uint64_t g571ColorUs = 0u, g571DepthUs = 0u, g571TriUs = 0u;
+        uint64_t g571SpanUs = 0u, g571OffsetUs = 0u, g571TileUs = 0u;
+        uint64_t g571DispatchUs = 0u, g571ReadUs = 0u;
+
+        if (!g570UploadWords(m_g570ColorTex, m_g570ColorRows, 512u, color))
+            return false;
+        if (g571On) g571ColorUs = g571LapUs();
+        if (!g570UploadWords(m_g570DepthTex, m_g570DepthRows, 512u, depth))
+            return false;
+        if (g571On) g571DepthUs = g571LapUs();
+        if (!g570UploadWords(m_g570TriTex, m_g570TriRows, 1024u, triWords))
+            return false;
+        if (g571On) g571TriUs = g571LapUs();
+        if (!g570UploadWords(m_g570SpanTex, m_g570SpanRows, 1024u, spanWords))
+            return false;
+        if (g571On) g571SpanUs = g571LapUs();
+        if (!g570UploadWords(m_g570TileOffsetTex, m_g570TileOffsetRows, 1024u, tileOffsets))
+            return false;
+        if (g571On) g571OffsetUs = g571LapUs();
+        if (!g570UploadWords(m_g570TileTriTex, m_g570TileTriRows, 1024u, tileTris))
+            return false;
+        if (g571On) g571TileUs = g571LapUs();
+
+        m_f.glUseProgram_(m_g570Prog);
+        m_e.glBindImageTexture_(0u, m_g570ColorTex, 0, GL_FALSE, 0,
+                                GL178_READ_WRITE, GL541_R32UI);
+        m_e.glBindImageTexture_(1u, m_g570DepthTex, 0, GL_FALSE, 0,
+                                GL542_READ_ONLY, GL541_R32UI);
+        m_e.glBindImageTexture_(2u, m_g570TriTex, 0, GL_FALSE, 0,
+                                GL542_READ_ONLY, GL541_R32UI);
+        m_e.glBindImageTexture_(3u, m_g570SpanTex, 0, GL_FALSE, 0,
+                                GL542_READ_ONLY, GL541_R32UI);
+        m_e.glBindImageTexture_(4u, m_g570TileOffsetTex, 0, GL_FALSE, 0,
+                                GL542_READ_ONLY, GL541_R32UI);
+        m_e.glBindImageTexture_(5u, m_g570TileTriTex, 0, GL_FALSE, 0,
+                                GL542_READ_ONLY, GL541_R32UI);
+        m_e.glDispatchCompute_(64u, 64u, 1u);
+        m_e.glMemoryBarrier_(GL178_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                             GL178_TEXTURE_UPDATE_BARRIER_BIT);
+        if (g571On) g571DispatchUs = g571LapUs();
+        const size_t surfacePixels = 512u * 512u;
+        out.resize(surfacePixels);
+        glBindTexture(GL_TEXTURE_2D, m_g570ColorTex);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL541_RED_INTEGER, GL_UNSIGNED_INT, out.data());
+        if (g571On)
+        {
+            g571ReadUs = g571LapUs();
+            static uint64_t s_g571Batch = 0u;
+            std::fprintf(stderr,
+                         "[G571:gpuwork] n=%llu color=%.3f depth=%.3f tri=%.3f "
+                         "span=%.3f offset=%.3f tile=%.3f dispatch=%.3f read=%.3f total=%.3fms\n",
+                         static_cast<unsigned long long>(++s_g571Batch),
+                         g571ColorUs / 1000.0, g571DepthUs / 1000.0,
+                         g571TriUs / 1000.0, g571SpanUs / 1000.0,
+                         g571OffsetUs / 1000.0, g571TileUs / 1000.0,
+                         g571DispatchUs / 1000.0, g571ReadUs / 1000.0,
+                         (g571ColorUs + g571DepthUs + g571TriUs + g571SpanUs +
+                          g571OffsetUs + g571TileUs + g571DispatchUs + g571ReadUs) / 1000.0);
+        }
+        return true;
     }
 
     bool setupG541NullCompute()
@@ -2765,7 +3147,8 @@ private:
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Base"),
                          static_cast<GLint>(kG309BaseUnit));
 
-        if (g560MultiDrawRequested() || g561TextureRunsRequested())
+        if (g560MultiDrawRequested() || g561TextureRunsRequested() ||
+            g570UntexturedRunsRequested())
         {
             // Keep the proven program independent: a driver without dual-source output support
             // simply leaves G560 unavailable and continues on the byte-identical legacy path.
@@ -2897,7 +3280,8 @@ private:
             m_g560Available = setupG560();
             std::fprintf(stderr, "[G560:backend] flat-state ordered runs %s mode=%s\n",
                          m_g560Available ? "READY" : "UNAVAILABLE; legacy path kept",
-                         g561TextureRunsRequested() ? "same-texture" : "blend-only");
+                         g561TextureRunsRequested() ? "same-texture" :
+                         (g570UntexturedRunsRequested() ? "untextured" : "blend-only"));
         }
         return true;
     }
@@ -4890,18 +5274,26 @@ private:
         // (DC2_G268_LIVE_ENVREAD=1 restores the per-call read for A/B).
         static const bool s_g255GpuRttEnvLive = g158EnvFlag("DC2_G268_LIVE_ENVREAD");
         static const bool s_g255GpuRttEnv = (std::getenv("DC2_G255_GPU_RTT") != nullptr);
+        const bool g255KnownRtt =
+            b.fbp == 0x139u || b.fbp == 0x13cu || b.fbp == 0x143u ||
+            b.fbp == 0x146u || b.fbp == 0x155u;
         const bool g255RttAlpha =
-            (b.rttRawAlpha || (s_g255GpuRttEnvLive
-                                   ? (std::getenv("DC2_G255_GPU_RTT") != nullptr)
-                                   : s_g255GpuRttEnv)) &&
-            (b.fbp == 0x139u || b.fbp == 0x13cu || b.fbp == 0x143u ||
-             b.fbp == 0x146u || b.fbp == 0x155u);
+            ((b.rttRawAlpha || (s_g255GpuRttEnvLive
+                                    ? (std::getenv("DC2_G255_GPU_RTT") != nullptr)
+                                    : s_g255GpuRttEnv)) && g255KnownRtt) ||
+            // G570's transient 0x13d batch sets the explicit per-batch contract. Do not widen the
+            // legacy environment switch to arbitrary targets; only this tagged path stores PS2's
+            // raw 0..128 framebuffer alpha after fixed-function RGB blending.
+            (b.rttRawAlpha && b.fbp == 0x13du);
         const bool g256Exact = g256ExactRttOn() && m_progExact != 0u &&
             (b.fbp == 0x139u || b.fbp == 0x13cu || b.fbp == 0x143u ||
              b.fbp == 0x146u || b.fbp == 0x155u) && !guestDepth;
         const bool g561TextureRuns = g561TextureRunsRequested() && m_g560Available && !g256Exact;
-        const bool g560MultiDraw = (g560MultiDrawRequested() || g561TextureRuns) &&
-                                   m_g560Available && !g256Exact;
+        const bool g570UntexturedRuns =
+            g570UntexturedRunsRequested() && m_g560Available && !g256Exact;
+        const bool g560MultiDraw =
+            (g560MultiDrawRequested() || g561TextureRuns || g570UntexturedRuns) &&
+            m_g560Available && !g256Exact;
 
         // G561: snapshot every shader-varying piece of G178Draw into four exactly-representable
         // packed floats.  Texture/sampler, scissor, low depth state, and blend equation remain fixed
@@ -5079,6 +5471,25 @@ private:
                    a.texKey == z.texKey && a.srcFbp == z.srcFbp &&
                    a.bilinear == z.bilinear && a.wrapU == z.wrapU && a.wrapV == z.wrapV;
         };
+        const auto g570StateEqual = [&](const G178Draw &a, const G178Draw &z) {
+            if (g560StateEqual(a, z))
+                return true;
+            const bool bothUntextured =
+                a.texKey == 0u && a.srcFbp == 0u && z.texKey == 0u && z.srcFbp == 0u;
+            return bothUntextured && a.firstVtx + a.vtxCount == z.firstVtx &&
+                   (a.depthFunc & 0x0fu) == (z.depthFunc & 0x0fu) &&
+                   a.depthWrite == z.depthWrite &&
+                   (a.blend == 4u) == (z.blend == 4u) &&
+                   a.scX0 == z.scX0 && a.scY0 == z.scY0 &&
+                   a.scX1 == z.scX1 && a.scY1 == z.scY1;
+        };
+        const auto g570RunEqual = [&](const G178Draw &a, const G178Draw &z) {
+            if (g561TextureRuns && g561StateEqual(a, z))
+                return true;
+            if (g570UntexturedRuns && g570StateEqual(a, z))
+                return true;
+            return g560StateEqual(a, z);
+        };
 
         // G559 premise gate (DC2_G559_DRAW_RUN_CENSUS=1, diagnostic only): price the draw-call
         // reduction available from a future multi-draw shader before building it.  The existing
@@ -5160,9 +5571,7 @@ private:
             size_t g560RunEnd = drawIndex + 1u;
             if (g560MultiDraw)
                 while (g560RunEnd < b.draws.size() &&
-                       (g561TextureRuns
-                            ? g561StateEqual(b.draws[g560RunEnd - 1u], b.draws[g560RunEnd])
-                            : g560StateEqual(b.draws[g560RunEnd - 1u], b.draws[g560RunEnd])))
+                       g570RunEqual(b.draws[g560RunEnd - 1u], b.draws[g560RunEnd]))
                     ++g560RunEnd;
             const int g560VtxCount = g560MultiDraw
                                          ? (b.draws[g560RunEnd - 1u].firstVtx +
@@ -5733,6 +6142,12 @@ private:
     GLuint m_g541NullProg = 0, m_g541StateTex = 0;
     GLint m_locG541KickCount = -1;
     bool m_g541Available = false;
+    GLuint m_g570Prog = 0;
+    GLuint m_g570ColorTex = 0, m_g570DepthTex = 0, m_g570TriTex = 0;
+    GLuint m_g570SpanTex = 0, m_g570TileOffsetTex = 0, m_g570TileTriTex = 0;
+    uint32_t m_g570ColorRows = 0, m_g570DepthRows = 0, m_g570TriRows = 0;
+    uint32_t m_g570SpanRows = 0, m_g570TileOffsetRows = 0, m_g570TileTriRows = 0;
+    bool m_g570Available = false;
     std::weak_ptr<G541NullBatch> m_g541QueuedBatch;
     std::atomic<uint64_t> m_g541Submitted{0ull};
     std::atomic<uint64_t> m_g541Executed{0ull};

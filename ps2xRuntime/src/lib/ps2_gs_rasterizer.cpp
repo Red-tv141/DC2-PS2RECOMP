@@ -302,6 +302,11 @@ int g498OwnPubArm();
 #include "ps2_gs_rasterizer_parts/g530_sprite_span.inc"
 
 
+// G570: exact CPU leaf kernel for the combat FBP 0x139 replay.  It reuses G530's CT32 row/group
+// swizzle helpers and therefore must follow g530_sprite_span.inc; drawTriangle is its only caller.
+#include "ps2_gs_rasterizer_parts/g570_cpu_triangle.inc"
+
+
 #include "ps2_gs_rasterizer_parts/rasterizer_draw_sprite.inc"
 
 

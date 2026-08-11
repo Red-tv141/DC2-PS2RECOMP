@@ -770,15 +770,16 @@ static void g261NoteCpuRttWrites(uint8_t *vram)
         {
             const uint32_t w = static_cast<uint32_t>(c.scissor.x1 - c.scissor.x0 + 1);
             const uint32_t h = static_cast<uint32_t>(c.scissor.y1 - c.scissor.y0 + 1);
-            g178NoteVramWriteRect(vram, framePageBaseToBlock(c.frame.fbp),
-                                  c.frame.fbw, c.frame.psm,
-                                  c.scissor.x0, c.scissor.y0, w, h);
+            g178NoteVramWriteRectTagged(vram, framePageBaseToBlock(c.frame.fbp),
+                                        c.frame.fbw, c.frame.psm,
+                                        c.scissor.x0, c.scissor.y0, w, h,
+                                        2u); // G570 source 2: post-CPU-replay RTT color write
             if (((c.zbuf >> 32u) & 1u) == 0u)
-                g178NoteVramWriteRect(vram,
-                                      static_cast<uint32_t>(c.zbuf & 0x1FFu) << 5u,
-                                      c.frame.fbw,
-                                      static_cast<uint32_t>((c.zbuf >> 24u) & 0xFu),
-                                      c.scissor.x0, c.scissor.y0, w, h);
+                g178NoteVramWriteRectTagged(
+                    vram, static_cast<uint32_t>(c.zbuf & 0x1FFu) << 5u,
+                    c.frame.fbw, static_cast<uint32_t>((c.zbuf >> 24u) & 0xFu),
+                    c.scissor.x0, c.scissor.y0, w, h,
+                    3u); // G570 source 3: post-CPU-replay RTT depth write
         }
     }
 }
@@ -1101,6 +1102,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
 
     const uint32_t fbp = g_g144List[0].ctx.frame.fbp;
     const bool g286Transient = g286TransientTarget(fbp);
+    const bool g570Transient13d = g570Transient13dTarget(fbp);
     if (g286Transient)
     {
         g_g286GpuAttempts.fetch_add(1u, std::memory_order_relaxed);
@@ -1159,7 +1161,14 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         if (!s_g524NoTrnMat)
             g261PrepareCpuReplay();
     }
-    // G523 prologue lap P0: the g286 transient-target admission (and its g261PrepareCpuReplay).
+    if (g570Transient13d)
+    {
+        // 0x13d overlaps 0x139 physically. Publish every resident sibling before framebuffer
+        // upload, then keep this target transient so the reverse edge can never find it dirty.
+        g_g570TransientAttempts.fetch_add(1u, std::memory_order_relaxed);
+        g261PrepareCpuReplay();
+    }
+    // G523 prologue lap P0: transient-target admission (and its g261PrepareCpuReplay).
     const auto g523P0 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
     const bool g255Rtt = g255GpuRttOn() && g248TargetIndex(fbp) >= 0;
@@ -1171,7 +1180,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const bool g255HeavyVerifyThis = g553VerifySelected(fbp) || g557VerifySelected(fbp);
     const bool g255VerifyThis = g255VerifyOn() && (!g255HeavyVerify || g255HeavyVerifyThis);
     const bool g261GlobalWave = g261WaveOn();
-    const bool g261Wave = g255Rtt && g261GlobalWave && !g255HeavyVerifyThis;
+    // G570's 0x139 same-run oracle needs immediate color readback and CPU replay, while keeping
+    // global waves alive so the G411 private-depth bridge remains selected.
+    const bool g261Wave = g255Rtt && g261GlobalWave && !g255HeavyVerifyThis &&
+                          !g570Verify139On();
     if (g261GlobalWave)
     {
         g_g261VramSize = vramSize; // materialize needs the size; GS::m_vramSize is private
@@ -1209,7 +1221,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // were a DISPLAY batch: framebuffer upload, alias/generation reasoning and readback all tuned
     // for 0x0/0x68, applied to an arbitrary address. The value this lever buys is the 8-lane
     // band-parallel CPU replay below, not the GPU. Route it there explicitly.
-    if (g527DiscoveredTarget(fbp))
+    if (g527DiscoveredTarget(fbp) && !g570Transient13d)
     {
         g_g266FlushRej = kG266FrCpuOnlyRtt;
         return false;
@@ -1275,6 +1287,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     int g282DepthLo = kFbH, g282DepthHi = -1;
     const bool g282Candidate =
         g282TightRowsOn() && fbp == 0x139u && fbw == 8u;
+    const bool g570Candidate =
+        g570Transient13d && fbp == 0x13du && fbw == 8u &&
+        g_g144List[0].ctx.frame.psm == GS_PSM_CT32;
+    const bool g570Private139Candidate =
+        g570Private139On() && fbp == 0x139u && fbw == 8u &&
+        g_g144List[0].ctx.frame.psm == GS_PSM_CT32;
     // G290: accumulate the same exact per-entry row unions WITHOUT engaging the default-off
     // G282 tight/seeding/fan-out machinery (g282MeasuredFamily stays gated on g282Candidate).
     const bool g290Candidate =
@@ -1419,7 +1437,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             {
                 depthRowLo = std::min(depthRowLo, static_cast<int>(st.scY0));
                 depthRowHi = std::max(depthRowHi, static_cast<int>(st.scY1));
-                if ((g282Candidate || g290Candidate) && g282EntryHi >= g282EntryLo)
+                if ((g282Candidate || g290Candidate || g570Candidate ||
+                     g570Private139Candidate) &&
+                    g282EntryHi >= g282EntryLo)
                 {
                     g282DepthLo = std::min(g282DepthLo, g282EntryLo);
                     g282DepthHi = std::max(g282DepthHi, g282EntryHi);
@@ -1431,7 +1451,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         {
             rowLo = std::min(rowLo, static_cast<int>(st.scY0));
             rowHi = std::max(rowHi, static_cast<int>(st.scY1));
-            if ((g282Candidate || g290Candidate) && g282EntryHi >= g282EntryLo)
+            if ((g282Candidate || g290Candidate || g570Candidate ||
+                 g570Private139Candidate) &&
+                g282EntryHi >= g282EntryLo)
             {
                 g282RowLo = std::min(g282RowLo, g282EntryLo);
                 g282RowHi = std::max(g282RowHi, g282EntryHi);
@@ -1581,6 +1603,72 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         else
             g_g290ExactRejShape.fetch_add(1u, std::memory_order_relaxed);
     }
+
+    // G570: classifier-approved 0x13d work is safe under a TRANSIENT contract. Pass 1 already
+    // proved every draw/state the backend implements, one CT32 target and at most one Z tuple.
+    // The only extra ownership proof is that live Z is the G403/G411 private mirror: color and
+    // depth then cannot alias despite their historical GS page ranges, and writable depth is read
+    // back into that mirror before return. Color is likewise read back and generation-published.
+    // Exact primitive bounds reduce both synchronous readbacks without changing coverage.
+    bool g570Exact13d =
+        g570Candidate && g282RowHi >= g282RowLo &&
+        (!guestDepth ||
+         (guestZbpPage == 0x0d0u && guestZpsm == 1u &&
+          g282DepthHi >= g282DepthLo && g411SharedGpuDepthOn() &&
+          g404SharedZScope(fbp, fbw, guestZbpPage, guestZpsm)));
+    if (g570Exact13d)
+    {
+        rowLo = g282RowLo;
+        rowHi = g282RowHi;
+        if (guestDepth)
+        {
+            depthRowLo = g282DepthLo;
+            depthRowHi = g282DepthHi;
+        }
+    }
+    if (g570Transient13d && !g570Exact13d)
+    {
+        const uint64_t n =
+            g_g570TransientRejectShape.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (g570Transient13dStatOn() && (n <= 8u || (n % 30u) == 0u))
+            std::fprintf(stderr,
+                         "[G570:transient13d-reject] n=%llu candidate=%u entries=%zu "
+                         "rows=%d..%d zrows=%d..%d guestZ=%u zwrite=%u\n",
+                         (unsigned long long)n, g570Candidate ? 1u : 0u,
+                         g_g144List.size(), g282RowLo, g282RowHi,
+                         g282DepthLo, g282DepthHi, guestDepth ? 1u : 0u,
+                         guestDepthWrites ? 1u : 0u);
+        g_g266FlushRej = kG266FrCpuOnlyRtt;
+        g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+        g_g178FbSnap.clear();
+        return false;
+    }
+
+    // G570: G403/G411 makes this depth surface a private authority shared by CPU and GPU.  Under
+    // that contract the historical CT32/Z24 page overlap is not a live alias.  Keep admission
+    // deliberately narrow: one measured target/layout, read-only private Z, classifier-approved
+    // entries, and exact primitive-bound row windows.  Any contract drift preserves CPU replay.
+    bool g570Exact139 =
+        g570Private139Candidate && guestDepth && !guestDepthWrites &&
+        guestZbpPage == 0x0d0u && guestZpsm == 1u &&
+        g282RowHi >= g282RowLo && g282DepthHi >= g282DepthLo &&
+        g411SharedGpuDepthOn() &&
+        g404SharedZScope(fbp, fbw, guestZbpPage, guestZpsm);
+    if (g570Exact139)
+    {
+        rowLo = g282RowLo;
+        rowHi = g282RowHi;
+        depthRowLo = g282DepthLo;
+        depthRowHi = g282DepthHi;
+        static uint64_t s_admit = 0u;
+        const uint64_t n = ++s_admit;
+        if ((g570Verify139On() || envFlagEnabled("DC2_G570_STAT")) &&
+            (n <= 8u || (n % 30u) == 0u))
+            std::fprintf(stderr,
+                         "[G570:private139] n=%llu entries=%zu rows=%d..%d zrows=%d..%d\n",
+                         (unsigned long long)n, g_g144List.size(), rowLo, rowHi,
+                         depthRowLo, depthRowHi);
+    }
     if (g255Rtt && guestDepth && !g262WideOn())
     {
         // G255 owns RTT color only. Real-Z batches retain the proven CPU replay until a separate
@@ -1673,7 +1761,22 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         const bool g282SeededColorZ =
             g282Tight && rawColorZAlias && rowLo == 0 && rowHi <= 447 &&
             depthRowLo >= 32 && depthRowHi <= 447;
-        const bool colorZAlias = rawColorZAlias && !g282SeededColorZ && !g290Seeded;
+        // G570's exact 0x13d batch reads/writes the G403/G411 private depth mirror. Its color and
+        // depth operations therefore do not share an authority even though their legacy GS page
+        // ranges overlap; both immediate readbacks restore CPU authority before this flush ends.
+        const bool colorZAlias = rawColorZAlias && !g282SeededColorZ && !g290Seeded &&
+                                  !g570Exact13d && !g570Exact139;
+        if (g570Exact13d && g570Transient13dStatOn())
+        {
+            static uint64_t s_g570Admit = 0u;
+            const uint64_t n = ++s_g570Admit;
+            if (n <= 8u || (n % 30u) == 0u)
+                std::fprintf(stderr,
+                             "[G570:transient13d-admit] n=%llu alias=%u entries=%zu "
+                             "rows=%d..%d zrows=%d..%d\n",
+                             (unsigned long long)n, rawColorZAlias ? 1u : 0u,
+                             g_g144List.size(), rowLo, rowHi, depthRowLo, depthRowHi);
+        }
         const bool g282LegacyAlias =
             g282Tight && g242RectsOverlap(
                 fbBlock, fbw, GS_PSM_CT32, 0u,
@@ -1954,7 +2057,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // G261: waves leave the result in the FBO (no readPixels, no swizzle-writeback); the raw-
     // alpha RTT store rides the batch flag so the backend does not depend on the G255 env var.
     s_batch.skipReadback = g261Wave || g272Wave || g276Coalesce;
-    s_batch.rttRawAlpha = g255Rtt || g286Transient;
+    s_batch.rttRawAlpha = g255Rtt || g286Transient || g570Exact13d;
 
     // Depth-clear on target change: mirror g106TitleZClearIfNeeded's fbp-transition semantics and
     // keep the CPU private-Z state machine in sync for any CPU-fallback flush in between.
@@ -2013,6 +2116,42 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                              "[G261:invariant] escaped writer fbp=0x%x genAtSkip=%llu genNow=%llu n=%llu\n",
                              fbp, (unsigned long long)r.genAtSkip,
                              (unsigned long long)g261WinNow, (unsigned long long)n);
+                uint64_t g570TargetInvariant = 0u;
+                if (g570BumpTraceOn())
+                {
+                    static std::array<uint64_t, kG248TargetCount> s_g570InvariantsByTarget{};
+                    g570TargetInvariant = ++s_g570InvariantsByTarget[g248TargetIndex(fbp)];
+                }
+                if (g570BumpTraceOn() &&
+                    (g570TargetInvariant <= 4u || (n % 512u) == 0u) &&
+                    r.g536PageGenFbw == r.fbw && r.fbw != 0u)
+                {
+                    uint32_t shown = 0u;
+                    const uint32_t pageRowLo = static_cast<uint32_t>(std::max(0, r.winLo)) / 32u;
+                    const uint32_t pageRowHi = static_cast<uint32_t>(std::min(511, r.winHi)) / 32u;
+                    for (uint32_t pr = pageRowLo; pr <= pageRowHi && shown < 8u; ++pr)
+                    {
+                        for (uint32_t pc = 0u; pc < r.fbw && shown < 8u; ++pc)
+                        {
+                            const uint32_t slot = pr * r.fbw + pc;
+                            const uint32_t page = (fbp + slot) & (kG178PageCount - 1u);
+                            const uint64_t now = g_g178PageGen[page].load(std::memory_order_relaxed);
+                            if (slot >= r.g536PageGen.size() || now == r.g536PageGen[slot])
+                                continue;
+                            const G570BumpTrace &b = g_g570LastBump[page];
+                            std::fprintf(
+                                stderr,
+                                "[G570:bump-owner] inv=%llu target=%03x page=%03x gen=%llu->%llu "
+                                "seq=%llu src=%u bp=%04x bw=%u psm=%02x rect=(%u,%u %ux%u)\n",
+                                static_cast<unsigned long long>(n), fbp, page,
+                                static_cast<unsigned long long>(r.g536PageGen[slot]),
+                                static_cast<unsigned long long>(now),
+                                static_cast<unsigned long long>(b.seq), b.source, b.bpBlocks,
+                                b.bw64, b.psm, b.x, b.y, b.w, b.h);
+                            ++shown;
+                        }
+                    }
+                }
                 g280DropOverlays(g248TargetIndex(fbp)); // residency dies; nothing publishes them
                 r.dirty = false;
                 r.dirtyLo = 512;
@@ -3197,12 +3336,16 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             if (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u)
                 continue; // G310 decoded this exact self-atlas snapshot before publication.
 
-            // G281: close the measured format-crossing consumer before the generic overlap loop
-            // materializes 0x13c. Admission proves the exact PSMT8 byte map belongs solely to
-            // that dirty FBO and that the CLUT remains VRAM-authoritative. The decoded GPU view
-            // is built later with the other texture work.
-            if (g281ViewOn() && fbp == 0x143u &&
-                e.ctx.tex0.psm == GS_PSM_T8 && e.ctx.tex0.tbp0 == 0x2820u)
+            // G281/G570: close the two measured format-crossing consumers before the generic
+            // overlap loop materializes their CT32 source. Admission proves the exact PSMT8 byte
+            // map belongs solely to that dirty FBO and the CLUT remains VRAM-authoritative. The
+            // decoded GPU view is built later with the other texture work.
+            const bool g281KnownTuple =
+                g281ViewOn() && fbp == 0x143u && e.ctx.tex0.tbp0 == 0x2820u;
+            const bool g570KnownTuple =
+                g570T8AliasViewOn() && fbp == 0x13cu && e.ctx.tex0.tbp0 == 0x2760u &&
+                e.ctx.tex0.tbw == 1u && st.texW == 64 && st.texH == 64;
+            if ((g281KnownTuple || g570KnownTuple) && e.ctx.tex0.psm == GS_PSM_T8)
             {
                 const int srcTi = g281TryEntry(fbp, e, st);
                 if (srcTi >= 0)
@@ -4063,7 +4206,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             GSVertex q0 = e.v[0], q1 = e.v[1];
             g406Round = g406SpriteUvRoundInfo(
                 a, b, ofx, ofy, !st.bilinear, e.prim.tme != 0u, e.prim.fst != 0u);
-            if (g255Rtt || g286Transient)
+            if (g255Rtt || g286Transient || g570Exact13d)
             {
                 // drawSprite first truncates screen positions, sorts the bounds, and expands a
                 // zero span to one pixel.  The RTT effects deliberately submit full rectangles
@@ -4222,9 +4365,26 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         {
             // Triangle: gouraud (iip=1) uses per-vertex color; flat uses v2's (drawTriangle).
             const bool tme = e.prim.tme, fst = e.prim.fst, iip = e.prim.iip;
+            // G570 diagnostic: the CPU's 0x139 untextured shadow-volume rule evaluates both
+            // coverage and attributes at integer GS coordinates, while GL evaluates at pixel
+            // centres. Translating the triangle by +0.5 maps GL (x+0.5,y+0.5) back to the CPU's
+            // (x,y) edge functions without touching the established generic GPU paths. Keep this
+            // numeric knob default-zero until the whole-batch verifier proves a sign/value.
+            static const float s_g570Gpu139Shift = []() {
+                const char *v = std::getenv("DC2_G570_GPU_139_SHIFT");
+                return v ? std::strtof(v, nullptr) : 0.0f;
+            }();
             for (int k = 0; k < 3; ++k)
-                g178PushVertex(s_batch.verts, e.v[k], ofx, ofy, iip ? e.v[k] : e.v[2],
+            {
+                GSVertex p = e.v[k];
+                if (g570Exact139 && !tme && s_g570Gpu139Shift != 0.0f)
+                {
+                    p.x += s_g570Gpu139Shift;
+                    p.y += s_g570Gpu139Shift;
+                }
+                g178PushVertex(s_batch.verts, p, ofx, ofy, iip ? e.v[k] : e.v[2],
                                tme, fst, pushTexW, pushTexH, 0.0f, 0.0f);
+            }
         }
         const int count = static_cast<int>(s_batch.verts.size()) - first;
         if (g261Bound)
@@ -4278,8 +4438,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // G255 verification is intentionally color-only. Any batch that needs real guest depth has
     // already failed closed unless the separately opt-in G242 ownership model is active; do not
     // combine those two experiments in one oracle.
-    if ((g255Rtt || (g286Transient && g286VerifyOn())) && !guestDepth)
-        g255BeginVerify(vram, vramSize, fbp, fbw, fbW, rowLo, rowHi);
+    if (((g255Rtt || (g286Transient && g286VerifyOn())) && !guestDepth) ||
+        (g570Exact13d && g570Verify13dOn()) ||
+        (g570Exact139 && g570Verify139On()))
+        g255BeginVerify(vram, vramSize, fbp, fbw, fbW, rowLo, rowHi,
+                        g570Exact13d && guestDepth && guestDepthWrites,
+                        depthRowLo, depthRowHi);
 
     const auto g273T1 = s_g273Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
@@ -4765,7 +4929,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // remember any other affected Z rows so a later same-key wave cannot use stale depth.
         if (g278ColorWrite.valid)
             g278MarkStaleRowsForRange(g278ColorWrite); // marks every overlapped pending owner
-        if (g286Transient)
+        if (g286Transient || g570Exact13d)
         {
             // Unlike display color, this work target is consumed later as ordinary VRAM. Publish
             // the same page generations an inline draw would advance, after bytes really changed.
@@ -4774,35 +4938,54 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                              static_cast<uint32_t>(rowHi - rowLo + 1));
             fbGenNow = g178GenSumRect(fbBlock, fbw, GS_PSM_CT32, 0u, 0u,
                                       static_cast<uint32_t>(fbW), kFbH);
-            const uint64_t done =
-                g_g286GpuSuccess.fetch_add(1u, std::memory_order_relaxed) + 1u;
-            g_g286RowsPublished.fetch_add(
-                static_cast<uint64_t>(rowHi - rowLo + 1), std::memory_order_relaxed);
-            if (g286StatOn() && (done <= 8u || (done % 120u) == 0u))
-                std::fprintf(stderr,
-                             "[G287:transient] gpu=%llu attempts=%llu captured=%llu "
-                             "rows=%llu fbp=%03x fbw=%u win=%d..%d entries=%zu\n",
-                             (unsigned long long)done,
-                             (unsigned long long)g_g286GpuAttempts.load(std::memory_order_relaxed),
-                             (unsigned long long)g_g286Captured.load(std::memory_order_relaxed),
-                             (unsigned long long)g_g286RowsPublished.load(std::memory_order_relaxed),
-                             fbp, fbw, rowLo, rowHi, g_g144List.size());
-            if (g289ConsumeOwner)
+            if (g286Transient)
             {
-                G289CopyOwner *o13b = g345OwnerFor(0x13bu);
-                const uint64_t version = o13b != nullptr ? o13b->version : 0u;
-                if (o13b != nullptr)
-                    o13b->active = false;
-                if (o13b == &s_g289Owners[0])
-                    s_g289PendingUpload.active = false;
-                g289Guard.armed = false;
-                const uint64_t n =
-                    g_g289Consumes.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                if (g289StatOn() && (n <= 16u || (n % 256u) == 0u))
+                const uint64_t done =
+                    g_g286GpuSuccess.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                g_g286RowsPublished.fetch_add(
+                    static_cast<uint64_t>(rowHi - rowLo + 1), std::memory_order_relaxed);
+                if (g286StatOn() && (done <= 8u || (done % 120u) == 0u))
                     std::fprintf(stderr,
-                                 "[G289:consume] n=%llu version=%llu fbp=0x13b rows=0..415\n",
-                                 static_cast<unsigned long long>(n),
-                                 static_cast<unsigned long long>(version));
+                                 "[G287:transient] gpu=%llu attempts=%llu captured=%llu "
+                                 "rows=%llu fbp=%03x fbw=%u win=%d..%d entries=%zu\n",
+                                 (unsigned long long)done,
+                                 (unsigned long long)g_g286GpuAttempts.load(std::memory_order_relaxed),
+                                 (unsigned long long)g_g286Captured.load(std::memory_order_relaxed),
+                                 (unsigned long long)g_g286RowsPublished.load(std::memory_order_relaxed),
+                                 fbp, fbw, rowLo, rowHi, g_g144List.size());
+                if (g289ConsumeOwner)
+                {
+                    G289CopyOwner *o13b = g345OwnerFor(0x13bu);
+                    const uint64_t version = o13b != nullptr ? o13b->version : 0u;
+                    if (o13b != nullptr)
+                        o13b->active = false;
+                    if (o13b == &s_g289Owners[0])
+                        s_g289PendingUpload.active = false;
+                    g289Guard.armed = false;
+                    const uint64_t n =
+                        g_g289Consumes.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    if (g289StatOn() && (n <= 16u || (n % 256u) == 0u))
+                        std::fprintf(stderr,
+                                     "[G289:consume] n=%llu version=%llu fbp=0x13b rows=0..415\n",
+                                     static_cast<unsigned long long>(n),
+                                     static_cast<unsigned long long>(version));
+                }
+            }
+            else
+            {
+                const uint64_t done =
+                    g_g570TransientSuccess.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                g_g570TransientRowsPublished.fetch_add(
+                    static_cast<uint64_t>(rowHi - rowLo + 1), std::memory_order_relaxed);
+                if (g570Transient13dStatOn() && (done <= 8u || (done % 30u) == 0u))
+                    std::fprintf(stderr,
+                                 "[G570:transient13d] gpu=%llu attempts=%llu rejectShape=%llu "
+                                 "rows=%llu fbp=%03x fbw=%u win=%d..%d entries=%zu\n",
+                                 (unsigned long long)done,
+                                 (unsigned long long)g_g570TransientAttempts.load(std::memory_order_relaxed),
+                                 (unsigned long long)g_g570TransientRejectShape.load(std::memory_order_relaxed),
+                                 (unsigned long long)g_g570TransientRowsPublished.load(std::memory_order_relaxed),
+                                 fbp, fbw, rowLo, rowHi, g_g144List.size());
             }
         }
     }
@@ -5229,6 +5412,23 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g_g178FbSnap.erase(fbp);
         return false;
     }
+    if (g570Exact13d && g570Verify13dOn())
+    {
+        // Restore both authorities before CPU replay. Writable private Z was captured after its
+        // immediate GPU readback and is restored by g570StageDepthVerify.
+        g255StageGpuVerify(vram, vramSize, s_batch.readback, kFbH);
+        g570StageDepthVerify();
+        g_g178FbSnap.erase(fbp);
+        return false;
+    }
+    if (g570Exact139 && g570Verify139On())
+    {
+        // Read-only private depth is unchanged by the GPU arm. Restore color, replay on CPU, and
+        // compare every CT32 pixel; the CPU result remains authoritative during verification.
+        g255StageGpuVerify(vram, vramSize, s_batch.readback, kFbH);
+        g_g178FbSnap.erase(fbp);
+        return false;
+    }
     g289OwnerViewGuard.armed = false;
     g289DirectGuard.armed = false;
     return true;
@@ -5252,8 +5452,10 @@ static void g242NoteCpuReplayWrites(uint8_t *vram)
                                   (static_cast<uint64_t>(fbw) << 16u) |
                                   (static_cast<uint64_t>(fpsm) << 24u);
         if (colorTargets.insert(colorKey).second)
-            g178NoteVramWriteRect(vram, fbBlock, fbw, fpsm, 0u, 0u,
-                                  std::max(1u, fbw) * 64u, 512u);
+            g178NoteVramWriteRectTagged(
+                vram, fbBlock, fbw, fpsm, 0u, 0u,
+                std::max(1u, fbw) * 64u, 512u,
+                4u); // G570 source 4: whole-flush CPU replay color write
 
         const bool zmsk = ((e.ctx.zbuf >> 32u) & 1u) != 0u;
         if (!zmsk)
@@ -5264,8 +5466,10 @@ static void g242NoteCpuReplayWrites(uint8_t *vram)
                                       (static_cast<uint64_t>(fbw) << 16u) |
                                       (static_cast<uint64_t>(zpsm) << 24u);
             if (depthTargets.insert(depthKey).second)
-                g178NoteVramWriteRect(vram, zbpBlock, fbw, zpsm, 0u, 0u,
-                                      std::max(1u, fbw) * 64u, 512u);
+                g178NoteVramWriteRectTagged(
+                    vram, zbpBlock, fbw, zpsm, 0u, 0u,
+                    std::max(1u, fbw) * 64u, 512u,
+                    5u); // G570 source 5: whole-flush CPU replay depth write
         }
     }
 }

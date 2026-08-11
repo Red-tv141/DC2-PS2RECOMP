@@ -137,6 +137,10 @@ bool g162DecodeT8Batch(int, const uint32_t *, const uint32_t *, const int *, con
                        const uint32_t *, const uint8_t *, size_t, uint32_t **) { return false; }
 bool g178_backend_ready() { return false; }
 bool g178_backend_submit(G178Batch &) { return false; }
+bool g570_backend_shadow139(const std::vector<uint32_t> &, const std::vector<uint32_t> &,
+                            const std::vector<uint32_t> &, const std::vector<uint32_t> &,
+                            const std::vector<uint32_t> &, const std::vector<uint32_t> &,
+                            std::vector<uint32_t> &) { return false; }
 bool g541_backend_null_compute() { return false; }
 bool g545_backend_live_submit(std::vector<uint8_t> &&) { return false; }
 bool g566_backend_authority_submit(

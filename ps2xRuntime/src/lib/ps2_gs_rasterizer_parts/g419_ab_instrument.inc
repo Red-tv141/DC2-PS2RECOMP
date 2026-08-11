@@ -726,6 +726,9 @@ enum G419Lever
     // G568: admit a GPU flush whose texture pages alias the live Z window when the texture PSM
     // reads ONLY bits the Z PSM never writes (T8H/T4HL/T4HH over PSMZ24). GS-worker lever: hold 16.
     kG568LeverBitAlias = 106,
+    // G573: admit Ridepod's textured+blended CT32 0x13b triangles to the transient graph path.
+    // GS-worker admission lever: hold 16.
+    kG573LeverTri13b = 107,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -956,6 +959,8 @@ static int g419AbLever()
             return static_cast<int>(kG552LeverRttTri);
         if (std::strcmp(value, "bitalias") == 0)
             return static_cast<int>(kG568LeverBitAlias);
+        if (std::strcmp(value, "tri13b") == 0)
+            return static_cast<int>(kG573LeverTri13b);
         if (std::strcmp(value, "vu1null") == 0)
             return static_cast<int>(kG541LeverVuNull);
         std::fprintf(stderr,
@@ -970,7 +975,7 @@ static int g419AbLever()
                      "fastdec|hashlane|vstore|vload|vmem|nopdisp|updesc|lowdense|dispdense|"
                      "peel4|g516disp|fpind|stampind|g517ind|cullcmp|macscan|capinplace|"
                       "l2lskip|flagtail|flaghead|divlower|imgspec|hot0c70|hot0e00|hot30d8|"
-                      "hot1be8|hot1c00|hot0900|hot1110|rtttri|vu1null)\n",
+                      "hot1be8|hot1c00|hot0900|hot1110|rtttri|bitalias|tri13b|vu1null)\n",
                      value);
         return static_cast<int>(kG419LeverNone);
     }();
@@ -1084,6 +1089,7 @@ static const char *g419AbLeverName(int lever)
     case kG555LeverHot1110: return "hot1110";
     case kG552LeverRttTri: return "rtttri";
     case kG568LeverBitAlias: return "bitalias";
+    case kG573LeverTri13b: return "tri13b";
     case kG541LeverVuNull: return "vu1null";
     default: return "none";
     }
@@ -1238,7 +1244,7 @@ static uint64_t g438ArmHoldFrames()
                  sel == kG549LeverHot30d8 || sel == kG550LeverHot1be8 ||
                  sel == kG551LeverHot1c00 || sel == kG554LeverHot0900 ||
                  sel == kG555LeverHot1110 || sel == kG552LeverRttTri ||
-                 sel == kG568LeverBitAlias ||
+                 sel == kG568LeverBitAlias || sel == kG573LeverTri13b ||
                  sel == kG541LeverVuNull ||
                 sel == kG439LeverCoalesce || sel == kG445LeverEarlyKick ||
                 sel == kG445LeverKickAll || sel == kG447LeverSpinWait || sel == kG447LeverWSpin ||
@@ -1984,6 +1990,23 @@ int g555Hot1110Arm()
 int g568BitAliasArm()
 {
     if (g419AbLever() != static_cast<int>(kG568LeverBitAlias))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G573 transient-0x13b triangle admission is queried only after the exact target/state predicate
+// passes. The sequence memo proves both paired paths executed without adding one atomic per draw.
+int g573Tri13bArm()
+{
+    if (g419AbLever() != static_cast<int>(kG573LeverTri13b))
         return -1;
     const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
     const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);

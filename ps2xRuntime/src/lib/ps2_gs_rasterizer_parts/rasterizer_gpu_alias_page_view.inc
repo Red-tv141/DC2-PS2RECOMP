@@ -2104,7 +2104,10 @@ static void g261Materialize(int ti, int cause)
             }
             g178BumpRectImpl(fbBlock, r.fbw, GS_PSM_CT32, 0u,
                              static_cast<uint32_t>(r.dirtyLo),
-                             static_cast<uint32_t>(r.fbW), static_cast<uint32_t>(rows));
+                             static_cast<uint32_t>(r.fbW), static_cast<uint32_t>(rows),
+                             1u | (static_cast<uint32_t>(cause & 0xff) << 8u));
+            // G570 trace source: low byte 1 = resident RTT FBO publication; high byte =
+            // G261MatCause. Diagnostic only, and zero work when DC2_G570_BUMP_TRACE is unset.
             // FBO still equals VRAM for this target: refresh the snapshot past our own bump —
             // G351: for the FBO key actually READ; a mixed-band publication leaves neither
             // single FBO equal to VRAM, so both surface snapshots go conservative-invalid.
@@ -2519,6 +2522,57 @@ static G144BlockRange g289OwnerRange()
     return out;
 }
 
+// G572 (default-ON, rollback DC2_G572_NO_EXACT_OWNER_GEN=1): G289 publishes only the physical blocks still owned by its FBO,
+// but historically bumped generations for the whole rectangular surface.  That makes unrelated
+// resident targets look guest-written even though g498PublishOwnedRows filtered every such byte.
+// A GS generation is an invalidation epoch, not a write count, so one increment for every
+// physical 8 KB page intersecting the actually written block interval is exact.
+static bool g572ExactOwnerGenOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G572_NO_EXACT_OWNER_GEN") &&
+                           !envFlagDisabled("DC2_G572_EXACT_OWNER_GEN");
+    return on;
+}
+
+static void g572BumpOwnedBlockRange(uint32_t firstBlock, uint32_t lastBlock)
+{
+    if (firstBlock > lastBlock)
+        return;
+    const uint32_t firstPage = firstBlock >> 5u;
+    const uint32_t lastPage = lastBlock >> 5u;
+    const bool traceOn = g570BumpTraceOn();
+    G570BumpTrace trace{};
+    if (traceOn)
+    {
+        trace.seq = g_g570BumpSeq.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        trace.source = 6u; // exact G289 owner publication
+        trace.bpBlocks = firstBlock;
+        trace.bw64 = 0u;
+        trace.psm = 0xffu; // diagnostic sentinel: physical block interval, not a PSM rect
+        trace.w = lastBlock - firstBlock + 1u;
+        trace.h = 1u;
+    }
+    for (uint32_t page = firstPage;; ++page)
+    {
+        const uint32_t physical = page & (kG178PageCount - 1u);
+        g_g178PageGen[physical].fetch_add(1u, std::memory_order_relaxed);
+        if (traceOn)
+            g_g570LastBump[physical] = trace;
+        if (page == lastPage)
+            break;
+    }
+    if (g289StatOn())
+    {
+        static uint64_t s_n = 0u;
+        ++s_n;
+        if (s_n <= 8u || (s_n % 128u) == 0u)
+            std::fprintf(stderr,
+                         "[G572:owner-gen] n=%llu blocks=%x..%x pages=%x..%x\n",
+                         static_cast<unsigned long long>(s_n), firstBlock, lastBlock,
+                         firstPage, lastPage);
+    }
+}
+
 static bool g345MaterializeSlot(G289CopyOwner &slot, int cause)
 {
     if (!slot.active)
@@ -2540,7 +2594,10 @@ static bool g345MaterializeSlot(G289CopyOwner &slot, int cause)
         // g498PublishRowsLegacy and runs for every row the owner's block filter does not cover.
         g498PublishOwnedRows(0, owner.vram, owner.vramSize, s_px, dstBlock, 8u, 512, 416,
                              0, 415, owner.firstOwnedBlock, owner.lastOwnedBlock);
-        g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 0u, 512u, 416u);
+        if (g572ExactOwnerGenOn())
+            g572BumpOwnedBlockRange(owner.firstOwnedBlock, owner.lastOwnedBlock);
+        else
+            g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 0u, 512u, 416u);
         g_g289Materializes.fetch_add(1u, std::memory_order_relaxed);
     }
     else
@@ -2582,10 +2639,11 @@ static bool g345MaterializeSlot(G289CopyOwner &slot, int cause)
             g_g289MatFail.load(std::memory_order_relaxed);
         if (n <= 8u || (n % 128u) == 0u)
             std::fprintf(stderr,
-                         "[G289:materialize] n=%llu version=%llu dst=%03x cause=%d ok=%u\n",
+                         "[G289:materialize] n=%llu version=%llu dst=%03x "
+                         "owner=%x..%x cause=%d ok=%u\n",
                          static_cast<unsigned long long>(n),
                          static_cast<unsigned long long>(owner.version), owner.dstFbp,
-                         cause, ok ? 1u : 0u);
+                         owner.firstOwnedBlock, owner.lastOwnedBlock, cause, ok ? 1u : 0u);
     }
     return ok;
 }
@@ -2738,7 +2796,20 @@ static bool g289Resolve14aBeforeDirect()
     // g418UnpackColorRows already uses, so the same (fbH, rowLo, rowHi) triple reproduces it.
     g498PublishOwnedRows(1, owner.vram, owner.vramSize, s_px, dstBlock, 8u, 512, 416,
                          320, 415, owner.firstOwnedBlock, owner.lastOwnedBlock);
-    g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 320u, 512u, 96u);
+    if (g572ExactOwnerGenOn())
+    {
+        const G144BlockRange rows =
+            g144RangeForRect(dstBlock, GS_PSM_CT32, 8u, 0u, 320u, 512u, 96u);
+        if (rows.valid)
+            g572BumpOwnedBlockRange(std::max(owner.firstOwnedBlock, rows.first),
+                                    std::min(owner.lastOwnedBlock, rows.last));
+        else
+            g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 320u, 512u, 96u);
+    }
+    else
+    {
+        g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 320u, 512u, 96u);
+    }
     o14a->active = false;
     s_g289PendingUpload.active = false;
     if (g345StatOn())

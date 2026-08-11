@@ -1305,6 +1305,44 @@ void GSRasterizer::drawTriangle(GS *gs)
     // writePixel. Delta in [G141:perf] GSraster ms = that stage's cost. Never ship enabled.
     static const bool s_g141SkipSample = (std::getenv("DC2_G141_SKIP_SAMPLE") != nullptr);
     static const bool s_g141SkipWrite = (std::getenv("DC2_G141_SKIP_WRITE") != nullptr);
+    // G570: the combat hitch is this exact deferred CPU class.  Keep the established scan
+    // conversion, interpolation, and G408 shadow-volume edge rule; only lower the private-Z read
+    // and CT32 commit leaves.  Every state predicate is exact and the path fails closed for probes.
+    const bool g570Cpu139 =
+        g570Cpu139On() && g570Cpu139Quiet() && t_g144InReplay &&
+        ctx.frame.fbp == 0x139u && ctx.frame.fbw == 8u &&
+        ctx.frame.psm == GS_PSM_CT32 && gs->m_vram != nullptr &&
+        !gs->m_prim.tme && gs->m_prim.abe && !gs->m_prim.fge &&
+        gs->m_prim.type == GS_PRIM_TRIFAN &&
+        ctx.test == 0x5000aull && ctx.zbuf == 0x1010000d0ull &&
+        g408ShadowVolume &&
+        g403DisplayZ && zEnabled && ztst == 2u && zmsk && !zWrite &&
+        !g357FlatDraw && !g232tri && !s_g141SkipWrite &&
+        minX >= 0 && maxX < static_cast<int>(kG403DisplayZW) &&
+        minY >= 0 && maxY < static_cast<int>(kG403DisplayZH);
+    const bool g570Cpu139Verify = g570Cpu139 && g570Cpu139VerifyOn();
+    G570Cpu139Commit g570Commit{};
+    if (g570Cpu139)
+    {
+        g570Commit = g570BuildCpu139Commit(gs->m_vram, gs->m_vramSize,
+                                           ctx.frame.fbp, ctx.frame.fbw,
+                                           ctx.frame.fbmsk, ctx.alpha, ctx.fba,
+                                           gs->m_prim.abe, gs->m_pabe);
+        const uint8_t g570AlphaMode = static_cast<uint8_t>(ctx.alpha & 0xffu);
+        const bool g570FlatUnit = !gs->m_prim.iip &&
+                                  v2.r == 1u && v2.g == 1u && v2.b == 1u && v2.a == 0x40u;
+        if (g570FlatUnit && (g570AlphaMode == 0x62u || g570AlphaMode == 0x68u) &&
+            static_cast<uint8_t>((ctx.alpha >> 32u) & 0xffu) == 0x80u &&
+            ctx.frame.fbmsk == 0u && ctx.fba == 0u && !gs->m_pabe)
+        {
+            g570Commit.unitDelta = (g570AlphaMode == 0x68u) ? 1 : -1;
+        }
+    }
+    const int g570DepthClass = g570Cpu139
+        ? g570Cpu139DepthClass(minX, minY, maxX, maxY, v0.z, v1.z, v2.z)
+        : 0;
+    uint64_t g570Cpu139Px = 0u;
+    uint64_t g570Cpu139Bad = 0u;
     const double g141S0 = static_cast<double>(fy1 - fy2) * static_cast<double>(winding) * static_cast<double>(invAbsDenom);
     const double g141S1 = static_cast<double>(fy2 - fy0) * static_cast<double>(winding) * static_cast<double>(invAbsDenom);
     const double g141S2 = -g141S0 - g141S1;
@@ -1554,12 +1592,25 @@ void GSRasterizer::drawTriangle(GS *gs)
     // the next). insideAcc/drawnAcc replace the g141InsidePx/f516cov increments so lanes don't race.
     auto g143RangeFn = [&](int y0, int y1, long &insideAcc, int &drawnAcc)
     {
+        if (g570Cpu139 && g570DepthClass < 0 && !g570Cpu139Verify)
+            return;
         if (g141UseClutCache)
             std::memset(g141ClutValid, 0, sizeof(g141ClutValid));
         for (int y = y0; y <= y1; ++y)
         {
             g141QValid = false;
             float py = static_cast<float>(y) + 0.5f;
+        G530RowAddr g570ColorRow{};
+        const uint32_t *g570DepthRow = nullptr;
+        uint32_t g570ColorGroup = ~0u;
+        uint32_t g570ColorGroupBase = 0u;
+        if (g570Cpu139)
+        {
+            g570ColorRow = g530RowAddr(g570Commit.frameBlock, g570Commit.frameWidth,
+                                      static_cast<uint32_t>(y));
+            g570DepthRow = g403DisplayZBuf().data() +
+                           static_cast<size_t>(y) * kG403DisplayZW;
+        }
         int xStart = minX, xEnd = maxX;
         if (!s_g141NoXspan)
         {
@@ -1592,8 +1643,231 @@ void GSRasterizer::drawTriangle(GS *gs)
             xStart = minX + static_cast<int>(tLoC);
             xEnd = minX + static_cast<int>(tHiC);
         }
+        // G570: evaluate four shadow-mask depth candidates at once. Coverage remains the exact
+        // G408 12.4 fixed-point top-left rule; each lane then executes the original float
+        // barycentric operation sequence, just in SSE lanes. Color commits remain ordered and
+        // immediate, preserving GS-memory aliases with adjacent RTTs.
+        const bool g570Quad = g570Cpu139 && g570Commit.unitDelta != 0 &&
+                              !t_g570Linear139.active;
+        if (g570Quad)
+        {
+            const int64_t sx0 = static_cast<int64_t>(xStart) * 16;
+            const int64_t sy = static_cast<int64_t>(y) * 16;
+            const auto edgeAt = [&](int a, int b) {
+                return ((g408Fx[b] - g408Fx[a]) * (sy - g408Fy[a]) -
+                        (g408Fy[b] - g408Fy[a]) * (sx0 - g408Fx[a])) * g408Sign;
+            };
+            int64_t edge0 = edgeAt(1, 2);
+            int64_t edge1 = edgeAt(2, 0);
+            int64_t edge2 = edgeAt(0, 1);
+            const int64_t step0 = -(g408Fy[2] - g408Fy[1]) * 16 * g408Sign;
+            const int64_t step1 = -(g408Fy[0] - g408Fy[2]) * 16 * g408Sign;
+            const int64_t step2 = -(g408Fy[1] - g408Fy[0]) * 16 * g408Sign;
+
+            const __m128 a0v = _mm_set1_ps(fy1 - fy2);
+            const __m128 b0v = _mm_set1_ps(fx2 - fx1);
+            const __m128 a1v = _mm_set1_ps(fy2 - fy0);
+            const __m128 b1v = _mm_set1_ps(fx0 - fx2);
+            const __m128 fx2v = _mm_set1_ps(fx2);
+            const __m128 dy2v = _mm_set1_ps(static_cast<float>(y) - fy2);
+            const __m128 windingv = _mm_set1_ps(static_cast<float>(winding));
+            const __m128 invDenomv = _mm_set1_ps(invAbsDenom);
+            const __m128 onev = _mm_set1_ps(1.0f);
+            const __m128 z0v = _mm_set1_ps(v0.z);
+            const __m128 z1v = _mm_set1_ps(v1.z);
+            const __m128 z2v = _mm_set1_ps(v2.z);
+            const __m128 zMinv = _mm_setzero_ps();
+            const __m128 zMaxv = _mm_set1_ps(16777215.0f);
+
+            for (int x = xStart; x <= xEnd; x += 4)
+            {
+                const int laneCount = std::min(4, xEnd - x + 1);
+                uint32_t coverageMask = 0u;
+                for (int lane = 0; lane < laneCount; ++lane)
+                {
+                    if (!(edge0 < 0 || (edge0 == 0 && !g408Tl[0]) ||
+                          edge1 < 0 || (edge1 == 0 && !g408Tl[1]) ||
+                          edge2 < 0 || (edge2 == 0 && !g408Tl[2])))
+                    {
+                        coverageMask |= 1u << lane;
+                        ++insideAcc;
+                    }
+                    edge0 += step0;
+                    edge1 += step1;
+                    edge2 += step2;
+                }
+                if (coverageMask == 0u)
+                    continue;
+
+                const __m128 pxv = _mm_setr_ps(static_cast<float>(x),
+                                                static_cast<float>(x + 1),
+                                                static_cast<float>(x + 2),
+                                                static_cast<float>(x + 3));
+                alignas(16) uint32_t ziLane[4] = {};
+                if (g570DepthClass == 0)
+                {
+                    __m128 w0v = _mm_add_ps(_mm_mul_ps(a0v, _mm_sub_ps(pxv, fx2v)),
+                                            _mm_mul_ps(b0v, dy2v));
+                    w0v = _mm_mul_ps(_mm_mul_ps(w0v, windingv), invDenomv);
+                    __m128 w1v = _mm_add_ps(_mm_mul_ps(a1v, _mm_sub_ps(pxv, fx2v)),
+                                            _mm_mul_ps(b1v, dy2v));
+                    w1v = _mm_mul_ps(_mm_mul_ps(w1v, windingv), invDenomv);
+                    const __m128 w2v = _mm_sub_ps(_mm_sub_ps(onev, w0v), w1v);
+                    __m128 zfv = _mm_add_ps(_mm_add_ps(_mm_mul_ps(z0v, w0v),
+                                                       _mm_mul_ps(z1v, w1v)),
+                                            _mm_mul_ps(z2v, w2v));
+                    zfv = _mm_min_ps(_mm_max_ps(zfv, zMinv), zMaxv);
+                    _mm_store_si128(reinterpret_cast<__m128i *>(ziLane),
+                                    _mm_cvttps_epi32(zfv));
+                }
+
+                uint32_t commitMask = 0u;
+                for (int lane = 0; lane < laneCount; ++lane)
+                {
+                    if ((coverageMask & (1u << lane)) == 0u)
+                        continue;
+                    const int px = x + lane;
+                    const uint32_t zdst = g570DepthRow[px];
+                    const bool fastPass = g570DepthClass > 0 ? true
+                                          : (g570DepthClass < 0 ? false
+                                                               : ziLane[lane] >= zdst);
+                    bool commitPass = fastPass;
+                    if (g570Cpu139Verify)
+                    {
+                        const float pxf = static_cast<float>(px);
+                        const float pyf = static_cast<float>(y);
+                        const float rw0 = (((fy1 - fy2) * (pxf - fx2) +
+                                            (fx2 - fx1) * (pyf - fy2)) * winding) * invAbsDenom;
+                        const float rw1 = (((fy2 - fy0) * (pxf - fx2) +
+                                            (fx0 - fx2) * (pyf - fy2)) * winding) * invAbsDenom;
+                        const float rw2 = 1.0f - rw0 - rw1;
+                        float rzf = v0.z * rw0 + v1.z * rw1 + v2.z * rw2;
+                        if (rzf < 0.0f) rzf = 0.0f;
+                        if (rzf > 16777215.0f) rzf = 16777215.0f;
+                        const uint32_t rzi = static_cast<uint32_t>(rzf);
+                        const bool referencePass = rzi >= zdst;
+                        if (referencePass != fastPass)
+                            ++g570Cpu139Bad;
+                        commitPass = referencePass;
+                        if (zdst != g403DisplayZRead(px, y, ctx.frame.fbp))
+                            ++g570Cpu139Bad;
+                    }
+                    if (commitPass)
+                        commitMask |= 1u << lane;
+                }
+
+                for (int lane = 0; lane < laneCount; ++lane)
+                {
+                    if ((commitMask & (1u << lane)) == 0u)
+                        continue;
+                    const int px = x + lane;
+
+                    // Every even/odd CT32 pixel pair is physically adjacent in GS memory. When
+                    // both pass, preserve their logical order with one 64-bit RMW and two packed
+                    // unsigned-saturating byte operations in one SSE register.
+                    if (!g570Cpu139Verify && (px & 1) == 0 && lane + 1 < laneCount &&
+                        (commitMask & (1u << (lane + 1))) != 0u)
+                    {
+                        const uint32_t group = static_cast<uint32_t>(px) >> 3u;
+                        if (group != g570ColorGroup)
+                        {
+                            g570ColorGroup = group;
+                            g570ColorGroupBase =
+                                g530GroupBase(g570ColorRow, static_cast<uint32_t>(px));
+                        }
+                        const uint32_t pairOff = g570ColorGroupBase +
+                            static_cast<uint32_t>(g570ColorRow.ct[px & 0x7]) * 4u;
+                        const uint32_t pairOff1 = g570ColorGroupBase +
+                            static_cast<uint32_t>(g570ColorRow.ct[(px + 1) & 0x7]) * 4u;
+                        if (pairOff1 == pairOff + 4u && pairOff + 8u <= gs->m_vramSize)
+                        {
+                            uint64_t existingPair = 0u;
+                            std::memcpy(&existingPair, gs->m_vram + pairOff,
+                                        sizeof(existingPair));
+                            const __m128i dstPair = _mm_cvtsi64_si128(
+                                static_cast<long long>(existingPair));
+                            const __m128i onePair = _mm_cvtsi64_si128(
+                                static_cast<long long>(0x0001010100010101ull));
+                            const __m128i adjustedPair = g570Commit.unitDelta > 0
+                                ? _mm_adds_epu8(dstPair, onePair)
+                                : _mm_subs_epu8(dstPair, onePair);
+                            uint64_t resultPair = static_cast<uint64_t>(
+                                _mm_cvtsi128_si64(adjustedPair));
+                            resultPair = (resultPair & 0x00ffffff00ffffffull) |
+                                         0x4000000040000000ull;
+                            std::memcpy(gs->m_vram + pairOff, &resultPair,
+                                        sizeof(resultPair));
+                            g570Cpu139Px += 2u;
+                            drawnAcc += 2;
+                            ++lane;
+                            continue;
+                        }
+                    }
+
+                    const uint32_t group = static_cast<uint32_t>(px) >> 3u;
+                    if (group != g570ColorGroup)
+                    {
+                        g570ColorGroup = group;
+                        g570ColorGroupBase =
+                            g530GroupBase(g570ColorRow, static_cast<uint32_t>(px));
+                    }
+                    uint32_t fastOff = 0u, fastPixel = 0u;
+                    if (!g570Cpu139Pixel(g570Commit, g570ColorRow, g570ColorGroupBase,
+                                         px, y, v2.r, v2.g, v2.b, v2.a,
+                                         fastOff, fastPixel))
+                        continue;
+                    if (g570Cpu139Verify)
+                    {
+                        writePixel(gs, px, y, v2.r, v2.g, v2.b, v2.a);
+                        const uint32_t refOff = GSPSMCT32::addrPSMCT32(
+                            g570Commit.frameBlock, g570Commit.frameWidth,
+                            static_cast<uint32_t>(px), static_cast<uint32_t>(y));
+                        uint32_t refPixel = 0u;
+                        if (refOff + 4u <= gs->m_vramSize)
+                            std::memcpy(&refPixel, gs->m_vram + refOff, sizeof(refPixel));
+                        if (fastOff != refOff || fastPixel != refPixel)
+                            ++g570Cpu139Bad;
+                    }
+                    else
+                    {
+                        std::memcpy(gs->m_vram + fastOff, &fastPixel, sizeof(fastPixel));
+                    }
+                    ++g570Cpu139Px;
+                    ++drawnAcc;
+                }
+            }
+            continue;
+        }
+        int64_t g570Edge0 = 0, g570Edge1 = 0, g570Edge2 = 0;
+        int64_t g570Step0 = 0, g570Step1 = 0, g570Step2 = 0;
+        if (g570Cpu139)
+        {
+            const int64_t sx = static_cast<int64_t>(xStart) * 16;
+            const int64_t sy = static_cast<int64_t>(y) * 16;
+            const auto edgeAt = [&](int a, int b) {
+                return ((g408Fx[b] - g408Fx[a]) * (sy - g408Fy[a]) -
+                        (g408Fy[b] - g408Fy[a]) * (sx - g408Fx[a])) * g408Sign;
+            };
+            g570Edge0 = edgeAt(1, 2);
+            g570Edge1 = edgeAt(2, 0);
+            g570Edge2 = edgeAt(0, 1);
+            g570Step0 = -(g408Fy[2] - g408Fy[1]) * 16 * g408Sign;
+            g570Step1 = -(g408Fy[0] - g408Fy[2]) * 16 * g408Sign;
+            g570Step2 = -(g408Fy[1] - g408Fy[0]) * 16 * g408Sign;
+        }
         for (int x = xStart; x <= xEnd; ++x)
         {
+            if (g570Cpu139)
+            {
+                const int64_t e0 = g570Edge0, e1 = g570Edge1, e2 = g570Edge2;
+                g570Edge0 += g570Step0;
+                g570Edge1 += g570Step1;
+                g570Edge2 += g570Step2;
+                if (e0 < 0 || (e0 == 0 && !g408Tl[0]) ||
+                    e1 < 0 || (e1 == 0 && !g408Tl[1]) ||
+                    e2 < 0 || (e2 == 0 && !g408Tl[2]))
+                    continue;
+            }
             float px = static_cast<float>(x) + 0.5f;
             // G408 diagnostic: PCSX2's GS software scanline setup evaluates triangle
             // attributes at integer GS pixel centers (ceil(edge), integer scanline Y).
@@ -1610,7 +1884,7 @@ void GSRasterizer::drawTriangle(GS *gs)
             float w1 = (((fy2 - fy0) * (px - fx2) + (fx0 - fx2) * (py - fy2)) * winding) * invAbsDenom;
             float w2 = 1.0f - w0 - w1;
 
-            if (g408ShadowVolume)
+            if (g408ShadowVolume && !g570Cpu139)
             {
                 const int64_t sx = static_cast<int64_t>(x) * 16;
                 const int64_t sy = static_cast<int64_t>(y) * 16;
@@ -1650,7 +1924,13 @@ void GSRasterizer::drawTriangle(GS *gs)
                 // G45: costume model (fbp=0x139) uses the private, non-aliasing Z buffer.
                 // G203: universal-Z reads the real VRAM Z for every target (private buffers retired).
                 if (g403DisplayZ)
-                    zdst = g403DisplayZRead(x, y, ctx.frame.fbp);
+                {
+                    zdst = g570Cpu139 ? g570DepthRow[x]
+                                      : g403DisplayZRead(x, y, ctx.frame.fbp);
+                    if (g570Cpu139Verify &&
+                        zdst != g403DisplayZRead(x, y, ctx.frame.fbp))
+                        ++g570Cpu139Bad;
+                }
                 else if (!g203Uni && ctx.frame.fbp == 0x139u)
                     zdst = costumeZRead(x, y);
                 else if (!g203Uni && g106TitleZ && g106TitleZPrivateEnabled())
@@ -1797,6 +2077,78 @@ void GSRasterizer::drawTriangle(GS *gs)
             }
             if (!zPass)
                 continue;
+
+            // G570 exact CPU leaf: all admission invariants above are per-triangle constants.
+            // The generic path remains the verifier's commit authority, so a bad candidate cannot
+            // change the frame while DC2_G570_VERIFY_CPU_139 is armed.
+            if (g570Cpu139)
+            {
+                uint8_t fr, fg, fb, fa;
+                if (gs->m_prim.iip)
+                {
+                    fr = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
+                    fg = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
+                    fb = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
+                    fa = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+                }
+                else
+                {
+                    fr = v2.r;
+                    fg = v2.g;
+                    fb = v2.b;
+                    fa = v2.a;
+                }
+
+                if (t_g570Linear139.active && t_g570Linear139.delta)
+                {
+                    const int delta = static_cast<uint8_t>(ctx.alpha & 0xffu) == 0x68u ? 1 : -1;
+                    g570Delta139Accumulate(x, y, delta, fa);
+                    if (g570Cpu139DeltaVerifyOn())
+                        writePixel(gs, x, y, fr, fg, fb, fa);
+                    ++g570Cpu139Px;
+                    ++drawnAcc;
+                    continue;
+                }
+
+                const uint32_t group = static_cast<uint32_t>(x) >> 3u;
+                if (group != g570ColorGroup)
+                {
+                    g570ColorGroup = group;
+                    g570ColorGroupBase =
+                        g530GroupBase(g570ColorRow, static_cast<uint32_t>(x));
+                }
+                uint32_t fastOff = 0u;
+                uint32_t fastPixel = 0u;
+                if (g570Cpu139Pixel(g570Commit, g570ColorRow, g570ColorGroupBase,
+                                    x, y, fr, fg, fb, fa, fastOff, fastPixel))
+                {
+                    if (t_g570Linear139.active)
+                    {
+                        g570Linear139Write(x, y, fastPixel);
+                        if (g570Cpu139LinearVerifyOn())
+                            writePixel(gs, x, y, fr, fg, fb, fa);
+                    }
+                    else if (g570Cpu139Verify)
+                    {
+                        writePixel(gs, x, y, fr, fg, fb, fa);
+                        const uint32_t refOff = GSPSMCT32::addrPSMCT32(
+                            g570Commit.frameBlock, g570Commit.frameWidth,
+                            static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                        uint32_t refPixel = 0u;
+                        if (refOff + 4u <= gs->m_vramSize)
+                            std::memcpy(&refPixel, gs->m_vram + refOff, sizeof(refPixel));
+                        if (fastOff != refOff || fastPixel != refPixel)
+                            ++g570Cpu139Bad;
+                    }
+                    else
+                    {
+                        std::memcpy(gs->m_vram + fastOff, &fastPixel, sizeof(fastPixel));
+                    }
+                    ++g570Cpu139Px;
+                    ++drawnAcc;
+                    continue;
+                }
+            }
 
             uint8_t r, g, b, a;
             if (gs->m_prim.iip)
@@ -2423,6 +2775,9 @@ void GSRasterizer::drawTriangle(GS *gs)
             g143RangeFn(minY, maxY, g141InsidePx, f516cov);
         }
     }
+
+    if (g570Cpu139)
+        g570NoteCpu139(g570Cpu139Px, g570Cpu139Bad);
 
     // G141 sub-profile flush (one atomic add per triangle, gated).
     {

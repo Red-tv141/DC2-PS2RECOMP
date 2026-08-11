@@ -197,6 +197,24 @@ static bool g310T8Base(uint32_t tbp)
            tbp == 0x34a0u || tbp == 0x34e0u;
 }
 
+// G570: the combat/jump route repeatedly reads one 64x64 PSMT8 tile at 0x2760 while the
+// containing 0x139/fbw=8 CT32 atlas is GPU-resident. Legacy handling materializes all 416/448
+// atlas rows for this tiny read; that publication also moves physical page generations beneath
+// the newly resident 0x13d target and forces its fail-loud residency drop. Reuse G281's exact
+// byte-address map + CLUT decoder for this measured tuple. The map builder admits the view only
+// when every sampled physical page has exactly one dirty owner and the CLUT remains guest-owned.
+// Kill: DC2_G570_NO_T8_ALIAS_VIEW=1 (DC2_G570_T8_ALIAS_VIEW=0 is equivalent).
+static bool g570T8AliasViewOn()
+{
+    static const bool s_on = []() {
+        if (envFlagEnabled("DC2_G570_NO_T8_ALIAS_VIEW") ||
+            envFlagDisabled("DC2_G570_T8_ALIAS_VIEW"))
+            return false;
+        return true;
+    }();
+    return s_on && g261WaveOn();
+}
+
 // G310 current-binary census: the remaining dominant publications are three 128x128 PSMT8
 // triangle-family reads from high pages of the dirty 0x139/fbw=8 atlas back into that atlas.
 // Snapshot those reads through G281's exact decoder. The separate texture avoids an illegal GL
@@ -251,20 +269,29 @@ static int g310TryT8Entry(uint32_t batchFbp, const G144Entry &e,
 static int g281TryEntry(uint32_t batchFbp, const G144Entry &e,
                         const G178EntryState &st)
 {
-    // The retained G262 census identifies this as the FST bilinear SPRITE consumer
-    // (prim=6, cov=0..127), not the earlier shorthand's TRI_STRIP description.
-    if (batchFbp != 0x143u || !e.prim.tme || !e.prim.fst ||
+    // The retained G262 census identifies both as FST bilinear SPRITE consumers. Keep the
+    // admission evidence-limited: G281's original 0x143<-0x13c 128x128 tuple, plus G570's
+    // 0x13c<-0x139 64x64 combat tuple. Everything else takes the materialize fallback.
+    const bool g281Tuple =
+        batchFbp == 0x143u && e.ctx.tex0.tbp0 == 0x2820u &&
+        e.ctx.tex0.tbw == 2u && st.texW == 128 && st.texH == 128;
+    const bool g570Tuple =
+        batchFbp == 0x13cu && e.ctx.tex0.tbp0 == 0x2760u &&
+        e.ctx.tex0.tbw == 1u && st.texW == 64 && st.texH == 64;
+    if ((!g281Tuple && !g570Tuple) || !e.prim.tme || !e.prim.fst ||
         e.prim.type != GS_PRIM_SPRITE || !st.bilinear ||
-        e.ctx.tex0.psm != GS_PSM_T8 || e.ctx.tex0.tbp0 != 0x2820u ||
-        e.ctx.tex0.tbw != 2u || st.texW != 128 || st.texH != 128)
+        e.ctx.tex0.psm != GS_PSM_T8)
     {
         g_g281RejShape.fetch_add(1u, std::memory_order_relaxed);
         return -1;
     }
     g_g281Candidates.fetch_add(1u, std::memory_order_relaxed);
-    const int srcTi = g248TargetIndex(0x13cu);
-    if (srcTi < 0 || !g_g261Res[srcTi].dirty || g_g261Res[srcTi].fbw != 2u ||
-        g_g261Res[srcTi].fbW != 128)
+    const uint32_t srcFbp = g570Tuple ? 0x139u : 0x13cu;
+    const uint32_t srcFbw = g570Tuple ? 8u : 2u;
+    const int srcFbW = g570Tuple ? 512 : 128;
+    const int srcTi = g248TargetIndex(srcFbp);
+    if (srcTi < 0 || !g_g261Res[srcTi].dirty || g_g261Res[srcTi].fbw != srcFbw ||
+        g_g261Res[srcTi].fbW != srcFbW)
     {
         g_g281RejPage.fetch_add(1u, std::memory_order_relaxed);
         return -1;

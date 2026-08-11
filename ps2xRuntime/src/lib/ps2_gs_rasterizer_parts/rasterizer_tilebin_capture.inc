@@ -339,7 +339,67 @@
                         g529BeginDispatch();
                     }
                     GS *rgs = g_g144LastGs;
-                    GSRowPool::instance().run(y0, y1, g529Lanes, [self, rgs](int a, int b) {
+                    const bool g570Linear139 = g570Cpu139LinearBatchCandidate();
+                    static const bool s_g570BatchStat =
+                        envFlagEnabled("DC2_G570_BATCH_STAT");
+                    static const bool s_g571Split =
+                        envFlagEnabled("DC2_G571_SPLIT");
+                    const auto g570PrepT = (s_g570BatchStat || s_g571Split)
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+                    const bool g570PreparedBatch = g570Batch139Prepare();
+                    const uint64_t g570PrepUs = (s_g570BatchStat || s_g571Split)
+                        ? static_cast<uint64_t>(std::chrono::duration_cast<
+                              std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - g570PrepT).count())
+                        : 0u;
+                    const bool g570GpuBatch =
+                        g570PreparedBatch && g570Batch139GpuOn();
+                    {
+                        if (s_g570BatchStat && !g_g144List.empty() &&
+                            g_g144List.front().ctx.frame.fbp == 0x139u)
+                        {
+                            static std::atomic<uint64_t> s_total{0u}, s_fast{0u};
+                            static std::atomic<uint64_t> s_entries{0u}, s_fastEntries{0u};
+                            const uint64_t total = s_total.fetch_add(
+                                1u, std::memory_order_relaxed) + 1u;
+                            s_entries.fetch_add(g_g144List.size(), std::memory_order_relaxed);
+                            if (g570PreparedBatch)
+                            {
+                                s_fast.fetch_add(1u, std::memory_order_relaxed);
+                                s_fastEntries.fetch_add(g_g144List.size(),
+                                                       std::memory_order_relaxed);
+                            }
+                            if (total <= 16u || (total % 20u) == 0u ||
+                                !g570PreparedBatch || g570PrepUs >= 5000u)
+                                std::fprintf(stderr,
+                                    "[G570:batchstat] total=%llu fast=%llu entries=%llu "
+                                    "fastEntries=%llu lastEntries=%zu admitted=%u reject=%d "
+                                    "prep=%.3fms\n",
+                                    static_cast<unsigned long long>(total),
+                                    static_cast<unsigned long long>(s_fast.load(
+                                        std::memory_order_relaxed)),
+                                    static_cast<unsigned long long>(s_entries.load(
+                                        std::memory_order_relaxed)),
+                                    static_cast<unsigned long long>(s_fastEntries.load(
+                                        std::memory_order_relaxed)),
+                                    g_g144List.size(), g570PreparedBatch ? 1u : 0u,
+                                    g570Batch139LastReject(),
+                                    static_cast<double>(g570PrepUs) / 1000.0);
+                        }
+                    }
+                    const bool g570Cpu139Batch =
+                        g570Cpu139BatchOn() && !g_g144List.empty() &&
+                        g_g144List.front().ctx.frame.fbp == 0x139u;
+                    if (g570Cpu139Batch && !g570PreparedBatch)
+                        g570Cpu139PrepareDepthTiles();
+                    const auto g571ClearT = s_g571Split
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+                    GSRowPool::instance().run(y0, y1, g529Lanes,
+                                              [self, rgs, g570Linear139,
+                                               g570PreparedBatch,
+                                               g570GpuBatch](int a, int b) {
                         G529LaneScope g529lane; // inert unless DC2_G529_STAT=1
                         static thread_local GS s_rg;
                         s_rg.m_vram = rgs->m_vram;
@@ -349,10 +409,9 @@
                         t_g144Banded = true;
                         t_g144BandY0 = a;
                         t_g144BandY1 = b;
-                        for (const auto &e : g_g144List)
-                        {
+                        auto g570DrawEntry = [&](const G144Entry &e) {
                             if (e.maxY < a || e.minY > b)
-                                continue; // bbox does not intersect this band
+                                return; // bbox does not intersect this band
                             s_rg.m_ctx[0] = e.ctx;
                             s_rg.m_prim = e.prim;
                             s_rg.m_prim.ctxt = false; // active context forced to m_ctx[0] = snapshot
@@ -378,7 +437,139 @@
                                 self->drawSprite(&s_rg);
                             else
                                 self->drawTriangle(&s_rg);
+
+                            // The admitted batch starts with its untextured color clear.  Load this
+                            // lane only after that clear has committed, so the linear surface has
+                            // exactly the same initial words as the generic replay.  If the clear's
+                            // bbox misses a lane, this is never reached there and that lane safely
+                            // stays on the ordinary swizzled path.
+                            if (g570Linear139 && &e == g_g144List.data())
+                                g570Cpu139LinearBegin(rgs->m_vram, rgs->m_vramSize, a, b);
+                        };
+
+                        if (g570PreparedBatch)
+                        {
+                            // The validated list is exactly one ordinary clear followed by the
+                            // ordered shadow-volume class. Keep the clear on the established sprite
+                            // path, then bypass drawTriangle's repeated lane-local front-end.
+                            g570DrawEntry(g_g144List.front());
+                            if (!g570GpuBatch)
+                            {
+                            static const bool s_g570TriVerify =
+                                envFlagEnabled("DC2_G570_BATCH_TRI_VERIFY");
+                            static std::atomic<uint32_t> s_g570TriVerifyClaims{0u};
+                            bool g570DoTriVerify = false;
+                            if (s_g570TriVerify && a == 0)
+                                g570DoTriVerify = s_g570TriVerifyClaims.fetch_add(
+                                    1u, std::memory_order_relaxed) < 64u;
+                            if (g570DoTriVerify)
+                            {
+                                std::vector<uint32_t> state, candidate, reference;
+                                g570Batch139ReadBand(rgs->m_vram, rgs->m_vramSize, a, b, state);
+                                for (size_t tri = 0; tri < g570Batch139TriCount(); ++tri)
+                                {
+                                    g570Batch139ReplayTri(rgs->m_vram, rgs->m_vramSize,
+                                                          a, b, tri);
+                                    g570Batch139ReadBand(rgs->m_vram, rgs->m_vramSize,
+                                                         a, b, candidate);
+                                    g570Batch139WriteBand(rgs->m_vram, rgs->m_vramSize,
+                                                          a, b, state);
+                                    g570DrawEntry(g_g144List[tri + 1u]);
+                                    g570Batch139ReadBand(rgs->m_vram, rgs->m_vramSize,
+                                                         a, b, reference);
+                                    size_t firstBad = static_cast<size_t>(-1);
+                                    for (size_t px = 0; px < candidate.size(); ++px)
+                                        if (candidate[px] != reference[px])
+                                        {
+                                            firstBad = px;
+                                            break;
+                                        }
+                                    if (firstBad != static_cast<size_t>(-1))
+                                    {
+                                        constexpr size_t g570W =
+                                            static_cast<size_t>(kG403DisplayZW);
+                                        const G144Entry &badEntry = g_g144List[tri + 1u];
+                                        std::fprintf(stderr,
+                                            "[G570:batchtribad] tri=%zu xy=(%zu,%d) "
+                                            "candidate=%08x reference=%08x alpha=%llx "
+                                            "v0=(%.9g,%.9g,%.9g) v1=(%.9g,%.9g,%.9g) "
+                                            "v2=(%.9g,%.9g,%.9g)\n",
+                                            tri, firstBad % g570W,
+                                            a + static_cast<int>(firstBad / g570W),
+                                            candidate[firstBad], reference[firstBad],
+                                            static_cast<unsigned long long>(badEntry.ctx.alpha),
+                                            badEntry.v[0].x, badEntry.v[0].y, badEntry.v[0].z,
+                                            badEntry.v[1].x, badEntry.v[1].y, badEntry.v[1].z,
+                                            badEntry.v[2].x, badEntry.v[2].y, badEntry.v[2].z);
+                                        for (size_t rest = tri + 1u;
+                                             rest < g570Batch139TriCount(); ++rest)
+                                            g570DrawEntry(g_g144List[rest + 1u]);
+                                        break;
+                                    }
+                                    state.swap(reference);
+                                }
+                            }
+                            else
+                            {
+                                std::vector<uint32_t> initial, candidate;
+                                if (g570Batch139VerifyOn())
+                                    g570Batch139ReadBand(rgs->m_vram, rgs->m_vramSize,
+                                                         a, b, initial);
+                                const uint64_t candidatePixels =
+                                    g570Batch139ReplayBand(rgs->m_vram, rgs->m_vramSize, a, b);
+                                if (g570Batch139VerifyOn())
+                                {
+                                    g570Batch139ReadBand(rgs->m_vram, rgs->m_vramSize,
+                                                         a, b, candidate);
+                                    g570Batch139WriteBand(rgs->m_vram, rgs->m_vramSize,
+                                                          a, b, initial);
+                                    for (size_t i = 1; i < g_g144List.size(); ++i)
+                                        g570DrawEntry(g_g144List[i]);
+                                    std::vector<uint32_t> reference;
+                                    g570Batch139ReadBand(rgs->m_vram, rgs->m_vramSize,
+                                                         a, b, reference);
+                                    uint64_t bad = 0u;
+                                    size_t firstBad = static_cast<size_t>(-1);
+                                    const size_t n = std::min(candidate.size(), reference.size());
+                                    for (size_t i = 0; i < n; ++i)
+                                        if (candidate[i] != reference[i])
+                                        {
+                                            if (firstBad == static_cast<size_t>(-1)) firstBad = i;
+                                            ++bad;
+                                        }
+                                    bad += static_cast<uint64_t>(candidate.size() > n
+                                        ? candidate.size() - n : reference.size() - n);
+                                    if (bad != 0u && firstBad != static_cast<size_t>(-1))
+                                    {
+                                        static std::atomic<uint32_t> s_g570BatchFirst{0u};
+                                        const uint32_t k = s_g570BatchFirst.fetch_add(
+                                            1u, std::memory_order_relaxed);
+                                        if (k < 32u)
+                                        {
+                                            constexpr size_t g570W =
+                                                static_cast<size_t>(kG403DisplayZW);
+                                            const int badX = static_cast<int>(firstBad % g570W);
+                                            const int badY = a + static_cast<int>(firstBad / g570W);
+                                            std::fprintf(stderr,
+                                                "[G570:batchbad] k=%u band=%d..%d xy=(%d,%d) "
+                                                "candidate=%08x reference=%08x bad=%llu\n",
+                                                k, a, b, badX, badY, candidate[firstBad],
+                                                reference[firstBad],
+                                                static_cast<unsigned long long>(bad));
+                                        }
+                                    }
+                                    g570Batch139NoteVerify(candidatePixels, bad);
+                                }
+                            }
+                            }
                         }
+                        else
+                        {
+                            for (const auto &e : g_g144List)
+                                g570DrawEntry(e);
+                        }
+                        if (g570Linear139)
+                            g570Cpu139LinearEnd(rgs->m_vram, rgs->m_vramSize);
                         t_g149Px = nullptr; t_g149Valid = nullptr;
                         t_g258EntryIndex = static_cast<size_t>(-1);
                         t_g144TitleRockScopeOverride = false;
@@ -386,14 +577,127 @@
                         t_g144InReplay = false;
                         t_g144Banded = false;
                     });
+                    const uint64_t g571ClearUs = s_g571Split
+                        ? static_cast<uint64_t>(std::chrono::duration_cast<
+                              std::chrono::microseconds>(
+                                  std::chrono::steady_clock::now() - g571ClearT).count())
+                        : 0u;
+                    if (g570GpuBatch)
+                    {
+                        constexpr int g570Y0 = 0;
+                        constexpr int g570Y1 = static_cast<int>(kG403DisplayZH) - 1;
+                        std::vector<uint32_t> initial, candidate;
+                        auto g571PhaseT = s_g571Split
+                            ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+                        g570Batch139ReadBand(rgs->m_vram, rgs->m_vramSize,
+                                             g570Y0, g570Y1, initial);
+                        const uint64_t g571ReadUs = s_g571Split
+                            ? static_cast<uint64_t>(std::chrono::duration_cast<
+                                  std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - g571PhaseT).count())
+                            : 0u;
+                        if (s_g571Split)
+                            g571PhaseT = std::chrono::steady_clock::now();
+                        const bool gpuOk = g570Batch139ReplayGpu(initial, candidate);
+                        const uint64_t g571GpuUs = s_g571Split
+                            ? static_cast<uint64_t>(std::chrono::duration_cast<
+                                  std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - g571PhaseT).count())
+                            : 0u;
+                        if (g570Batch139GpuVerifyOn())
+                            g570Batch139ResetCpuDebug();
+                        const auto replayCpuBatch = [&] {
+                            GSRowPool::instance().run(
+                                g570Y0, g570Y1, g529Lanes,
+                                [rgs](int a, int b) {
+                                    g570Batch139ReplayBand(
+                                        rgs->m_vram, rgs->m_vramSize, a, b);
+                                });
+                        };
+                        if (s_g571Split)
+                            g571PhaseT = std::chrono::steady_clock::now();
+                        if (gpuOk)
+                            g570Batch139WriteBand(rgs->m_vram, rgs->m_vramSize,
+                                                  g570Y0, g570Y1, candidate);
+                        else
+                            replayCpuBatch();
+                        const uint64_t g571CommitUs = s_g571Split
+                            ? static_cast<uint64_t>(std::chrono::duration_cast<
+                                  std::chrono::microseconds>(
+                                      std::chrono::steady_clock::now() - g571PhaseT).count())
+                            : 0u;
+
+                        if (s_g571Split)
+                            g571PhaseT = std::chrono::steady_clock::now();
+                        if (gpuOk && g570Batch139GpuVerifyOn())
+                        {
+                            g570Batch139WriteBand(rgs->m_vram, rgs->m_vramSize,
+                                                  g570Y0, g570Y1, initial);
+                            replayCpuBatch();
+                            std::vector<uint32_t> reference;
+                            g570Batch139ReadBand(rgs->m_vram, rgs->m_vramSize,
+                                                 g570Y0, g570Y1, reference);
+                            uint64_t bad = 0u;
+                            size_t firstBad = static_cast<size_t>(-1);
+                            const size_t n = std::min(candidate.size(), reference.size());
+                            for (size_t i = 0; i < n; ++i)
+                                if (candidate[i] != reference[i])
+                                {
+                                    if (firstBad == static_cast<size_t>(-1))
+                                        firstBad = i;
+                                    ++bad;
+                                }
+                            bad += static_cast<uint64_t>(candidate.size() > n
+                                ? candidate.size() - n : reference.size() - n);
+                            if (bad != 0u && firstBad != static_cast<size_t>(-1))
+                            {
+                                static std::atomic<uint32_t> s_g570GpuFirst{0u};
+                                const uint32_t k = s_g570GpuFirst.fetch_add(
+                                    1u, std::memory_order_relaxed);
+                                if (k < 32u)
+                                {
+                                    constexpr size_t width =
+                                        static_cast<size_t>(kG403DisplayZW);
+                                    std::fprintf(stderr,
+                                        "[G570:gpubad] k=%u xy=(%zu,%zu) "
+                                        "candidate=%08x reference=%08x bad=%llu\n",
+                                        k, firstBad % width, firstBad / width,
+                                        candidate[firstBad], reference[firstBad],
+                                        static_cast<unsigned long long>(bad));
+                                }
+                            }
+                            g570Batch139NoteGpuVerify(candidate.size(), bad);
+                        }
+                        if (s_g571Split)
+                        {
+                            const auto g571Done = std::chrono::steady_clock::now();
+                            const uint64_t g571OracleUs = static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::microseconds>(
+                                    g571Done - g571PhaseT).count());
+                            const uint64_t g571TotalUs = static_cast<uint64_t>(
+                                std::chrono::duration_cast<std::chrono::microseconds>(
+                                    g571Done - g570PrepT).count());
+                            std::fprintf(stderr,
+                                         "[G571:batch] entries=%zu prep=%.3f clear=%.3f "
+                                         "read=%.3f gpu=%.3f commit=%.3f oracle=%.3f "
+                                         "total=%.3fms ok=%u\n",
+                                         g_g144List.size(), g570PrepUs / 1000.0,
+                                         g571ClearUs / 1000.0, g571ReadUs / 1000.0,
+                                         g571GpuUs / 1000.0, g571CommitUs / 1000.0,
+                                         g571OracleUs / 1000.0, g571TotalUs / 1000.0,
+                                         gpuOk ? 1u : 0u);
+                        }
+                    }
                     if (g529On)
                     {
                         g529EndDispatch();
                         const uint64_t wallNs =
                             (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
                                 std::chrono::steady_clock::now() - g529T).count();
-                        g529NoteDispatch(g528ClassifyFbp(g_g144BlockFbp), wallNs, g529ZclrNs,
-                                         g529ScanNs, g529Entries, g529Rows, g529Px, g529Lanes);
+                        g529NoteDispatch(g528ClassifyFbp(g_g144BlockFbp), g_g144BlockFbp,
+                                         wallNs, g529ZclrNs, g529ScanNs, g529Entries,
+                                         g529Rows, g529Px, g529Lanes);
                     }
                 }
                 const auto g290T4 = g290P ? std::chrono::steady_clock::now()
@@ -557,6 +861,14 @@
         const bool g286Transient =
             g286TransientTarget(ctx.frame.fbp) && diagOff144 && isSprite144 &&
             (gs->m_prim.tme || g558Solid13bOn()) && !gs->m_prim.abe;
+        // G573: one measured Ridepod class only. Keep TRIFAN and every other state inline until
+        // independently observed; the downstream classifier remains an all-or-nothing fail-closed
+        // gate, so unsupported blend/depth/texture state replays through the exact CPU bands.
+        const bool g573Tri13b =
+            g286TransientTarget(ctx.frame.fbp) && diagOff144 &&
+            (pt144 == GS_PRIM_TRIANGLE || pt144 == GS_PRIM_TRISTRIP) &&
+            ctx.frame.psm == GS_PSM_CT32 && gs->m_prim.tme && gs->m_prim.abe &&
+            g573Tri13bOn();
         // G260 (opt-in): under the native-renderer command graph, RTT-family TRIANGLES (both
         // textured and untextured — the census shows both) become recordable too, closing the
         // G247 structural exclusion that rasterized them inline scalar on the GS thread. They
@@ -576,7 +888,7 @@
                                     (isTri144 ? (gs->m_prim.tme || g178GpuOn()) : true) &&
                                     (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u ||
                                       g252RttTarget)) ||
-                                   g260RttTri || g270LineWave || g286Transient;
+                                   g260RttTri || g270LineWave || g286Transient || g573Tri13b;
         if (g_g312SegStat)
             t_g312Seg2bEnd = std::chrono::steady_clock::now(); // G312 seg2b end (eligibility computed)
         g526Lap(kG526Pro); // G526: entry -> eligibility decided (shared by defer and inline)
@@ -641,6 +953,8 @@
         {
             if (g286Transient)
                 g_g286Captured.fetch_add(1u, std::memory_order_relaxed);
+            if (g573Tri13b)
+                g573NoteTri13bAdmission(pt144);
             const std::chrono::steady_clock::time_point g156CapT0 =
                 g_g156Stat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             // G312 segment census: close seg2 (post-pile -> capture start) and report periodically.

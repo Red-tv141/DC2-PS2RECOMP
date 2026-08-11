@@ -622,6 +622,18 @@ static bool g286VerifyOn()
     return on;
 }
 
+static bool g570Verify13dOn()
+{
+    static const bool on = envFlagEnabled("DC2_G570_VERIFY_13D");
+    return on;
+}
+
+static bool g570Verify139On()
+{
+    static const bool on = envFlagEnabled("DC2_G570_VERIFY_139");
+    return on;
+}
+
 struct G255VerifyState
 {
     bool pending = false;
@@ -645,6 +657,11 @@ struct G255VerifyState
     uint64_t traceBatch = 0;
     std::vector<uint32_t> before;
     std::vector<uint32_t> gpu;
+    bool g570Depth = false;
+    int depthRowLo = 0;
+    int depthRowHi = -1;
+    std::vector<uint32_t> depthBefore;
+    std::vector<uint32_t> depthGpu;
 };
 
 static G255VerifyState g_g255Verify;
@@ -653,6 +670,8 @@ static std::atomic<uint64_t> g_g255Gpu[kG248TargetCount]{};
 static std::atomic<uint64_t> g_g255Checks[kG248TargetCount]{};
 static std::atomic<uint64_t> g_g255Bad[kG248TargetCount]{};
 static std::atomic<uint64_t> g_g286VerifyChecks{0}, g_g286VerifyBad{0};
+static std::atomic<uint64_t> g_g570VerifyChecks{0}, g_g570VerifyBad{0};
+static std::atomic<uint64_t> g_g570Verify139Checks{0}, g_g570Verify139Bad{0};
 
 static bool g553HeavyVerifyOn()
 {
@@ -711,9 +730,13 @@ static void g255NoteAttempt(uint32_t fbp)
 }
 
 static void g255BeginVerify(uint8_t *vram, uint32_t vramSize, uint32_t fbp, uint32_t fbw,
-                            int fbW, int rowLo, int rowHi)
+                            int fbW, int rowLo, int rowHi,
+                            bool g570Depth = false, int depthRowLo = 0, int depthRowHi = -1)
 {
     g_g255Verify.pending = false;
+    g_g255Verify.g570Depth = false;
+    g_g255Verify.depthBefore.clear();
+    g_g255Verify.depthGpu.clear();
     // G553 diagnostic: reach s05's heavy triangle population without comparing a full 512x416
     // target after every one-entry sprite batch. Existing G255 verification is unchanged unless
     // explicitly narrowed; clearing both buffers makes the later staging hook fail closed.
@@ -724,7 +747,9 @@ static void g255BeginVerify(uint8_t *vram, uint32_t vramSize, uint32_t fbp, uint
         g_g255Verify.gpu.clear();
         return;
     }
-    if (!(g255VerifyOn() || (g286VerifyOn() && fbp == 0x13bu)) ||
+    if (!(g255VerifyOn() || (g286VerifyOn() && fbp == 0x13bu) ||
+          (g570Verify13dOn() && fbp == 0x13du) ||
+          (g570Verify139On() && fbp == 0x139u)) ||
         !vram || rowHi < rowLo)
         return;
     G255VerifyState &s = g_g255Verify;
@@ -773,13 +798,29 @@ static void g255BeginVerify(uint8_t *vram, uint32_t vramSize, uint32_t fbp, uint
                 std::memcpy(&px, vram + off, 4);
             s.before[static_cast<size_t>(y - rowLo) * fbW + x] = px;
         }
+    s.g570Depth = g570Depth && depthRowHi >= depthRowLo;
+    s.depthRowLo = depthRowLo;
+    s.depthRowHi = depthRowHi;
+    if (s.g570Depth)
+    {
+        const size_t depthCount =
+            static_cast<size_t>(depthRowHi - depthRowLo + 1) * static_cast<size_t>(fbW);
+        s.depthBefore.resize(depthCount);
+        s.depthGpu.resize(depthCount);
+        for (int y = depthRowLo; y <= depthRowHi; ++y)
+            for (int x = 0; x < fbW; ++x)
+                s.depthBefore[static_cast<size_t>(y - depthRowLo) * fbW + x] =
+                    g403DisplayZRead(x, y, fbp);
+    }
 }
 
 static void g255StageGpuVerify(uint8_t *vram, uint32_t vramSize,
                                const std::vector<uint32_t> &readback, int fbH)
 {
     G255VerifyState &s = g_g255Verify;
-    if (!(g255VerifyOn() || (g286VerifyOn() && s.fbp == 0x13bu)) ||
+    if (!(g255VerifyOn() || (g286VerifyOn() && s.fbp == 0x13bu) ||
+          (g570Verify13dOn() && s.fbp == 0x13du) ||
+          (g570Verify139On() && s.fbp == 0x139u)) ||
         !vram || s.before.empty() ||
         readback.size() != static_cast<size_t>(s.fbW) * static_cast<size_t>(fbH))
         return;
@@ -797,6 +838,21 @@ static void g255StageGpuVerify(uint8_t *vram, uint32_t vramSize,
     s.pending = true;
 }
 
+static void g570StageDepthVerify()
+{
+    G255VerifyState &s = g_g255Verify;
+    if (!g570Verify13dOn() || !s.pending || !s.g570Depth ||
+        s.depthBefore.size() != s.depthGpu.size())
+        return;
+    for (int y = s.depthRowLo; y <= s.depthRowHi; ++y)
+        for (int x = 0; x < s.fbW; ++x)
+        {
+            const size_t i = static_cast<size_t>(y - s.depthRowLo) * s.fbW + x;
+            s.depthGpu[i] = g403DisplayZRead(x, y, s.fbp);
+            g403DisplayZWrite(x, y, s.fbp, s.depthBefore[i]);
+        }
+}
+
 static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
 {
     G255VerifyState &s = g_g255Verify;
@@ -806,6 +862,7 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
     uint64_t badRgb = 0;
     uint64_t badAlpha = 0;
     uint64_t coverage = 0;
+    uint64_t depthBad = 0;
     int firstX = -1, firstY = -1;
     uint32_t firstCpu = 0, firstGpu = 0;
     for (int y = s.rowLo; y <= s.rowHi; ++y)
@@ -832,8 +889,34 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
                     ++coverage;
             }
         }
+    if (s.g570Depth)
+        for (int y = s.depthRowLo; y <= s.depthRowHi; ++y)
+            for (int x = 0; x < s.fbW; ++x)
+            {
+                const size_t i = static_cast<size_t>(y - s.depthRowLo) * s.fbW + x;
+                if (g403DisplayZRead(x, y, s.fbp) != s.depthGpu[i])
+                    ++depthBad;
+            }
     const int ti = g248TargetIndex(s.fbp);
-    if (ti >= 0)
+    if (g570Verify139On() && s.fbp == 0x139u)
+    {
+        const uint64_t n =
+            g_g570Verify139Checks.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (bad != 0u)
+            g_g570Verify139Bad.fetch_add(bad, std::memory_order_relaxed);
+        if (bad != 0u || n <= 8u || (n % 30u) == 0u)
+            std::fprintf(stderr,
+                         "[G570:verify139] n=%llu pixels=%zu bad=%llu rgb=%llu a=%llu cov=%llu "
+                         "rows=%d..%d entries=%zu prim=%u tme=%u tbp=0x%x psm=0x%x "
+                         "first=(%d,%d cpu=%08x gpu=%08x) cumulativeBad=%llu\n",
+                         (unsigned long long)n, s.gpu.size(),
+                         (unsigned long long)bad, (unsigned long long)badRgb,
+                         (unsigned long long)badAlpha, (unsigned long long)coverage,
+                         s.rowLo, s.rowHi, s.entries, s.prim, s.tme, s.tbp, s.tpsm,
+                         firstX, firstY, firstCpu, firstGpu,
+                         (unsigned long long)g_g570Verify139Bad.load(std::memory_order_relaxed));
+    }
+    else if (ti >= 0)
     {
         const uint64_t n = g_g255Checks[ti].fetch_add(1u, std::memory_order_relaxed) + 1u;
         if (bad != 0)
@@ -872,9 +955,29 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
                          (unsigned long long)badAlpha, (unsigned long long)coverage,
                          s.rowLo, s.rowHi, s.entries, s.prim, s.tme, s.tbp, s.tpsm,
                          firstX, firstY, firstCpu, firstGpu,
-                         (unsigned long long)g_g286VerifyBad.load(std::memory_order_relaxed));
+                             (unsigned long long)g_g286VerifyBad.load(std::memory_order_relaxed));
+    }
+    else if (g570Verify13dOn() && s.fbp == 0x13du)
+    {
+        const uint64_t n =
+            g_g570VerifyChecks.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (bad != 0u || depthBad != 0u)
+            g_g570VerifyBad.fetch_add(bad + depthBad, std::memory_order_relaxed);
+        if (bad != 0u || depthBad != 0u || n <= 8u || (n % 30u) == 0u)
+            std::fprintf(stderr,
+                         "[G570:verify13d] n=%llu pixels=%zu bad=%llu rgb=%llu a=%llu cov=%llu "
+                         "zbad=%llu zrows=%d..%d rows=%d..%d entries=%zu prim=%u tme=%u tbp=0x%x psm=0x%x "
+                         "first=(%d,%d cpu=%08x gpu=%08x) cumulativeBad=%llu\n",
+                         (unsigned long long)n, s.gpu.size(),
+                         (unsigned long long)bad, (unsigned long long)badRgb,
+                         (unsigned long long)badAlpha, (unsigned long long)coverage,
+                         (unsigned long long)depthBad, s.depthRowLo, s.depthRowHi,
+                         s.rowLo, s.rowHi, s.entries, s.prim, s.tme, s.tbp, s.tpsm,
+                         firstX, firstY, firstCpu, firstGpu,
+                         (unsigned long long)g_g570VerifyBad.load(std::memory_order_relaxed));
     }
     s.pending = false;
+    s.g570Depth = false;
 }
 
 // G253 (diagnostic only, default off): attribute G252's mid-frame drains without changing
