@@ -640,6 +640,7 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
     f59_log_frame(rdram, n, loopNo);
     g195_log_camera_state(rdram, n, loopNo);
     g154_observe_frame(rdram, n, scriptFrame, loopNo, nextLoopNo);
+    g570_observe_frame(rdram, n, scriptFrame, loopNo);
     g202_update_town_depth_scope(rdram, n, scriptFrame, loopNo);
     dc2_apply_60fps_patch(rdram);
     // G361 bisect aid: per-N-frame player world position + map number, so the

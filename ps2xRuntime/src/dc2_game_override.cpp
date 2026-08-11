@@ -1,3 +1,4 @@
+// G570 probe: force-recompile marker for spike-only per-frame thread/backend attribution.
 // G434 probe: force-recompile marker for [G434:inv] kick workload invariant.
 // PHASE9: DC2 ג€” Game override: binds all 173 missing stub addresses to their handlers.
 // Without this file the recomp wrappers call TODO_NAMED() (returns -1) instead of the
@@ -432,6 +433,8 @@ extern uint64_t g297GsCollectStalls();
 extern uint64_t g297GsCollectTotalNs();
 extern uint64_t g297GsCollectCalls();
 extern uint64_t g303_gs_worker_busy_ns();
+extern uint64_t g332_gs_worker_total_ns();
+extern void g332_backend_snapshot(uint64_t nsOut[4], uint64_t cntOut[4]);
 
 // G217: one-shot exact head-object packet correlation consumed by ps2_memory.cpp.
 std::atomic<uint32_t> g_dc2G217HeadDmaPacket{0u};

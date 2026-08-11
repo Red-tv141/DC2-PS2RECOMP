@@ -371,6 +371,309 @@ static void g154_observe_frame(uint8_t *rdram,
     }
 }
 
+// G570: low-overhead attribution for the isolated jump/dash spike class. This runs only at the
+// once-per-frame mgEndFrame hook and snapshots counters that already exist for the light census.
+// It emits the spike plus its two predecessors so the depth-two frame pipeline cannot hide a
+// producer one frame earlier. Normal frames stay quiet; periodic summaries retain the base rate.
+struct G570Counters
+{
+    uint64_t eeCpuNs = 0ull;
+    uint64_t vuBusyNs = 0ull;
+    uint64_t vuKicks = 0ull;
+    uint64_t gsWindowNs = 0ull;
+    uint64_t gsTotalNs = 0ull;
+    uint64_t collectNs = 0ull;
+    uint64_t collectStallNs = 0ull;
+    uint64_t collectCalls = 0ull;
+    uint64_t vifNs = 0ull;
+    uint64_t gifNs = 0ull;
+    uint64_t imageNs = 0ull;
+    uint64_t localNs = 0ull;
+    uint64_t uploadNs = 0ull;
+    uint64_t uploadCount = 0ull;
+    uint64_t packetNs = 0ull;
+    uint64_t packetCount = 0ull;
+    uint64_t drawNs = 0ull;
+    uint64_t drawCount = 0ull;
+    uint64_t imageBytes = 0ull;
+    uint64_t backendNs[4]{};
+    uint64_t backendCount[4]{};
+};
+
+struct G570FrameSample
+{
+    uint32_t n = 0u;
+    uint32_t scriptFrame = 0u;
+    uint32_t loopNo = 0u;
+    int32_t dngStatus = 0;
+    double frameMs = 0.0;
+    G570Counters delta{};
+};
+
+struct G570Accum
+{
+    uint64_t frames = 0ull;
+    double frameMs = 0.0;
+    G570Counters sum{};
+};
+
+static G570Counters g570_capture_counters()
+{
+    G570Counters out;
+    out.eeCpuNs = g182ThreadCpuNs();
+    out.vuBusyNs = g297WorkerBusyNs();
+    out.vuKicks = g297WorkerKicksRun();
+    out.gsWindowNs = g303_gs_worker_busy_ns();
+    out.gsTotalNs = g332_gs_worker_total_ns();
+    out.collectNs = g297GsCollectTotalNs();
+    out.collectStallNs = g297GsCollectStallNs();
+    out.collectCalls = g297GsCollectCalls();
+    out.vifNs = g_g146Vif1Ns.load(std::memory_order_relaxed);
+    out.gifNs = g_g146GifSubmitNs.load(std::memory_order_relaxed);
+    out.imageNs = g_g146GsImageNs.load(std::memory_order_relaxed);
+    out.localNs = g_g146GsLocalNs.load(std::memory_order_relaxed);
+    out.uploadNs = g_g146G144FlushUploadNs.load(std::memory_order_relaxed);
+    out.uploadCount = g_g146G144FlushUploadCount.load(std::memory_order_relaxed);
+    out.packetNs = g_g147GsGifPacketNs.load(std::memory_order_relaxed);
+    out.packetCount = g_g147GsGifPacketCount.load(std::memory_order_relaxed);
+    out.drawNs = g_g147DrawPrimitiveNs.load(std::memory_order_relaxed);
+    out.drawCount = g_g147DrawPrimitiveCount.load(std::memory_order_relaxed);
+    out.imageBytes = g_g147ImageBytes.load(std::memory_order_relaxed);
+    g332_backend_snapshot(out.backendNs, out.backendCount);
+    return out;
+}
+
+static uint64_t g570_counter_delta(uint64_t now, uint64_t before)
+{
+    return now >= before ? now - before : 0ull;
+}
+
+static G570Counters g570_counter_delta(const G570Counters &now, const G570Counters &before)
+{
+    G570Counters out;
+    out.eeCpuNs = g570_counter_delta(now.eeCpuNs, before.eeCpuNs);
+    out.vuBusyNs = g570_counter_delta(now.vuBusyNs, before.vuBusyNs);
+    out.vuKicks = g570_counter_delta(now.vuKicks, before.vuKicks);
+    out.gsWindowNs = g570_counter_delta(now.gsWindowNs, before.gsWindowNs);
+    out.gsTotalNs = g570_counter_delta(now.gsTotalNs, before.gsTotalNs);
+    out.collectNs = g570_counter_delta(now.collectNs, before.collectNs);
+    out.collectStallNs = g570_counter_delta(now.collectStallNs, before.collectStallNs);
+    out.collectCalls = g570_counter_delta(now.collectCalls, before.collectCalls);
+    out.vifNs = g570_counter_delta(now.vifNs, before.vifNs);
+    out.gifNs = g570_counter_delta(now.gifNs, before.gifNs);
+    out.imageNs = g570_counter_delta(now.imageNs, before.imageNs);
+    out.localNs = g570_counter_delta(now.localNs, before.localNs);
+    out.uploadNs = g570_counter_delta(now.uploadNs, before.uploadNs);
+    out.uploadCount = g570_counter_delta(now.uploadCount, before.uploadCount);
+    out.packetNs = g570_counter_delta(now.packetNs, before.packetNs);
+    out.packetCount = g570_counter_delta(now.packetCount, before.packetCount);
+    out.drawNs = g570_counter_delta(now.drawNs, before.drawNs);
+    out.drawCount = g570_counter_delta(now.drawCount, before.drawCount);
+    out.imageBytes = g570_counter_delta(now.imageBytes, before.imageBytes);
+    for (int i = 0; i < 4; ++i)
+    {
+        out.backendNs[i] = g570_counter_delta(now.backendNs[i], before.backendNs[i]);
+        out.backendCount[i] = g570_counter_delta(now.backendCount[i], before.backendCount[i]);
+    }
+    return out;
+}
+
+static void g570_accumulate(G570Accum &acc, const G570FrameSample &sample)
+{
+    ++acc.frames;
+    acc.frameMs += sample.frameMs;
+    const G570Counters &in = sample.delta;
+    G570Counters &out = acc.sum;
+    out.eeCpuNs += in.eeCpuNs;
+    out.vuBusyNs += in.vuBusyNs;
+    out.vuKicks += in.vuKicks;
+    out.gsWindowNs += in.gsWindowNs;
+    out.gsTotalNs += in.gsTotalNs;
+    out.collectNs += in.collectNs;
+    out.collectStallNs += in.collectStallNs;
+    out.collectCalls += in.collectCalls;
+    out.vifNs += in.vifNs;
+    out.gifNs += in.gifNs;
+    out.imageNs += in.imageNs;
+    out.localNs += in.localNs;
+    out.uploadNs += in.uploadNs;
+    out.uploadCount += in.uploadCount;
+    out.packetNs += in.packetNs;
+    out.packetCount += in.packetCount;
+    out.drawNs += in.drawNs;
+    out.drawCount += in.drawCount;
+    out.imageBytes += in.imageBytes;
+    for (int i = 0; i < 4; ++i)
+    {
+        out.backendNs[i] += in.backendNs[i];
+        out.backendCount[i] += in.backendCount[i];
+    }
+}
+
+static double g570_ms_per_frame(uint64_t ns, uint64_t frames)
+{
+    return frames ? static_cast<double>(ns) / 1.0e6 / static_cast<double>(frames) : 0.0;
+}
+
+static double g570_count_per_frame(uint64_t count, uint64_t frames)
+{
+    return frames ? static_cast<double>(count) / static_cast<double>(frames) : 0.0;
+}
+
+static void g570_print_sample(uint32_t spikeN, int rel, const G570FrameSample &sample)
+{
+    const G570Counters &d = sample.delta;
+    const uint64_t backendNs = d.backendNs[0] + d.backendNs[1] + d.backendNs[2] + d.backendNs[3];
+    const uint64_t frontNs = d.gsTotalNs > backendNs ? d.gsTotalNs - backendNs : 0ull;
+    const uint64_t gsOtherNs = d.gsTotalNs > d.gsWindowNs ? d.gsTotalNs - d.gsWindowNs : 0ull;
+    std::fprintf(stderr,
+                 "[G570:frame] spike=%u rel=%d n=%u script=%u ms=%.2f loop=%u dng=%d "
+                 "| eeCpu=%.2f vu=%.2f/%llu gs=%.2f(win=%.2f other=%.2f front=%.2f) "
+                 "collect=%.2f stall=%.2f calls=%llu "
+                 "| be(render=%.2f/%llu rb=%.2f/%llu copy=%.2f/%llu other=%.2f/%llu) "
+                 "| gif(packet=%.2f/%llu draw=%.2f/%llu imageKB=%.1f) "
+                 "upload=%.2f/%llu vif=%.2f submit=%.2f image=%.2f local=%.2f\n",
+                 spikeN, rel, sample.n, sample.scriptFrame, sample.frameMs,
+                 sample.loopNo, sample.dngStatus,
+                 d.eeCpuNs / 1.0e6, d.vuBusyNs / 1.0e6,
+                 static_cast<unsigned long long>(d.vuKicks),
+                 d.gsTotalNs / 1.0e6, d.gsWindowNs / 1.0e6, gsOtherNs / 1.0e6,
+                 frontNs / 1.0e6, d.collectNs / 1.0e6, d.collectStallNs / 1.0e6,
+                 static_cast<unsigned long long>(d.collectCalls),
+                 d.backendNs[0] / 1.0e6,
+                 static_cast<unsigned long long>(d.backendCount[0]),
+                 d.backendNs[1] / 1.0e6,
+                 static_cast<unsigned long long>(d.backendCount[1]),
+                 d.backendNs[2] / 1.0e6,
+                 static_cast<unsigned long long>(d.backendCount[2]),
+                 d.backendNs[3] / 1.0e6,
+                 static_cast<unsigned long long>(d.backendCount[3]),
+                 d.packetNs / 1.0e6,
+                 static_cast<unsigned long long>(d.packetCount),
+                 d.drawNs / 1.0e6,
+                 static_cast<unsigned long long>(d.drawCount),
+                 static_cast<double>(d.imageBytes) / 1024.0,
+                 d.uploadNs / 1.0e6,
+                 static_cast<unsigned long long>(d.uploadCount),
+                 d.vifNs / 1.0e6, d.gifNs / 1.0e6, d.imageNs / 1.0e6,
+                 d.localNs / 1.0e6);
+}
+
+static void g570_print_summary(uint32_t n, double thresholdMs,
+                               const G570Accum &spike, const G570Accum &normal)
+{
+    const uint64_t spikeBackend = spike.sum.backendNs[0] + spike.sum.backendNs[1] +
+                                  spike.sum.backendNs[2] + spike.sum.backendNs[3];
+    const uint64_t normalBackend = normal.sum.backendNs[0] + normal.sum.backendNs[1] +
+                                   normal.sum.backendNs[2] + normal.sum.backendNs[3];
+    const uint64_t spikeFront = spike.sum.gsTotalNs > spikeBackend
+                                    ? spike.sum.gsTotalNs - spikeBackend : 0ull;
+    const uint64_t normalFront = normal.sum.gsTotalNs > normalBackend
+                                     ? normal.sum.gsTotalNs - normalBackend : 0ull;
+    std::fprintf(stderr,
+                 "[G570:summary] n=%u threshold=%.1f spike=%llu normal=%llu "
+                 "| frame=%.2f/%.2f ee=%.2f/%.2f vu=%.2f/%.2f gs=%.2f/%.2f "
+                 "front=%.2f/%.2f rb=%.2f/%.2f packet=%.2f/%.2f draw=%.2f/%.2f "
+                 "upload=%.2f/%.2f calls=%.1f/%.1f\n",
+                 n, thresholdMs,
+                 static_cast<unsigned long long>(spike.frames),
+                 static_cast<unsigned long long>(normal.frames),
+                 spike.frames ? spike.frameMs / static_cast<double>(spike.frames) : 0.0,
+                 normal.frames ? normal.frameMs / static_cast<double>(normal.frames) : 0.0,
+                 g570_ms_per_frame(spike.sum.eeCpuNs, spike.frames),
+                 g570_ms_per_frame(normal.sum.eeCpuNs, normal.frames),
+                 g570_ms_per_frame(spike.sum.vuBusyNs, spike.frames),
+                 g570_ms_per_frame(normal.sum.vuBusyNs, normal.frames),
+                 g570_ms_per_frame(spike.sum.gsTotalNs, spike.frames),
+                 g570_ms_per_frame(normal.sum.gsTotalNs, normal.frames),
+                 g570_ms_per_frame(spikeFront, spike.frames),
+                 g570_ms_per_frame(normalFront, normal.frames),
+                 g570_ms_per_frame(spike.sum.backendNs[1], spike.frames),
+                 g570_ms_per_frame(normal.sum.backendNs[1], normal.frames),
+                 g570_ms_per_frame(spike.sum.packetNs, spike.frames),
+                 g570_ms_per_frame(normal.sum.packetNs, normal.frames),
+                 g570_ms_per_frame(spike.sum.drawNs, spike.frames),
+                 g570_ms_per_frame(normal.sum.drawNs, normal.frames),
+                 g570_ms_per_frame(spike.sum.uploadNs, spike.frames),
+                 g570_ms_per_frame(normal.sum.uploadNs, normal.frames),
+                 g570_count_per_frame(spike.sum.collectCalls, spike.frames),
+                 g570_count_per_frame(normal.sum.collectCalls, normal.frames));
+}
+
+static void g570_observe_frame(uint8_t *rdram, uint32_t n, uint32_t scriptFrame, uint32_t loopNo)
+{
+    static const bool s_on = dc2_env_flag_enabled("DC2_G570_FRAME");
+    if (!s_on)
+        return;
+
+    static const double s_thresholdMs = []() {
+        const char *value = std::getenv("DC2_G570_SPIKE_MS");
+        const double parsed = value ? std::strtod(value, nullptr) : 90.0;
+        return std::max(16.0, std::min(2000.0, parsed));
+    }();
+    static const uint32_t s_summaryEvery =
+        g154_env_u32("DC2_G570_SUMMARY_EVERY", 300u, 30u, 3600u);
+    static bool s_haveLast = false;
+    static auto s_lastTs = std::chrono::steady_clock::time_point{};
+    static G570Counters s_lastCounters{};
+    static G570FrameSample s_ring[3]{};
+    static uint32_t s_ringWrite = 0u;
+    static uint32_t s_ringCount = 0u;
+    static G570Accum s_spike{};
+    static G570Accum s_normal{};
+    static uint32_t s_summaryFrames = 0u;
+
+    const auto now = std::chrono::steady_clock::now();
+    const G570Counters counters = g570_capture_counters();
+    if (!s_haveLast)
+    {
+        s_haveLast = true;
+        s_lastTs = now;
+        s_lastCounters = counters;
+        std::fprintf(stderr,
+                     "[G570:init] threshold=%.1f summaryEvery=%u g332=%u g146=%u g147=%u\n",
+                     s_thresholdMs, s_summaryEvery,
+                     std::getenv("DC2_G332_CENSUS") ? 1u : 0u,
+                     std::getenv("DC2_G146_PERF") ? 1u : 0u,
+                     std::getenv("DC2_G147_PERF") ? 1u : 0u);
+        return;
+    }
+
+    G570FrameSample sample;
+    sample.n = n;
+    sample.scriptFrame = scriptFrame;
+    sample.loopNo = loopNo;
+    sample.dngStatus = static_cast<int32_t>(dc2_read_u32(rdram, 0x01E9F6E0u));
+    sample.frameMs = std::chrono::duration<double, std::milli>(now - s_lastTs).count();
+    sample.delta = g570_counter_delta(counters, s_lastCounters);
+    s_lastTs = now;
+    s_lastCounters = counters;
+
+    s_ring[s_ringWrite] = sample;
+    s_ringWrite = (s_ringWrite + 1u) % 3u;
+    s_ringCount = std::min<uint32_t>(3u, s_ringCount + 1u);
+
+    const bool spike = sample.frameMs >= s_thresholdMs;
+    g570_accumulate(spike ? s_spike : s_normal, sample);
+    ++s_summaryFrames;
+    if (spike)
+    {
+        for (uint32_t i = 0u; i < s_ringCount; ++i)
+        {
+            const uint32_t index = (s_ringWrite + 3u - s_ringCount + i) % 3u;
+            const int rel = static_cast<int>(i) - static_cast<int>(s_ringCount) + 1;
+            g570_print_sample(sample.n, rel, s_ring[index]);
+        }
+    }
+    if (s_summaryFrames >= s_summaryEvery)
+    {
+        g570_print_summary(n, s_thresholdMs, s_spike, s_normal);
+        s_spike = {};
+        s_normal = {};
+        s_summaryFrames = 0u;
+    }
+}
+
 static bool f39_trace_map_entry_enabled()
 {
     static const bool enabled = dc2_env_flag_enabled("DC2_TRACE_MAP_ENTRY");
