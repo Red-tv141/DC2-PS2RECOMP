@@ -149,8 +149,32 @@ bool g286TransientTarget(uint32_t fbp)
 // whole-flush classifier still fails closed to exact banded CPU replay, and a successful GPU flush
 // retains G286's immediate readback/page-publication contract.
 //
-// Bring-up is default-OFF. G573 promotion flips the standalone default only after paired timing,
-// G286 same-run pixel verification, ownership invariants and normal Ridepod motion all pass.
+// G573 PROMOTION (2026-08-13): DEFAULT-ON. Rollback is DC2_G573_NO_TRI_13B=1.
+// Gated on the Ridepod boss with `tools/g525_route.ps1 -Route ridepod -Ab tri13b`:
+//   cand 52.871 ms/f (n=311) vs ctrl 61.568 (n=271) -> -8.697 ms/f, -14.13%, seDelta 0.642 (~13.5 sigma)
+//   blocked(w=6 mean=-6.255 se=1.314 t=-4.76 fav=6)   used(... 3=0), i.e. no interval saw both arms.
+// The control arm reproduces G572's independently measured 62.23 ms/f default for the same window.
+// Divergence proof: [G573:admit] n=2,228,224 (tri 852,881 / strip 1,375,343), all inside n=1321..1921.
+//
+// WHY THIS IS SAFE. [G290:probe] measures 23,996,467 CPU-replayed entries against those admissions:
+// the boss mesh is DEPTH-TESTED, and a batch needing real guest depth "has already failed closed"
+// (rasterizer_vram_materialization.inc:4438), so the admitted primitives are consumed by the exact
+// banded CPU replay -- the SAME scalar rasterizer, in submission order. Admission changes WHEN and
+// IN WHAT GROUPING the work runs, not how a pixel is computed. Ownership is untouched:
+// [G261:invariant] escaped writer = 0 on every run (3 runs), 0 crash lines (4 runs).
+//
+// ⛔ TWO GATES ARE NOT AVAILABLE HERE AND MUST NOT BE CLAIMED AS PASSED:
+//  1. The G286 same-run pixel oracle NEVER FIRES on this population -- it is gated `!guestDepth`
+//     (that file, :4441 and :5407) and this geometry is depth-tested. Zero checks over 2.2 M
+//     admitted primitives. It gates the depth-less SPRITE class only.
+//  2. A cross-arm pixel comparison CANNOT gate this route. Measured: on-vs-off median 92.85% of
+//     pixels differing -- but the DETERMINISM CONTROL (same binary, same flags, two runs) measures
+//     92.10%. The boss fight's AI/RNG does not replay, so equal host ticks are not equal scenes.
+//     `ridepod`'s boss window joins route3 as unusable for a pixel A/B.
+// Correctness therefore rests on: the exact-CPU-replay argument above, zero ownership invariants,
+// and direct normal-output review of BOTH arms (full route, 14 boss frames each: Linda's textures
+// and decals, Ridepod chassis, the alpha-blended spotlight cone, floor shadows, depth ordering,
+// HUD, damage numbers -- clean in both, neither arm showing a defect the other lacks).
 static bool g573Tri13bOn()
 {
     static const bool paired = []()
@@ -160,8 +184,7 @@ static bool g573Tri13bOn()
     }();
     if (paired)
         return g573Tri13bArm() > 0;
-    static const bool on = envFlagEnabled("DC2_G573_TRI_13B") &&
-                           !envFlagEnabled("DC2_G573_NO_TRI_13B") &&
+    static const bool on = !envFlagEnabled("DC2_G573_NO_TRI_13B") &&
                            !envFlagDisabled("DC2_G573_TRI_13B");
     return on && g286TransientTargetOn();
 }
@@ -233,6 +256,93 @@ static bool g570Transient13dStatOn()
     return s_on;
 }
 
+// ===== G586: transient GPU execution for the measured 0x141 Ridepod RTT =====
+//
+// G583's post-promotion whole-population census leaves 0x141 as 78.4% of replayed fallback
+// entries.  G569 proved that making this alias-family target persistently resident is unsafe:
+// guest writers can escape while GPU ownership survives.  This path therefore reuses G570's
+// opposite ownership contract: materialize overlapping residents before the batch, render into
+// the ordinary backend FBO, immediately read colour back to guest VRAM, publish generations, and
+// retain no residency after the flush.  The exact verifier implies the path; an explicitly armed
+// G569 slot disables it so persistent and transient ownership can never be mixed.
+bool g586Transient141On()
+{
+    static const bool s_on =
+        (envFlagEnabled("DC2_G586_TRANSIENT_141") || g586Verify141On()) &&
+        !envFlagEnabled("DC2_G586_NO_TRANSIENT_141") &&
+        !envFlagDisabled("DC2_G586_TRANSIENT_141");
+    return s_on && g260NrOn() && g248TargetIndex(0x141u) < 0;
+}
+
+bool g586Transient141Target(uint32_t fbp)
+{
+    return g586Transient141On() && fbp == 0x141u;
+}
+
+static bool g586Transient141StatOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G586_STAT") || g586Verify141On();
+    return s_on;
+}
+
+static void g586NoteTransient141Admission(uint32_t prim)
+{
+    if (!g586Transient141StatOn())
+        return;
+    static uint64_t total = 0u, sprite = 0u, tri = 0u, strip = 0u;
+    ++total;
+    sprite += prim == GS_PRIM_SPRITE ? 1u : 0u;
+    tri += prim == GS_PRIM_TRIANGLE ? 1u : 0u;
+    strip += prim == GS_PRIM_TRISTRIP ? 1u : 0u;
+    if (total <= 8u || (total % 65536u) == 0u)
+        std::fprintf(stderr,
+                     "[G586:admit141] n=%llu sprite=%llu tri=%llu strip=%llu\n",
+                     static_cast<unsigned long long>(total),
+                     static_cast<unsigned long long>(sprite),
+                     static_cast<unsigned long long>(tri),
+                     static_cast<unsigned long long>(strip));
+}
+
+// G587: bounded follow-up for the next Ridepod reject family.  Keep it independent from G586 so
+// 0x141's failed oracle can never be enabled as a side effect of testing 0x15d.
+bool g587Transient15dOn()
+{
+    static const bool s_on =
+        (envFlagEnabled("DC2_G587_TRANSIENT_15D") || g587Verify15dOn()) &&
+        !envFlagEnabled("DC2_G587_NO_TRANSIENT_15D") &&
+        !envFlagDisabled("DC2_G587_TRANSIENT_15D");
+    return s_on && g260NrOn() && g248TargetIndex(0x15du) < 0;
+}
+
+bool g587Transient15dTarget(uint32_t fbp)
+{
+    return g587Transient15dOn() && fbp == 0x15du;
+}
+
+static bool g587Transient15dStatOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G587_STAT") || g587Verify15dOn();
+    return s_on;
+}
+
+static void g587NoteTransient15dAdmission(uint32_t prim)
+{
+    if (!g587Transient15dStatOn())
+        return;
+    static uint64_t total = 0u, sprite = 0u, tri = 0u, strip = 0u;
+    ++total;
+    sprite += prim == GS_PRIM_SPRITE ? 1u : 0u;
+    tri += prim == GS_PRIM_TRIANGLE ? 1u : 0u;
+    strip += prim == GS_PRIM_TRISTRIP ? 1u : 0u;
+    if (total <= 8u || (total % 65536u) == 0u)
+        std::fprintf(stderr,
+                     "[G587:admit15d] n=%llu sprite=%llu tri=%llu strip=%llu\n",
+                     static_cast<unsigned long long>(total),
+                     static_cast<unsigned long long>(sprite),
+                     static_cast<unsigned long long>(tri),
+                     static_cast<unsigned long long>(strip));
+}
+
 // G558 experiment: S05's remaining 0x13b pole is the same transient target, but its terminal
 // full-screen sprite is an opaque SOLID fill (TME=0).  G286 only admitted textured sprites even
 // though the transient backend already supports the untextured draw state and preserves the same
@@ -268,6 +378,10 @@ static std::atomic<uint64_t> g_g286Captured{0}, g_g286GpuAttempts{0},
     g_g286GpuSuccess{0}, g_g286RowsPublished{0};
 static std::atomic<uint64_t> g_g570TransientAttempts{0}, g_g570TransientSuccess{0},
     g_g570TransientRejectShape{0}, g_g570TransientRowsPublished{0};
+static std::atomic<uint64_t> g_g586TransientAttempts{0}, g_g586TransientSuccess{0},
+    g_g586TransientRejectShape{0}, g_g586TransientRowsPublished{0};
+static std::atomic<uint64_t> g_g587TransientAttempts{0}, g_g587TransientSuccess{0},
+    g_g587TransientRejectShape{0}, g_g587TransientRowsPublished{0};
 
 // G272 display-color residency helpers are defined after the G178 framebuffer snapshot state.
 // The nested G260 scheduler namespace uses these .cpp-local bridges without a public header.
@@ -850,6 +964,10 @@ namespace
         static const bool s_seqEnv = (std::getenv("DC2_G144_SEQ") != nullptr);
         const std::function<void()> &fn =
             (allowParallel && !s_seqEnv && g_g144FlushFn) ? g_g144FlushFn : g_g144FlushSeqFn;
+        // G589: this loop is one DRAIN TRANSACTION. Nothing outside the batches themselves can
+        // mutate guest VRAM, residency or ownership while it runs, which is what lets
+        // flush-invariant preparation be paid once instead of once per batch.
+        g589BeginDrain();
         for (size_t bi = 0; bi < prefixCount; ++bi)
         {
             G260Batch &b = g_g260Graph[bi];
@@ -893,20 +1011,22 @@ namespace
                         continue;
                     if (c.scissor.x1 >= c.scissor.x0 && c.scissor.y1 >= c.scissor.y0)
                     {
-                        g178NoteVramWriteRect(vram260,
+                        g178NoteVramWriteRectTagged(vram260,
                                               framePageBaseToBlock(c.frame.fbp),
                                               c.frame.fbw, c.frame.psm,
                                               c.scissor.x0, c.scissor.y0,
                                               static_cast<uint32_t>(c.scissor.x1 - c.scissor.x0 + 1),
-                                              static_cast<uint32_t>(c.scissor.y1 - c.scissor.y0 + 1));
+                                              static_cast<uint32_t>(c.scissor.y1 - c.scissor.y0 + 1),
+                                              10u); // G582 source 10: g260 publish A, color
                         if (((c.zbuf >> 32u) & 1u) == 0u)
-                            g178NoteVramWriteRect(vram260,
+                            g178NoteVramWriteRectTagged(vram260,
                                                   static_cast<uint32_t>(c.zbuf & 0x1FFu) << 5u,
                                                   c.frame.fbw,
                                                   static_cast<uint32_t>((c.zbuf >> 24u) & 0xFu),
                                                   c.scissor.x0, c.scissor.y0,
                                                   static_cast<uint32_t>(c.scissor.x1 - c.scissor.x0 + 1),
-                                                  static_cast<uint32_t>(c.scissor.y1 - c.scissor.y0 + 1));
+                                                  static_cast<uint32_t>(c.scissor.y1 - c.scissor.y0 + 1),
+                                                  11u); // G582 source 11: g260 publish A, depth
                     }
                 }
             }
@@ -920,6 +1040,7 @@ namespace
             g_g144List.swap(b.entries); // reclaim the (now empty) storage's capacity
             g_g260Pool.push_back(std::move(b.entries));
         }
+        g589EndDrain();
         g_g260Graph.erase(g_g260Graph.begin(), g_g260Graph.begin() + prefixCount);
         g_g144BlockFbp = 0xFFFFFFFFu;
         g260StatReport();
@@ -944,6 +1065,8 @@ namespace
         // uses its separate opt-in helper only; this avoids changing vector lifetime/capacity or
         // open-batch state for the promoted G260-G266 stack.
         const bool g290Probe = g290ProbeOn();
+        // G589: one DRAIN TRANSACTION (see g589_drain_transaction.inc and the prefix executor).
+        g589BeginDrain();
         for (auto &b : g_g260Graph)
         {
             if (b.entries.empty())
@@ -977,19 +1100,21 @@ namespace
                         continue;
                     if (c.scissor.x1 >= c.scissor.x0 && c.scissor.y1 >= c.scissor.y0)
                     {
-                        g178NoteVramWriteRect(vram260, framePageBaseToBlock(c.frame.fbp),
+                        g178NoteVramWriteRectTagged(vram260, framePageBaseToBlock(c.frame.fbp),
                                               c.frame.fbw, c.frame.psm,
                                               c.scissor.x0, c.scissor.y0,
                                               static_cast<uint32_t>(c.scissor.x1 - c.scissor.x0 + 1),
-                                              static_cast<uint32_t>(c.scissor.y1 - c.scissor.y0 + 1));
+                                              static_cast<uint32_t>(c.scissor.y1 - c.scissor.y0 + 1),
+                                              12u); // G582 source 12: g260 publish B, color
                         if (((c.zbuf >> 32u) & 1u) == 0u)
-                            g178NoteVramWriteRect(vram260,
+                            g178NoteVramWriteRectTagged(vram260,
                                                   static_cast<uint32_t>(c.zbuf & 0x1FFu) << 5u,
                                                   c.frame.fbw,
                                                   static_cast<uint32_t>((c.zbuf >> 24u) & 0xFu),
                                                   c.scissor.x0, c.scissor.y0,
                                                   static_cast<uint32_t>(c.scissor.x1 - c.scissor.x0 + 1),
-                                                  static_cast<uint32_t>(c.scissor.y1 - c.scissor.y0 + 1));
+                                                  static_cast<uint32_t>(c.scissor.y1 - c.scissor.y0 + 1),
+                                                  13u); // G582 source 13: g260 publish B, depth
                     }
                 }
             }
@@ -1003,6 +1128,7 @@ namespace
             g_g144List.swap(b.entries);
             g_g260Pool.push_back(std::move(b.entries));
         }
+        g589EndDrain();
         g_g260Graph.clear();
         g_g144BlockFbp = 0xFFFFFFFFu;
         if (g290Probe && (++g_g290Drains % 100u) == 0u)
@@ -1319,6 +1445,28 @@ static uint64_t g277GenSumAligned(uint32_t fbBlock, uint32_t fbw, uint32_t rows)
     return sum;
 }
 
+// G582: the page set a bump rect WOULD touch, as a 512-bit mask, without touching a generation.
+// Used only by the G582 dedup oracle (DC2_G582_VERIFY=1) to assert the invariant that matters:
+// the SET of pages whose generation moved must be identical with and without duplicate elision.
+// Mirrors g178BumpRectImpl's walk exactly, including the conservative +1 slack page.
+using G582PageMask = std::array<uint64_t, kG178PageCount / 64u>;
+
+static void g582MarkRectPages(G582PageMask &mask, uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
+                              uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    const G471PageRect pr = g471PageRect(bpBlocks, bw64, psm, x, y, w, h);
+    const uint32_t slack = (g572ExactAlignedGenOn() && (bpBlocks & 31u) == 0u) ? 0u : 1u;
+    for (uint32_t py = pr.py0; py <= pr.py1; ++py)
+    {
+        const uint32_t row = pr.basePage + py * pr.widthPages;
+        for (uint32_t px = pr.px0; px <= pr.px1 + slack; ++px)
+        {
+            const uint32_t pg = (row + px) & (kG178PageCount - 1u);
+            mask[pg >> 6u] |= 1ull << (pg & 63u);
+        }
+    }
+}
+
 // G276 pending-display state (declared before g178BumpRectImpl so the G277 mover probe can read
 // it; the lever/flush logic lives later with the other G276 code).
 struct G276PendDisplay
@@ -1371,6 +1519,82 @@ static void g570TraceBump(const G471PageRect &pr,
     }
 }
 
+// ===== G582: page-generation BUMP census (diagnosis only, default OFF) =====
+//
+// The G446 PC sampler resolved against the linker /MAP puts `g178BumpRectImpl+0x5b5` — the
+// `lock inc qword ptr [g_g178PageGen + rax*8]` inner loop — at 9.9% of EVERY GS-worker sample on
+// the Ridepod boss, i.e. about half of all non-waiting in-exe samples on the pole thread. G476
+// already refuted the "+1 slack page" as the cause and explicitly said to re-open the ATTRIBUTION
+// instead; this is that census.
+//
+// Rank by VISITS (one `lock inc` each), never by calls: the call sites differ by two orders of
+// magnitude in rect area, and a per-CALL count would rank a 1-page bbox bump equal to a 104-page
+// whole-scissor one. Both columns are printed so `visits/call` is readable.
+//
+// Behaviour-pure: two relaxed atomic RMWs per call, and only when armed.
+static bool g582BumpCensusOn()
+{
+    static const bool on = envFlagEnabled("DC2_G582_BUMPCENSUS");
+    return on;
+}
+
+struct G582BumpBucket
+{
+    std::atomic<uint64_t> calls{0u};
+    std::atomic<uint64_t> visits{0u};
+};
+static std::array<G582BumpBucket, 32> g_g582Bump{};
+static std::atomic<uint64_t> g_g582BumpCalls{0u};
+
+// Source tags. 0 stays "untagged" so a missed site is visible rather than silently merged.
+static const char *const kG582BumpName[32] = {
+    "untagged", "aliasfbpub", "cpurttcol", "cpurttdep", "flushcol", "flushdep",
+    "inlinecol", "inlinedep", "l2ldst", "imgupload",
+    "g260pubAcol", "g260pubAdep", "g260pubBcol", "g260pubBdep",
+    "g286trncol", "g286trndep",
+    "dispmirror", "src17", "aliasfull", "aliaslowA", "aliaslowB", "aliasz",
+    "rttz", "matz", "matcolA", "matcolB",
+    "src26", "src27", "src28", "src29", "src30", "other"};
+
+// The G261/G272 alias publication site (source 1) packs its CAUSE into bits 8..15, so bucket on
+// the low byte only -- otherwise every cause lands in "other".
+static void g582NoteBump(uint32_t source, uint32_t rows, uint32_t cols)
+{
+    const uint32_t tag = source & 0xffu;
+    const uint32_t idx = (tag < 32u) ? tag : 31u;
+    g_g582Bump[idx].calls.fetch_add(1u, std::memory_order_relaxed);
+    g_g582Bump[idx].visits.fetch_add(static_cast<uint64_t>(rows) * cols,
+                                     std::memory_order_relaxed);
+    const uint64_t n = g_g582BumpCalls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if ((n % 200000ull) != 0ull)
+        return;
+    uint64_t totCalls = 0u, totVisits = 0u;
+    for (uint32_t i = 0u; i < 32u; ++i)
+    {
+        totCalls += g_g582Bump[i].calls.load(std::memory_order_relaxed);
+        totVisits += g_g582Bump[i].visits.load(std::memory_order_relaxed);
+    }
+    std::fprintf(stderr, "[G582:bump] calls=%llu visits=%llu\n",
+                 static_cast<unsigned long long>(totCalls),
+                 static_cast<unsigned long long>(totVisits));
+    for (uint32_t i = 0u; i < 32u; ++i)
+    {
+        const uint64_t c = g_g582Bump[i].calls.load(std::memory_order_relaxed);
+        if (c == 0u)
+            continue;
+        const uint64_t v = g_g582Bump[i].visits.load(std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "[G582:bumpsrc] src=%u name=%-11s calls=%llu visits=%llu "
+                     "perCall=%.1f shareVisits=%.1f%%\n",
+                     i, kG582BumpName[i],
+                     static_cast<unsigned long long>(c),
+                     static_cast<unsigned long long>(v),
+                     static_cast<double>(v) / static_cast<double>(c),
+                     totVisits ? 100.0 * static_cast<double>(v) /
+                                     static_cast<double>(totVisits) : 0.0);
+    }
+}
+
 void g178BumpRectImpl(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
                       uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                       uint32_t g570Source = 0u)
@@ -1406,6 +1630,9 @@ void g178BumpRectImpl(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
     const uint32_t py0 = pr.py0, py1 = pr.py1, px0 = pr.px0, px1 = pr.px1;
     const uint32_t basePage = pr.basePage;
     const bool exactAligned = g572ExactAlignedGenOn() && (bpBlocks & 31u) == 0u;
+    if (g582BumpCensusOn())
+        g582NoteBump(g570Source, py1 - py0 + 1u,
+                     px1 - px0 + 1u + (exactAligned ? 0u : 1u));
     g570TraceBump(pr, bpBlocks, bw64, psm, x, y, w, h, g570Source);
     // G277-R mover probe: report every bump whose page walk (incl. the +1 slack) can touch the
     // 0x68 display chunk-12 pages 200..207 — pins the writer that trips publish-before-upload.
@@ -1828,7 +2055,8 @@ void g272MaterializeIndex(int index, int cause)
         }
         g178BumpRectImpl(fbBlock, r.fbw, GS_PSM_CT32, 0u,
                          static_cast<uint32_t>(r.dirtyLo), static_cast<uint32_t>(r.fbW),
-                         static_cast<uint32_t>(rows));
+                         static_cast<uint32_t>(rows),
+                         16u); // G582 source 16: display-mirror publication
         g149BumpVramGen();
         G178FbSnap &snap = g_g178FbSnap[r.fbp];
         snap.valid = true;

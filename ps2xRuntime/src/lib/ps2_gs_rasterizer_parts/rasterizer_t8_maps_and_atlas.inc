@@ -1189,7 +1189,12 @@ static void g310VerifyAgainstLegacy(const std::vector<uint32_t> &logical)
 static bool g310PrepareLogical(bool &useLogical)
 {
     useLogical = false;
-    if (!g310EnsureCurrent())
+    // G589: the atlas refresh is the largest single dependency leaf ([G323]: 55% of `deps`) and is
+    // re-run for every batch of a drain even though its inputs are residency metadata that a drain
+    // cannot change between batches unless a batch itself changes them. g589MemoEnsureAtlas
+    // recomputes the complete input key and calls through on any difference; with the arm off it
+    // is an unconditional call to the same function.
+    if (!g589MemoEnsureAtlas(&g310EnsureCurrent))
         return false;
     const uint64_t n =
         g_g310Prepares.fetch_add(1u, std::memory_order_relaxed) + 1u;

@@ -1,4 +1,5 @@
 // G566: GPU-authoritative VU1 packet publication and one-readback-per-16-kick prototype (v3).
+// G587: include transient 0x15d in the explicit raw-alpha two-pass (force .inc recompile v2).
 // G433: blocking colour-readback ceiling probe in lle_gpu_raster_backend.inc
 // (DC2_G433_NO_RB=1 skips only glReadPixels; DC2_G433_RBSTAT=1 times it). Content edit here
 // forces MSBuild to consume the .inc.

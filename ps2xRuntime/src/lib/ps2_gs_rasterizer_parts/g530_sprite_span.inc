@@ -413,4 +413,70 @@ inline G530UTable &g530UTable()
     return t;
 }
 
+// ===== G588: exact replayed solid-sprite commit =====
+//
+// The post-G585 reject census is dominated on several routes by CPU-only RTT batches whose
+// entries are opaque, untextured CT32 sprites with a no-op Z state. Their established CPU replay
+// still calls the fully generic writePixel path once per pixel even though alpha classification,
+// blending, masking, Z, and the source word are all draw constants. This kernel changes no
+// ownership: guest VRAM remains authoritative and every band still writes only its assigned rows.
+// The verifier leaves writePixel authoritative and compares the direct-store word afterwards.
+// PROMOTED default-on 2026-08-14: authoritative Ridepod oracle covered 272,449,924 pixels with
+// bad=0; four independent boss-local paired runs all favoured the exact commit, mean -1.169 ms/f
+// (-2.86%, pooled run-level se ~0.313 ms). Roll back with DC2_G588_NO_SOLID_SPRITE=1 or
+// DC2_G588_SOLID_SPRITE=0.
+inline bool g588SolidSpriteOn()
+{
+    const int abArm = g588SolidSpriteArm();
+    if (abArm >= 0)
+        return abArm != 0;
+    static const bool on = !envFlagEnabled("DC2_G588_NO_SOLID_SPRITE") &&
+                           !envFlagDisabled("DC2_G588_SOLID_SPRITE");
+    return on;
+}
+
+inline bool g588SolidSpriteVerifyOn()
+{
+    static const bool on = envFlagEnabled("DC2_G588_VERIFY_SOLID_SPRITE");
+    return on;
+}
+
+inline bool g588SolidSpriteStatOn()
+{
+    static const bool on = envFlagEnabled("DC2_G588_STAT") ||
+                           g588SolidSpriteVerifyOn();
+    return on;
+}
+
+std::atomic<uint64_t> g_g588Draws{0}, g_g588Pixels{0}, g_g588Bad{0}, g_g588Reject{0};
+std::atomic<uint64_t> g_g588RejQuiet{0}, g_g588RejLayout{0},
+                      g_g588RejState{0}, g_g588RejAlpha{0};
+
+inline void g588SolidSpriteReport()
+{
+    if (!g588SolidSpriteStatOn())
+        return;
+    static std::atomic<uint64_t> next{1};
+    const uint64_t draws = g_g588Draws.load(std::memory_order_relaxed);
+    const uint64_t reject = g_g588Reject.load(std::memory_order_relaxed);
+    const uint64_t seen = draws + reject;
+    uint64_t want = next.load(std::memory_order_relaxed);
+    if (seen < want || !next.compare_exchange_strong(
+            want, (want < 65536u) ? 65536u : want + 65536u))
+        return;
+    std::fprintf(stderr,
+                 "[G588:solid] draws=%llu pixels=%llu bad=%llu reject=%llu "
+                 "why(q=%llu layout=%llu state=%llu alpha=%llu) verify=%u\n",
+                 static_cast<unsigned long long>(draws),
+                 static_cast<unsigned long long>(g_g588Pixels.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_g588Bad.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(reject),
+                 static_cast<unsigned long long>(g_g588RejQuiet.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_g588RejLayout.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_g588RejState.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_g588RejAlpha.load(std::memory_order_relaxed)),
+                 g588SolidSpriteVerifyOn() ? 1u : 0u);
+    std::fflush(stderr);
+}
+
 } // namespace

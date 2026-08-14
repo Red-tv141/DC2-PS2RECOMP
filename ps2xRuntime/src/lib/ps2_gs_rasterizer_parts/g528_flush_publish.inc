@@ -278,10 +278,16 @@ static void g528PublishScoped(int cause, const G260RangeSet &rd, const G260Range
     // the replay depth-testing against a mirror the GPU had already superseded. Publish them here,
     // at the same semantic edge g278FlushPendingDepthForInline already uses for single primitives.
     // Range-scoping cannot apply: the mirror has no guest-VRAM range to intersect rd/wr against.
+    //
+    // G592: true of VRAM RANGES, false of CONSUMERS. This publication is a 416-row blocking
+    // GPU->CPU depth readback plus a 213 k-iteration unpack, it fires 0.95 times/frame, and on
+    // `s05` NOT ONE CPU draw in the whole cutscene consumes the mirror. g592PublishPrivateMirrors
+    // asks whether THIS batch's captured entries contain a draw that can reach the mirror
+    // (g403DisplayZ, i.e. g404SharedZScope over ctx) before paying for it. It runs the identical
+    // unconditional loop when untracked, fails OPEN on every uncertainty, and carries the
+    // `escapedReplay` invariant. See g592_publish_consumer.inc.
     if (g535EdgePubOn())
-        for (int i = 0; i < kG278PendSlots; ++i)
-            if (s_g278PendTab[i].active && s_g278PendTab[i].privateMirror)
-                (void)g278FlushPendSlot(s_g278PendTab[i], cause);
+        g592PublishPrivateMirrors(cause);
     for (int i = 0; i < rd.n; ++i)
     {
         (void)g278FlushPendingDepthForRanges(cause, rd.r[i], none, false, false);

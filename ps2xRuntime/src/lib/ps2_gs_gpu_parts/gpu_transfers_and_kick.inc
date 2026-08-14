@@ -220,9 +220,11 @@ void GS::performLocalToLocalTransfer()
         // G178/G242: notify only after pending draws and source depth have been resolved.
         // The hook materializes an overlapping GPU-owned destination before the CPU copy writes it.
         {
-            extern void g178NoteVramWriteRect(uint8_t *, uint32_t, uint32_t, uint32_t,
-                                              uint32_t, uint32_t, uint32_t, uint32_t);
-            g178NoteVramWriteRect(m_vram, dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+            extern void g178NoteVramWriteRectTagged(uint8_t *, uint32_t, uint32_t, uint32_t,
+                                                    uint32_t, uint32_t, uint32_t, uint32_t,
+                                                    uint32_t);
+            g178NoteVramWriteRectTagged(m_vram, dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
+                                        8u); // G582 source 8: local-to-local copy destination
         }
     }
     if (g289GpuCopy)
@@ -803,10 +805,12 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
     }
     // G178/G242: notify only after the pending-draw barrier above has established GS order.
     {
-        extern void g178NoteVramWriteRect(uint8_t *, uint32_t, uint32_t, uint32_t,
-                                          uint32_t, uint32_t, uint32_t, uint32_t);
-        g178NoteVramWriteRect(m_vram, m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
-                              m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh);
+        extern void g178NoteVramWriteRectTagged(uint8_t *, uint32_t, uint32_t, uint32_t,
+                                                uint32_t, uint32_t, uint32_t, uint32_t,
+                                                uint32_t);
+        g178NoteVramWriteRectTagged(m_vram, m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
+                                    m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh,
+                                    9u); // G582 source 9: host->local IMAGE upload
     }
     if (s_g313Census)
     {

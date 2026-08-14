@@ -235,6 +235,15 @@
                 }
                 const auto g290T2 = g290P ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
+                // G583: rank the CPU-fallback population by REPLAYED ENTRIES. Deliberately NOT
+                // gated on g290P — the entry weight is the whole point and must not require the
+                // probe's per-flush clock pair to be armed.
+                g583NoteFallback(g_g144List);
+                // G589: this batch leaves the pure-GPU path. The CPU band replay writes guest VRAM
+                // and the private depth mirror through paths that publish no residency metadata,
+                // so the drain memo's key cannot observe them. Fail CLOSED for the rest of the
+                // transaction.
+                g589DisarmTransaction();
                 if (g290P)
                 {
                     ++g_g290GpuFail;
@@ -393,13 +402,32 @@
                         g_g144List.front().ctx.frame.fbp == 0x139u;
                     if (g570Cpu139Batch && !g570PreparedBatch)
                         g570Cpu139PrepareDepthTiles();
+                    const bool g580SharedClutBatch =
+                        g580SharedClutBatchSelected(g_g144List) &&
+                        g580PrepareSharedCluts(
+                            g_g144List,
+                            [self, rgs](const G144Entry &e,
+                                        std::array<uint32_t, 256> &out) {
+                                static thread_local GS s_clutGs;
+                                s_clutGs.m_vram = rgs->m_vram;
+                                s_clutGs.m_vramSize = rgs->m_vramSize;
+                                s_clutGs.m_privRegs = rgs->m_privRegs;
+                                s_clutGs.m_texa = e.texa;
+                                s_clutGs.m_texclut = e.texclut;
+                                for (uint32_t i = 0; i < 256u; ++i)
+                                    out[i] = self->lookupCLUT(
+                                        &s_clutGs, static_cast<uint8_t>(i), e.ctx.tex0.cbp,
+                                        e.ctx.tex0.cpsm, e.ctx.tex0.csm,
+                                        e.ctx.tex0.csa, e.ctx.tex0.psm);
+                            });
                     const auto g571ClearT = s_g571Split
                         ? std::chrono::steady_clock::now()
                         : std::chrono::steady_clock::time_point{};
                     GSRowPool::instance().run(y0, y1, g529Lanes,
                                               [self, rgs, g570Linear139,
                                                g570PreparedBatch,
-                                               g570GpuBatch](int a, int b) {
+                                               g570GpuBatch,
+                                               g580SharedClutBatch](int a, int b) {
                         G529LaneScope g529lane; // inert unless DC2_G529_STAT=1
                         static thread_local GS s_rg;
                         s_rg.m_vram = rgs->m_vram;
@@ -412,6 +440,12 @@
                         auto g570DrawEntry = [&](const G144Entry &e) {
                             if (e.maxY < a || e.minY > b)
                                 return; // bbox does not intersect this band
+                            const size_t entryIndex =
+                                static_cast<size_t>(&e - g_g144List.data());
+                            if (g580SharedClutBatch)
+                                g580BindSharedSample(entryIndex);
+                            else
+                                g580ClearSharedSample();
                             s_rg.m_ctx[0] = e.ctx;
                             s_rg.m_prim = e.prim;
                             s_rg.m_prim.ctxt = false; // active context forced to m_ctx[0] = snapshot
@@ -426,7 +460,7 @@
                             s_rg.m_vtxQueue[0] = e.v[0];
                             s_rg.m_vtxQueue[1] = e.v[1];
                             s_rg.m_vtxQueue[2] = e.v[2];
-                            t_g258EntryIndex = static_cast<size_t>(&e - g_g144List.data());
+                            t_g258EntryIndex = entryIndex;
                             if (e.decoded) { t_g149Px = e.decoded->px.data(); t_g149Valid = e.decoded->valid.data(); }
                             else { t_g149Px = nullptr; t_g149Valid = nullptr; }
                             // G172: widened G144 to also defer SPRITE entries (see the capture site);
@@ -571,6 +605,7 @@
                         if (g570Linear139)
                             g570Cpu139LinearEnd(rgs->m_vram, rgs->m_vramSize);
                         t_g149Px = nullptr; t_g149Valid = nullptr;
+                        g580ClearSharedSample();
                         t_g258EntryIndex = static_cast<size_t>(-1);
                         t_g144TitleRockScopeOverride = false;
                         t_g144TownDepthScopeOverride = false;
@@ -741,6 +776,8 @@
                     g_g144List.clear();
                     return;
                 }
+                // G589: same fail-closed disarm as the parallel closure above.
+                g589DisarmTransaction();
                 // G528: identical prologue to the parallel closure above (see its comment). Routing
                 // both through one function is what keeps DC2_G144_SEQ a pure parallelism bisect.
                 g528FlushPrologue(3, g_g144LastGs->m_vram, g_g144BlockFbp);
@@ -1423,22 +1460,24 @@
         }
         if (!bumpEmpty)
         {
-            g178NoteVramWriteRect(gs->m_vram,
+            g178NoteVramWriteRectTagged(gs->m_vram,
                                   GSInternal::framePageBaseToBlock(ctx178.frame.fbp),
                                   ctx178.frame.fbw, ctx178.frame.psm,
                                   static_cast<uint32_t>(std::max(bx0, 0)),
                                   static_cast<uint32_t>(std::max(by0, 0)),
                                   static_cast<uint32_t>(bx1 - std::max(bx0, 0) + 1),
-                                  static_cast<uint32_t>(by1 - std::max(by0, 0) + 1));
+                                  static_cast<uint32_t>(by1 - std::max(by0, 0) + 1),
+                                  6u); // G582 source 6: inline-draw bbox color bump
             if (((ctx178.zbuf >> 32u) & 1u) == 0u)
-                g178NoteVramWriteRect(gs->m_vram,
+                g178NoteVramWriteRectTagged(gs->m_vram,
                                       static_cast<uint32_t>(ctx178.zbuf & 0x1FFu) << 5u,
                                       ctx178.frame.fbw,
                                       static_cast<uint32_t>((ctx178.zbuf >> 24u) & 0xFu),
                                       static_cast<uint32_t>(std::max(bx0, 0)),
                                       static_cast<uint32_t>(std::max(by0, 0)),
                                       static_cast<uint32_t>(bx1 - std::max(bx0, 0) + 1),
-                                      static_cast<uint32_t>(by1 - std::max(by0, 0) + 1));
+                                      static_cast<uint32_t>(by1 - std::max(by0, 0) + 1),
+                                      7u); // G582 source 7: inline-draw bbox depth bump
         }
     }
 }

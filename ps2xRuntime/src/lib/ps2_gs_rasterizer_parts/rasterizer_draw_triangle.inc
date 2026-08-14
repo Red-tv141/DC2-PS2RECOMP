@@ -1271,6 +1271,16 @@ void GSRasterizer::drawTriangle(GS *gs)
         maxX >= 344 && minX <= 412 &&
         maxY >= 40 && minY <= 144;
 
+    // G591 slice A: the G411 private depth mirror's WRITE EPOCH — the triangle twin of the sprite
+    // hook. This is the per-draw predicate every g403DisplayZWrite below already sits behind,
+    // hoisted to draw scope; minY/maxY are the scissor- and band-clamped bbox, a superset of the
+    // rows the depth store can reach.
+    if (g403DisplayZ && zWrite)
+        g591MirrorDrawWrite(minY, maxY);
+    // G592 INVARIANT PROBE (inert unless tracked) — the triangle twin. NOT `&& zWrite`: a depth
+    // TEST reads the mirror too. See g592_publish_consumer.inc.
+    g592NoteDisplayZDraw(g403DisplayZ);
+
     // G141 sub-profile: local coverage tally (flushed to the globals once after the loop, so no
     // per-pixel atomic). bbox area vs inside-count exposes bounding-box scan waste.
     long g141BboxPx = (maxX >= minX && maxY >= minY)
@@ -1384,6 +1394,61 @@ void GSRasterizer::drawTriangle(GS *gs)
     const bool g141FastSampleTri =
         !s_g141NoFastSample && gs->m_prim.tme && g141TraceOff &&
         ctx.frame.fbp != 0x139u && g141FastPsm && ctx.tex0.tbw != 0u;
+    // G580 census + exact-state admission. The broad subject matches G573's replay population;
+    // the candidate then fails closed on every shader/depth/commit semantic it specializes.
+    const bool g580Subject =
+        g580Tri13bRequested() && t_g144InReplay &&
+        ctx.frame.fbp == 0x13bu && ctx.frame.fbw == 8u &&
+        ctx.frame.psm == GS_PSM_CT32 && gs->m_vram != nullptr &&
+        gs->m_prim.tme && gs->m_prim.abe &&
+        (gs->m_prim.type == GS_PRIM_TRIANGLE || gs->m_prim.type == GS_PRIM_TRISTRIP);
+    if (g580Tri13bCensusOn() && g580Subject)
+        g580NoteTri13bState(gs->m_prim, gs->m_pabe, ctx);
+    const bool g580Tri13b =
+        g580Subject && g580Tri13bQuiet() && g141FastSampleTri &&
+        gs->m_prim.iip && !gs->m_prim.fst && !gs->m_prim.fge && !gs->m_prim.aa1 &&
+        ctx.tex0.psm == GS_PSM_T8 && ctx.tex0.tfx == 0u && ctx.tex0.tcc == 1u &&
+        ctx.tex0.cpsm == GS_PSM_CT32 && ctx.tex0.csm == 0u && ctx.tex0.csa == 0u &&
+        ctx.tex1 == 0x260ull && ctx.alpha == 0x44ull && ctx.test == 0x5000bull &&
+        ctx.frame.fbmsk == 0u && ctx.fba == 0u && !gs->m_pabe &&
+        zEnabled && z24 && ztst == 2u && zbpPage == 0xd0u && !zmsk && zWrite &&
+        g403DisplayZ && !g357FlatDraw && !g408ShadowVolume && !g232tri &&
+        minX >= 0 && maxX < static_cast<int>(kG403DisplayZW) &&
+        minY >= 0 && maxY < static_cast<int>(kG403DisplayZH) &&
+        g580SharedSampleReady() &&
+        g580Tri13bSelected();
+    if (g580Subject && g580Tri13bStatOn() && !g580Tri13b)
+    {
+        static std::atomic<uint32_t> s_g580RejectLogs{0u};
+        const uint32_t n = s_g580RejectLogs.fetch_add(1u, std::memory_order_relaxed);
+        if (n < 16u)
+            std::fprintf(stderr,
+                         "[G580:reject] n=%u quiet=%u samp=%u prim=%u tex=%u regs=%u out=%u "
+                         "z=%u excl=%u bounds=%u sel=%u cpsm=%x csm=%u csa=%u bbox=%d,%d..%d,%d\n",
+                         n, g580Tri13bQuiet() ? 1u : 0u, g141FastSampleTri ? 1u : 0u,
+                         (gs->m_prim.iip && !gs->m_prim.fst && !gs->m_prim.fge &&
+                          !gs->m_prim.aa1) ? 1u : 0u,
+                         (ctx.tex0.psm == GS_PSM_T8 && ctx.tex0.tfx == 0u &&
+                          ctx.tex0.tcc == 1u && ctx.tex0.cpsm == GS_PSM_CT32 &&
+                          ctx.tex0.csm == 0u && ctx.tex0.csa == 0u) ? 1u : 0u,
+                         (ctx.tex1 == 0x260ull && ctx.alpha == 0x44ull &&
+                          ctx.test == 0x5000bull) ? 1u : 0u,
+                         (ctx.frame.fbmsk == 0u && ctx.fba == 0u && !gs->m_pabe) ? 1u : 0u,
+                         (zEnabled && z24 && ztst == 2u && zbpPage == 0xd0u &&
+                          !zmsk && zWrite && g403DisplayZ) ? 1u : 0u,
+                         (!g357FlatDraw && !g408ShadowVolume && !g232tri) ? 1u : 0u,
+                         (minX >= 0 && maxX < static_cast<int>(kG403DisplayZW) &&
+                          minY >= 0 && maxY < static_cast<int>(kG403DisplayZH)) ? 1u : 0u,
+                         g580Tri13bSelected() ? 1u : 0u,
+                         static_cast<unsigned>(ctx.tex0.cpsm),
+                         static_cast<unsigned>(ctx.tex0.csm),
+                         static_cast<unsigned>(ctx.tex0.csa),
+                         minX, minY, maxX, maxY);
+    }
+    const bool g580Tri13bVerify = g580Tri13b && g580Tri13bVerifyOn();
+    const uint32_t g580ColorBlock = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+    uint64_t g580Tri13bPx = 0u;
+    uint64_t g580Tri13bBad = 0u;
     // G141 one-shot: report WHY textured non-RTT tris do/don't take the fast path (DC2_G141_FASTDIAG).
     {
         static const bool s_g141FastDiag = (std::getenv("DC2_G141_FASTDIAG") != nullptr);
@@ -1604,11 +1669,23 @@ void GSRasterizer::drawTriangle(GS *gs)
         const uint32_t *g570DepthRow = nullptr;
         uint32_t g570ColorGroup = ~0u;
         uint32_t g570ColorGroupBase = 0u;
+        G530RowAddr g580ColorRow{};
+        uint32_t *g580DepthRow = nullptr;
+        uint32_t g580ColorGroup = ~0u;
+        uint32_t g580ColorGroupBase = 0u;
         if (g570Cpu139)
         {
             g570ColorRow = g530RowAddr(g570Commit.frameBlock, g570Commit.frameWidth,
                                       static_cast<uint32_t>(y));
             g570DepthRow = g403DisplayZBuf().data() +
+                           static_cast<size_t>(y) * kG403DisplayZW;
+        }
+        if (g580Tri13b)
+        {
+            g580BeginSharedSampleRow();
+            g580ColorRow = g530RowAddr(g580ColorBlock, ctx.frame.fbw,
+                                      static_cast<uint32_t>(y));
+            g580DepthRow = g403DisplayZBuf().data() +
                            static_cast<size_t>(y) * kG403DisplayZW;
         }
         int xStart = minX, xEnd = maxX;
@@ -1923,7 +2000,22 @@ void GSRasterizer::drawTriangle(GS *gs)
                 zi = static_cast<uint32_t>(zf);
                 // G45: costume model (fbp=0x139) uses the private, non-aliasing Z buffer.
                 // G203: universal-Z reads the real VRAM Z for every target (private buffers retired).
-                if (g403DisplayZ)
+                if (g580Tri13b)
+                {
+                    const uint32_t fastZ = g580DepthRow[x];
+                    if (g580Tri13bVerify)
+                    {
+                        const uint32_t refZ = g403DisplayZRead(x, y, ctx.frame.fbp);
+                        if (fastZ != refZ)
+                            ++g580Tri13bBad;
+                        zdst = refZ; // generic shared-Z read remains authoritative in verify mode
+                    }
+                    else
+                    {
+                        zdst = fastZ;
+                    }
+                }
+                else if (g403DisplayZ)
                 {
                     zdst = g570Cpu139 ? g570DepthRow[x]
                                       : g403DisplayZRead(x, y, ctx.frame.fbp);
@@ -2077,6 +2169,77 @@ void GSRasterizer::drawTriangle(GS *gs)
             }
             if (!zPass)
                 continue;
+
+            // G580 exact replay leaf. Coverage, Z interpolation, STQ interpolation, bilinear T8
+            // sampling, and MODULATE all retain the established operation order. Only the final
+            // address/commit is lowered. In verify mode generic writePixel owns the output.
+            if (g580Tri13b)
+            {
+                const uint8_t shadeR = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
+                const uint8_t shadeG = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
+                const uint8_t shadeB = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
+                const uint8_t shadeA = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+                const float is = v0.s * w0 + v1.s * w1 + v2.s * w2;
+                const float it = v0.t * w0 + v1.t * w1 + v2.t * w2;
+                const float iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
+                const uint32_t texel = g580SampleSharedT8(gs->m_vram, is, it, iq);
+                if (g580Tri13bVerify)
+                {
+                    const uint32_t refTexel = g141FastSample(is, it, iq, 0u, 0u);
+                    if (texel != refTexel)
+                        ++g580Tri13bBad;
+                }
+                const uint8_t tr = static_cast<uint8_t>(texel & 0xffu);
+                const uint8_t tg = static_cast<uint8_t>((texel >> 8u) & 0xffu);
+                const uint8_t tb = static_cast<uint8_t>((texel >> 16u) & 0xffu);
+                const uint8_t ta = static_cast<uint8_t>((texel >> 24u) & 0xffu);
+                const TextureCombineResult color = combineTexture(
+                    ctx.tex0, shadeR, shadeG, shadeB, shadeA, tr, tg, tb, ta);
+
+                const uint32_t group = static_cast<uint32_t>(x) >> 3u;
+                if (group != g580ColorGroup)
+                {
+                    g580ColorGroup = group;
+                    g580ColorGroupBase = g530GroupBase(g580ColorRow,
+                                                       static_cast<uint32_t>(x));
+                }
+                uint32_t fastOff = 0u;
+                uint32_t fastPixel = 0u;
+                if (g580Commit44(gs->m_vram, gs->m_vramSize, g580ColorRow,
+                                 g580ColorGroupBase, x,
+                                 color.r, color.g, color.b, color.a,
+                                 fastOff, fastPixel))
+                {
+                    if (g580Tri13bVerify)
+                    {
+                        const AlphaTestResult refAlpha = classifyAlphaTest(ctx.test, color.a);
+                        if (!refAlpha.writeFramebuffer || !refAlpha.writeDepth)
+                            ++g580Tri13bBad;
+                        writePixel(gs, x, y, color.r, color.g, color.b, color.a);
+                        const uint32_t refOff = GSPSMCT32::addrPSMCT32(
+                            g580ColorBlock, ctx.frame.fbw,
+                            static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                        uint32_t refPixel = 0u;
+                        if (refOff + 4u <= gs->m_vramSize)
+                            std::memcpy(&refPixel, gs->m_vram + refOff, sizeof(refPixel));
+                        if (fastOff != refOff || fastPixel != refPixel)
+                            ++g580Tri13bBad;
+                        if (refAlpha.writeDepth)
+                            g403DisplayZWrite(x, y, ctx.frame.fbp, zi);
+                        if (g580DepthRow[x] != zi)
+                            ++g580Tri13bBad;
+                    }
+                    else
+                    {
+                        std::memcpy(gs->m_vram + fastOff, &fastPixel, sizeof(fastPixel));
+                        g580DepthRow[x] = zi;
+                    }
+                    ++g580Tri13bPx;
+                    ++drawnAcc;
+                    continue;
+                }
+                ++g580Tri13bBad; // fail closed into the generic body below
+            }
 
             // G570 exact CPU leaf: all admission invariants above are per-triangle constants.
             // The generic path remains the verifier's commit authority, so a bad candidate cannot
@@ -2778,6 +2941,8 @@ void GSRasterizer::drawTriangle(GS *gs)
 
     if (g570Cpu139)
         g570NoteCpu139(g570Cpu139Px, g570Cpu139Bad);
+    if (g580Tri13b)
+        g580NoteTri13b(g580Tri13bPx, g580Tri13bBad);
 
     // G141 sub-profile flush (one atomic add per triangle, gated).
     {

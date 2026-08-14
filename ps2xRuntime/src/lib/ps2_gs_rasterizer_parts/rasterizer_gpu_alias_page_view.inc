@@ -1304,6 +1304,8 @@ static void g261Report()
                      (unsigned long long)g_g338VerifyBad.load(std::memory_order_relaxed));
     g345PrintEscape();
     g347PrintUp139();
+    g590Report(); // G590 surface-authority ledger; no-op unless DC2_G590_CENSUS/SHADOW
+    g591Report(); // G591 window-authority censuses + same-run oracles; no-op unless selected
     g262Report();
     g265Report();
     g266Report();
@@ -1963,6 +1965,10 @@ static void g261Materialize(int ti, int cause)
     const uint32_t fbp = kG261Fbp[ti];
     g536NoteMaterialize(r, fbp, cause); // G536 probe: has guest VRAM moved since the GPU render?
     const int rows = r.dirtyHi - r.dirtyLo + 1;
+    // G590: this is the edge where GPU authority is surrendered back to guest VRAM. A GPU-resident
+    // model has to delete it, so count it by TARGET x CAUSE x ROWS — the two existing counters
+    // (g_g261MatByTarget per target, g_g310MatN per cause) cannot be crossed after the fact.
+    g590NoteMaterialize(fbp, cause, rows);
     if (g345StatOn() && g345FamilyFbp(fbp) && rows > 0)
         g345NoteFamReadbackFbp(fbp, static_cast<uint64_t>(rows));
     // G351: attribute this 0x139 FBO→VRAM publication (and the consumer demand behind its cause)
@@ -2597,7 +2603,8 @@ static bool g345MaterializeSlot(G289CopyOwner &slot, int cause)
         if (g572ExactOwnerGenOn())
             g572BumpOwnedBlockRange(owner.firstOwnedBlock, owner.lastOwnedBlock);
         else
-            g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 0u, 512u, 416u);
+            g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 0u, 512u, 416u,
+                             18u); // G582 source 18: full 512x416 owner materialize
         g_g289Materializes.fetch_add(1u, std::memory_order_relaxed);
     }
     else
@@ -2804,11 +2811,13 @@ static bool g289Resolve14aBeforeDirect()
             g572BumpOwnedBlockRange(std::max(owner.firstOwnedBlock, rows.first),
                                     std::min(owner.lastOwnedBlock, rows.last));
         else
-            g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 320u, 512u, 96u);
+            g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 320u, 512u, 96u,
+                             19u); // G582 source 19: lower-strip owner materialize (A)
     }
     else
     {
-        g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 320u, 512u, 96u);
+        g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 320u, 512u, 96u,
+                         20u); // G582 source 20: lower-strip owner materialize (B)
     }
     o14a->active = false;
     s_g289PendingUpload.active = false;
@@ -3851,7 +3860,8 @@ static bool g278FlushPendSlot(G278PendDepth &slot, int cause)
         g178BumpRectImpl(zbpBlock, p.fbw, GS_PSM_Z24, 0u,
                          static_cast<uint32_t>(p.rowLo),
                          static_cast<uint32_t>(p.fbW),
-                         static_cast<uint32_t>(rows));
+                         static_cast<uint32_t>(rows),
+                         21u); // G582 source 21: alias-view depth publication
         g336NotePublishZ(zbpBlock, p.fbw, p.fbW, p.rowLo, p.rowHi);
         g149BumpVramGen();
     }
@@ -3864,6 +3874,11 @@ static bool g278FlushPendSlot(G278PendDepth &slot, int cause)
     {
         // G274's equality stamp describes guest VRAM and is meaningless for the private mirror.
         g_g274LastZGen.erase(p.key);
+        g590ZDropStamp(p.key); // G590 rides G274's stamp lifetime exactly
+        // G591: but the private mirror now HAS an authority record of its own, and this deferred
+        // publication is exactly the instant it becomes true — the unpack above just wrote the
+        // resident texture's depth into the mirror over rows p.rowLo..p.rowHi.
+        g591PrivZStamp(p.key, p.rowLo, p.rowHi);
     }
     else if (g278StaleRowsAny(p))
     {
@@ -3873,11 +3888,18 @@ static bool g278FlushPendSlot(G278PendDepth &slot, int cause)
         g_g274LastZGen.erase(p.key);
         g_g262DepthInit.erase(p.key);
         g_g278Reinits.fetch_add(1u, std::memory_order_relaxed);
+        g590ZDropStamp(p.key);
     }
     else if (g274ZTimeOn() || g274ZResidentOn() || g278DepthRbOn())
+    {
         g_g274LastZGen[p.key] =
             g178GenSumRect(zbpBlock, p.fbw, GS_PSM_Z24, 0u, 0u,
                            static_cast<uint32_t>(p.fbW), 512u);
+        // G590: snapshot the SAME instant per page. This publication just synced GPU->VRAM over
+        // the whole surface, so the resident texture equals VRAM everywhere right now — the only
+        // moment a per-window authority claim can be founded on.
+        g590ZStamp(p.key, zbpBlock, p.fbw);
+    }
     g_g262ZReadbacks.fetch_add(1u, std::memory_order_relaxed);
     if (p.privateMirror)
     {

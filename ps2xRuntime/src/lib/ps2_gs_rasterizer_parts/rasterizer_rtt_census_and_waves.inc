@@ -195,6 +195,215 @@ static std::map<uint64_t, uint64_t> g_g266L2lShapes;
 static std::map<uint64_t, uint64_t> g_g266TexShapes;
 static std::atomic<uint64_t> g_g266CpuN{0}, g_g266L2lN{0}, g_g266TexN{0};
 
+// ===== G583: WHOLE-POPULATION CPU-FALLBACK CENSUS (DEFAULT-OFF, DC2_G583_REJCENSUS=1) =====
+//
+// Neither existing reject census can see the population that actually drives the Ridepod boss's
+// CPU band replay. G262's counters are gated `g248TargetIndex(fbp) >= 0` (the five named RTT
+// targets) and G265's are gated `fbp == 0 || fbp == 0x68` (display). fbp=0x13b — G286's transient
+// target, the largest single fallback source on that route — is in NEITHER set, so both censuses
+// report zero for it and always did.
+//
+// `[G290:gpufail]` is not a substitute. It prints ENTRY 0 of the batch, which is not the entry
+// that rejected: g178TryFlushGpu's classify loop stops at the FIRST failure, so entry 0 is the
+// rejecter only by coincidence. Every design question an admission lever has to answer (which Z
+// shape, which blend, which prim class) is a property of the REJECTER.
+//
+// It also ranks by ENTRIES, not events (g568_rank_fallback_by_entries_not_events). A fallback's
+// cost is the entries it hands to the scalar banded replay, and entries/event spans 134..1338
+// across the boss window's shapes, so an event ranking inverts the true order.
+static bool g583RejCensusOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G583_REJCENSUS");
+    return s_on;
+}
+
+// The rejecting entry's shape, stashed on exactly the same single-value contract as
+// g_g266ClassifySite above (flush-owner threads only, at most one classify reject per attempt
+// because the classifier returns false immediately).
+static uint64_t g_g583RejEntryKey = 0ull;
+static bool g_g583RejEntryValid = false;
+static std::map<uint64_t, uint64_t> g_g583FallbackEvents;  // key -> events
+static std::map<uint64_t, uint64_t> g_g583FallbackEntries; // key -> entries replayed
+static uint64_t g_g583FallbackN = 0ull, g_g583FallbackEntriesN = 0ull;
+
+// site/rej occupy the high bits so a sorted dump groups by reason; everything else is GS state.
+static uint64_t g583ShapeKey(const G144Entry &e)
+{
+    const GSContext &ctx = e.ctx;
+    const uint64_t ts = ctx.test;
+    const uint64_t al = ctx.alpha;
+    uint64_t k = 0ull;
+    k |= static_cast<uint64_t>(ctx.frame.fbp & 0x1FFu);                     // 0-8
+    k |= static_cast<uint64_t>(ctx.frame.fbw & 0xFu) << 9;                  // 9-12
+    k |= static_cast<uint64_t>(e.prim.type & 0x7u) << 13;                   // 13-15
+    k |= static_cast<uint64_t>(e.prim.tme ? 1u : 0u) << 16;                 // 16
+    k |= static_cast<uint64_t>(e.prim.abe ? 1u : 0u) << 17;                 // 17
+    k |= ((ts >> 16) & 1ull) << 18;                                         // 18: zte
+    k |= ((ts >> 17) & 3ull) << 19;                                         // 19-20: ztst
+    k |= ((ctx.zbuf >> 32) & 1ull) << 21;                                   // 21: zmsk
+    k |= ((ctx.zbuf >> 24) & 0xFull) << 22;                                 // 22-25: zpsm
+    k |= (ts & 1ull) << 26;                                                 // 26: ate
+    k |= ((ts >> 1) & 7ull) << 27;                                          // 27-29: atst
+    k |= (al & 3ull) << 30;                                                 // 30-31: A
+    k |= ((al >> 2) & 3ull) << 32;                                          // 32-33: B
+    k |= ((al >> 4) & 3ull) << 34;                                          // 34-35: C
+    k |= ((al >> 6) & 3ull) << 36;                                          // 36-37: D
+    k |= static_cast<uint64_t>(ctx.frame.psm & 0x3Fu) << 38;                // 38-43: frame psm
+    k |= static_cast<uint64_t>(ctx.frame.fbmsk != 0u ? 1u : 0u) << 44;      // 44
+    k |= static_cast<uint64_t>(e.prim.tme ? (ctx.tex0.psm & 0x3Fu) : 0u) << 45; // 45-50
+    return k;
+}
+
+static void g583NoteRejectEntry(const G144Entry &e)
+{
+    if (!g583RejCensusOn())
+        return;
+    g_g583RejEntryKey = g583ShapeKey(e);
+    g_g583RejEntryValid = true;
+}
+
+static void g583ReportFallbacks()
+{
+    std::fprintf(stderr, "[G583:rejcensus] fallbacks=%llu entries=%llu shapes=%zu\n",
+                 static_cast<unsigned long long>(g_g583FallbackN),
+                 static_cast<unsigned long long>(g_g583FallbackEntriesN),
+                 g_g583FallbackEntries.size());
+    for (const auto &kv : g_g583FallbackEntries)
+    {
+        const uint64_t k = kv.first;
+        const int rej = static_cast<int>((k >> 60) & 0xFull);
+        const int site = static_cast<int>((k >> 56) & 0xFull);
+        const auto ev = g_g583FallbackEvents.find(k);
+        std::fprintf(stderr,
+                     "[G583:rejshape] entries=%llu events=%llu rej=%s site=%s fbp=%03x fbw=%u "
+                     "fpsm=%x fbmskNZ=%u prim=%u tme=%u abe=%u tpsm=0x%02x abcd=%u%u%u%u "
+                     "ate=%u atst=%u zte=%u ztst=%u zmsk=%u zpsm=%u\n",
+                     static_cast<unsigned long long>(kv.second),
+                     static_cast<unsigned long long>(ev == g_g583FallbackEvents.end()
+                                                         ? 0ull : ev->second),
+                     kG266FrName[rej & 0xF],
+                     (rej == kG266FrClassify && site < kG262RejSiteCount && site >= 0)
+                         ? kG262SiteName[site] : "-",
+                     static_cast<unsigned>(k & 0x1FFull),
+                     static_cast<unsigned>((k >> 9) & 0xFull),
+                     static_cast<unsigned>((k >> 38) & 0x3Full),
+                     static_cast<unsigned>((k >> 44) & 1ull),
+                     static_cast<unsigned>((k >> 13) & 0x7ull),
+                     static_cast<unsigned>((k >> 16) & 1ull),
+                     static_cast<unsigned>((k >> 17) & 1ull),
+                     static_cast<unsigned>((k >> 45) & 0x3Full),
+                     static_cast<unsigned>((k >> 30) & 3ull),
+                     static_cast<unsigned>((k >> 32) & 3ull),
+                     static_cast<unsigned>((k >> 34) & 3ull),
+                     static_cast<unsigned>((k >> 36) & 3ull),
+                     static_cast<unsigned>((k >> 26) & 1ull),
+                     static_cast<unsigned>((k >> 27) & 7ull),
+                     static_cast<unsigned>((k >> 18) & 1ull),
+                     static_cast<unsigned>((k >> 19) & 3ull),
+                     static_cast<unsigned>((k >> 21) & 1ull),
+                     static_cast<unsigned>((k >> 22) & 0xFull));
+    }
+}
+
+// Called from the flush closure's CPU-fallback branch, i.e. once per g178TryFlushGpu==false.
+// `entries` is the batch size that is about to be band-replayed — the ranking weight.
+static void g583NoteFallback(const std::vector<G144Entry> &list)
+{
+    if (!g583RejCensusOn() || list.empty())
+        return;
+    const int rej = g_g266FlushRej & 0xF;
+    const int site = (rej == kG266FrClassify) ? g_g266ClassifySite : -1;
+    // Classify rejects carry the REJECTER's shape; every other reason is a whole-batch property,
+    // so entry 0 is the honest representative for those.
+    uint64_t k = (rej == kG266FrClassify && g_g583RejEntryValid)
+                     ? g_g583RejEntryKey
+                     : g583ShapeKey(list[0]);
+    k |= static_cast<uint64_t>(rej & 0xF) << 60;
+    k |= static_cast<uint64_t>(site & 0xF) << 56;
+    g_g583RejEntryValid = false;
+    ++g_g583FallbackEvents[k];
+    g_g583FallbackEntries[k] += list.size();
+    ++g_g583FallbackN;
+    g_g583FallbackEntriesN += list.size();
+    if ((g_g583FallbackN % 2048ull) == 0ull)
+        g583ReportFallbacks();
+}
+
+// ===== G583: NON-PERSISTENT PER-WAVE GUEST DEPTH FOR THE 0x13b TRANSIENT TARGET =====
+// G585 closes the missed G584 promotion: default-ON; rollback DC2_G583_NO_TRN13B_Z=1 or
+// explicitly set DC2_G583_TRN13B_Z=0.
+//
+// WHAT THE CENSUS SAYS. On the Ridepod boss window (n=1441..1861) the upload-forced drain is
+// 33.9 ms/f, and 62.4% of it is the CPU band replay of the 28.7% of flushes the GPU path rejects
+// — not the GPU (36.8%) and not the upload edge itself. Ranked by REPLAYED ENTRIES, the single
+// largest fallback source is `classify` at site `depth` on fbp=0x13b: 57.1% of every entry the
+// boss window hands to the scalar replay.
+//
+// WHY IT REJECTS. Under universal-Z an entry that reads or writes real Z is admitted only if
+// `g242GpuDepthOn() || g262Rtt || g265Display`, and `g262Rtt` names the five G248 residency slots
+// plus G570's 0x13d. 0x13b is in neither list, so every depth-tested draw to it fails closed —
+// including the whole Ridepod boss mesh. G573 already admitted that geometry at CAPTURE and
+// bought -14.13% from the regrouping alone; its own header records that the batches then "fail
+// closed" at exactly this gate and are consumed by the banded CPU replay. This is that gate.
+//
+// WHY IT IS SAFE TO WIDEN HERE, WHEN G569's RESIDENCY WIDENING WAS NOT. The two are different
+// ownership models and only one of them can produce G569's escaped-writer defect:
+//   * G569 added PERSISTENT G248 residency slots. GPU ownership of those rows survives the flush,
+//     so a later guest write to a page the GPU owns is an escape — the jump/dash defect that
+//     demoted it (rasterizer_tilebinning_and_probes.inc, g569RttWideMask).
+//   * This rides G262/G570's NON-PERSISTENT per-wave contract: the Z window is uploaded fresh for
+//     the wave and read back at the end of the same flush, and 0x13b's COLOR already returns to
+//     guest VRAM in-flush under G286/G287's promoted transient contract. Nothing is added to
+//     g248TargetIndex, no G261 residency record is created, and no authority survives the drain,
+//     so there is no window in which an escaped writer can exist. That is the same reason G570
+//     was built for 0x13d after G569's defect was found.
+//
+// WIDENED AS A SET, NOT AS ONE SITE (g536_invariant_untested_at_the_consuming_edge,
+// g569_alias_family_admitted_whole_or_not_at_all). `g570Transient13dTarget` gates THREE conjuncts
+// in this classifier — the two additive-FIX blend shapes and the guest-depth admission — and the
+// G262 census found those blends on ~11% of the same RTT population that Z-tests. Widening depth
+// alone would trade a `depth` reject for a `blend` reject on that slice and read as a partial
+// null. All three move together or none does.
+static bool g583Trn13bWaveOn()
+{
+    // G584 proved this path and recorded it as promoted, but its gate remained opt-in.  Keep both
+    // rollback spellings so the shipped path remains bisectable without a rebuild.
+    static const bool s_on = !envFlagEnabled("DC2_G583_NO_TRN13B_Z") &&
+                             !envFlagDisabled("DC2_G583_TRN13B_Z");
+    return s_on;
+}
+
+// The transient target this admits. Deliberately keyed on g286TransientTarget rather than on a
+// bare `fbp == 0x13b` so the whole thing disarms with G286/G287's own kill switches: the
+// in-flush colour readback is what makes the wave transient, and without it this would be an
+// ownership claim, which is precisely what must not happen here.
+static bool g583Trn13bWaveTarget(uint32_t fbp)
+{
+    return g583Trn13bWaveOn() && g286TransientTarget(fbp);
+}
+
+// Every site that asks "may this target take the non-persistent per-wave RTT contract?".
+static inline bool g583WaveEligibleTarget(uint32_t fbp)
+{
+    return g248TargetIndex(fbp) >= 0 || g570Transient13dTarget(fbp) ||
+           g583Trn13bWaveTarget(fbp) || g586Transient141Target(fbp) ||
+           g587Transient15dTarget(fbp);
+}
+
+// Divergence proof for the paired gate. Plain counters on the flush-owner thread, same shape as
+// g573NoteTri13bAdmission; DC2_G583_STAT=1 to print. Never on in a timing run.
+static uint64_t g_g583Trn13bZAdmits = 0ull;
+static void g583NoteTrn13bZAdmission()
+{
+    ++g_g583Trn13bZAdmits;
+    static const bool s_stat = envFlagEnabled("DC2_G583_STAT");
+    if (!s_stat)
+        return;
+    if (g_g583Trn13bZAdmits <= 8ull || (g_g583Trn13bZAdmits % 65536ull) == 0ull)
+        std::fprintf(stderr, "[G583:trn13bz] admits=%llu\n",
+                     static_cast<unsigned long long>(g_g583Trn13bZAdmits));
+}
+
 static void g262NoteSeen(const G144Entry &e)
 {
     if (!g262CensusOn() || g248TargetIndex(e.ctx.frame.fbp) < 0)
@@ -314,12 +523,10 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         else if (a == 0u && b == 2u && c == 0u && d == 1u)
             st.blend = 2; // Cs*As + Cd
         else if (a == 0u && b == 2u && c == 2u && d == 1u && ((al >> 32) & 0xFFull) == 128ull &&
-                 g262WideOn() && (g248TargetIndex(ctx.frame.fbp) >= 0 ||
-                                  g570Transient13dTarget(ctx.frame.fbp)))
+                 g262WideOn() && g583WaveEligibleTarget(ctx.frame.fbp))
             st.blend = 3; // (Cs-0)*(FIX=128)>>7 + Cd == Cs + Cd (G262 census shape, RTT waves only)
         else if (a == 2u && b == 0u && c == 2u && d == 1u && ((al >> 32) & 0xFFull) == 128ull &&
-                 g262WideOn() && (g248TargetIndex(ctx.frame.fbp) >= 0 ||
-                                  g570Transient13dTarget(ctx.frame.fbp)))
+                 g262WideOn() && g583WaveEligibleTarget(ctx.frame.fbp))
             st.blend = 4; // (0-Cs)*(FIX=128)>>7 + Cd == Cd - Cs (G262 census shape, RTT waves only)
         else if (a == 2u && b == 1u && c == 0u && d == 1u &&
                  g265DisplayZWaveOn() && g265DisplayTarget(ctx.frame.fbp))
@@ -358,9 +565,11 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         // on GPU while their proven CPU replay was bilinear.
         const bool g286ExactEntry = g286TransientTarget(ctx.frame.fbp);
         const bool g570ExactEntry = g570Transient13dTarget(ctx.frame.fbp);
+        const bool g586ExactEntry = g586Transient141Target(ctx.frame.fbp);
+        const bool g587ExactEntry = g587Transient15dTarget(ctx.frame.fbp);
         const bool g255RttEntry =
             (g255GpuRttOn() && g248TargetIndex(ctx.frame.fbp) >= 0) ||
-            g286ExactEntry || g570ExactEntry;
+            g286ExactEntry || g570ExactEntry || g586ExactEntry || g587ExactEntry;
         st.bilinear = g255RttEntry
             ? tex1UsesLinearFilter(ctx.tex1)
             : (((ctx.tex1 >> 5u) & 1u) != 0u);
@@ -376,7 +585,8 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         // G256's explicit texel fetch applies the CPU sampler's wrap mode itself, including point
         // samples.  Preserve G179's clamp-at-the-normalized-seam convention for the legacy shader.
         const bool exactSampler = (g256ExactRttOn() && g255RttEntry) ||
-                                  g286ExactEntry || g570ExactEntry;
+                                  g286ExactEntry || g570ExactEntry || g586ExactEntry ||
+                                  g587ExactEntry;
         st.wrapU = exactSampler ? wu : (st.bilinear ? wu : 1u);
         st.wrapV = exactSampler ? wv : (st.bilinear ? wv : 1u);
     }
@@ -437,9 +647,9 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
             // the flush executes it as a NON-PERSISTENT per-wave Z round-trip (no ownership).
             // G570's 0x13d path uses this same non-persistent guest-depth attachment, but keeps
             // COLOR transient too: both authorities return to CPU/VRAM before the flush ends.
-            const bool g262Rtt =
-                g262WideOn() && (g248TargetIndex(ctx.frame.fbp) >= 0 ||
-                                 g570Transient13dTarget(ctx.frame.fbp));
+            // G583 adds G286's 0x13b on that same transient-colour contract — see
+            // g583Trn13bWaveOn above for why this cannot reproduce G569's escaped writer.
+            const bool g262Rtt = g262WideOn() && g583WaveEligibleTarget(ctx.frame.fbp);
             const bool g265Display = g265DisplayZWaveOn() && g265DisplayTarget(ctx.frame.fbp);
             if (g242GpuDepthOn() || g262Rtt || g265Display)
             {
@@ -466,6 +676,16 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
                 st.depthFunc = static_cast<uint8_t>(g265AlphaMode | 0x10u |
                     ((ztst == 1u) ? 1u : (ztst == 2u ? 2u : 3u)));
                 st.depthWrite = !zmsk;
+                // G583 PATH COUNTER. A null paired A/B is only evidence if something proves the
+                // arms actually diverged (g538_null_ab_needs_a_path_counter). This entry reached
+                // guest-depth admission ONLY because of this phase's widening, so it counts
+                // exactly the entries the lever moved off the scalar band replay.
+                if (g583Trn13bWaveTarget(ctx.frame.fbp))
+                    g583NoteTrn13bZAdmission();
+                else if (g586Transient141Target(ctx.frame.fbp))
+                    g586NoteTransient141Admission(static_cast<uint32_t>(e.prim.type));
+                else if (g587Transient15dTarget(ctx.frame.fbp))
+                    g587NoteTransient15dAdmission(static_cast<uint32_t>(e.prim.type));
                 return true;
             }
             g262NoteReject(kG262RejDepth, e);
@@ -712,7 +932,8 @@ bool g242SyncDepthState(uint8_t *vram, G242DepthState &s)
     }
     g178BumpRectImpl(zbpBlock, s.fbw, GS_PSM_Z24, 0u,
                      static_cast<uint32_t>(s.dirtyLo), static_cast<uint32_t>(s.fbW),
-                     static_cast<uint32_t>(rows));
+                     static_cast<uint32_t>(rows),
+                     22u); // G582 source 22: RTT wave depth publication
     // Decoded CPU textures use their own coarse VRAM generation.  A Z page may also be texture or
     // CLUT storage, so publishing GPU depth bytes must invalidate that cache as well.
     g149BumpVramGen();

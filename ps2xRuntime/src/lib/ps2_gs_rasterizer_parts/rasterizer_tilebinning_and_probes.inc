@@ -634,6 +634,53 @@ static bool g570Verify139On()
     return on;
 }
 
+// G583: same-run exact oracle for the 0x13b transient target WITH guest depth.
+//
+// G286's own 0x13b oracle is gated `!guestDepth` and therefore never fires on this population —
+// G573 recorded exactly that (zero checks over 2.2 M admitted primitives). G570 already built the
+// depth-carrying shape of this oracle for 0x13d; this reuses it verbatim, so the comparison arm
+// is the SAME banded CPU replay that is authoritative today, for both colour and the G403/G411
+// private Z mirror.
+//
+// Like G570's, the verifier IMPLIES its path (see g583Trn13bWaveOn) so it can never end up
+// comparing the CPU replay against itself and reporting a vacuous bad=0.
+static bool g583Verify13bOn()
+{
+    static const bool on = envFlagEnabled("DC2_G583_VERIFY_TRN13B");
+    return on;
+}
+
+// G586: exact same-run oracle for the non-persistent 0x141 contract.  Like G583's verifier it
+// snapshots colour and the G403/G411 private Z mirror, stages the GPU result, restores both
+// authorities, then lets the existing CPU band replay remain authoritative for comparison.
+// g586Transient141On() treats this flag as an implication, preventing a vacuous CPU-vs-CPU pass.
+static bool g586Verify141On()
+{
+    static const bool on = envFlagEnabled("DC2_G586_VERIFY_TRN141");
+    return on;
+}
+// G587: same oracle contract, isolated to the residual untextured FBW=8 target at 0x15d.
+static bool g587Verify15dOn()
+{
+    static const bool on = envFlagEnabled("DC2_G587_VERIFY_TRN15D");
+    return on;
+}
+static std::atomic<uint64_t> g_g583VerifyChecks{0}, g_g583VerifyBad{0},
+    g_g583VerifyZBad{0}, g_g583VerifyPixels{0};
+static std::atomic<uint64_t> g_g586VerifyChecks{0}, g_g586VerifyBad{0},
+    g_g586VerifyZBad{0}, g_g586VerifyPixels{0}, g_g586VerifyBadBig{0},
+    g_g586VerifyMaxDelta{0};
+static std::atomic<uint64_t> g_g587VerifyChecks{0}, g_g587VerifyBad{0},
+    g_g587VerifyZBad{0}, g_g587VerifyPixels{0}, g_g587VerifyBadBig{0},
+    g_g587VerifyMaxDelta{0};
+// G584: `bad` is a bit-equality count, so it cannot tell a WRONG pixel from a pixel that rounded
+// the other way. The fixed-function GL blend evaluates ((A-B)*C)>>7 + D in float and the CPU
+// replay in integers, so a +-1 LSB disagreement is the port's standing approximation on EVERY
+// GPU-admitted blended draw, not a property of any one admission. Split it: `big` counts pixels
+// whose worst channel differs by MORE than 1, which is the number a promotion gate should read.
+static std::atomic<uint64_t> g_g584VerifyBadBig{0}, g_g584VerifyMaxDelta{0};
+static std::atomic<uint64_t> g_g584Verify139BadBig{0}, g_g584Verify139Pixels{0};
+
 struct G255VerifyState
 {
     bool pending = false;
@@ -748,6 +795,9 @@ static void g255BeginVerify(uint8_t *vram, uint32_t vramSize, uint32_t fbp, uint
         return;
     }
     if (!(g255VerifyOn() || (g286VerifyOn() && fbp == 0x13bu) ||
+          (g583Verify13bOn() && fbp == 0x13bu) ||
+          (g586Verify141On() && fbp == 0x141u) ||
+          (g587Verify15dOn() && fbp == 0x15du) ||
           (g570Verify13dOn() && fbp == 0x13du) ||
           (g570Verify139On() && fbp == 0x139u)) ||
         !vram || rowHi < rowLo)
@@ -819,6 +869,9 @@ static void g255StageGpuVerify(uint8_t *vram, uint32_t vramSize,
 {
     G255VerifyState &s = g_g255Verify;
     if (!(g255VerifyOn() || (g286VerifyOn() && s.fbp == 0x13bu) ||
+          (g583Verify13bOn() && s.fbp == 0x13bu) ||
+          (g586Verify141On() && s.fbp == 0x141u) ||
+          (g587Verify15dOn() && s.fbp == 0x15du) ||
           (g570Verify13dOn() && s.fbp == 0x13du) ||
           (g570Verify139On() && s.fbp == 0x139u)) ||
         !vram || s.before.empty() ||
@@ -841,7 +894,11 @@ static void g255StageGpuVerify(uint8_t *vram, uint32_t vramSize,
 static void g570StageDepthVerify()
 {
     G255VerifyState &s = g_g255Verify;
-    if (!g570Verify13dOn() || !s.pending || !s.g570Depth ||
+    // G583/G586 ride this unchanged: their depth authority is the same G403/G411 private mirror,
+    // so the snapshot/restore pair is identical for 0x13b, 0x13d and 0x141.
+    if (!(g570Verify13dOn() || g583Verify13bOn() || g586Verify141On() ||
+          g587Verify15dOn()) ||
+        !s.pending || !s.g570Depth ||
         s.depthBefore.size() != s.depthGpu.size())
         return;
     for (int y = s.depthRowLo; y <= s.depthRowHi; ++y)
@@ -863,6 +920,10 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
     uint64_t badAlpha = 0;
     uint64_t coverage = 0;
     uint64_t depthBad = 0;
+    uint64_t badBig = 0;      // G584: worst channel off by more than 1 LSB
+    unsigned maxDelta = 0;    // G584: worst per-channel delta seen in this batch
+    int firstBigX = -1, firstBigY = -1;
+    uint32_t firstBigCpu = 0, firstBigGpu = 0;
     int firstX = -1, firstY = -1;
     uint32_t firstCpu = 0, firstGpu = 0;
     for (int y = s.rowLo; y <= s.rowHi; ++y)
@@ -887,6 +948,27 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
                     ++badAlpha;
                 if (((cpu & 0x00FFFFFFu) == 0u) != ((s.gpu[i] & 0x00FFFFFFu) == 0u))
                     ++coverage;
+                unsigned worst = 0u;
+                for (int ch = 0; ch < 4; ++ch)
+                {
+                    const int ca = static_cast<int>((cpu >> (ch * 8)) & 0xFFu);
+                    const int ga = static_cast<int>((s.gpu[i] >> (ch * 8)) & 0xFFu);
+                    const unsigned d =
+                        static_cast<unsigned>(ca > ga ? ca - ga : ga - ca);
+                    if (d > worst)
+                        worst = d;
+                }
+                if (worst > maxDelta)
+                    maxDelta = worst;
+                if (worst > 1u)
+                {
+                    if (badBig == 0u)
+                    {
+                        firstBigX = x; firstBigY = y;
+                        firstBigCpu = cpu; firstBigGpu = s.gpu[i];
+                    }
+                    ++badBig;
+                }
             }
         }
     if (s.g570Depth)
@@ -904,17 +986,108 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
             g_g570Verify139Checks.fetch_add(1u, std::memory_order_relaxed) + 1u;
         if (bad != 0u)
             g_g570Verify139Bad.fetch_add(bad, std::memory_order_relaxed);
+        // G584: this is the CONTROL for the G583 oracle's residue — 0x139 is an already-promoted,
+        // GPU-admitted, BLENDED population on the same route and the same fixed-function blend, so
+        // its big/maxd is the port's standing float-vs-integer rounding rate. Same fields, so the
+        // two oracles can be read against each other directly.
+        if (badBig != 0u)
+            g_g584Verify139BadBig.fetch_add(badBig, std::memory_order_relaxed);
+        g_g584Verify139Pixels.fetch_add(s.gpu.size(), std::memory_order_relaxed);
         if (bad != 0u || n <= 8u || (n % 30u) == 0u)
             std::fprintf(stderr,
                          "[G570:verify139] n=%llu pixels=%zu bad=%llu rgb=%llu a=%llu cov=%llu "
-                         "rows=%d..%d entries=%zu prim=%u tme=%u tbp=0x%x psm=0x%x "
-                         "first=(%d,%d cpu=%08x gpu=%08x) cumulativeBad=%llu\n",
+                         "big=%llu maxd=%u rows=%d..%d entries=%zu prim=%u tme=%u tbp=0x%x "
+                         "psm=0x%x first=(%d,%d cpu=%08x gpu=%08x) "
+                         "cumulative(px=%llu bad=%llu big=%llu)\n",
                          (unsigned long long)n, s.gpu.size(),
                          (unsigned long long)bad, (unsigned long long)badRgb,
                          (unsigned long long)badAlpha, (unsigned long long)coverage,
+                         (unsigned long long)badBig, maxDelta,
                          s.rowLo, s.rowHi, s.entries, s.prim, s.tme, s.tbp, s.tpsm,
                          firstX, firstY, firstCpu, firstGpu,
-                         (unsigned long long)g_g570Verify139Bad.load(std::memory_order_relaxed));
+                         (unsigned long long)g_g584Verify139Pixels.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g570Verify139Bad.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g584Verify139BadBig.load(std::memory_order_relaxed));
+    }
+    else if (g586Verify141On() && s.fbp == 0x141u)
+    {
+        const uint64_t n =
+            g_g586VerifyChecks.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        g_g586VerifyPixels.fetch_add(s.gpu.size(), std::memory_order_relaxed);
+        if (bad != 0u)
+            g_g586VerifyBad.fetch_add(bad, std::memory_order_relaxed);
+        if (depthBad != 0u)
+            g_g586VerifyZBad.fetch_add(depthBad, std::memory_order_relaxed);
+        if (badBig != 0u)
+            g_g586VerifyBadBig.fetch_add(badBig, std::memory_order_relaxed);
+        {
+            uint64_t prev = g_g586VerifyMaxDelta.load(std::memory_order_relaxed);
+            while (maxDelta > prev &&
+                   !g_g586VerifyMaxDelta.compare_exchange_weak(prev, maxDelta,
+                                                               std::memory_order_relaxed))
+            {
+            }
+        }
+        if (bad != 0u || depthBad != 0u || n <= 8u || (n % 30u) == 0u)
+            std::fprintf(stderr,
+                         "[G586:verify141] n=%llu pixels=%zu bad=%llu rgb=%llu a=%llu cov=%llu "
+                         "big=%llu maxd=%u zbad=%llu zrows=%d..%d rows=%d..%d entries=%zu "
+                         "prim=%u tme=%u first=(%d,%d cpu=%08x gpu=%08x) "
+                         "firstBig=(%d,%d cpu=%08x gpu=%08x) "
+                         "cumulative(px=%llu bad=%llu big=%llu maxd=%llu zbad=%llu)\n",
+                         (unsigned long long)n, s.gpu.size(),
+                         (unsigned long long)bad, (unsigned long long)badRgb,
+                         (unsigned long long)badAlpha, (unsigned long long)coverage,
+                         (unsigned long long)badBig, maxDelta,
+                         (unsigned long long)depthBad, s.depthRowLo, s.depthRowHi,
+                         s.rowLo, s.rowHi, s.entries, s.prim, s.tme,
+                         firstX, firstY, firstCpu, firstGpu,
+                         firstBigX, firstBigY, firstBigCpu, firstBigGpu,
+                         (unsigned long long)g_g586VerifyPixels.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g586VerifyBad.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g586VerifyBadBig.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g586VerifyMaxDelta.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g586VerifyZBad.load(std::memory_order_relaxed));
+    }
+    else if (g587Verify15dOn() && s.fbp == 0x15du)
+    {
+        const uint64_t n =
+            g_g587VerifyChecks.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        g_g587VerifyPixels.fetch_add(s.gpu.size(), std::memory_order_relaxed);
+        if (bad != 0u)
+            g_g587VerifyBad.fetch_add(bad, std::memory_order_relaxed);
+        if (depthBad != 0u)
+            g_g587VerifyZBad.fetch_add(depthBad, std::memory_order_relaxed);
+        if (badBig != 0u)
+            g_g587VerifyBadBig.fetch_add(badBig, std::memory_order_relaxed);
+        {
+            uint64_t prev = g_g587VerifyMaxDelta.load(std::memory_order_relaxed);
+            while (maxDelta > prev &&
+                   !g_g587VerifyMaxDelta.compare_exchange_weak(prev, maxDelta,
+                                                               std::memory_order_relaxed))
+            {
+            }
+        }
+        if (bad != 0u || depthBad != 0u || n <= 8u || (n % 30u) == 0u)
+            std::fprintf(stderr,
+                         "[G587:verify15d] n=%llu pixels=%zu bad=%llu rgb=%llu a=%llu cov=%llu "
+                         "big=%llu maxd=%u zbad=%llu zrows=%d..%d rows=%d..%d entries=%zu "
+                         "prim=%u tme=%u first=(%d,%d cpu=%08x gpu=%08x) "
+                         "firstBig=(%d,%d cpu=%08x gpu=%08x) "
+                         "cumulative(px=%llu bad=%llu big=%llu maxd=%llu zbad=%llu)\n",
+                         (unsigned long long)n, s.gpu.size(),
+                         (unsigned long long)bad, (unsigned long long)badRgb,
+                         (unsigned long long)badAlpha, (unsigned long long)coverage,
+                         (unsigned long long)badBig, maxDelta,
+                         (unsigned long long)depthBad, s.depthRowLo, s.depthRowHi,
+                         s.rowLo, s.rowHi, s.entries, s.prim, s.tme,
+                         firstX, firstY, firstCpu, firstGpu,
+                         firstBigX, firstBigY, firstBigCpu, firstBigGpu,
+                         (unsigned long long)g_g587VerifyPixels.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g587VerifyBad.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g587VerifyBadBig.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g587VerifyMaxDelta.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g587VerifyZBad.load(std::memory_order_relaxed));
     }
     else if (ti >= 0)
     {
@@ -938,6 +1111,49 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
                          s.x1, s.y1, static_cast<uint32_t>(s.u1), static_cast<uint32_t>(s.v1),
                          static_cast<unsigned long long>(s.tex1),
                          firstX, firstY, firstCpu, firstGpu);
+    }
+    // G583 before G286: the two 0x13b oracles are kept DISJOINT by `s.g570Depth`. G286's is gated
+    // `!guestDepth` at its own trigger site and reports the depth-less sprite class; this one
+    // reports exactly the depth-carrying class G286's oracle has never been able to see.
+    else if (g583Verify13bOn() && s.fbp == 0x13bu && s.g570Depth)
+    {
+        const uint64_t n =
+            g_g583VerifyChecks.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        g_g583VerifyPixels.fetch_add(s.gpu.size(), std::memory_order_relaxed);
+        if (bad != 0u)
+            g_g583VerifyBad.fetch_add(bad, std::memory_order_relaxed);
+        if (depthBad != 0u)
+            g_g583VerifyZBad.fetch_add(depthBad, std::memory_order_relaxed);
+        if (badBig != 0u)
+            g_g584VerifyBadBig.fetch_add(badBig, std::memory_order_relaxed);
+        {
+            uint64_t prev = g_g584VerifyMaxDelta.load(std::memory_order_relaxed);
+            while (maxDelta > prev &&
+                   !g_g584VerifyMaxDelta.compare_exchange_weak(prev, maxDelta,
+                                                               std::memory_order_relaxed))
+            {
+            }
+        }
+        if (bad != 0u || depthBad != 0u || n <= 8u || (n % 30u) == 0u)
+            std::fprintf(stderr,
+                         "[G583:verify13b] n=%llu pixels=%zu bad=%llu rgb=%llu a=%llu cov=%llu "
+                         "big=%llu maxd=%u zbad=%llu zrows=%d..%d rows=%d..%d entries=%zu "
+                         "prim=%u tme=%u tbp=0x%x psm=0x%x first=(%d,%d cpu=%08x gpu=%08x) "
+                         "firstBig=(%d,%d cpu=%08x gpu=%08x) "
+                         "cumulative(px=%llu bad=%llu big=%llu maxd=%llu zbad=%llu)\n",
+                         (unsigned long long)n, s.gpu.size(),
+                         (unsigned long long)bad, (unsigned long long)badRgb,
+                         (unsigned long long)badAlpha, (unsigned long long)coverage,
+                         (unsigned long long)badBig, maxDelta,
+                         (unsigned long long)depthBad, s.depthRowLo, s.depthRowHi,
+                         s.rowLo, s.rowHi, s.entries, s.prim, s.tme, s.tbp, s.tpsm,
+                         firstX, firstY, firstCpu, firstGpu,
+                         firstBigX, firstBigY, firstBigCpu, firstBigGpu,
+                         (unsigned long long)g_g583VerifyPixels.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g583VerifyBad.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g584VerifyBadBig.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g584VerifyMaxDelta.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g583VerifyZBad.load(std::memory_order_relaxed));
     }
     else if (g286VerifyOn() && s.fbp == 0x13bu)
     {

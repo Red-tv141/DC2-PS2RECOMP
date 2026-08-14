@@ -308,6 +308,20 @@ bool g256ExactRttOn()
     return on;
 }
 
+// G584 (default ON, roll back with DC2_G584_NO_EXACT_BLENDA=1): the G286/G287 exact-sampler
+// branch is the only fragment path that returns before the outA blend-factor encoding, so a
+// BLENDED draw on it weighted by As/255 instead of the GS As/128. Two coupled halves, one flag:
+//   1. uMode bit 15 makes that branch emit the same encoding the legacy branch does;
+//   2. the raw-alpha two-pass (which then supplies the unblended framebuffer A byte) is extended
+//      to the transient targets that already assert G178Batch::rttRawAlpha.
+// Both must move together — encoding alone would store the doubled A, the two-pass alone would
+// still blend with the raw weight.
+bool g584ExactBlendAOn()
+{
+    static const bool on = !g158EnvFlag("DC2_G584_NO_EXACT_BLENDA");
+    return on;
+}
+
 // G257 (default OFF): prove image-store, barrier, coverage, and direct texture readback on the
 // actual persistent G178 worker context without touching a guest batch.
 bool g257ImageStoreTestOn()
@@ -3025,6 +3039,17 @@ void main()
             "    ivec3 fc = ivec3(uFogCol & 255, (uFogCol >> 8) & 255, (uFogCol >> 16) & 255);\n"
             "    return (c * f + fc * (255 - f) + ivec3(127)) / 255;\n"
             "}\n"
+            // G584: the exact-sampler branch below wrote the RAW source alpha into o.a and
+            // returned, skipping the outA encoding the legacy branch applies at the bottom of
+            // main(). o.a is ALSO what glBlendFunc consumes as GL_SRC_ALPHA, so every BLENDED
+            // draw on that branch weighted by As/255 while the GS (and the CPU replay) weight is
+            // As/128 -- an exact 128/255 = 0.502 halving at As = 0x80, drifting toward 1.0 as Cd
+            // grows. Bit 15 selects the blend-factor encoding; the caller sets it only for the
+            // exact branch, so the rollback flag reproduces the legacy value bit-for-bit.
+            "float g584ExactA(int a){\n"
+            "    return ((uMode & 32768) != 0) ? min(float(a) * (1.0 / 128.0), 1.0)\n"
+            "                                  : float(a) * (1.0 / 255.0);\n"
+            "}\n"
             "void main(){\n"
             "    if ((uMode & 512) != 0) {\n"
             "        ivec4 vc = clamp(ivec4(floor(vColor * 255.0 + 0.5)), 0, 255);\n"
@@ -3038,7 +3063,9 @@ void main()
             "            if (ec.a < refA) discard;\n"
             "        }\n"
             "        ec.rgb = fogExact(ec.rgb);\n"
-            "        o = vec4(ec) * (1.0 / 255.0);\n"
+            "        o = vec4(vec3(ec.rgb) * (1.0 / 255.0),\n"
+            "                 ((uMode & 32) != 0) ? float(ec.a) * (1.0 / 255.0)\n"
+            "                                     : g584ExactA(ec.a));\n"
             "        float ez = max(vZ, 0.0);\n"
             "        if ((uMode & 16) != 0) ez = floor(min(ez, 16777215.0));\n"
             "        gl_FragDepth = ez * (1.0 / 4294967296.0);\n"
@@ -3209,10 +3236,17 @@ void main()
                                 "    oG560Factor = vec4(sf, sf, sf, df);\n"
                                 "}\n"
                                 "void main(){\n") ||
+                    // G584: the dual-source factor for the exact branch takes the same encoding
+                    // as the legacy fixed-function one. It fed the RAW As/255 before, which is
+                    // the identical halving the legacy path had -- SRC1_COLOR just carried it.
                     !replaceOne(g560Fs,
-                                "        o = vec4(ec) * (1.0 / 255.0);\n",
-                                "        g560Factors(float(ec.a) * (1.0 / 255.0));\n"
-                                "        o = vec4(ec) * (1.0 / 255.0);\n") ||
+                                "        o = vec4(vec3(ec.rgb) * (1.0 / 255.0),\n"
+                                "                 ((uMode & 32) != 0) ? float(ec.a) * (1.0 / 255.0)\n"
+                                "                                     : g584ExactA(ec.a));\n",
+                                "        g560Factors(g584ExactA(ec.a));\n"
+                                "        o = vec4(vec3(ec.rgb) * (1.0 / 255.0),\n"
+                                "                 ((uMode & 32) != 0) ? float(ec.a) * (1.0 / 255.0)\n"
+                                "                                     : g584ExactA(ec.a));\n") ||
                     !replaceOne(g560Fs,
                                 "    o = vec4(c.rgb, outA);\n",
                                 "    g560Factors(min(c.a * 1.9921875, 1.0));\n"
@@ -5284,7 +5318,12 @@ void main()
             // G570's transient 0x13d batch sets the explicit per-batch contract. Do not widen the
             // legacy environment switch to arbitrary targets; only this tagged path stores PS2's
             // raw 0..128 framebuffer alpha after fixed-function RGB blending.
-            (b.rttRawAlpha && b.fbp == 0x13du);
+            // G584 adds 0x13b, the OTHER target that already asserts rttRawAlpha (g286Transient in
+            // rasterizer_vram_materialization.inc). Its flag was set and then ignored here, so its
+            // blended draws had no pass that could carry the As/128 weight at all.
+            (b.rttRawAlpha &&
+             (b.fbp == 0x13du || b.fbp == 0x141u || b.fbp == 0x15du ||
+              (g584ExactBlendAOn() && b.fbp == 0x13bu)));
         const bool g256Exact = g256ExactRttOn() && m_progExact != 0u &&
             (b.fbp == 0x139u || b.fbp == 0x13cu || b.fbp == 0x143u ||
              b.fbp == 0x146u || b.fbp == 0x155u) && !guestDepth;
@@ -5324,6 +5363,8 @@ void main()
                 if (g286Exact)
                 {
                     mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0) | 512;
+                    if (g584ExactBlendAOn())
+                        mode |= 32768; // G584: encode o.a / the SRC1 factor as As/128.
                 }
                 else if (d.texKey != 0u)
                 {
@@ -5765,6 +5806,8 @@ void main()
                               g496GlCache);
                 mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
                 mode |= 512;
+                if (g584ExactBlendAOn())
+                    mode |= 32768; // G584: encode o.a as the As/128 blend factor.
                 g496Uniform1i(g496Uni, kG496ULinear, locLinear, d.bilinear ? 1 : 0, g496GlCache);
                 g496Uniform1i(g496Uni, kG496UWrapU, locWrapU, static_cast<int>(d.wrapU),
                               g496GlCache);

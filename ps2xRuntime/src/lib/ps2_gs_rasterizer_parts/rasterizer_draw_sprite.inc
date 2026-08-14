@@ -296,6 +296,16 @@ void GSRasterizer::drawSprite(GS *gs)
         if (drawY0 < t_g144BandY0) drawY0 = t_g144BandY0;
         if (drawY1 > t_g144BandY1) drawY1 = t_g144BandY1;
     }
+    // G591 slice A: the G411 private depth mirror's WRITE EPOCH. This is the per-draw predicate
+    // every g403DisplayZWrite in this file already sits behind, hoisted to draw scope — not an
+    // enumeration of the write sites, so a future writer inside this draw is covered for free.
+    // The band is the post-scissor bbox, which is a superset of the rows spriteZStore can reach.
+    if (g403DisplayZ && sZWrite)
+        g591MirrorDrawWrite(drawY0, drawY1);
+    // G592 INVARIANT PROBE (inert unless tracked): a CPU draw must never reach the private mirror
+    // while a private-mirror owner is still pending. Deliberately NOT `&& sZWrite` — a depth TEST
+    // reads the mirror too, and the consumer test this guards admits reads as consumers.
+    g592NoteDisplayZDraw(g403DisplayZ);
     if (drawX1 >= drawX0 && drawY1 >= drawY0)
     {
         g248Scope.setPixels(static_cast<uint64_t>(drawX1 - drawX0 + 1) *
@@ -1332,6 +1342,156 @@ void GSRasterizer::drawSprite(GS *gs)
         uint8_t ur = r, ug = g, ub = b;
         if (gs->m_prim.fge && g364FogEnabled())
             g364ApplyFog(v1.fog, ur, ug, ub);
+
+        // G588: all guards describe work writePixel reduces to one unconditional CT32 store.
+        // The verifier still calls writePixel and compares the word, so it cannot author pixels.
+        const AlphaTestResult g588Alpha = classifyAlphaTest(ctx.test, a);
+        const bool g588Selected = g588SolidSpriteOn() && t_g144InReplay;
+        const bool g588Quiet = g530Quiet() && !g530AnyProbe();
+        const bool g588Layout = gs->m_vram != nullptr && ctx.frame.psm == GS_PSM_CT32 &&
+                                ctx.frame.fbmsk == 0u;
+        const bool g588State = !gs->m_prim.abe && !sZActive && !sZWrite;
+        // `writeDepth` is not a pixel-side requirement here: g588State already proves
+        // sZWrite=false, so the generic spriteZStore call is a no-op regardless of AFAIL's depth
+        // permission. Requiring !writeDepth rejected every ordinary alpha-test-disabled sprite.
+        const bool g588AlphaExact = g588Alpha.writeFramebuffer &&
+                                    !g588Alpha.preserveDestinationAlpha;
+        const bool g588Exact =
+            g588Selected && g588Quiet && g588Layout && g588State && g588AlphaExact;
+        if (g588Exact)
+        {
+            uint8_t outA = a;
+            if ((ctx.fba & 0x1ull) != 0ull)
+                outA = static_cast<uint8_t>(outA | 0x80u);
+            const uint32_t pixel = static_cast<uint32_t>(ur) |
+                (static_cast<uint32_t>(ug) << 8u) |
+                (static_cast<uint32_t>(ub) << 16u) |
+                (static_cast<uint32_t>(outA) << 24u);
+            const uint32_t block = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+            const uint32_t width = ctx.frame.fbw != 0u ? ctx.frame.fbw : 1u;
+            const bool verify = g588SolidSpriteVerifyOn();
+            const bool stat = g588SolidSpriteStatOn();
+            uint64_t committed = 0u;
+            if (verify)
+            {
+                // Oracle path: generic writePixel remains authoritative. Reading through the exact
+                // fast address proves both the constant word and the factorised address for every
+                // eligible pixel; no candidate store can conceal a mismatch.
+                for (int y = drawY0; y <= drawY1; ++y)
+                {
+                    const G530RowAddr row = g530RowAddr(block, width, static_cast<uint32_t>(y));
+                    uint32_t groupX = ~0u;
+                    uint32_t groupBase = 0u;
+                    for (int x = drawX0; x <= drawX1; ++x)
+                    {
+                        const uint32_t ux = static_cast<uint32_t>(x);
+                        const uint32_t gx = ux & ~7u;
+                        if (gx != groupX)
+                        {
+                            groupX = gx;
+                            groupBase = g530GroupBase(row, ux);
+                        }
+                        const uint32_t off = groupBase +
+                            static_cast<uint32_t>(row.ct[ux & 0x7u]) * 4u;
+                        if (off + 4u > gs->m_vramSize)
+                            continue;
+                        writePixel(gs, x, y, ur, ug, ub, a);
+                        uint32_t actual = 0u;
+                        std::memcpy(&actual, gs->m_vram + off, sizeof(actual));
+                        if (actual != pixel)
+                        {
+                            const uint64_t bad =
+                                g_g588Bad.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                            if (bad <= 16u)
+                                std::fprintf(stderr,
+                                             "[G588:bad] n=%llu fbp=%x fbw=%u xy=%d,%d "
+                                             "ref=%08x fast=%08x\n",
+                                             static_cast<unsigned long long>(bad), ctx.frame.fbp,
+                                             static_cast<uint32_t>(ctx.frame.fbw), x, y,
+                                             actual, pixel);
+                        }
+                        ++committed;
+                    }
+                }
+            }
+            else
+            {
+                // Every columnTable32 row consists of four adjacent word pairs. Full aligned
+                // 8-pixel groups therefore need four 8-byte stores, not eight 4-byte stores and
+                // eight inner-loop address/branch iterations. Clipped edge pixels retain the
+                // original per-pixel bound rule. The pair value is two identical CT32 words, so
+                // this is byte-for-byte the same little-endian commit.
+                const uint64_t pair = static_cast<uint64_t>(pixel) |
+                                      (static_cast<uint64_t>(pixel) << 32u);
+                for (int y = drawY0; y <= drawY1; ++y)
+                {
+                    const G530RowAddr row = g530RowAddr(block, width, static_cast<uint32_t>(y));
+                    int x = drawX0;
+                    const auto writeOne = [&](int sx) {
+                        const uint32_t ux = static_cast<uint32_t>(sx);
+                        const uint32_t base = g530GroupBase(row, ux);
+                        const uint32_t off = base +
+                            static_cast<uint32_t>(row.ct[ux & 0x7u]) * 4u;
+                        if (off + 4u <= gs->m_vramSize)
+                        {
+                            std::memcpy(gs->m_vram + off, &pixel, sizeof(pixel));
+                            if (stat)
+                                ++committed;
+                        }
+                    };
+
+                    // Reach an aligned 8-pixel group without changing clipped-edge behaviour.
+                    while (x <= drawX1 && (x & 7) != 0)
+                    {
+                        writeOne(x);
+                        ++x;
+                    }
+                    for (; x + 7 <= drawX1; x += 8)
+                    {
+                        const uint32_t base =
+                            g530GroupBase(row, static_cast<uint32_t>(x));
+                        for (unsigned p = 0; p < 4u; ++p)
+                        {
+                            const uint32_t off = base +
+                                static_cast<uint32_t>(row.ct[p * 2u]) * 4u;
+                            if (off + 8u <= gs->m_vramSize)
+                            {
+                                std::memcpy(gs->m_vram + off, &pair, sizeof(pair));
+                                if (stat)
+                                    committed += 2u;
+                            }
+                            else if (off + 4u <= gs->m_vramSize)
+                            {
+                                std::memcpy(gs->m_vram + off, &pixel, sizeof(pixel));
+                                if (stat)
+                                    ++committed;
+                            }
+                        }
+                    }
+                    while (x <= drawX1)
+                    {
+                        writeOne(x);
+                        ++x;
+                    }
+                }
+            }
+            if (stat)
+            {
+                g_g588Pixels.fetch_add(committed, std::memory_order_relaxed);
+                g_g588Draws.fetch_add(1u, std::memory_order_relaxed);
+                g588SolidSpriteReport();
+            }
+            return;
+        }
+        if (g588Selected && g588SolidSpriteStatOn())
+        {
+            g_g588Reject.fetch_add(1u, std::memory_order_relaxed);
+            if (!g588Quiet) g_g588RejQuiet.fetch_add(1u, std::memory_order_relaxed);
+            else if (!g588Layout) g_g588RejLayout.fetch_add(1u, std::memory_order_relaxed);
+            else if (!g588State) g_g588RejState.fetch_add(1u, std::memory_order_relaxed);
+            else g_g588RejAlpha.fetch_add(1u, std::memory_order_relaxed);
+            g588SolidSpriteReport();
+        }
         for (int y = drawY0; y <= drawY1; ++y)
             for (int x = drawX0; x <= drawX1; ++x)
             {

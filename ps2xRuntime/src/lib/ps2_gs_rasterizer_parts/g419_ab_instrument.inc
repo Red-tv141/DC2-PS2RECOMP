@@ -729,6 +729,23 @@ enum G419Lever
     // G573: admit Ridepod's textured+blended CT32 0x13b triangles to the transient graph path.
     // GS-worker admission lever: hold 16.
     kG573LeverTri13b = 107,
+    // G580: replace only the Z24-read and CT32-commit leaves of the exact replayed 0x13b state.
+    // GS replay-worker code-shape lever: hold 16.
+    kG580LeverTri13bFast = 108,
+    // G588: replace the generic writePixel leaf for exact opaque CT32 replayed sprites with the
+    // same precomputed word and direct swizzled store. GS replay-worker lever: hold 16.
+    kG588LeverSolidSprite = 109,
+    // G589: the drain-transaction memo for the logical/T8 atlas refresh. GS worker lever: hold 16.
+    kG589LeverDrainMemo = 110,
+    // G590: window-scoped depth authority — skip the windowed depth upload when no page over the
+    // batch's own row band moved since the resident texture was last synced. GS worker: hold 16.
+    kG590LeverZWin = 111,
+    // G591: window-scoped surface authority. `privz` gates the windowed depth upload on the G411
+    // private mirror's own write epoch; `colwin` narrows the colour snapshot's whole-target
+    // generation test to the pages the batch's own row window covers. GS worker levers: hold 16.
+    kG591LeverPrivZ = 112,
+    kG591LeverColWin = 113,
+    kG592LeverPubCons = 114,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -961,6 +978,20 @@ static int g419AbLever()
             return static_cast<int>(kG568LeverBitAlias);
         if (std::strcmp(value, "tri13b") == 0)
             return static_cast<int>(kG573LeverTri13b);
+        if (std::strcmp(value, "tri13bfast") == 0)
+            return static_cast<int>(kG580LeverTri13bFast);
+        if (std::strcmp(value, "solidsprite") == 0)
+            return static_cast<int>(kG588LeverSolidSprite);
+        if (std::strcmp(value, "drainmemo") == 0)
+            return static_cast<int>(kG589LeverDrainMemo);
+        if (std::strcmp(value, "zwin") == 0)
+            return static_cast<int>(kG590LeverZWin);
+        if (std::strcmp(value, "privz") == 0)
+            return static_cast<int>(kG591LeverPrivZ);
+        if (std::strcmp(value, "colwin") == 0)
+            return static_cast<int>(kG591LeverColWin);
+        if (std::strcmp(value, "pubcons") == 0)
+            return static_cast<int>(kG592LeverPubCons);
         if (std::strcmp(value, "vu1null") == 0)
             return static_cast<int>(kG541LeverVuNull);
         std::fprintf(stderr,
@@ -975,7 +1006,8 @@ static int g419AbLever()
                      "fastdec|hashlane|vstore|vload|vmem|nopdisp|updesc|lowdense|dispdense|"
                      "peel4|g516disp|fpind|stampind|g517ind|cullcmp|macscan|capinplace|"
                       "l2lskip|flagtail|flaghead|divlower|imgspec|hot0c70|hot0e00|hot30d8|"
-                      "hot1be8|hot1c00|hot0900|hot1110|rtttri|bitalias|tri13b|vu1null)\n",
+                      "hot1be8|hot1c00|hot0900|hot1110|rtttri|bitalias|tri13b|tri13bfast|"
+                      "solidsprite|drainmemo|zwin|vu1null)\n",
                      value);
         return static_cast<int>(kG419LeverNone);
     }();
@@ -1090,6 +1122,13 @@ static const char *g419AbLeverName(int lever)
     case kG552LeverRttTri: return "rtttri";
     case kG568LeverBitAlias: return "bitalias";
     case kG573LeverTri13b: return "tri13b";
+    case kG580LeverTri13bFast: return "tri13bfast";
+    case kG588LeverSolidSprite: return "solidsprite";
+    case kG589LeverDrainMemo: return "drainmemo";
+    case kG590LeverZWin: return "zwin";
+    case kG591LeverPrivZ: return "privz";
+    case kG591LeverColWin: return "colwin";
+    case kG592LeverPubCons: return "pubcons";
     case kG541LeverVuNull: return "vu1null";
     default: return "none";
     }
@@ -1245,6 +1284,10 @@ static uint64_t g438ArmHoldFrames()
                  sel == kG551LeverHot1c00 || sel == kG554LeverHot0900 ||
                  sel == kG555LeverHot1110 || sel == kG552LeverRttTri ||
                  sel == kG568LeverBitAlias || sel == kG573LeverTri13b ||
+                 sel == kG580LeverTri13bFast || sel == kG588LeverSolidSprite ||
+                 sel == kG589LeverDrainMemo || sel == kG590LeverZWin ||
+                 sel == kG591LeverPrivZ || sel == kG591LeverColWin ||
+                 sel == kG592LeverPubCons ||
                  sel == kG541LeverVuNull ||
                 sel == kG439LeverCoalesce || sel == kG445LeverEarlyKick ||
                 sel == kG445LeverKickAll || sel == kG447LeverSpinWait || sel == kG447LeverWSpin ||
@@ -2007,6 +2050,124 @@ int g568BitAliasArm()
 int g573Tri13bArm()
 {
     if (g419AbLever() != static_cast<int>(kG573LeverTri13b))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G580's exact leaf is consumed on replay workers. One relaxed RMW per selected arm/frame proves
+// both buckets executed while avoiding an atomic on every selected triangle.
+int g580Tri13bFastArm()
+{
+    if (g419AbLever() != static_cast<int>(kG580LeverTri13bFast))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G588's exact sprite leaf runs on every replay lane. Attribute at most one relaxed RMW per lane
+// and A/B tick rather than putting an atomic in the per-sprite or per-pixel hot path.
+int g588SolidSpriteArm()
+{
+    if (g419AbLever() != static_cast<int>(kG588LeverSolidSprite))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G589's drain memo is queried once per batch on the GS worker (~57/frame on S05). Same sequence
+// memo as the levers above so paired attribution costs one relaxed RMW per A/B tick, not one per
+// batch. The arm is read inside g589MemoEnsureAtlas, which is on the flush's dependency path.
+// G590: window-scoped depth-authority arm. Same shape as g589DrainMemoArm — global linkage so the
+// rasterizer part (which lives inside an anonymous namespace) binds to THIS symbol, not a
+// never-defined anonymous one (the G568 lesson).
+int g590ZWinArm()
+{
+    if (g419AbLever() != static_cast<int>(kG590LeverZWin))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G591: the two window-scoped surface-authority arms. Same shape and same global-linkage rule as
+// g590ZWinArm above.
+int g591PrivZArm()
+{
+    if (g419AbLever() != static_cast<int>(kG591LeverPrivZ))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G592: the private-mirror publication consumer test. Same shape and same global-linkage rule.
+int g592PubConsArm()
+{
+    if (g419AbLever() != static_cast<int>(kG592LeverPubCons))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g591ColWinArm()
+{
+    if (g419AbLever() != static_cast<int>(kG591LeverColWin))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g589DrainMemoArm()
+{
+    if (g419AbLever() != static_cast<int>(kG589LeverDrainMemo))
         return -1;
     const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
     const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);

@@ -97,6 +97,16 @@ static uint32_t g570Batch139GpuDebugAt(size_t index);
 static uint32_t g570Batch139CpuDebugAt(size_t index);
 static uint32_t g570Batch139PackedCoverageHash(int x, int y);
 
+// G580 declarations. The implementation follows G530's swizzle helpers, while the replay
+// dispatcher owns the candidate-only serial CLUT preparation and per-entry TLS binding.
+using G580ClutFillFn =
+    std::function<void(const G144Entry &, std::array<uint32_t, 256> &)>;
+static bool g580SharedClutBatchSelected(const std::vector<G144Entry> &entries);
+static bool g580PrepareSharedCluts(const std::vector<G144Entry> &entries,
+                                   const G580ClutFillFn &fill);
+static void g580BindSharedSample(size_t entryIndex);
+static void g580ClearSharedSample();
+
 static bool g529StatOn()
 {
     static const bool on = envFlagEnabled("DC2_G529_STAT");

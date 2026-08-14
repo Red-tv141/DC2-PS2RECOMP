@@ -1,4 +1,28 @@
-﻿// G524: the transient-target materialize DELETION CEILING PROBE, in
+﻿// G583: the whole-population CPU-fallback census + the 0x13b transient guest-depth admission, in
+// G588: default-on exact CPU solid-sprite replay kernel + authoritative word oracle. Revision: 3.
+// DC2_G586_TRANSIENT_141=1 arms only FBW=8 CT32 untextured sprite/tristrip batches with read-only
+// ZBP=0xd0/Z24; DC2_G586_VERIFY_TRN141=1 implies it and leaves CPU replay authoritative. This
+// content edit forces MSBuild to consume the G586 .inc changes (G359).
+// rasterizer_rtt_census_and_waves.inc (both), rasterizer_vram_materialization.inc (the rejecter
+// shape stash) and rasterizer_tilebin_capture.inc (the fallback hook) — content edit here forces
+// MSBuild to consume them (G359). revision: 1
+//   * DC2_G583_REJCENSUS=1 -> [G583:rejcensus] / [G583:rejshape]. Ranks every g178TryFlushGpu
+//     fallback by REPLAYED ENTRIES for ANY fbp. G262's census is gated on the five named G248
+//     targets and G265's on fbp 0/0x68, so fbp=0x13b — the largest fallback source on the Ridepod
+//     boss — was invisible to both, and [G290:gpufail] prints entry 0 rather than the entry that
+//     actually rejected.
+//   * DC2_G583_TRN13B_Z=1 (default-ON since G585; rollback DC2_G583_NO_TRN13B_Z=1) admits G286's transient 0x13b target to
+//     G262/G570's NON-PERSISTENT per-wave guest-depth contract and to the two additive-FIX blend
+//     shapes, as one set. Nothing is added to g248TargetIndex and no residency survives the
+//     flush, so this cannot reproduce G569's persistent-ownership escaped-writer defect.
+//     Rollback DC2_G583_NO_TRN13B_Z=1; divergence counter DC2_G583_STAT=1 -> [G583:trn13bz].
+//   * DC2_G583_VERIFY_TRN13B=1 -> [G583:verify13b]. Same-run exact oracle for that population,
+//     reusing G570's 0x13d depth-carrying shape: snapshot colour + the G403/G411 private Z,
+//     render the batch on the GPU, restore both authorities, replay on the CPU, compare. G286's
+//     own 0x13b oracle is gated `!guestDepth` and has never fired here (G573 recorded zero checks
+//     over 2.2 M primitives). The verifier IMPLIES the admission so it cannot compare the CPU
+//     path against itself; it renders each admitted batch twice and is never valid for timing.
+// G524: the transient-target materialize DELETION CEILING PROBE, in
 // rasterizer_vram_materialization.inc — content edit here forces MSBuild to consume it (G359).
 // revision: 1
 //   * DC2_G524_NO_TRNMAT=1 (default-off, knowingly WRONG output) deletes the single
@@ -88,6 +112,7 @@
 //                Rollback DC2_G510_NO_CLSMEMO=1. Census DC2_G510_CENSUS=1 → [G510:cls].
 //   * `g510both` (kG510LeverBoth) — the combined promotion arm.
 // G508: `lockskip` lever + g508LockSkipArm() in g419_ab_instrument.inc.
+// G588: promoted `solidsprite` replay commit + paired arm/oracle/depth-no-op proof + paired stores.
 // G475: held paired arm for the VU1 compact VNOP trace; force-consume g419 instrument edit.
 // G434: DC2_G434_NO_L2LPIN l2l-pin deletion ceiling probe in rasterizer_draw_sprite.inc ג€”
 // content edit here forces MSBuild to consume it.
@@ -116,6 +141,31 @@ int g456UvPredicateArm();
 // every part that reads it is inside an anonymous namespace, and the definition lives in
 // g419_ab_instrument.inc far below.
 int g498OwnPubArm();
+// G589: the DRAIN TRANSACTION (GPU-VU command/authority redesign, slice 1). These five must be
+// declared at GLOBAL scope here, before any part is included: g589BeginDrain / g589EndDrain are
+// called from rasterizer_command_graph.inc (inside an anonymous namespace, and far earlier than
+// the definitions), g589MemoEnsureAtlas from rasterizer_t8_maps_and_atlas.inc, g589NoteBatch from
+// rasterizer_vram_materialization.inc and g589DisarmTransaction from rasterizer_tilebin_capture.inc.
+// Declaring them inside any part's anonymous namespace would name a different, never-defined
+// symbol (the G568 lesson). g589DrainMemoArm is the paired A/B accessor defined in
+// g419_ab_instrument.inc, same rule as g498OwnPubArm above.
+int g589DrainMemoArm();
+// G590: window-scoped depth-authority paired arm, defined at global scope in
+// g419_ab_instrument.inc and consumed by g590_surface_authority.inc (which is inside the
+// anonymous namespace, so it must NOT redeclare it there — the G568 linkage lesson).
+int g590ZWinArm();
+// G591: the two window-scoped surface-authority paired arms (private-mirror depth epoch, colour
+// window authority). Same global-linkage rule as g590ZWinArm above — g591_window_authority.inc
+// lives inside the anonymous namespace and must bind to THESE symbols.
+int g591PrivZArm();
+int g591ColWinArm();
+// G592: the private-mirror publication consumer test. Same global-linkage rule as above.
+int g592PubConsArm();
+void g589BeginDrain();
+void g589EndDrain();
+void g589NoteBatch();
+void g589DisarmTransaction();
+bool g589MemoEnsureAtlas(bool (*real)());
 // G499: new A/B lever `blklower` (kG499LeverBlkLower = 58) + its arm accessor g499BlkLowerArm(),
 // both defined in g419_ab_instrument.inc below. The consumer is the VU1 TU, which declares it
 // `extern` at global scope in vu1_g490_block_run.inc (force recompile v1).
@@ -198,6 +248,26 @@ int g498OwnPubArm();
 
 #include "ps2_gs_rasterizer_parts/g345_closure.inc"
 
+// G590 revision: 1 — SURFACE AUTHORITY census + generalized shadow oracle (both default-off,
+// behaviour-pure except the shadow's blocking readback). MUST follow
+// rasterizer_rtt_census_and_waves.inc (G261Res / kG261Fbp / G261MatCause / kG248TargetCount and
+// the global g242_backend_read_depth declaration) and MUST precede
+// rasterizer_gpu_alias_page_view.inc, whose g261Materialize calls g590NoteMaterialize, and
+// rasterizer_vram_materialization.inc, which owns the colour/depth upload decisions and the pack
+// site the shadow oracle hooks. Content edit here forces MSBuild to consume the .inc files (G359).
+#include "ps2_gs_rasterizer_parts/g590_surface_authority.inc"
+
+// G591 revision: 2 — WINDOW-SCOPED SURFACE AUTHORITY. Slice A (the G411 private depth mirror's
+// WRITE EPOCH) is PROMOTED DEFAULT-ON; slice B (window-scoped colour authority) is REFUTED by its
+// own census and stays default-off. Rollback DC2_G591_NO_PRIVZ=1.
+// MUST follow g590_surface_authority.inc (it answers the question G590's shadow oracle opened and
+// shares its page-generation vocabulary) and MUST precede rasterizer_gpu_alias_page_view.inc
+// (g278FlushPendSlot stamps the private-mirror epoch and g261Report calls g591Report),
+// rasterizer_vram_materialization.inc (the colour/depth upload decisions and the pack site), and
+// rasterizer_draw_sprite.inc / rasterizer_draw_triangle.inc (the per-draw mirror-epoch bump).
+// Content edit here forces MSBuild to consume the .inc files (G359).
+#include "ps2_gs_rasterizer_parts/g591_window_authority.inc"
+
 // G399: DC2_G399_SURFDUMP joins the raw-VRAM diag flag set in the part below.
 // G535 revision: 3 — PROMOTES the consumer-edge publication to DEFAULT-ON (g535EdgePubOn):
 // deferral is kept and the private-mirror owner is published in g528PublishScoped. +3.51% on lean
@@ -227,6 +297,15 @@ int g498OwnPubArm();
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_t8_map_resolver.inc"
+
+// G589 revision: 1 — the DRAIN TRANSACTION. MUST follow rasterizer_rtt_census_and_waves.inc
+// (kG248TargetCount / g_g261Res), rasterizer_alias_page_state.inc (g_g280Ovl) and
+// rasterizer_t8_maps_and_atlas.inc (g_g310ProducerN and the atlas lifecycle flags), because its
+// memo key is computed over exactly those; and MUST precede rasterizer_vram_materialization.inc
+// and rasterizer_tilebin_capture.inc, which call g589NoteBatch / g589DisarmTransaction. Its
+// definitions are at global scope and are declared at the top of this file. Content edit here
+// forces MSBuild to consume the .inc files (G359).
+#include "ps2_gs_rasterizer_parts/g589_drain_transaction.inc"
 
 // G342 arc#6 slice-1 premise-gate: per-consumer-shape TIME census of c5 tex-alias materialize.
 // Included before vram_materialization.inc so g342NoteTexAlias is visible at the trigger site.
@@ -261,6 +340,17 @@ int g498OwnPubArm();
 
 #include "ps2_gs_rasterizer_parts/rasterizer_vram_materialization.inc"
 
+
+// G592 revision: 1 — the private-mirror PUBLICATION's consumer test (the READ half of the
+// ownership record G591 opened). MUST follow rasterizer_gpu_alias_page_view.inc (G278PendDepth /
+// s_g278PendTab / g278FlushPendSlot), rasterizer_tilebinning_and_probes.inc (g_g144List /
+// t_g144InReplay), rasterizer_clipping_and_tex_checks.inc (g203UniversalZEnabled /
+// g404SharedZScope) and g419_ab_instrument.inc (g592PubConsArm, defined at GLOBAL scope — this
+// part is inside an anonymous namespace and must NOT redeclare it: the G568 linkage lesson).
+// MUST precede g528_flush_publish.inc, whose G535 edge is its only publication call site, and
+// rasterizer_draw_sprite.inc / rasterizer_draw_triangle.inc, which carry the invariant probe.
+// Content edit here forces MSBuild to consume the .inc files (G359).
+#include "ps2_gs_rasterizer_parts/g592_publish_consumer.inc"
 
 // G528 revision: 1 — the flush prologue, scoped to the executing batch's own page ranges.
 // MUST follow rasterizer_gpu_alias_page_view.inc / rasterizer_vram_materialization.inc (it calls
@@ -305,6 +395,12 @@ int g498OwnPubArm();
 // G570: exact CPU leaf kernel for the combat FBP 0x139 replay.  It reuses G530's CT32 row/group
 // swizzle helpers and therefore must follow g530_sprite_span.inc; drawTriangle is its only caller.
 #include "ps2_gs_rasterizer_parts/g570_cpu_triangle.inc"
+
+// G580 revision: 2 - exact Z24/CT32 leaves plus a candidate-only batch-shared T8 CLUT for the
+// replayed Ridepod 0x13b triangle state. It reuses G530's CT32 row helper, so it must follow
+// G530/G570 and precede drawTriangle; forward declarations let the replay dispatcher bind it.
+// This content edit also forces MSBuild to consume later g580_cpu_triangle.inc edits (G359).
+#include "ps2_gs_rasterizer_parts/g580_cpu_triangle.inc"
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_draw_sprite.inc"
