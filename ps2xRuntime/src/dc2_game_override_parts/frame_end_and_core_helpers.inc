@@ -1,3 +1,107 @@
+// ===================== G598: SCRIPT-FRAME-KEYED FRAME CAPTURE (DEFAULT OFF) =====================
+//
+// ⛔ THE SHIPPED FRAME DUMP IS KEYED ON THE HOST PRESENT TICK, WHICH IS NOT A SCRIPT CLOCK.
+// `tick` is incremented by the host present loop (runtime_dispatch_and_memory.inc), which free-runs
+// at ~58 Hz whether the guest advanced or not, while everything the route does — the pad script, the
+// cutscene camera, the scene itself — is keyed on `scriptFrame` = f(n), n = mgEndFrame calls. On a
+// 120 s run BOTH arms therefore write exactly 116 files named 000060..006960, but the DEFAULT arm
+// reached scriptFrame 10216 and `DC2_G400_NO_RESIDENT_139=1` (54.8 ms/f vs 27) only 6097. The two
+// 116-frame sets are DIFFERENT SCENES. Comparing a defect RATE across them is the coverage-
+// denominator error of G596 §6 wearing a second costume, and G597 §5.2 stopped one sentence short
+// of committing it.
+//
+// This dumps on the SCRIPT clock instead, from the GS-worker closure immediately after the present
+// latch that frame's pixels belong to — so the file named `<sf>` holds exactly what the script
+// produced at scriptFrame `<sf>`, in every arm, at any frame rate, and the two arms' file sets are
+// comparable BY CONSTRUCTION rather than by a post-hoc timing model.
+//
+// It runs after `latchHostPresentationFrame()` has returned, so `copyLatchedHostPresentationFrame`
+// (which takes s_g189HostPresentMutex, non-recursive) cannot self-deadlock, and no other latch can
+// interleave: the pairing frame↔scriptFrame is exact, not "usually right".
+//
+//   DC2_G598_DUMP_SF=<every>   dump when scriptFrame crosses a multiple of <every> (0/unset = off)
+//   DC2_G598_SF_LO=<sf>        window lower bound (default 0)
+//   DC2_G598_SF_HI=<sf>        window upper bound (default 0 = no bound)
+//   DC2_G598_MAP=1             print [G598:map] tick=<hostTick> n=<n> sf=<sf> once per guest frame,
+//                              i.e. the tick→script mapping the shipped dump does not record
+//
+// Diagnostic only: writing a 637 KB PPM on the GS worker perturbs frame time. Never quote a frame
+// time from a run that had DC2_G598_DUMP_SF set.
+//
+// ⚠️ This .inc is included INSIDE dc2_game_override.cpp's anonymous namespace, so `dc2::dumpFramePpm`
+// must be declared by the header at file scope (added to that .cpp's include block) and called as
+// `::dc2::` — a local `namespace dc2 { ... }` declaration here compiles and then fails to link.
+
+static uint32_t g598_script_frame(uint32_t n)
+{
+    // Identical to the mapping mgEndFrame applies below; kept in one place so the capture key and
+    // the pad script can never drift apart.
+    const uint32_t sf = static_cast<uint32_t>((static_cast<uint64_t>(n) * 31ull) / 14ull);
+    return sf > 16u ? sf - 16u : 0u;
+}
+
+static void g598_capture_on_script_frame(uint32_t n, PS2Runtime *runtime)
+{
+    static const uint32_t s_every = []() -> uint32_t {
+        const char *e = std::getenv("DC2_G598_DUMP_SF");
+        const long v = e ? std::strtol(e, nullptr, 10) : 0L;
+        return v > 0 ? static_cast<uint32_t>(v) : 0u;
+    }();
+    static const bool s_map = dc2_env_flag_enabled("DC2_G598_MAP");
+    // Script-clock twin of DC2_G138_GSDUMP_AT_TICK. Closes the packet-dump gate at boot and opens
+    // it the first time the SCRIPT reaches the requested frame, so a capture aimed at a defect
+    // lands on the same scene in every arm regardless of frame rate.
+    static const long s_gsAtSf = []() -> long {
+        const char *e = std::getenv("DC2_G598_GS_AT_SF");
+        const long v = e ? std::strtol(e, nullptr, 10) : -1L;
+        if (v >= 0)
+            g_dc2G138DumpGateOpen.store(false, std::memory_order_relaxed);
+        return v;
+    }();
+    if (s_every == 0u && !s_map && s_gsAtSf < 0)
+        return;
+
+    const uint32_t sf = g598_script_frame(n);
+    if (s_gsAtSf >= 0 && static_cast<long>(sf) >= s_gsAtSf &&
+        !g_dc2G138DumpGateOpen.load(std::memory_order_relaxed))
+    {
+        g_dc2G138DumpGateOpen.store(true, std::memory_order_relaxed);
+        std::fprintf(stderr, "[G598:gsdump] gate OPEN at sf=%u n=%u\n", sf, n);
+    }
+    if (s_map)
+    {
+        std::fprintf(stderr, "[G598:map] tick=%llu n=%u sf=%u\n",
+                     static_cast<unsigned long long>(g_dc2PresentTick.load(std::memory_order_relaxed)),
+                     n, sf);
+    }
+    if (s_every == 0u)
+        return;
+
+    static const uint32_t s_lo = []() -> uint32_t {
+        const char *e = std::getenv("DC2_G598_SF_LO");
+        const long v = e ? std::strtol(e, nullptr, 10) : 0L;
+        return v > 0 ? static_cast<uint32_t>(v) : 0u;
+    }();
+    static const uint32_t s_hi = []() -> uint32_t {
+        const char *e = std::getenv("DC2_G598_SF_HI");
+        const long v = e ? std::strtol(e, nullptr, 10) : 0L;
+        return v > 0 ? static_cast<uint32_t>(v) : 0u;
+    }();
+    if (sf < s_lo || (s_hi != 0u && sf > s_hi))
+        return;
+
+    // scriptFrame advances ~2.21 per guest frame, so "== 0 mod every" would skip most buckets.
+    // Fire on the BUCKET CROSSING instead: every bucket in [lo,hi] gets exactly one file, and the
+    // file is named for the bucket, so the two arms' names line up even though neither arm ever
+    // lands on the same sf as the other.
+    static uint32_t s_lastBucket = 0xFFFFFFFFu;
+    const uint32_t bucket = sf / s_every;
+    if (bucket == s_lastBucket)
+        return;
+    s_lastBucket = bucket;
+    ::dc2::dumpFramePpm(static_cast<uint64_t>(bucket) * s_every, false, runtime);
+}
+
 static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     // PHASE F30: green clear behind env-var gate. Default OFF so real title pixels survive.
@@ -10,6 +114,11 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
     }();
     static uint32_t calls = 0u;
     const uint32_t n = ++calls;
+    // G599: publish the SCRIPT clock for every other TU's diagnostics. This override is the only
+    // place that knows `n`, and `scriptFrame` is the only key on which two arms — or a census and
+    // a captured frame — describe the same scene (G598 §1). One relaxed store per guest frame,
+    // unconditional so a census does not need a flag of its own to be windowed.
+    g_dc2ScriptFrame.store(g598_script_frame(n), std::memory_order_relaxed);
 
     // ===== G503: the fourth derivative probe, and the EE thread's first PC sampler =====
     //
@@ -616,6 +725,9 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                 runtime->gs().latchHostPresentationFrame();
             }
             g189_set_closure_stage(3, n);
+            // G598: capture on the SCRIPT clock, here — the one point where the latch for guest
+            // frame n has completed and no later latch can have started.
+            g598_capture_on_script_frame(n, runtime);
         });
         if (f29_should_log(n))
         {

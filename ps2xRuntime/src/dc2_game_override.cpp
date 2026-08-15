@@ -8,6 +8,10 @@
 
 #include "game_overrides.h"
 #include "ps2_runtime.h"
+// G598: script-frame-keyed frame capture (frame_end_and_core_helpers.inc). Included HERE, at file
+// scope — everything below line 492 lives in an anonymous namespace, so a declaration written
+// inside the .inc would define `(anonymous)::dc2::dumpFramePpm` and fail to link.
+#include "ps2_frame_dump.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -233,6 +237,16 @@ extern std::atomic<int> g_dc2PreemptSuppressDepth;
 // G214: extern-visible host present-loop tick (defined in ps2_runtime.cpp) so the skin-matrix
 // collapse scanner can print the frame_NNNNNN.ppm number an event lands on.
 extern std::atomic<uint64_t> g_dc2PresentTick;
+// G598: the G138 packet-dump gate (defined in ps2_runtime.cpp). DC2_G138_GSDUMP_AT_TICK opens it on
+// a HOST tick, which names a different script position in every arm for exactly the reason the
+// tick-keyed frame dump did; DC2_G598_GS_AT_SF opens it on the SCRIPT clock instead. File scope,
+// not inside the anonymous namespace below.
+extern std::atomic<bool> g_dc2G138DumpGateOpen;
+// G599: the SCRIPT clock, published for cross-TU diagnostics (defined in ps2_memory.cpp's
+// memory_page_table_and_translate.inc). Only this TU can compute it, and the GS-side censuses need
+// it to window themselves on the defect's script moment. Same file-scope rule as the two above —
+// declaring it inside the anonymous namespace below would name a different, never-defined symbol.
+extern std::atomic<uint32_t> g_dc2ScriptFrame;
 // G56: main-title map geometry-submission chain (delegated by the G56 chain taps).
 extern void Draw__9CMapPartsFv_0x15e3d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void PreDraw__9CMapPartsFv_0x166a00(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
