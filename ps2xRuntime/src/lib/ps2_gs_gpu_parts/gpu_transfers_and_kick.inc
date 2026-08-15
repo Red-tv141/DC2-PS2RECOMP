@@ -316,6 +316,13 @@ void GS::performLocalToLocalTransfer()
     }
     else if (formatAware)
     {
+        // G596: table-driven same-format body. One loop-invariant call-level branch; it fails
+        // CLOSED to the untouched legacy loop below on any shape it cannot reproduce exactly.
+        if (!g596TryFastLocalCopy(m_vram, m_vramSize,
+                                  sbp, static_cast<uint32_t>(sbw), spsm, ssax, ssay,
+                                  dbp, static_cast<uint32_t>(dbw), dpsm, dsax, dsay,
+                                  rrw, rrh, traversal.reverseX, traversal.reverseY))
+        {
         for (uint32_t row = 0; row < rrh; ++row)
         {
             const uint32_t srcY = transferCoord(ssay, rrh, row, traversal.reverseY);
@@ -328,6 +335,7 @@ void GS::performLocalToLocalTransfer()
                     readTransferPixel(m_vram, m_vramSize, sbp, sbw, spsm, srcX, srcY);
                 writeTransferPixel(m_vram, m_vramSize, dbp, dbw, dpsm, dstX, dstY, pixel);
             }
+        }
         }
     }
     else

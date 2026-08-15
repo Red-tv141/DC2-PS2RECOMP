@@ -143,6 +143,45 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             m_hwregX = 0;
             m_hwregY = 0;
             const bool g171On = g171PerfEnabled();
+            // ===== G593 ceiling probe (DC2_G593_NOREG=1, default-off, knowingly WRONG output) =====
+            // ⚠️ The arm selects a DUPLICATED cold loop rather than adding a branch to the hot one.
+            // The first form put one loop-invariant predicted branch inside the ~141 k
+            // descriptors/frame loop, and `[G147:gif] parserOther` moved 9.12 -> 9.76 ms/f — 4.5 ns
+            // per descriptor of standing tax on the POLE THREAD for a diagnostic that ships
+            // default-off. G520's law is that arm symmetry is a CODEGEN property; here the
+            // requirement is the opposite and stronger — the DEFAULT arm's code must be untouched.
+            // The `else` branch below is byte-identical to the pre-G593 loop.
+            if (g593NoRegOn())
+            {
+                for (uint32_t loop = 0; loop < nloop; ++loop)
+                {
+                    for (uint32_t r = 0; r < nreg; ++r)
+                    {
+                        if (offset + 16 > sizeBytes)
+                        {
+                            g147FlushCounters();
+                            return;
+                        }
+                        const uint64_t lo = loadLE64(data + offset);
+                        const uint64_t hi = loadLE64(data + offset + 8);
+                        offset += 16;
+                        ++g147PackedRegs;
+                        // Keep every vertex kick so [G434:inv] kicks/f stays exact; drop every
+                        // other descriptor. A+D (0x0E) carries its GS register address in
+                        // hi[7:0], and the four vertex codes are the same there as in the PACKED
+                        // descriptor table.
+                        const uint8_t d593 = static_cast<uint8_t>(regs[r] & 0xFu);
+                        const uint8_t a593 = static_cast<uint8_t>(hi & 0xFFu);
+                        const bool vtx593 =
+                            (d593 == 0x04u || d593 == 0x05u || d593 == 0x0Cu || d593 == 0x0Du) ||
+                            (d593 == 0x0Eu && (a593 == 0x04u || a593 == 0x05u ||
+                                               a593 == 0x0Cu || a593 == 0x0Du));
+                        if (vtx593)
+                            writeRegisterPacked(regs[r], lo, hi);
+                    }
+                }
+                continue; // this tag is fully consumed
+            }
             for (uint32_t loop = 0; loop < nloop; ++loop)
             {
                 for (uint32_t r = 0; r < nreg; ++r)

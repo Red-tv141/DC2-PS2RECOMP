@@ -357,4 +357,108 @@ inline void g526Mark()
         t_g526Mark = std::chrono::steady_clock::now();
 }
 
+// =============================================================================================
+// G595 §1 — DECOMPOSE `pro`, the LARGEST leaf of the draw/capture layer.
+//
+// WHY. `[G526:split]` de-cumulated over `s05 n=1021..2461` (tools/g595_draw.py) ranks the layer:
+//
+//   pro 1.633 ms/f (29.7%) | note 1.369 (24.9%) | inline edge+drain+raster 1.007 (18.3%)
+//   build 0.459 | push 0.366 | dec 0.185 | sw 0.181 | cull 0.146      -> 5.50 ms/f total
+//
+// `pro` is the single biggest one and it is a BLACK BOX: one lap from drawPrimitive's first
+// instruction to the point where `deferrable144` is known, 84.9 ns over 19,229 non-culled calls
+// per frame. G511/G528's law — DECOMPOSE THE BUCKET BEFORE DESIGNING — so this splits it into the
+// six regions a lever could plausibly attack, each bracketing exactly one structural stage:
+//
+//   front  drawPrimitive entry -> the G401 reserved-PSM reject decided.  g401NoteFrontDoor, the
+//          G141 perf scope, the G369/G219 gates, activeContext().
+//   zclr   the G45/G49 costume private-Z block. Contains an ATOMIC EXCHANGE on every draw.
+//   pile   the rest of rasterizer_setup_and_perf_census.inc: the F31/F44/F53/... diagnostic pile
+//          plus the G141 coverage counters. G312 priced this at ~17 ns/draw on MAP-0.
+//   cull   the G458 scissor cull + the G459 triangle-separation stat.
+//   body   the tile-bin prologue: lane count, flush-closure assignment test, g_g144Last* stores.
+//   elig   the deferral predicate itself: g527NoteTargetDraw, g527DeferTarget, g286TransientTarget,
+//          g248TargetIndex, g573/g270/g260/g178 gates.
+//
+// The four exits' own totals are NOT re-derived here; `pro`'s six laps sum to the `pro` lap that
+// `[G526:split]` already prints, so the two instruments cross-check each other by construction.
+//
+// INSTRUMENT HYGIENE. Its own flag (DC2_G595_PRO=1), INDEPENDENT of DC2_G526_SPLIT, so the
+// prologue can be decomposed without also paying G526's five capture-path laps. thread_local,
+// non-atomic, one steady_clock read per lap, and the report prints `selfNs/read` measured on this
+// host so a reader can separate attribution from instrument (G312's trap). With the flag unset
+// this contributes one predicted-not-taken branch per lap and no clock reads at all.
+// =============================================================================================
+static const bool g_g595Pro = (std::getenv("DC2_G595_PRO") != nullptr);
+
+enum G595ProLap
+{
+    kG595Front = 0,
+    kG595ZClr,
+    kG595Pile,
+    kG595Cull,
+    kG595Body,
+    kG595Elig,
+    kG595ProN
+};
+static const char *const kG595ProName[kG595ProN] = {"front", "zclr", "pile", "cull", "body",
+                                                    "elig"};
+
+struct G595ProAcc
+{
+    uint64_t ns[kG595ProN];
+    uint64_t n[kG595ProN];
+    uint64_t calls;
+    uint64_t selfNs;
+};
+static thread_local G595ProAcc t_g595Pro{};
+static thread_local std::chrono::steady_clock::time_point t_g595ProMark{};
+
+static void g595ProReport()
+{
+    // Measure the clock pair's own cost on this thread and this clock, exactly as G526 does.
+    {
+        const auto a = std::chrono::steady_clock::now();
+        for (int i = 0; i < 64; ++i)
+        {
+            const auto x = std::chrono::steady_clock::now();
+            (void)x;
+        }
+        const auto b = std::chrono::steady_clock::now();
+        t_g595Pro.selfNs = static_cast<uint64_t>(
+                               std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count()) /
+                           64u;
+    }
+    std::fprintf(stderr, "[G595:pro] calls=%llu selfNs/read=%llu",
+                 (unsigned long long)t_g595Pro.calls, (unsigned long long)t_g595Pro.selfNs);
+    for (int i = 0; i < kG595ProN; ++i)
+        std::fprintf(stderr, " %s=%.1f/%llu", kG595ProName[i], t_g595Pro.ns[i] / 1e6,
+                     (unsigned long long)t_g595Pro.n[i]);
+    std::fprintf(stderr, "\n");
+    std::fflush(stderr);
+}
+
+// Arm the mark at drawPrimitive's first instruction.
+inline void g595ProBegin()
+{
+    if (!g_g595Pro)
+        return;
+    t_g595ProMark = std::chrono::steady_clock::now();
+    ++t_g595Pro.calls;
+    if ((t_g595Pro.calls % 200000ull) == 0ull)
+        g595ProReport();
+}
+
+// Close one prologue lap and re-arm.
+inline void g595Lap(uint32_t which)
+{
+    if (!g_g595Pro)
+        return;
+    const auto now = std::chrono::steady_clock::now();
+    t_g595Pro.ns[which] += static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(now - t_g595ProMark).count());
+    ++t_g595Pro.n[which];
+    t_g595ProMark = now;
+}
+
 } // namespace

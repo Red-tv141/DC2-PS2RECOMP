@@ -39,6 +39,12 @@ void g178NoteVramWriteRectTagged(uint8_t *vram, uint32_t bpBlocks, uint32_t bw64
 // GLOBAL-scope gap: a declaration inside the anonymous namespace below names a different,
 // never-defined symbol.
 int g476PageBumpArm();
+// G595 paired A/B arms, declared in the same GLOBAL-scope gap and for the same reason (the G568
+// lesson): `g595line` alternates G270's display-LINE deferral, `g595note` alternates the
+// state-identity memo for the per-entry page-range append. Both are defined with EXTERNAL linkage
+// in g419_ab_instrument.inc, which this TU includes 91 includes AFTER this file.
+int g595LineArm();
+int g595NoteMemoArm();
 namespace
 {
 
@@ -67,11 +73,52 @@ bool g260NrOn()
 // removes that artificial barrier. The GPU executor expands the existing integer Bresenham walk
 // into ordered 1x1 quads, preserving the CPU rasterizer's exact pixel coordinates and colors.
 // Keep this opt-in until CPU fallback, GPU composition, and downstream presentation all pass.
+// G595 PROMOTION: DEFAULT-ON under the native-renderer graph. `DC2_G270_LINE_WAVE=1` is retained
+// as a redundant compatibility opt-in; the rollbacks are DC2_G595_NO_LINEDEFER=1 (this phase) and
+// the original DC2_G270_NO_LINE_WAVE=1. Same shape as g286TransientTargetOn's G287 promotion.
 bool g270LineWaveOn()
 {
-    static const bool s_on = g260NrOn() && envFlagEnabled("DC2_G270_LINE_WAVE") &&
-                             !envFlagEnabled("DC2_G270_NO_LINE_WAVE");
+    static const bool s_on = g260NrOn() &&
+                             !envFlagEnabled("DC2_G595_NO_LINEDEFER") &&
+                             !envFlagEnabled("DC2_G270_NO_LINE_WAVE") &&
+                             !envFlagDisabled("DC2_G270_LINE_WAVE");
     return s_on;
+}
+
+// ⭐⭐⭐ G595: G270 WAS REFUTED ON A ROUTE THAT HAS NO LINES.
+//
+// The 2026-07-16 verdict ("default-off — no payoff on MAP-0") is a MAP-0 property, and G568's law
+// says a direction refuted on one route may lead on another. `[G526:draw]`/`[G526:split]`
+// de-cumulated over `s05 n=1021..2461` (tools/g595_draw.py) prices the inline exit at
+//
+//     4.2 calls/frame x 242.4 us = 1.007 ms/f — 18.3% of the whole 5.50 ms/f draw+capture layer
+//
+// and `[G526:type]` says all of them are LINESTRIP, `[G526:inl]` that they are exactly two shapes:
+// fbp=0x0 and fbp=0x68 (the two display buffers), fpsm=CT32, tme=0, abe=0, 464 px each. That is
+// G270's admission predicate verbatim. The cost is NOT the raster (15 us of the 242): it is
+// `drain` 51.8 us + `edge` 175.4 us — every one of those four primitives forces a full pending-
+// graph drain plus the g278/g289/g272/g277/g276/g261/g242 ownership+materialize edge, four times
+// a frame, because a LINE is not deferrable. Measured with the lever on, the whole inline bucket
+// disappears and the layer reads 5.498 -> 4.358 ms/f (-1.140, -20.7%) with the deferred count up
+// by exactly the missing lines.
+//
+// `g270LineWaveOn()` stays the cached env/default accessor. `g270LineWaveActive()` is what the
+// capture predicate and the whole-flush classifier read, so the paired A/B can alternate it.
+// The arm is frame-stable (g419AbTick runs once per frame, hold 16) and every batch drains inside
+// the frame that captured it, so an entry can never be captured under one arm and classified
+// under the other.
+// The arm accessor is hoisted behind a one-shot cached bool so the shipped path does not call
+// g595LineArm() per draw just to learn that no A/B is running (G502, applied to a lever's own
+// selector). ⚠️ This was built to recover a +0.15 ms/f prologue regression and DID NOT: `pro`
+// reads 1.783 hoisted / 1.773 hoisted+reordered against a 1.633 control. Both that hypothesis and
+// the conjunct-order one are REFUTED — the residual is unattributed (G595 §6). Kept as the better
+// shape, not as a fix.
+bool g270LineWaveActive()
+{
+    static const bool s_underAb = (g595LineArm() >= 0);
+    if (!s_underAb)
+        return g270LineWaveOn();
+    return g260NrOn() && g595LineArm() == 1;
 }
 
 bool g270LineType(uint32_t type)
@@ -404,10 +451,16 @@ namespace
         int n = 0;
         bool unknown = false;
 
+        // G595: bumped by EVERY reset. `add()` and `markUnknown()` only ever GROW the set, so a
+        // stable `seq` proves that everything appended since the value was read is still in here.
+        // That is exactly the invariant the G595 note memo needs, and reset() is the ONE place the
+        // open sets are cleared (g260CloseOpenBatch) — so no other site has to be plumbed.
+        uint32_t seq = 0;
         void reset()
         {
             n = 0;
             unknown = false;
+            ++seq;
         }
         void add(const G144BlockRange &b)
         {
@@ -826,6 +879,204 @@ namespace
             }
         }
         g314ObservePendingDraw(g314WriteHit, g314ReadHit, g314Unknown);
+    }
+
+    // =========================================================================================
+    // ⭐⭐⭐ G595 — STATE-IDENTITY MEMO FOR THE PER-ENTRY PAGE-RANGE APPEND
+    //
+    // PREMISE, MEASURED (not argued). `[G526:split]` de-cumulated over `s05 n=1021..2461` with
+    // tools/g595_draw.py puts the `note` lap at **71.2 ns x 19,225 captured entries/frame =
+    // 1.369 ms/f** — 24.9% of the whole 5.50 ms/f drawPrimitive+capture layer and its second
+    // largest leaf. `g336NoteConsumer` early-outs on `!g_g336Armed` (default off), so essentially
+    // all of it is g260NoteAppend. `[G510:cls]` over the same window reads **92.80% of 18,638
+    // entries/frame carrying byte-identical GS state to their predecessor**.
+    //
+    // ROOT. EVERY input g260NoteAppend reads lives inside that state group, and NOTHING it reads
+    // is per-primitive:
+    //   g144TargetRange   <- ctx.frame{fbp,fbw,psm} + ctx.scissor
+    //   g254DepthSurface  <- ctx.zbuf + ctx.test + ctx.frame.fbw + ctx.scissor
+    //   g144TextureRange  <- ctx.tex0
+    //   g144ClutRange     <- ctx.tex0 + texclut
+    //   the two gates     <- prim.tme, ctx.tex0.psm
+    // It never touches e.v[], e.minY/maxY or e.decoded. So when the state repeats, all four block
+    // ranges repeat EXACTLY, bit for bit.
+    //
+    // EXACTNESS — the skipped call provably changes nothing:
+    //  1. `G260RangeSet::add(b)` is IDEMPOTENT for an already-added `b`. Whichever of its three
+    //     paths took `b` the first time, `b` is afterwards contained in some interval `r[i]`, so
+    //     the merge test `b.first <= r[i].last+1 && r[i].first <= b.last+1` fires and the
+    //     min/max assignment is a no-op. It cannot fall through to `r[n++]` or to the capacity
+    //     path, so `n` cannot move either.
+    //  2. `markUnknown()` is idempotent by inspection.
+    //  3. `add()`/`markUnknown()` only ever GROW the set; `reset()` is the only shrink, and it is
+    //     called from exactly one place (g260CloseOpenBatch). So `seq` unchanged since the memo
+    //     was filled ⇒ the memoized ranges are still inside the live open sets. This is what
+    //     makes the memo safe against every `g_g144List.clear()` in the TU without plumbing a
+    //     single one of them: the memo keys on the ACCUMULATOR, not on the list.
+    //  4. The only other observable is `g314ObservePendingDraw`, which CONSUMES `g_g314Pending`.
+    //     It is a pure no-op unless `DC2_G314_CENSUS=1`, so the memo is disarmed whole when that
+    //     census is armed (fail closed) rather than trying to replay its side effect.
+    //
+    // The shadow is a raw byte copy of the entry's state prefix, refreshed by `memcpy` on every
+    // miss. That makes the comparison exact ACROSS PADDING TOO: the shadow's padding bytes are
+    // copied verbatim out of the same stack-local `G144Entry e` the next entry is built in, and
+    // nothing ever writes those bytes, so they agree. A disagreement (e.g. right after a vector
+    // reallocation move-constructs entries member-wise) can only cause a MISS, never a false hit.
+    //
+    // Arm `DC2_G419_AB=g595note`; standalone `DC2_G595_NOTEMEMO=1`; rollback once promoted
+    // `DC2_G595_NO_NOTEMEMO=1`; oracle `DC2_G595_NOTEVFY=1`; sub-timer `DC2_G595_CENSUS=1`.
+    // =========================================================================================
+    static constexpr size_t kG595StateBytes = offsetof(G144Entry, v);
+    static constexpr size_t kG595StateQwords = kG595StateBytes / 8u;
+    static constexpr size_t kG595StateTail = kG595StateBytes % 8u;
+    static_assert(kG595StateTail == 0u || kG595StateTail == 4u,
+                  "G595: unexpected G144Entry state-prefix size");
+
+    static bool g595NoteMemoDefaultOn()
+    {
+        // G595 PROMOTION: DEFAULT-ON. Rollback DC2_G595_NO_NOTEMEMO=1 (or DC2_G595_NOTEMEMO=0).
+        // Exactness: [G595:note] vfyChecks=58,167,644 vfyBad=0 on `s05`, each check running the
+        // REAL g260NoteAppend against a snapshot and asserting both accumulators are unchanged.
+        static const bool on = !envFlagEnabled("DC2_G595_NO_NOTEMEMO") &&
+                               !envFlagDisabled("DC2_G595_NOTEMEMO");
+        return on;
+    }
+    static bool g595NoteMemoEligible()
+    {
+        // §4 above: the memo elides g314ObservePendingDraw, whose side effect is real only under
+        // the G314 census. Cached once — never a getenv on the per-entry path.
+        static const bool ok = !g314CensusOn();
+        return ok;
+    }
+    static bool g595NoteVerifyOn()
+    {
+        static const bool on = envFlagEnabled("DC2_G595_NOTEVFY");
+        return on;
+    }
+    static bool g595NoteCensusOn()
+    {
+        static const bool on = envFlagEnabled("DC2_G595_CENSUS");
+        return on;
+    }
+
+    alignas(16) static thread_local unsigned char t_g595Prev[kG595StateBytes];
+    static thread_local bool t_g595Have = false;
+    static thread_local uint32_t t_g595WrSeq = 0u;
+    static thread_local uint32_t t_g595RdSeq = 0u;
+    // Non-atomic and thread_local: the pole is ONE thread and an atomic RMW per captured entry
+    // would be a self-inflicted cost on the very path this memo exists to shorten (G526's rule).
+    static thread_local uint64_t t_g595NoteNs = 0u;
+    static thread_local uint64_t t_g595NoteEntries = 0u;
+    static thread_local uint64_t t_g595NoteHits = 0u;
+    static thread_local uint64_t t_g595VfyChecks = 0u;
+    static thread_local uint64_t t_g595VfyBad = 0u;
+
+    static bool g595StateEq(const G144Entry &e)
+    {
+        const uint64_t *a = reinterpret_cast<const uint64_t *>(&e);
+        const uint64_t *b = reinterpret_cast<const uint64_t *>(t_g595Prev);
+        uint64_t d = 0u;
+        for (size_t i = 0; i < kG595StateQwords; ++i)
+            d |= a[i] ^ b[i];
+        if (kG595StateTail == 4u)
+        {
+            uint32_t x = 0u, y = 0u;
+            std::memcpy(&x, reinterpret_cast<const unsigned char *>(&e) + kG595StateBytes - 4u, 4u);
+            std::memcpy(&y, t_g595Prev + kG595StateBytes - 4u, 4u);
+            d |= static_cast<uint64_t>(x ^ y);
+        }
+        return d == 0u;
+    }
+
+    // Oracle. Asserts the INVARIANT the skip relies on (G528's law: not "the old path found no
+    // work", but "running it would have changed nothing"), by running the REAL function against
+    // a snapshot and restoring. noinline so the comparison never lands inside the measured basic
+    // block (G519 §5b).
+    __declspec(noinline) static void g595VerifyNoteSkip(const G144Entry &e)
+    {
+        const G260RangeSet wr0 = g_g260OpenWr;
+        const G260RangeSet rd0 = g_g260OpenRd;
+        g260NoteAppend(e);
+        const bool bad = std::memcmp(&g_g260OpenWr, &wr0, sizeof(G260RangeSet)) != 0 ||
+                         std::memcmp(&g_g260OpenRd, &rd0, sizeof(G260RangeSet)) != 0;
+        g_g260OpenWr = wr0;
+        g_g260OpenRd = rd0;
+        ++t_g595VfyChecks;
+        if (bad)
+        {
+            ++t_g595VfyBad;
+            if (t_g595VfyBad <= 8u)
+                std::fprintf(stderr,
+                             "[G595:vfy-BAD] n=%llu fbp=0x%x fpsm=0x%x sc=%u,%u..%u,%u tme=%u "
+                             "tbp=0x%x wrN=%d rdN=%d\n",
+                             (unsigned long long)t_g595VfyBad, e.ctx.frame.fbp,
+                             (unsigned)e.ctx.frame.psm, (unsigned)e.ctx.scissor.x0,
+                             (unsigned)e.ctx.scissor.y0, (unsigned)e.ctx.scissor.x1,
+                             (unsigned)e.ctx.scissor.y1, (unsigned)e.prim.tme, e.ctx.tex0.tbp0,
+                             g_g260OpenWr.n, g_g260OpenRd.n);
+        }
+    }
+
+    static void g595NoteReport()
+    {
+        std::fprintf(stderr,
+                     "[G595:note] entries=%llu hits=%llu (%.2f%%) noteNs=%llu avgNs=%.1f | "
+                     "vfyChecks=%llu vfyBad=%llu stateBytes=%zu\n",
+                     (unsigned long long)t_g595NoteEntries, (unsigned long long)t_g595NoteHits,
+                     t_g595NoteEntries
+                         ? 100.0 * (double)t_g595NoteHits / (double)t_g595NoteEntries
+                         : 0.0,
+                     (unsigned long long)t_g595NoteNs,
+                     t_g595NoteEntries ? (double)t_g595NoteNs / (double)t_g595NoteEntries : 0.0,
+                     (unsigned long long)t_g595VfyChecks, (unsigned long long)t_g595VfyBad,
+                     kG595StateBytes);
+        std::fflush(stderr);
+    }
+
+    // The single call the capture site makes. With the memo disarmed this is exactly
+    // `g260NoteAppend(e)` plus one cached-bool test.
+    inline void g595NoteAppend(const G144Entry &e)
+    {
+        static const bool s_verify = g595NoteVerifyOn();
+        // G589's law: a `bad=` is unreadable without its `checks=`. The oracle therefore IMPLIES
+        // the reporting path, so a verify run can never print a clean-looking verdict silently.
+        static const bool s_census = g595NoteCensusOn() || s_verify;
+        static const bool s_eligible = g595NoteMemoEligible();
+        const auto t0 = s_census ? std::chrono::steady_clock::now()
+                                 : std::chrono::steady_clock::time_point{};
+        // Same hoist as g270LineWaveActive: the arm accessor must not be called per entry on the
+        // shipped path just to answer "no A/B is running".
+        static const bool s_underAb = (g595NoteMemoArm() >= 0);
+        static const bool s_default = g595NoteMemoDefaultOn();
+        const bool memoOn = s_eligible && (s_underAb ? (g595NoteMemoArm() == 1) : s_default);
+        if (memoOn && t_g595Have && t_g595WrSeq == g_g260OpenWr.seq &&
+            t_g595RdSeq == g_g260OpenRd.seq && g595StateEq(e))
+        {
+            if (s_census)
+                ++t_g595NoteHits;
+            if (s_verify)
+                g595VerifyNoteSkip(e);
+        }
+        else
+        {
+            g260NoteAppend(e);
+            if (memoOn)
+            {
+                t_g595Have = true;
+                t_g595WrSeq = g_g260OpenWr.seq;
+                t_g595RdSeq = g_g260OpenRd.seq;
+                std::memcpy(t_g595Prev, &e, kG595StateBytes);
+            }
+        }
+        if (s_census)
+        {
+            t_g595NoteNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0)
+                    .count());
+            if ((++t_g595NoteEntries % 400000ull) == 0ull)
+                g595NoteReport();
+        }
     }
 
     bool g260HasPending()

@@ -548,7 +548,32 @@ void PS2Runtime::run()
             const long v = e ? std::strtol(e, nullptr, 10) : 60;
             return v > 0 ? static_cast<uint64_t>(v) : 60ull;
         }();
-        const bool periodic = dc2FrameDumpEnabled() && (tick != 0) && (tick % s_frameDumpEvery == 0);
+        // G600: window the TICK-keyed dump on the SCRIPT clock.
+        //   DC2_G600_TICK_SF_LO=<sf> / _SF_HI=<sf>
+        // DC2_G598_DUMP_SF fires at most once per GUEST frame, so it cannot see a defect that
+        // alternates between HOST PRESENTS of the same guest frame (the host loop free-runs at
+        // ~58 Hz while a dumping run's guest can be at 17). This gate keeps the per-present dump
+        // and makes it affordable by bounding it to a script window. Off unless _SF_LO is set;
+        // a cross-ARM comparison must still use DC2_G598_DUMP_SF (G598's law) — this is for
+        // finding an alternation WITHIN one run.
+        extern std::atomic<uint32_t> g_dc2ScriptFrame;
+        static const uint32_t s_tickSfLo = []() -> uint32_t {
+            const char *e = std::getenv("DC2_G600_TICK_SF_LO");
+            const long v = e ? std::strtol(e, nullptr, 10) : 0L;
+            return v > 0 ? static_cast<uint32_t>(v) : 0u;
+        }();
+        static const uint32_t s_tickSfHi = []() -> uint32_t {
+            const char *e = std::getenv("DC2_G600_TICK_SF_HI");
+            const long v = e ? std::strtol(e, nullptr, 10) : 0L;
+            return v > 0 ? static_cast<uint32_t>(v) : 0u;
+        }();
+        bool inTickSfWindow = true;
+        if (s_tickSfLo != 0u || s_tickSfHi != 0u) {
+            const uint32_t sf = g_dc2ScriptFrame.load(std::memory_order_relaxed);
+            inTickSfWindow = sf >= s_tickSfLo && (s_tickSfHi == 0u || sf <= s_tickSfHi);
+        }
+        const bool periodic = dc2FrameDumpEnabled() && (tick != 0) && inTickSfWindow &&
+                              (tick % s_frameDumpEvery == 0);
         const bool manual = IsKeyPressed(KEY_F12);
         if (periodic || manual) {
             dc2::dumpFramePpm(tick, s_forceBlank || manual, this);

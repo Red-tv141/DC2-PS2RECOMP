@@ -390,10 +390,126 @@ void g412_latch_host_presentation_snapshot(GS *gs,
     gs->latchHostPresentationFrame();
 }
 
+// ===== G599: WHOLE-VRAM PAGE MAP AT THE PRESENTATION LATCH (default OFF) =====
+// Every visible pixel is in m_vram at this instant — copyFrameToHostRgbaUnlocked is a VRAM
+// deswizzle read — so hashing ALL pages here and diffing two arms names a visual defect's pages
+// with no hypothesis at all. G599 needed this after refuting two specific write hypotheses one at
+// a time (the 0x139 publication's whole guest-VRAM write, and the VRAM→FBO upload skip), each of
+// which cost a build cycle to test.
+//
+// Called at the TOP of the latch, before any presentation path branches: the dual-CRT and
+// Crt1Only/Crt2Only modes all `return` early, so a hook placed at the single-CRT copy fires on no
+// frame at all on this route.
+//
+// Keyed on the SCRIPT clock (`g_dc2ScriptFrame`), so the key names the same script instant in every
+// arm at any frame rate and matches the `-SfDump` PPM of the same key by construction (G598 §1).
+//   DC2_G599_VRAMMAP=<every>   emit once per <every>-scriptFrame bucket
+//   DC2_G599_SF_LO / _SF_HI    window (shared with the rasterizer-side G599 census)
+static void g599VramMap(const uint8_t *vram, uint32_t vramSize)
+{
+    static const uint32_t s_every = []() -> uint32_t {
+        const char *e = std::getenv("DC2_G599_VRAMMAP");
+        const long v = e ? std::strtol(e, nullptr, 10) : 0L;
+        return v > 0 ? static_cast<uint32_t>(v) : 0u;
+    }();
+    if (s_every == 0u || vram == nullptr || vramSize < 8192u)
+        return;
+    static const uint32_t s_lo = []() -> uint32_t {
+        const char *e = std::getenv("DC2_G599_SF_LO");
+        const long v = e ? std::strtol(e, nullptr, 10) : 0L;
+        return v > 0 ? static_cast<uint32_t>(v) : 0u;
+    }();
+    static const uint32_t s_hi = []() -> uint32_t {
+        const char *e = std::getenv("DC2_G599_SF_HI");
+        const long v = e ? std::strtol(e, nullptr, 10) : 0L;
+        return v > 0 ? static_cast<uint32_t>(v) : 0u;
+    }();
+    const uint32_t sf = g_dc2ScriptFrame.load(std::memory_order_relaxed);
+    if (sf < s_lo || (s_hi != 0u && sf > s_hi))
+        return;
+    static uint32_t s_lastBucket = 0xFFFFFFFFu;
+    const uint32_t bucket = sf / s_every;
+    if (bucket == s_lastBucket)
+        return;
+    s_lastBucket = bucket;
+    const uint32_t key = bucket * s_every;
+    // DC2_G599_SURF="139,68,0" — also decode each named surface straight out of guest VRAM as
+    // PSMCT32 512x416 and write it as a PPM named for the SAME key as the -SfDump frame. G399's
+    // probe does the same decode but keys on the latch counter and forces the raw-VRAM diag path;
+    // this one keys on the script clock and changes nothing, so the two arms' surfaces line up with
+    // each other and with their presented frames.
+    static const std::vector<uint32_t> s_surf = []() {
+        std::vector<uint32_t> out;
+        const char *e = std::getenv("DC2_G599_SURF");
+        for (const char *p = e ? e : ""; *p;)
+        {
+            char *end = nullptr;
+            const unsigned long v = std::strtoul(p, &end, 16);
+            if (end == p)
+                break;
+            out.push_back(static_cast<uint32_t>(v));
+            p = end;
+            while (*p == ',' || *p == ' ')
+                ++p;
+        }
+        return out;
+    }();
+    if (!s_surf.empty())
+    {
+        constexpr uint32_t kW = 512u, kH = 416u, kFbwPages = 8u;
+        const char *tag = std::getenv("DC2_FRAME_DUMP_TAG");
+        std::vector<uint8_t> rgb(static_cast<size_t>(kW) * kH * 3u);
+        for (const uint32_t fbp : s_surf)
+        {
+            const uint32_t base = GSInternal::framePageBaseToBlock(fbp);
+            for (uint32_t y = 0u; y < kH; ++y)
+                for (uint32_t x = 0u; x < kW; ++x)
+                {
+                    const uint32_t off = GSPSMCT32::addrPSMCT32(base, kFbwPages, x, y);
+                    uint32_t px = 0u;
+                    if (off + 4u <= vramSize)
+                        std::memcpy(&px, vram + off, 4u);
+                    const size_t o = (static_cast<size_t>(y) * kW + x) * 3u;
+                    rgb[o + 0u] = static_cast<uint8_t>(px & 0xFFu);
+                    rgb[o + 1u] = static_cast<uint8_t>((px >> 8) & 0xFFu);
+                    rgb[o + 2u] = static_cast<uint8_t>((px >> 16) & 0xFFu);
+                }
+            char path[192];
+            std::snprintf(path, sizeof(path), "D:/ps2r/dc2/captures/g599surf_%s_%03x_%06u.ppm",
+                          tag ? tag : "run", fbp, key);
+            if (FILE *fp = std::fopen(path, "wb"))
+            {
+                std::fprintf(fp, "P6\n%u %u\n255\n", kW, kH);
+                std::fwrite(rgb.data(), 1u, rgb.size(), fp);
+                std::fclose(fp);
+            }
+        }
+    }
+    const uint32_t pages = vramSize / 8192u;
+    std::fprintf(stderr, "[G599:vram] key=%u sf=%u pages=%u\n", key, sf, pages);
+    char line[32 * 9 + 8];
+    for (uint32_t p0 = 0; p0 < pages; p0 += 32u)
+    {
+        int o = 0;
+        line[0] = '\0';
+        for (uint32_t p = p0; p < p0 + 32u && p < pages; ++p)
+        {
+            uint64_t h = 1469598103934665603ull; // FNV-1a, fingerprint only
+            const uint8_t *b = vram + static_cast<size_t>(p) * 8192u;
+            for (uint32_t k = 0; k < 8192u; ++k)
+                h = (h ^ b[k]) * 1099511628211ull;
+            o += std::snprintf(line + o, sizeof(line) - o, "%08x ",
+                               static_cast<uint32_t>(h >> 32));
+        }
+        std::fprintf(stderr, "[G599:vrampg] key=%u p=%03x %s\n", bucket * s_every, p0, line);
+    }
+}
+
 void GS::latchHostPresentationFrame()
 {
     // G189: dedicated mutex, not m_stateMutex — see s_g189HostPresentMutex's comment above.
     std::lock_guard<std::mutex> lock(s_g189HostPresentMutex);
+    g599VramMap(m_vram, m_vramSize); // G599 diagnostic, default OFF
     // G440 (diagnostic, DC2_G440_LATCH=1): this whole function is the frame-boundary closure the
     // GS worker runs after every window of the frame — measured at 5.4-5.8 ms/f, i.e. the entire
     // "serial residue" G439 could not attribute. Declared BEFORE the total scope so the report

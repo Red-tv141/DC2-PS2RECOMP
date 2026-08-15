@@ -596,7 +596,10 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
     // defensive gate keeps an accidentally captured textured/off-target line on CPU fallback.
     if (g270LineType(static_cast<uint32_t>(e.prim.type)))
     {
-        if (!g270LineWaveOn() || e.prim.tme ||
+        // G595: read the ARM-AWARE accessor, so a line captured under the paired A/B's candidate
+        // arm is classified under the same arm. The arm is frame-stable (g419AbTick, hold 16) and
+        // every batch drains inside the frame that captured it, so the two can never disagree.
+        if (!g270LineWaveActive() || e.prim.tme ||
             (ctx.frame.fbp != 0x0u && ctx.frame.fbp != 0x68u))
         {
             g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);

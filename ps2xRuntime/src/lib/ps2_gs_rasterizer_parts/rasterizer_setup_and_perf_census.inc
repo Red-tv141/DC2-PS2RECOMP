@@ -135,6 +135,9 @@ void GSRasterizer::drawPrimitive(GS *gs)
     // defer/inline). Inert unless DC2_G526_DRAW=1. Must be the FIRST thing in the function so the
     // four columns sum to `[G147:gif] draw` and the split can be checked against it.
     G526DrawScope g526Scope(static_cast<uint32_t>(gs->m_prim.type));
+    // G595 §1: arm the prologue decomposition (inert unless DC2_G595_PRO=1). Must be the second
+    // statement, so `front` covers everything G526's `pro` lap covers up to the G401 reject.
+    g595ProBegin();
     g401NoteFrontDoor(this, gs, gs->m_vram, gs->m_vtxQueue[0],
                       gs->m_prim, gs->activeContext());
     static const bool s_g141PerfOn = (std::getenv("DC2_PERF") != nullptr);
@@ -192,6 +195,7 @@ void GSRasterizer::drawPrimitive(GS *gs)
         g526SetExit(kG526Rej); // G526 exit 0
         return;
     }
+    g595Lap(kG595Front); // G595: entry -> G401 reserved-PSM reject decided
     // G45: clear the costume model's PRIVATE Z buffer exactly once per costume frame, on the
     // fbp -> 0x139 transition (the first draw of each frame's model RTT pass). The old clear was
     // gated on the full-RTT black-sprite signature, which does NOT fire every frame in the
@@ -248,6 +252,7 @@ void GSRasterizer::drawPrimitive(GS *gs)
                              sn, prevFbp, ctx.frame.fbp, (unsigned)didClear);
         }
     }
+    g595Lap(kG595ZClr); // G595: the G45/G49 costume private-Z block (atomic exchange per draw)
     const std::chrono::steady_clock::time_point g312T1 =
         g_g312SegStat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // (G312 note: a master skip-branch over the F31..G34 diagnostic pile below was built and
@@ -1139,3 +1144,4 @@ void GSRasterizer::drawPrimitive(GS *gs)
     }
     if (g_g312SegStat)
         t_g312Seg2aEnd = std::chrono::steady_clock::now(); // G312 seg2a end (perf-counter block done)
+    g595Lap(kG595Pile); // G595: the F31/F44/F53 diagnostic pile + the G141 coverage counters

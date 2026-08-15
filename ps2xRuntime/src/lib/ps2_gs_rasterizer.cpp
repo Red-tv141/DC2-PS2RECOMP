@@ -1,4 +1,39 @@
-﻿// G583: the whole-population CPU-fallback census + the 0x13b transient guest-depth admission, in
+﻿// G597: DC2_G597_OWNCHK=1 -> [G597:own]. Counts EVERY conjunct of g536CollectGuestOwnedPages'
+// fail-closed gate separately, plus pagesScanned/pagesMoved, because G596 measured that guard
+// firing on 0.28-0.38% of publications while guest VRAM moved under 38-80% of them. Behaviour-pure.
+// G597 FIX (DC2_G597_SCOPEDANCHOR=1, rollback DC2_G597_NO_SCOPEDANCHOR=1): g264FlushMirror re-anchors
+// the PER-PAGE baseline only for the rows it actually mirrored. revision: 2
+// G596: register-TRIGGERED transfers (G593 layer 3), re-priced at 5.848 ms/f on `s05` and split by
+// [G432:trxdir] into the 4.455 ms/f dependency PIN and the 1.354 ms/f format-aware pixel copy. The
+// lever itself lives in ps2_gs_gpu.cpp's parts (g596_fast_local_copy.inc); this TU only gains the
+// `g596copy` A/B arm in g419_ab_instrument.inc, so this content edit forces MSBuild to consume it
+// (G359). revision: 1
+// G595: the drawPrimitive+capture LAYER (G593 layer 2), decomposed and attacked. All of it lives
+// in .inc parts — g526_draw_census.inc (the [G595:pro] prologue split), rasterizer_command_graph.inc
+// (the note memo + the arm-aware line accessor), rasterizer_setup_and_perf_census.inc and
+// rasterizer_tilebin_capture.inc (the lap calls + the two call sites), rasterizer_rtt_census_and_waves.inc
+// (the classifier's arm-aware conjunct) and g419_ab_instrument.inc (the arms) — so this content
+// edit forces MSBuild to consume them (G359). revision: 3 — both slices PROMOTED DEFAULT-ON; the
+// arm accessors hoisted behind one-shot cached bools AND the line predicate reordered to test the
+// primitive TYPE before the accessor, after the first two shapes cost the SHIPPED prologue
+// +0.15 ms/f (G502 applied to a lever's own selector, then to its conjunct order).
+//   * DC2_G595_PRO=1 -> [G595:pro]. Splits `pro`, the layer's LARGEST leaf (1.633 ms/f of 5.50 on
+//     `s05 n=1021..2461`), into front/zclr/pile/cull/body/elig. Its six laps sum to the `pro` lap
+//     [G526:split] already prints, so the two instruments cross-check by construction.
+//   * `g595line` (kG595LeverLineDefer) — G270's display-LINE deferral, refuted in 2026-07-16 on a
+//     route that HAS NO LINES. [G526:draw] on `s05` prices the inline exit at 4.2 calls/frame x
+//     242.4 us = 1.007 ms/f (18.3% of the layer), all LINESTRIP to fbp 0x0/0x68, tme=0 abe=0 —
+//     G270's admission predicate verbatim. The cost is `drain` 51.8 us + `edge` 175.4 us per
+//     primitive, not raster (15 us). Measured with the lever on: layer 5.498 -> 4.358 ms/f.
+//     Arm DC2_G419_AB=g595line; opt-in DC2_G270_LINE_WAVE=1.
+//   * `g595note` (kG595LeverNoteMemo) — a state-identity memo in front of g260NoteAppend, whose
+//     four per-entry block ranges are a pure function of the GS state group that [G510:cls]
+//     measures 92.80% identical to the predecessor. 1.369 ms/f pool. Exact because
+//     G260RangeSet::add is idempotent for a repeated range and reset() (the only shrink) bumps a
+//     seq the memo keys on. Arm DC2_G419_AB=g595note; opt-in DC2_G595_NOTEMEMO=1; rollback
+//     DC2_G595_NO_NOTEMEMO=1; oracle DC2_G595_NOTEVFY=1; sub-timer DC2_G595_CENSUS=1.
+//   * `g595both` is the promotion gate: exactly the shipped pair against exactly the rollback.
+// G583: the whole-population CPU-fallback census + the 0x13b transient guest-depth admission, in
 // G588: default-on exact CPU solid-sprite replay kernel + authoritative word oracle. Revision: 3.
 // DC2_G586_TRANSIENT_141=1 arms only FBW=8 CT32 untextured sprite/tristrip batches with read-only
 // ZBP=0xd0/Z24; DC2_G586_VERIFY_TRN141=1 implies it and leaves CPU replay authoritative. This
@@ -161,6 +196,14 @@ int g591PrivZArm();
 int g591ColWinArm();
 // G592: the private-mirror publication consumer test. Same global-linkage rule as above.
 int g592PubConsArm();
+// G594: the two logical/T8 atlas-refresh paired arms (owned-page enumeration instead of the
+// 128-page x target winner walk; 4-lane guest-page hash instead of the byte-serial 8 KiB FNV).
+// Same global-linkage rule as g590ZWinArm — rasterizer_t8_maps_and_atlas.inc is included at line
+// 296, ~36 includes BEFORE g419_ab_instrument.inc defines them, and it lives inside the anonymous
+// namespace, so it must bind to THESE global declarations (the G568 lesson).
+int g594FastWalkArm();
+int g594FastHashArm();
+int g594FastDeswzArm();
 void g589BeginDrain();
 void g589EndDrain();
 void g589NoteBatch();
@@ -190,6 +233,16 @@ bool g589MemoEnsureAtlas(bool (*real)());
 // Content edit here forces MSBuild to consume both .inc files (G359). revision: 1
 
 #include <deque>
+
+// G599: the SCRIPT clock (defined in ps2_memory.cpp, written once per guest frame by the mgEndFrame
+// override). The MAP-15 sky defect occupies scriptFrames ~1958..2440 and its consumer is ~0.06% of
+// the T8 traffic, so the write-side census MUST window itself on this rather than on a first-N
+// counter (G598 §6). Declared here, BEFORE the first part is included, because
+// rasterizer_headers_and_diagnostics.inc opens an anonymous namespace that stays open through every
+// later part — a declaration written after it names `(anonymous)::g_dc2ScriptFrame`, an
+// internal-linkage variable that is never defined (C7631; the G568 linkage lesson).
+#include <atomic>
+extern std::atomic<uint32_t> g_dc2ScriptFrame;
 
 #include "ps2_gs_rasterizer_parts/rasterizer_headers_and_diagnostics.inc"
 
@@ -337,6 +390,11 @@ bool g589MemoEnsureAtlas(bool (*real)());
 // visible at the framebuffer staging pack; rasterizer_row_pool.inc forward-declares
 // g420PoolNarrowArm because it is included far earlier in this TU.
 #include "ps2_gs_rasterizer_parts/g420_pack_residue.inc"
+
+// G600: the MAP-15 backdrop probe (default OFF). Needs g599EnvU32/g_dc2ScriptFrame from
+// rasterizer_gpu_alias_page_view.inc above, and must precede vram_materialization.inc, whose
+// texture loop carries all three call sites (source decision, registry hit, decode).
+#include "ps2_gs_rasterizer_parts/g600_sky_probe.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_vram_materialization.inc"
 

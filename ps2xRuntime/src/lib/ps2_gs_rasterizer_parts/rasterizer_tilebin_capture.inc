@@ -163,6 +163,7 @@
                          static_cast<unsigned long long>(
                              s_separated.load(std::memory_order_relaxed)));
     }
+    g595Lap(kG595Cull); // G595: the G458 scissor cull + the G459 separation stat
 
     // ===== G144 frame-level tile-binning capture/flush (G168: DEFAULT 8 lanes) =====
     // Runs AFTER the perf counters (so deferred tris still count) and BEFORE the switch (so the
@@ -844,6 +845,7 @@
             };
         }
 
+        g595Lap(kG595Body); // G595: lane count, flush-closure assignment test, g_g144Last* stores
         const uint32_t pt144 = static_cast<uint32_t>(gs->m_prim.type);
         const bool isTri144 = (pt144 == GS_PRIM_TRIANGLE || pt144 == GS_PRIM_TRISTRIP || pt144 == GS_PRIM_TRIFAN);
         const bool isLine144 = g270LineType(pt144);
@@ -918,7 +920,15 @@
         const bool g260RttTri = g260NrOn() && !s_g260NoRttTri && isTri144 && diagOff144 &&
                                 (g248TargetIndex(ctx.frame.fbp) >= 0 ||
                                  (g527TriOn() && g527DiscoveredTarget(ctx.frame.fbp)));
-        const bool g270LineWave = g270LineWaveOn() && isLine144 && !gs->m_prim.tme &&
+        // G595: arm-aware (DC2_G419_AB=g595line). Identical to g270LineWaveOn() outside the A/B.
+        // `isLine144` FIRST: the conjuncts are side-effect-free and order-independent in value but
+        // not in COST — lines are 4 of 19,229 captured entries/frame, so the type test
+        // short-circuits the accessor on 99.98% of draws. ⚠️ MEASURED, NOT ASSUMED: this reorder
+        // did NOT recover the shipped prologue's +0.14 ms/f (`pro` 1.783 -> 1.773 against a 1.633
+        // control), and neither did hoisting the arm accessor behind a cached bool. Both
+        // hypotheses are REFUTED; the residual is unattributed and needs /MAP+capstone, not
+        // another guess (G595 §6). Kept because it is the strictly better shape.
+        const bool g270LineWave = isLine144 && g270LineWaveActive() && !gs->m_prim.tme &&
                                   diagOff144 &&
                                   (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u);
         const bool deferrable144 = ((isTri144 || isSprite144) && diagOff144 &&
@@ -928,6 +938,7 @@
                                    g260RttTri || g270LineWave || g286Transient || g573Tri13b;
         if (g_g312SegStat)
             t_g312Seg2bEnd = std::chrono::steady_clock::now(); // G312 seg2b end (eligibility computed)
+        g595Lap(kG595Elig); // G595: the deferral predicate itself
         g526Lap(kG526Pro); // G526: entry -> eligibility decided (shared by defer and inline)
         // G526 §2: name the inline population. The coarse pass proved ~20 primitives/frame carry
         // the whole per-primitive residual on Georama; this records WHICH they are (target fbp,
@@ -1214,7 +1225,7 @@
                 }
             }
             if (g260NrOn())
-                g260NoteAppend(e); // accumulate this entry's R/W block ranges (open batch)
+                g595NoteAppend(e); // G595: state-identity memo in front of g260NoteAppend
             g336NoteConsumer(e); // G336: first next-frame consumer of boundary-published state (default-off)
             g526Lap(kG526Note); // G526: g260NoteAppend page-range accumulation + g336
             // G510: `e` is a loop-local, fully assigned above and dead from here on (only the

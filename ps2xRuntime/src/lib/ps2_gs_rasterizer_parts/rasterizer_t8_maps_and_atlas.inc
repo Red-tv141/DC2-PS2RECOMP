@@ -1,3 +1,269 @@
+// ===== G594 logical-atlas refresh census (DIAGNOSIS ONLY, default OFF, DC2_G594_CENSUS=1) =====
+// G593 ranked the per-flush FIXED front-end (7.29 ms/f on `s05`, 0.1283 ms per flush) as target #1
+// and named `g310EnsureCurrent` its biggest single leaf — `[G323:census]` books `logical` at
+// 0.043 of a 0.073 ms/flush `deps`. But that leaf is TWO structurally different jobs and no phase
+// has ever split them:
+//
+//   * g310BuildDesired  — a fixed 128-page x kG248TargetCount winner walk. Pure function of the
+//     G261Res scalars plus one g_g178PageGen load per candidate page; contains an integer DIVIDE
+//     and MODULO per (page, target) pair, i.e. up to 1,792 divisions per flush.
+//   * g310ApplyDesired  — reconciles the result against the snapshot, and recomputes an
+//     8192-byte FNV hash (g310GuestPageMeta) for every guest-owned page whose generation moved.
+//
+// One is a loop-structure problem, the other is a hashing problem, and they take opposite fixes.
+// This times both, counts the dirty targets the walk actually has to consider, and counts the
+// guest-page hashes. Behaviour-pure: two steady_clock reads per g310EnsureCurrent call and one
+// counter bump per hashed page, all behind a cached bool. Reported every 30 frame boundaries.
+static bool g594CensusOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G594_CENSUS");
+    return s_on;
+}
+static std::atomic<uint64_t> g_g594Calls{0}, g_g594BuildNs{0}, g_g594ApplyNs{0},
+    g_g594BuildFail{0}, g_g594DirtyTargets{0}, g_g594OwnedPages{0}, g_g594GuestHashes{0},
+    g_g594Frozen{0}, g_g594Uninit{0};
+// Oracle counters (never touched unless the matching VERIFY flag is on).
+static std::atomic<uint64_t> g_g594WalkChecks{0}, g_g594WalkBad{0},
+    g_g594HashChecks{0}, g_g594HashBad{0},
+    g_g594DeswzChecks{0}, g_g594DeswzBad{0}, g_g594DeswzPages{0};
+// ⭐ G593's law: a change worth ~1 ms/f inside a 36 ms frame measures NULL against `avgFrameMs`
+// (the s05 paired gate resolved +/-0.24 ms at best). Price it on the GS worker's OWN clock instead.
+// `initNs` brackets g310Initialize (the FULL composite), `hashNs` the 8 KiB guest-page hash and
+// `deswzNs` the 2,048-texel page deswizzle, so the two levers' savings are read directly as a
+// difference of per-call sub-timers between two otherwise identical census runs.
+static std::atomic<uint64_t> g_g594InitNs{0}, g_g594Inits{0},
+    g_g594HashNs{0}, g_g594DeswzNs{0}, g_g594DeswzCalls{0};
+
+// ===== G594 LEVER 1 — owned-page ENUMERATION instead of the 128 x kG248TargetCount winner walk =====
+// The legacy build asks "who owns this page?" for all 128 atlas pages against all 14 target slots.
+// Every (page, target) pair that clears the base/alignment guard executes `off / r.fbw` and
+// `off % r.fbw` with a RUNTIME divisor - up to 1,792 integer divisions per flush, on the pole
+// thread, once per GPU flush (56.8/f on `s05`). The information is the same either way: a dirty
+// target owns exactly the pages of its own dirty row window, so ENUMERATE those pages directly.
+// Ascending target order + first-claim-wins reproduces g310LegacyPageWinner's rule exactly (the
+// legacy inner loop returns on the first owning target), and row/col fall out of the construction
+// instead of being recovered by a division and then thrown away and recomputed (G593 6.2 target 1).
+// ⛔ STAYS DEFAULT-OFF — PRICED AND NOT WORTH IT. It is EXACT (5,242,752-decision same-run oracle,
+// `walkBad=0`), but g310BuildDesired costs only 2.59 us per call = 0.037 ms/f on `s05`, because
+// only ONE target is dirty per call (`dirtyTargets/call = 1.00`), so 13 of the 14 slots early-out
+// before ever reaching the division. The enumeration returns 0.014 ms/f. G593 6.2 ranked this leaf
+// #1 off `[G323:census] logical=0.043 ms/flush x 56.8 flushes` — but g310EnsureCurrent runs
+// 14.22x/frame, not 56.8x, and the walk is not where its time is (see plans/phase-G594-fix-log.md).
+// The A/B arm WINS when this phase's gate is armed, so the paired measurement stays valid whichever
+// way the default points; the env pair is the standalone bring-up / rollback every promoted lever in
+// this arc carries. Never cache the arm (G501) — it flips every A/B tick. No block-scope `extern`
+// here on purpose: g594FastWalkArm is DEFINED earlier in this same TU (g419_ab_instrument.inc), and
+// this file sits inside an anonymous namespace, so an unqualified call resolves correctly while an
+// `extern` redeclaration would assert global linkage and break (the G568 lesson).
+static bool g594FastWalkOn()
+{
+    const int arm = g594FastWalkArm(); // -1 unless DC2_G419_AB=g594walk|g594both
+    if (arm >= 0)
+        return arm == 1;
+    static const bool s_on = envFlagEnabled("DC2_G594_FASTWALK") &&
+                             !envFlagEnabled("DC2_G594_NO_FASTWALK");
+    return s_on;
+}
+// Same-run oracle: run BOTH forms and compare the 128 desired entries field by field
+// (G310DesiredPage has padding, so a memcmp could false-fail). Implies the lever.
+static bool g594WalkVerifyOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G594_WALKVFY");
+    return s_on;
+}
+
+// ===== G594 LEVER 2 — 4-lane guest-page content hash =====
+// g310GuestPageMeta hashes 8,192 bytes of a guest-owned atlas page with byte-serial FNV-1a: one
+// 64-bit multiply per BYTE on a single dependency chain, i.e. ~8,192 x ~5 cycles = ~12.8 us PER
+// PAGE on the GS worker. The hash is a pure INTERNAL equality token - it is produced and consumed
+// only by this unit inside one process (G310PageState::guestHash vs the previous call's, and
+// g311DeltaCount) - so any hash function works provided both sides use the same one, which a
+// cached process-wide bool guarantees. Four independent chains over 64-bit words cut the chain
+// length 32x (1,024 words / 4 lanes = 256 dependent multiplies). Precedent: G513's 8-lane
+// source-page hash, promoted. DEFAULT-OFF. Rollback once promoted: DC2_G594_NO_FASTHASH.
+static bool g594FastHashOn()
+{
+    const int arm = g594FastHashArm(); // -1 unless DC2_G419_AB=g594hash|g594both
+    if (arm >= 0)
+        return arm == 1;
+    // PROMOTED DEFAULT-ON (G594): exact by a 146,173-decision same-run oracle (`hashBad=0`) and
+    // 13.3x cheaper on the GS worker's own clock (7.71 -> 0.58 us per 8 KiB page).
+    static const bool s_on = !envFlagEnabled("DC2_G594_NO_FASTHASH");
+    return s_on;
+}
+
+// ===== G594 LEVER 3 — run-length CT32 page deswizzle =====
+// g310Initialize rebuilds a guest-owned atlas page by calling GSMem::ReadCT32 ONCE PER TEXEL:
+// 64 x 32 = 2,048 cross-TU calls per page, each redoing the page-id arithmetic and two lookup-table
+// indirections for an address that depends only on (x & 63, y & 31). The GS swizzle is PAGE-LOCAL,
+// so that address pattern is the SAME for every page and can be reduced once to a list of
+// CONTIGUOUS RUNS, then replayed as memcpy. Precedent: G512's promoted whole-texture fast decode.
+// DEFAULT-OFF. Rollback once promoted: DC2_G594_NO_FASTDESWZ.
+static bool g594FastDeswzOn()
+{
+    const int arm = g594FastDeswzArm(); // -1 unless DC2_G419_AB=g594deswz|g594both
+    if (arm >= 0)
+        return arm == 1;
+    // PROMOTED DEFAULT-ON (G594): exact by a 299,411,456-texel same-run oracle (`deswzBad=0`) and
+    // 1.8x cheaper on the GS worker's own clock (5.83 -> 3.25 us per 64x32 page). Fails CLOSED —
+    // if the run plan could not be derived the per-texel loop still runs.
+    static const bool s_on = !envFlagEnabled("DC2_G594_NO_FASTDESWZ");
+    return s_on;
+}
+// Same-run oracle: deswizzle each page BOTH ways and compare all 2,048 texels. Implies the lever.
+static bool g594DeswzVerifyOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G594_DESWVFY");
+    return s_on;
+}
+
+// One contiguous run of texels inside a CT32 page: `count` words starting at word `srcWord` of the
+// page map to `count` consecutive destination pixels starting at column `dstX` of row `localY`.
+struct G594Ct32Run
+{
+    uint16_t srcWord;
+    uint8_t localY;
+    uint8_t dstX;
+    uint8_t count;
+};
+static std::vector<G594Ct32Run> g_g594Ct32Runs;
+static bool g_g594Ct32PlanReady = false;
+static bool g_g594Ct32PlanTried = false;
+static uint32_t g_g594Ct32Texels = 0u;
+
+// ⭐ The plan is DERIVED FROM THE SHIPPED ADDRESSING FUNCTION, not from a hand-written swizzle
+// formula: fill a private page with its own word indices and ask GSMem::ReadCT32 where each texel
+// lives. Whatever that function does, the table agrees with it by construction. Fails CLOSED — any
+// out-of-page answer leaves the plan unready and every page keeps the per-texel loop.
+static void g594BuildCt32Plan()
+{
+    if (g_g594Ct32PlanTried)
+        return;
+    g_g594Ct32PlanTried = true;
+    std::vector<uint8_t> probe(8192u * 4u, 0u); // 3 pages of slack beyond the one we read
+    uint32_t *const words = reinterpret_cast<uint32_t *>(probe.data());
+    const uint32_t probeWords = static_cast<uint32_t>(probe.size() / 4u);
+    for (uint32_t i = 0u; i < probeWords; ++i)
+        words[i] = i;
+    std::array<uint16_t, 64u * 32u> map{};
+    for (uint32_t y = 0u; y < 32u; ++y)
+        for (uint32_t x = 0u; x < 64u; ++x)
+        {
+            const uint32_t got = GSMem::ReadCT32(probe.data(), 0u, 8u, x, y);
+            if (got >= 2048u)
+                return; // addressing left page 0 — do not build a plan for it
+            map[y * 64u + x] = static_cast<uint16_t>(got);
+        }
+    g_g594Ct32Runs.clear();
+    uint32_t texels = 0u;
+    for (uint32_t y = 0u; y < 32u; ++y)
+    {
+        uint32_t x = 0u;
+        while (x < 64u)
+        {
+            const uint16_t start = map[y * 64u + x];
+            uint32_t len = 1u;
+            while (x + len < 64u && len < 255u &&
+                   map[y * 64u + x + len] == static_cast<uint16_t>(start + len))
+                ++len;
+            G594Ct32Run run{};
+            run.srcWord = start;
+            run.localY = static_cast<uint8_t>(y);
+            run.dstX = static_cast<uint8_t>(x);
+            run.count = static_cast<uint8_t>(len);
+            g_g594Ct32Runs.push_back(run);
+            texels += len;
+            x += len;
+        }
+    }
+    if (texels != 64u * 32u)
+    {
+        g_g594Ct32Runs.clear();
+        return;
+    }
+    g_g594Ct32Texels = texels;
+    g_g594Ct32PlanReady = true;
+    if (g594CensusOn() || g594DeswzVerifyOn())
+        std::fprintf(stderr, "[G594:plan] ct32Runs=%zu texels=%u avgRun=%.2f\n",
+                     g_g594Ct32Runs.size(), texels,
+                     static_cast<double>(texels) /
+                         static_cast<double>(std::max<size_t>(1u, g_g594Ct32Runs.size())));
+}
+
+// Replay the plan for atlas page (px,py) into the 512x512 base-pixel buffer. Returns false when the
+// plan is unavailable or the page is out of VRAM, in which case the caller keeps the legacy loop.
+static bool g594DeswizzlePage(uint32_t px, uint32_t py, std::vector<uint32_t> &basePixels)
+{
+    // Magic static: built exactly once, thread-safely, on first use.
+    static const bool s_built = [] { g594BuildCt32Plan(); return true; }();
+    (void)s_built;
+    if (!g_g594Ct32PlanReady || g_g144LastVram == nullptr)
+        return false;
+    const size_t page = static_cast<size_t>(py) * 8u + px;
+    const uint32_t pageBlock = 0x2720u + static_cast<uint32_t>(page) * 32u;
+    const size_t byteOffset = static_cast<size_t>(pageBlock) << 8u;
+    if (byteOffset > g_g261VramSize ||
+        8192u > static_cast<size_t>(g_g261VramSize) - byteOffset)
+        return false;
+    const uint8_t *const src = g_g144LastVram + byteOffset;
+    const uint32_t dstX0 = px * 64u;
+    const uint32_t gsY0 = py * 32u;
+    for (const G594Ct32Run &run : g_g594Ct32Runs)
+    {
+        const uint32_t glY = 511u - (gsY0 + run.localY);
+        std::memcpy(&basePixels[static_cast<size_t>(glY) * 512u + dstX0 + run.dstX],
+                    src + static_cast<size_t>(run.srcWord) * 4u,
+                    static_cast<size_t>(run.count) * 4u);
+    }
+    if (g594CensusOn() || g594DeswzVerifyOn())
+        g_g594DeswzPages.fetch_add(1u, std::memory_order_relaxed);
+    return true;
+}
+// ⚠️ `G310PageState::guestHash` PERSISTS in `g_g310Pages` across calls, so when the paired A/B
+// flips the arm the stored hash was produced by the OTHER function and compares unequal. That is
+// exact in the safe direction — a page reads as CHANGED, never as unchanged, so the atlas refreshes
+// a page it did not have to — and it is symmetric across the flip, so the paired delta is unbiased.
+// It is bounded at <=128 extra page refreshes per A/B tick (one per atlas page, hold 16 frames).
+// The standalone env pair has no flips at all and is the right form for a level measurement.
+// Same-run oracle: compute BOTH hashes for every hashed page and compare the DECISION each one
+// would produce against the previous value of the same page (G513's law: the claim under test is
+// that the two forms agree on "did this page change?", not that they produce the same bits).
+static bool g594HashVerifyOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G594_HASHVFY");
+    return s_on;
+}
+// ⚠️ CUMULATIVE, like every other long-lived census in this unit — DE-CUMULATE it against the
+// nearest preceding `[G154:perf] n=` with `python tools/g529_decum.py <log> G594:g310 --f0 --f1`.
+// Printed on a CALL cadence (every 512 calls), which is deliberately unrelated to frames.
+static void g594Report()
+{
+    if (!g594CensusOn() && !g594WalkVerifyOn() && !g594HashVerifyOn() &&
+        !g594DeswzVerifyOn())
+        return;
+    auto v = [](const std::atomic<uint64_t> &a) {
+        return static_cast<unsigned long long>(a.load(std::memory_order_relaxed));
+    };
+    std::fprintf(stderr,
+                 "[G594:g310] calls=%llu buildNs=%llu applyNs=%llu initNs=%llu inits=%llu "
+                 "hashNs=%llu deswzNs=%llu deswzCalls=%llu dirtyTargets=%llu "
+                 "ownedPages=%llu guestHashes=%llu buildFail=%llu frozen=%llu uninit=%llu\n",
+                 v(g_g594Calls), v(g_g594BuildNs), v(g_g594ApplyNs),
+                 v(g_g594InitNs), v(g_g594Inits), v(g_g594HashNs), v(g_g594DeswzNs),
+                 v(g_g594DeswzCalls), v(g_g594DirtyTargets),
+                 v(g_g594OwnedPages), v(g_g594GuestHashes), v(g_g594BuildFail),
+                 v(g_g594Frozen), v(g_g594Uninit));
+    // ⚠️ G589's law: a `bad=0` beside a `checks=0` has COMPARED NOTHING. Both counts are printed
+    // together, always, so the comparison count is read before the verdict.
+    if (g594WalkVerifyOn() || g594HashVerifyOn() || g594DeswzVerifyOn())
+        std::fprintf(stderr,
+                     "[G594:vfy] walkChecks=%llu walkBad=%llu hashChecks=%llu hashBad=%llu "
+                     "deswzChecks=%llu deswzBad=%llu deswzPages=%llu\n",
+                     v(g_g594WalkChecks), v(g_g594WalkBad),
+                     v(g_g594HashChecks), v(g_g594HashBad),
+                     v(g_g594DeswzChecks), v(g_g594DeswzBad), v(g_g594DeswzPages));
+}
+
 static uint64_t g281ViewKey(uint64_t base)
 {
     uint64_t h = 1469598103934665603ull;
@@ -250,6 +516,61 @@ struct G310DesiredPage
     uint64_t sourceGen = 0u;
 };
 
+// The legacy byte-serial FNV-1a over one 8 KiB page. Kept out of line and unchanged so the oracle
+// compares against exactly the shipped pre-G594 producer, and so the fast arm's loop is not
+// polluted by a branch (G593: a default-off arm must not branch inside the loop it replaces).
+__declspec(noinline)
+static uint64_t g594PageHashSerial(const uint8_t *bytes)
+{
+    uint64_t hash = 1469598103934665603ull;
+    for (size_t i = 0u; i < 8192u; ++i)
+    {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+// Four independent FNV-style chains over 64-bit words. 1,024 words / 4 lanes = 256 DEPENDENT
+// multiplies instead of 8,192, and the four chains issue in parallel on separate ports. Loads go
+// through memcpy so no alignment or strict-aliasing assumption is made about g_g144LastVram; MSVC
+// lowers each to a single `mov`. The final fold is order-dependent, so two pages that differ only
+// by a lane permutation still hash differently.
+__declspec(noinline)
+static uint64_t g594PageHashLanes(const uint8_t *bytes)
+{
+    constexpr uint64_t kPrime = 1099511628211ull;
+    uint64_t h0 = 1469598103934665603ull;
+    uint64_t h1 = h0 ^ 0x9E3779B97F4A7C15ull;
+    uint64_t h2 = h0 ^ 0xC2B2AE3D27D4EB4Full;
+    uint64_t h3 = h0 ^ 0x165667B19E3779F9ull;
+    for (size_t i = 0u; i < 8192u; i += 32u)
+    {
+        uint64_t w0, w1, w2, w3;
+        std::memcpy(&w0, bytes + i, 8u);
+        std::memcpy(&w1, bytes + i + 8u, 8u);
+        std::memcpy(&w2, bytes + i + 16u, 8u);
+        std::memcpy(&w3, bytes + i + 24u, 8u);
+        h0 = (h0 ^ w0) * kPrime;
+        h1 = (h1 ^ w1) * kPrime;
+        h2 = (h2 ^ w2) * kPrime;
+        h3 = (h3 ^ w3) * kPrime;
+    }
+    uint64_t h = (h0 ^ (h1 * kPrime)) * kPrime;
+    h = (h ^ (h2 * kPrime)) * kPrime;
+    h = (h ^ (h3 * kPrime)) * kPrime;
+    h ^= h >> 29;
+    h *= kPrime;
+    h ^= h >> 32;
+    return h;
+}
+
+// Oracle storage: the previous value each form produced for each page. Only written when
+// DC2_G594_HASHVFY=1, so the shipped path never touches them.
+static std::array<uint64_t, 128> g_g594VfyFast{};
+static std::array<uint64_t, 128> g_g594VfySlow{};
+static std::array<uint8_t, 128> g_g594VfySeen{};
+
 static bool g310GuestPageMeta(size_t pageIndex, uint64_t &gen, uint64_t &hash)
 {
     if (pageIndex >= 128u || g_g144LastVram == nullptr)
@@ -261,13 +582,39 @@ static bool g310GuestPageMeta(size_t pageIndex, uint64_t &gen, uint64_t &hash)
         8192u > static_cast<size_t>(g_g261VramSize) - byteOffset)
         return false;
     gen = g_g178PageGen[pageBlock >> 5u].load(std::memory_order_relaxed);
-    hash = 1469598103934665603ull;
+    if (g594CensusOn())
+        g_g594GuestHashes.fetch_add(1u, std::memory_order_relaxed);
     const uint8_t *const bytes = g_g144LastVram + byteOffset;
-    for (size_t i = 0u; i < 8192u; ++i)
+    if (g594HashVerifyOn())
     {
-        hash ^= bytes[i];
-        hash *= 1099511628211ull;
+        // Both forms, then compare the DECISION ("did this page change since we last hashed it?")
+        // rather than the bits. A disagreement is a real defect: one form saw a change the other
+        // missed. Never valid in a timing arm - it does strictly more work than either arm.
+        const uint64_t fast = g594PageHashLanes(bytes);
+        const uint64_t slow = g594PageHashSerial(bytes);
+        if (g_g594VfySeen[pageIndex] != 0u)
+        {
+            g_g594HashChecks.fetch_add(1u, std::memory_order_relaxed);
+            if ((fast == g_g594VfyFast[pageIndex]) != (slow == g_g594VfySlow[pageIndex]))
+                g_g594HashBad.fetch_add(1u, std::memory_order_relaxed);
+        }
+        g_g594VfyFast[pageIndex] = fast;
+        g_g594VfySlow[pageIndex] = slow;
+        g_g594VfySeen[pageIndex] = 1u;
+        hash = g594FastHashOn() ? fast : slow;
+        return true;
     }
+    if (g594CensusOn())
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        hash = g594FastHashOn() ? g594PageHashLanes(bytes) : g594PageHashSerial(bytes);
+        g_g594HashNs.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - t0).count()),
+            std::memory_order_relaxed);
+        return true;
+    }
+    hash = g594FastHashOn() ? g594PageHashLanes(bytes) : g594PageHashSerial(bytes);
     return true;
 }
 
@@ -310,6 +657,134 @@ static bool g310BuildDesired(std::array<G310DesiredPage, 128> &desired,
         }
     }
 
+    // G594 LEVER 1. The two forms are DUPLICATED LOOPS selected by one cached bool, never a branch
+    // inside either loop body (G593's law for a default-off arm on a hot path). `g310StatOn()` is a
+    // census gate that already stands outside the lever, so the fast arm publishes the identical
+    // per-target page histogram.
+    const bool g594Fast = g594FastWalkOn() || g594WalkVerifyOn();
+    if (g594Fast)
+    {
+        // Enumerate each dirty target's OWN pages. The legacy walk's guards decompose exactly:
+        //   * `pageBlock < base` / `(pageBlock-base)&31`  - impossible by construction here
+        //     (pageBlock = base + off*32, and 0x2720 is itself 32-aligned);
+        //   * `row = off/fbw`, `col = off%fbw`            - inverted for free from off = row*fbw+col
+        //     with col < fbw, so the round trip is exact and needs no division;
+        //   * `y0 >= 512`                                 - row <= 15;
+        //   * `y0+31 < dirtyLo || y0 > dirtyHi`           - rows [dirtyLo/32, dirtyHi/32], exact
+        //     because the layout guard above already proved dirtyLo and dirtyHi+1 are 32-aligned;
+        //   * `(col+1)*64 > fbW`                          - kept verbatim;
+        //   * `g144RangeOverlaps(page, r.range)`          - kept verbatim.
+        // Ascending target order with first-claim-wins reproduces g310LegacyPageWinner, whose inner
+        // loop returns on the FIRST owning target (and returns -1 when that target's page is
+        // guest-owned, which is the `continue` below leaving the default sourceTi = -1).
+        for (G310DesiredPage &d : desired)
+            d = G310DesiredPage{};
+        std::array<uint8_t, 128> claimed{};
+        for (uint32_t t = 0u; t < kG248TargetCount; ++t)
+        {
+            const G261Res &r = g_g261Res[t];
+            if (!r.dirty || r.fbw == 0u || r.fbW <= 0 ||
+                r.dirtyHi < r.dirtyLo || !r.range.valid)
+                continue;
+            const uint32_t base = framePageBaseToBlock(kG261Fbp[t]);
+            const int rowLo = std::max(0, r.dirtyLo) / 32;
+            const int rowHi = std::min(15, r.dirtyHi / 32);
+            for (int row = rowLo; row <= rowHi; ++row)
+            {
+                for (uint32_t col = 0u; col < r.fbw; ++col)
+                {
+                    if (static_cast<int>(col + 1u) * 64 > r.fbW)
+                        break;
+                    const uint64_t off =
+                        static_cast<uint64_t>(row) * r.fbw + col;
+                    const uint64_t pageBlock64 =
+                        static_cast<uint64_t>(base) + off * 32ull;
+                    if (pageBlock64 < 0x2720ull)
+                        continue;
+                    const uint64_t pageIx = (pageBlock64 - 0x2720ull) >> 5u;
+                    if (pageIx >= 128ull)
+                        continue;
+                    const size_t page = static_cast<size_t>(pageIx);
+                    if (claimed[page] != 0u)
+                        continue;
+                    const uint32_t pageBlock = static_cast<uint32_t>(pageBlock64);
+                    const G144BlockRange pr{pageBlock, pageBlock + 31u, true};
+                    if (!g144RangeOverlaps(pr, r.range))
+                        continue;
+                    claimed[page] = 1u; // this target is the legacy winner for this page
+                    if (g536GuestOwnsTargetPage(r, kG261Fbp[t],
+                                                static_cast<uint32_t>(row), col))
+                        continue; // legacy winner == -1: guest bytes are authoritative
+                    if (row >= 16 || col >= 8u)
+                    {
+                        g_g310FailLayout.fetch_add(1u, std::memory_order_relaxed);
+                        return false;
+                    }
+                    G310DesiredPage &d = desired[page];
+                    d.sourceTi = static_cast<int8_t>(t);
+                    d.sourceRow = static_cast<uint8_t>(row);
+                    d.sourceCol = static_cast<uint8_t>(col);
+                    d.sourceGen = g_g310TargetPageGen[t][page];
+                }
+            }
+        }
+        if (g310StatOn())
+            for (const G310DesiredPage &d : desired)
+                g_g310SourcePages[
+                    d.sourceTi >= 0 ? static_cast<uint32_t>(d.sourceTi)
+                                    : kG248TargetCount]
+                    .fetch_add(1u, std::memory_order_relaxed);
+        if (!g594WalkVerifyOn())
+            return true;
+        // Same-run oracle: rebuild with the legacy walk into a scratch array and compare field by
+        // field (G310DesiredPage has padding, so memcmp could false-fail). The census-only
+        // g310StatOn histogram is deliberately NOT re-published by this arm.
+        std::array<G310DesiredPage, 128> ref{};
+        for (size_t page = 0u; page < ref.size(); ++page)
+        {
+            const uint32_t pageBlock =
+                0x2720u + static_cast<uint32_t>(page) * 32u;
+            G310DesiredPage d{};
+            const int winner = g310LegacyPageWinner(pageBlock);
+            if (winner >= 0)
+            {
+                uint32_t row = 0u, col = 0u;
+                if (!g280DirtyTargetOwnsPage(winner, pageBlock, &row, &col) ||
+                    row >= 16u || col >= 8u)
+                {
+                    g_g310FailLayout.fetch_add(1u, std::memory_order_relaxed);
+                    return false;
+                }
+                d.sourceTi = static_cast<int8_t>(winner);
+                d.sourceRow = static_cast<uint8_t>(row);
+                d.sourceCol = static_cast<uint8_t>(col);
+                d.sourceGen = g_g310TargetPageGen[static_cast<uint32_t>(winner)][page];
+            }
+            ref[page] = d;
+        }
+        uint64_t bad = 0u;
+        for (size_t page = 0u; page < ref.size(); ++page)
+            if (desired[page].sourceTi != ref[page].sourceTi ||
+                desired[page].sourceRow != ref[page].sourceRow ||
+                desired[page].sourceCol != ref[page].sourceCol ||
+                desired[page].sourceGen != ref[page].sourceGen)
+                ++bad;
+        g_g594WalkChecks.fetch_add(ref.size(), std::memory_order_relaxed);
+        if (bad != 0u)
+        {
+            g_g594WalkBad.fetch_add(bad, std::memory_order_relaxed);
+            static std::atomic<uint32_t> s_vlog{0};
+            if (s_vlog.fetch_add(1u, std::memory_order_relaxed) < 8u)
+                for (size_t page = 0u; page < ref.size(); ++page)
+                    if (desired[page].sourceTi != ref[page].sourceTi)
+                        std::fprintf(stderr,
+                                     "[G594:walkbad] page=%zu fast=%d ref=%d\n",
+                                     page, (int)desired[page].sourceTi,
+                                     (int)ref[page].sourceTi);
+            desired = ref; // the oracle keeps the legacy result authoritative
+        }
+        return true;
+    }
     for (size_t page = 0u; page < desired.size(); ++page)
     {
         const uint32_t pageBlock =
@@ -686,17 +1161,50 @@ static bool g310Initialize(
                 {
                     if (g326G310On() && g326DiagOn())
                         ++g_g326.g310Miss;
-                    for (uint32_t localY = 0u; localY < 32u; ++localY)
+                    // G594 LEVER 3. Duplicated loop selected by one cached bool per page (never a
+                    // branch inside the 2,048-texel body). The plan replays the SAME addressing the
+                    // legacy call computes, in contiguous runs.
+                    const bool g594Deswz = g594FastDeswzOn() || g594DeswzVerifyOn();
+                    const bool g594Timed = g594CensusOn();
+                    const auto g594DeswzT0 = g594Timed
+                        ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
+                    bool g594Did = false;
+                    if (g594Deswz)
+                        g594Did = g594DeswizzlePage(px, py, s_basePixels);
+                    if (!g594Did || g594DeswzVerifyOn())
                     {
-                        const uint32_t gsY = py * 32u + localY;
-                        const uint32_t glY = 511u - gsY;
-                        for (uint32_t localX = 0u; localX < 64u; ++localX)
+                        // Same-run oracle: when VERIFY is on, the fast run already wrote the page;
+                        // compare every texel against the per-texel form BEFORE overwriting it, so a
+                        // mismatch is counted and the legacy value stays authoritative.
+                        const bool g594Cmp = g594Did && g594DeswzVerifyOn();
+                        for (uint32_t localY = 0u; localY < 32u; ++localY)
                         {
-                            const uint32_t x = px * 64u + localX;
-                            s_basePixels[static_cast<size_t>(glY) * 512u + x] =
-                                GSMem::ReadCT32(
+                            const uint32_t gsY = py * 32u + localY;
+                            const uint32_t glY = 511u - gsY;
+                            for (uint32_t localX = 0u; localX < 64u; ++localX)
+                            {
+                                const uint32_t x = px * 64u + localX;
+                                const uint32_t ref = GSMem::ReadCT32(
                                     g_g144LastVram, 0x2720u, 8u, x, gsY);
+                                const size_t at = static_cast<size_t>(glY) * 512u + x;
+                                if (g594Cmp)
+                                {
+                                    g_g594DeswzChecks.fetch_add(1u, std::memory_order_relaxed);
+                                    if (s_basePixels[at] != ref)
+                                        g_g594DeswzBad.fetch_add(1u, std::memory_order_relaxed);
+                                }
+                                s_basePixels[at] = ref;
+                            }
                         }
+                    }
+                    if (g594Timed)
+                    {
+                        g_g594DeswzNs.fetch_add(static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - g594DeswzT0).count()),
+                            std::memory_order_relaxed);
+                        g_g594DeswzCalls.fetch_add(1u, std::memory_order_relaxed);
                     }
                     if (g326G310On() && !g326ForceColdOn())
                     {
@@ -952,27 +1460,79 @@ static bool g310EnsureCurrent()
 {
     if (!g310On())
         return false;
+    const bool g594 = g594CensusOn();
+    if (g594)
+    {
+        const uint64_t n594 = g_g594Calls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if ((n594 % 512u) == 0u)
+            g594Report();
+    }
     if (g_g310Frozen)
+    {
+        if (g594)
+            g_g594Frozen.fetch_add(1u, std::memory_order_relaxed);
         return g310FrozenUsable();
+    }
     std::array<G310DesiredPage, 128> desired{};
     int seedTi = -1;
-    const auto g324DesiredT0 = g_g324ActiveDiag != nullptr
+    const auto g324DesiredT0 = (g_g324ActiveDiag != nullptr || g594)
         ? std::chrono::steady_clock::now()
         : std::chrono::steady_clock::time_point{};
     const bool desiredOk = g310BuildDesired(desired, seedTi);
+    const auto g594BuildT1 = g594 ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
     if (g_g324ActiveDiag != nullptr)
         g_g324ActiveDiag->desiredCpuNs +=
             g324ElapsedNs(g324DesiredT0, std::chrono::steady_clock::now());
+    if (g594)
+        g_g594BuildNs.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                g594BuildT1 - g324DesiredT0).count()), std::memory_order_relaxed);
     if (!desiredOk)
     {
+        if (g594)
+            g_g594BuildFail.fetch_add(1u, std::memory_order_relaxed);
         g_g310Initialized = false;
         return false;
     }
+    if (g594)
+    {
+        uint64_t owned = 0u;
+        for (const G310DesiredPage &d : desired)
+            if (d.sourceTi >= 0)
+                ++owned;
+        g_g594OwnedPages.fetch_add(owned, std::memory_order_relaxed);
+        uint64_t dirty = 0u;
+        for (uint32_t t = 0u; t < kG248TargetCount; ++t)
+            if (g_g261Res[t].dirty)
+                ++dirty;
+        g_g594DirtyTargets.fetch_add(dirty, std::memory_order_relaxed);
+    }
     if (!g_g310Initialized)
-        return g310Initialize(desired, seedTi);
+    {
+        if (!g594)
+            return g310Initialize(desired, seedTi);
+        g_g594Uninit.fetch_add(1u, std::memory_order_relaxed);
+        const auto initT0 = std::chrono::steady_clock::now();
+        const bool initOk = g310Initialize(desired, seedTi);
+        g_g594InitNs.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - initT0).count()),
+            std::memory_order_relaxed);
+        g_g594Inits.fetch_add(1u, std::memory_order_relaxed);
+        return initOk;
+    }
     // G311: incremental page-delta refresh of the persisted snapshot. On any backend failure it
     // fails closed (g310Invalidate → g_g310Initialized=false → full composite next consumer).
-    if (!g310ApplyDesired(desired))
+    const auto g594ApplyT0 = g594 ? std::chrono::steady_clock::now()
+                                  : std::chrono::steady_clock::time_point{};
+    const bool applyOk = g310ApplyDesired(desired);
+    if (g594)
+        g_g594ApplyNs.fetch_add(static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g594ApplyT0).count()),
+            std::memory_order_relaxed);
+    if (!applyOk)
         return false;
     if (g311VerifyOn())
         g311VerifyIncremental(desired, seedTi);

@@ -2470,6 +2470,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // that stale target is never read by this batch.
     const bool g276Coalesce = g276DisplayRbOn() && g265DisplayTarget(fbp) &&
                               !g261Wave && !g272Wave && !g255Rtt;
+    if (g265DisplayTarget(fbp))
+        g600NoteDisplayBatch(fbp, fbw, rowLo, rowHi, g276Coalesce, g261Wave, g272Wave, g255Rtt,
+                             guestDepth);
+    g600Seq("gpuBatch", static_cast<int>(g_g144List.size()), fbp, rowHi);
     if (g276Coalesce && s_g276Pend.active &&
         (s_g276Pend.fbp != fbp || s_g276Pend.fbw != fbw))
         g276FlushPendingDisplay(0);
@@ -2651,6 +2655,36 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 // oracle at the pack site compares the live FBO against the bytes we still pack.
                 g591CVerifyPend = true;
             }
+        }
+    }
+    // ===== G599 CEILING PROBE (default OFF, knowingly incorrect): force the VRAM->FBO upload =====
+    // The other direction of the same question. G599 refuted the WRITE (deleting 0x139's whole
+    // guest-VRAM publication leaves the sky broken at the control's own speed) and the sky texture's
+    // own bytes are identical in the broken and the fixed arm — so the wrong pixels are in the FBO,
+    // not in guest VRAM. With `cov=0..511` every batch's rows are inside the claimed window, so
+    // `g261ForceNoUpload` fires unconditionally and this target's FBO is NEVER refreshed from VRAM:
+    // any guest write that reached VRAM through a path the residency hooks forgive is invisible to
+    // it forever. This probe forces the refresh. Knowingly incorrect (it can overwrite FBO-only
+    // rows with stale VRAM); it exists to price the staleness, not to ship.
+    //   DC2_G599_FORCEUP=<fbp hex>   e.g. 139, or ffffffff for every target
+    {
+        static const uint32_t s_forceUp = []() -> uint32_t {
+            const char *e = std::getenv("DC2_G599_FORCEUP");
+            return e != nullptr ? static_cast<uint32_t>(std::strtoul(e, nullptr, 16))
+                                : 0xFFFFFFFEu; // sentinel: never matches a real fbp
+        }();
+        if (s_forceUp != 0xFFFFFFFEu && (s_forceUp == 0xFFFFFFFFu || s_forceUp == fbp) &&
+            !s_batch.uploadFb)
+        {
+            s_batch.uploadFb = true;
+            static std::atomic<uint64_t> s_n{0};
+            const uint64_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (n <= 4u || (n % 8192u) == 0u)
+                std::fprintf(stderr,
+                             "[G599:forceup] CEILING PROBE fbp=0x%x n=%llu rows=%d..%d "
+                             "forceNoUpload=%d\n",
+                             fbp, (unsigned long long)n, rowLo, rowHi,
+                             g261ForceNoUpload ? 1 : 0);
         }
     }
     if (s_batch.uploadFb && g345StatOn() && g345FamilyFbp(fbp))
@@ -3162,6 +3196,23 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         fbBlock, GS_PSM_CT32, fbw, 0u,
         static_cast<uint32_t>(rowLo), static_cast<uint32_t>(fbW),
         static_cast<uint32_t>(rowHi - rowLo + 1));
+    // G599 (default OFF): does THIS batch reach the GPU path at all, and does it carry guest depth?
+    // `[G599:zseq]` prints only inside `if (guestDepth)`, so a target whose batches have no depth is
+    // INVISIBLE to it — which is exactly what 0x139 looked like in the MAP-15 defect window. Print
+    // every batch that gets this far, windowed on the script clock.
+    if (g599PubOn() && g599InWindow())
+    {
+        static std::atomic<uint64_t> s_n{0};
+        const uint64_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        static const uint32_t every = g599EnvU32("DC2_G599_FLUSH_EVERY", 40u);
+        if (n <= 24u || (n % every) == 0u)
+            std::fprintf(stderr,
+                         "[G599:flush] sf=%u n=%llu fbp=0x%x fbw=%u rows=%d..%d guestDepth=%u "
+                         "zbp=0x%x zpsm=%u drows=%d..%d entries=%zu\n",
+                         g_dc2ScriptFrame.load(std::memory_order_relaxed),
+                         (unsigned long long)n, fbp, fbw, rowLo, rowHi, guestDepth ? 1u : 0u,
+                         guestZbpPage, guestZpsm, depthRowLo, depthRowHi, g_g144List.size());
+    }
     if (guestDepth)
     {
         if (guestZpsm != 0x1u || depthRowHi < depthRowLo)
@@ -3344,6 +3395,27 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             }
             // G534 sequence probe (default OFF): one line per guest-depth wave — which colour
             // target, which depth key, whether this wave uploads or rides the retained texture.
+            // G599: the same line, but windowed on the SCRIPT clock instead of a first-60 counter.
+            // The MAP-15 sky defect occupies 480 scriptFrames ~40 s into a route, so G534's global
+            // window contains none of it (G598 §6's law). Prints the depth key's SHARING as well:
+            // g404SharedZScope requires fbw==8, so the display targets and the WIDE 0x139 share one
+            // authority while the NARROW 0x139 batches do not — and 0x139 flips width every frame.
+            if (g599PubOn() && g599InWindow())
+            {
+                static std::atomic<uint64_t> s_n{0};
+                const uint64_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                static const uint32_t every = g599EnvU32("DC2_G599_ZSEQ_EVERY", 40u);
+                if (n <= 24u || (n % every) == 0u)
+                    std::fprintf(stderr,
+                                 "[G599:zseq] sf=%u n=%llu fbp=%03x fbw=%u key=%llx priv=%u "
+                                 "full=%u skip=%u pend=%u eligible=%u rows=%d..%d drows=%d..%d\n",
+                                 g_dc2ScriptFrame.load(std::memory_order_relaxed),
+                                 (unsigned long long)n, fbp, fbw,
+                                 (unsigned long long)depthKey, g411PrivateDepth ? 1u : 0u,
+                                 fullInit ? 1u : 0u, g274SkipUpload ? 1u : 0u,
+                                 g278PendingSameKey ? 1u : 0u, g278OwnerEligible ? 1u : 0u,
+                                 rowLo, rowHi, depthRowLo, depthRowHi);
+            }
             static const bool s_g534ZSeq = envFlagEnabled("DC2_G534_ZSEQ");
             if (s_g534ZSeq)
             {
@@ -3667,21 +3739,42 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 const bool triType =
                     e.prim.type == GS_PRIM_TRIANGLE ||
                     e.prim.type == GS_PRIM_TRISTRIP;
-                if (st.texKey == 0u || st.skip || e.ctx.frame.fbp != 0x139u ||
-                    !e.prim.tme || e.prim.fst || !triType || !st.bilinear ||
-                    e.ctx.tex0.psm != GS_PSM_T8 || !g310T8Base(e.ctx.tex0.tbp0) ||
-                    e.ctx.tex0.tbw != 2u || st.texW != 128 || st.texH != 128)
+                // G598: the shipped admission is the 0x139-destination / four-base whitelist below.
+                // With DC2_G598_T8ANY=1 the SOURCE is resolved from the texture base instead, which
+                // is what admits the MAP-15 sky (`fbp=0x13b` sampling `tbp=0x2720`, 0x139's own
+                // base) — see rasterizer_t8_map_resolver.inc. Default-off arm keeps the original
+                // expression byte-identical: `g598T8AnyOn()` is a cached static bool, and the
+                // legacy predicate is evaluated first and short-circuits.
+                const bool g598Any = g598T8AnyOn();
+                const bool g310Shape =
+                    st.texKey != 0u && !st.skip && e.ctx.frame.fbp == 0x139u &&
+                    e.prim.tme && !e.prim.fst && triType && st.bilinear &&
+                    e.ctx.tex0.psm == GS_PSM_T8 && g310T8Base(e.ctx.tex0.tbp0) &&
+                    e.ctx.tex0.tbw == 2u && st.texW == 128 && st.texH == 128;
+                if (!g310Shape && !g598Any)
                     continue;
                 const uint64_t viewKey = g281ViewKey(st.texKey);
-                if (s_g310BuiltViews.count(viewKey) != 0u)
+                if (g310Shape && s_g310BuiltViews.count(viewKey) != 0u)
                 {
                     s_g281ViewKey[i] = viewKey;
                     s_g281ViewSrc[i] = static_cast<int8_t>(g248TargetIndex(0x139u));
                     continue;
                 }
-                const int srcTi = g310TryT8Entry(0x139u, e, st);
+                // The legacy tuple keeps its own resolver (its `srcTi` is 0x139 by construction and
+                // its fbw/fbW conjuncts are part of that evidence); anything else goes through the
+                // general source lookup. Both end in g281BuildT8Map's fail-closed page proof.
+                const int srcTi = g310Shape ? g310TryT8Entry(0x139u, e, st)
+                                            : g598TryT8EntryAny(e, st);
                 if (srcTi < 0)
                     continue;
+                // A view already built this flush for this texture key is reused whatever admitted
+                // it — the snapshot is a pure function of (producer FBO, byte map, CLUT).
+                if (s_g310BuiltViews.count(viewKey) != 0u)
+                {
+                    s_g281ViewKey[i] = viewKey;
+                    s_g281ViewSrc[i] = static_cast<int8_t>(srcTi);
+                    continue;
+                }
                 const bool syncOk =
                     g242SyncOverlappingDepth(vram, e.ctx.tex0.cbp, 1u, GS_PSM_CT32,
                                              0u, 0u, 64u, 32u);
@@ -3879,7 +3972,18 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                           : std::chrono::steady_clock::time_point{};
         if (s_g323Census)
             g323BindEntries += static_cast<uint64_t>(g_g144List.size());
-        for (size_t i = 0; i < g_g144List.size(); ++i)
+        // ===== G599 CEILING PROBE (default OFF, DC2_G599_NOBIND=1): no entry may sample an FBO ====
+        // The MAP-15 sky band is painted by a FULL-SCREEN CT32 tristrip on the display target that
+        // samples `tbp=0x2720` — the WIDE 0x139 surface — not by the PSMT8 draw G598 investigated.
+        // Every path below can answer such a read from the resident FBO instead of guest VRAM. This
+        // arm publishes every dirty target first and then denies all of them, so every texture read
+        // in this flush goes through the ordinary VRAM decode. It keeps the GPU render (unlike
+        // DC2_G400_NO_RESIDENT_139, which also halves the frame rate); it is the FBO-SOURCE half of
+        // residency, isolated.
+        static const bool s_g599NoBind = envFlagEnabled("DC2_G599_NOBIND");
+        if (s_g599NoBind)
+            g261MaterializeAllDirty(kG261MatTexAlias);
+        for (size_t i = 0; i < g_g144List.size() && !s_g599NoBind; ++i)
         {
             const G178EntryState &st = s_states[i];
             const G144Entry &e = g_g144List[i];
@@ -3958,6 +4062,21 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             if ((g281KnownTuple || g570KnownTuple) && e.ctx.tex0.psm == GS_PSM_T8)
             {
                 const int srcTi = g281TryEntry(fbp, e, st);
+                if (srcTi >= 0)
+                {
+                    s_g281ViewKey[i] = g281ViewKey(st.texKey);
+                    s_g281ViewSrc[i] = static_cast<int8_t>(srcTi);
+                    continue;
+                }
+            }
+            // G598: the same consumer edge for a tuple that is in NO list. The MAP-15 sky arrives
+            // here as an FST SPRITE reading `tbp=0x2720` — target 0x139's own base — and the two
+            // literals above are the only reason it falls through to the legacy VRAM decode of a
+            // surface whose live pixels are in the FBO. Resolve the source instead; the byte-map
+            // and CLUT ownership proofs inside are the shipped ones, unchanged.
+            else if (g598T8AnyOn() && e.ctx.tex0.psm == GS_PSM_T8)
+            {
+                const int srcTi = g598TryT8EntryAny(e, st);
                 if (srcTi >= 0)
                 {
                     s_g281ViewKey[i] = g281ViewKey(st.texKey);
@@ -4062,9 +4181,49 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             for (uint32_t t = 0; t < kG248TargetCount; ++t)
             {
                 G261Res &r = g_g261Res[t];
+                const uint32_t tBlock = framePageBaseToBlock(kG261Fbp[t]);
+                // ===== G599 census (default OFF): EVERY CONJUNCT of this bind, for every read
+                // whose texture base IS a resident target's base. The MAP-15 sky band is painted by
+                // a FULL-SCREEN CT32 tristrip on the display target sampling tbp=0x2720 — the wide
+                // 0x139 surface — not by the PSMT8 draw G598 investigated. DC2_G599_NOBIND=1 (deny
+                // every FBO source) breaks that band on MORE frames than the default and with the
+                // SAME pixels, so outside the defect window this bind is what keeps the sky right.
+                // Count why it declines rather than guessing (G590), windowed on the script clock
+                // because the consumer is a tiny fraction of the traffic (G598 §6).
+                if (g599PubOn() && e.ctx.tex0.tbp0 == tBlock && g599InWindow())
+                {
+                    static std::atomic<uint64_t> s_n{0};
+                    const uint64_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    static const uint32_t every = g599EnvU32("DC2_G599_BIND_EVERY", 200u);
+                    if (n <= 16u || (n % every) == 0u)
+                    {
+                        int u0 = INT32_MAX, u1 = INT32_MIN, v0 = INT32_MAX, v1 = INT32_MIN;
+                        const int nv = (e.prim.type == GS_PRIM_SPRITE) ? 2 : 3;
+                        for (int k = 0; k < nv; ++k)
+                        {
+                            const int uu = static_cast<int>(e.v[k].u >> 4);
+                            const int vv = static_cast<int>(e.v[k].v >> 4);
+                            u0 = std::min(u0, uu); u1 = std::max(u1, uu);
+                            v0 = std::min(v0, vv); v1 = std::max(v1, vv);
+                        }
+                        std::fprintf(stderr,
+                                     "[G599:bind] sf=%u n=%llu dst=0x%x tgt=0x%x tbp=0x%x psm=%u "
+                                     "tbw=%u prim=%u fst=%u bilin=%u tex=%dx%d uv=%d..%d,%d..%d "
+                                     "| dirty=%u fbw=%u fbW=%d cov=%d..%d dirtyRows=%d..%d "
+                                     "psmOk=%u tbwOk=%u\n",
+                                     g_dc2ScriptFrame.load(std::memory_order_relaxed),
+                                     static_cast<unsigned long long>(n), fbp, kG261Fbp[t],
+                                     e.ctx.tex0.tbp0, static_cast<unsigned>(e.ctx.tex0.psm),
+                                     e.ctx.tex0.tbw, e.prim.type, e.prim.fst ? 1u : 0u,
+                                     st.bilinear ? 1u : 0u, st.texW, st.texH, u0, u1, v0, v1,
+                                     r.dirty ? 1u : 0u, r.fbw, r.fbW, r.covLo, r.covHi,
+                                     r.dirtyLo, r.dirtyHi,
+                                     e.ctx.tex0.psm == GS_PSM_CT32 ? 1u : 0u,
+                                     e.ctx.tex0.tbw == r.fbw ? 1u : 0u);
+                    }
+                }
                 if (!r.dirty)
                     continue;
-                const uint32_t tBlock = framePageBaseToBlock(kG261Fbp[t]);
                 bool bind = false;
                 if (e.ctx.tex0.psm == GS_PSM_CT32 && e.ctx.tex0.tbp0 == tBlock &&
                     e.ctx.tex0.tbw == r.fbw && e.prim.fst &&
@@ -4344,6 +4503,145 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     for (size_t i = 0; i < g_g144List.size(); ++i)
     {
         const G178EntryState &st = s_states[i];
+        // G598 (DC2_G598_T8WHY=1): this loop is the only per-entry walk that is NOT inside the
+        // `g261AnyDirty()` pre-pass guard, so it is the one place that can observe an entry the
+        // pre-pass never saw. Report every PSMT8 read whose base is a resident target's base,
+        // together with that target's residency state, so "rejected on shape" and "the pre-pass
+        // never ran for this flush" stop being the same undifferentiated `noSrc` bucket.
+        if ((g598T8WhyOn() || g599PubOn()) && g_g144List[i].ctx.tex0.psm == GS_PSM_T8)
+        {
+            const G144Entry &pe = g_g144List[i];
+            for (uint32_t t = 0; t < kG248TargetCount; ++t)
+            {
+                if (framePageBaseToBlock(kG261Fbp[t]) != pe.ctx.tex0.tbp0)
+                    continue;
+                // ⭐ THE DECIDING DISTRIBUTION, not a sample: can a read-side decoded view help at
+                // all? It can only help while the source is DIRTY (live pixels in the FBO). If
+                // these reads overwhelmingly observe dirty=0, the corruption is already in guest
+                // VRAM when the read happens and no admission change can repair it.
+                if (g598T8WhyOn()) // G599 shares this walk; it must not move G598's denominator
+                {
+                    static std::atomic<uint64_t> s_tot{0}, s_dirty{0}, s_anyDirty{0};
+                    const uint64_t tot = s_tot.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                    if (g_g261Res[t].dirty)
+                        s_dirty.fetch_add(1u, std::memory_order_relaxed);
+                    if (g261AnyDirty())
+                        s_anyDirty.fetch_add(1u, std::memory_order_relaxed);
+                    if ((tot % 200000u) == 0u)
+                        std::fprintf(stderr,
+                                     "[G598:t8why] BASEDIST tgt=0x%x reads=%llu srcDirty=%llu "
+                                     "anyDirty=%llu\n",
+                                     kG261Fbp[t], (unsigned long long)tot,
+                                     (unsigned long long)s_dirty.load(std::memory_order_relaxed),
+                                     (unsigned long long)s_anyDirty.load(std::memory_order_relaxed));
+                }
+                // The MAP-15 sky read is ~0.06% of this traffic, so a global first-N print window
+                // never contains one. Give the consumer under investigation its own window.
+                static std::atomic<uint64_t> s_skyN{0};
+                const bool skyRead = pe.ctx.frame.fbp == 0x13bu;
+                const uint64_t skyN =
+                    skyRead ? s_skyN.fetch_add(1u, std::memory_order_relaxed) : 0u;
+                // ===== G599: WHO WROTE THE BYTES THIS READ OBSERVES? =====
+                // The read side is refuted, so the only remaining question about this consumer is
+                // provenance. G570's per-page trace already records the LAST generation publisher
+                // of every physical page (arm DC2_G570_BUMP_TRACE=1 for the source field); print it
+                // for the pages this texture occupies, plus a content fingerprint so a broken frame
+                // and a clean one can be told apart without a pixel capture. Windowed on the SCRIPT
+                // clock, because the sky read is ~0.06% of the T8 traffic (G598 §6).
+                if (g599PubOn() && g599InWindow())
+                {
+                    static std::atomic<uint64_t> s_whoN{0};
+                    const uint64_t whoN = s_whoN.fetch_add(1u, std::memory_order_relaxed);
+                    static const uint32_t whoEvery = g599EnvU32("DC2_G599_WHO_EVERY", 4000u);
+                    if (skyRead || whoN < 8u || (whoN % whoEvery) == 0u)
+                    {
+                        const uint32_t basePage = pe.ctx.tex0.tbp0 / 32u;
+                        // 128x128 PSMT8 = 16 KB = two 8 KB pages; print both so a partial rewrite
+                        // is visible rather than averaged away.
+                        for (uint32_t k = 0; k < 2u; ++k)
+                        {
+                            const uint32_t page = basePage + k;
+                            if (page >= kG178PageCount || g_g144LastVram == nullptr ||
+                                static_cast<uint64_t>(page) * 8192ull + 8192ull >
+                                    g_g261VramSize)
+                                continue;
+                            const G570BumpTrace &bt = g_g570LastBump[page];
+                            const uint8_t *p =
+                                g_g144LastVram + static_cast<uint64_t>(page) * 8192ull;
+                            uint64_t h = 1469598103934665603ull; // FNV-1a, fingerprint only
+                            for (uint32_t o = 0; o < 8192u; ++o)
+                                h = (h ^ p[o]) * 1099511628211ull;
+                            std::fprintf(stderr,
+                                         "[G599:who] sf=%u %s fbp=0x%x tbp=0x%x page=0x%x "
+                                         "hash=%016llx | lastBump(seq=%llu src=%u:%s bp=0x%x "
+                                         "bw=%u psm=%u rect=%u,%u %ux%u)\n",
+                                         g_dc2ScriptFrame.load(std::memory_order_relaxed),
+                                         skyRead ? "SKY" : "t8", pe.ctx.frame.fbp,
+                                         pe.ctx.tex0.tbp0, page,
+                                         static_cast<unsigned long long>(h),
+                                         static_cast<unsigned long long>(bt.seq), bt.source,
+                                         kG582BumpName[bt.source & 31u], bt.bpBlocks, bt.bw64,
+                                         bt.psm, bt.x, bt.y, bt.w, bt.h);
+                        }
+                    }
+                }
+                static uint64_t s_n = 0u;
+                if (g598T8WhyOn() &&
+                    ((skyRead && skyN < 24u) || s_n++ < 24u || (s_n % 20000u) == 0u))
+                    std::fprintf(stderr,
+                                 "[G598:t8why] BASEHIT n=%llu fbp=0x%x tbp=0x%x prim=%u fst=%u "
+                                 "bilin=%u %dx%d skip=%u | tgt=0x%x dirty=%u rangeValid=%u "
+                                 "fbw=%u fbW=%d cov=%d..%d anyDirty=%u\n",
+                                 (unsigned long long)s_n, pe.ctx.frame.fbp, pe.ctx.tex0.tbp0,
+                                 pe.prim.type, pe.prim.fst ? 1u : 0u, st.bilinear ? 1u : 0u,
+                                 st.texW, st.texH, st.skip ? 1u : 0u, kG261Fbp[t],
+                                 g_g261Res[t].dirty ? 1u : 0u,
+                                 g_g261Res[t].range.valid ? 1u : 0u, g_g261Res[t].fbw,
+                                 g_g261Res[t].fbW, g_g261Res[t].covLo, g_g261Res[t].covHi,
+                                 g261AnyDirty() ? 1u : 0u);
+            }
+        }
+        // ===== G599 census (default OFF): WHICH SOURCE did this read finally get? =====
+        // Every bind path above `continue`s the moment it claims an entry, so a census inside any
+        // one of them is blind to the others (the CT32 composite of tbp=0x2720 never reaches the
+        // per-target loop — G310/G309/G289 take it first). This is the single point where the
+        // decision is final: `s_g261FboSrc[i]` non-zero means the read is answered from an FBO,
+        // zero means it decodes guest VRAM. Report it for every read whose base IS a resident
+        // target's base, windowed on the script clock.
+        if (g599PubOn() && g599InWindow())
+        {
+            for (uint32_t t = 0; t < kG248TargetCount; ++t)
+            {
+                if (framePageBaseToBlock(kG261Fbp[t]) != g_g144List[i].ctx.tex0.tbp0)
+                    continue;
+                static std::atomic<uint64_t> s_n{0};
+                const uint64_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                static const uint32_t every = g599EnvU32("DC2_G599_SRC_EVERY", 500u);
+                if (n <= 16u || (n % every) == 0u)
+                {
+                    const G144Entry &pe = g_g144List[i];
+                    std::fprintf(stderr,
+                                 "[G599:src] sf=%u n=%llu dst=0x%x tgt=0x%x tbp=0x%x psm=%u "
+                                 "tbw=%u prim=%u fst=%u bilin=%u tex=%dx%d skip=%u | src=0x%x "
+                                 "dirty=%u fbw=%u cov=%d..%d\n",
+                                 g_dc2ScriptFrame.load(std::memory_order_relaxed),
+                                 static_cast<unsigned long long>(n), pe.ctx.frame.fbp,
+                                 kG261Fbp[t], pe.ctx.tex0.tbp0,
+                                 static_cast<unsigned>(pe.ctx.tex0.psm), pe.ctx.tex0.tbw,
+                                 pe.prim.type, pe.prim.fst ? 1u : 0u, st.bilinear ? 1u : 0u,
+                                 st.texW, st.texH, st.skip ? 1u : 0u,
+                                 (g261HaveFboSrc && !s_g261FboSrc.empty()) ? s_g261FboSrc[i] : 0u,
+                                 g_g261Res[t].dirty ? 1u : 0u, g_g261Res[t].fbw,
+                                 g_g261Res[t].covLo, g_g261Res[t].covHi);
+                }
+            }
+        }
+        // G600 (default OFF): the same "final source" point, but reported per BIG texture rather
+        // than per resident-target base, because the MAP-15 backdrop turned out to be answered by a
+        // consumer whose base is not a target base at all.
+        g600NoteBigEntry(g_g144List[i], st.texW, st.texH, st.texKey,
+                         (g261HaveFboSrc && !s_g261FboSrc.empty()) ? s_g261FboSrc[i] : 0u,
+                         s_g281ViewKey.empty() ? 0u : s_g281ViewKey[i], st.skip);
         if (g511Census)
             ++g511Entries;
         if (g261HaveFboSrc && s_g261FboSrc[i] != 0u)
@@ -4521,10 +4819,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             envFlagEnabled("DC2_G401_CT24_REDECODE");
         const bool g401ForceDecode =
             s_g401Ct24Redecode && ctx.tex0.psm == GS_PSM_CT24;
-        if (!g401ForceDecode && it != g_g178TexReg.end() && backendHas &&
+        if (!g401ForceDecode && !g600TexPaintOn() && it != g_g178TexReg.end() && backendHas &&
             it->second.genSum == genNow)
         {
             g_g178TexHits.fetch_add(1u, std::memory_order_relaxed);
+            g600NoteTexHit(e, st.texW, st.texH, st.texKey, "gen");
             continue;
         }
         // Gen mismatch (or unknown): DC2 re-uploads texture data every frame, usually byte-
@@ -4601,12 +4900,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // G513: the stamp must have been written by the SAME byte loop that just produced
         // `hashNow`. Without this the paired A/B's arm switch would compare a reference digest
         // against an 8-lane one — always a MISS, and on a collision a stale texture.
-        if (!g401ForceDecode && it != g_g178TexReg.end() && backendHas &&
+        if (!g401ForceDecode && !g600TexPaintOn() && it != g_g178TexReg.end() && backendHas &&
             it->second.hashVar == static_cast<uint8_t>(g513Fast ? 1u : 0u) &&
             it->second.contentHash == hashNow)
         {
             it->second.genSum = genNow;
             g_g178TexHashHits.fetch_add(1u, std::memory_order_relaxed);
+            g600NoteTexHit(e, st.texW, st.texH, st.texKey, "hash");
             continue;
         }
         const auto g511DecT0 = g511Split ? std::chrono::steady_clock::now()
@@ -4617,6 +4917,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         up.h = st.texH;
         up.px.resize(static_cast<size_t>(st.texW) * st.texH);
         g178DecodeWhole(self, gs, vram, ctx, e.texa, e.texclut, st.texW, st.texH, up.px.data());
+        // G600 (default OFF, except DC2_G600_TEXFILL which is a knowingly-incorrect ceiling probe):
+        // dump / mark the texels that are about to be uploaded.
+        g600DumpDecoded(e, st.texW, st.texH, st.texKey, up.px);
         if (g511Split)
         {
             g511DecodeNs += static_cast<uint64_t>(

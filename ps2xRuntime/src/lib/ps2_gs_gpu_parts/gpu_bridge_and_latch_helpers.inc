@@ -106,6 +106,29 @@ namespace
         return s_on;
     }
 
+    // G593 CEILING PROBE (DC2_G593_NOREG=1, DEFAULT-OFF, knowingly INCORRECT OUTPUT).
+    //
+    // Prices the GIF REGISTER-REPLAY layer — the per-descriptor CPU decode a GPU-resident
+    // VU1 -> XGKICK/GIF -> GS front end deletes. On `s05 n=1021..2461` that layer runs
+    // 141,124 PACKED descriptors per frame against 9,700 tags, and `[G147:gif] parserOther`
+    // (= packet - draw - image) prices the whole parse bucket at 9.12 ms/f on the pole thread.
+    //
+    // The probe skips every PACKED descriptor that is NOT a vertex kick, so `vertexKick` still
+    // runs exactly once per XYZ(F)2/XYZ(F)3 and the [G434:inv] workload invariant (kicks/f,
+    // drawKicks/f) is PRESERVED — which is what makes the arms comparable at all (G434's own
+    // rule). Colours, UVs, texture binds and context state are then stale, i.e. the frame is
+    // knowingly wrong; this must never be promoted.
+    //
+    // ⚠️ RUN IT TOGETHER WITH DC2_G434_NO_DRAW=1. With draw submission deleted nothing
+    // downstream can react to the missing state, so (NO_DRAW) - (NO_DRAW + NOREG) is exactly
+    // the register-replay CPU. Alone it also changes which textures decode and which batches
+    // classify, and would over-count.
+    bool g593NoRegOn()
+    {
+        static const bool s_on = (std::getenv("DC2_G593_NOREG") != nullptr);
+        return s_on;
+    }
+
     struct G146PerfScope
     {
         bool on = false;

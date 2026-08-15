@@ -746,6 +746,36 @@ enum G419Lever
     kG591LeverPrivZ = 112,
     kG591LeverColWin = 113,
     kG592LeverPubCons = 114,
+    // G594: the two logical/T8 atlas-refresh levers inside the per-flush FIXED front-end (G593
+    // 6.2 target 1, 2.44 ms/f on `s05`). `g594walk` replaces g310BuildDesired's 128-page x
+    // kG248TargetCount winner walk — up to 1,792 runtime-divisor integer divisions per flush —
+    // with an enumeration of each dirty target's own pages; `g594hash` replaces the byte-serial
+    // 8 KiB guest-page FNV (one dependent 64-bit multiply per BYTE) with four independent chains
+    // over 64-bit words. `g594both` is the promotion gate: the shipped pair against the full
+    // rollback. Both are read once per g310EnsureCurrent call, i.e. at most once per GPU flush
+    // (56.8/frame) against the thousands of operations they gate, so the accessor cannot pollute
+    // the loop it measures (G502). GS worker levers: hold 16.
+    kG594LeverFastWalk = 115,
+    kG594LeverFastHash = 116,
+    // `g594deswz` replaces g310Initialize's 2,048-cross-TU-calls-per-page CT32 deswizzle with a
+    // run-length memcpy plan derived from the shipped addressing function itself.
+    kG594LeverFastDeswz = 118,
+    kG594LeverBoth = 117,
+    // G595: the two levers inside the drawPrimitive+capture layer (G593 layer 2, 5.50 ms/f on
+    // `s05` as re-measured by [G526:split]/tools/g595_draw.py). `g595line` alternates G270's
+    // display-LINE deferral, which deletes the layer's whole `inline` exit — 4.2 primitives a
+    // frame that each force a graph drain plus the ownership/materialize edge, 1.007 ms/f.
+    // `g595note` alternates the state-identity memo in front of g260NoteAppend, whose per-entry
+    // page-range work is 1.369 ms/f and 92.80% redundant. Both are GS-worker levers: hold 16.
+    kG595LeverLineDefer = 119,
+    kG595LeverNoteMemo = 120,
+    kG595LeverBoth = 121,
+    // G596: the table-driven same-format LOCAL->LOCAL transfer body (G593 layer 3, re-priced at
+    // 5.848 ms/f on `s05` by [G432:trxdir]/tools/g596_trx.py, of which the format-aware pixel copy
+    // is 1.354 ms/f at 12.81 ns/px). `g596copy` alternates that body against the legacy per-texel
+    // read/writeTransferPixel pair. It runs on the GS worker inside performLocalToLocalTransfer:
+    // hold 16.
+    kG596LeverFastCopy = 122,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -992,6 +1022,22 @@ static int g419AbLever()
             return static_cast<int>(kG591LeverColWin);
         if (std::strcmp(value, "pubcons") == 0)
             return static_cast<int>(kG592LeverPubCons);
+        if (std::strcmp(value, "g594walk") == 0)
+            return static_cast<int>(kG594LeverFastWalk);
+        if (std::strcmp(value, "g594hash") == 0)
+            return static_cast<int>(kG594LeverFastHash);
+        if (std::strcmp(value, "g594deswz") == 0)
+            return static_cast<int>(kG594LeverFastDeswz);
+        if (std::strcmp(value, "g594both") == 0)
+            return static_cast<int>(kG594LeverBoth);
+        if (std::strcmp(value, "g595line") == 0)
+            return static_cast<int>(kG595LeverLineDefer);
+        if (std::strcmp(value, "g595note") == 0)
+            return static_cast<int>(kG595LeverNoteMemo);
+        if (std::strcmp(value, "g595both") == 0)
+            return static_cast<int>(kG595LeverBoth);
+        if (std::strcmp(value, "g596copy") == 0)
+            return static_cast<int>(kG596LeverFastCopy);
         if (std::strcmp(value, "vu1null") == 0)
             return static_cast<int>(kG541LeverVuNull);
         std::fprintf(stderr,
@@ -1007,7 +1053,8 @@ static int g419AbLever()
                      "peel4|g516disp|fpind|stampind|g517ind|cullcmp|macscan|capinplace|"
                       "l2lskip|flagtail|flaghead|divlower|imgspec|hot0c70|hot0e00|hot30d8|"
                       "hot1be8|hot1c00|hot0900|hot1110|rtttri|bitalias|tri13b|tri13bfast|"
-                      "solidsprite|drainmemo|zwin|vu1null)\n",
+                      "solidsprite|drainmemo|zwin|g595line|g595note|g595both|g596copy|"
+                      "vu1null)\n",
                      value);
         return static_cast<int>(kG419LeverNone);
     }();
@@ -1129,6 +1176,14 @@ static const char *g419AbLeverName(int lever)
     case kG591LeverPrivZ: return "privz";
     case kG591LeverColWin: return "colwin";
     case kG592LeverPubCons: return "pubcons";
+    case kG594LeverFastWalk: return "g594walk";
+    case kG594LeverFastHash: return "g594hash";
+    case kG594LeverFastDeswz: return "g594deswz";
+    case kG594LeverBoth: return "g594both";
+    case kG595LeverLineDefer: return "g595line";
+    case kG595LeverNoteMemo: return "g595note";
+    case kG595LeverBoth: return "g595both";
+    case kG596LeverFastCopy: return "g596copy";
     case kG541LeverVuNull: return "vu1null";
     default: return "none";
     }
@@ -1288,6 +1343,16 @@ static uint64_t g438ArmHoldFrames()
                  sel == kG589LeverDrainMemo || sel == kG590LeverZWin ||
                  sel == kG591LeverPrivZ || sel == kG591LeverColWin ||
                  sel == kG592LeverPubCons ||
+                 // G506's law: a new thread-level arm joins THIS predicate in the SAME edit that
+                 // adds it. All three G594 arms run on the GS worker inside the flush front end.
+                 sel == kG594LeverFastWalk || sel == kG594LeverFastHash ||
+                 sel == kG594LeverFastDeswz || sel == kG594LeverBoth ||
+                 // G506's law again: both G595 arms run on the GS worker inside drawPrimitive.
+                 sel == kG595LeverLineDefer || sel == kG595LeverNoteMemo ||
+                 sel == kG595LeverBoth ||
+                 // G506's law again: the G596 arm runs on the GS worker inside
+                 // GS::performLocalToLocalTransfer.
+                 sel == kG596LeverFastCopy ||
                  sel == kG541LeverVuNull ||
                 sel == kG439LeverCoalesce || sel == kG445LeverEarlyKick ||
                 sel == kG445LeverKickAll || sel == kG447LeverSpinWait || sel == kG447LeverWSpin ||
@@ -2122,6 +2187,113 @@ int g590ZWinArm()
 int g591PrivZArm()
 {
     if (g419AbLever() != static_cast<int>(kG591LeverPrivZ))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G594: the two atlas-refresh arms. Same shape and same global-linkage rule as g590ZWinArm — the
+// atlas part lives inside this TU's anonymous namespace, so these must be GLOBAL definitions it
+// calls by ordinary lookup (the G568 lesson). `g594both` selects both, which is the promotion gate.
+int g594FastWalkArm()
+{
+    const int sel = g419AbLever();
+    if (sel != static_cast<int>(kG594LeverFastWalk) && sel != static_cast<int>(kG594LeverBoth))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g594FastDeswzArm()
+{
+    const int sel = g419AbLever();
+    if (sel != static_cast<int>(kG594LeverFastDeswz) && sel != static_cast<int>(kG594LeverBoth))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g594FastHashArm()
+{
+    const int sel = g419AbLever();
+    if (sel != static_cast<int>(kG594LeverFastHash) && sel != static_cast<int>(kG594LeverBoth))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G595: the two draw/capture-layer arms. Same shape and same GLOBAL-linkage rule as g594*Arm —
+// both are read from rasterizer_command_graph.inc, which this TU includes 91 includes BEFORE this
+// file, so the declarations there sit in that file's global-scope gap (the G568 lesson).
+// `g595both` selects both, which is the promotion gate: exactly the shipped pair against exactly
+// the full rollback.
+int g595LineArm()
+{
+    const int sel = g419AbLever();
+    if (sel != static_cast<int>(kG595LeverLineDefer) && sel != static_cast<int>(kG595LeverBoth))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g595NoteMemoArm()
+{
+    const int sel = g419AbLever();
+    if (sel != static_cast<int>(kG595LeverNoteMemo) && sel != static_cast<int>(kG595LeverBoth))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G596: the table-driven same-format local->local transfer body. Same shape and same GLOBAL-linkage
+// rule as g595*Arm — but this one is read from ps2_gs_gpu.cpp, a DIFFERENT translation unit, so the
+// declaration lives at the top of that file above its first anonymous namespace (the appendix's
+// anon-namespace trap, as done for g508LockSkipArm).
+int g596CopyArm()
+{
+    if (g419AbLever() != static_cast<int>(kG596LeverFastCopy))
         return -1;
     const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
     const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);

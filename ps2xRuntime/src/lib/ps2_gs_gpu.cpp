@@ -1,11 +1,17 @@
 int g473SimdMergeArm();
 // G508: A/B arm for the m_stateMutex lock-skip lever, read once per GIF packet in
-// GS::processGIFPacket. Defined at global scope in g419_ab_instrument.inc (rasterizer TU) — declared
+// GS::processGIFPacket. Defined at global scope in g419_ab_instrument.inc (rasterizer TU) - declared
 // HERE, above every anonymous namespace, or it would bind to an internal-linkage symbol and fail to
 // link (the appendix's anon-namespace trap).
 int g508LockSkipArm();
-// G508: force-recompile marker — .inc edits do not trigger MSBuild (G359). revision: 2
-// G522: `g144L2lLatePin` — the fail-safe replay of the local->local guest-VRAM publication that the
+// G596: A/B arm for the table-driven same-format local->local transfer body, read once per
+// GS::performLocalToLocalTransfer call (~15/frame). Defined at global scope in
+// g419_ab_instrument.inc (rasterizer TU) - declared HERE, above every anonymous namespace, for the
+// same reason g508LockSkipArm is (the appendix's anon-namespace trap).
+int g596CopyArm();
+// G508: force-recompile marker - .inc edits do not trigger MSBuild (G359). revision: 2
+// G596: force-recompile marker for the table-driven l2l copy. revision: 1
+// G522: `g144L2lLatePin` - the fail-safe replay of the local->local guest-VRAM publication that the
 // range barrier skipped when g289CanDeferLocalCopy promised an FBO->FBO blit. Declared with the
 // other g144* externs at the top of gpu_transfers_and_kick.inc, called from
 // GS::performLocalToLocalTransfer the moment g289TryGpuLocalCopy returns false. Defined at global
@@ -20,6 +26,14 @@ int g508LockSkipArm();
 // helpers/display parts so both can use G440LatchScope.
 // g440_latch_profile.inc revision: 3 (merge loop restored to the vectorisable three-pass form)
 // G473: exact SSE2 dual-CRT merge promoted + scalar byte oracle (force recompile v2).
+// G599: DC2_G599_VRAMMAP=<every> — whole-VRAM page-hash map at the presentation latch
+// (gpu_display_and_snapshot.inc), keyed on the SCRIPT clock. The presented image is a VRAM
+// deswizzle read, so every visible pixel is in m_vram at that instant; hashing all 512 pages and
+// diffing two arms localizes a visual defect to its pages without a hypothesis. `g_dc2ScriptFrame`
+// is defined in ps2_memory.cpp and declared HERE, above every anonymous namespace, or it would bind
+// to an internal-linkage symbol and fail to link (the appendix's anon-namespace trap). revision: 1
+#include <atomic>
+extern std::atomic<uint32_t> g_dc2ScriptFrame;
 #include "ps2_gs_gpu_parts/g440_latch_profile.inc"
 #include "ps2_gs_gpu_parts/gpu_bridge_and_latch_helpers.inc"
 // G432: TRXDIR cost census (DC2_G432_CENSUS=1, behaviour-pure). Must precede
@@ -32,8 +46,14 @@ int g508LockSkipArm();
 // G424: run-based host->local IMAGE upload writer, PROMOTED default-on
 // (-2.45 ms/f, -4.69%); kill DC2_G424_NO_FAST_IMAGE=1.
 // Must precede gpu_transfers_and_kick.inc, which calls into it from GS::processImageData.
-// g424_fast_image_upload.inc revision: 4 (G359 .inc rebuild marker — touch on every edit)
+// g424_fast_image_upload.inc revision: 4 (G359 .inc rebuild marker - touch on every edit)
 #include "ps2_gs_gpu_parts/g424_fast_image_upload.inc"
+// G596: table-driven same-format LOCAL->LOCAL transfer body (rollback DC2_G596_NO_FASTCOPY=1;
+// bring-up DC2_G596_FASTCOPY=1 is a no-op now the body is default-ON). Must precede
+// gpu_transfers_and_kick.inc, which calls it from GS::performLocalToLocalTransfer's format-aware
+// branch.
+// g596_fast_local_copy.inc revision: 3 (BYTE oracle replaces the address oracle; G359 marker)
+#include "ps2_gs_gpu_parts/g596_fast_local_copy.inc"
 #include "ps2_gs_gpu_parts/gpu_transfers_and_kick.inc"
 // G446: env-read census hook in envFlagEnabled (force recompile v1).
 // G446: cache DC2_DUMP_FONT at the T4HH upload site (force recompile v2).

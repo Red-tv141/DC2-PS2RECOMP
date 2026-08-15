@@ -1,3 +1,26 @@
+// ===== G599: the 512-TEXEL-WIDE PSMT8 VIEW (default OFF, DC2_G599_T8WIDE=1) =====
+// `texW > 256` rejects the consumer that actually paints the MAP-15 sky band. `[G599:src]` — the
+// census taken at the one point where a read's source is final — shows the display targets
+// (dst=0x0/0x68) sampling `tbp=0x2720` as **PSMT8 512x512 with tbw=8**, 475 reads in the window,
+// every one of them `src=0x0` (guest VRAM) while the CT32 reads of the SAME base are all served
+// from an FBO (`src=0xfffffff5`). The 256 cap is bring-up narrowing from the tuples G281 happened
+// to measure — the byte map below proves per texel that the page is in range, page-aligned, inside
+// covLo..covHi and owned by no other dirty target, and that proof does not care how wide the view
+// is. The packing already carries 9 bits of source X and 9 of GL-Y, so a 512-wide CT32 source is
+// representable without any format change.
+//
+// Default-OFF until it is gated; `DC2_G599_NO_T8WIDE=1` is reserved as the rollback if promoted.
+static bool g599T8WideOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G599_NO_T8WIDE") &&
+                           envFlagEnabled("DC2_G599_T8WIDE");
+    return on;
+}
+static int g599T8MaxW()
+{
+    return g599T8WideOn() ? 512 : 256;
+}
+
 // Build the exact per-texel source map for the measured PSMT8 views. Each RGBA8 map texel packs:
 // R=src X low byte, G=src GL-Y low byte, B.bit0=GL-Y bit8, B.bits1..2=byte lane,
 // B.bit3=src X bit8. The source is restricted to one dirty CT32 FBO, and every physical page
@@ -7,7 +30,7 @@ static bool g281BuildT8MapCold(const G144Entry &e, int srcTi, int texW, int texH
 {
     static const G281Ct32Inverse s_inv;
     if (!s_inv.ok || srcTi < 0 || srcTi >= static_cast<int>(kG248TargetCount) ||
-        texW <= 0 || texH <= 0 || texW > 256 || texH > 512)
+        texW <= 0 || texH <= 0 || texW > g599T8MaxW() || texH > 512)
         return false;
     const G261Res &src = g_g261Res[srcTi];
     if (!src.dirty || !src.range.valid || src.fbw == 0u || src.fbW <= 0 || src.fbW > 512)
@@ -15,6 +38,15 @@ static bool g281BuildT8MapCold(const G144Entry &e, int srcTi, int texW, int texH
     const uint32_t srcBase = framePageBaseToBlock(kG261Fbp[srcTi]);
     const uint32_t pageBwT8 = std::max<uint32_t>(1u, e.ctx.tex0.tbw >> 1u);
     out.resize(static_cast<size_t>(texW) * texH);
+    // ⭐ G599: the page conjuncts (range, alignment, foreign dirty owner) depend only on the PAGE,
+    // never on the texel, and this walk visits at most 32 distinct pages — so the shipped per-texel
+    // form re-ran a 14-target ownership walk ~8,000 times per page. At the 128x128 views it was
+    // built for that is invisible; at the 512x512 view G599 needs it is 262,144 iterations and the
+    // frame collapses to 935 ms. Memoize the ACCEPT verdict per page. Exact: the same conjuncts in
+    // the same order and the same fail-closed direction — a rejected page still returns false
+    // immediately, so only accepts are ever cached.
+    constexpr uint32_t kG599PageMemo = 256u;
+    uint8_t pageOk[kG599PageMemo] = {};
     for (int vv = 0; vv < texH; ++vv)
         for (int uu = 0; uu < texW; ++uu)
         {
@@ -22,18 +54,25 @@ static bool g281BuildT8MapCold(const G144Entry &e, int srcTi, int texW, int texH
                 e.ctx.tex0.tbp0, pageBwT8,
                 static_cast<uint32_t>(uu), static_cast<uint32_t>(vv));
             const uint32_t pageBlock = (off >> 13u) << 5u;
-            const G144BlockRange page{pageBlock, pageBlock + 31u, true};
-            if (page.last > 0x3FFFu || page.first < src.range.first ||
-                page.last > src.range.last || pageBlock < srcBase ||
-                ((pageBlock - srcBase) & 31u) != 0u)
-                return false;
-            for (uint32_t t = 0; t < kG248TargetCount; ++t)
+            const uint32_t memoIdx = pageBlock >= srcBase ? ((pageBlock - srcBase) >> 5u)
+                                                          : kG599PageMemo;
+            if (memoIdx >= kG599PageMemo || pageOk[memoIdx] == 0u)
             {
-                if (static_cast<int>(t) == srcTi || !g_g261Res[t].dirty)
-                    continue;
-                if (!g_g261Res[t].range.valid ||
-                    g280DirtyTargetOwnsPage(static_cast<int>(t), pageBlock))
+                const G144BlockRange page{pageBlock, pageBlock + 31u, true};
+                if (page.last > 0x3FFFu || page.first < src.range.first ||
+                    page.last > src.range.last || pageBlock < srcBase ||
+                    ((pageBlock - srcBase) & 31u) != 0u)
                     return false;
+                for (uint32_t t = 0; t < kG248TargetCount; ++t)
+                {
+                    if (static_cast<int>(t) == srcTi || !g_g261Res[t].dirty)
+                        continue;
+                    if (!g_g261Res[t].range.valid ||
+                        g280DirtyTargetOwnsPage(static_cast<int>(t), pageBlock))
+                        return false;
+                }
+                if (memoIdx < kG599PageMemo)
+                    pageOk[memoIdx] = 1u;
             }
 
             const uint32_t pageOff = (pageBlock - srcBase) >> 5u;
@@ -317,6 +356,213 @@ static int g281TryEntry(uint32_t batchFbp, const G144Entry &e,
         return -1;
     }
     return srcTi;
+}
+
+// ===== G598: a PSMT8 read of ANY dirty resident target's window, not four hardcoded bases =====
+//
+// ⛔ THE BUG THIS FIXES. A PSMT8 texture read whose base lies inside a GPU-resident target's VRAM
+// window must be served by G281's decoded view, because the target's live pixels are in the FBO and
+// guest VRAM holds only what the last materialize left there. Whether that read is served was
+// decided by THREE HARDCODED TUPLE LISTS:
+//
+//   g310TryT8Entry   batchFbp==0x139 && tbp0 in {0x3420,0x3460,0x34a0,0x34e0} && tbw==2 && 128x128
+//   g281TryEntry     batchFbp==0x143 && tbp0==0x2820 && tbw==2 && 128x128        (SPRITE/FST)
+//                 or batchFbp==0x13c && tbp0==0x2760 && tbw==1 && 64x64          (SPRITE/FST)
+//
+// The MAP-15 cutscene sky is a FOURTH measured tuple that is in none of them: a TRIANGLE-family
+// read of **`tbp0=0x2720`** — which is `framePageBaseToBlock(0x139)`, target 0x139's OWN BASE —
+// from a batch whose destination is **`fbp=0x13b`**. G598 proved it (identical guest packet stream
+// in both arms, `fbp=0x13b tbp=0x2720 psm=19` = 14,352 vertices with and without residency; the
+// sky breaks only when 0x139 is resident). It fell through every admission and took the legacy
+// VRAM decode, which read the stale mirror — a whole stretched stone texture where the sky belongs.
+//
+// ⭐ THE LISTS ARE NOT THE SAFETY PROPERTY. `g281BuildT8MapCold` already proves, per sampled texel,
+// that the page is inside the source's range, page-aligned to its base, in `covLo..covHi`, and
+// owned by NO OTHER dirty target — and `g281TryEntry`/`g310TryT8Entry` separately prove the CLUT is
+// still guest-owned. The tuple lists are bring-up narrowing on top of a proof that is already
+// general and already fail-closed. Adding a fourth literal would be a per-screen fix for a defect
+// whose whole shape is "the list has no entry for me"; this resolves the SOURCE instead and lets
+// the existing proof decide, so the next texture that lands in a resident window is served too.
+//
+//   DC2_G598_T8ANY=1     arm (default OFF during bring-up; flip to default-ON at promotion)
+//   DC2_G598_NO_T8ANY=1  rollback once promoted
+//   DC2_G598_T8WHY=1     census: population + per-conjunct rejections + the observed tuples
+static bool g598T8AnyOn()
+{
+    static const bool s_on = []() {
+        if (envFlagEnabled("DC2_G598_NO_T8ANY") || envFlagDisabled("DC2_G598_T8ANY"))
+            return false;
+        return envFlagEnabled("DC2_G598_T8ANY");
+    }();
+    return s_on && g261WaveOn();
+}
+
+static bool g598T8WhyOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G598_T8WHY");
+    return s_on;
+}
+
+static std::atomic<uint64_t> g_g598T8Seen{0}, g_g598T8Src{0}, g_g598T8Admit{0},
+    g_g598T8RejShape{0}, g_g598T8RejNoSrc{0}, g_g598T8RejClut{0}, g_g598T8RejMap{0},
+    g_g598T8Ambiguous{0};
+
+// Which dirty resident target's window does this PSMT8 texture base live in?
+// Deterministic by construction: an EXACT base match wins (the sky's `tbp0 == 0x2720` is precisely
+// `framePageBaseToBlock(0x139)`), otherwise containment must be UNIQUE. Two dirty targets claiming
+// the same base is exactly the multi-owner case G304 has refuted six skip levers on, so it fails
+// closed to the materialize path rather than guessing an owner.
+static int g598FindT8Source(uint32_t tbp0)
+{
+    int exact = -1, contain = -1, containN = 0;
+    for (uint32_t t = 0; t < kG248TargetCount; ++t)
+    {
+        const G261Res &r = g_g261Res[t];
+        if (!r.dirty || !r.range.valid || r.fbw == 0u || r.fbW <= 0)
+            continue;
+        const uint32_t base = framePageBaseToBlock(kG261Fbp[t]);
+        if (tbp0 == base)
+        {
+            if (exact >= 0)
+                return -1; // two dirty targets share a base: fail closed
+            exact = static_cast<int>(t);
+            continue;
+        }
+        if (tbp0 > base && tbp0 <= r.range.last && ((tbp0 - base) & 31u) == 0u)
+        {
+            contain = static_cast<int>(t);
+            ++containN;
+        }
+    }
+    if (exact >= 0)
+        return exact;
+    if (containN > 1)
+    {
+        g_g598T8Ambiguous.fetch_add(1u, std::memory_order_relaxed);
+        return -1;
+    }
+    return contain;
+}
+
+// Triangle-family twin of g310TryT8Entry with the destination/base whitelist replaced by the source
+// lookup above. Every remaining conjunct is one the shipped code already applies, in the same order,
+// so a rejection here is a rejection the default path would also have made.
+static int g598TryT8EntryAny(const G144Entry &e, const G178EntryState &st)
+{
+    // ⭐ Every reject counter is gated on the CENSUS flag, not on the lever. The shape reject fires
+    // once per entry per flush on a ~141 k-descriptor pole thread; an unconditional atomic there
+    // would be a standing tax the moment this promotes to default-ON (G593's lesson, in the
+    // instrument's own file rather than the hot loop's).
+    const bool why = g598T8WhyOn();
+    // ⭐⭐ THE MEASURED GAP IS A **PRIM SHAPE**, NOT AN ADDRESS. The MAP-15 sky is
+    // `fbp=0x13b tbp=0x2720 psm=T8 TRISTRIP fst=1` (tools/g598_tbp.py). Every shipped admission is
+    // one of two disjoint shapes and it matches NEITHER:
+    //     g310TryT8Entry : triangle family AND **!fst**   (STQ triangles)
+    //     g281TryEntry   : **fst** AND prim == SPRITE     (UV sprites)
+    // An FST TRIANGLE falls between them. FST is a TEXTURE-COORDINATE space (UV vs STQ/perspective)
+    // and cannot bear on whether a TEXEL SNAPSHOT is correct: g281BuildT8Map derives its byte map
+    // from tex0.tbp0/tbw and the TEX0 TW/TH dimensions and never reads a coordinate. So the
+    // conjunct is bring-up narrowing from the tuples that happened to be measured, and dropping it
+    // is not a relaxation of any safety property — the page-ownership proof below is untouched.
+    // TRIFAN is admitted for the same reason: it is the third member of the same family.
+    //
+    // ⭐⭐⭐ …AND THE PRIM TYPE IS NOT A SAFETY PROPERTY EITHER. `[G598:t8why] BASEHIT` reports the
+    // MAP-15 sky entry as `prim=6` (SPRITE) `fst=1` — the GIF stream's PRIM register said TRISTRIP,
+    // but the entry the renderer admits is a SPRITE. It therefore never reaches the triangle
+    // pre-pass at all; it reaches the SPRITE site, whose `g281TryEntry` rejects it on the
+    // {0x143<-0x2820, 0x13c<-0x2760} tuple list. Both families are admitted here, and the
+    // byte-map/CLUT ownership proof is what decides.
+    const bool shapeOk =
+        e.prim.type == GS_PRIM_TRIANGLE || e.prim.type == GS_PRIM_TRISTRIP ||
+        e.prim.type == GS_PRIM_TRIFAN || e.prim.type == GS_PRIM_SPRITE;
+    if (st.texKey == 0u || st.skip || !e.prim.tme || !shapeOk ||
+        !st.bilinear || e.ctx.tex0.psm != GS_PSM_T8 ||
+        st.texW <= 0 || st.texH <= 0 || st.texW > g599T8MaxW() || st.texH > 512)
+    {
+        // Report a T8 entry that HAS a resident source but was refused on shape — the line that
+        // names the next gap instead of leaving it as an unexplained `rej(shape=)` bucket.
+        if (why && e.ctx.tex0.psm == GS_PSM_T8 &&
+            g598FindT8Source(e.ctx.tex0.tbp0) >= 0)
+        {
+            const uint64_t n =
+                g_g598T8RejShape.fetch_add(1u, std::memory_order_relaxed);
+            if (n < 16u)
+                std::fprintf(stderr,
+                             "[G598:t8why] REJ-SHAPE fbp=0x%x tbp=0x%x prim=%u fst=%u tme=%u "
+                             "bilin=%u %dx%d skip=%u key=%u\n",
+                             e.ctx.frame.fbp, e.ctx.tex0.tbp0, e.prim.type,
+                             e.prim.fst ? 1u : 0u, e.prim.tme ? 1u : 0u,
+                             st.bilinear ? 1u : 0u, st.texW, st.texH,
+                             st.skip ? 1u : 0u, st.texKey != 0u ? 1u : 0u);
+        }
+        else if (why)
+            g_g598T8RejShape.fetch_add(1u, std::memory_order_relaxed);
+        return -1;
+    }
+    if (why)
+        g_g598T8Seen.fetch_add(1u, std::memory_order_relaxed);
+    const int srcTi = g598FindT8Source(e.ctx.tex0.tbp0);
+    if (srcTi < 0)
+    {
+        if (why)
+            g_g598T8RejNoSrc.fetch_add(1u, std::memory_order_relaxed);
+        return -1;
+    }
+    if (why)
+        g_g598T8Src.fetch_add(1u, std::memory_order_relaxed);
+    // CLUT must still be guest-authoritative — identical test to g310TryT8Entry.
+    const G144BlockRange clut = g144ClutRange(e);
+    if (!clut.valid)
+    {
+        if (why)
+            g_g598T8RejClut.fetch_add(1u, std::memory_order_relaxed);
+        return -1;
+    }
+    for (uint32_t t = 0; t < kG248TargetCount; ++t)
+        if (g_g261Res[t].dirty &&
+            (!g_g261Res[t].range.valid ||
+             g144RangeOverlaps(clut, g_g261Res[t].range)))
+        {
+            if (why)
+                g_g598T8RejClut.fetch_add(1u, std::memory_order_relaxed);
+            return -1;
+        }
+    // The real safety property: exact byte map with single-owner pages, fail-closed.
+    static std::vector<uint32_t> s_probeMap;
+    if (!g281BuildT8Map(e, srcTi, st.texW, st.texH, s_probeMap))
+    {
+        if (why)
+            g_g598T8RejMap.fetch_add(1u, std::memory_order_relaxed);
+        return -1;
+    }
+    if (g598T8WhyOn())
+    {
+        const uint64_t n = g_g598T8Admit.load(std::memory_order_relaxed);
+        if (n < 24u || (n % 4096u) == 0u)
+            std::fprintf(stderr,
+                         "[G598:t8why] ADMIT fbp=0x%x tbp=0x%x tbw=%u psm=%u %dx%d src=%d "
+                         "srcFbp=0x%x fbw=%u cov=%d..%d\n",
+                         e.ctx.frame.fbp, e.ctx.tex0.tbp0, e.ctx.tex0.tbw, e.ctx.tex0.psm,
+                         st.texW, st.texH, srcTi, kG261Fbp[srcTi],
+                         g_g261Res[srcTi].fbw, g_g261Res[srcTi].covLo, g_g261Res[srcTi].covHi);
+    }
+    g_g598T8Admit.fetch_add(1u, std::memory_order_relaxed);
+    return srcTi;
+}
+
+static void g598T8Report()
+{
+    if (!g598T8WhyOn() && !g598T8AnyOn())
+        return;
+    const auto v = [](const std::atomic<uint64_t> &a) {
+        return (unsigned long long)a.load(std::memory_order_relaxed);
+    };
+    std::fprintf(stderr,
+                 "[G598:t8] shaped=%llu haveSrc=%llu admit=%llu "
+                 "rej(shape=%llu noSrc=%llu clut=%llu map=%llu) ambiguousSrc=%llu\n",
+                 v(g_g598T8Seen), v(g_g598T8Src), v(g_g598T8Admit),
+                 v(g_g598T8RejShape), v(g_g598T8RejNoSrc), v(g_g598T8RejClut),
+                 v(g_g598T8RejMap), v(g_g598T8Ambiguous));
 }
 
 static bool g280VerifyOn()

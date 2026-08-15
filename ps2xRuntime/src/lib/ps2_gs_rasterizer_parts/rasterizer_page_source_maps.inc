@@ -258,6 +258,7 @@ static void g310Report()
         (unsigned long long)g_g310T8RejShape.load(std::memory_order_relaxed),
         (unsigned long long)g_g310T8RejPage.load(std::memory_order_relaxed),
         (unsigned long long)g_g310T8RejClut.load(std::memory_order_relaxed));
+    g598T8Report();
     g311Report();
 }
 

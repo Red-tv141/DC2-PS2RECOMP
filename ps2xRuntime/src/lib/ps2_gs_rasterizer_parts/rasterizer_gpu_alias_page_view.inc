@@ -494,6 +494,9 @@ static bool g311On();
 static bool g311CensusOn();
 static bool g311VerifyOn();
 static void g311Report();
+// G598: defined in rasterizer_t8_map_resolver.inc, which is included AFTER
+// rasterizer_page_source_maps.inc where g310Report() calls it.
+static void g598T8Report();
 struct G310BatchFreeze
 {
     bool active = false;
@@ -1494,8 +1497,28 @@ static void g266Report()
 // of the page-ownership guard).
 static void g536SnapshotPageGens(G261Res &r, uint32_t fbp);
 
+// ===== G597: is the guard's ANCHOR destroyed between the hazard and the guard? =====
+// G597's first probe refuted the fbw-flip hypothesis: `[G597:own]` reads `ran=calls` with EVERY
+// conjunct passing, and the walk still finds 0.07% of pages moved. So the guard is not disarmed —
+// its BASELINE is stale-free, i.e. re-anchored too late. `g261Materialize` calls `g264FlushMirror`
+// BEFORE the readback, and that function ends in `g261UpdateWindow`, which re-snapshots ALL 128
+// pages even though the mirror only patched `patchLo..patchHi`. Every guest write elsewhere in the
+// window is forgiven, moments before `g536CollectGuestOwnedPages` asks about exactly those pages.
+// This counts re-anchors that land inside a materialize BEFORE its publication.
+static bool g597OwnChkOn();                 // defined with the rest of the probe, below
+static bool g597ScopedAnchorOn();           // the FIX's gate, likewise
+static thread_local bool t_g597InMatPrePub = false;
+static std::atomic<uint64_t> g_g597AnchorTotal{0}, g_g597AnchorPrePub{0},
+    g_g597MirrorAnchor{0}, g_g597MirrorScoped{0};
+
 static void g261UpdateWindow(int ti)
 {
+    if (g597OwnChkOn())
+    {
+        g_g597AnchorTotal.fetch_add(1u, std::memory_order_relaxed);
+        if (t_g597InMatPrePub)
+            g_g597AnchorPrePub.fetch_add(1u, std::memory_order_relaxed);
+    }
     G261Res &r = g_g261Res[ti];
     int lo = r.covLo, hi = r.covHi;
     if (r.dirty)
@@ -1611,6 +1634,62 @@ static bool g536GuestOwnsTargetPage(const G261Res &r, uint32_t fbp,
     return g_g178PageGen[page].load(std::memory_order_relaxed) != r.g536PageGen[p];
 }
 
+// ===== G597 probe (behaviour-pure, DC2_G597_OWNCHK=1): WHY does the guard decline? =====
+// G596 measured this guard firing on 0.28-0.38% of publications while `[G536:matchk]` reported guest
+// VRAM moving under 38-80% of them. That is a gap of two orders of magnitude, and a guard's hit rate
+// is a CONJUNCTION - so count every conjunct separately rather than guessing which one fails
+// (G590's law, and G595's "two refuted guesses = stop"; this is guess ZERO).
+static std::atomic<uint64_t> g_g597Calls{0}, g_g597BailOff{0}, g_g597BailNoSnap{0},
+    g_g597BailFbwMismatch{0}, g_g597BailFbwRange{0}, g_g597BailVram{0}, g_g597BailRows{0},
+    g_g597Scanned{0}, g_g597Moved{0}, g_g597Ran{0};
+static bool g597OwnChkOn()
+{
+    static const bool on = envFlagEnabled("DC2_G597_OWNCHK");
+    return on;
+}
+// The FIX. Default-OFF until the gate passes; then flipped, with DC2_G597_NO_SCOPEDANCHOR=1 as the
+// single rollback. It only NARROWS what a re-anchor forgives, so it can only ever protect more
+// pages than today — it cannot cause a publication to be skipped, only to preserve guest bytes.
+static constexpr bool kG597PromotedDefaultOn = false;
+static bool g597ScopedAnchorOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G597_NO_SCOPEDANCHOR") &&
+                           (kG597PromotedDefaultOn || envFlagEnabled("DC2_G597_SCOPEDANCHOR"));
+    return on;
+}
+static void g597OwnReport()
+{
+    if (!g597OwnChkOn())
+        return;
+    const uint64_t n = g_g597Calls.load(std::memory_order_relaxed);
+    if ((n % 2048u) != 0u)
+        return;
+    std::fprintf(stderr,
+                 "[G597:own] scoped=%d calls=%llu ran=%llu | bail(off=%llu noSnap=%llu "
+                 "fbwMismatch=%llu fbwRange=%llu vram=%llu rows=%llu) | anchors=%llu "
+                 "anchorPrePub=%llu mirrorAnchor=%llu mirrorScoped=%llu | pagesScanned=%llu "
+                 "pagesMoved=%llu (%.3f%% of scanned)\n",
+                 g597ScopedAnchorOn() ? 1 : 0,
+                 (unsigned long long)n,
+                 (unsigned long long)g_g597Ran.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g597BailOff.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g597BailNoSnap.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g597BailFbwMismatch.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g597BailFbwRange.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g597BailVram.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g597BailRows.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g597AnchorTotal.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g597AnchorPrePub.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g597MirrorAnchor.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g597MirrorScoped.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g597Scanned.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g597Moved.load(std::memory_order_relaxed),
+                 g_g597Scanned.load(std::memory_order_relaxed)
+                     ? 100.0 * (double)g_g597Moved.load(std::memory_order_relaxed) /
+                           (double)g_g597Scanned.load(std::memory_order_relaxed)
+                     : 0.0);
+}
+
 // Collect every page inside the rows about to be published whose generation moved since the
 // anchor. Fails CLOSED in the safe direction: if the snapshot is missing or the layout changed,
 // nothing is protected and the legacy publication runs unchanged.
@@ -1619,6 +1698,26 @@ static void g536CollectGuestOwnedPages(const G261Res &r, uint32_t fbp, int rowLo
                                        std::vector<G536PageSave> &out)
 {
     out.clear();
+    const bool g597 = g597OwnChkOn();
+    if (g597)
+    {
+        g_g597Calls.fetch_add(1u, std::memory_order_relaxed);
+        if (!g536PageOwnOn())
+            g_g597BailOff.fetch_add(1u, std::memory_order_relaxed);
+        else if (r.g536PageGenFbw == 0u)
+            g_g597BailNoSnap.fetch_add(1u, std::memory_order_relaxed);
+        else if (r.g536PageGenFbw != r.fbw)
+            g_g597BailFbwMismatch.fetch_add(1u, std::memory_order_relaxed);
+        else if (r.fbw == 0u || r.fbw > 8u)
+            g_g597BailFbwRange.fetch_add(1u, std::memory_order_relaxed);
+        else if (vram == nullptr)
+            g_g597BailVram.fetch_add(1u, std::memory_order_relaxed);
+        else if (rowHi < rowLo)
+            g_g597BailRows.fetch_add(1u, std::memory_order_relaxed);
+        else
+            g_g597Ran.fetch_add(1u, std::memory_order_relaxed);
+        g597OwnReport();
+    }
     if (!g536PageOwnOn() || r.g536PageGenFbw == 0u || r.g536PageGenFbw != r.fbw ||
         r.fbw == 0u || r.fbw > 8u || vram == nullptr || rowHi < rowLo)
         return;
@@ -1630,8 +1729,12 @@ static void g536CollectGuestOwnedPages(const G261Res &r, uint32_t fbp, int rowLo
         {
             const uint32_t p = py * r.fbw + px;
             const uint32_t page = basePage + p;
+            if (g597)
+                g_g597Scanned.fetch_add(1u, std::memory_order_relaxed);
             if (!g536GuestOwnsTargetPage(r, fbp, py, px))
                 continue; // FBO still owns this page
+            if (g597)
+                g_g597Moved.fetch_add(1u, std::memory_order_relaxed);
             const uint64_t off = static_cast<uint64_t>(page) * 8192ull;
             if (off + 8192ull > vramSize)
                 continue;
@@ -1821,7 +1924,45 @@ static bool g264FlushMirror(int ti)
         return false;
     if (patchLo < r.covLo) r.covLo = patchLo;
     if (patchHi > r.covHi) r.covHi = patchHi;
-    g261UpdateWindow(ti); // re-anchor claimed rows + gen baseline past the upload's own bumps
+    // ===== G597 FIX: re-anchor the PER-PAGE baseline only for the rows this mirror PATCHED =====
+    // The mirror reconciles guest VRAM into the FBO for `patchLo..patchHi` ONLY, so only those
+    // pages' guest writes have been absorbed and only they may be forgiven. `g261UpdateWindow`
+    // re-snapshots all 16*fbw pages, which additionally forgives every guest write elsewhere in
+    // the claimed window — and this runs INSIDE g261Materialize, moments before
+    // g536CollectGuestOwnedPages asks about exactly those pages. That is what makes G536's guard
+    // read 0.28-0.38% against a 38-80% hazard rate.
+    // `r.range` / `r.winLo` / `r.winHi` / `r.genAtSkip` are deliberately left EXACTLY as before
+    // (one architectural variable per arm): only the per-page twin is scoped.
+    if (g597OwnChkOn())
+        g_g597MirrorAnchor.fetch_add(1u, std::memory_order_relaxed);
+    if (g597ScopedAnchorOn() && r.g536PageGenFbw == r.fbw && r.fbw != 0u && r.fbw <= 8u)
+    {
+        const std::array<uint64_t, 16 * 8> savedGens = r.g536PageGen;
+        const uint32_t savedFbw = r.g536PageGenFbw;
+        g261UpdateWindow(ti);
+        if (r.g536PageGenFbw == savedFbw && r.g536PageGenFbw == r.fbw)
+        {
+            const uint32_t prLo = static_cast<uint32_t>(std::max(0, patchLo)) / 32u;
+            const uint32_t prHi = static_cast<uint32_t>(std::min(511, patchHi)) / 32u;
+            for (uint32_t py = 0; py < 16u; ++py)
+            {
+                if (py >= prLo && py <= prHi)
+                    continue; // genuinely mirrored: the FBO absorbed these guest bytes
+                for (uint32_t px = 0; px < r.fbw; ++px)
+                {
+                    const uint32_t p = py * r.fbw + px;
+                    if (p < r.g536PageGen.size())
+                        r.g536PageGen[p] = savedGens[p]; // NOT mirrored: keep the older anchor
+                }
+            }
+            if (g597OwnChkOn())
+                g_g597MirrorScoped.fetch_add(1u, std::memory_order_relaxed);
+        }
+    }
+    else
+    {
+        g261UpdateWindow(ti); // re-anchor claimed rows + gen baseline past the upload's own bumps
+    }
     // FBO == VRAM again for the mirrored rows; keep the snapshot coherent if one is live.
     G178FbSnap &snap = g_g178FbSnap[fbp];
     if (snap.valid)
@@ -1945,6 +2086,244 @@ static bool g432MatCensusOn()
 }
 static uint64_t g_g432MatUnpackNs = 0, g_g432MatUnpackN = 0, g_g432MatUnpackPx = 0;
 
+// ===== G599: THE WRITE — what does a publication actually CHANGE in guest VRAM? (DEFAULT OFF) ====
+//
+// G598 settled that the MAP-15 sky defect is entirely in what the port leaves in guest VRAM at the
+// sky's texture base (`0x2720 = 0x139 << 5`) — the guest packet stream is byte-identical in both
+// arms — and it REFUTED the read side: at the sky read the target reads `dirty=0 anyDirty=0`, so no
+// admission change can serve those texels from a live FBO. The wrong bytes are already committed
+// when the read happens. What is left is the WRITE, and `g261Materialize` is the one write G598
+// never excluded (`DC2_G528_NO_PUB=1` deletes the FLUSH publication, not this readback).
+//
+// So measure the write instead of arguing about it. Per publication this records how many BYTES of
+// each of the target's OWN 8 KB pages the unpack actually changed. A publication that changes zero
+// bytes in a page is harmless there; one that changes bytes in the page a texture consumer reads is
+// the edge under investigation. Paired with `[G599:who]` (the consumer side, in
+// rasterizer_vram_materialization.inc) it closes the loop: this end says "the publication rewrote
+// page 0x139", that end says "the sky read observed page 0x139 last written by <source>".
+//
+//   DC2_G599_PUB=1            arm the census
+//   DC2_G599_SF_LO/_SF_HI     window it on the SCRIPT clock (defect window: sf 1958..2440)
+//   DC2_G599_EVERY=<n>        print one aggregate line every n publications (default 256)
+//
+// Behaviour-pure: every byte compared and every counter touched is inside `if (g599)`. The page
+// walk is g536CollectGuestOwnedPages' walk verbatim, so the two describe the same page set.
+static bool g599PubOn()
+{
+    static const bool on = envFlagEnabled("DC2_G599_PUB");
+    return on;
+}
+static uint32_t g599EnvU32(const char *name, uint32_t dflt)
+{
+    const char *e = std::getenv(name);
+    if (e == nullptr)
+        return dflt;
+    const long v = std::strtol(e, nullptr, 0);
+    return v > 0 ? static_cast<uint32_t>(v) : dflt;
+}
+// ⚠️ The script clock is a GUEST-frame quantity, so it only moves between flushes. That is exactly
+// the resolution this census needs (the defect window is ~217 guest frames wide) and no finer.
+static bool g599InWindow()
+{
+    static const uint32_t lo = g599EnvU32("DC2_G599_SF_LO", 0u);
+    static const uint32_t hi = g599EnvU32("DC2_G599_SF_HI", 0u);
+    const uint32_t sf = g_dc2ScriptFrame.load(std::memory_order_relaxed);
+    return sf >= lo && (hi == 0u || sf <= hi);
+}
+// ===== G599 CEILING PROBE (default OFF, knowingly incorrect): delete ONE publication's write =====
+// `DC2_G400_NO_RESIDENT_139=1` fixes the sky but also halves the frame rate and removes the whole
+// GPU path, so it cannot say WHICH of residency's effects matters. This probe deletes exactly one:
+// the guest-VRAM WRITE of a chosen target's publication. Residency, the readback, the snapshots and
+// every other consumer edge are untouched, so the arm runs at the CONTROL'S OWN SPEED — the property
+// G598 §3 had to buy with a sibling-target lever.
+//
+//   DC2_G599_NOPUB=<fbp hex>     e.g. 139 — that target's publications leave guest VRAM unchanged
+//   DC2_G599_NOPUB_PLO/_PHI      restrict the restore to page offsets [plo,phi] of the target
+//                                (p = page - fbp), so the write can be bisected page by page
+//   DC2_G599_NOPUB_FBW=<n>       restrict it to publications at that FBW (0x139 publishes at both
+//                                8 and 2; G568's law says never treat the two as one population)
+static uint32_t g599NoPubFbp()
+{
+    static const uint32_t v = []() -> uint32_t {
+        const char *e = std::getenv("DC2_G599_NOPUB");
+        return e != nullptr ? static_cast<uint32_t>(std::strtoul(e, nullptr, 16)) : 0xFFFFFFFFu;
+    }();
+    return v;
+}
+static bool g599NoPubFor(uint32_t fbp, uint32_t fbw)
+{
+    if (g599NoPubFbp() != fbp)
+        return false;
+    static const uint32_t only = g599EnvU32("DC2_G599_NOPUB_FBW", 0u);
+    return only == 0u || only == fbw;
+}
+static std::atomic<uint64_t> g_g599NoPubHits{0}, g_g599NoPubPages{0};
+
+struct G599PubBucket
+{
+    uint64_t calls = 0u, pages = 0u, pagesChanged = 0u, bytesChanged = 0u;
+    uint64_t baseSeen = 0u, baseChanged = 0u, baseBytes = 0u;
+};
+// [target][fbw]: fbw is part of the publication's identity (0x139 is written at both 8 and 2), and
+// G568's law says never to collapse a bimodal population into one average.
+static G599PubBucket g_g599Pub[kG248TargetCount][9];
+static uint64_t g_g599PubCalls = 0u, g_g599PubPrints = 0u;
+static void g599PubReport(); // per-bucket summary; emitted from the aggregate print below
+
+// Flush-owner thread only (same ownership as s_g261Px / s_g536Saved).
+static std::vector<uint32_t> s_g599Pages;
+static std::vector<uint8_t> s_g599Before;
+
+// Snapshot every target-local page the publication is about to write. Returns the page count.
+static size_t g599SnapshotPages(const G261Res &r, uint32_t fbp, int rowLo, int rowHi,
+                                const uint8_t *vram, uint32_t vramSize)
+{
+    s_g599Pages.clear();
+    if (vram == nullptr || rowHi < rowLo || r.fbw == 0u || r.fbw > 8u)
+        return 0u;
+    const uint32_t pageRowLo = static_cast<uint32_t>(std::max(0, rowLo)) / 32u;
+    const uint32_t pageRowHi = static_cast<uint32_t>(std::min(511, rowHi)) / 32u;
+    for (uint32_t py = pageRowLo; py <= pageRowHi && py < 16u; ++py)
+        for (uint32_t px = 0; px < r.fbw; ++px)
+        {
+            const uint32_t page = fbp + py * r.fbw + px;
+            if (static_cast<uint64_t>(page) * 8192ull + 8192ull > vramSize)
+                continue;
+            s_g599Pages.push_back(page);
+        }
+    s_g599Before.resize(s_g599Pages.size() * 8192u);
+    for (size_t i = 0; i < s_g599Pages.size(); ++i)
+        std::memcpy(s_g599Before.data() + i * 8192u,
+                    vram + static_cast<uint64_t>(s_g599Pages[i]) * 8192ull, 8192);
+    return s_g599Pages.size();
+}
+
+// Compare, accumulate and report. `basePage` is the target's page 0 — the block a texture consumer
+// binds when it samples the target's base (`tbp0 == fbp << 5`), i.e. the sky's page for 0x139.
+static void g599ReportPublish(int ti, uint32_t fbp, int cause, const G261Res &r,
+                              int rowLo, int rowHi, const uint8_t *vram, size_t nPages,
+                              size_t guarded)
+{
+    if (ti < 0 || ti >= static_cast<int>(kG248TargetCount))
+        return; // kG248TargetCount is 14, not a power of two — bound, never mask
+    G599PubBucket &b = g_g599Pub[ti][r.fbw <= 8u ? r.fbw : 0u];
+    ++b.calls;
+    b.pages += nPages;
+    uint64_t changedPages = 0u, changedBytes = 0u, baseBytes = 0u;
+    uint64_t baseHashBefore = 0u, baseHashAfter = 0u;
+    bool baseSeen = false;
+    for (size_t i = 0; i < nPages; ++i)
+    {
+        const uint8_t *before = s_g599Before.data() + i * 8192u;
+        const uint8_t *after = vram + static_cast<uint64_t>(s_g599Pages[i]) * 8192ull;
+        uint64_t diff = 0u;
+        for (uint32_t k = 0; k < 8192u; ++k)
+            diff += (before[k] != after[k]) ? 1u : 0u;
+        if (diff != 0u)
+            ++changedPages;
+        changedBytes += diff;
+        if (s_g599Pages[i] == fbp)
+        {
+            baseSeen = true;
+            baseBytes = diff;
+            // Same FNV-1a fingerprint [G599:who] prints at the consumer, so a publication's
+            // OUTPUT hash can be matched against the hash the sky read later observes. A
+            // changed-byte COUNT says a page moved; the pair of hashes says WHICH image it holds.
+            baseHashBefore = 1469598103934665603ull;
+            baseHashAfter = 1469598103934665603ull;
+            for (uint32_t k = 0; k < 8192u; ++k)
+            {
+                baseHashBefore = (baseHashBefore ^ before[k]) * 1099511628211ull;
+                baseHashAfter = (baseHashAfter ^ after[k]) * 1099511628211ull;
+            }
+        }
+    }
+    b.pagesChanged += changedPages;
+    b.bytesChanged += changedBytes;
+    if (baseSeen)
+    {
+        ++b.baseSeen;
+        b.baseBytes += baseBytes;
+        if (baseBytes != 0u)
+            ++b.baseChanged;
+    }
+    static const uint32_t every = g599EnvU32("DC2_G599_EVERY", 256u);
+    const uint64_t n = ++g_g599PubCalls;
+    // Always print the first 24 publications that rewrite the BASE page — that is the event the
+    // phase is hunting, and it is far too rare to survive an "every n" filter.
+    const bool baseEvent = baseSeen && baseBytes != 0u && g_g599PubPrints < 24u;
+    if (baseEvent)
+        ++g_g599PubPrints;
+    if (!baseEvent && (n % every) != 0u)
+        return;
+    std::fprintf(stderr,
+                 "[G599:pub] %s sf=%u n=%llu fbp=0x%x cause=%d fbw=%u fbW=%d dirty=%d..%d "
+                 "cov=%d..%d win=%d..%d snapFbw=%u | pages=%zu chgPages=%llu chgBytes=%llu "
+                 "guarded=%zu | base(page=0x%x seen=%u chgBytes=%llu %016llx->%016llx)\n",
+                 baseEvent ? "BASEWRITE" : "agg",
+                 g_dc2ScriptFrame.load(std::memory_order_relaxed),
+                 static_cast<unsigned long long>(n), fbp, cause, r.fbw, r.fbW, rowLo, rowHi,
+                 r.covLo, r.covHi, r.winLo, r.winHi, r.g536PageGenFbw, nPages,
+                 static_cast<unsigned long long>(changedPages),
+                 static_cast<unsigned long long>(changedBytes), guarded, fbp,
+                 baseSeen ? 1u : 0u, static_cast<unsigned long long>(baseBytes),
+                 static_cast<unsigned long long>(baseHashBefore),
+                 static_cast<unsigned long long>(baseHashAfter));
+    if (!baseEvent && (n % (static_cast<uint64_t>(every) * 16u)) == 0u)
+        g599PubReport();
+}
+
+// Put the snapshotted bytes back, so the publication's net effect on guest VRAM is nothing. Runs
+// AFTER g536RestoreGuestOwnedPages, so it subsumes the guard rather than racing it.
+static void g599UndoPublish(uint32_t fbp, uint8_t *vram, size_t nPages)
+{
+    static const uint32_t plo = g599EnvU32("DC2_G599_NOPUB_PLO", 0u);
+    static const uint32_t phi = g599EnvU32("DC2_G599_NOPUB_PHI", 0xFFFFu);
+    uint64_t restored = 0u;
+    for (size_t i = 0; i < nPages; ++i)
+    {
+        const uint32_t p = s_g599Pages[i] - fbp;
+        if (p < plo || p > phi)
+            continue;
+        std::memcpy(vram + static_cast<uint64_t>(s_g599Pages[i]) * 8192ull,
+                    s_g599Before.data() + i * 8192u, 8192);
+        ++restored;
+    }
+    const uint64_t n = g_g599NoPubHits.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    g_g599NoPubPages.fetch_add(restored, std::memory_order_relaxed);
+    if (n <= 4u || (n % 4096u) == 0u)
+        std::fprintf(stderr,
+                     "[G599:nopub] CEILING PROBE fbp=0x%x n=%llu pagesRestored=%llu "
+                     "(this call %llu of %zu, window p=%u..%u)\n",
+                     fbp, (unsigned long long)n,
+                     (unsigned long long)g_g599NoPubPages.load(std::memory_order_relaxed),
+                     (unsigned long long)restored, nPages, plo, phi);
+}
+
+static void g599PubReport()
+{
+    if (!g599PubOn())
+        return;
+    for (int t = 0; t < kG248TargetCount; ++t)
+        for (uint32_t w = 0; w < 9u; ++w)
+        {
+            const G599PubBucket &b = g_g599Pub[t][w];
+            if (b.calls == 0u)
+                continue;
+            std::fprintf(stderr,
+                         "[G599:pubsum] fbp=0x%x fbw=%u calls=%llu pages=%llu chgPages=%llu "
+                         "(%.1f%%) chgBytes=%llu | base seen=%llu changed=%llu (%.1f%%) "
+                         "bytes/seen=%.0f\n",
+                         kG261Fbp[t], w, (unsigned long long)b.calls,
+                         (unsigned long long)b.pages, (unsigned long long)b.pagesChanged,
+                         b.pages ? 100.0 * (double)b.pagesChanged / (double)b.pages : 0.0,
+                         (unsigned long long)b.bytesChanged, (unsigned long long)b.baseSeen,
+                         (unsigned long long)b.baseChanged,
+                         b.baseSeen ? 100.0 * (double)b.baseChanged / (double)b.baseSeen : 0.0,
+                         b.baseSeen ? (double)b.baseBytes / (double)b.baseSeen : 0.0);
+        }
+}
+
 static void g261Materialize(int ti, int cause)
 {
     g324NoteObserver(1u); // direct resident-FBO/guest-authority consumer
@@ -1963,6 +2342,9 @@ static void g261Materialize(int ti, int cause)
     const auto g279T0 = g279Profile ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
     const uint32_t fbp = kG261Fbp[ti];
+    // G597: everything from here to g536CollectGuestOwnedPages is "after the hazard, before the
+    // guard" — a re-anchor landing in this span destroys the evidence the guard reads.
+    t_g597InMatPrePub = true;
     g536NoteMaterialize(r, fbp, cause); // G536 probe: has guest VRAM moved since the GPU render?
     const int rows = r.dirtyHi - r.dirtyLo + 1;
     // G590: this is the edge where GPU authority is surrendered back to guest VRAM. A GPU-resident
@@ -2081,13 +2463,28 @@ static void g261Materialize(int ti, int cause)
             static std::vector<G536PageSave> s_g536Saved; // flush-owner thread only
             g536CollectGuestOwnedPages(r, fbp, r.dirtyLo, r.dirtyHi, vram, g_g261VramSize,
                                        s_g536Saved);
+            t_g597InMatPrePub = false; // G597: the guard has read the anchor
             g_g536PubTotal.fetch_add(1u, std::memory_order_relaxed);
             if (!s_g536Saved.empty())
                 g_g536PubGuarded.fetch_add(1u, std::memory_order_relaxed);
+            // G599 (default OFF): snapshot the target's own pages so the publication's ACTUAL
+            // byte effect can be measured, not inferred. Straddles the guard's restore so what it
+            // reports is the net effect on guest VRAM, which is what a consumer reads.
+            const bool g599 = g599PubOn() && g599InWindow();
+            const bool g599NoPub = g599NoPubFor(fbp, r.fbw);
+            const size_t g599N = (g599 || g599NoPub)
+                                     ? g599SnapshotPages(r, fbp, r.dirtyLo, r.dirtyHi, vram,
+                                                         g_g261VramSize)
+                                     : 0u;
             g418UnpackColorRows(vram, g_g261VramSize, s_g261Px, fbBlock, r.fbw, r.fbW,
                                 r.dirtyHi + 1, r.dirtyLo, r.dirtyHi,
                                 /*legacy=*/!g432Fast);
             g536RestoreGuestOwnedPages(s_g536Saved, vram, g_g261VramSize);
+            if (g599)
+                g599ReportPublish(ti, fbp, cause, r, r.dirtyLo, r.dirtyHi, vram, g599N,
+                                  s_g536Saved.size());
+            if (g599NoPub)
+                g599UndoPublish(fbp, vram, g599N); // CEILING PROBE — knowingly incorrect
             if (g432MatCensus)
             {
                 g_g432MatUnpackNs += static_cast<uint64_t>(
@@ -2168,6 +2565,7 @@ static void g261Materialize(int ti, int cause)
                 break; // split off (or another target): original single-key behavior
         }
     }
+    t_g597InMatPrePub = false; // G597: also clear on the !ok / early-return paths
     r.dirty = false;
     r.dirtyLo = 512;
     r.dirtyHi = -1;
@@ -2211,8 +2609,76 @@ static void g261Materialize(int ti, int cause)
 // Defined at global scope (region 4683..7342), static/internal linkage; called only from sites that
 // are lexically after this point (the different-target site in g178TryFlushGpu and each
 // g272MaterializeAll consumer-edge call site), so no forward declaration is needed.
+// ===== G600 ORDERED TRACE (default OFF, DC2_G600_SEQ=1 + _SEQ_LO/_SEQ_HI) =====
+// `[G600:direct]` says the display grab loses its FBO source because `s_g276Pend.active == 0`, and
+// `[G600:disp]` says the display batch armed it (`coalesce=1`) — so the record is CLEARED between
+// the two. A bucketed census cannot show that; only an ordered trace of one script frame can.
+// Window it to two guest frames and it prints a few dozen lines.
+static bool g600SeqOn()
+{
+    static const bool on = envFlagEnabled("DC2_G600_SEQ");
+    return on;
+}
+static bool g600SeqWindow()
+{
+    if (!g600SeqOn())
+        return false;
+    static const uint32_t lo = g599EnvU32("DC2_G600_SEQ_LO", 0u);
+    static const uint32_t hi = g599EnvU32("DC2_G600_SEQ_HI", 0u);
+    const uint32_t sf = g_dc2ScriptFrame.load(std::memory_order_relaxed);
+    return sf >= lo && (hi == 0u || sf <= hi);
+}
+static void g600Seq(const char *what, int a, uint32_t b, int c)
+{
+    if (!g600SeqWindow())
+        return;
+    static uint64_t s_n = 0u;
+    std::fprintf(stderr,
+                 "[G600:seq] sf=%u i=%llu %-12s a=%d b=0x%x c=%d | pend(act=%u fbp=0x%x "
+                 "rows=%d..%d)\n",
+                 g_dc2ScriptFrame.load(std::memory_order_relaxed),
+                 static_cast<unsigned long long>(++s_n), what, a, b, c,
+                 s_g276Pend.active ? 1u : 0u, s_g276Pend.fbp, s_g276Pend.rowLo, s_g276Pend.rowHi);
+}
+
+// ===== G600 FIX (DEFAULT ON, rollback DC2_G600_NO_DISPLAY_PUB_GEN=1) =====
+// THE COALESCED DISPLAY PUBLICATION IS A TEXTURE-PRODUCER EVENT AND WAS NOT ANNOUNCED AS ONE.
+//
+// Every other path that writes guest VRAM from an FBO advances the page generations G178's texture
+// registry keys on, and then RE-ANCHORS its own snapshot past that bump so the upload-suppression
+// property is unchanged — g261Materialize does exactly this ~200 lines above, and the per-batch
+// display readback does it in rasterizer_vram_materialization.inc ("The RTT color write is a
+// texture-producer event"). G276's coalesced flush skipped BOTH halves, keeping only the second
+// half's *intent* ("no color-gen bump, so re-upload stays suppressed"). The consequence is not a
+// suppressed upload — it is a texture registry entry over the display pages that can never be
+// invalidated:
+//
+//   MAP-15, scriptFrames 1961..2424. The cutscene runs a full-screen post-process: a one-entry
+//   `display -> 0x139` grab sprite, then `0x139 -> display`. The grab normally binds the display FBO
+//   directly (g289DirectDisplayToken), which requires `s_g276Pend.active`. In this window the inline
+//   CPU-primitive consumer edge (cause 4, rasterizer_tilebin_capture.inc) publishes and CLEARS the
+//   pending record ~1000 flushes before the grab, so the grab falls back to the ordinary guest-VRAM
+//   decode — and `[G600:hit] why=gen` on EVERY key of the window says that decode never happens: the
+//   registry's first test is `genSum == genNow`, the publication never moved a generation, so the
+//   GPU keeps ONE frozen copy of the display for 460 scriptFrames. It is composited back over the
+//   frame, and wherever nothing overdraws it — the sky band — you see a frozen old image.
+//   Measured: `mean|A-B|` over rows 0..119 between sf 1980 and 2002 is EXACTLY 0.00.
+//
+// The fix is the missing half, in the form the neighbours already use: bump the published rect, then
+// re-anchor this target's snapshot past our own bump. Upload suppression is preserved by
+// construction (the snapshot is re-sampled after the bump); the registry now sees the invalidation
+// and falls through to its exact content-hash test, which re-decodes only when the bytes moved.
+static bool g600DisplayPubGenOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G600_NO_DISPLAY_PUB_GEN") &&
+                           !envFlagDisabled("DC2_G600_DISPLAY_PUB_GEN");
+    return on;
+}
+static std::atomic<uint64_t> g_g600PubGenBumps{0};
+
 static void g276FlushPendingDisplay(int cause)
 {
+    g600Seq("flush.enter", cause, 0u, 0);
     if (!s_g276Pend.active)
         return;
     const bool g279Profile = g279ProfileOn();
@@ -2246,6 +2712,7 @@ static void g276FlushPendingDisplay(int cause)
     if (g277CensusOn() && cause >= 0 && cause < 9)
         g_g277FlushByCause[cause].fetch_add(1u, std::memory_order_relaxed);
     G276PendDisplay p = s_g276Pend;
+    g600Seq("flush.clear", cause, s_g276Pend.fbp, s_g276Pend.rowHi);
     s_g276Pend.active = false;
     s_g276Pend.rowLo = 1 << 30;
     s_g276Pend.rowHi = -1;
@@ -2294,6 +2761,22 @@ static void g276FlushPendingDisplay(int cause)
     {
         g_g276Flushes.fetch_add(1u, std::memory_order_relaxed);
         g_g276FlushRows.fetch_add(static_cast<uint64_t>(rows), std::memory_order_relaxed);
+        // G600: guest VRAM for rows p.rowLo..p.rowHi of this display target just CHANGED. Announce
+        // it on the same page generations the texture registry reads, then re-anchor this target's
+        // snapshot past our own bump so the FBO<->VRAM equality the upload skip depends on is
+        // exactly as it was before (g261Materialize's pattern, same order, same gen window).
+        if (g600DisplayPubGenOn())
+        {
+            g178BumpRectImpl(p.fbBlock, p.fbw, GS_PSM_CT32, 0u,
+                             static_cast<uint32_t>(p.rowLo), static_cast<uint32_t>(p.fbW),
+                             static_cast<uint32_t>(rows),
+                             2u | (static_cast<uint32_t>(cause & 0xff) << 8u));
+            G178FbSnap &snap = g_g178FbSnap[p.fbp];
+            if (snap.valid)
+                snap.genSum = g178GenSumRect(p.fbBlock, p.fbw, GS_PSM_CT32, 0u, 0u,
+                                             static_cast<uint32_t>(p.fbW), 512u);
+            g_g600PubGenBumps.fetch_add(1u, std::memory_order_relaxed);
+        }
     }
     else
     {
@@ -2468,16 +2951,81 @@ extern bool g289_backend_copy_display_to_work(uint32_t srcFbp, uint32_t dstFbp);
 extern bool g289_backend_build_work_alias_view();
 static bool g289Resolve14aBeforeDirect();
 
+// ===== G600 census (default OFF, DC2_G600_DIRECT=1): WHICH CONJUNCT OF THE DISPLAY GRAB FAILS =====
+// The MAP-15 defect window is exactly the interval over which this token is 0. When it is 0 the
+// full-screen `display -> 0x139` grab falls back to decoding guest VRAM at the display base, which
+// is stale because the display target is GPU-resident — so the post-process composites a FROZEN
+// old frame back over the sky. G590's law applies: count EVERY conjunct, or the lever names nothing.
+static bool g600DirectOn()
+{
+    static const bool on = envFlagEnabled("DC2_G600_DIRECT");
+    return on;
+}
+
+// Fires only on flushes that plausibly ARE the grab (some entry draws a CT32 textured sprite into
+// 0x139), at most once per script-frame bucket per reason, so the log stays bounded.
+static void g600ReportDirect(const char *why, uint32_t shapeBits)
+{
+    bool candidate = false;
+    for (const G144Entry &e : g_g144List)
+        if (e.ctx.frame.fbp == 0x139u && e.prim.type == GS_PRIM_SPRITE && e.prim.tme &&
+            e.ctx.tex0.psm == GS_PSM_CT32 && e.ctx.tex0.tbw == 8u)
+        {
+            candidate = true;
+            break;
+        }
+    if (!candidate)
+        return;
+    static const uint32_t every = g599EnvU32("DC2_G600_DIRECT_EVERY", 22u);
+    const uint32_t sf = g_dc2ScriptFrame.load(std::memory_order_relaxed);
+    static uint32_t s_bucket = 0xFFFFFFFFu;
+    static uint32_t s_seenMask = 0u;
+    const uint32_t bucket = sf / (every ? every : 1u);
+    if (bucket != s_bucket)
+    {
+        s_bucket = bucket;
+        s_seenMask = 0u;
+    }
+    const uint32_t bit = 1u << (why[0] & 31u);
+    if ((s_seenMask & bit) != 0u)
+        return;
+    s_seenMask |= bit;
+    const G144Entry &e = g_g144List[0]; // the candidate scan above proves the list is non-empty
+    std::fprintf(stderr,
+                 "[G600:direct] sf=%u why=%s n=%zu localCopy=%u pend(act=%u fbp=0x%x fbw=%u "
+                 "fbW=%d rows=%d..%d) e0(fbp=0x%x fbw=%u psm=%u prim=%u tme=%u fst=%u tbp=0x%x "
+                 "tbw=%u tpsm=%u tw=%u th=%u sciss=%u,%u..%u,%u uv=%u,%u..%u,%u) shape=0x%x "
+                 "owner=%u\n",
+                 sf, why, g_g144List.size(), g289LocalCopyOn() ? 1u : 0u,
+                 s_g276Pend.active ? 1u : 0u, s_g276Pend.fbp, s_g276Pend.fbw, s_g276Pend.fbW,
+                 s_g276Pend.rowLo, s_g276Pend.rowHi,
+                 e.ctx.frame.fbp, e.ctx.frame.fbw, static_cast<unsigned>(e.ctx.frame.psm),
+                 static_cast<unsigned>(e.prim.type), e.prim.tme ? 1u : 0u, e.prim.fst ? 1u : 0u,
+                 e.ctx.tex0.tbp0, e.ctx.tex0.tbw, static_cast<unsigned>(e.ctx.tex0.psm),
+                 static_cast<unsigned>(e.ctx.tex0.tw), static_cast<unsigned>(e.ctx.tex0.th),
+                 e.ctx.scissor.x0, e.ctx.scissor.y0, e.ctx.scissor.x1, e.ctx.scissor.y1,
+                 e.v[0].u, e.v[0].v, e.v[1].u, e.v[1].v, shapeBits,
+                 g345AnyOwnerActive() ? 1u : 0u);
+}
+
 // The exact display-grab sprite previously proven by G288's direct-source prototype. The one-row
 // bilinear halo is safe because CLAMP repeats GS row 415; no undefined FBO row is sampled.
 static uint32_t g289DirectDisplayToken()
 {
+    const bool g600 = g600DirectOn();
     if (!g289LocalCopyOn() || !s_g276Pend.active ||
         s_g276Pend.fbW != 512 || s_g276Pend.fbw != 8u ||
         s_g276Pend.rowLo != 0 || s_g276Pend.rowHi != 415 ||
         (s_g276Pend.fbp != 0u && s_g276Pend.fbp != 0x68u) ||
         g_g144List.size() != 1u)
+    {
+        if (g600)
+            g600ReportDirect("pend", 0u);
+        if (!g_g144List.empty() && g_g144List[0].ctx.frame.fbp == 0x139u)
+            g600Seq("grab.NOPEND", static_cast<int>(g_g144List.size()),
+                    g_g144List[0].ctx.tex0.tbp0, 0);
         return 0u;
+    }
 
     const G144Entry &e = g_g144List[0];
     const uint32_t sourceBlock = framePageBaseToBlock(s_g276Pend.fbp);
@@ -2494,11 +3042,47 @@ static uint32_t g289DirectDisplayToken()
         e.v[0].u == 0u && e.v[0].v == 0u &&
         e.v[1].u == 512u * 16u && e.v[1].v == 416u * 16u;
     if (!exact)
+    {
+        if (g600)
+        {
+            // One bit per conjunct of `exact`, in source order, so the census names the failure
+            // instead of reporting that "the shape did not match".
+            const uint32_t bits =
+                (e.ctx.frame.fbp == 0x139u ? 0u : 1u << 0) |
+                (e.ctx.frame.fbw == 8u ? 0u : 1u << 1) |
+                (e.ctx.frame.psm == GS_PSM_CT32 ? 0u : 1u << 2) |
+                ((e.ctx.scissor.x0 == 0u && e.ctx.scissor.y0 == 0u &&
+                  e.ctx.scissor.x1 == 511u && e.ctx.scissor.y1 == 447u) ? 0u : 1u << 3) |
+                (e.prim.type == GS_PRIM_SPRITE ? 0u : 1u << 4) |
+                (e.prim.tme ? 0u : 1u << 5) |
+                (e.prim.fst ? 0u : 1u << 6) |
+                (e.ctx.tex0.tbp0 == sourceBlock ? 0u : 1u << 7) |
+                (e.ctx.tex0.tbw == 8u ? 0u : 1u << 8) |
+                (e.ctx.tex0.psm == GS_PSM_CT32 ? 0u : 1u << 9) |
+                (e.ctx.tex0.tw == 9u ? 0u : 1u << 10) |
+                (e.ctx.tex0.th == 9u ? 0u : 1u << 11) |
+                (tex1UsesLinearFilter(e.ctx.tex1) ? 0u : 1u << 12) |
+                ((e.v[0].u == 0u && e.v[0].v == 0u) ? 0u : 1u << 13) |
+                ((e.v[1].u == 512u * 16u && e.v[1].v == 416u * 16u) ? 0u : 1u << 14);
+            g600ReportDirect("shape", bits);
+        }
         return 0u;
+    }
     if (g345AnyOwnerActive() && !g289Resolve14aBeforeDirect())
+    {
+        if (g600)
+            g600ReportDirect("resolve14a", 0u);
         return 0u;
+    }
     if (g345AnyOwnerActive())
+    {
+        if (g600)
+            g600ReportDirect("g345owner", 0u);
         return 0u; // G346: another slot survived the 0x14a resolve — fail closed to normal path
+    }
+    if (g600)
+        g600ReportDirect("bind", 0u);
+    g600Seq("grab.BIND", 0, s_g276Pend.fbp, 0);
     return s_g276Pend.fbp == 0u ? kG289ZeroFbpToken : s_g276Pend.fbp;
 }
 

@@ -259,6 +259,16 @@ void PS2Memory::flushMaskedPath3Packets(bool drainImmediately)
 // G234: cross-TU gate for deferred-start dumping (see g138DumpSubmit); the present
 // loop in ps2_runtime.cpp flips it once DC2_G138_GSDUMP_AT_TICK is reached.
 std::atomic<bool> g_dc2G138DumpGateOpen{true};
+
+// G599: THE SCRIPT CLOCK, exported cross-TU.
+// G598 established that the host present tick is not a script clock (it free-runs at ~58 Hz
+// independently of the guest), so any diagnostic that wants to look at ONE scene has to window
+// itself on `scriptFrame`, which only the mgEndFrame override can compute. Published here — the
+// same TU that already owns g_dc2G138DumpGateOpen — so a rasterizer-side census can localize its
+// prints to the defect window instead of relying on a first-N window, which G598 §6 showed is
+// blind to a consumer that is 0.06% of the traffic. Written once per guest frame (one relaxed
+// store, unconditional); read by diagnostics only, never by a behaviour path.
+std::atomic<uint32_t> g_dc2ScriptFrame{0u};
 namespace
 {
     struct Dc2G138GsDump
