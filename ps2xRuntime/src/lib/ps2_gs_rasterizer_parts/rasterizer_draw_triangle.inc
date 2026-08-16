@@ -4,6 +4,12 @@ void GSRasterizer::drawTriangle(GS *gs)
     const GSVertex &v1 = gs->m_vtxQueue[1];
     const GSVertex &v2 = gs->m_vtxQueue[2];
     const auto &ctx = gs->activeContext();
+    // G605: per-REPLAYED-DRAW prologue/loop cycle lap, bucketed by batch class x leaf. Inert unless
+    // DC2_G605_CYC=1 and this call is inside a G144 band replay. The leaf starts provisional (the
+    // sampler admission is only known ~1,390 lines below) and is corrected by setLeaf() there, so a
+    // draw that returns early is still booked to a sensible bucket.
+    G605CycScope g605cyc(ctx.frame.fbp,
+                         gs->m_prim.tme ? kG605LeafTriGeneric : kG605LeafTriUntex);
     // G408 diagnostic: snapshot the live CT32 RTT immediately before the display
     // pass reinterprets the same 0x2720 storage as T8.
     static const bool s_g408DumpRttBeforeT8 =
@@ -1394,6 +1400,16 @@ void GSRasterizer::drawTriangle(GS *gs)
     const bool g141FastSampleTri =
         !s_g141NoFastSample && gs->m_prim.tme && g141TraceOff &&
         ctx.frame.fbp != 0x139u && g141FastPsm && ctx.tex0.tbw != 0u;
+    g605cyc.setLeaf(!gs->m_prim.tme ? kG605LeafTriUntex
+                                    : (g141FastSampleTri ? kG605LeafTriFast : kG605LeafTriGeneric));
+    g605cyc.setShape(ctx.frame.fbp, static_cast<uint8_t>(gs->m_prim.type),
+                     static_cast<uint8_t>(ctx.frame.psm), ctx.frame.fbmsk, ctx.tex0.tbp0,
+                     static_cast<uint8_t>(ctx.tex0.psm), static_cast<uint8_t>(ctx.tex0.tfx),
+                     static_cast<uint8_t>(ctx.tex0.tcc), g141Linear, ctx.tex1, ctx.alpha, ctx.test,
+                     static_cast<uint8_t>(zpsm), static_cast<uint8_t>(ztst),
+                     gs->m_prim.iip != 0u, gs->m_prim.fst != 0u, gs->m_prim.abe != 0u,
+                     gs->m_prim.fge != 0u, gs->m_pabe != 0u, (ctx.fba & 0x1ull) != 0ull,
+                     g403DisplayZ);
     // G580 census + exact-state admission. The broad subject matches G573's replay population;
     // the candidate then fails closed on every shader/depth/commit semantic it specializes.
     const bool g580Subject =
@@ -1445,6 +1461,107 @@ void GSRasterizer::drawTriangle(GS *gs)
                          static_cast<unsigned>(ctx.tex0.csa),
                          minX, minY, maxX, maxY);
     }
+    // ===================== G605: the property-admitted exact triangle leaf =====================
+    // The per-DRAW twin of g605SharedEntryEligible — same conjuncts, read off the live state the
+    // band replay restored. Fail-closed: any mismatch falls through to the untouched generic nest.
+    // `g580Tri13b` wins where both would fire (it is the narrower, already-verified contract).
+    const bool g605TriSubject =
+        g605TriSpanRequested() && t_g144InReplay && !g580Tri13b && gs->m_vram != nullptr &&
+        (gs->m_prim.type == GS_PRIM_TRIANGLE || gs->m_prim.type == GS_PRIM_TRISTRIP);
+    int g605Reject = kG605RejState;
+    bool g605Tri = false;
+    if (g605TriSubject)
+    {
+        const bool stateOk =
+            ctx.frame.psm == GS_PSM_CT32 && ctx.frame.fbw == 8u && ctx.frame.fbmsk == 0u &&
+            ctx.fba == 0u && !gs->m_pabe && gs->m_prim.tme && gs->m_prim.iip &&
+            // G608: `fst=1` is admitted through the second sampler leaf when it is armed. The
+            // conjunct is the SAME predicate g605SharedEntryEligible reads, so the batch-shared
+            // palette and the per-draw admission cannot disagree about this population.
+            (!gs->m_prim.fst || g608TriFstEnabled()) && !gs->m_prim.aa1 &&
+            ctx.tex0.psm == GS_PSM_T8 && ctx.tex0.tfx == 0u && ctx.tex0.tcc == 1u &&
+            ctx.tex0.cpsm == GS_PSM_CT32 && ctx.tex0.csm == 0u && ctx.tex0.csa == 0u &&
+            ctx.tex0.tbw != 0u && g141Linear &&
+            !g357FlatDraw && !g408ShadowVolume && !g232tri && !g570Cpu139;
+        // ZMSK is carried, not required — see g605SharedEntryEligible. `zWrite` is the generic
+        // path's own predicate and becomes the kernel's per-draw store constant.
+        const bool depthOk =
+            zEnabled && z24 && ztst == 2u && zbpPage == 0xd0u && g403DisplayZ;
+        const bool boundsOk =
+            minY >= 0 && maxY < static_cast<int>(kG403DisplayZH) &&
+            minX >= 0 && maxX < static_cast<int>(kG403DisplayZW);
+        if (!stateOk)
+            g605Reject = kG605RejState;
+        else if (!g141FastSampleTri)
+            g605Reject = kG605RejSampler;
+        else if (!g605AlphaTestAlwaysPasses(ctx.test))
+            g605Reject = kG605RejAlphaTest;
+        else if (!depthOk)
+            g605Reject = kG605RejDepth;
+        else if (!boundsOk)
+            g605Reject = kG605RejBounds;
+        else if (!g580SharedSampleReady())
+            g605Reject = kG605RejClut; // no batch-shared palette bound for this entry
+        else
+            g605Reject = -1;
+        g605Tri = (g605Reject < 0) && g605TriSpanQuiet() && g605TriSpanSelected();
+        if (g605TriSpanRejectOn())
+        {
+            G605RejectFacts f{};
+            f.fbp = ctx.frame.fbp;
+            f.fbw = ctx.frame.fbw;
+            f.fbmsk = ctx.frame.fbmsk;
+            f.fpsm = static_cast<uint32_t>(ctx.frame.psm);
+            f.fba = static_cast<uint32_t>(ctx.fba & 0x1ull);
+            f.pabe = gs->m_pabe ? 1u : 0u;
+            f.tme = gs->m_prim.tme ? 1u : 0u;
+            f.iip = gs->m_prim.iip ? 1u : 0u;
+            f.fst = gs->m_prim.fst ? 1u : 0u;
+            f.fge = gs->m_prim.fge ? 1u : 0u;
+            f.aa1 = gs->m_prim.aa1 ? 1u : 0u;
+            f.abe = gs->m_prim.abe ? 1u : 0u;
+            f.tbp = ctx.tex0.tbp0;
+            f.tbw = ctx.tex0.tbw;
+            f.tpsm = static_cast<uint32_t>(ctx.tex0.psm);
+            f.tfx = ctx.tex0.tfx;
+            f.tcc = ctx.tex0.tcc;
+            f.cbp = ctx.tex0.cbp;
+            f.cpsm = static_cast<uint32_t>(ctx.tex0.cpsm);
+            f.csm = ctx.tex0.csm;
+            f.csa = ctx.tex0.csa;
+            f.tex1 = ctx.tex1;
+            f.lin = g141Linear ? 1u : 0u;
+            f.fastSampler = g141FastSampleTri ? 1u : 0u;
+            f.alpha = ctx.alpha;
+            f.test = ctx.test;
+            f.zbuf = ctx.zbuf;
+            f.zbpPage = zbpPage;
+            f.zpsm = zpsm;
+            f.ztst = ztst;
+            f.zte = zte;
+            f.zmsk = zmsk ? 1u : 0u;
+            f.privz = g403DisplayZ ? 1u : 0u;
+            f.minX = minX; f.maxX = maxX; f.minY = minY; f.maxY = maxY;
+            g605NoteReject(ctx.frame.fbp, g605Reject, f);
+        }
+    }
+    const bool g605TriVerify = g605Tri && g605TriSpanVerifyOn();
+    // Per-DRAW constants the generic per-pixel path re-derives inside writePixel.
+    const G605Blend g605Blend =
+        g605Tri ? g605BuildBlend(gs->m_prim.abe != 0u, ctx.alpha) : G605Blend{};
+    const uint32_t g605ColorBlock =
+        g605Tri ? GSInternal::framePageBaseToBlock(ctx.frame.fbp) : 0u;
+    const bool g605Fog = g605Tri && gs->m_prim.fge && g364FogEnabled();
+    // G608: which of the two sampler leaves this draw uses. A per-DRAW constant — the branch it
+    // feeds inside the pixel loop is loop-invariant and perfectly predicted, and it replaces the
+    // generic sampler's own `if (gs->m_prim.fst)` which the admitted population pays per pixel.
+    const bool g605Fst = g605Tri && gs->m_prim.fst != 0u;
+    // The alpha test is admitted only when it always passes, so `fragmentAlpha.writeDepth` is
+    // always true and the generic condition `zWrite && fragmentAlpha.writeDepth` reduces to this.
+    const bool g605ZWrite = g605Tri && zWrite;
+    uint64_t g605TriPx = 0u;
+    uint64_t g605TriBad = 0u;
+
     const bool g580Tri13bVerify = g580Tri13b && g580Tri13bVerifyOn();
     const uint32_t g580ColorBlock = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
     uint64_t g580Tri13bPx = 0u;
@@ -1686,6 +1803,20 @@ void GSRasterizer::drawTriangle(GS *gs)
             g580ColorRow = g530RowAddr(g580ColorBlock, ctx.frame.fbw,
                                       static_cast<uint32_t>(y));
             g580DepthRow = g403DisplayZBuf().data() +
+                           static_cast<size_t>(y) * kG403DisplayZW;
+        }
+        // G605: the same two per-ROW hoists — the CT32 swizzle row descriptor and the private-Z
+        // mirror row — for the property-admitted leaf.
+        G530RowAddr g605ColorRow{};
+        uint32_t *g605DepthRow = nullptr;
+        uint32_t g605ColorGroup = ~0u;
+        uint32_t g605ColorGroupBase = 0u;
+        if (g605Tri)
+        {
+            g580BeginSharedSampleRow();
+            g605ColorRow = g530RowAddr(g605ColorBlock, ctx.frame.fbw,
+                                       static_cast<uint32_t>(y));
+            g605DepthRow = g403DisplayZBuf().data() +
                            static_cast<size_t>(y) * kG403DisplayZW;
         }
         int xStart = minX, xEnd = maxX;
@@ -2015,6 +2146,24 @@ void GSRasterizer::drawTriangle(GS *gs)
                         zdst = fastZ;
                     }
                 }
+                else if (g605Tri)
+                {
+                    // G605 lowering 2: one indexed load instead of an out-of-line call with four
+                    // bounds compares. The row pointer is fixed by the loop and the x range is
+                    // inside the mirror by admission.
+                    const uint32_t fastZ = g605DepthRow[x];
+                    if (g605TriVerify)
+                    {
+                        const uint32_t refZ = g403DisplayZRead(x, y, ctx.frame.fbp);
+                        if (fastZ != refZ)
+                            ++g605TriBad;
+                        zdst = refZ; // the generic read stays authoritative while the oracle is on
+                    }
+                    else
+                    {
+                        zdst = fastZ;
+                    }
+                }
                 else if (g403DisplayZ)
                 {
                     zdst = g570Cpu139 ? g570DepthRow[x]
@@ -2169,6 +2318,115 @@ void GSRasterizer::drawTriangle(GS *gs)
             }
             if (!zPass)
                 continue;
+
+            // ===================== G605: THE EXACT ACCELERATED LEAF =====================
+            // Coverage, the barycentrics, the Z interpolation and test, the STQ interpolation, the
+            // bilinear weights, MODULATE and the fog lerp are all still the generic code's, in the
+            // generic order, on the generic float expressions. Three things are lowered, and only
+            // three: the palette (batch-shared instead of decoded per triangle), the private-Z
+            // access (row pointer instead of two bounds-checked calls), and the commit (writePixel's
+            // own 32-bit tail with the address and the blend selectors hoisted out of the loop).
+            // In verify mode the generic path performs every store and this only compares.
+            if (g605Tri)
+            {
+                const uint8_t shadeR = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
+                const uint8_t shadeG = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
+                const uint8_t shadeB = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
+                const uint8_t shadeA = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+                // G608: the two sampler leaves. Both branches reproduce the generic path's own
+                // interpolation for their arm statement for statement — `iu`/`iv` here are the
+                // identical expressions the `gs->m_prim.fst` branch below evaluates, and the
+                // constants handed to the oracle (`is=0, it=0, iq=1`) are the ones it sets there.
+                float is = 0.0f, it = 0.0f, iq = 1.0f;
+                uint16_t iu = 0u, iv = 0u;
+                uint32_t texel;
+                if (g605Fst)
+                {
+                    iu = static_cast<uint16_t>(v0.u * w0 + v1.u * w1 + v2.u * w2);
+                    iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
+                    texel = g608SampleSharedT8Uv(gs->m_vram, iu, iv);
+                }
+                else
+                {
+                    is = v0.s * w0 + v1.s * w1 + v2.s * w2;
+                    it = v0.t * w0 + v1.t * w1 + v2.t * w2;
+                    iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
+                    texel = g580SampleSharedT8(gs->m_vram, is, it, iq);
+                }
+                if (g605TriVerify)
+                {
+                    const uint32_t refTexel = g141FastSample(is, it, iq, iu, iv);
+                    if (texel != refTexel)
+                        ++g605TriBad;
+                }
+                const TextureCombineResult color = combineTexture(
+                    ctx.tex0, shadeR, shadeG, shadeB, shadeA,
+                    static_cast<uint8_t>(texel & 0xffu),
+                    static_cast<uint8_t>((texel >> 8u) & 0xffu),
+                    static_cast<uint8_t>((texel >> 16u) & 0xffu),
+                    static_cast<uint8_t>((texel >> 24u) & 0xffu));
+                uint8_t fr = color.r, fg = color.g, fb = color.b;
+                const uint8_t fa = color.a;
+                if (g605Fog)
+                {
+                    // Identical to the generic block below: F is Gouraud-interpolated regardless of
+                    // PRIM.IIP and applied to the post-texture RGB, before the blend.
+                    const float ff = static_cast<float>(v0.fog) * w0 +
+                                     static_cast<float>(v1.fog) * w1 +
+                                     static_cast<float>(v2.fog) * w2;
+                    g364ApplyFog(static_cast<uint32_t>(clampU8(static_cast<int>(ff + 0.5f))),
+                                 fr, fg, fb);
+                }
+
+                const uint32_t group = static_cast<uint32_t>(x) >> 3u;
+                if (group != g605ColorGroup)
+                {
+                    g605ColorGroup = group;
+                    g605ColorGroupBase = g530GroupBase(g605ColorRow, static_cast<uint32_t>(x));
+                }
+                const uint32_t fastOff =
+                    g605ColorGroupBase + static_cast<uint32_t>(g605ColorRow.ct[x & 7]) * 4u;
+                if (fastOff + 4u <= gs->m_vramSize)
+                {
+                    uint32_t dstWord = 0u;
+                    std::memcpy(&dstWord, gs->m_vram + fastOff, sizeof(dstWord));
+                    const uint32_t fastPixel = g605CommitWord(g605Blend, dstWord, fr, fg, fb, fa);
+                    if (g605TriVerify)
+                    {
+                        // The alpha test is admitted only when it passes for all 256 alphas, so
+                        // assert that here rather than trusting the admission.
+                        const AlphaTestResult refAlpha = classifyAlphaTest(ctx.test, fa);
+                        if (!refAlpha.writeFramebuffer || !refAlpha.writeDepth ||
+                            refAlpha.preserveDestinationAlpha)
+                            ++g605TriBad;
+                        writePixel(gs, x, y, fr, fg, fb, fa);
+                        const uint32_t refOff = GSPSMCT32::addrPSMCT32(
+                            g605ColorBlock, ctx.frame.fbw,
+                            static_cast<uint32_t>(x), static_cast<uint32_t>(y));
+                        uint32_t refPixel = 0u;
+                        if (refOff + 4u <= gs->m_vramSize)
+                            std::memcpy(&refPixel, gs->m_vram + refOff, sizeof(refPixel));
+                        if (fastOff != refOff || fastPixel != refPixel)
+                            ++g605TriBad;
+                        if (g605ZWrite)
+                        {
+                            g403DisplayZWrite(x, y, ctx.frame.fbp, zi);
+                            if (g605DepthRow[x] != zi)
+                                ++g605TriBad;
+                        }
+                    }
+                    else
+                    {
+                        std::memcpy(gs->m_vram + fastOff, &fastPixel, sizeof(fastPixel));
+                        if (g605ZWrite)
+                            g605DepthRow[x] = zi;
+                    }
+                    ++g605TriPx;
+                    ++drawnAcc;
+                    continue;
+                }
+                ++g605TriBad; // out of VRAM: fail closed into the generic body below
+            }
 
             // G580 exact replay leaf. Coverage, Z interpolation, STQ interpolation, bilinear T8
             // sampling, and MODULATE all retain the established operation order. Only the final
@@ -2898,6 +3156,7 @@ void GSRasterizer::drawTriangle(GS *gs)
     // per-pixel diagnostic is active (those use shared static/atomic state that would race). The
     // costume RTT (fbp=0x139) is excluded. Bit-exact by construction; DEFAULT OFF pending a
     // full-frame golden diff before it is ever promoted to default-on.
+    g605cyc.markLoop(); // G605: everything above this line is the per-draw PROLOGUE
     {
         static const int s_g143Threads = []() {
             const char *e = std::getenv("DC2_G143_THREADS");
@@ -2939,10 +3198,19 @@ void GSRasterizer::drawTriangle(GS *gs)
         }
     }
 
+    // G605: f516cov is the count of pixels this call actually COMMITTED (the g143RangeFn lanes
+    // accumulate into it); g141BboxPx is the bbox area it walked. The ratio is what says whether a
+    // lever belongs in the pixel loop or in the prologue.
+    g605cyc.setPx(static_cast<uint64_t>(f516cov < 0 ? 0 : f516cov),
+                  static_cast<uint64_t>(g141BboxPx < 0 ? 0 : g141BboxPx));
+    g605cyc.setInside(static_cast<uint64_t>(g141InsidePx < 0 ? 0 : g141InsidePx));
+
     if (g570Cpu139)
         g570NoteCpu139(g570Cpu139Px, g570Cpu139Bad);
     if (g580Tri13b)
         g580NoteTri13b(g580Tri13bPx, g580Tri13bBad);
+    if (g605Tri)
+        g605NoteTriSpan(g605TriPx, g605TriBad, g605Fst);
 
     // G141 sub-profile flush (one atomic add per triangle, gated).
     {

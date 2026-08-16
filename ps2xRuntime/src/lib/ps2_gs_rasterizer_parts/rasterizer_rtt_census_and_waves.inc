@@ -187,6 +187,54 @@ enum G266FlushRej : int
 };
 static int g_g266FlushRej = kG266FrNone; // why the LAST g178TryFlushGpu returned false
 static int g_g266ClassifySite = -1;      // kG262Rej* site of the latest classify reject
+// ===== G603: THE DISPLAY BUFFER'S SUBTRACTIVE BLEND =====
+// `[G603:admit]` on route `s03` (the user's 2026-08-16 recording), 1,066 display CPU-fallback
+// batches / 137,449 entries:
+//
+//   cls=disp fbp=000  batches=534  entries=68760  allOk=188  allOkRelaxBlend=534
+//   cls=disp fbp=068  batches=532  entries=68689  allOk=187  allOkRelaxBlend=532
+//   shipped(blend=23474 ok=113975)                relaxBlend(ok=137449)
+//   [G603:blend] A=2 B=0 C=0 D=1 fix128=0 tpsm=0x13 entries=23474   <- ONE shape, 100% of them
+//
+// i.e. a SINGLE unimplemented ALPHA combo is the only thing keeping the display batch off the GPU,
+// and with it admitted EVERY entry of EVERY one of those batches classifies clean — measured with
+// the relax pass, not inferred (g534_admission_proof_true_but_insufficient).
+//
+// The combo is `((0 - Cs) * As) >> 7 + Cd` = `Cd - Cs*As/128`: source-alpha-weighted SUBTRACTIVE.
+// It is blend mode 4 (`Cd - Cs`, FIX=128, already promoted) with As in place of the fixed 128, so
+// the backend expresses it with the same GL_FUNC_REVERSE_SUBTRACT equation and the ordinary
+// GL_SRC_ALPHA factor — and the fragment shader's alpha output already carries GS's /128 weight
+// (`min(As*255/128, 1)`, G584), so this does NOT reintroduce the /255 factor error.
+//
+// SCOPE: display targets only, under the same g265 display-wave contract that gates mode 5. That
+// keeps it disjoint from the g256Exact program (legacy five RTT fbps), whose `d.blend & 3` packing
+// could not represent a 6.
+//
+// Bring-up default OFF (DC2_G603_SUBBLEND=1); rollback after promotion DC2_G603_NO_SUBBLEND=1.
+// ⛔ NOT given a DC2_G419_AB arm: admitting the batch changes WHICH authority produced the display
+// pixels and runs the g265 Z round-trip, so alternating it per frame would have the control frames
+// composite over the candidate's output (g569_no_ab_arm_for_an_authority_lever). Measure it with
+// alternating WHOLE RUNS on a scripted route, bucketed by window.
+static bool g603SubBlendOn()
+{
+    static const bool on = envFlagEnabled("DC2_G603_SUBBLEND") &&
+                           !envFlagEnabled("DC2_G603_NO_SUBBLEND");
+    return on;
+}
+
+// G603 (CENSUS-ONLY, always false on every shipped path). g603_admission_census.inc sets this for
+// one dry-run classification so "the blend combo is the LAST blocker" is measured rather than
+// inferred — see g534_admission_proof_true_but_insufficient. It is read ONLY on the blend REJECT
+// arm below, i.e. on a path that is already returning false, so an accepted entry never touches it
+// and the hot classifier's shape is unchanged (g602: a hot function's price can be its prologue).
+static thread_local bool t_g603RelaxBlend = false;
+// G604 (CENSUS-ONLY, same contract as t_g603RelaxBlend above, always false on every shipped path).
+// `depth` is the FIRST failing conjunct on ~100% of the `discov` entries, and a first failing
+// conjunct is not an admission proof (g534). This lets the census ask the only question a lever
+// design depends on: if a discovered target were given the same non-persistent guest-depth
+// contract G570/G586/G587 already hold, what would reject it NEXT? Read only on the depth
+// admission arm, which every accepted `discov` entry currently never reaches.
+static thread_local bool t_g604RelaxDepth = false;
 static const char *const kG266FrName[] = {
     "none", "off", "cpuonlyrtt", "fbw", "mixedtgt", "classify", "mixedz", "rttdepth",
     "colorzalias", "depthsetup", "texaliasz", "submit", "zreadback"};
@@ -531,6 +579,13 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         else if (a == 2u && b == 1u && c == 0u && d == 1u &&
                  g265DisplayZWaveOn() && g265DisplayTarget(ctx.frame.fbp))
             st.blend = 5; // G265 census: (0-Cd)*As>>7 + Cd == Cd*(1-As)
+        else if (a == 2u && b == 0u && c == 0u && d == 1u && g603SubBlendOn() &&
+                 g265DisplayZWaveOn() && g265DisplayTarget(ctx.frame.fbp))
+            st.blend = 6; // G603 census: (0-Cs)*As>>7 + Cd == Cd - Cs*As/128 (see the header above)
+        else if (t_g603RelaxBlend)
+        {
+            st.blend = 0; // G603 census pass 2 only — never reachable on a shipped path.
+        }
         else
         {
             g262NoteReject(kG262RejBlend, e);
@@ -652,9 +707,17 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
             // COLOR transient too: both authorities return to CPU/VRAM before the flush ends.
             // G583 adds G286's 0x13b on that same transient-colour contract — see
             // g583Trn13bWaveOn above for why this cannot reproduce G569's escaped writer.
-            const bool g262Rtt = g262WideOn() && g583WaveEligibleTarget(ctx.frame.fbp);
+            // G604: the discovered targets join this admission and NOTHING else. They are
+            // deliberately kept out of g583WaveEligibleTarget, whose other two uses select the
+            // FIX=128 blend modes 3/4 — widening those would be a second, unmeasured change
+            // riding on this one (g534: an admission proof answers ONE question).
+            const bool g262Rtt = g262WideOn() && (g583WaveEligibleTarget(ctx.frame.fbp) ||
+                                                  g604DiscovTransientTarget(ctx.frame.fbp));
             const bool g265Display = g265DisplayZWaveOn() && g265DisplayTarget(ctx.frame.fbp);
-            if (g242GpuDepthOn() || g262Rtt || g265Display)
+            // t_g604RelaxDepth is the census-only arm (see its declaration): it grants this entry
+            // the guest-depth contract it does not yet have, purely so the dry run can report the
+            // NEXT rejecting conjunct instead of stopping at this one.
+            if (g242GpuDepthOn() || g262Rtt || g265Display || t_g604RelaxDepth)
             {
                 const uint32_t zbpPage = static_cast<uint32_t>(ctx.zbuf & 0x1FFu);
                 const uint32_t zpsm = static_cast<uint32_t>((ctx.zbuf >> 24) & 0xFu);
@@ -689,6 +752,8 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
                     g586NoteTransient141Admission(static_cast<uint32_t>(e.prim.type));
                 else if (g587Transient15dTarget(ctx.frame.fbp))
                     g587NoteTransient15dAdmission(static_cast<uint32_t>(e.prim.type));
+                else if (g604DiscovTransientTarget(ctx.frame.fbp))
+                    g604NoteDiscovAdmission(static_cast<uint32_t>(e.prim.type)); // g538 path counter
                 return true;
             }
             g262NoteReject(kG262RejDepth, e);

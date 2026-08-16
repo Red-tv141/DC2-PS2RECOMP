@@ -207,6 +207,11 @@
         // master-gate comment above the loop).
         if (g295Diag)
         {
+        // G607: per-kick PC histogram. Pure observer -- reads currentPc, writes only its own
+        // counters, touches no guest state, so an armed run is bit-identical to an unarmed one.
+        // Only this DIAG copy of the loop carries it; the shipped copies compile it out.
+        if (g607Prof)
+            g607ProfPair(currentPc);
         if (s_g216CharExec && currentPc == 0x1d48u)
         {
             ++s_g216Stats.gate1d48;
@@ -1264,6 +1269,14 @@
         // trace, G32. Interior indentation intentionally unchanged.
         if (g295Diag)
         {
+
+        // G608: per-PROGRAM-POINT VU-RAM footprint. This region is POST-FETCH and PRE-EXECUTE
+        // (execLower/g422FastLower run far below), which is exactly the point where `m_state.vi`
+        // still holds the value LQI/SQI address with before their post-increment. Pure observer —
+        // reads `lower`, `currentPc` and the VI file, writes only its own bitmaps. Only this DIAG
+        // copy of the loop carries it.
+        if (g608Mem)
+            g608MemProfPair(currentPc, lower, m_state.vi);
 
         // G68: ADC-source histogram. The title 3D map renders flat-blue because all its vertices
         // reach the GS with ADC=1 (bit15 of the stored vertex word). Histogram EVERY integer store

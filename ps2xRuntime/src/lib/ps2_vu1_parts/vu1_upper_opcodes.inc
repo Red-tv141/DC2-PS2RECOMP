@@ -186,7 +186,13 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
             "DC2_G117_TS", "DC2_G132_COPYW", "DC2_G237_TRACE", "DC2_G70", "DC2_G198_GATE_TRACE",
             "DC2_G200_DET_TRACE", "DC2_G72_VI1", "DC2_G71_PROBE", "DC2_G72_DISP",
             "DC2_G140_CLIP", "DC2_G101_VFPROBE", "DC2_G102_STAT", "DC2_G108_2128_QCLIP",
-            "DC2_G108_2128_Q_STAT", "DC2_G106_FORCE_2128_MAC"};
+            "DC2_G108_2128_Q_STAT", "DC2_G106_FORCE_2128_MAC",
+            // G607: the per-kick control-flow profile is a per-cycle probe, so it registers here
+            // exactly as the note above requires. Arming it routes the run onto the diagnostic
+            // loop copy; the shipped body never grows a branch for it.
+            "DC2_G607_PROF",
+            // G608: the per-program-point VU-RAM footprint is likewise a per-cycle probe.
+            "DC2_G608_MEMPROF"};
         for (const char *n : k)
             if (std::getenv(n) != nullptr)
                 return true;
@@ -1141,6 +1147,17 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const uint64_t g483T1 = g483RunProf ? (uint64_t)std::chrono::duration_cast<
         std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0ull;
 
+    // G607: arm the per-kick control-flow profile for THIS run (default OFF). `g607Prof` is a
+    // loop-invariant bool consumed only by the DC2_VU1_LOOP_DIAG copy of the pair loop; every
+    // other copy compiles the reference out entirely.
+    const bool g607Prof = g607ProfBeginKick(vuCode, codeSize, m_state.pc, m_state.itop,
+                                            memory ? (memory->vif1_regs.top & 0x3FFu) : 0u,
+                                            s_g502Resume ? 1u : 0u);
+    (void)g607Prof;
+    // G608: arm the per-program-point VU-RAM footprint for THIS run (default OFF), same shape.
+    const bool g608Mem = g608MemBeginKick(vuCode, codeSize, m_state.pc);
+    (void)g608Mem;
+
         // G435: copies of the same loop body (vu1_g435_pair_loop.inc). The lean copy is
         // the identical body with the four never-executed G295 diagnostic regions removed by the
         // preprocessor. Selected only when no per-cycle probe can fire. G443 adds a third copy
@@ -1503,6 +1520,11 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
 #undef DC2_G443_FIXED
 #undef DC2_VU1_LOOP_DIAG
         }
+
+    // G607: close this kick's histogram and append it to the profile file (no-op when off).
+    g607ProfEndKick();
+    // G608: same, for this kick's per-program-point VU-RAM footprint.
+    g608MemEndKick();
 
     const uint64_t g483T2 = g483RunProf ? (uint64_t)std::chrono::duration_cast<
         std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0ull;

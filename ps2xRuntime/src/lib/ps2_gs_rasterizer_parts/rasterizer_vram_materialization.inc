@@ -1346,6 +1346,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const bool g570Transient13d = g570Transient13dTarget(fbp);
     const bool g586Transient141 = g586Transient141Target(fbp);
     const bool g587Transient15d = g587Transient15dTarget(fbp);
+    // G604: the same non-persistent contract, selected by PROPERTY (see rasterizer_command_graph).
+    const bool g604DiscovTrn = g604DiscovTransientTarget(fbp);
     if (g286Transient)
     {
         g_g286GpuAttempts.fetch_add(1u, std::memory_order_relaxed);
@@ -1425,6 +1427,15 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g_g587TransientAttempts.fetch_add(1u, std::memory_order_relaxed);
         g261PrepareCpuReplay();
     }
+    if (g604DiscovTrn)
+    {
+        // G604: a DISCOVERED target's address is not known in advance, so it must be assumed to
+        // be a physical sibling of the resident family exactly like 0x13d/0x141/0x15d — publish
+        // every resident sibling into guest VRAM before any framebuffer upload or texture decode
+        // can observe stale bytes. This is the same consumer edge G570/G586/G587 take, and it is
+        // the reason the contract is safe to select by property rather than by address.
+        g261PrepareCpuReplay();
+    }
     // G523 prologue lap P0: transient-target admission (and its g261PrepareCpuReplay).
     const auto g523P0 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
@@ -1479,7 +1490,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // for 0x0/0x68, applied to an arbitrary address. The value this lever buys is the 8-lane
     // band-parallel CPU replay below, not the GPU. Route it there explicitly.
     if (g527DiscoveredTarget(fbp) && !g570Transient13d && !g586Transient141 &&
-        !g587Transient15d)
+        !g587Transient15d && !g604DiscovTrn)
     {
         g_g266FlushRej = kG266FrCpuOnlyRtt;
         return false;
@@ -1562,6 +1573,21 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g_g144List[0].ctx.frame.psm == GS_PSM_CT32 &&
         std::all_of(g_g144List.begin(), g_g144List.end(), [](const G144Entry &e) {
             return e.ctx.frame.fbp == 0x15du && e.ctx.frame.fbw == 8u &&
+                   e.ctx.frame.psm == GS_PSM_CT32 &&
+                   (e.prim.type == GS_PRIM_SPRITE || e.prim.type == GS_PRIM_TRIANGLE ||
+                    e.prim.type == GS_PRIM_TRISTRIP);
+        });
+    // G604: G587's shape contract with the address turned into `this batch's own target`.
+    // `[G603:admit]` measured this contract holding on 100% of the batches of every discovered
+    // target it saw (shapeOk == batches for 0x15c/0x151/0x14d/0x15f/0x14c/0x162/0x13e/0x149),
+    // so it is a description of the population rather than a hopeful narrowing — but it stays
+    // fail-closed: any single entry that mixes target, width, format or primitive class returns
+    // the whole batch to the proven band replay.
+    const bool g604MeasuredShape =
+        g604DiscovTrn && fbw == 8u &&
+        g_g144List[0].ctx.frame.psm == GS_PSM_CT32 &&
+        std::all_of(g_g144List.begin(), g_g144List.end(), [fbp, fbw](const G144Entry &e) {
+            return e.ctx.frame.fbp == fbp && e.ctx.frame.fbw == fbw &&
                    e.ctx.frame.psm == GS_PSM_CT32 &&
                    (e.prim.type == GS_PRIM_SPRITE || e.prim.type == GS_PRIM_TRIANGLE ||
                     e.prim.type == GS_PRIM_TRISTRIP);
@@ -1717,7 +1743,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 depthRowLo = std::min(depthRowLo, static_cast<int>(st.scY0));
                 depthRowHi = std::max(depthRowHi, static_cast<int>(st.scY1));
                 if ((g282Candidate || g290Candidate || g570Candidate || g586MeasuredShape ||
-                     g587MeasuredShape ||
+                     g587MeasuredShape || g604MeasuredShape ||
                      g570Private139Candidate) &&
                     g282EntryHi >= g282EntryLo)
                 {
@@ -1732,7 +1758,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             rowLo = std::min(rowLo, static_cast<int>(st.scY0));
             rowHi = std::max(rowHi, static_cast<int>(st.scY1));
             if ((g282Candidate || g290Candidate || g570Candidate || g586MeasuredShape ||
-                 g587MeasuredShape ||
+                 g587MeasuredShape || g604MeasuredShape ||
                  g570Private139Candidate) &&
                 g282EntryHi >= g282EntryLo)
             {
@@ -2058,6 +2084,49 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         return false;
     }
 
+    // G604: identical admission to G586/G587 above, selected by property. Every real-Z batch must
+    // be the private ZBP=0xd0/Z24 tuple under g404SharedZScope — i.e. the batch's depth authority
+    // is the G403/G411 PRIVATE mirror, never aliased guest VRAM. Any drift falls back.
+    bool g604ExactDiscov =
+        g604MeasuredShape && g282RowHi >= g282RowLo &&
+        (!guestDepth ||
+         (guestZbpPage == 0x0d0u && guestZpsm == 1u &&
+          g282DepthHi >= g282DepthLo && g411SharedGpuDepthOn() &&
+          g404SharedZScope(fbp, fbw, guestZbpPage, guestZpsm)));
+    if (g604ExactDiscov)
+    {
+        rowLo = g282RowLo;
+        rowHi = g282RowHi;
+        if (guestDepth)
+        {
+            depthRowLo = g282DepthLo;
+            depthRowHi = g282DepthHi;
+        }
+        g_g604DiscovAdmits.fetch_add(1u, std::memory_order_relaxed);
+        // Publish the raw-alpha property for the backend TU (see ps2_gs_rasterizer.cpp).
+        g_g604RawAlphaFbpBits[(fbp >> 6) & 7u].fetch_or(1ull << (fbp & 63u),
+                                                        std::memory_order_relaxed);
+    }
+    if (g604DiscovTrn && !g604ExactDiscov)
+    {
+        const uint64_t n =
+            g_g604DiscovRejectShape.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (g604DiscovStatOn() && (n <= 8u || (n % 120u) == 0u))
+            std::fprintf(stderr,
+                         "[G604:discov-reject] n=%llu fbp=0x%x fbw=%u measured=%u entries=%zu "
+                         "rows=%d..%d zrows=%d..%d guestZ=%u zwrite=%u zbp=0x%x zpsm=%u "
+                         "admits=%llu\n",
+                         (unsigned long long)n, fbp, fbw, g604MeasuredShape ? 1u : 0u,
+                         g_g144List.size(), g282RowLo, g282RowHi,
+                         g282DepthLo, g282DepthHi, guestDepth ? 1u : 0u,
+                         guestDepthWrites ? 1u : 0u, guestZbpPage, guestZpsm,
+                         (unsigned long long)g_g604DiscovAdmits.load(std::memory_order_relaxed));
+        g_g266FlushRej = kG266FrCpuOnlyRtt;
+        g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+        g581InvalidateCpuFallbackSnapshots();
+        return false;
+    }
+
     // G570: G403/G411 makes this depth surface a private authority shared by CPU and GPU.  Under
     // that contract the historical CT32/Z24 page overlap is not a live alias.  Keep admission
     // deliberately narrow: one measured target/layout, read-only private Z, classifier-approved
@@ -2180,7 +2249,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // ranges overlap; both immediate readbacks restore CPU authority before this flush ends.
         const bool colorZAlias = rawColorZAlias && !g282SeededColorZ && !g290Seeded &&
                                   !g570Exact13d && !g586Exact141 && !g587Exact15d &&
-                                  !g570Exact139;
+                                  !g570Exact139 &&
+                                  // G604: same argument as the three transient contracts above —
+                                  // this batch's depth is the G403/G411 private mirror, so the
+                                  // historical CT32/Z24 page overlap is not a live alias, and both
+                                  // authorities are read back before the flush ends.
+                                  !g604ExactDiscov;
         if (g570Exact13d && g570Transient13dStatOn())
         {
             static uint64_t s_g570Admit = 0u;
@@ -2468,8 +2542,17 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // lands in the persistent FBO), and publish the pending union at the next different target or a
     // consumer edge. If a pending readback exists for a DIFFERENT target/width, publish it first so
     // that stale target is never read by this batch.
+    // G604 (oracle validity, not a behaviour arm): the same-run display oracle compares the GPU
+    // result against the CPU replay through `s_batch.readback`. A coalesced readback leaves that
+    // vector empty, so g255StageGpuVerify's size check fails closed and the oracle silently
+    // reports ZERO checks on the very population it exists to cover — the exact defect
+    // (g589_oracle_with_zero_checks) this phase was opened to repair. Only the verify flag
+    // disarms it, so the shipped default path is unchanged. g261WaveOn is deliberately NOT
+    // declined here: g265DisplayZWaveOn rides it, and killing it would un-admit every display
+    // batch and give the oracle nothing to check for the opposite reason.
     const bool g276Coalesce = g276DisplayRbOn() && g265DisplayTarget(fbp) &&
-                              !g261Wave && !g272Wave && !g255Rtt;
+                              !g261Wave && !g272Wave && !g255Rtt &&
+                              !g604VerifyDispOn();
     if (g265DisplayTarget(fbp))
         g600NoteDisplayBatch(fbp, fbw, rowLo, rowHi, g276Coalesce, g261Wave, g272Wave, g255Rtt,
                              guestDepth);
@@ -2481,7 +2564,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // alpha RTT store rides the batch flag so the backend does not depend on the G255 env var.
     s_batch.skipReadback = g261Wave || g272Wave || g276Coalesce;
     s_batch.rttRawAlpha = g255Rtt || g286Transient || g570Exact13d || g586Exact141 ||
-                          g587Exact15d;
+                          g587Exact15d || g604ExactDiscov;
 
     // Depth-clear on target change: mirror g106TitleZClearIfNeeded's fbp-transition semantics and
     // keep the CPU private-Z state machine in sync for any CPU-fallback flush in between.
@@ -4266,7 +4349,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         static const bool s_g263Off = envFlagEnabled("DC2_G263_NO_BILIN_BIND");
                         if (!s_g263Off)
                         {
-                            bind = g263BilinearSpriteBind(e, st, r);
+                            bind = g263BilinearSpriteBind(e, st, r, nullptr, kG261Fbp[t]);
                             if (bind)
                                 g_g263FboBindBi.fetch_add(1u, std::memory_order_relaxed);
                         }
@@ -5358,7 +5441,19 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g286Transient && g583Trn13bWaveTarget(fbp) && guestDepth &&
         guestZbpPage == 0x0d0u && guestZpsm == 1u && g411PrivateDepth &&
         depthRowHi >= depthRowLo;
+    // G604: the DISPLAY batch arm. Same shape as G586/G587 — the batch is admitted on the
+    // established g265 display-Z wave contract, and its depth (when it carries any) is the
+    // G403/G411 private ZBP=0xd0/Z24 mirror, which is what makes g570StageDepthVerify's
+    // snapshot/restore valid. A depth-less display batch verifies colour only.
+    const bool g604ExactDisp =
+        g604VerifyDispOn() && !g255Rtt && g265DisplayZWaveOn() && g265DisplayTarget(fbp) &&
+        rowHi >= rowLo &&
+        (!guestDepth ||
+         (guestZbpPage == 0x0d0u && guestZpsm == 1u && g411PrivateDepth &&
+          depthRowHi >= depthRowLo));
+    const bool g604VerifyDsc = g604ExactDiscov && g604VerifyDiscovOn();
     if (((g255Rtt || (g286Transient && g286VerifyOn())) && !guestDepth) ||
+        g604ExactDisp || g604VerifyDsc ||
         (g583Exact13b && g583Verify13bOn()) ||
         (g586Exact141 && g586Verify141On()) ||
         (g587Exact15d && g587Verify15dOn()) ||
@@ -5367,7 +5462,67 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     {
         const bool verifyPrivateDepth =
             ((g570Exact13d || g583Exact13b) && guestDepth && guestDepthWrites) ||
-            ((g586Exact141 || g587Exact15d) && guestDepth);
+            ((g586Exact141 || g587Exact15d || g604ExactDisp || g604VerifyDsc) && guestDepth);
+        // g538: prove the arms diverged. Count the draws this batch built on the G603 blend mode
+        // before the oracle consumes the batch; a run with subDraws=0 in BOTH arms has measured
+        // nothing about the admission under test.
+        g_g604PendIsDiscov = g604ExactDiscov;
+        g_g604PendUpload = (s_batch.uploadFb ? 1u : 0u) | (g261ForceNoUpload ? 2u : 0u) |
+                           (snap.valid ? 4u : 0u) | (g289ConsumeOwner ? 8u : 0u);
+        g_g604PendSubDraws = 0u;
+        g_g604PendFboSrcDraws = 0u;
+        g_g604PendSubVerts = 0u;
+        g_g604PendSubX0 = 1 << 30; g_g604PendSubX1 = -(1 << 30);
+        g_g604PendSubY0 = 1 << 30; g_g604PendSubY1 = -(1 << 30);
+        if (g604ExactDisp)
+        {
+            for (const G178Draw &d : s_batch.draws)
+            {
+                if (d.blend == 6u)
+                {
+                    ++g_g604PendSubDraws;
+                    g_g604PendSubVerts += static_cast<uint32_t>(d.vtxCount);
+                    // ⭐ THE ATTRIBUTION TEST. A SUB batch is ~50 ordinary entries plus ONE
+                    // mode-6 draw, so "SUB batches diverge more" does not by itself convict the
+                    // admission — the batch could simply be harder. Union the mode-6 draws'
+                    // screen bounding box (verts are already in the compare loop's GS space:
+                    // g178PushVertex stores v.x-ofx, v.y-ofy) and split the pixel census by it.
+                    for (int v = d.firstVtx; v < d.firstVtx + d.vtxCount; ++v)
+                    {
+                        const G178Vtx &vv = s_batch.verts[static_cast<size_t>(v)];
+                        const int vx = static_cast<int>(std::floor(vv.x));
+                        const int vy = static_cast<int>(std::floor(vv.y));
+                        if (vx < g_g604PendSubX0) g_g604PendSubX0 = vx;
+                        if (vx > g_g604PendSubX1) g_g604PendSubX1 = vx;
+                        if (vy < g_g604PendSubY0) g_g604PendSubY0 = vy;
+                        if (vy > g_g604PendSubY1) g_g604PendSubY1 = vy;
+                    }
+                    if (g_g604PendSubDraws == 1u)
+                    {
+                        g_g604PendSubTfx = d.tfx;
+                        g_g604PendSubTcc = d.tcc;
+                        g_g604PendSubBilinear = d.bilinear ? 1u : 0u;
+                        g_g604PendSubTexKey = d.texKey;
+                        g_g604PendSubSrcFbp = d.srcFbp;
+                    }
+                }
+                // An FBO-sourced draw samples the resident target on the GPU arm and that
+                // target's guest-VRAM bytes on the CPU arm — the oracle's suspected floor.
+                if (d.srcFbp != 0u)
+                    ++g_g604PendFboSrcDraws;
+            }
+            // Recover the GS state of the first mode-6 ENTRY (the draw carries only the classified
+            // form). ALPHA/TEX0 are what a blend-exactness argument has to be made against.
+            if (g_g604PendSubDraws != 0u)
+                for (size_t i = 0; i < g_g144List.size() && i < s_states.size(); ++i)
+                    if (s_states[i].blend == 6u)
+                    {
+                        g_g604PendSubAlpha = g_g144List[i].ctx.alpha;
+                        g_g604PendSubTpsm = g_g144List[i].ctx.tex0.psm;
+                        g_g604PendSubTme = g_g144List[i].prim.tme ? 1u : 0u;
+                        break;
+                    }
+        }
         g255BeginVerify(vram, vramSize, fbp, fbw, fbW, rowLo, rowHi,
                         verifyPrivateDepth, depthRowLo, depthRowHi);
     }
@@ -5396,7 +5551,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // counts as zbad. That is what made G583 read zbad ~= bad and collapse 16x under
         // DC2_G535_NO_EDGEPUB=1 -- an artifact of measuring THROUGH the deferral, not a defect.
         // Only the verify flag disarms it, so the shipped default path is unchanged.
-        !g583Verify13bOn() && !g586Verify141On() && !g587Verify15dOn();
+        // G604 rides the same disarm: the display oracle samples the private mirror right after
+        // the submit, and a deferred readback has not written it yet, so every pixel the CPU
+        // replay then writes would count as zbad.
+        !g583Verify13bOn() && !g586Verify141On() && !g587Verify15dOn() &&
+        !g604VerifyDispOn() && !g604VerifyDiscovOn();
     if (g278DeferDepth && !g278OwnerEligible)
         g_g337WideDefer.fetch_add(1u, std::memory_order_relaxed);
     if (g337ZAuthOn() && g262WaveDepth && guestDepthWrites && !g278DeferDepth)
@@ -5875,7 +6034,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // remember any other affected Z rows so a later same-key wave cannot use stale depth.
         if (g278ColorWrite.valid)
             g278MarkStaleRowsForRange(g278ColorWrite); // marks every overlapped pending owner
-        if (g286Transient || g570Exact13d || g586Exact141 || g587Exact15d)
+        if (g286Transient || g570Exact13d || g586Exact141 || g587Exact15d || g604ExactDiscov)
         {
             // Unlike display color, this work target is consumed later as ordinary VRAM. Publish
             // the same page generations an inline draw would advance, after bytes really changed.
@@ -6514,6 +6673,28 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // Read-only private depth is unchanged by the GPU arm. Restore color, replay on CPU, and
         // compare every CT32 pixel; the CPU result remains authoritative during verification.
         g255StageGpuVerify(vram, vramSize, s_batch.readback, kFbH);
+        g_g178FbSnap.erase(fbp);
+        return false;
+    }
+    if (g604VerifyDsc)
+    {
+        // G604 discov oracle: identical contract to the G586/G587 arms — keep the GPU colour and
+        // the private-Z result only as the comparison arm, restore both pre-batch authorities,
+        // and let the banded CPU replay stay authoritative for the whole run.
+        g255StageGpuVerify(vram, vramSize, s_batch.readback, kFbH);
+        g570StageDepthVerify();
+        g_g178FbSnap.erase(fbp);
+        return false;
+    }
+    if (g604ExactDisp)
+    {
+        // G604: identical oracle contract to the transient arms above. Keep the GPU display
+        // colour and the private-Z result only as the comparison arm, restore both pre-batch
+        // authorities, and let the established banded CPU replay stay authoritative for the run.
+        // Returning false is what makes this an ORACLE rather than a second renderer — and it is
+        // also why an oracle run is NOT a timing run: every display batch falls back by design.
+        g255StageGpuVerify(vram, vramSize, s_batch.readback, kFbH);
+        g570StageDepthVerify();
         g_g178FbSnap.erase(fbp);
         return false;
     }

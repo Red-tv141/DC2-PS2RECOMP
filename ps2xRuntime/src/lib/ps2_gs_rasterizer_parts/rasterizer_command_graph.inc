@@ -372,6 +372,78 @@ static bool g587Transient15dStatOn()
     return s_on;
 }
 
+// ===== G604: the G527-DISCOVERED targets, as a PROPERTY instead of a fourth hardcoded address ====
+//
+// `discov` is 47.8% of route s03's CPU band-replay wall (23.4 s of 49.1 s) and it is the single
+// largest remaining fallback population in the arc. `[G603:admit]` re-run with a DEPTH-relax pass
+// (G604) prices it exactly: on 13,259 of the 13,348 big discovered batches, `depth` is the ONLY
+// classifier blocker, and with it relaxed EVERY entry of EVERY one of those batches classifies
+// clean — 5.4 M entries across 0x15c/0x151/0x14d/0x15f/0x14c/0x162/0x13e, all `zbp=0x0d0 zpsm=1`
+// (Z24), ~100% textured and Z-writing, and the G586/G587 transient shape contract holding on
+// 100% of batches. (0x149 is the one exception: `atest` survives the relax on 78,571 entries, so
+// it stays on the CPU replay and is a separate lever.)
+//
+// This is therefore not a new contract — it is the contract G570/G586/G587 already built THREE
+// times for three hardcoded addresses (0x13d / 0x141 / 0x15d), generalized to the property those
+// addresses share. Nothing about it is address-specific:
+//   * non-persistent: colour and Z both return to CPU/VRAM authority before the flush ends, so
+//     there is no residency to escape and no cross-frame ownership to break;
+//   * the Z it touches is the G403/G411 PRIVATE mirror (g404SharedZScope), not aliased VRAM;
+//   * any shape drift returns the whole batch to the proven band replay.
+//
+// ⛔ This is deliberately NOT `g248TargetIndex` widening. That is G569, DEMOTED for a
+// user-verified escaped-writer defect on every jump/dash. G569 granted RESIDENCY; this claims
+// none, which is exactly why it cannot reproduce that defect.
+bool g604DiscovTransientOn()
+{
+    static const bool s_on =
+        (envFlagEnabled("DC2_G604_DISCOV_TRANSIENT") || g604VerifyDiscovOn()) &&
+        !envFlagEnabled("DC2_G604_NO_DISCOV_TRANSIENT") &&
+        !envFlagDisabled("DC2_G604_DISCOV_TRANSIENT");
+    return s_on && g260NrOn() && g262WideOn();
+}
+
+bool g604DiscovTransientTarget(uint32_t fbp)
+{
+    // Every target that already has an owner keeps its own gate: the legacy five residency slots,
+    // the three hardcoded transient contracts, 0x13b, and the two display buffers. What is left
+    // is exactly the population `[G603:admit]` measured.
+    return g604DiscovTransientOn() && g527DiscoveredTarget(fbp) &&
+           g248TargetIndex(fbp) < 0 && fbp != 0u && fbp != 0x68u &&
+           !g570Transient13dTarget(fbp) && !g586Transient141Target(fbp) &&
+           !g587Transient15dTarget(fbp) &&
+           // g583Trn13bWaveTarget is defined in rasterizer_rtt_census_and_waves.inc, which this
+           // file PRECEDES in the include order — but it implies g286TransientTarget, so
+           // excluding that excludes it.
+           !g286TransientTarget(fbp);
+}
+
+static bool g604DiscovStatOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G604_STAT") || g604VerifyDiscovOn();
+    return s_on;
+}
+
+static std::atomic<uint64_t> g_g604DiscovAdmits{0}, g_g604DiscovRejectShape{0};
+
+static void g604NoteDiscovAdmission(uint32_t prim)
+{
+    if (!g604DiscovStatOn())
+        return;
+    static uint64_t total = 0u, sprite = 0u, tri = 0u, strip = 0u;
+    ++total;
+    sprite += prim == GS_PRIM_SPRITE ? 1u : 0u;
+    tri += prim == GS_PRIM_TRIANGLE ? 1u : 0u;
+    strip += prim == GS_PRIM_TRISTRIP ? 1u : 0u;
+    if (total <= 8u || (total % 65536u) == 0u)
+        std::fprintf(stderr,
+                     "[G604:admitdiscov] n=%llu sprite=%llu tri=%llu strip=%llu\n",
+                     static_cast<unsigned long long>(total),
+                     static_cast<unsigned long long>(sprite),
+                     static_cast<unsigned long long>(tri),
+                     static_cast<unsigned long long>(strip));
+}
+
 static void g587NoteTransient15dAdmission(uint32_t prim)
 {
     if (!g587Transient15dStatOn())

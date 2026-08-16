@@ -178,8 +178,15 @@ static bool g580SharedClutBatchSelected(const std::vector<G144Entry> &entries)
     return g580Tri13bSelected();
 }
 
-static bool g580PrepareSharedCluts(const std::vector<G144Entry> &entries,
-                                   const G580ClutFillFn &fill)
+// G605: the eligibility predicate is now a PARAMETER. Everything below it is state-general — the
+// CLUT key is built from tex0/texa/texclut and the sampler state from tex0/clamp, none of which is
+// 0x13b-specific — so G605's wider property reuses this body unchanged rather than forking it.
+// `g580PrepareSharedCluts` keeps its original meaning as the G580-predicate wrapper.
+using G605EligibleFn = bool (*)(const G144Entry &);
+
+static bool g580PrepareSharedClutsWith(const std::vector<G144Entry> &entries,
+                                       const G580ClutFillFn &fill,
+                                       G605EligibleFn eligibleFn)
 {
     struct BuildKey
     {
@@ -201,7 +208,7 @@ static bool g580PrepareSharedCluts(const std::vector<G144Entry> &entries,
     for (size_t i = 0; i < entries.size(); ++i)
     {
         const G144Entry &e = entries[i];
-        if (!g580SharedEntryEligible(e))
+        if (!eligibleFn(e))
             continue;
         ++eligible;
         const G580ClutKey key{
@@ -255,7 +262,7 @@ static bool g580PrepareSharedCluts(const std::vector<G144Entry> &entries,
         }
     }
 
-    if (g580Tri13bStatOn())
+    if (g580Tri13bStatOn() || envFlagEnabled("DC2_G605_STAT"))
     {
         static std::atomic<uint64_t> batches{0u}, totalEligible{0u}, totalShared{0u};
         const uint64_t n = batches.fetch_add(1u, std::memory_order_relaxed) + 1u;
@@ -270,6 +277,12 @@ static bool g580PrepareSharedCluts(const std::vector<G144Entry> &entries,
                          g_g580SharedCluts.size(), minRefs);
     }
     return shared != 0u;
+}
+
+static bool g580PrepareSharedCluts(const std::vector<G144Entry> &entries,
+                                   const G580ClutFillFn &fill)
+{
+    return g580PrepareSharedClutsWith(entries, fill, &g580SharedEntryEligible);
 }
 
 static void g580BindSharedSample(size_t entryIndex)

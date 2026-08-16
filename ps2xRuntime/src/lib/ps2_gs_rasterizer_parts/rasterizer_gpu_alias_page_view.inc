@@ -2130,6 +2130,45 @@ static bool g599InWindow()
     const uint32_t sf = g_dc2ScriptFrame.load(std::memory_order_relaxed);
     return sf >= lo && (hi == 0u || sf <= hi);
 }
+// ===== G601 (default OFF): the `s05` hair-band flicker instruments =====
+// Measured: on every 4th guest frame ALL 51 sprites of the `0x13a` glow composite (tbp=0x2740,
+// CT32, tbw=8, bilinear FST sprites) decode guest VRAM instead of binding the producer FBO, and
+// guest VRAM is BLACK there — the band vanishes for one frame. `[G599:bind]` names the failing
+// conjunct as `dirty=0`, and the transition 1 -> 0 happens INSIDE the first entry's own per-target
+// pass, i.e. that entry's bind was refused and its fallback materialized the target. These two
+// probes answer the two remaining questions in one run:
+//   DC2_G601_REJ=1  `[G601:rej]` — WHY g263BilinearSpriteBind refused a sprite, uncapped and
+//                   windowed on the script clock (the shipped `[G263:rej]` caps at 16 lines from
+//                   process start, which this route consumes ~100 s before the window opens).
+//   DC2_G601_MAT=1  `[G601:mat]` — every g261Materialize of the traced target, with the mean of the
+//                   band rectangle IN THE FBO BUFFER THAT IS ABOUT TO BE PUBLISHED. A black FBO and
+//                   a black publication are different bugs and this separates them.
+//   DC2_G601_FBP=<hex>  target to trace (default 0x13a) · DC2_G601_SF_LO/_HI (falls back to G599's)
+static bool g601RejOn()
+{
+    static const bool on = envFlagEnabled("DC2_G601_REJ");
+    return on;
+}
+static bool g601MatOn()
+{
+    static const bool on = envFlagEnabled("DC2_G601_MAT");
+    return on;
+}
+static uint32_t g601Fbp()
+{
+    static const uint32_t v = []() -> uint32_t {
+        const char *e = std::getenv("DC2_G601_FBP");
+        return e != nullptr ? static_cast<uint32_t>(std::strtoul(e, nullptr, 16)) : 0x13au;
+    }();
+    return v;
+}
+static bool g601Window()
+{
+    static const uint32_t lo = g599EnvU32("DC2_G601_SF_LO", g599EnvU32("DC2_G599_SF_LO", 0u));
+    static const uint32_t hi = g599EnvU32("DC2_G601_SF_HI", g599EnvU32("DC2_G599_SF_HI", 0u));
+    const uint32_t sf = g_dc2ScriptFrame.load(std::memory_order_relaxed);
+    return sf >= lo && (hi == 0u || sf <= hi);
+}
 // ===== G599 CEILING PROBE (default OFF, knowingly incorrect): delete ONE publication's write =====
 // `DC2_G400_NO_RESIDENT_139=1` fixes the sky but also halves the frame rate and removes the whole
 // GPU path, so it cannot say WHICH of residency's effects matters. This probe deletes exactly one:
@@ -2480,6 +2519,38 @@ static void g261Materialize(int ti, int cause)
                                 r.dirtyHi + 1, r.dirtyLo, r.dirtyHi,
                                 /*legacy=*/!g432Fast);
             g536RestoreGuestOwnedPages(s_g536Saved, vram, g_g261VramSize);
+            if (g601MatOn() && fbp == g601Fbp() && g601Window())
+            {
+                // Mean of the hair-band rectangle in the buffer just read back from the FBO.
+                // Layout: `rows` rows of r.fbW, GL bottom-first, so buffer row k = GS row
+                // (r.dirtyHi - k) — the same mapping g418UnpackColorRows was handed above.
+                double sum = 0.0;
+                uint64_t nPx = 0u;
+                for (int y = 140; y <= 200; ++y)
+                {
+                    if (y < r.dirtyLo || y > r.dirtyHi)
+                        continue;
+                    const size_t row = static_cast<size_t>(r.dirtyHi - y);
+                    for (int x = 420; x <= 485 && x < r.fbW; ++x)
+                    {
+                        const size_t o = row * static_cast<size_t>(r.fbW) +
+                                         static_cast<size_t>(x);
+                        if (o >= s_g261Px.size())
+                            continue;
+                        const uint32_t c = s_g261Px[o];
+                        sum += static_cast<double>((c & 0xFFu) + ((c >> 8) & 0xFFu) +
+                                                   ((c >> 16) & 0xFFu));
+                        ++nPx;
+                    }
+                }
+                std::fprintf(stderr,
+                             "[G601:mat] sf=%u fbp=0x%x cause=%d rows=%d..%d fbW=%d cov=%d..%d "
+                             "guarded=%zu bandFboMean=%.2f n=%llu\n",
+                             g_dc2ScriptFrame.load(std::memory_order_relaxed), fbp, cause,
+                             r.dirtyLo, r.dirtyHi, r.fbW, r.covLo, r.covHi, s_g536Saved.size(),
+                             nPx ? sum / static_cast<double>(nPx) / 3.0 : -1.0,
+                             static_cast<unsigned long long>(nPx));
+            }
             if (g599)
                 g599ReportPublish(ti, fbp, cause, r, r.dirtyLo, r.dirtyHi, vram, g599N,
                                   s_g536Saved.size());
@@ -4762,11 +4833,48 @@ static bool g278FlushPendingDepthForInline(const GSPrimReg &prim,
 // REPEAT consumers with edge taps (GL would clamp where the CPU wraps), taps past the covered
 // rows (FBO content undefined there), taps past the DECLARED texture dims (the CPU folds at
 // texW/texH, the fbW×512 FBO space does not).
+// ===== G601 FIX (DEFAULT ON, rollback DC2_G601_NO_EMPTYBIND=1) =====
+// A PRIMITIVE WITH NO COVERED PIXEL CENTRE HAS NO TAPS, SO THE ADMISSION CRITERION IS VACUOUSLY
+// SATISFIED — NOT UNPROVABLE.
+//
+// `g263BilinearSpriteBind` admits a bilinear FST sprite when "every tap that can carry NONZERO
+// weight lands on an FBO-defined texel". When an axis covers no GL pixel centre at all
+// (`cL < cF`, or a zero-extent axis) there is no such tap, so the criterion holds for the empty
+// set — yet the shipped code returned false and sent the entry to the fallback, whose first act is
+// `g261Materialize(target)`. That publication clears `dirty`, and the `if (!r.dirty) continue;`
+// gate at the top of the bind loop then refuses the FBO to **every later entry of the same batch**.
+//
+// Measured on `s05` (route10-s05-bandage, sf 6958..6985): the `0x13a` hair-band glow composite is
+// 51 bilinear FST sprites reading tbp=0x2740. On sf 6963 / 6972 / 6981 — and only there — exactly
+// ONE of them is sub-pixel on one axis (e.g. y = 1983.688..1984.000, cF=1984.50 > cL=1983.50).
+// Its rejection materialized 0x13a with `cause=5 guarded=73`: the G536 page-ownership guard
+// withheld the 73 pages `0x13a`'s window shares with sibling target `0x159` (whose own
+// publication, two targets earlier in the same per-entry pass, had just moved their generations),
+// so guest VRAM kept BLACK where the band is while the FBO held it (`bandFboMean=57.05`). The
+// other 50 sprites then decoded that black VRAM and Monica's hair band vanished for one frame.
+//
+// Admitting the empty primitive is exact: `s_g261FboSrc` is consumed only when the batch is built
+// for the GPU backend, where a quad covering no pixel centre emits no fragment either way. A
+// tap-bounds QUERY (`outTaps != nullptr`, G280's alias screen) has no footprint to report and
+// still fails closed.
+static std::atomic<uint64_t> g_g601EmptyAdmit{0};
+static bool g601NoEmptyBind()
+{
+    static const bool off = envFlagEnabled("DC2_G601_NO_EMPTYBIND");
+    return off;
+}
+static bool g601StatOn()
+{
+    static const bool on = envFlagEnabled("DC2_G601_STAT");
+    return on;
+}
 static bool g263BilinearSpriteBind(const G144Entry &e, const G178EntryState &st,
-                                   const G261Res &r, int *outTaps = nullptr)
+                                   const G261Res &r, int *outTaps = nullptr,
+                                   uint32_t g601Tag = 0u)
 {
     const GSVertex &q0 = e.v[0];
     const GSVertex &q1 = e.v[1];
+    const bool g601Rej = g601RejOn() && g601Tag == g601Fbp() && g601Window();
     int tapLo[2] = {0, 0}, tapHi[2] = {0, 0};
     for (int a = 0; a < 2; ++a)
     {
@@ -4779,7 +4887,29 @@ static bool g263BilinearSpriteBind(const G144Entry &e, const G178EntryState &st,
         const float cF = std::ceil(lo - 0.5f) + 0.5f;
         const float cL = std::ceil(hi - 0.5f) - 0.5f;
         if (!(cL >= cF) || p1 == p0)
-            return false; // degenerate/empty axis — nothing provable, materialize instead
+        {
+            // No GL pixel centre on this axis (or a zero-extent axis): the primitive has no tap
+            // with nonzero weight, so admission is vacuous — see the G601 header above.
+            if (g601Rej)
+                std::fprintf(stderr,
+                             "[G601:rej] sf=%u fbp=0x%x why=degenerate axis=%d p=%.3f..%.3f "
+                             "t=%.3f..%.3f cF=%.2f cL=%.2f | xy0=(%.2f,%.2f) xy1=(%.2f,%.2f) "
+                             "uv0=(%u,%u) uv1=(%u,%u)\n",
+                             g_dc2ScriptFrame.load(std::memory_order_relaxed), g601Tag, a,
+                             lo, hi, t0, t1, cF, cL, q0.x, q0.y, q1.x, q1.y,
+                             q0.u, q0.v, q1.u, q1.v);
+            if (outTaps != nullptr || g601NoEmptyBind())
+                return false; // a tap-bounds QUERY has no footprint to report — fail closed
+            const uint64_t n = g_g601EmptyAdmit.fetch_add(1u, std::memory_order_relaxed) + 1u;
+            if (g601StatOn() && (n <= 8u || (n % 256u) == 0u))
+                std::fprintf(stderr,
+                             "[G601:empty] admit=%llu sf=%u fbp=0x%x axis=%d p=%.3f..%.3f "
+                             "cF=%.2f cL=%.2f\n",
+                             static_cast<unsigned long long>(n),
+                             g_dc2ScriptFrame.load(std::memory_order_relaxed), g601Tag, a,
+                             lo, hi, cF, cL);
+            return true;
+        }
         const float g = (t1 - t0) / (p1 - p0);
         const float shift = -0.5f * g; // drawSprite left-edge (0.0) bias, exactly as pushed
         const float sA = t0 + (cF - p0) * g + shift;
@@ -4796,6 +4926,16 @@ static bool g263BilinearSpriteBind(const G144Entry &e, const G178EntryState &st,
     const bool uOk = (tapLo[0] >= 0 || (clampU && tapLo[0] == -1)) && tapHi[0] <= maxCol;
     const bool vOk = (tapLo[1] >= r.covLo || (clampV && r.covLo == 0 && tapLo[1] == -1)) &&
                      tapHi[1] <= maxRow;
+    if (g601Rej && !(uOk && vOk))
+        std::fprintf(stderr,
+                     "[G601:rej] sf=%u fbp=0x%x why=tap uOk=%u vOk=%u tapU=%d..%d tapV=%d..%d "
+                     "maxCol=%d maxRow=%d cov=%d..%d fbW=%d tex=%dx%d wrap=%u%u | "
+                     "xy0=(%.2f,%.2f) xy1=(%.2f,%.2f) uv0=(%u,%u) uv1=(%u,%u)\n",
+                     g_dc2ScriptFrame.load(std::memory_order_relaxed), g601Tag,
+                     uOk ? 1u : 0u, vOk ? 1u : 0u, tapLo[0], tapHi[0], tapLo[1], tapHi[1],
+                     maxCol, maxRow, r.covLo, r.covHi, r.fbW, st.texW, st.texH,
+                     static_cast<unsigned>(st.wrapU), static_cast<unsigned>(st.wrapV),
+                     q0.x, q0.y, q1.x, q1.y, q0.u, q0.v, q1.u, q1.v);
     if (!(uOk && vOk) && g262CensusOn())
     {
         static std::atomic<uint32_t> s_g263RejLog{0};

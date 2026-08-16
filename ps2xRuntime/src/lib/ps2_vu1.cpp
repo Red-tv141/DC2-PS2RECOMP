@@ -1,6 +1,6 @@
 ﻿// G520: `macscan` — g430ResolveAt (vu1_g421_fast_upper.inc) resolves the architectural MAC with a
 // branchless tree reduction instead of a serial branchy scan of the 8-slot history ring. Content
-// edit here forces MSBuild to consume the .inc (G359). revision: 26 (G555 hot-1110 fragment)
+// edit here forces MSBuild to consume the .inc (G359). revision: 27 (G607 pc profile)
 #include "ps2_vu1_parts/vu1_helpers_and_tables.inc"
 #include "ps2_vu1_parts/vu1_g370_store_watch.inc"
 #include "ps2_g480_packet_pool.inc"
@@ -18,6 +18,14 @@
 // G533: immutable microprogram-fragment plans and static exact-source specialization
 //       (v8 promoted default-on; direct exact-block gate with G531-canonical fallback).
 #include "ps2_vu1_parts/vu1_g483_run_cycles.inc"
+// G607: per-kick VU1 control-flow profile (default OFF, DC2_G607_PROF=1). Observer only; lives
+// in the DC2_VU1_LOOP_DIAG copy of the pair loop, so the shipped body is untouched. Must precede
+// vu1_upper_opcodes.inc, which arms it at run() entry.
+#include "ps2_vu1_parts/vu1_g607_pc_profile.inc"
+// G608: per-PROGRAM-POINT VU-RAM read/write footprint (default OFF, DC2_G608_MEMPROF=1). The one
+// precondition G607 parked program-point GPU batching behind. Observer only, same DIAG-copy
+// discipline as G607, and likewise must precede vu1_upper_opcodes.inc which arms it at run() entry.
+#include "ps2_vu1_parts/vu1_g608_mem_profile.inc"
 #include "ps2_vu1_parts/vu1_upper_opcodes.inc"
 #include "ps2_vu1_parts/vu1_lower_opcodes.inc"
 #include "ps2_vu1_parts/vu1_dispatch_and_sync.inc"

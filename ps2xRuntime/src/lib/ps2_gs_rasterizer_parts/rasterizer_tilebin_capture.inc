@@ -240,6 +240,11 @@
                 // gated on g290P — the entry weight is the whole point and must not require the
                 // probe's per-flush clock pair to be armed.
                 g583NoteFallback(g_g144List);
+                // G603 (default-off, DC2_G603_ADMIT=1): the same choke point, asking the question
+                // G583's reason code cannot answer — WOULD the classifier admit these entries, and
+                // if not, is the first failing conjunct the last one? Must follow g583NoteFallback:
+                // the dry-run clobbers g_g266ClassifySite, which G583 reads.
+                g603NoteFallbackAdmission(g_g144List);
                 // G589: this batch leaves the pure-GPU path. The CPU band replay writes guest VRAM
                 // and the private depth mirror through paths that publish no residency metadata,
                 // so the drain memo's key cannot observe them. Fail CLOSED for the rest of the
@@ -403,24 +408,32 @@
                         g_g144List.front().ctx.frame.fbp == 0x139u;
                     if (g570Cpu139Batch && !g570PreparedBatch)
                         g570Cpu139PrepareDepthTiles();
+                    // G605: one palette-decode pass per batch, whichever leaf claims it. G580's
+                    // single 0x13b shape wins when present (it is the narrower contract); otherwise
+                    // G605's property-admitted family gets the same tables. They must never both
+                    // run — the second call would `assign()` over the first's samples.
+                    const auto g605ClutFill = [self, rgs](const G144Entry &e,
+                                                          std::array<uint32_t, 256> &out) {
+                        static thread_local GS s_clutGs;
+                        s_clutGs.m_vram = rgs->m_vram;
+                        s_clutGs.m_vramSize = rgs->m_vramSize;
+                        s_clutGs.m_privRegs = rgs->m_privRegs;
+                        s_clutGs.m_texa = e.texa;
+                        s_clutGs.m_texclut = e.texclut;
+                        for (uint32_t i = 0; i < 256u; ++i)
+                            out[i] = self->lookupCLUT(
+                                &s_clutGs, static_cast<uint8_t>(i), e.ctx.tex0.cbp,
+                                e.ctx.tex0.cpsm, e.ctx.tex0.csm,
+                                e.ctx.tex0.csa, e.ctx.tex0.psm);
+                    };
                     const bool g580SharedClutBatch =
                         g580SharedClutBatchSelected(g_g144List) &&
-                        g580PrepareSharedCluts(
-                            g_g144List,
-                            [self, rgs](const G144Entry &e,
-                                        std::array<uint32_t, 256> &out) {
-                                static thread_local GS s_clutGs;
-                                s_clutGs.m_vram = rgs->m_vram;
-                                s_clutGs.m_vramSize = rgs->m_vramSize;
-                                s_clutGs.m_privRegs = rgs->m_privRegs;
-                                s_clutGs.m_texa = e.texa;
-                                s_clutGs.m_texclut = e.texclut;
-                                for (uint32_t i = 0; i < 256u; ++i)
-                                    out[i] = self->lookupCLUT(
-                                        &s_clutGs, static_cast<uint8_t>(i), e.ctx.tex0.cbp,
-                                        e.ctx.tex0.cpsm, e.ctx.tex0.csm,
-                                        e.ctx.tex0.csa, e.ctx.tex0.psm);
-                            });
+                        g580PrepareSharedCluts(g_g144List, g605ClutFill);
+                    const bool g605SharedClutBatch =
+                        !g580SharedClutBatch &&
+                        g605SharedClutBatchSelected(g_g144List) &&
+                        g605PrepareSharedCluts(g_g144List, g605ClutFill);
+                    const bool g605AnySharedClut = g580SharedClutBatch || g605SharedClutBatch;
                     const auto g571ClearT = s_g571Split
                         ? std::chrono::steady_clock::now()
                         : std::chrono::steady_clock::time_point{};
@@ -428,7 +441,7 @@
                                               [self, rgs, g570Linear139,
                                                g570PreparedBatch,
                                                g570GpuBatch,
-                                               g580SharedClutBatch](int a, int b) {
+                                               g605AnySharedClut](int a, int b) {
                         G529LaneScope g529lane; // inert unless DC2_G529_STAT=1
                         static thread_local GS s_rg;
                         s_rg.m_vram = rgs->m_vram;
@@ -443,7 +456,7 @@
                                 return; // bbox does not intersect this band
                             const size_t entryIndex =
                                 static_cast<size_t>(&e - g_g144List.data());
-                            if (g580SharedClutBatch)
+                            if (g605AnySharedClut)
                                 g580BindSharedSample(entryIndex);
                             else
                                 g580ClearSharedSample();

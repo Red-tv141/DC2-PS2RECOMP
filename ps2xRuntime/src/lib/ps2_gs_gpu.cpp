@@ -34,8 +34,17 @@ int g596CopyArm();
 // to an internal-linkage symbol and fail to link (the appendix's anon-namespace trap). revision: 1
 #include <atomic>
 extern std::atomic<uint32_t> g_dc2ScriptFrame;
+// G602: Layer-4 (GIF decode) hot-path SHAPE. Every default-off diagnostic that used to sit inline in
+// processGIFPacket / writeRegisterPacked / writeRegister / vertexKick now lives behind a
+// `__declspec(noinline)` helper there, so MSVC stops giving those three hot members prologues of
+// 5-8 GPR pushes, a 256-328 byte frame, 2-9 nonvolatile XMM spills and a /GS cookie (17d §2.1's
+// measured call-boundary class). Compile-time rollbacks: DC2_G602_COLD_OUTLINE / DC2_G602_FLAG_GLOBALS.
+// Must follow gpu_bridge_and_latch_helpers.inc (it uses that file's accessors and g123/g34 statics)
+// and precede gpu_gif_and_registers.inc + gpu_transfers_and_kick.inc, which call into it.
+// g602_gif_cold_outline.inc revision: 1  (G359 .inc rebuild marker — touch on every edit)
 #include "ps2_gs_gpu_parts/g440_latch_profile.inc"
 #include "ps2_gs_gpu_parts/gpu_bridge_and_latch_helpers.inc"
+#include "ps2_gs_gpu_parts/g602_gif_cold_outline.inc"
 // G432: TRXDIR cost census (DC2_G432_CENSUS=1, behaviour-pure). Must precede
 // gpu_gif_and_registers.inc (the TRXDIR dispatch site) and gpu_transfers_and_kick.inc.
 // g432_trxdir_census.inc revision: 2 (added dir=2 internal stage split)

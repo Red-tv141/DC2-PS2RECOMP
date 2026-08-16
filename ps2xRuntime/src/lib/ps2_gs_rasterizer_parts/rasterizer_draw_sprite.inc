@@ -23,6 +23,9 @@ void GSRasterizer::drawSprite(GS *gs)
     // lane's retired-cycle count — the two things `[G529:spr] ns/px` silently assumed. Inert unless
     // DC2_G530_CYC=1 AND this call is inside a band replay.
     G530CycScope g530cyc;
+    // G605: the same bracket again, but bucketed by BATCH CLASS (disp/legacy/discov/other) so the
+    // sprite side can be ranked against the triangle side in one table. Inert unless DC2_G605_CYC=1.
+    G605CycScope g605cyc(ctx.frame.fbp, kG605LeafSprite);
     // G248 state census (DEFAULT OFF): print each distinct RTT-sprite state once.  Kept separate
     // from DC2_G248_STAT because stderr I/O would distort the timing discriminator above.
     {
@@ -314,6 +317,22 @@ void GSRasterizer::drawSprite(GS *gs)
                       static_cast<uint64_t>(drawY1 - drawY0 + 1));
         g530cyc.setPx(static_cast<uint64_t>(drawX1 - drawX0 + 1) *
                       static_cast<uint64_t>(drawY1 - drawY0 + 1));
+        g605cyc.setPx(static_cast<uint64_t>(drawX1 - drawX0 + 1) *
+                          static_cast<uint64_t>(drawY1 - drawY0 + 1),
+                      static_cast<uint64_t>(drawX1 - drawX0 + 1) *
+                          static_cast<uint64_t>(drawY1 - drawY0 + 1));
+        g605cyc.setInside(static_cast<uint64_t>(drawX1 - drawX0 + 1) *
+                          static_cast<uint64_t>(drawY1 - drawY0 + 1));
+        g605cyc.setShape(ctx.frame.fbp, static_cast<uint8_t>(gs->m_prim.type),
+                         static_cast<uint8_t>(ctx.frame.psm), ctx.frame.fbmsk, ctx.tex0.tbp0,
+                         static_cast<uint8_t>(ctx.tex0.psm), static_cast<uint8_t>(ctx.tex0.tfx),
+                         static_cast<uint8_t>(ctx.tex0.tcc), tex1UsesLinearFilter(ctx.tex1),
+                         ctx.tex1, ctx.alpha, ctx.test,
+                         static_cast<uint8_t>((ctx.zbuf >> 24) & 0xFu),
+                         static_cast<uint8_t>((ctx.test >> 17) & 0x3u),
+                         gs->m_prim.iip != 0u, gs->m_prim.fst != 0u, gs->m_prim.abe != 0u,
+                         gs->m_prim.fge != 0u, gs->m_pabe != 0u, (ctx.fba & 0x1ull) != 0ull,
+                         g403DisplayZ);
     }
 
     // G219 (default-off, DC2_G219_SKYPX=1): log any SPRITE touching Z inside the zoom black
@@ -768,6 +787,7 @@ void GSRasterizer::drawSprite(GS *gs)
         // Everything above this line is the PROLOGUE the [G530:cyc] census books separately.
         g530cyc.setFast(g248FastSampleSprite);
         g530cyc.markLoop();
+        g605cyc.markLoop();
         // ============================ G530: THE SPAN KERNEL ============================
         // Full rationale + the exactness argument: g530_sprite_span.inc. Admission is by PROPERTY,
         // never by address (G526/G527's law): the kernel runs when the draw is an axis-aligned

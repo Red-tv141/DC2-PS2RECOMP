@@ -665,6 +665,115 @@ static bool g587Verify15dOn()
     static const bool on = envFlagEnabled("DC2_G587_VERIFY_TRN15D");
     return on;
 }
+
+// G604: same-run exact oracle for the DISPLAY batches (fbp 0x0 / 0x68).
+//
+// G603 measured -8.27% end-to-end on route `s03` by admitting the one missing GS blend combo
+// (`Cd - Cs*As/128`, mode 6) on the display targets, but could not CERTIFY exactness: every
+// existing oracle's arming site is scoped to an RTT/transient target set the display buffers are
+// in NONE of, and the generic G255 arm additionally excludes `guestDepth` outright. A verified
+// run of `DC2_G255_VERIFY=1` on that route emitted ZERO `[G255:*]` lines — `bad=0` with
+// `checks=0` is a failed run, not a pass (g589_oracle_with_zero_checks).
+//
+// The contract here is G586/G587's verbatim: a display batch's depth authority is the SAME
+// G403/G411 private ZBP=0xd0/Z24 mirror those two snapshot and restore (g404SharedZScope admits
+// exactly fbw=8/ZBP 0xd0/Z24 and the display FBPs), so g570StageDepthVerify is valid unchanged.
+//
+// ⚠️ READ `bigRgb`, NOT `big`. The display path stores GL-convention alpha (0..255) while the CPU
+// band replay writes PS2's raw 0..128 framebuffer alpha: `G178Batch::rttRawAlpha` is asserted
+// only for the tagged RTT/transient targets and never for a display batch. That divergence is a
+// PRE-EXISTING property of every GPU-admitted display batch in the shipped default, not something
+// any one admission introduces, so this oracle reports an RGB-restricted big/maxd beside the
+// all-channel pair. The CONTROL is this same oracle with the candidate arm OFF, which then covers
+// exactly the display batches the shipped binary already admits — a same-population, same-binary
+// control (g515_parity_gate_needs_a_same_binary_control), strictly better than reading it against
+// `[G570:verify139]`'s different target.
+static bool g604VerifyDispOn()
+{
+    static const bool on = envFlagEnabled("DC2_G604_VERIFY_DISP");
+    return on;
+}
+
+// G604: the same same-run oracle contract for the G527-DISCOVERED transient targets (ROADMAP
+// Target 1, 47.8% of s03's replay wall). Like G570/G583/G586/G587's verifiers this flag IMPLIES
+// its own path (g604DiscovTransientOn reads it), so the oracle can never end up comparing the CPU
+// replay against itself and reporting a vacuous bad=0.
+static bool g604VerifyDiscovOn()
+{
+    static const bool on = envFlagEnabled("DC2_G604_VERIFY_DISCOV");
+    return on;
+}
+// ⛔ NOT a forward declaration of g604DiscovTransientTarget. ps2_gs_rasterizer.cpp nests TWO
+// anonymous namespaces (rasterizer_headers_and_diagnostics.inc opens one, rasterizer_draw_prim_
+// probe.inc opens a second that rasterizer_rtt_census_and_waves.inc closes), and this file sits in
+// the OUTER one while rasterizer_command_graph.inc sits in the INNER. A declaration here would
+// therefore name a DIFFERENT function from the definition there, and every call site that can see
+// both is an ambiguous overload (g568_anon_namespace_include_window, one level deeper).
+// The arming site publishes the answer instead, exactly like g_g604PendSubDraws below.
+static bool g_g604PendIsDiscov = false;
+// G604: the FBO-upload decision for this batch. A pixel the batch never draws must read
+// back equal to the pre-batch destination; the discov oracle shows it reading back BLACK,
+// which can only mean the FBO was not seeded from guest VRAM over that pixel.
+static uint32_t g_g604PendUpload = 0u;
+static std::atomic<uint64_t> g_g604DscChecks{0}, g_g604DscBad{0}, g_g604DscZBad{0},
+    g_g604DscPixels{0}, g_g604DscBadBig{0}, g_g604DscMaxDelta{0}, g_g604DscBigRgb{0},
+    g_g604DscMaxDeltaRgb{0};
+
+// g265DisplayTarget lives in rasterizer_rtt_census_and_waves.inc, which this file PRECEDES in
+// ps2_gs_rasterizer.cpp's include order. Same predicate; the arming site uses g265DisplayTarget.
+static bool g604DisplayFbp(uint32_t fbp)
+{
+    return fbp == 0u || fbp == 0x68u;
+}
+
+static std::atomic<uint64_t> g_g604VerifyChecks{0}, g_g604VerifyBad{0},
+    g_g604VerifyZBad{0}, g_g604VerifyPixels{0}, g_g604VerifyBadBig{0},
+    g_g604VerifyMaxDelta{0}, g_g604VerifyBigRgb{0}, g_g604VerifyMaxDeltaRgb{0},
+    g_g604VerifySubBatches{0}, g_g604VerifySubDraws{0};
+// ⭐ THE GATE. The whole-population rate is NOT the number to read: this oracle's own noise floor
+// on the SHIPPED display path is large (the CPU arm samples textures out of guest VRAM while the
+// GPU arm samples the resident FBO family directly through `srcFbp`, so any residency skew shows
+// up as a pixel difference that has nothing to do with the admission under test). Split the
+// SAME RUN into the batches that carry a G603 blend-mode-6 draw and the batches that do not: both
+// halves see identical residency, identical texture state and identical geometry, so the
+// difference between their rates is the lever's own contribution and nothing else.
+// (g515_parity_gate_needs_a_same_binary_control, taken one step further to a same-RUN control.)
+static std::atomic<uint64_t> g_g604SubPixels{0}, g_g604SubBad{0}, g_g604SubBigRgb{0},
+    g_g604SubZBad{0}, g_g604SubMaxDeltaRgb{0};
+static std::atomic<uint64_t> g_g604NoSubPixels{0}, g_g604NoSubBad{0}, g_g604NoSubBigRgb{0},
+    g_g604NoSubZBad{0}, g_g604NoSubMaxDeltaRgb{0};
+// The residency-skew hypothesis needs its own counter, not an argument: a draw with srcFbp != 0
+// samples another target's FBO on the GPU arm and that target's guest-VRAM bytes on the CPU arm.
+// Splitting the no-sub population again by this tag says whether the floor is that, or the port's
+// ordinary sampler/blend rounding.
+static std::atomic<uint64_t> g_g604FboSrcPixels{0}, g_g604FboSrcBigRgb{0},
+    g_g604PlainPixels{0}, g_g604PlainBigRgb{0};
+// g538: a null oracle result is worthless without a counter proving the two arms took different
+// code paths. The arming site publishes this batch's blend-mode-6 draw count here just before
+// g255BeginVerify; the compare arm folds it into the per-check line and the cumulative totals.
+static uint32_t g_g604PendSubDraws = 0u;
+static uint32_t g_g604PendFboSrcDraws = 0u;
+// The mode-6 draw's own GS state, recovered at the arming site. A blend-exactness argument has to
+// be made against ALPHA/TEX0/TFX/TCC/filter, not against the classified summary.
+static uint32_t g_g604PendSubVerts = 0u, g_g604PendSubTfx = 0u, g_g604PendSubTcc = 0u,
+    g_g604PendSubBilinear = 0u, g_g604PendSubTexKey = 0u, g_g604PendSubSrcFbp = 0u,
+    g_g604PendSubTpsm = 0u, g_g604PendSubTme = 0u;
+static uint64_t g_g604PendSubAlpha = 0u;
+static int g_g604PendSubX0 = 0, g_g604PendSubX1 = -1, g_g604PendSubY0 = 0, g_g604PendSubY1 = -1;
+// Pixels inside vs outside the mode-6 draws' own footprint, over SUB batches only. If the
+// admission is what diverges, these two rates separate; if the batch is merely a hard one, they
+// do not. (The oracle's own version of g601_finder_is_not_a_gate: scope the finder.)
+static std::atomic<uint64_t> g_g604InBoxPixels{0}, g_g604InBoxBigRgb{0},
+    g_g604OutBoxPixels{0}, g_g604OutBoxBigRgb{0}, g_g604InBoxMaxDRgb{0};
+// ⛔ THE BOX IS NOT A CLEAN ATTRIBUTION ON ITS OWN. The mode-6 draw's footprint is the burning
+// wreck, and the SAME region carries the effect's ADDITIVE (mode 1/2) draws — the worst-pixel
+// dump shows both arms ADDING 100-240 there, one saturating at 255 and the other not. So "inside
+// the box diverges, outside does not" is equally consistent with "the fire is hard" as with
+// "mode 6 is wrong". The control is the SAME REGION in the batches that carry no mode-6 draw:
+// carry the last observed box forward and score NOSUB batches against it too.
+static int g_g604LastBoxX0 = 0, g_g604LastBoxX1 = -1, g_g604LastBoxY0 = 0, g_g604LastBoxY1 = -1;
+static std::atomic<uint64_t> g_g604NoSubInBoxPixels{0}, g_g604NoSubInBoxBigRgb{0},
+    g_g604NoSubInBoxMaxDRgb{0};
 static std::atomic<uint64_t> g_g583VerifyChecks{0}, g_g583VerifyBad{0},
     g_g583VerifyZBad{0}, g_g583VerifyPixels{0};
 static std::atomic<uint64_t> g_g586VerifyChecks{0}, g_g586VerifyBad{0},
@@ -709,6 +818,14 @@ struct G255VerifyState
     int depthRowHi = -1;
     std::vector<uint32_t> depthBefore;
     std::vector<uint32_t> depthGpu;
+    uint32_t g604SubDraws = 0; // G604: blend-mode-6 draws in this batch (arm-divergence counter)
+    uint32_t g604FboSrcDraws = 0; // G604: draws sampling another target's FBO (residency skew)
+    bool g604IsDiscov = false;    // G604: this batch is a G527-discovered transient target
+    uint32_t g604Upload = 0u;     // G604: bit0 uploadFb, bit1 forceNoUpload, bit2 snapValid
+    uint32_t g604SubVerts = 0, g604SubTfx = 0, g604SubTcc = 0, g604SubBilinear = 0;
+    uint32_t g604SubTexKey = 0, g604SubSrcFbp = 0, g604SubTpsm = 0, g604SubTme = 0;
+    uint64_t g604SubAlpha = 0;
+    int g604SubX0 = 0, g604SubX1 = -1, g604SubY0 = 0, g604SubY1 = -1;
 };
 
 static G255VerifyState g_g255Verify;
@@ -799,10 +916,34 @@ static void g255BeginVerify(uint8_t *vram, uint32_t vramSize, uint32_t fbp, uint
           (g586Verify141On() && fbp == 0x141u) ||
           (g587Verify15dOn() && fbp == 0x15du) ||
           (g570Verify13dOn() && fbp == 0x13du) ||
-          (g570Verify139On() && fbp == 0x139u)) ||
+          (g570Verify139On() && fbp == 0x139u) ||
+          (g604VerifyDispOn() && g604DisplayFbp(fbp)) ||
+          (g604VerifyDiscovOn() && g_g604PendIsDiscov)) ||
         !vram || rowHi < rowLo)
         return;
     G255VerifyState &s = g_g255Verify;
+    s.g604SubDraws = g_g604PendSubDraws; // published by the arming site, just above the call
+    s.g604FboSrcDraws = g_g604PendFboSrcDraws;
+    s.g604IsDiscov = g_g604PendIsDiscov;
+    s.g604Upload = g_g604PendUpload;
+    s.g604SubVerts = g_g604PendSubVerts;
+    s.g604SubTfx = g_g604PendSubTfx;
+    s.g604SubTcc = g_g604PendSubTcc;
+    s.g604SubBilinear = g_g604PendSubBilinear;
+    s.g604SubTexKey = g_g604PendSubTexKey;
+    s.g604SubSrcFbp = g_g604PendSubSrcFbp;
+    s.g604SubTpsm = g_g604PendSubTpsm;
+    s.g604SubTme = g_g604PendSubTme;
+    s.g604SubAlpha = g_g604PendSubAlpha;
+    if (s.g604SubDraws != 0u && g_g604PendSubX1 >= g_g604PendSubX0)
+    {
+        g_g604LastBoxX0 = g_g604PendSubX0; g_g604LastBoxX1 = g_g604PendSubX1;
+        g_g604LastBoxY0 = g_g604PendSubY0; g_g604LastBoxY1 = g_g604PendSubY1;
+    }
+    // Every display batch is scored against the last observed mode-6 footprint, so the SUB and
+    // NOSUB in-region rates are directly comparable.
+    s.g604SubX0 = g_g604LastBoxX0; s.g604SubX1 = g_g604LastBoxX1;
+    s.g604SubY0 = g_g604LastBoxY0; s.g604SubY1 = g_g604LastBoxY1;
     s.fbp = fbp;
     s.fbw = fbw;
     s.fbBlock = GSInternal::framePageBaseToBlock(fbp);
@@ -873,7 +1014,9 @@ static void g255StageGpuVerify(uint8_t *vram, uint32_t vramSize,
           (g586Verify141On() && s.fbp == 0x141u) ||
           (g587Verify15dOn() && s.fbp == 0x15du) ||
           (g570Verify13dOn() && s.fbp == 0x13du) ||
-          (g570Verify139On() && s.fbp == 0x139u)) ||
+          (g570Verify139On() && s.fbp == 0x139u) ||
+          (g604VerifyDispOn() && g604DisplayFbp(s.fbp)) ||
+          (g604VerifyDiscovOn() && s.g604IsDiscov)) ||
         !vram || s.before.empty() ||
         readback.size() != static_cast<size_t>(s.fbW) * static_cast<size_t>(fbH))
         return;
@@ -896,8 +1039,10 @@ static void g570StageDepthVerify()
     G255VerifyState &s = g_g255Verify;
     // G583/G586 ride this unchanged: their depth authority is the same G403/G411 private mirror,
     // so the snapshot/restore pair is identical for 0x13b, 0x13d and 0x141.
+    // G604 rides this unchanged for the same reason: a display batch's live Z is the SAME
+    // G403/G411 private mirror, so the snapshot/restore pair is identical for 0x0/0x68.
     if (!(g570Verify13dOn() || g583Verify13bOn() || g586Verify141On() ||
-          g587Verify15dOn()) ||
+          g587Verify15dOn() || g604VerifyDispOn() || g604VerifyDiscovOn()) ||
         !s.pending || !s.g570Depth ||
         s.depthBefore.size() != s.depthGpu.size())
         return;
@@ -922,6 +1067,22 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
     uint64_t depthBad = 0;
     uint64_t badBig = 0;      // G584: worst channel off by more than 1 LSB
     unsigned maxDelta = 0;    // G584: worst per-channel delta seen in this batch
+    // G604: the same two numbers restricted to R/G/B. A display batch's ALPHA convention differs
+    // between the two arms by construction (the GL path is not tagged rttRawAlpha, so it stores
+    // 0..255 where the CPU replay stores PS2's raw 0..128) — an all-channel `big` on that
+    // population measures that standing convention, not the admission under test.
+    uint64_t badBigRgb = 0;
+    unsigned maxDeltaRgb = 0;
+    // G604: `firstBig` is dominated by the standing ALPHA convention (an exact 2x), so it never
+    // shows the RGB defect. Sample the first pixel whose RGB is off by more than 1, and carry the
+    // SIGNED mean RGB delta — a subtractive-blend error has a sign, rounding does not.
+    int firstBigRgbX = -1, firstBigRgbY = -1;
+    uint32_t firstBigRgbCpu = 0, firstBigRgbGpu = 0, firstBigRgbDst = 0;
+    long long sumDeltaRgb = 0;
+    // G604 attribution: same two counts, split by the mode-6 draws' footprint.
+    const bool g604HaveBox = s.g604SubX1 >= s.g604SubX0 && s.g604SubY1 >= s.g604SubY0;
+    uint64_t inBoxPx = 0, inBoxBig = 0, outBoxPx = 0, outBoxBig = 0;
+    unsigned inBoxMaxD = 0;
     int firstBigX = -1, firstBigY = -1;
     uint32_t firstBigCpu = 0, firstBigGpu = 0;
     int firstX = -1, firstY = -1;
@@ -935,6 +1096,12 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
             uint32_t cpu = 0;
             if (off + 4u <= vramSize)
                 std::memcpy(&cpu, vram + off, 4);
+            const bool g604InBox = g604HaveBox && x >= s.g604SubX0 && x <= s.g604SubX1 &&
+                                   y >= s.g604SubY0 && y <= s.g604SubY1;
+            if (g604HaveBox)
+            {
+                if (g604InBox) ++inBoxPx; else ++outBoxPx;
+            }
             if (cpu != s.gpu[i])
             {
                 if (bad == 0)
@@ -949,6 +1116,7 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
                 if (((cpu & 0x00FFFFFFu) == 0u) != ((s.gpu[i] & 0x00FFFFFFu) == 0u))
                     ++coverage;
                 unsigned worst = 0u;
+                unsigned worstRgb = 0u; // G604: channels 0..2 only
                 for (int ch = 0; ch < 4; ++ch)
                 {
                     const int ca = static_cast<int>((cpu >> (ch * 8)) & 0xFFu);
@@ -957,9 +1125,43 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
                         static_cast<unsigned>(ca > ga ? ca - ga : ga - ca);
                     if (d > worst)
                         worst = d;
+                    if (ch < 3 && d > worstRgb)
+                        worstRgb = d;
                 }
                 if (worst > maxDelta)
                     maxDelta = worst;
+                if (worstRgb > maxDeltaRgb)
+                    maxDeltaRgb = worstRgb;
+                if (worstRgb > 1u)
+                {
+                    // The WORST pixel, not the first: scan order finds a 2-LSB pixel long before
+                    // the one that carries the defect's magnitude.
+                    if (worstRgb >= maxDeltaRgb)
+                    {
+                        firstBigRgbX = x; firstBigRgbY = y;
+                        firstBigRgbCpu = cpu; firstBigRgbGpu = s.gpu[i];
+                        // s.before IS the pre-batch destination (Cd). With it, each arm's actual
+                        // subtraction is readable directly instead of inferred.
+                        firstBigRgbDst = s.before[i];
+                    }
+                    ++badBigRgb;
+                    for (int ch = 0; ch < 3; ++ch)
+                        sumDeltaRgb += static_cast<int>((s.gpu[i] >> (ch * 8)) & 0xFFu) -
+                                       static_cast<int>((cpu >> (ch * 8)) & 0xFFu);
+                    if (g604HaveBox)
+                    {
+                        if (g604InBox)
+                        {
+                            ++inBoxBig;
+                            if (worstRgb > inBoxMaxD)
+                                inBoxMaxD = worstRgb;
+                        }
+                        else
+                        {
+                            ++outBoxBig;
+                        }
+                    }
+                }
                 if (worst > 1u)
                 {
                     if (badBig == 0u)
@@ -986,10 +1188,28 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
             g_g570Verify139Checks.fetch_add(1u, std::memory_order_relaxed) + 1u;
         if (bad != 0u)
             g_g570Verify139Bad.fetch_add(bad, std::memory_order_relaxed);
-        // G584: this is the CONTROL for the G583 oracle's residue — 0x139 is an already-promoted,
-        // GPU-admitted, BLENDED population on the same route and the same fixed-function blend, so
-        // its big/maxd is the port's standing float-vs-integer rounding rate. Same fields, so the
-        // two oracles can be read against each other directly.
+        // ⛔⛔ G604 CORRECTION — DO NOT USE THIS AS A PROMOTION CONTROL.
+        //
+        // G584 described this as "the CONTROL … an ALREADY-PROMOTED, GPU-admitted, BLENDED
+        // population … so its big/maxd is the port's standing float-vs-integer rounding rate", and
+        // ROADMAP G604 Target 0 then made "no worse than the standing [G570:verify139] control" the
+        // promotion gate for a different lever. **That is wrong and it would have licensed a false
+        // promotion.** This arm only ever runs under g570Verify139On(), which IMPLIES
+        // g570Private139On() — a lever that is DEFAULT-OFF because `plans/phase-G570-fix-log.md`
+        // REJECTED it: "treating the large 0x139 batch as a normal G178 GPU batch with the private
+        // depth mirror still produced hundreds of color/alpha/coverage mismatches per batch", with
+        // an explicit Do-NOT-Carry-Forward entry against re-running it as if its oracle had passed.
+        //
+        // G604 re-measured it on `s03` and reproduced exactly that: 181.9 M pixels, 470,390 bad
+        // (0.259%), 378,294 off by more than 1 LSB (0.208%), max channel delta 64 — i.e. ~590 bad
+        // pixels per batch. That is a REJECTED lever's error rate, not a rounding floor.
+        //
+        // ⇒ This port has NO certified GPU-admitted blended population to gate against. Build a
+        // same-RUN control instead (G604 §1.3: the same screen region in batches that do not carry
+        // the admission under test).
+        //
+        // The counters stay — the number is still the right thing to compare a NEW admission's
+        // order of magnitude to, and G583/G584's residue analysis is still readable against it.
         if (badBig != 0u)
             g_g584Verify139BadBig.fetch_add(badBig, std::memory_order_relaxed);
         g_g584Verify139Pixels.fetch_add(s.gpu.size(), std::memory_order_relaxed);
@@ -1088,6 +1308,246 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
                          (unsigned long long)g_g587VerifyBadBig.load(std::memory_order_relaxed),
                          (unsigned long long)g_g587VerifyMaxDelta.load(std::memory_order_relaxed),
                          (unsigned long long)g_g587VerifyZBad.load(std::memory_order_relaxed));
+    }
+    else if (g604VerifyDiscovOn() && s.g604IsDiscov)
+    {
+        // ROADMAP Target 1's gate. Same fields as G586/G587 — those two are the precedent this
+        // contract generalizes, so their numbers are the reference this one is read against.
+        const uint64_t n = g_g604DscChecks.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        g_g604DscPixels.fetch_add(s.gpu.size(), std::memory_order_relaxed);
+        g_g604DscBad.fetch_add(bad, std::memory_order_relaxed);
+        g_g604DscZBad.fetch_add(depthBad, std::memory_order_relaxed);
+        g_g604DscBadBig.fetch_add(badBig, std::memory_order_relaxed);
+        g_g604DscBigRgb.fetch_add(badBigRgb, std::memory_order_relaxed);
+        {
+            uint64_t p = g_g604DscMaxDelta.load(std::memory_order_relaxed);
+            while (maxDelta > p &&
+                   !g_g604DscMaxDelta.compare_exchange_weak(p, maxDelta,
+                                                            std::memory_order_relaxed))
+            {
+            }
+            p = g_g604DscMaxDeltaRgb.load(std::memory_order_relaxed);
+            while (maxDeltaRgb > p &&
+                   !g_g604DscMaxDeltaRgb.compare_exchange_weak(p, maxDeltaRgb,
+                                                               std::memory_order_relaxed))
+            {
+            }
+        }
+        if (bad != 0u || depthBad != 0u || n <= 8u || (n % 60u) == 0u)
+        {
+            const uint64_t px = g_g604DscPixels.load(std::memory_order_relaxed);
+            std::fprintf(stderr,
+                         "[G604:verifydiscov] n=%llu fbp=0x%x pixels=%zu bad=%llu rgb=%llu "
+                         "a=%llu cov=%llu big=%llu bigRgb=%llu maxd=%u maxdRgb=%u zbad=%llu "
+                         "zrows=%d..%d rows=%d..%d entries=%zu prim=%u tme=%u up=%u "
+                         "worstRgbPx=(%d,%d dst=%08x cpu=%08x gpu=%08x) "
+                         "cumulative(px=%llu bad=%llu %.5f%% big=%llu %.5f%% bigRgb=%llu %.5f%% "
+                         "maxd=%llu maxdRgb=%llu zbad=%llu)\n",
+                         (unsigned long long)n, s.fbp, s.gpu.size(),
+                         (unsigned long long)bad, (unsigned long long)badRgb,
+                         (unsigned long long)badAlpha, (unsigned long long)coverage,
+                         (unsigned long long)badBig, (unsigned long long)badBigRgb,
+                         maxDelta, maxDeltaRgb, (unsigned long long)depthBad,
+                         s.depthRowLo, s.depthRowHi, s.rowLo, s.rowHi, s.entries,
+                         s.prim, s.tme, s.g604Upload,
+                         firstBigRgbX, firstBigRgbY, firstBigRgbDst,
+                         firstBigRgbCpu, firstBigRgbGpu,
+                         (unsigned long long)px,
+                         (unsigned long long)g_g604DscBad.load(std::memory_order_relaxed),
+                         px ? 100.0 * (double)g_g604DscBad.load(std::memory_order_relaxed) / (double)px : 0.0,
+                         (unsigned long long)g_g604DscBadBig.load(std::memory_order_relaxed),
+                         px ? 100.0 * (double)g_g604DscBadBig.load(std::memory_order_relaxed) / (double)px : 0.0,
+                         (unsigned long long)g_g604DscBigRgb.load(std::memory_order_relaxed),
+                         px ? 100.0 * (double)g_g604DscBigRgb.load(std::memory_order_relaxed) / (double)px : 0.0,
+                         (unsigned long long)g_g604DscMaxDelta.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g604DscMaxDeltaRgb.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g604DscZBad.load(std::memory_order_relaxed));
+        }
+    }
+    else if (g604VerifyDispOn() && g604DisplayFbp(s.fbp))
+    {
+        // The display population G603 changed. Same fields as G586/G587 plus the RGB-restricted
+        // pair and the blend-mode-6 draw count that proves the two arms diverged.
+        const uint64_t n =
+            g_g604VerifyChecks.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        g_g604VerifyPixels.fetch_add(s.gpu.size(), std::memory_order_relaxed);
+        if (bad != 0u)
+            g_g604VerifyBad.fetch_add(bad, std::memory_order_relaxed);
+        if (depthBad != 0u)
+            g_g604VerifyZBad.fetch_add(depthBad, std::memory_order_relaxed);
+        if (badBig != 0u)
+            g_g604VerifyBadBig.fetch_add(badBig, std::memory_order_relaxed);
+        if (badBigRgb != 0u)
+            g_g604VerifyBigRgb.fetch_add(badBigRgb, std::memory_order_relaxed);
+        // ⭐ The same-run split. `sub` = this batch carries a G603 blend-mode-6 draw and therefore
+        // exists on the GPU arm ONLY because of the admission under test.
+        if (s.g604SubDraws != 0u)
+        {
+            g_g604VerifySubBatches.fetch_add(1u, std::memory_order_relaxed);
+            g_g604VerifySubDraws.fetch_add(s.g604SubDraws, std::memory_order_relaxed);
+            g_g604SubPixels.fetch_add(s.gpu.size(), std::memory_order_relaxed);
+            g_g604SubBad.fetch_add(bad, std::memory_order_relaxed);
+            g_g604SubBigRgb.fetch_add(badBigRgb, std::memory_order_relaxed);
+            g_g604SubZBad.fetch_add(depthBad, std::memory_order_relaxed);
+            g_g604InBoxPixels.fetch_add(inBoxPx, std::memory_order_relaxed);
+            g_g604InBoxBigRgb.fetch_add(inBoxBig, std::memory_order_relaxed);
+            g_g604OutBoxPixels.fetch_add(outBoxPx, std::memory_order_relaxed);
+            g_g604OutBoxBigRgb.fetch_add(outBoxBig, std::memory_order_relaxed);
+            {
+                uint64_t q = g_g604InBoxMaxDRgb.load(std::memory_order_relaxed);
+                while (inBoxMaxD > q &&
+                       !g_g604InBoxMaxDRgb.compare_exchange_weak(q, inBoxMaxD,
+                                                                 std::memory_order_relaxed))
+                {
+                }
+            }
+            uint64_t p = g_g604SubMaxDeltaRgb.load(std::memory_order_relaxed);
+            while (maxDeltaRgb > p &&
+                   !g_g604SubMaxDeltaRgb.compare_exchange_weak(p, maxDeltaRgb,
+                                                               std::memory_order_relaxed))
+            {
+            }
+        }
+        else
+        {
+            g_g604NoSubPixels.fetch_add(s.gpu.size(), std::memory_order_relaxed);
+            g_g604NoSubBad.fetch_add(bad, std::memory_order_relaxed);
+            g_g604NoSubBigRgb.fetch_add(badBigRgb, std::memory_order_relaxed);
+            g_g604NoSubZBad.fetch_add(depthBad, std::memory_order_relaxed);
+            // The region control: same screen rectangle, batches with no mode-6 draw in them.
+            g_g604NoSubInBoxPixels.fetch_add(inBoxPx, std::memory_order_relaxed);
+            g_g604NoSubInBoxBigRgb.fetch_add(inBoxBig, std::memory_order_relaxed);
+            {
+                uint64_t q = g_g604NoSubInBoxMaxDRgb.load(std::memory_order_relaxed);
+                while (inBoxMaxD > q &&
+                       !g_g604NoSubInBoxMaxDRgb.compare_exchange_weak(q, inBoxMaxD,
+                                                                      std::memory_order_relaxed))
+                {
+                }
+            }
+            uint64_t p = g_g604NoSubMaxDeltaRgb.load(std::memory_order_relaxed);
+            while (maxDeltaRgb > p &&
+                   !g_g604NoSubMaxDeltaRgb.compare_exchange_weak(p, maxDeltaRgb,
+                                                                 std::memory_order_relaxed))
+            {
+            }
+        }
+        // Second split, orthogonal to the first: does the oracle's floor come from FBO-sourced
+        // sampling (residency skew between the two arms) or from ordinary rounding?
+        if (s.g604FboSrcDraws != 0u)
+        {
+            g_g604FboSrcPixels.fetch_add(s.gpu.size(), std::memory_order_relaxed);
+            g_g604FboSrcBigRgb.fetch_add(badBigRgb, std::memory_order_relaxed);
+        }
+        else
+        {
+            g_g604PlainPixels.fetch_add(s.gpu.size(), std::memory_order_relaxed);
+            g_g604PlainBigRgb.fetch_add(badBigRgb, std::memory_order_relaxed);
+        }
+        // One compact, greppable gate line. Everything a promotion decision needs is on it, so a
+        // timeout-killed run still yields the verdict without parsing the per-batch stream.
+        if ((n % 200u) == 0u)
+        {
+            const auto rate = [](uint64_t num, uint64_t den) {
+                return den ? (100.0 * static_cast<double>(num) / static_cast<double>(den)) : 0.0;
+            };
+            const uint64_t subPx = g_g604SubPixels.load(std::memory_order_relaxed);
+            const uint64_t noSubPx = g_g604NoSubPixels.load(std::memory_order_relaxed);
+            const uint64_t fboPx = g_g604FboSrcPixels.load(std::memory_order_relaxed);
+            const uint64_t plainPx = g_g604PlainPixels.load(std::memory_order_relaxed);
+            std::fprintf(stderr,
+                         "[G604:gate] chk=%llu subBatches=%llu subDraws=%llu | "
+                         "SUB(px=%llu bigRgb=%llu %.4f%% bad=%.3f%% zbad=%llu maxdRgb=%llu) | "
+                         "NOSUB(px=%llu bigRgb=%llu %.4f%% bad=%.3f%% zbad=%llu maxdRgb=%llu) | "
+                         "FBOSRC(px=%llu %.4f%%) PLAIN(px=%llu %.4f%%) | "
+                         "SUB6BOX(sub-in px=%llu %.4f%% maxd=%llu / sub-out px=%llu %.4f%%) | "
+                         "REGIONCTL(nosub-in px=%llu %.4f%% maxd=%llu)\n",
+                         (unsigned long long)n,
+                         (unsigned long long)g_g604VerifySubBatches.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g604VerifySubDraws.load(std::memory_order_relaxed),
+                         (unsigned long long)subPx,
+                         (unsigned long long)g_g604SubBigRgb.load(std::memory_order_relaxed),
+                         rate(g_g604SubBigRgb.load(std::memory_order_relaxed), subPx),
+                         rate(g_g604SubBad.load(std::memory_order_relaxed), subPx),
+                         (unsigned long long)g_g604SubZBad.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g604SubMaxDeltaRgb.load(std::memory_order_relaxed),
+                         (unsigned long long)noSubPx,
+                         (unsigned long long)g_g604NoSubBigRgb.load(std::memory_order_relaxed),
+                         rate(g_g604NoSubBigRgb.load(std::memory_order_relaxed), noSubPx),
+                         rate(g_g604NoSubBad.load(std::memory_order_relaxed), noSubPx),
+                         (unsigned long long)g_g604NoSubZBad.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g604NoSubMaxDeltaRgb.load(std::memory_order_relaxed),
+                         (unsigned long long)fboPx,
+                         rate(g_g604FboSrcBigRgb.load(std::memory_order_relaxed), fboPx),
+                         (unsigned long long)plainPx,
+                         rate(g_g604PlainBigRgb.load(std::memory_order_relaxed), plainPx),
+                         (unsigned long long)g_g604InBoxPixels.load(std::memory_order_relaxed),
+                         rate(g_g604InBoxBigRgb.load(std::memory_order_relaxed),
+                              g_g604InBoxPixels.load(std::memory_order_relaxed)),
+                         (unsigned long long)g_g604InBoxMaxDRgb.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g604OutBoxPixels.load(std::memory_order_relaxed),
+                         rate(g_g604OutBoxBigRgb.load(std::memory_order_relaxed),
+                              g_g604OutBoxPixels.load(std::memory_order_relaxed)),
+                         (unsigned long long)g_g604NoSubInBoxPixels.load(std::memory_order_relaxed),
+                         rate(g_g604NoSubInBoxBigRgb.load(std::memory_order_relaxed),
+                              g_g604NoSubInBoxPixels.load(std::memory_order_relaxed)),
+                         (unsigned long long)g_g604NoSubInBoxMaxDRgb.load(std::memory_order_relaxed));
+        }
+        {
+            uint64_t prev = g_g604VerifyMaxDelta.load(std::memory_order_relaxed);
+            while (maxDelta > prev &&
+                   !g_g604VerifyMaxDelta.compare_exchange_weak(prev, maxDelta,
+                                                               std::memory_order_relaxed))
+            {
+            }
+            prev = g_g604VerifyMaxDeltaRgb.load(std::memory_order_relaxed);
+            while (maxDeltaRgb > prev &&
+                   !g_g604VerifyMaxDeltaRgb.compare_exchange_weak(prev, maxDeltaRgb,
+                                                                  std::memory_order_relaxed))
+            {
+            }
+        }
+        // Always print a SUB batch: there are only ~130 of them in a run and each one is a
+        // datapoint about the admission under test.
+        if (s.g604SubDraws != 0u || badBigRgb != 0u || depthBad != 0u || n <= 8u ||
+            (n % 60u) == 0u)
+            std::fprintf(stderr,
+                         "[G604:verifydisp] n=%llu fbp=0x%x pixels=%zu bad=%llu rgb=%llu a=%llu "
+                         "cov=%llu big=%llu maxd=%u bigRgb=%llu maxdRgb=%u sub=%u "
+                         "zbad=%llu zrows=%d..%d rows=%d..%d entries=%zu prim=%u tme=%u "
+                         "first=(%d,%d cpu=%08x gpu=%08x) firstBig=(%d,%d cpu=%08x gpu=%08x) "
+                         "worstRgbPx=(%d,%d dst=%08x cpu=%08x gpu=%08x) meanDRgb=%.2f "
+                         "sub6(verts=%u tme=%u tfx=%u tcc=%u bil=%u tpsm=0x%x texKey=%u "
+                         "srcFbp=0x%x alpha=%016llx) "
+                         "cumulative(chk=%llu px=%llu bad=%llu big=%llu bigRgb=%llu maxd=%llu "
+                         "maxdRgb=%llu zbad=%llu subBatches=%llu subDraws=%llu)\n",
+                         (unsigned long long)n, s.fbp, s.gpu.size(),
+                         (unsigned long long)bad, (unsigned long long)badRgb,
+                         (unsigned long long)badAlpha, (unsigned long long)coverage,
+                         (unsigned long long)badBig, maxDelta,
+                         (unsigned long long)badBigRgb, maxDeltaRgb, s.g604SubDraws,
+                         (unsigned long long)depthBad, s.depthRowLo, s.depthRowHi,
+                         s.rowLo, s.rowHi, s.entries, s.prim, s.tme,
+                         firstX, firstY, firstCpu, firstGpu,
+                         firstBigX, firstBigY, firstBigCpu, firstBigGpu,
+                         firstBigRgbX, firstBigRgbY, firstBigRgbDst,
+                         firstBigRgbCpu, firstBigRgbGpu,
+                         badBigRgb ? (static_cast<double>(sumDeltaRgb) /
+                                      (3.0 * static_cast<double>(badBigRgb)))
+                                   : 0.0,
+                         s.g604SubVerts, s.g604SubTme, s.g604SubTfx, s.g604SubTcc,
+                         s.g604SubBilinear, s.g604SubTpsm, s.g604SubTexKey, s.g604SubSrcFbp,
+                         (unsigned long long)s.g604SubAlpha,
+                         (unsigned long long)n,
+                         (unsigned long long)g_g604VerifyPixels.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g604VerifyBad.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g604VerifyBadBig.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g604VerifyBigRgb.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g604VerifyMaxDelta.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g604VerifyMaxDeltaRgb.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g604VerifyZBad.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g604VerifySubBatches.load(std::memory_order_relaxed),
+                         (unsigned long long)g_g604VerifySubDraws.load(std::memory_order_relaxed));
     }
     else if (ti >= 0)
     {

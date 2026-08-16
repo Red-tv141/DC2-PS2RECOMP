@@ -244,6 +244,19 @@ bool g589MemoEnsureAtlas(bool (*real)());
 #include <atomic>
 extern std::atomic<uint32_t> g_dc2ScriptFrame;
 
+// G604: which framebuffer pages are G527-DISCOVERED targets admitted under the non-persistent
+// transient contract, published as a 512-bit set for the GPU backend TU.
+//
+// The backend has to know, because those targets are render targets that get sampled with TCC=1
+// later and therefore need PS2's raw 0..128 framebuffer alpha exactly as 0x13d/0x141/0x15d do —
+// and the whole point of this contract is that it is a PROPERTY, so it cannot be spelled as a
+// fourth hardcoded address list over there. It must live HERE, before the first part is included,
+// for the same reason g_dc2ScriptFrame does: every .inc below sits inside an anonymous namespace
+// (two of them, nested), so a definition written after this point would have internal linkage and
+// the backend's `extern` would never resolve. Set-once and monotonic, so it needs no ordering
+// beyond relaxed: a target is admitted before any batch of it can be submitted.
+std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
+
 #include "ps2_gs_rasterizer_parts/rasterizer_headers_and_diagnostics.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_g214_cap_trace.inc"
@@ -429,6 +442,15 @@ extern std::atomic<uint32_t> g_dc2ScriptFrame;
 // a FRAGMENT OF GSRasterizer::drawPrimitive's BODY. Content edit forces MSBuild to consume it (G359).
 #include "ps2_gs_rasterizer_parts/g529_replay_dispatch.inc"
 
+// G603 revision: 1 — the CPU-fallback ADMISSION census (default-off, DC2_G603_ADMIT=1). MUST follow
+// rasterizer_rtt_census_and_waves.inc (g178ClassifyEntry / kG262Rej* / g_g266ClassifySite /
+// t_g603RelaxBlend) and g528_flush_publish.inc (g528ClassifyFbp / kG528Cls*), and MUST precede
+// rasterizer_tilebin_capture.inc, whose CPU-fallback branch is its only call site. Same namespace
+// constraint as G528/G529: it sits BEFORE rasterizer_setup_and_perf_census.inc, which is a FRAGMENT
+// OF GSRasterizer::drawPrimitive's BODY and cannot contain a namespace. Content edit forces MSBuild
+// to consume it (G359).
+#include "ps2_gs_rasterizer_parts/g603_admission_census.inc"
+
 #include "ps2_gs_rasterizer_parts/rasterizer_setup_and_perf_census.inc"
 
 
@@ -459,6 +481,20 @@ extern std::atomic<uint32_t> g_dc2ScriptFrame;
 // G530/G570 and precede drawTriangle; forward declarations let the replay dispatcher bind it.
 // This content edit also forces MSBuild to consume later g580_cpu_triangle.inc edits (G359).
 #include "ps2_gs_rasterizer_parts/g580_cpu_triangle.inc"
+
+// G605 revision: 1 — the exact accelerated leaf for the dominant replayed TRIANGLE shape, which
+// `[G605:leaf]`/`[G605:shape]` measured at 70.6% of all CPU band-replay cycles on `s03`. It is
+// G580's lowering with its ADDRESS replaced by the PROPERTY, plus fog and a general ALPHA register.
+// Must follow g580_cpu_triangle.inc (it reuses G580's shared-CLUT tables and its STQ T8 sampler)
+// and precede rasterizer_draw_triangle.inc, which is a FRAGMENT of the member function body.
+#include "ps2_gs_rasterizer_parts/g605_tri_span.inc"
+
+// G605 revision: 1 — the CPU band replay's cycles, split PER-DRAW vs PER-PIXEL and bucketed by
+// g528ClassifyFbp x leaf. It is the TRIANGLE/LINE twin of [G530:cyc], which only ever split sprites.
+// Must precede rasterizer_draw_sprite.inc and rasterizer_draw_triangle.inc (both are FRAGMENTS of a
+// member function body and cannot open a namespace), and must follow g528_flush_publish.inc, whose
+// g528ClassifyFbp/kG528Cls* it uses. Default-off: DC2_G605_CYC=1.
+#include "ps2_gs_rasterizer_parts/g605_replay_leaf_census.inc"
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_draw_sprite.inc"

@@ -104,6 +104,12 @@ using G580ClutFillFn =
 static bool g580SharedClutBatchSelected(const std::vector<G144Entry> &entries);
 static bool g580PrepareSharedCluts(const std::vector<G144Entry> &entries,
                                    const G580ClutFillFn &fill);
+// G605 declarations. The property-admitted twin of the two above: it populates the SAME
+// g_g580SharedSamples / g_g580SharedCluts tables (so g580BindSharedSample serves both leaves) but
+// selects the wider shape family `[G605:shape]` measured at 70.6% of the replay's cycles.
+static bool g605SharedClutBatchSelected(const std::vector<G144Entry> &entries);
+static bool g605PrepareSharedCluts(const std::vector<G144Entry> &entries,
+                                   const G580ClutFillFn &fill);
 static void g580BindSharedSample(size_t entryIndex);
 static void g580ClearSharedSample();
 

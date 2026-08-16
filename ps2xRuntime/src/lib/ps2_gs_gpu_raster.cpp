@@ -1,3 +1,7 @@
+// G607: TRANSLATED VU1 kernel throughput CEILING bench (g607_tbench.inc + the generated
+// g607_translated_body.inc, v1). Prices the one term G606 left unmeasured.
+// G606: WIDE offline VU1 executor bench + kick-independence census (g606_wide_vu.inc, v1).
+// Content edit here forces MSBuild to consume the .inc changes (G359).
 // G566: GPU-authoritative VU1 packet publication and one-readback-per-16-kick prototype (v3).
 // G587: include transient 0x15d in the explicit raw-alpha two-pass (force .inc recompile v2).
 // G433: blocking colour-readback ceiling probe in lle_gpu_raster_backend.inc
@@ -85,6 +89,14 @@ int g494NoSyncArm();
 int g496GpuSlowArm();
 // G496b redundant-GL-state-elision arm (DC2_G419_AB=glstate). Same global-scope contract.
 int g496GlStateArm();
+// G604: the set of G527-discovered targets admitted under the non-persistent transient contract,
+// defined in ps2_gs_rasterizer.cpp. They need PS2's raw 0..128 framebuffer alpha exactly as
+// 0x13d/0x141/0x15d do, and the contract selects them by PROPERTY, so the backend cannot spell
+// them as a fourth address list. Declared HERE, above the anonymous namespace the parts sit
+// inside — the same global-scope contract as the G491/G492/G494/G496 arms above (a declaration
+// written inside a part names an internal-linkage object that is never defined: C7631).
+#include <atomic>
+extern std::atomic<uint64_t> g_g604RawAlphaFbpBits[8];
 
 #include "ps2_gs_gpu_raster_parts/gpu_raster_infrastructure.inc"
 #include "ps2_gs_gpu_raster_parts/persistent_t8_decoder.inc"

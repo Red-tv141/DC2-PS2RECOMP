@@ -57,6 +57,25 @@ bool g566VuAuthorityRequested()
     return on;
 }
 
+// G606 re-runs G543's proven-exact semantic source at a CONFIGURABLE workgroup width over a real
+// captured corpus, times it, and (with DC2_G606_TRACE) publishes per-record VU RAM read/write
+// bitmaps for the kick-independence census. Offline, default-off, never authoritative: every prior
+// GPU-VU number in this project came from a 1-lane dispatch and this is what re-prices it.
+bool g606WideBenchRequested()
+{
+    static const bool on = g158EnvFlag("DC2_G606_VUBENCH");
+    return on;
+}
+
+// G607 prices the OTHER half of the translated-backend question G606 left open: how much cheaper
+// a TRANSLATED pair-step is than an interpreted one, at the widths the control-flow profile says
+// are actually available (p50 = 5 iterations per loop entry). Ceiling bench, offline, default-off.
+bool g607TBenchRequestedFwd()
+{
+    static const bool on = g158EnvFlag("DC2_G607_TBENCH");
+    return on;
+}
+
 // G570: exact compute authority for the narrowly validated FBP 0x139 shadow-volume batch.
 // Provision the worker for either the candidate or its full-surface CPU oracle.
 bool g570Shadow139Requested()
@@ -425,6 +444,30 @@ static bool g349DecolOn()
     return on;
 }
 
+// G603: which GS blend modes need GL_FUNC_REVERSE_SUBTRACT rather than GL_FUNC_ADD. The equation is
+// PERSISTENT GL state and is the one blend term the G560 dual-source path cannot carry per
+// primitive, so it is also the term every run splitter below must group by. Mode 4 is `Cd - Cs`
+// (FIX=128); mode 6 is `Cd - Cs*As/128`, the same equation with the ordinary GL_SRC_ALPHA factor.
+// Keeping this in ONE predicate is the point: the splitters and the two glBlendEquationSeparate
+// call sites previously spelled `blend == 4` in five separate places.
+// G604: the set of G527-discovered targets admitted under the non-persistent transient contract,
+// published by ps2_gs_rasterizer.cpp at TRUE global scope (every .inc in that TU is inside an
+// anonymous namespace, so the predicate itself has internal linkage and cannot be called from
+// here). This keeps the raw-alpha rule below asking for the PROPERTY instead of carrying a second
+// hardcoded address list that would drift from the front-end's.
+// (the extern itself lives in ps2_gs_gpu_raster.cpp, ABOVE this TU's anonymous namespace)
+static inline bool g604RawAlphaTarget(uint32_t fbp)
+{
+    return fbp < 512u &&
+           (g_g604RawAlphaFbpBits[(fbp >> 6) & 7u].load(std::memory_order_relaxed) &
+            (1ull << (fbp & 63u))) != 0ull;
+}
+
+static inline bool g603RevSubBlend(uint32_t blend)
+{
+    return blend == 4u || blend == 6u;
+}
+
 // G560: adjacent draws whose complete raster state differs only by GS blend mode can share one
 // ordered glDrawArrays call.  Flat G178Vtx draw state and a dual-source fragment output supply the
 // per-primitive shader inputs and source/destination factors.  Default-off until the route and
@@ -532,6 +575,7 @@ bool g178LoadGLExt(G178GLExt &e)
     else if (g541NullComputeRequested() || g542AbiReplayRequested() ||
              g543SemanticReplayRequested() || g544ChainReplayRequested() ||
              g545LiveShadowRequested() || g566VuAuthorityRequested() ||
+             g606WideBenchRequested() || g607TBenchRequestedFwd() ||
              g570Shadow139Requested())
     {
         // Optional prototype: missing compute support must not disable the proven graphics backend.
@@ -541,7 +585,7 @@ bool g178LoadGLExt(G178GLExt &e)
     if (g541NullComputeRequested() || g542AbiReplayRequested() ||
         g543SemanticReplayRequested() || g544ChainReplayRequested() ||
         g545LiveShadowRequested() || g566VuAuthorityRequested() ||
-        g570Shadow139Requested())
+        g606WideBenchRequested() || g607TBenchRequestedFwd() || g570Shadow139Requested())
         (void)loadProc(e.glDispatchCompute_, "glDispatchCompute");
     return ok;
 }
@@ -568,6 +612,11 @@ constexpr GLenum GL257_SHADER_IMAGE_STORE = 0x82A5;
 #include "g543_vu_gpu_semantics.inc"
 #include "g544_vu_gpu_chain.inc"
 #include "g545_vu_gpu_live.inc"
+#include "g606_wide_vu.inc"
+// G607 after G606: it reuses g606LinkProgram, and its body comes from the generated
+// translated-kernel include.
+#include "g607_translated_body.inc"
+#include "g607_tbench.inc"
 // GPU texture-cache residency cap (bytes of decoded RGBA8). Title uses a handful of ≤512²
 // textures (~1-4MB); the cap only matters on texture-heavy routes. LRU by last-used batch.
 constexpr size_t kG178TexCacheCapBytes = 256ull * 1024 * 1024;
@@ -1506,6 +1555,10 @@ private:
             (void)g543RunSemanticReplay(m_f, m_e);
         if (g544ChainReplayRequested())
             (void)g544RunChainReplay(m_f, m_e);
+        if (g606WideBenchRequested())
+            (void)g606RunWideBench(m_f, m_e);
+        if (g607TBenchRequested())
+            (void)g607RunTBench(m_f, m_e);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         m_ready.store(true, std::memory_order_release);
@@ -3050,6 +3103,32 @@ void main()
             "    return ((uMode & 32768) != 0) ? min(float(a) * (1.0 / 128.0), 1.0)\n"
             "                                  : float(a) * (1.0 / 255.0);\n"
             "}\n"
+            // G604: which GS blend combo this draw is. Legacy path: bits 17..19 of uMode (the
+            // G560 build masks uMode to 16 bits and overrides this body with its own field).
+            "int g604BlendMode(){ return (uMode >> 17) & 7; }\n"
+            // G604 -- THE EXACTNESS FIX FOR G603's BLEND MODE 6 (Cd - Cs*As/128).
+            //
+            // The GS evaluates ((A-B)*C)>>7 + D in INTEGERS, and for this combo (A=0, B=Cs) the
+            // product is NEGATIVE. `>>7` on a negative int is an ARITHMETIC shift, i.e. FLOOR, so
+            // the hardware computes Cd - ceil(Cs*As/128) -- it always rounds the subtraction AWAY
+            // from zero. GL's fixed-function blend evaluates in float and rounds the UNORM8 result
+            // to NEAREST, so it subtracts 0..1 less on every fragment. On an overdrawn effect that
+            // bias accumulates: the same-run oracle measured 22.5% of pixels off by >1 with a
+            // uniform +1.6 mean, against a 1.53% floor on the display batches beside them.
+            //
+            // GL cannot be asked to floor a blend, so do the multiply HERE, exactly, and hand the
+            // fixed-function unit a plain subtraction (factors ONE/ONE, reverse-subtract). Integer
+            // operands make the final UNORM8 rounding a no-op. `(n+127)/128` is ceil for n >= 0.
+            //
+            // The 255-clamp on the emitted value is safe rather than approximate: it only engages
+            // when Cs*As/128 >= 255, and Cd <= 255, so both arms clamp the difference to 0.
+            // (Same shape of repair as G584: fold the weight into the shader output rather than
+            // trying to express a PS2 rounding rule in GL blend state.)
+            "vec3 g604SubBlendRgb(vec3 rgb, float aa){\n"
+            "    ivec3 cs = clamp(ivec3(floor(rgb * 255.0 + 0.5)), 0, 255);\n"
+            "    int as = clamp(int(floor(aa * 255.0 + 0.5)), 0, 255);\n"
+            "    return vec3(min((cs * as + 127) / 128, ivec3(255))) * (1.0 / 255.0);\n"
+            "}\n"
             "void main(){\n"
             "    if ((uMode & 512) != 0) {\n"
             "        ivec4 vc = clamp(ivec4(floor(vColor * 255.0 + 0.5)), 0, 255);\n"
@@ -3118,6 +3197,11 @@ void main()
             "    float outA = ((uMode & 32) != 0) ? c.a : min(c.a * 1.9921875, 1.0);\n"
             "    if ((uMode & 8192) != 0)\n"
             "        c.rgb = vec3(fogExact(clamp(ivec3(floor(c.rgb * 255.0 + 0.5)), 0, 255))) * (1.0 / 255.0);\n"
+            // G604: after fog (the GS fogs the source colour before blending it), fold mode 6's
+            // As/128 weight into the emitted colour. outA is left alone deliberately: it is also
+            // the STORED framebuffer alpha, and the display path's 0..255 alpha convention is a
+            // property of every display batch, not of this admission.
+            "    if (g604BlendMode() == 6) c.rgb = g604SubBlendRgb(c.rgb, c.a);\n"
             "    o = vec4(c.rgb, outA);\n"
             "    float z = max(vZ, 0.0);\n"
             "    if ((uMode & 16) != 0) z = floor(min(z, 16777215.0));\n"
@@ -3231,11 +3315,21 @@ void main()
                                 "void main(){\n",
                                 "void g560Factors(float blendA){\n"
                                 "    int b = (vG560State.x >> 16) & 7;\n"
+                                // G604 CORRECTION to G603: mode 6's As/128 weight is applied by
+                                // g604SubBlendRgb in the shader (GS floors the negative product;
+                                // a GL factor rounds to nearest and drifts). The factor is now a
+                                // plain 1.0, exactly like mode 4 whose equation it shares.
                                 "    float sf = (b == 1 || b == 2) ? blendA : (b == 5 ? 0.0 : 1.0);\n"
                                 "    float df = b == 0 ? 0.0 : ((b == 1 || b == 5) ? 1.0-blendA : 1.0);\n"
                                 "    oG560Factor = vec4(sf, sf, sf, df);\n"
                                 "}\n"
                                 "void main(){\n") ||
+                    // G604: this build masks uMode to 16 bits, so the legacy bits-17..19 blend
+                    // field is invisible to it. Point g604BlendMode() at its own per-primitive
+                    // field instead, or mode 6 would silently keep the drifting GL-factor form.
+                    !replaceOne(g560Fs,
+                                "int g604BlendMode(){ return (uMode >> 17) & 7; }\n",
+                                "int g604BlendMode(){ return (vG560State.x >> 16) & 7; }\n") ||
                     // G584: the dual-source factor for the exact branch takes the same encoding
                     // as the legacy fixed-function one. It fed the RAW As/255 before, which is
                     // the identical halving the legacy path had -- SRC1_COLOR just carried it.
@@ -4960,7 +5054,12 @@ void main()
                 static_cast<size_t>(d.vtxCount) >
                     b.verts.size() - static_cast<size_t>(d.firstVtx))
                 return false;
-            if (d.scX0 > d.scX1 || d.scY0 > d.scY1 || d.blend > 5u || d.tfx > 3u ||
+            // G603: mode 6 is the display buffer's source-alpha subtractive combo
+            // ((0-Cs)*As>>7 + Cd). It is admitted by the classifier only for fbp 0x0/0x68 under the
+            // g265 display-wave contract; this bound is the batch-level validation that would
+            // otherwise reject the whole batch and put it straight back on the CPU band replay —
+            // exactly the second admission question g534 warns a lever forgets to ask.
+            if (d.scX0 > d.scX1 || d.scY0 > d.scY1 || d.blend > 6u || d.tfx > 3u ||
                 d.wrapU > 1u || d.wrapV > 1u ||
                 (d.depthFunc & 0x0Fu) > 3u)
                 return false;
@@ -5323,7 +5422,13 @@ void main()
             // blended draws had no pass that could carry the As/128 weight at all.
             (b.rttRawAlpha &&
              (b.fbp == 0x13du || b.fbp == 0x141u || b.fbp == 0x15du ||
-              (g584ExactBlendAOn() && b.fbp == 0x13bu)));
+              (g584ExactBlendAOn() && b.fbp == 0x13bu) ||
+              // G604: the discovered targets are selected by PROPERTY, so they cannot be spelled
+              // as an address here. They are render targets that get sampled with TCC=1 later, so
+              // they need PS2's raw 0..128 framebuffer alpha exactly as 0x13d/0x141/0x15d do.
+              // The front-end publishes the property as a bit set (see above), which keeps
+              // it in ONE place instead of duplicating a second address list here.
+              g604RawAlphaTarget(b.fbp)));
         const bool g256Exact = g256ExactRttOn() && m_progExact != 0u &&
             (b.fbp == 0x139u || b.fbp == 0x13cu || b.fbp == 0x143u ||
              b.fbp == 0x146u || b.fbp == 0x155u) && !guestDepth;
@@ -5375,6 +5480,8 @@ void main()
                 const bool accurateUv = ((d.uvRoundU | d.uvRoundV) & 8u) != 0u;
                 if (accurateUv && (mode & 1) != 0 && (mode & 512) == 0)
                     mode |= 4096;
+                // (G604's exact-tap routing for mode 6 measured null and was not kept; see the
+                // refutation note at the matching site in the legacy loop below.)
                 if (d.fge != 0u)
                     mode |= 8192;
                 if (d.uvRoundU != 0u || d.uvRoundV != 0u)
@@ -5491,7 +5598,7 @@ void main()
 
         const auto g560StateEqual = [](const G178Draw &a, const G178Draw &z) {
             return a.firstVtx + a.vtxCount == z.firstVtx &&
-                   (a.blend == 4u) == (z.blend == 4u) &&
+                   g603RevSubBlend(a.blend) == g603RevSubBlend(z.blend) &&
                    a.texKey == z.texKey && a.srcFbp == z.srcFbp &&
                    a.tfx == z.tfx && a.tcc == z.tcc && a.fge == z.fge &&
                    a.fogCol == z.fogCol && a.depthFunc == z.depthFunc &&
@@ -5506,7 +5613,7 @@ void main()
             return a.firstVtx + a.vtxCount == z.firstVtx &&
                    (a.depthFunc & 0x0fu) == (z.depthFunc & 0x0fu) &&
                    a.depthWrite == z.depthWrite &&
-                   (a.blend == 4u) == (z.blend == 4u) &&
+                   g603RevSubBlend(a.blend) == g603RevSubBlend(z.blend) &&
                    a.scX0 == z.scX0 && a.scY0 == z.scY0 &&
                    a.scX1 == z.scX1 && a.scY1 == z.scY1 &&
                    a.texKey == z.texKey && a.srcFbp == z.srcFbp &&
@@ -5520,7 +5627,7 @@ void main()
             return bothUntextured && a.firstVtx + a.vtxCount == z.firstVtx &&
                    (a.depthFunc & 0x0fu) == (z.depthFunc & 0x0fu) &&
                    a.depthWrite == z.depthWrite &&
-                   (a.blend == 4u) == (z.blend == 4u) &&
+                   g603RevSubBlend(a.blend) == g603RevSubBlend(z.blend) &&
                    a.scX0 == z.scX0 && a.scY0 == z.scY0 &&
                    a.scX1 == z.scX1 && a.scY1 == z.scY1;
         };
@@ -5555,7 +5662,7 @@ void main()
             auto eqFixed = [](const G178Draw &a, const G178Draw &z) {
                 return (a.depthFunc & 0x0fu) == (z.depthFunc & 0x0fu) &&
                        a.depthWrite == z.depthWrite &&
-                       (a.blend == 4u) == (z.blend == 4u) &&
+                       g603RevSubBlend(a.blend) == g603RevSubBlend(z.blend) &&
                        a.scX0 == z.scX0 && a.scY0 == z.scY0 &&
                        a.scX1 == z.scX1 && a.scY1 == z.scY1;
             };
@@ -5682,7 +5789,7 @@ void main()
                             { m_e.glBlendEquationSeparate_(eqRgb, eqA); },
                             [&](GLenum sRgb, GLenum dRgb, GLenum sA, GLenum dA)
                             { m_e.glBlendFuncSeparate_(sRgb, dRgb, sA, dA); },
-                            d.blend == 4 ? GL178_FUNC_REVERSE_SUBTRACT : GL178_FUNC_ADD,
+                            g603RevSubBlend(d.blend) ? GL178_FUNC_REVERSE_SUBTRACT : GL178_FUNC_ADD,
                             GL178_FUNC_ADD, GL178_SRC1_COLOR, GL178_SRC1_ALPHA,
                             GL_ONE, GL_ZERO, g496GlCache);
             }
@@ -5699,19 +5806,38 @@ void main()
                 // COLCLAMP). The RGB equation is persistent GL state, so it must be re-set whenever
                 // it is not already the one this draw wants — which is exactly what the cache
                 // tracks; a run of same-mode blended draws now sets it once.
+                // G603 blend==6: (0-Cs)*As>>7 + Cd == Cd - Cs*As/128.
+                // ⛔ G604 CORRECTION: it does NOT want GL_SRC_ALPHA. GS floors the negative
+                // product; GL rounds to nearest, and the resulting sub-LSB shortfall accumulates
+                // over an overdrawn effect (measured: 22.5% of pixels off by >1). The shader now
+                // emits ceil(Cs*As/128) itself (g604SubBlendRgb), so mode 6 takes mode 4's plain
+                // GL_ONE source factor and the fixed-function unit only has to subtract.
                 g496BlendOn([&](GLenum eqRgb, GLenum eqA)
                             { m_e.glBlendEquationSeparate_(eqRgb, eqA); },
                             [&](GLenum sRgb, GLenum dRgb, GLenum sA, GLenum dA)
                             { m_e.glBlendFuncSeparate_(sRgb, dRgb, sA, dA); },
-                            d.blend == 4 ? GL178_FUNC_REVERSE_SUBTRACT : GL178_FUNC_ADD,
+                            g603RevSubBlend(d.blend) ? GL178_FUNC_REVERSE_SUBTRACT : GL178_FUNC_ADD,
                             GL178_FUNC_ADD,
                             d.blend == 5 ? GL_ZERO
-                                         : ((d.blend == 3 || d.blend == 4) ? GL_ONE
-                                                                           : GL_SRC_ALPHA),
+                                         : ((d.blend == 3 || g603RevSubBlend(d.blend))
+                                                ? GL_ONE
+                                                : GL_SRC_ALPHA),
                             (d.blend == 1 || d.blend == 5) ? GL_ONE_MINUS_SRC_ALPHA : GL_ONE,
                             GL_ONE, GL_ZERO, g496GlCache);
             }
             int mode = 0;
+            // G604: carry the blend combo into the shader (bits 17..19), so mode 6 can apply the
+            // GS's integer-floor weighting itself. The field sits above bit 16 so the G560 build's
+            // `uMode & 65535` mask cannot see it — that build overrides g604BlendMode() with its
+            // own per-primitive field instead.
+            //
+            // ⚠️ Set ONLY for mode 6, deliberately. `uMode` is a cached uniform (g496Uniform1i), so
+            // encoding the field unconditionally would make two otherwise-identical draws that
+            // differ only in blend mode a cache MISS and add a glUniform1i to the shipped path for
+            // a value nothing reads. Mode 6 is unreachable unless DC2_G603_SUBBLEND=1, so the
+            // default binary's uMode stream is bit-identical to the pre-G604 one.
+            if (d.blend == 6u)
+                mode |= (6 << 17);
             // G558: 0x13b also carries an opaque SOLID terminal sprite.  G286's integer sampler
             // is a property of its textured batches, not of the framebuffer address itself;
             // selecting it for TME=0 made the backend demand a texture and reject the batch.
@@ -5832,6 +5958,13 @@ void main()
                 ((d.uvRoundU | d.uvRoundV) & 8u) != 0u;
             if (g407AccurateUv && (mode & 1) != 0 && (mode & 512) == 0)
                 mode |= 4096;
+            // ⛔ G604 REFUTED HYPOTHESIS (do not re-try without new evidence): routing mode 6
+            // through the exact 12.4 tap (`mode |= 4096`, which also implements GS's 4-bit
+            // bilinear weights) to explain its divergence. The mode-6 draws are all bilinear
+            // PSMT8/MODULATE, so the sampler looked like the obvious suspect. It measured NULL:
+            // 27.72% -> 28.27% of in-footprint pixels off by >1. Caveat for whoever revisits —
+            // that null was taken while mode 6 was still diverging for the unfound reason, so it
+            // bounds the sampler's contribution as small, not as zero.
             if ((mode & 4096) != 0)
             {
                 // Accurate UV uses exact 12.4 point/bilinear taps. The wrap mode travels as a
