@@ -424,62 +424,30 @@ void GS::performLocalToLocalTransfer()
 
 void GS::vertexKick(bool drawing)
 {
-    // G196: raw per-kick ADC/drawing trace for tbp=0x2a20 (the G195 foreground-sheet suspect),
-    // scoped identically to the existing G195:fgtri draw-time trace, so the two can be diffed
-    // directly against the real map_0.gs freeze-dump's vertex/ADC stream. Default-off.
-    // G268: this ran getenv() on EVERY vertex kick (~2.4us/vertex, ~66ms/frame on MAP-0).
-    static const bool s_g196AdcTrace = envFlagEnabled("DC2_G196_ADC_TRACE");
-    if (g268LiveEnvRead() ? envFlagEnabled("DC2_G196_ADC_TRACE") : s_g196AdcTrace)
+    // G602: every default-off diagnostic that used to sit inline in this function now lives in
+    // g602_gif_cold_outline.inc behind a `__declspec(noinline)` helper. Before that move MSVC gave
+    // this function — called 24,569x per frame on `s05` — a prologue of 8 GPR pushes,
+    // `sub rsp,0x148` and NINE `movaps` spills of xmm6..xmm14, because the G65/G66/G14/G196 traces
+    // print floats. That is 17d §2.1's measured call-boundary class (G487: ~10 ns/call). The
+    // diagnostics are unchanged; only where their register pressure is accounted has moved.
+    if (G602_GATE_KICK_G196)
     {
         const GSContext &ctx196 = m_ctx[m_prim.ctxt & 1u];
-        if (m_prim.tme && ctx196.tex0.tbp0 == 0x2a20u &&
-            (ctx196.frame.fbp == 0u || ctx196.frame.fbp == 0x68u))
-        {
-            static std::atomic<uint32_t> s_g196{0};
-            const uint32_t n = s_g196.fetch_add(1u, std::memory_order_relaxed);
-            if (n < 512u)
-            {
-                // G200: also log the freshly-written vertex position so the runner's output
-                // coords can be compared against the real map_0.gs freeze's XYZ2 stream for the
-                // same tbp (positions-diverge vs pure-gate-diverge discriminator).
-                const GSVertex &v196 = m_vtxQueue[m_vtxCount % kMaxVerts];
-                std::fprintf(stderr,
-                    "[G196:kick] n=%u prim=%u drawing=%u vtxCount=%u fbp=0x%x x=%.3f y=%.3f z=%.1f q=%g\n",
-                    n, static_cast<uint32_t>(m_prim.type),
-                    static_cast<uint32_t>(drawing ? 1u : 0u), m_vtxCount, ctx196.frame.fbp,
-                    v196.x, v196.y, v196.z, v196.q);
-            }
-        }
+        // G200: log the freshly-written vertex position (the slot the caller just filled, before
+        // the count advances) so the runner's coords can be diffed against map_0.gs.
+        g602ColdKickG196(static_cast<uint32_t>(m_prim.type), m_prim.tme, ctx196.tex0.tbp0,
+                         ctx196.frame.fbp, drawing, m_vtxCount,
+                         m_vtxQueue[m_vtxCount % kMaxVerts]);
     }
 
     // G107 A/B: ADC is "drawing kick disabled". For title-rock strips, test the stricter
     // interpretation that an ADC vertex must not advance the primitive queue either.
-    if (!drawing)
+    if (!drawing && G602_GATE_KICK_G107)
     {
-        extern std::atomic<bool> g_dc2TitleRockScope;
-        static const bool s_g107NoAdvance = envFlagEnabled("DC2_G107_ADC_NO_ADVANCE");
-        if (s_g107NoAdvance &&
-            g_dc2TitleRockScope.load(std::memory_order_relaxed) &&
-            m_prim.type == GS_PRIM_TRISTRIP)
-        {
-            const GSContext &ctx = m_ctx[m_prim.ctxt & 1u];
-            if (m_prim.tme && ctx.frame.fbp != 0x139u && g105TitleRockTbp(ctx.tex0.tbp0))
-            {
-                static const bool s_stat = envFlagEnabled("DC2_G107_ADC_STAT");
-                if (s_stat)
-                {
-                    static std::atomic<uint64_t> s_skip{0};
-                    const uint64_t n = s_skip.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                    if (n <= 32u || (n & 0x3FFull) == 0ull)
-                        std::fprintf(stderr,
-                                     "[G107:adcskip] n=%llu prim=%u tbp=0x%x vtxCount=%u\n",
-                                     static_cast<unsigned long long>(n),
-                                     static_cast<uint32_t>(m_prim.type),
-                                     ctx.tex0.tbp0, m_vtxCount);
-                }
-                return;
-            }
-        }
+        const GSContext &ctx = m_ctx[m_prim.ctxt & 1u];
+        if (g602ColdKickG107(static_cast<uint32_t>(m_prim.type), m_prim.tme, ctx.tex0.tbp0,
+                             ctx.frame.fbp, m_vtxCount))
+            return;
     }
 
     ++m_vtxCount;
@@ -527,125 +495,28 @@ void GS::vertexKick(bool drawing)
 
     // [G123] ordered interleave: accumulate this tri-class kick into the current draw-run keyed
     // by the bound TEX0; a tbp change flushes the run. Pairs with the BIND events above.
-    if (g123SeqEnabled())
+    if (G602_GATE_KICK_G123)
     {
-        const uint32_t tt123 = (uint32_t)m_prim.type & 7u;
-        const bool triClass123 = (tt123 == GS_PRIM_TRIANGLE || tt123 == GS_PRIM_TRISTRIP ||
-                                  tt123 == GS_PRIM_TRIFAN);
-        extern std::atomic<bool> g_dc2TitleRockScope;
-        if (triClass123 && m_prim.tme &&
-            g_dc2TitleRockScope.load(std::memory_order_relaxed))
-        {
-            const GSContext &ctx123 = m_ctx[m_prim.ctxt & 1u];
-            if (g105TitleRockTbp(ctx123.tex0.tbp0))
-            {
-                std::lock_guard<std::mutex> lk(s_g123Mtx);
-                if (ctx123.tex0.tbp0 != s_g123RunTbp || tt123 != s_g123RunPrim)
-                    g123FlushRun();
-                s_g123RunTbp = ctx123.tex0.tbp0;
-                s_g123RunPrim = tt123;
-                if (drawing)
-                    ++s_g123RunDraw;
-                else
-                    ++s_g123RunNodraw;
-            }
-        }
+        const GSContext &ctx123 = m_ctx[m_prim.ctxt & 1u];
+        g602ColdKickG123(static_cast<uint32_t>(m_prim.type), m_prim.tme, ctx123.tex0.tbp0, drawing);
     }
 
     if (m_vtxCount < needed)
         return;
 
-    // G65: tally EVERY vertexKick by prim type AND by drawing flag, so we can tell whether
-    // the title's tristrips reach the GS at all (and with drawing=true) vs are lost upstream.
-    if (g14TraceEnabled())
-    {
-        static std::atomic<uint64_t> s_all[8]{}, s_nodraw[8]{};
-        const uint32_t tt = (uint32_t)m_prim.type & 7u;
-        s_all[tt].fetch_add(1u, std::memory_order_relaxed);
-        if (!drawing) s_nodraw[tt].fetch_add(1u, std::memory_order_relaxed);
-
-        // G66: per-tbp draw/nodraw tally for tri-class prims. Distinguishes "rock geometry
-        // (tbp=0x3960) never emitted" (H1) vs "emitted but ADC=1 / texture missing / occluded"
-        // (H2). HW new_game.gs: rock = tbp=0x3960 PSMT8, 608 tstrip+184 tfan+128 tri / frame.
-        {
-            static std::mutex s_g66Mtx;
-            struct TbpRec { uint32_t tbp; uint32_t tme; uint64_t draw; uint64_t nodraw; };
-            static TbpRec s_g66[64]{};
-            static uint32_t s_g66N = 0;
-            const bool triClass = (tt == GS_PRIM_TRIANGLE || tt == GS_PRIM_TRISTRIP || tt == GS_PRIM_TRIFAN);
-            if (triClass)
-            {
-                const uint32_t tbp = m_prim.tme ? m_ctx[m_prim.ctxt & 1u].tex0.tbp0 : 0xFFFFFFFFu;
-                std::lock_guard<std::mutex> lk(s_g66Mtx);
-                uint32_t idx = 0xFFFFFFFFu;
-                for (uint32_t i = 0; i < s_g66N; ++i)
-                    if (s_g66[i].tbp == tbp) { idx = i; break; }
-                if (idx == 0xFFFFFFFFu && s_g66N < 64u) { idx = s_g66N++; s_g66[idx].tbp = tbp; s_g66[idx].tme = m_prim.tme; }
-                if (idx != 0xFFFFFFFFu) { if (drawing) s_g66[idx].draw++; else s_g66[idx].nodraw++; }
-                static uint64_t s_g66Tick = 0;
-                if ((++s_g66Tick % 20000ull) == 0ull)
-                {
-                    for (uint32_t i = 0; i < s_g66N; ++i)
-                        std::fprintf(stderr, "[G66:tbp] tbp=0x%x tme=%u draw=%llu nodraw=%llu\n",
-                            s_g66[i].tbp, s_g66[i].tme,
-                            (unsigned long long)s_g66[i].draw, (unsigned long long)s_g66[i].nodraw);
-                }
-            }
-        }
-        static std::atomic<uint64_t> s_n{0};
-        const uint64_t vkn = s_n.fetch_add(1u, std::memory_order_relaxed);
-        // G65: steady-state (late) sample of triangle-class coords + tme, skipping the early
-        // boot/intro geometry that contaminates the capped per-sample traces. Window at high
-        // vkn so we see the actual title menu rock geometry, not boot frames.
-        if (vkn >= 80000u && vkn < 80360u &&
-            (tt == GS_PRIM_TRIANGLE || tt == GS_PRIM_TRISTRIP) && m_vtxCount >= 3u)
-        {
-            const GSVertex& a = m_vtxQueue[(m_vtxCount-3) % kMaxVerts];
-            const GSVertex& b = m_vtxQueue[(m_vtxCount-2) % kMaxVerts];
-            const GSVertex& c = m_vtxQueue[(m_vtxCount-1) % kMaxVerts];
-            std::fprintf(stderr, "[G65:late] t=%u draw=%u tme=%u tbp=0x%x v0=(%.0f,%.0f,%.0f) v1=(%.0f,%.0f,%.0f) v2=(%.0f,%.0f,%.0f)\n",
-                tt, (unsigned)(drawing?1u:0u), (unsigned)m_prim.tme, m_ctx[m_prim.ctxt&1u].tex0.tbp0,
-                a.x,a.y,a.z, b.x,b.y,b.z, c.x,c.y,c.z);
-        }
-        if ((vkn % 20000u) == 0u)
-            std::fprintf(stderr, "[G65:vk] ALL t0..7= %llu %llu %llu %llu %llu %llu %llu %llu | NODRAW tri/tstrip/tfan= %llu %llu %llu\n",
-                (unsigned long long)s_all[0].load(),(unsigned long long)s_all[1].load(),(unsigned long long)s_all[2].load(),
-                (unsigned long long)s_all[3].load(),(unsigned long long)s_all[4].load(),(unsigned long long)s_all[5].load(),
-                (unsigned long long)s_all[6].load(),(unsigned long long)s_all[7].load(),
-                (unsigned long long)s_nodraw[3].load(),(unsigned long long)s_nodraw[4].load(),(unsigned long long)s_nodraw[5].load());
-    }
-
-    if (drawing && g14TraceEnabled())
-    {
-        static std::atomic<uint32_t> s_pt[8]{};
-        const uint32_t t = (uint32_t)m_prim.type & 7u;
-        const uint32_t c = s_pt[t].fetch_add(1u, std::memory_order_relaxed);
-        const bool tri = (t == GS_PRIM_TRIANGLE || t == GS_PRIM_TRISTRIP || t == GS_PRIM_TRIFAN);
-        if (tri && c < 40u)
-        {
-            std::fprintf(stderr, "[G14:tri] type=%u n=%u tme=%u v0=(%.1f,%.1f,%.1f) v1=(%.1f,%.1f,%.1f) v2=(%.1f,%.1f,%.1f)\n",
-                         t, c, (uint32_t)m_prim.tme,
-                         m_vtxQueue[0].x, m_vtxQueue[0].y, m_vtxQueue[0].z,
-                         m_vtxQueue[1].x, m_vtxQueue[1].y, m_vtxQueue[1].z,
-                         m_vtxQueue[2].x, m_vtxQueue[2].y, m_vtxQueue[2].z);
-            std::fflush(stderr);
-        }
-        if (((c + 1u) % 5000u) == 0u || (tri && c == 0u))
-        {
-            std::fprintf(stderr, "[G14:primsum] point=%u line=%u lstrip=%u tri=%u tstrip=%u tfan=%u sprite=%u\n",
-                         s_pt[GS_PRIM_POINT].load(), s_pt[GS_PRIM_LINE].load(), s_pt[GS_PRIM_LINESTRIP].load(),
-                         s_pt[GS_PRIM_TRIANGLE].load(), s_pt[GS_PRIM_TRISTRIP].load(), s_pt[GS_PRIM_TRIFAN].load(),
-                         s_pt[GS_PRIM_SPRITE].load());
-            std::fflush(stderr);
-        }
-    }
+    // G65/G66/G14: per-prim-type and per-tbp draw/nodraw tallies plus the sampled coordinate
+    // traces. G602 moved the whole block out of line (g602_gif_cold_outline.inc) — it owns most of
+    // this function's nine nonvolatile XMM saves.
+    if (G602_GATE_KICK_G14)
+        g602ColdKickTrace(static_cast<uint32_t>(m_prim.type), m_prim.tme,
+                          m_ctx[m_prim.ctxt & 1u].tex0.tbp0, drawing, m_vtxCount,
+                          m_vtxQueue, kMaxVerts);
 
     // G434 workload invariant: a ceiling probe that deletes draw submission is only admissible if
     // both arms provably completed the same kicks. Behind the same cached master bool as the
     // report, so the default path pays one predicted branch, not two atomics per vertex.
     extern std::atomic<uint64_t> g_g434Kicks, g_g434DrawKicks;
-    static const bool s_g434Inv = envFlagEnabled("DC2_G434_INV");
-    if (s_g434Inv)
+    if (G602_GATE_KICK_INV)
     {
         g_g434Kicks.fetch_add(1u, std::memory_order_relaxed);
         if (drawing)
@@ -658,8 +529,7 @@ void GS::vertexKick(bool drawing)
         // skip the entire front-thread primitive submission — deferral, tile-binning, GPU
         // batching and CPU raster all vanish, while GIF parse, register replay, transfers and
         // the vertex queue keep running identically. Prices "what if drawPrimitive cost zero".
-        static const bool s_g434NoDraw = envFlagEnabled("DC2_G434_NO_DRAW");
-        if (!s_g434NoDraw)
+        if (!G602_GATE_KICK_NODRAW)
         {
             G147CountedPerfScope g147DrawScope(g_g147DrawPrimitiveNs, g_g147DrawPrimitiveCount);
             m_rasterizer.drawPrimitive(this);

@@ -134,9 +134,17 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             writeRegister(GS_REG_PRIM, (tagLo >> 47) & 0x7FF);
         }
 
+        // G602: the descriptor list IS `tagHi`'s nibbles, so read them where they already are. The
+        // old `uint8_t regs[16]` staging array cost 16 stores per tag AND was the only stack array
+        // in this function, i.e. the reason MSVC gave it a /GS security cookie.
+#if DC2_G602_TAGWALK
+#define G602_REGDESC(r) static_cast<uint8_t>((tagHi >> ((r) * 4)) & 0xFu)
+#else
         uint8_t regs[16];
         for (uint32_t i = 0; i < nreg; ++i)
             regs[i] = static_cast<uint8_t>((tagHi >> (i * 4)) & 0xF);
+#define G602_REGDESC(r) regs[r]
+#endif
 
         if (flg == GIF_FMT_PACKED)
         {
@@ -144,13 +152,12 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
             m_hwregY = 0;
             const bool g171On = g171PerfEnabled();
             // ===== G593 ceiling probe (DC2_G593_NOREG=1, default-off, knowingly WRONG output) =====
-            // ⚠️ The arm selects a DUPLICATED cold loop rather than adding a branch to the hot one.
+            // The arm selects a DUPLICATED cold loop rather than adding a branch to the hot one.
             // The first form put one loop-invariant predicted branch inside the ~141 k
-            // descriptors/frame loop, and `[G147:gif] parserOther` moved 9.12 -> 9.76 ms/f — 4.5 ns
+            // descriptors/frame loop, and `[G147:gif] parserOther` moved 9.12 -> 9.76 ms/f - 4.5 ns
             // per descriptor of standing tax on the POLE THREAD for a diagnostic that ships
             // default-off. G520's law is that arm symmetry is a CODEGEN property; here the
-            // requirement is the opposite and stronger — the DEFAULT arm's code must be untouched.
-            // The `else` branch below is byte-identical to the pre-G593 loop.
+            // requirement is the opposite and stronger - the DEFAULT arm's code must be untouched.
             if (g593NoRegOn())
             {
                 for (uint32_t loop = 0; loop < nloop; ++loop)
@@ -170,18 +177,53 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                         // other descriptor. A+D (0x0E) carries its GS register address in
                         // hi[7:0], and the four vertex codes are the same there as in the PACKED
                         // descriptor table.
-                        const uint8_t d593 = static_cast<uint8_t>(regs[r] & 0xFu);
+                        const uint8_t d593 = G602_REGDESC(r);
                         const uint8_t a593 = static_cast<uint8_t>(hi & 0xFFu);
                         const bool vtx593 =
                             (d593 == 0x04u || d593 == 0x05u || d593 == 0x0Cu || d593 == 0x0Du) ||
                             (d593 == 0x0Eu && (a593 == 0x04u || a593 == 0x05u ||
                                                a593 == 0x0Cu || a593 == 0x0Du));
                         if (vtx593)
-                            writeRegisterPacked(regs[r], lo, hi);
+                            writeRegisterPacked(d593, lo, hi);
                     }
                 }
                 continue; // this tag is fully consumed
             }
+#if DC2_G602_TAGWALK
+            // ===== G602 (default): the descriptor walk, bounds-checked ONCE PER TAG =====
+            // Two per-descriptor costs leave the ~141 k/frame loop:
+            //   1. `offset + 16 > sizeBytes`, replaced by one `availDesc` computation. Truncation
+            //      semantics are identical - process exactly min(nloop*nreg, availDesc)
+            //      descriptors, count exactly those, then return if the tag was short.
+            //   2. the loop-invariant `if (g171On)` branch, which now selects a duplicated loop
+            //      instead - the same remedy G593 applied to its own probe, for the same measured
+            //      reason.
+            if (!g171On)
+            {
+                const uint32_t availDesc = (sizeBytes - offset) >> 4;
+                const uint64_t wantDesc = static_cast<uint64_t>(nloop) * nreg;
+                const bool truncated = wantDesc > static_cast<uint64_t>(availDesc);
+                const uint32_t nDesc = truncated ? availDesc : static_cast<uint32_t>(wantDesc);
+                const uint32_t fullLoops = nDesc / nreg;
+                const uint32_t tailRegs = nDesc - fullLoops * nreg;
+                const uint8_t *p = data + offset;
+                for (uint32_t loop = 0; loop < fullLoops; ++loop)
+                {
+                    for (uint32_t r = 0; r < nreg; ++r, p += 16)
+                        writeRegisterPacked(G602_REGDESC(r), loadLE64(p), loadLE64(p + 8));
+                }
+                for (uint32_t r = 0; r < tailRegs; ++r, p += 16)
+                    writeRegisterPacked(G602_REGDESC(r), loadLE64(p), loadLE64(p + 8));
+                offset += nDesc * 16u;
+                g147PackedRegs += nDesc;
+                if (truncated)
+                {
+                    g147FlushCounters();
+                    return;
+                }
+                continue; // this tag is fully consumed
+            }
+            // [G171:regstat] census arm - its own loop, so the default walk above carries no branch.
             for (uint32_t loop = 0; loop < nloop; ++loop)
             {
                 for (uint32_t r = 0; r < nreg; ++r)
@@ -191,54 +233,60 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                         g147FlushCounters();
                         return;
                     }
-                    uint64_t lo = loadLE64(data + offset);
-                    uint64_t hi = loadLE64(data + offset + 8);
+                    const uint64_t lo = loadLE64(data + offset);
+                    const uint64_t hi = loadLE64(data + offset + 8);
+                    offset += 16;
+                    const uint8_t g171Desc = G602_REGDESC(r);
+                    const auto g171T0 = std::chrono::steady_clock::now();
+                    writeRegisterPacked(g171Desc, lo, hi);
+                    const auto g171Ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - g171T0).count();
+                    const GSContext &sctx = m_ctx[m_prim.ctxt & 1u];
+                    g602ColdG171Note(g171Desc, hi, static_cast<long long>(g171Ns),
+                                     static_cast<uint32_t>(m_prim.type), m_prim.tme, m_prim.abe,
+                                     sctx.frame, sctx.scissor,
+                                     m_vtxQueue[(m_vtxCount + kMaxVerts - 1) % kMaxVerts],
+                                     m_vtxQueue[(m_vtxCount + kMaxVerts - 2) % kMaxVerts]);
+                    ++g147PackedRegs;
+                }
+            }
+#else
+            // Pre-G602 shape: one fused loop, bounds-checked per descriptor, with the
+            // loop-invariant `g171On` test inside it.
+            for (uint32_t loop = 0; loop < nloop; ++loop)
+            {
+                for (uint32_t r = 0; r < nreg; ++r)
+                {
+                    if (offset + 16 > sizeBytes)
+                    {
+                        g147FlushCounters();
+                        return;
+                    }
+                    const uint64_t lo = loadLE64(data + offset);
+                    const uint64_t hi = loadLE64(data + offset + 8);
                     offset += 16;
                     if (g171On)
                     {
+                        const uint8_t g171Desc = G602_REGDESC(r);
                         const auto g171T0 = std::chrono::steady_clock::now();
-                        writeRegisterPacked(regs[r], lo, hi);
+                        writeRegisterPacked(g171Desc, lo, hi);
                         const auto g171Ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - g171T0).count();
-                        const uint8_t g171Desc = regs[r] & 0xFu;
-                        g_g171RegNs[g171Desc].fetch_add(static_cast<uint64_t>(g171Ns), std::memory_order_relaxed);
-                        g_g171RegCount[g171Desc].fetch_add(1u, std::memory_order_relaxed);
-                        if (g171Desc == 0x0Eu)
-                        {
-                            const uint8_t g171AdAddr = static_cast<uint8_t>(hi & 0xFFu);
-                            g_g171AdNs[g171AdAddr].fetch_add(static_cast<uint64_t>(g171Ns), std::memory_order_relaxed);
-                            g_g171AdCount[g171AdAddr].fetch_add(1u, std::memory_order_relaxed);
-                            // G171 follow-up: identify WHAT is being drawn on the slow A+D XYZ2/XYZF2
-                            // vertex-kick path (candidate: non-deferred 2D sprite raster, since G144
-                            // only defers textured TRIS). Rate-limited trace on expensive calls only.
-                            if ((g171AdAddr == 0x04u || g171AdAddr == 0x05u) && g171Ns > 5000)
-                            {
-                                static std::atomic<uint32_t> s_g171SlowCount{0};
-                                const uint32_t sn = s_g171SlowCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                                if (sn <= 40u || (sn % 200u) == 0u)
-                                {
-                                    const GSContext &sctx = m_ctx[m_prim.ctxt & 1u];
-                                    const GSVertex &vA = m_vtxQueue[(m_vtxCount + kMaxVerts - 1) % kMaxVerts];
-                                    const GSVertex &vB = m_vtxQueue[(m_vtxCount + kMaxVerts - 2) % kMaxVerts];
-                                    std::fprintf(stderr,
-                                                 "[G171:slowad] sn=%u addr=0x%02x ns=%lld prim=%u tme=%u abe=%u fbp=0x%x fbw=%u psm=0x%x scissor=(%d,%d)-(%d,%d) vtx=(%.1f,%.1f)-(%.1f,%.1f)\n",
-                                                 sn, g171AdAddr, static_cast<long long>(g171Ns),
-                                                 static_cast<uint32_t>(m_prim.type),
-                                                 (unsigned)m_prim.tme, (unsigned)m_prim.abe,
-                                                 sctx.frame.fbp, sctx.frame.fbw, static_cast<uint32_t>(sctx.frame.psm),
-                                                 sctx.scissor.x0, sctx.scissor.y0, sctx.scissor.x1, sctx.scissor.y1,
-                                                 vA.x, vA.y, vB.x, vB.y);
-                                }
-                            }
-                        }
+                        const GSContext &sctx = m_ctx[m_prim.ctxt & 1u];
+                        g602ColdG171Note(g171Desc, hi, static_cast<long long>(g171Ns),
+                                         static_cast<uint32_t>(m_prim.type), m_prim.tme, m_prim.abe,
+                                         sctx.frame, sctx.scissor,
+                                         m_vtxQueue[(m_vtxCount + kMaxVerts - 1) % kMaxVerts],
+                                         m_vtxQueue[(m_vtxCount + kMaxVerts - 2) % kMaxVerts]);
                     }
                     else
                     {
-                        writeRegisterPacked(regs[r], lo, hi);
+                        writeRegisterPacked(G602_REGDESC(r), lo, hi);
                     }
                     ++g147PackedRegs;
                 }
             }
+#endif
         }
         else if (flg == GIF_FMT_REGLIST)
         {
@@ -251,7 +299,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                         g147FlushCounters();
                         return;
                     }
-                    writeRegister(regs[r], loadLE64(data + offset));
+                    writeRegister(G602_REGDESC(r), loadLE64(data + offset));
                     offset += 8;
                     ++g147ReglistRegs;
                 }
@@ -338,6 +386,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     }
     g147FlushCounters();
 }
+#undef G602_REGDESC
 
 void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 {
@@ -355,44 +404,20 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         // RETAIN the previous (valid) vertex color. Triangles interpolating from these zero
         // verts produced the long-deferred dark "face/hand speckle". Scope: only the costume
         // model context (fbp=0x139 textured tristrip). Kill switch DC2_G52_HOLDCOLOR=0.
-        static const bool g52holdOff = envFlagEnabled("DC2_G52_NO_HOLDCOLOR");
-        const bool g52ZeroRgbaq = (lo == 0u && hi == 0u);
-        const bool g52ModelCtx = (m_prim.type == GS_PRIM_TRISTRIP &&
-                                  m_ctx[m_prim.ctxt & 1u].frame.fbp == 0x139u);
-        if (!(!g52holdOff && g52ZeroRgbaq && g52ModelCtx))
+        if (!(G602_GATE_PK_G52HOLD && (lo == 0u && hi == 0u) &&
+              m_prim.type == GS_PRIM_TRISTRIP &&
+              m_ctx[m_prim.ctxt & 1u].frame.fbp == 0x139u))
         {
             m_curR = static_cast<uint8_t>(lo & 0xFF);
             m_curG = static_cast<uint8_t>((lo >> 32) & 0xFF);
             m_curB = static_cast<uint8_t>(hi & 0xFF);
             m_curA = static_cast<uint8_t>((hi >> 32) & 0xFF);
         }
-        {
-            static const bool g52seq = envFlagEnabled("DC2_G52_SEQ");
-            if (g52seq && m_prim.type == GS_PRIM_TRISTRIP &&
-                m_ctx[m_prim.ctxt & 1u].frame.fbp == 0x139u)
-            {
-                static std::atomic<uint32_t> s_g52c{0};
-                const uint32_t n = s_g52c.fetch_add(1u, std::memory_order_relaxed);
-                if (n < 400u)
-                    std::fprintf(stderr, "[G52:rgba] n=%u col=(%u,%u,%u,%u) lo=0x%016llx hi=0x%016llx\n",
-                                 n, (unsigned)m_curR, (unsigned)m_curG, (unsigned)m_curB, (unsigned)m_curA,
-                                 static_cast<unsigned long long>(lo), static_cast<unsigned long long>(hi));
-            }
-        }
-        if (phaseDiagnosticsEnabled())
-        {
-            static std::atomic<uint32_t> s_f31PackedRgbaCount{0};
-            const uint32_t n = s_f31PackedRgbaCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-            const bool rgbNz = (m_curR | m_curG | m_curB) != 0u;
-            if (n <= 32u || rgbNz || (n % 1024u) == 0u)
-            {
-                std::fprintf(stderr,
-                             "[F31:packed-rgbaq] n=%u rgba=%02x,%02x,%02x,%02x lo=0x%016llx hi=0x%016llx\n",
-                             n, m_curR, m_curG, m_curB, m_curA,
-                             static_cast<unsigned long long>(lo),
-                             static_cast<unsigned long long>(hi));
-            }
-        }
+        // G602: [G52:rgba] + [F31:packed-rgbaq] moved out of line (g602_gif_cold_outline.inc).
+        if (G602_GATE_PK_RGBAQTRACE)
+            g602ColdPackedRgbaqTrace(static_cast<uint32_t>(m_prim.type),
+                                     m_ctx[m_prim.ctxt & 1u].frame.fbp,
+                                     m_curR, m_curG, m_curB, m_curA, lo, hi);
         break;
     }
     case 0x02:
@@ -418,88 +443,22 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         uint32_t z = static_cast<uint32_t>((hi >> 4) & 0xFFFFFF);
         uint8_t f = static_cast<uint8_t>((hi >> 36) & 0xFF);
         bool adk = ((hi >> 47) & 1) != 0;
-        { static const bool s_fd = envFlagEnabled("DC2_G65_FORCEDRAW"); if (s_fd) adk = false; }
+        if (G602_GATE_PK_FORCEDRAW)
+            adk = false;
         bool g105Restart = false;
+        // G602: the G105 synthetic-ADC scissor guard (the only float arithmetic in this switch that
+        // is not the vertex unpack) moved out of line — see g602_gif_cold_outline.inc.
+        if (!adk && G602_GATE_PK_SYNTHADC &&
+            g602ColdPackedSynthAdc(x, y, m_ctx[m_prim.ctxt & 1u],
+                                   static_cast<uint32_t>(m_prim.type), m_prim.tme, g105Restart))
         {
-            extern std::atomic<bool> g_dc2TitleRockScope;
-            const GSContext &ctx = m_ctx[m_prim.ctxt & 1u];
-            if (!adk && g105SynthAdcEnabled() &&
-                g_dc2TitleRockScope.load(std::memory_order_relaxed) &&
-                m_prim.type == GS_PRIM_TRISTRIP &&
-                m_prim.tme &&
-                ctx.frame.fbp != 0x139u &&
-                g105TitleRockTbp(ctx.tex0.tbp0))
-            {
-                const float guard = g105AdcGuard();
-                const float sx = static_cast<float>(x) / 16.0f -
-                                 static_cast<float>(ctx.xyoffset.ofx >> 4);
-                const float sy = static_cast<float>(y) / 16.0f -
-                                 static_cast<float>(ctx.xyoffset.ofy >> 4);
-                const bool outside =
-                    sx < static_cast<float>(ctx.scissor.x0) - guard ||
-                    sx > static_cast<float>(ctx.scissor.x1) + guard ||
-                    sy < static_cast<float>(ctx.scissor.y0) - guard ||
-                    sy > static_cast<float>(ctx.scissor.y1) + guard;
-                if (outside)
-                {
-                    adk = true;
-                    g105Restart = g105ResetStripEnabled();
-                    static const bool s_stat = envFlagEnabled("DC2_G105_ADC_STAT");
-                    if (s_stat)
-                    {
-                        static std::atomic<uint64_t> s_forced{0}, s_seen{0};
-                        const uint64_t n = s_seen.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                        const uint64_t fcnt = s_forced.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                        if ((n & 0x1FFFull) == 0ull)
-                            std::fprintf(stderr,
-                                         "[G105:adc] seen=%llu forced=%llu guard=%.0f tbp=0x%x xy=(%.1f,%.1f)\n",
-                                         static_cast<unsigned long long>(n),
-                                         static_cast<unsigned long long>(fcnt),
-                                         guard, ctx.tex0.tbp0, sx, sy);
-                    }
-                }
-            }
+            adk = true;
         }
-        {
-            static const bool g52seq = envFlagEnabled("DC2_G52_SEQ");
-            if (g52seq && m_prim.type == GS_PRIM_TRISTRIP &&
-                m_ctx[m_prim.ctxt & 1u].frame.fbp == 0x139u)
-            {
-                static std::atomic<uint32_t> s_g52{0};
-                const uint32_t n = s_g52.fetch_add(1u, std::memory_order_relaxed);
-                if (n < 400u)
-                    std::fprintf(stderr,
-                                 "[G52:seq] n=%u adc=%u xy=(%.1f,%.1f) col=(%u,%u,%u,%u) tbp=0x%x hi=0x%016llx\n",
-                                 n, (unsigned)(adk ? 1u : 0u), x / 16.0f, y / 16.0f,
-                                 (unsigned)m_curR, (unsigned)m_curG, (unsigned)m_curB, (unsigned)m_curA,
-                                 m_ctx[m_prim.ctxt & 1u].tex0.tbp0,
-                                 static_cast<unsigned long long>(hi));
-            }
-        }
-        if (g31TraceEnabled() &&
-            (m_prim.type == GS_PRIM_TRIANGLE ||
-             m_prim.type == GS_PRIM_TRISTRIP ||
-             m_prim.type == GS_PRIM_TRIFAN))
-        {
-            static std::atomic<uint32_t> s_g31PackedXyzf2Count{0};
-            const uint32_t n = s_g31PackedXyzf2Count.fetch_add(1u, std::memory_order_relaxed);
-            if (n < 160u)
-            {
-                std::fprintf(stderr,
-                             "[G31:xyzf2] n=%u prim=%u slot=%u countBefore=%u adc=%u x=%u(%.1f) y=%u(%.1f) z=0x%x f=%u lo=0x%016llx hi=0x%016llx\n",
-                             n,
-                             static_cast<uint32_t>(m_prim.type),
-                             static_cast<uint32_t>(m_vtxCount % kMaxVerts),
-                             m_vtxCount,
-                             static_cast<uint32_t>(adk ? 1u : 0u),
-                             static_cast<uint32_t>(x), x / 16.0f,
-                             static_cast<uint32_t>(y), y / 16.0f,
-                             z,
-                             static_cast<uint32_t>(f),
-                             static_cast<unsigned long long>(lo),
-                             static_cast<unsigned long long>(hi));
-            }
-        }
+        // G602: [G52:seq] + [G31:xyzf2] moved out of line.
+        if (G602_GATE_PK_XYZTRACE)
+            g602ColdPackedXyzTrace(static_cast<uint32_t>(m_prim.type), m_ctx[m_prim.ctxt & 1u],
+                                   m_curR, m_curG, m_curB, m_curA, m_vtxCount, adk,
+                                   x, y, z, f, lo, hi, kMaxVerts);
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t debugIndex = s_debugGsPackedVertexCount.fetch_add(1, std::memory_order_relaxed);
             if (debugIndex < 64u)
@@ -540,47 +499,15 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         uint16_t y = static_cast<uint16_t>((lo >> 32) & 0xFFFF);
         uint32_t z = static_cast<uint32_t>(hi & 0xFFFFFFFF);
         bool adk = ((hi >> 47) & 1) != 0;
-        { static const bool s_fd = envFlagEnabled("DC2_G65_FORCEDRAW"); if (s_fd) adk = false; }
+        if (G602_GATE_PK_FORCEDRAW)
+            adk = false;
         bool g105Restart = false;
+        // G602: same out-of-line G105 synthetic-ADC guard as descriptor 0x04.
+        if (!adk && G602_GATE_PK_SYNTHADC &&
+            g602ColdPackedSynthAdc(x, y, m_ctx[m_prim.ctxt & 1u],
+                                   static_cast<uint32_t>(m_prim.type), m_prim.tme, g105Restart))
         {
-            extern std::atomic<bool> g_dc2TitleRockScope;
-            const GSContext &ctx = m_ctx[m_prim.ctxt & 1u];
-            if (!adk && g105SynthAdcEnabled() &&
-                g_dc2TitleRockScope.load(std::memory_order_relaxed) &&
-                m_prim.type == GS_PRIM_TRISTRIP &&
-                m_prim.tme &&
-                ctx.frame.fbp != 0x139u &&
-                g105TitleRockTbp(ctx.tex0.tbp0))
-            {
-                const float guard = g105AdcGuard();
-                const float sx = static_cast<float>(x) / 16.0f -
-                                 static_cast<float>(ctx.xyoffset.ofx >> 4);
-                const float sy = static_cast<float>(y) / 16.0f -
-                                 static_cast<float>(ctx.xyoffset.ofy >> 4);
-                const bool outside =
-                    sx < static_cast<float>(ctx.scissor.x0) - guard ||
-                    sx > static_cast<float>(ctx.scissor.x1) + guard ||
-                    sy < static_cast<float>(ctx.scissor.y0) - guard ||
-                    sy > static_cast<float>(ctx.scissor.y1) + guard;
-                if (outside)
-                {
-                    adk = true;
-                    g105Restart = g105ResetStripEnabled();
-                    static const bool s_stat = envFlagEnabled("DC2_G105_ADC_STAT");
-                    if (s_stat)
-                    {
-                        static std::atomic<uint64_t> s_forced{0}, s_seen{0};
-                        const uint64_t n = s_seen.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                        const uint64_t fcnt = s_forced.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                        if ((n & 0x1FFFull) == 0ull)
-                            std::fprintf(stderr,
-                                         "[G105:adc] seen=%llu forced=%llu guard=%.0f tbp=0x%x xy=(%.1f,%.1f)\n",
-                                         static_cast<unsigned long long>(n),
-                                         static_cast<unsigned long long>(fcnt),
-                                         guard, ctx.tex0.tbp0, sx, sy);
-                    }
-                }
-            }
+            adk = true;
         }
         PS2_IF_AGRESSIVE_LOGS({
             const uint32_t debugIndex = s_debugGsPackedVertexCount.fetch_add(1, std::memory_order_relaxed);
@@ -683,13 +610,9 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
     case 0x0E:
     {
         uint8_t addr = static_cast<uint8_t>(hi & 0xFF);
-        if (f33AdTraceEnabled() && f33TraceAdRegister(addr))
-        {
-            static std::atomic<uint32_t> s_f33AdCount{0};
-            const uint32_t n = s_f33AdCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-            if (n <= 1024u)
-                f33TraceAdWrite(n, addr, lo);
-        }
+        // G602: [F33:ad] moved out of line (g602_gif_cold_outline.inc).
+        if (G602_GATE_PK_ADTRACE)
+            g602ColdPackedAdTrace(addr, lo);
         writeRegister(addr, lo);
         break;
     }
@@ -706,158 +629,15 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     // G508: ~55.8k calls/frame, ~all of them nested inside processGIFPacket's own hold of this
     // same recursive mutex. See G508StateLock in gpu_bridge_and_latch_helpers.inc.
     G508StateLock lock(m_stateMutex);
-    if (g508RegCensusOn())
+    // G602: the register census and the whole PHASE F30/F31 diagnostic preamble (three separate
+    // tests of `phaseDiagnosticsEnabled()`, each a magic-static guard, on every one of ~55.8k calls
+    // per frame) are now one gate plus one out-of-line call. The `interestingReg` /
+    // `isCopyRelevantReg` chains and their PS2_IF_AGRESSIVE_LOGS blocks were dead in every Release
+    // build (`ps2_log::agressive_logs_enabled` is `constexpr false`) and are deleted with them.
+    if (G602_GATE_RG_CENSUS)
         g508NoteRegisterWrite(regAddr, value);
-    // PHASE F30: gsreg probe — track RGBAQ separately to catch color sets
-    if (phaseDiagnosticsEnabled())
-    {
-        static std::atomic<uint32_t> s_f30GsReg{0};
-        static std::atomic<uint32_t> s_f30Rgbaq{0};
-        static std::atomic<uint32_t> s_f30RgbaqNz{0};
-        const uint32_t n = s_f30GsReg.fetch_add(1, std::memory_order_relaxed) + 1u;
-        if (regAddr == 0x01u)
-        {
-            const uint32_t k = s_f30Rgbaq.fetch_add(1, std::memory_order_relaxed) + 1u;
-            const uint32_t lo = static_cast<uint32_t>(value & 0xFFFFFFFFu);
-            const bool rgbNz = (lo & 0x00FFFFFFu) != 0u;
-            if (rgbNz)
-                s_f30RgbaqNz.fetch_add(1, std::memory_order_relaxed);
-            if (k <= 8u || (k & 0x3FFu) == 0u || rgbNz)
-            {
-                std::fprintf(stderr,
-                             "[F30:rgbaq] k=%u value=0x%016llx rgbNz=%u nzTotal=%u\n",
-                             k, static_cast<unsigned long long>(value),
-                             rgbNz ? 1u : 0u, s_f30RgbaqNz.load());
-            }
-        }
-        if (regAddr >= 0x50u && regAddr <= 0x53u)
-        {
-            static std::atomic<uint32_t> s_f31UploadRegCount{0};
-            const uint32_t k = s_f31UploadRegCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-            if (k <= 64u || (k % 256u) == 0u)
-            {
-                std::fprintf(stderr,
-                             "[F31:upload-reg] k=%u reg=0x%02x value=0x%016llx\n",
-                             k, regAddr, static_cast<unsigned long long>(value));
-            }
-        }
-        if (n <= 12u || (n % 256u) == 0u)
-        {
-            std::fprintf(stderr,
-                         "[F30:gsreg] n=%u reg=0x%02x lo=0x%08x\n",
-                         n, regAddr, static_cast<uint32_t>(value & 0xFFFFFFFFu));
-        }
-    }
-    if (phaseDiagnosticsEnabled() && regAddr == GS_REG_PRIM)
-    {
-        static std::atomic<uint32_t> s_f31PrimRegCount{0};
-        const uint32_t n = s_f31PrimRegCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-        if (n <= 64u || (n % 4096u) == 0u)
-        {
-            std::fprintf(stderr,
-                         "[F31:prim-reg] n=%u value=0x%llx prmodecont=%u type=%u iip=%u tme=%u abe=%u fst=%u ctxt=%u\n",
-                         n, static_cast<unsigned long long>(value),
-                         m_prmodecont ? 1u : 0u,
-                         static_cast<uint32_t>(value & 0x7u),
-                         static_cast<uint32_t>((value >> 3u) & 1u),
-                         static_cast<uint32_t>((value >> 4u) & 1u),
-                         static_cast<uint32_t>((value >> 6u) & 1u),
-                         static_cast<uint32_t>((value >> 8u) & 1u),
-                         static_cast<uint32_t>((value >> 9u) & 1u));
-        }
-    }
-    else if (phaseDiagnosticsEnabled() && (regAddr == GS_REG_TEX0_1 || regAddr == GS_REG_TEX0_2))
-    {
-        static std::atomic<uint32_t> s_f31Tex0RegCount{0};
-        const uint32_t n = s_f31Tex0RegCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-        if (n <= 64u || (n % 1024u) == 0u)
-        {
-            std::fprintf(stderr,
-                         "[F31:tex0-reg] n=%u reg=0x%02x value=0x%016llx tbp=0x%x tbw=%u psm=0x%x tw=%u th=%u tcc=%u tfx=%u cbp=0x%x cpsm=0x%x csm=%u csa=%u cld=%u\n",
-                         n, regAddr, static_cast<unsigned long long>(value),
-                         static_cast<uint32_t>(value & 0x3FFFu),
-                         static_cast<uint32_t>((value >> 14u) & 0x3Fu),
-                         static_cast<uint32_t>((value >> 20u) & 0x3Fu),
-                         static_cast<uint32_t>((value >> 26u) & 0xFu),
-                         static_cast<uint32_t>((value >> 30u) & 0xFu),
-                         static_cast<uint32_t>((value >> 34u) & 0x1u),
-                         static_cast<uint32_t>((value >> 35u) & 0x3u),
-                         static_cast<uint32_t>((value >> 37u) & 0x3FFFu),
-                         static_cast<uint32_t>((value >> 51u) & 0xFu),
-                         static_cast<uint32_t>((value >> 55u) & 0x1u),
-                         static_cast<uint32_t>((value >> 56u) & 0x1Fu),
-                         static_cast<uint32_t>((value >> 61u) & 0x7u));
-        }
-    }
-    const bool interestingReg =
-        regAddr == GS_REG_PRIM ||
-        regAddr == GS_REG_RGBAQ ||
-        regAddr == GS_REG_ST ||
-        regAddr == GS_REG_UV ||
-        regAddr == GS_REG_XYZ2 ||
-        regAddr == GS_REG_XYZ3 ||
-        regAddr == GS_REG_XYZF2 ||
-        regAddr == GS_REG_XYZF3 ||
-        regAddr == GS_REG_TEX0_1 ||
-        regAddr == GS_REG_TEX0_2 ||
-        regAddr == GS_REG_TEX2_1 ||
-        regAddr == GS_REG_TEX2_2 ||
-        regAddr == GS_REG_TEXCLUT ||
-        regAddr == GS_REG_TEXA ||
-        regAddr == GS_REG_XYOFFSET_1 ||
-        regAddr == GS_REG_XYOFFSET_2 ||
-        regAddr == GS_REG_SCISSOR_1 ||
-        regAddr == GS_REG_SCISSOR_2 ||
-        regAddr == GS_REG_FRAME_1 ||
-        regAddr == GS_REG_FRAME_2 ||
-        regAddr == GS_REG_ALPHA_1 ||
-        regAddr == GS_REG_ALPHA_2 ||
-        regAddr == GS_REG_TEST_1 ||
-        regAddr == GS_REG_TEST_2 ||
-        regAddr == GS_REG_BITBLTBUF ||
-        regAddr == GS_REG_TRXPOS ||
-        regAddr == GS_REG_TRXREG ||
-        regAddr == GS_REG_TRXDIR;
-
-    PS2_IF_AGRESSIVE_LOGS({
-        if (interestingReg)
-        {
-            const uint32_t debugIndex = s_debugGsRegisterCount.fetch_add(1, std::memory_order_relaxed);
-            if (debugIndex < 128u)
-            {
-                RUNTIME_LOG("[gs:reg] idx=" << debugIndex
-                                            << " reg=0x" << std::hex << static_cast<uint32_t>(regAddr)
-                                            << " value=0x" << value
-                                            << std::dec
-                                            << std::endl);
-            }
-        }
-    });
-
-    const bool isCopyRelevantReg =
-        regAddr == GS_REG_PRIM ||
-        regAddr == GS_REG_TEX0_2 ||
-        regAddr == GS_REG_TEX1_2 ||
-        regAddr == GS_REG_ALPHA_2 ||
-        regAddr == GS_REG_TEST_2 ||
-        regAddr == GS_REG_PABE ||
-        regAddr == GS_REG_FRAME_2 ||
-        regAddr == GS_REG_XYOFFSET_2 ||
-        regAddr == GS_REG_SCISSOR_2;
-    PS2_IF_AGRESSIVE_LOGS({
-        if (isCopyRelevantReg &&
-            s_debugCopyRegCount.fetch_add(1u, std::memory_order_relaxed) < 64u)
-        {
-            RUNTIME_LOG("[gs:copy-reg] reg=0x"
-                        << std::hex << static_cast<uint32_t>(regAddr)
-                        << " value=0x" << value
-                        << std::dec
-                        << " primCtxt=" << static_cast<uint32_t>(m_prim.ctxt)
-                        << " ctx0fbp=" << m_ctx[0].frame.fbp
-                        << " ctx1fbp=" << m_ctx[1].frame.fbp
-                        << std::endl);
-        }
-    });
+    if (G602_GATE_RG_PHASE)
+        g602ColdRegPreamble(regAddr, value, m_curR, m_curG, m_curB, m_prmodecont);
 
     switch (regAddr)
     {
@@ -877,25 +657,19 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         }
         m_vtxCount = 0;
         m_vtxIndex = 0;
-        if (renderQualityTraceEnabled() && g_g34SeqWindow.load(std::memory_order_relaxed) > 0 &&
-            g_g34SeqCap.load(std::memory_order_relaxed) < 1600u)
-        {
-            g_g34SeqWindow.fetch_sub(1, std::memory_order_relaxed);
-            g_g34SeqCap.fetch_add(1u, std::memory_order_relaxed);
-            std::fprintf(stderr, "[G35:seq] PRIM type=%u ctxt=%u tme=%u abe=%u\n",
-                         (unsigned)m_prim.type, (unsigned)m_prim.ctxt,
-                         (unsigned)m_prim.tme, (unsigned)m_prim.abe);
-        }
+        // G602: [G35:seq] PRIM moved out of line.
+        if (G602_GATE_RG_QUALITY)
+            g602ColdRegPrimTrace(static_cast<uint32_t>(m_prim.type), m_prim.ctxt, m_prim.tme,
+                                 m_prim.abe);
         break;
     }
     case GS_REG_RGBAQ:
     {
         // G52: hold last valid color on a spurious fully-zero model RGBAQ (see writeRegisterPacked
         // case 0x01). Covers the A+D / REGLIST color path. Scope: costume model fbp=0x139 tristrip.
-        static const bool g52holdOff = envFlagEnabled("DC2_G52_NO_HOLDCOLOR");
-        const bool g52ModelCtx = (m_prim.type == GS_PRIM_TRISTRIP &&
-                                  m_ctx[m_prim.ctxt & 1u].frame.fbp == 0x139u);
-        if (!g52holdOff && g52ModelCtx && (value & 0xFFFFFFFFull) == 0ull)
+        if (G602_GATE_PK_G52HOLD && (value & 0xFFFFFFFFull) == 0ull &&
+            m_prim.type == GS_PRIM_TRISTRIP &&
+            m_ctx[m_prim.ctxt & 1u].frame.fbp == 0x139u)
             break;
         m_curR = static_cast<uint8_t>(value & 0xFF);
         m_curG = static_cast<uint8_t>((value >> 8) & 0xFF);
@@ -938,16 +712,11 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         vtx.t = m_curT;
         vtx.u = m_curU;
         vtx.v = m_curV;
-        if (renderQualityTraceEnabled() && g_g34SeqWindow.load(std::memory_order_relaxed) > 0 &&
-            g_g34SeqCap.load(std::memory_order_relaxed) < 1600u)
-        {
-            const auto &sc = m_ctx[m_prim.ctxt & 1u].tex0;
-            g_g34SeqWindow.fetch_sub(1, std::memory_order_relaxed);
-            g_g34SeqCap.fetch_add(1u, std::memory_order_relaxed);
-            std::fprintf(stderr, "[G35:seq] XYZF2 xy=(%.1f,%.1f) curTex0(tbp=0x%x psm=0x%x) ctxt=%u%s\n",
-                         vtx.x, vtx.y, sc.tbp0, (unsigned)sc.psm, (unsigned)m_prim.ctxt,
-                         (sc.tbp0 == 0x2720u) ? ((sc.psm == 0u) ? "  <-- verts under CT32 (GOOD)" : "  <-- verts under T8 (BUG)") : "");
-        }
+        // G602: [G35:seq] moved out of line.
+        if (G602_GATE_RG_QUALITY)
+            g602ColdRegVertexTrace(true, vtx, m_ctx[m_prim.ctxt & 1u].tex0, m_prim.ctxt,
+                                   m_prim.tme, static_cast<uint32_t>(m_prim.type), m_vtxCount,
+                                   m_curU, m_curV);
         vertexKick(regAddr == GS_REG_XYZF2);
         break;
     }
@@ -968,32 +737,11 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         vtx.u = m_curU;
         vtx.v = m_curV;
         vtx.fog = m_curFog;
-        // [G34] Does the costume composite's sprite geometry reach the GS? Log vertices
-        // kicked while the active context binds the CT32 0x2720 RTT (the composite).
-        if (renderQualityTraceEnabled())
-        {
-            const auto &ct = m_ctx[m_prim.ctxt & 1u].tex0;
-            if (m_prim.tme && ct.tbp0 == 0x2720u && ct.psm == 0u)
-            {
-                static std::atomic<uint32_t> s_g34v{0};
-                const uint32_t vn = s_g34v.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                if (vn <= 64u)
-                    std::fprintf(stderr, "[G34:vtx2720ct32] vn=%u xyz2 vtxCount=%u xy=(%.1f,%.1f) prim=%u ctxt=%u uv=(%u,%u)\n",
-                                 vn, m_vtxCount, vtx.x, vtx.y,
-                                 (unsigned)m_prim.type, (unsigned)m_prim.ctxt,
-                                 (unsigned)m_curU, (unsigned)m_curV);
-            }
-            if (g_g34SeqWindow.load(std::memory_order_relaxed) > 0 &&
-                g_g34SeqCap.load(std::memory_order_relaxed) < 1600u)
-            {
-                const auto &sc = m_ctx[m_prim.ctxt & 1u].tex0;
-                g_g34SeqWindow.fetch_sub(1, std::memory_order_relaxed);
-                g_g34SeqCap.fetch_add(1u, std::memory_order_relaxed);
-                std::fprintf(stderr, "[G35:seq] XYZ2 xy=(%.1f,%.1f) curTex0(tbp=0x%x psm=0x%x) ctxt=%u%s\n",
-                             vtx.x, vtx.y, sc.tbp0, (unsigned)sc.psm, (unsigned)m_prim.ctxt,
-                             (sc.tbp0 == 0x2720u) ? ((sc.psm == 0u) ? "  <-- verts under CT32 (GOOD)" : "  <-- verts under T8 (BUG)") : "");
-            }
-        }
+        // G602: [G34:vtx2720ct32] + [G35:seq] moved out of line.
+        if (G602_GATE_RG_QUALITY)
+            g602ColdRegVertexTrace(false, vtx, m_ctx[m_prim.ctxt & 1u].tex0, m_prim.ctxt,
+                                   m_prim.tme, static_cast<uint32_t>(m_prim.type), m_vtxCount,
+                                   m_curU, m_curV);
         vertexKick(regAddr == GS_REG_XYZ2);
         break;
     }
@@ -1014,99 +762,10 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         t.csm = static_cast<uint8_t>((value >> 55) & 0x1);
         t.csa = static_cast<uint8_t>((value >> 56) & 0x1F);
         t.cld = static_cast<uint8_t>((value >> 61) & 0x7);
-        // [G91] Ground-truth TEX0 register-write stream for the title rock. Logs every rock-range
-        // TEX0 bind in DMA/GIF stream order (title scope) so we can tell whether the wall pages
-        // (0x2b20/0x2f20/0x3320) are ever WRITTEN to the GS context at all (vs the geometry just
-        // inheriting a stale block-0 late texture). DC2_G91_TEX0.
-        {
-            extern std::atomic<bool> g_dc2TitleRockScope;
-            static const bool s_g91tex0 = (std::getenv("DC2_G91_TEX0") != nullptr);
-            if (s_g91tex0 && g_dc2TitleRockScope.load(std::memory_order_relaxed) &&
-                t.tbp0 >= 0x2720u && t.tbp0 <= 0x3960u)
-            {
-                static std::atomic<uint32_t> s_n{0};
-                const uint32_t k = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                if (k <= 4000u)
-                    std::fprintf(stderr, "[G91:tex0] k=%u ci=%d tbp=0x%x psm=0x%x cbp=0x%x tw=%u th=%u\n",
-                        k, ci, t.tbp0, (unsigned)t.psm, t.cbp, (unsigned)t.tw, (unsigned)t.th);
-            }
-        }
-        // [G123] ordered interleave: emit the rock-range BIND event (and flush the pending
-        // draw-run that preceded it) so the bind/kick pairing is visible vs the .gs ground truth.
-        {
-            extern std::atomic<bool> g_dc2TitleRockScope;
-            if (g123SeqEnabled() && g_dc2TitleRockScope.load(std::memory_order_relaxed) &&
-                g105TitleRockTbp(t.tbp0))
-            {
-                std::lock_guard<std::mutex> lk(s_g123Mtx);
-                g123FlushRun();
-                if (s_g123Events < g123Cap())
-                {
-                    const uint32_t seq = s_g123Seq.fetch_add(1u, std::memory_order_relaxed);
-                    std::fprintf(stderr, "[G123:seq] %u BIND tbp=0x%x psm=0x%x ci=%d\n",
-                                 seq, t.tbp0, (unsigned)t.psm, ci);
-                    ++s_g123Events;
-                }
-            }
-        }
-        // [G34] Count every TEX0 register bind of block 0x2720 (the model-RTT / brick
-        // time-share) by psm. Tells definitively whether the costume model composite ever
-        // emits a CT32 (psm=0) bind to GS, vs only the T8 brick (psm=0x13). ct32==0 after
-        // a costume run => the composite's CT32 sprite never reaches the GS at all.
-        if (renderQualityTraceEnabled() && t.tbp0 == 0x2720u)
-        {
-            static std::atomic<uint32_t> s_g34ct32{0};
-            static std::atomic<uint32_t> s_g34t8{0};
-            static std::atomic<uint32_t> s_g34oth{0};
-            std::atomic<uint32_t> *c = (t.psm == 0u) ? &s_g34ct32
-                                       : ((t.psm == GS_PSM_T8) ? &s_g34t8 : &s_g34oth);
-            const uint32_t bn = c->fetch_add(1u, std::memory_order_relaxed) + 1u;
-            if ((t.psm == 0u && bn <= 32u) || (bn % 8192u) == 0u)
-                std::fprintf(stderr,
-                    "[G34:tex0bind2720] psm=0x%x tbw=%u tw=%u th=%u bn=%u (ct32=%u t8=%u oth=%u)\n",
-                    (unsigned)t.psm, (unsigned)t.tbw, (unsigned)t.tw, (unsigned)t.th, bn,
-                    s_g34ct32.load(std::memory_order_relaxed),
-                    s_g34t8.load(std::memory_order_relaxed),
-                    s_g34oth.load(std::memory_order_relaxed));
-        }
-        // [G35] GIF register-sequence capture: arm on a CT32 0x2720 bind, then log every
-        // following TEX0 (catching the T8 0x2720 clobber), bounded by the window + global cap.
-        if (renderQualityTraceEnabled() && g_g34SeqCap.load(std::memory_order_relaxed) < 1600u)
-        {
-            const int seqCi = (regAddr == GS_REG_TEX0_2) ? 1 : 0;
-            if (t.tbp0 == 0x2720u && t.psm == 0u)
-            {
-                g_g34SeqWindow.store(70, std::memory_order_relaxed);
-                g_g34SeqCap.fetch_add(1u, std::memory_order_relaxed);
-                std::fprintf(stderr, "[G35:seq] TEX0 ci=%d tbp=0x2720 psm=0x0 tbw=%u  (CT32 ARM)\n",
-                             seqCi, (unsigned)t.tbw);
-            }
-            else if (g_g34SeqWindow.load(std::memory_order_relaxed) > 0)
-            {
-                g_g34SeqWindow.fetch_sub(1, std::memory_order_relaxed);
-                g_g34SeqCap.fetch_add(1u, std::memory_order_relaxed);
-                std::fprintf(stderr, "[G35:seq] TEX0 ci=%d tbp=0x%x psm=0x%x tbw=%u%s\n",
-                             seqCi, t.tbp0, (unsigned)t.psm, (unsigned)t.tbw,
-                             (t.tbp0 == 0x2720u && t.psm != 0u) ? "   <-- T8 0x2720 CLOBBER" : "");
-            }
-        }
-        // F50.9: uncapped histogram of paletted (PSMT4/T8) TEX0 binds per context, to see
-        // whether materials ever bind the uploaded pages (0x2820/0x2f20/...) or only the
-        // empty 0x2580/0x2980 the dungeon draw samples.
-        if (renderQualityTraceEnabled() &&
-            (t.psm == GS_PSM_T4 || t.psm == GS_PSM_T8 || t.psm == GS_PSM_T4HL || t.psm == GS_PSM_T4HH))
-        {
-            // Skip the title 4HH spam (tbp=0x1a00) so the cap captures dungeon-steady-state binds.
-            if (t.tbp0 != 0x1a00u)
-            {
-                static std::atomic<uint32_t> s_f509Tex0Bind{0};
-                const uint32_t n = s_f509Tex0Bind.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                if (n <= 300u)
-                    std::fprintf(stderr, "[F509:tex0bind] n=%u ci=%d tbp=0x%x tbw=%u psm=0x%x cbp=0x%x cpsm=0x%x cld=%u\n",
-                                 n, ci, t.tbp0, (unsigned)t.tbw, (unsigned)t.psm,
-                                 t.cbp, (unsigned)t.cpsm, (unsigned)t.cld);
-            }
-        }
+        // G602: [G91:tex0] / [G123:seq] BIND / [G34:tex0bind2720] / [G35:seq] / [F509:tex0bind]
+        // moved out of line (g602_gif_cold_outline.inc).
+        if (G602_GATE_RG_TEX0)
+            g602ColdRegTex0(regAddr, ci, t);
         break;
     }
     case GS_REG_CLAMP_1:
@@ -1201,27 +860,9 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_ctx[ci].frame.fbw = static_cast<uint32_t>((value >> 16) & 0x3F);
         m_ctx[ci].frame.psm = static_cast<uint8_t>((value >> 24) & 0x3F);
         m_ctx[ci].frame.fbmsk = static_cast<uint32_t>((value >> 32) & 0xFFFFFFFF);
-        if (frameRegisterTraceEnabled())
-        {
-            static std::atomic<uint32_t> s_f49FrameRegCount{0};
-            const uint32_t n = s_f49FrameRegCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-            const bool zeroed = (m_ctx[ci].frame.fbp == 0u || m_ctx[ci].frame.fbw == 0u);
-            const bool changed = prev.fbp != m_ctx[ci].frame.fbp ||
-                                 prev.fbw != m_ctx[ci].frame.fbw ||
-                                 prev.psm != m_ctx[ci].frame.psm ||
-                                 prev.fbmsk != m_ctx[ci].frame.fbmsk;
-            if ((changed && (n <= 256u || (n % 512u) == 0u)) || zeroed)
-            {
-                std::fprintf(stderr,
-                             "[F49:frame] n=%u reg=0x%02x ctx=%d raw=0x%016llx prev(fbp=0x%x fbw=%u psm=0x%x msk=0x%08x) new(fbp=0x%x fbw=%u psm=0x%x msk=0x%08x) zero=%u primCtxt=%u bitblt(dbp=0x%x dbw=%u dpsm=0x%x)\n",
-                             n, regAddr, ci, static_cast<unsigned long long>(value),
-                             prev.fbp, prev.fbw, static_cast<uint32_t>(prev.psm), prev.fbmsk,
-                             m_ctx[ci].frame.fbp, m_ctx[ci].frame.fbw, static_cast<uint32_t>(m_ctx[ci].frame.psm), m_ctx[ci].frame.fbmsk,
-                             zeroed ? 1u : 0u,
-                             m_prim.ctxt ? 1u : 0u,
-                             m_bitbltbuf.dbp, static_cast<uint32_t>(m_bitbltbuf.dbw), static_cast<uint32_t>(m_bitbltbuf.dpsm));
-            }
-        }
+        // G602: [F49:frame] moved out of line (g602_gif_cold_outline.inc).
+        if (G602_GATE_RG_FRAME)
+            g602ColdRegFrame(regAddr, ci, value, prev, m_ctx[ci].frame, m_prim.ctxt, m_bitbltbuf);
         break;
     }
     case GS_REG_ZBUF_1:
@@ -1249,76 +890,10 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_bitbltbuf.dbp = static_cast<uint32_t>((value >> 32) & 0x3FFF);
         m_bitbltbuf.dbw = static_cast<uint8_t>((value >> 48) & 0x3F);
         m_bitbltbuf.dpsm = static_cast<uint8_t>((value >> 56) & 0x3F);
-        if (frameRegisterTraceEnabled())
-        {
-            static std::atomic<uint32_t> s_f49BitbltRegCount{0};
-            const uint32_t n = s_f49BitbltRegCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-            const bool changed = prevDbp != m_bitbltbuf.dbp ||
-                                 prevDbw != m_bitbltbuf.dbw ||
-                                 prevDpsm != m_bitbltbuf.dpsm;
-            if (changed && (n <= 128u || (n % 256u) == 0u))
-            {
-                std::fprintf(stderr,
-                             "[F49:bitblt] n=%u raw=0x%016llx dst=0x%x/%u/0x%x src=0x%x/%u/0x%x primCtxt=%u frame0=0x%x/%u frame1=0x%x/%u\n",
-                             n, static_cast<unsigned long long>(value),
-                             m_bitbltbuf.dbp, static_cast<uint32_t>(m_bitbltbuf.dbw), static_cast<uint32_t>(m_bitbltbuf.dpsm),
-                             m_bitbltbuf.sbp, static_cast<uint32_t>(m_bitbltbuf.sbw), static_cast<uint32_t>(m_bitbltbuf.spsm),
-                             m_prim.ctxt ? 1u : 0u,
-                             m_ctx[0].frame.fbp, m_ctx[0].frame.fbw,
-                             m_ctx[1].frame.fbp, m_ctx[1].frame.fbw);
-            }
-        }
-        if (renderQualityTraceEnabled())
-        {
-            static std::atomic<uint32_t> s_f37BitbltCount{0};
-            const uint32_t n = s_f37BitbltCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-            if (n <= 64u)
-                std::fprintf(stderr, "[F37:bitblt] n=%u raw=0x%016llx sbp=0x%x sbw=%u spsm=0x%x dbp=0x%x dbw=%u dpsm=0x%x\n",
-                             n, static_cast<unsigned long long>(value),
-                             m_bitbltbuf.sbp, static_cast<uint32_t>(m_bitbltbuf.sbw),
-                             static_cast<uint32_t>(m_bitbltbuf.spsm),
-                             m_bitbltbuf.dbp, static_cast<uint32_t>(m_bitbltbuf.dbw),
-                             static_cast<uint32_t>(m_bitbltbuf.dpsm));
-        }
-        if (t8UploadTraceEnabled())
-        {
-            static std::atomic<uint32_t> s_f43BitbltCount{0};
-            const uint32_t n = s_f43BitbltCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-            if (n <= 128u)
-                std::fprintf(stderr, "[F43:t8] n=%u sbp=0x%x sbw=%u spsm=0x%x dbp=0x%x dbw=%u dpsm=0x%x\n",
-                             n,
-                             m_bitbltbuf.sbp, static_cast<uint32_t>(m_bitbltbuf.sbw),
-                             static_cast<uint32_t>(m_bitbltbuf.spsm),
-                             m_bitbltbuf.dbp, static_cast<uint32_t>(m_bitbltbuf.dbw),
-                             static_cast<uint32_t>(m_bitbltbuf.dpsm));
-        }
-        // F50.9: UNCAPPED check — does ANY BITBLTBUF ever target the pages the dungeon
-        // paletted draws actually sample (tbp=0x2580 texture, cbp=0x2980 CLUT)? If never,
-        // the upload-destination vs draw-reference addressing genuinely diverges.
-        if (renderQualityTraceEnabled())
-        {
-            static std::atomic<uint32_t> s_f509Tex2580{0};
-            static std::atomic<uint32_t> s_f509Clut2980{0};
-            static std::atomic<uint32_t> s_f509Total{0};
-            const uint32_t tot = s_f509Total.fetch_add(1u, std::memory_order_relaxed) + 1u;
-            if (m_bitbltbuf.dbp == 0x2580u)
-            {
-                const uint32_t h = s_f509Tex2580.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                if (h <= 8u)
-                    std::fprintf(stderr, "[F509:hit2580] hit=%u dbp=0x%x dbw=%u dpsm=0x%x\n",
-                                 h, m_bitbltbuf.dbp, (unsigned)m_bitbltbuf.dbw, (unsigned)m_bitbltbuf.dpsm);
-            }
-            if (m_bitbltbuf.dbp == 0x2980u)
-            {
-                const uint32_t h = s_f509Clut2980.fetch_add(1u, std::memory_order_relaxed) + 1u;
-                if (h <= 8u)
-                    std::fprintf(stderr, "[F509:hit2980] hit=%u dbp=0x%x dbw=%u dpsm=0x%x\n",
-                                 h, m_bitbltbuf.dbp, (unsigned)m_bitbltbuf.dbw, (unsigned)m_bitbltbuf.dpsm);
-            }
-            if ((tot % 256u) == 0u)
-                std::fprintf(stderr, "[F509:bbtally] total=%u hit2580=%u hit2980=%u\n",
-                             tot, s_f509Tex2580.load(), s_f509Clut2980.load());
-        }
+        // G602: [F49:bitblt] / [F37:bitblt] / [F43:t8] / [F509:hit*] moved out of line.
+        if (G602_GATE_RG_BITBLT)
+            g602ColdRegBitblt(value, m_bitbltbuf, prevDbp, prevDbw, prevDpsm,
+                              m_prim.ctxt, m_ctx[0].frame, m_ctx[1].frame);
         break;
     }
     case GS_REG_TRXPOS:
@@ -1334,13 +909,9 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     {
         m_trxreg.rrw = static_cast<uint16_t>(value & 0xFFF);
         m_trxreg.rrh = static_cast<uint16_t>((value >> 32) & 0xFFF);
-        if (renderQualityTraceEnabled())
-        {
-            static std::atomic<uint32_t> s_f37TrxregCount{0};
-            const uint32_t n = s_f37TrxregCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-            if (n <= 64u)
-                std::fprintf(stderr, "[F37:trxreg] n=%u rrw=%u rrh=%u\n", n, m_trxreg.rrw, m_trxreg.rrh);
-        }
+        // G602: [F37:trxreg] moved out of line.
+        if (G602_GATE_RG_QUALITY)
+            g602ColdRegTrxreg(m_trxreg);
         break;
     }
     case GS_REG_TRXDIR:
@@ -1348,16 +919,9 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_trxdir = static_cast<uint32_t>(value & 0x3);
         m_hwregX = 0;
         m_hwregY = 0;
-        if (renderQualityTraceEnabled())
-        {
-            static std::atomic<uint32_t> s_f37TrxdirCount{0};
-            const uint32_t n = s_f37TrxdirCount.fetch_add(1u, std::memory_order_relaxed) + 1u;
-            if (n <= 64u)
-                std::fprintf(stderr, "[F37:trxdir] n=%u dir=%u dbp=0x%x dpsm=0x%x rr=(%u,%u)\n",
-                             n, m_trxdir, m_bitbltbuf.dbp,
-                             static_cast<uint32_t>(m_bitbltbuf.dpsm),
-                             m_trxreg.rrw, m_trxreg.rrh);
-        }
+        // G602: [F37:trxdir] moved out of line.
+        if (G602_GATE_RG_QUALITY)
+            g602ColdRegTrxdir(m_trxdir, m_bitbltbuf, m_trxreg);
 
         // G432: split the addr=0x53 A+D bucket by the transfer it actually dispatches. The dir=1
         // gather charges itself from inside performLocalToHostToBuffer (prep vs pixel loop).
@@ -1388,9 +952,12 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_HWREG:
     {
-        uint8_t buf[8];
-        std::memcpy(buf, &value, 8);
-        processImageData(buf, 8);
+        // G602: `value` is a by-value uint64_t parameter and the GS consumes HWREG as its eight
+        // little-endian bytes, so this is byte-identical to the old `uint8_t buf[8]` + memcpy — and
+        // it removes the only stack ARRAY in this function, which is what made MSVC give a
+        // 55.8k-calls/frame function a /GS security cookie plus a `__security_check_cookie` call on
+        // every return.
+        processImageData(reinterpret_cast<const uint8_t *>(&value), 8);
         break;
     }
     case GS_REG_PABE:
@@ -1474,38 +1041,10 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     case 0x5d:
     case 0x5e:
     case 0x5f:
-    {
-        static const bool s_g397LegacyAliases =
-            (std::getenv("DC2_G397_LEGACY_RESERVED_DISPLAY") != nullptr);
-        static const bool s_g397Trace =
-            (std::getenv("DC2_G397_PRESENT_TRACE") != nullptr);
-        static std::atomic<uint32_t> s_g397ReservedWrites{0u};
-
-        if (s_g397LegacyAliases && m_privRegs)
-        {
-            switch (regAddr)
-            {
-            case 0x59: m_privRegs->dispfb1 = value; break;
-            case 0x5a: m_privRegs->display1 = value; break;
-            case 0x5b: m_privRegs->dispfb2 = value; break;
-            case 0x5c: m_privRegs->display2 = value; break;
-            case 0x5f: m_privRegs->bgcolor = value; break;
-            default: break;
-            }
-        }
-
-        const uint32_t n = s_g397ReservedWrites.fetch_add(1u, std::memory_order_relaxed);
-        if (s_g397Trace && n < 64u)
-        {
-            std::fprintf(stderr,
-                         "[G397:reserved-gs] n=%u reg=0x%x value=0x%llx action=%s\n",
-                         n + 1u,
-                         static_cast<unsigned>(regAddr),
-                         static_cast<unsigned long long>(value),
-                         s_g397LegacyAliases ? "legacy-alias" : "ignored");
-        }
+        // G602: moved out of line (g602_gif_cold_outline.inc). Behaviour unchanged — the aliases
+        // stay off unless DC2_G397_LEGACY_RESERVED_DISPLAY is set.
+        g602ColdRegReserved(regAddr, value, m_privRegs);
         break;
-    }
     default:
         break;
     }
