@@ -507,6 +507,35 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // must precede rasterizer_draw_triangle.inc, which is a FRAGMENT of the member function body.
 #include "ps2_gs_rasterizer_parts/g609_tri_scan.inc"
 
+// G614 revision: 1 — the SPRITE twin of G609's stage decomposition. `dungeon1` (G613) is 99.8%
+// sprites and 67.04% of its replay cycles are ONE PSMT8/bilinear `discov sprite` shape family, so
+// the triangle kernels are inert and the sprite pixel has never been decomposed. Ceiling probe
+// only (DC2_G614_CEIL, default-off, knowingly wrong pixels). Must precede
+// rasterizer_draw_sprite.inc, which is a FRAGMENT of the member function body.
+#include "ps2_gs_rasterizer_parts/g614_sprite_scan.inc"
+
+// G615 revision: 1 — the PRIVATE-Z display sprite population, admitted into the two promoted sprite
+// fast paths that both refused it (the G530/G614 span kernel on `!g403DisplayZ`, G588's exact solid
+// fill on `!sZActive && !sZWrite`). 37.6% of `dungeon1`'s CPU band replay, one cause. Must follow
+// rasterizer_clipping_and_tex_checks.inc (g403DisplayZBuf / kG403DisplayZW / kG403DisplayZH),
+// g530_sprite_span.inc (G530RowAddr) and g419_ab_instrument.inc (g615PrivZArm, defined at GLOBAL
+// scope — this file's body is inside an anonymous namespace and must NOT redeclare it: the G568
+// linkage lesson), and MUST precede rasterizer_draw_sprite.inc, which is a FRAGMENT of the member
+// function body and therefore cannot open a namespace of its own.
+// Content edit here forces MSBuild to consume the .inc files (G359).
+#include "ps2_gs_rasterizer_parts/g615_privz_row.inc"
+
+// G617 revision: 1 — the two remaining replayed-sprite populations on `dungeon1`, once the leaf
+// census was split by ADMISSION and the shape census could see `tme`: the untextured BLENDED
+// display fill (25.2% of replay) and the PSMT4HH display sprite the G248 fast sampler refuses
+// (37.4% at 819.0 cyc/inside — the largest single item on the route). Must follow
+// g530_sprite_span.inc (G530RowAddr / g530GroupBase, reused verbatim for the P4HH tap, which shares
+// C32's page/block/column geometry exactly) and g419_ab_instrument.inc (g617BlendFillArm /
+// g617T4hhArm, defined at GLOBAL scope — this file's body is inside an anonymous namespace and must
+// NOT redeclare them: the G568 linkage lesson), and MUST precede rasterizer_draw_sprite.inc, which
+// is a FRAGMENT of the member function body and cannot open a namespace of its own.
+#include "ps2_gs_rasterizer_parts/g617_sprite_fill.inc"
+
 
 #include "ps2_gs_rasterizer_parts/rasterizer_draw_sprite.inc"
 

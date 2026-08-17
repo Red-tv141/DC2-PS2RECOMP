@@ -1409,7 +1409,7 @@ void GSRasterizer::drawTriangle(GS *gs)
                      static_cast<uint8_t>(zpsm), static_cast<uint8_t>(ztst),
                      gs->m_prim.iip != 0u, gs->m_prim.fst != 0u, gs->m_prim.abe != 0u,
                      gs->m_prim.fge != 0u, gs->m_pabe != 0u, (ctx.fba & 0x1ull) != 0ull,
-                     g403DisplayZ);
+                     g403DisplayZ, gs->m_prim.tme != 0u);
     // G580 census + exact-state admission. The broad subject matches G573's replay population;
     // the candidate then fails closed on every shader/depth/commit semantic it specializes.
     const bool g580Subject =

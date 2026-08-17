@@ -55,10 +55,24 @@ enum
     kG605LeafTriGeneric,   // fell through to the non-inlined sampleTexture
     kG605LeafSprite,
     kG605LeafLine,
+    // G615: the UNTEXTURED sprite. It was previously booked to `sprite` AND — because
+    // drawSprite's only markLoop() sits inside `if (gs->m_prim.tme)` — its entire pixel loop was
+    // booked as PROLOGUE. That is what `[G605:leaf] disp sprite pro% = 38.8 / 50.79 us/call` was
+    // (ROADMAP "Target K"): not a per-draw prologue at all, but a second population's whole fill
+    // loop folded into the first population's envelope column. `[G530:cyc]`'s own comment always
+    // said "culled/untextured: all of it is prologue"; the G605 copy dropped the word.
+    kG605LeafSpriteUntex,
+    // G617: the TEXTURED sprite that the G530/G614 span kernel REFUSED. Before this split, one
+    // `disp sprite` row averaged an admitted population running the kernel with a refused one
+    // walking the generic per-pixel nest, at radically different per-pixel prices — the same
+    // "two populations in one bucket" defect G615 found in the `pro%` column, one level down.
+    // With `[G615:privz] span(draws=7135)` against `spanRej(samp=102994)` the row was 94% refused
+    // BY DRAW and 17% refused BY PIXEL, so neither its `cyc/inside` nor its share named anything.
+    kG605LeafSpriteSlow,
     kG605LeafN
 };
 static const char *const kG605LeafName[kG605LeafN] = {"tri-untex", "tri-fast", "tri-gen",
-                                                      "sprite", "line"};
+                                                      "sprite", "line", "spr-untex", "spr-slow"};
 
 // [cls][leaf]; cls is g528ClassifyFbp's value (disp / legacy / discov / other).
 static std::atomic<uint64_t> g_g605N[kG528ClsN][kG605LeafN];
@@ -69,6 +83,10 @@ static std::atomic<uint64_t> g_g605ProNs[kG528ClsN][kG605LeafN];
 static std::atomic<uint64_t> g_g605LoopNs[kG528ClsN][kG605LeafN];
 static std::atomic<uint64_t> g_g605ProCyc[kG528ClsN][kG605LeafN];
 static std::atomic<uint64_t> g_g605LoopCyc[kG528ClsN][kG605LeafN];
+// G615: calls that returned BEFORE the raster dispatch, so the whole lap landed in the PRO column.
+// Without this, `pro%` cannot be read: a high value means either an expensive prologue or a
+// population that never reaches a marked loop, and those name completely different levers.
+static std::atomic<uint64_t> g_g605Unmarked[kG528ClsN][kG605LeafN];
 
 static bool g605CycOn()
 {
@@ -95,6 +113,15 @@ struct G605Shape
     uint32_t fbmsk = 0u;
     uint8_t cls = 0u, prim = 0u, fpsm = 0u, tpsm = 0u, tfx = 0u, tcc = 0u;
     uint8_t zpsm = 0u, ztst = 0u, flags = 0u, lin = 0u;
+    // ⛔⛔ G617: `prim` is the PRIMITIVE TYPE, not the leaf, and `tme` was in NEITHER the key nor
+    // the print. An UNTEXTURED sprite therefore hashed into the same row as a textured one whenever
+    // the stale TEX0 state matched — so on `dungeon1` the ten printed `disp sprite` rows summed to
+    // 85.5 M px against a `[G605:leaf] disp sprite` total of 45.2 M, and no row could be attributed
+    // to a population. A shape table that cannot separate "samples a texture" from "does not" is
+    // not a ranking of kernels.
+    uint8_t tme = 0u;
+    // G617: the RESOLVED leaf (`kG605LeafName`), so a shape row names the loop that ran it.
+    uint8_t leaf = 0u;
 };
 enum { kG605ShapeCap = 96 };
 static G605Shape g_g605Shape[kG605ShapeCap];
@@ -159,22 +186,23 @@ static void g605ShapeReport()
                  static_cast<unsigned long long>(ovN),
                  static_cast<unsigned long long>(ovCyc),
                  static_cast<unsigned long long>(all));
-    static const char *const kPrimName[8] = {"point", "line", "linestrip", "tri",
-                                             "tristrip", "trifan", "sprite", "?"};
+    // ⛔ G617: the second column used to be `kPrimName[prim]` — the GS primitive type. It printed
+    // "sprite" for both an admitted textured sprite and an untextured fill, which is exactly the
+    // distinction a kernel ranking needs. It is now the RESOLVED LEAF.
     for (int i = 0; i < used && i < 16; ++i)
     {
         const G605Shape &r = copy[order[i]];
         std::fprintf(stderr,
             "[G605:shape] #%02d %-6s %-9s cyc%%=%5.2f n=%llu px=%llu inside=%llu cyc/inside=%.1f "
-            "fbp=%03x fpsm=%x fbmsk=%08x tbp=%04x tpsm=%02x tfx=%u tcc=%u lin=%u tex1=%llx "
+            "tme=%u fbp=%03x fpsm=%x fbmsk=%08x tbp=%04x tpsm=%02x tfx=%u tcc=%u lin=%u tex1=%llx "
             "alpha=%llx test=%llx zpsm=%x ztst=%u iip=%u fst=%u abe=%u fge=%u pabe=%u fba=%u "
             "prz=%u\n",
-            i, kG528ClsName[r.cls & 3u], kPrimName[r.prim & 7u],
+            i, kG528ClsName[r.cls & 3u], kG605LeafName[r.leaf % kG605LeafN],
             (all > 0u) ? 100.0 * static_cast<double>(r.cyc) / static_cast<double>(all) : 0.0,
             static_cast<unsigned long long>(r.n), static_cast<unsigned long long>(r.px),
             static_cast<unsigned long long>(r.inside),
             (r.inside > 0u) ? static_cast<double>(r.cyc) / static_cast<double>(r.inside) : 0.0,
-            r.fbp, r.fpsm, r.fbmsk, r.tbp, r.tpsm, r.tfx, r.tcc, r.lin,
+            r.tme, r.fbp, r.fpsm, r.fbmsk, r.tbp, r.tpsm, r.tfx, r.tcc, r.lin,
             static_cast<unsigned long long>(r.tex1),
             static_cast<unsigned long long>(r.alpha),
             static_cast<unsigned long long>(r.test), r.zpsm, r.ztst,
@@ -226,16 +254,20 @@ static void g605CycReport()
             const double lns = static_cast<double>(g_g605LoopNs[c][l].load(std::memory_order_relaxed));
             const double pcy = static_cast<double>(g_g605ProCyc[c][l].load(std::memory_order_relaxed));
             const double lcy = static_cast<double>(g_g605LoopCyc[c][l].load(std::memory_order_relaxed));
+            const double un = static_cast<double>(
+                g_g605Unmarked[c][l].load(std::memory_order_relaxed));
             std::fprintf(stderr,
                 "[G605:leaf] %-6s %-9s n=%.0f px=%.0f pxPerCall=%.1f insidePerCall=%.1f "
                 "bboxPerCall=%.1f | PRO ms=%.1f us/call=%.2f cyc/call=%.0f | LOOP ms=%.1f "
-                "cyc/px=%.1f cyc/inside=%.1f cyc/bbox=%.1f | pro%%=%.1f share%%=%.1f\n",
+                "cyc/px=%.1f cyc/inside=%.1f cyc/bbox=%.1f | pro%%=%.1f share%%=%.1f "
+                "unmarked=%.0f unmarked%%=%.1f\n",
                 kG528ClsName[c], kG605LeafName[l], n, px, px / n, ins / n, bb / n,
                 pns / 1e6, pns / n / 1e3, pcy / n,
                 lns / 1e6, (px > 0.0) ? lcy / px : 0.0, (ins > 0.0) ? lcy / ins : 0.0,
                 (bb > 0.0) ? lcy / bb : 0.0,
                 100.0 * pns / (pns + lns + 1e-9),
-                (allNs > 0.0) ? 100.0 * (pns + lns) / allNs : 0.0);
+                (allNs > 0.0) ? 100.0 * (pns + lns) / allNs : 0.0,
+                un, 100.0 * un / n);
         }
     }
     std::fflush(stderr);
@@ -292,13 +324,15 @@ struct G605CycScope
     void setShape(uint32_t fbp, uint8_t prim, uint8_t fpsm, uint32_t fbmsk, uint32_t tbp,
                   uint8_t tpsm, uint8_t tfx, uint8_t tcc, bool lin, uint64_t tex1,
                   uint64_t alpha, uint64_t test, uint8_t zpsm, uint8_t ztst,
-                  bool iip, bool fst, bool abe, bool fge, bool pabe, bool fba, bool privZ)
+                  bool iip, bool fst, bool abe, bool fge, bool pabe, bool fba, bool privZ,
+                  bool tme)
     {
         if (!on)
             return;
         hasShape = true;
         shape.cls = static_cast<uint8_t>(cls);
         shape.prim = prim;
+        shape.tme = tme ? 1u : 0u;
         shape.fbp = fbp;
         shape.fpsm = fpsm;
         shape.fbmsk = fbmsk;
@@ -327,7 +361,8 @@ struct G605CycScope
                 (static_cast<uint64_t>(shape.tcc) << 40) |
                 (static_cast<uint64_t>(shape.lin) << 48) |
                 (static_cast<uint64_t>(shape.flags) << 56),
-            static_cast<uint64_t>(shape.zpsm) | (static_cast<uint64_t>(shape.ztst) << 8),
+            static_cast<uint64_t>(shape.zpsm) | (static_cast<uint64_t>(shape.ztst) << 8) |
+                (static_cast<uint64_t>(shape.tme) << 16),
             shape.alpha, shape.test, shape.tex1, shape.fbmsk, shape.fbp,
             0u, 0u, 0u};
         for (int i = 0; i < 10; ++i)
@@ -360,11 +395,14 @@ struct G605CycScope
         {
             // Returned before the raster dispatch (culled, degenerate, scissored out): the whole
             // call is prologue, and that is itself a finding — a lever must know how many replayed
-            // draws never rasterize anything.
+            // draws never rasterize anything. ⛔ G615: it is ONLY that finding if the population
+            // really did return early, which is why `unmarked` is now counted beside it. An
+            // unmarked call whose loop RAN books that loop here and inflates `pro%` without limit.
             g_g605ProNs[cls][leaf].fetch_add(static_cast<uint64_t>(
                 std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count()),
                 std::memory_order_relaxed);
             g_g605ProCyc[cls][leaf].fetch_add(c1 - c0, std::memory_order_relaxed);
+            g_g605Unmarked[cls][leaf].fetch_add(1u, std::memory_order_relaxed);
         }
         else
         {
@@ -383,6 +421,11 @@ struct G605CycScope
             shape.cyc = (c1 - c0);
             shape.px = px;
             shape.inside = inside;
+            // G617: the LEAF is only resolved once the draw has chosen its loop, which is after
+            // setShape(). Fold it into the row key here so a shape row can never merge two
+            // different kernels' populations (and print it as the row's second column).
+            shape.leaf = static_cast<uint8_t>(leaf);
+            shape.key ^= static_cast<uint64_t>(leaf) * 1099511628211ull;
             g605NoteShape(shape);
         }
         g605CycReport();

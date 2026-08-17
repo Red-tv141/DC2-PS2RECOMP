@@ -796,6 +796,23 @@ enum G419Lever
     // alternates, so the candidate arm can never draw an empty slot table. Read once per run() on
     // the VU1 worker: hold 16.
     kG612LeverVuRegion = 126,
+    // G614: the three INLINED leaves of the G530-admitted replayed sprite pixel (the bilinear
+    // filter, the PSMT8 tap and combineTexture). Read once per drawSprite on the GS worker /
+    // replay lane, exactly like G588's solid-sprite leaf, so it takes the same attribution shape.
+    kG614LeverSprFast = 127,
+    // G615: admit the PRIVATE-Z (G403/G411 display mirror) sprite population into the two promoted
+    // sprite fast paths it was excluded from — the G530/G614 span kernel (`!g403DisplayZ` was a hard
+    // admission conjunct) and G588's exact solid fill (`!sZActive && !sZWrite` was). Read once per
+    // drawSprite on the replay lane: the same hook family as G588's and G614's.
+    kG615LeverPrivZ = 128,
+    // G617 (a): the exact UNTEXTURED **BLENDED** display fill — 19,352 draws / 59.5 M px at 323.8
+    // cyc/inside on `dungeon1`, refused by G588's promoted solid fill on `!abe` alone even though
+    // half of them carry a blend (`ALPHA=0x2a`) that is algebraically the identity. Read once per
+    // drawSprite on the replay lane: the same hook family as G588's, G614's and G615's.
+    kG617LeverBlendFill = 129,
+    // G617 (b): the PSMT4HH tap leaf, which admits the LARGEST single replay item on that route
+    // (`disp spr-slow`, 37.4% at 819.0 cyc/inside) into the G530/G614 span kernel. Same shape.
+    kG617LeverT4hh = 130,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -916,6 +933,14 @@ static int g419AbLever()
             return static_cast<int>(kG611LeverVuQSplit);
         if (std::strcmp(value, "vureg") == 0)
             return static_cast<int>(kG612LeverVuRegion);
+        if (std::strcmp(value, "sprfast") == 0)
+            return static_cast<int>(kG614LeverSprFast);
+        if (std::strcmp(value, "privz") == 0)
+            return static_cast<int>(kG615LeverPrivZ);
+        if (std::strcmp(value, "blendfill") == 0)
+            return static_cast<int>(kG617LeverBlendFill);
+        if (std::strcmp(value, "t4hh") == 0)
+            return static_cast<int>(kG617LeverT4hh);
         if (std::strcmp(value, "rbfmt") == 0)
             return static_cast<int>(kG491LeverRbFmt);
         if (std::strcmp(value, "rbspin") == 0)
@@ -1074,7 +1099,7 @@ static int g419AbLever()
                      "vu1slow|gsslow|coalesce|earlykick|kickall|spinwait|wspin|spinboth|async1|"
                      "rb_all|rb_l2l|rb_resync|rb_display|uvpred|simdmerge|vnoptrace|pagebump|"
                      "leanfetch|pcreg|widevf0|flaglower|fastop|pcskip|blockrun|vujit|vuops|"
-                     "vuqsplit|vureg|rbfmt|rbspin|"
+                     "vuqsplit|vureg|sprfast|privz|rbfmt|rbspin|"
                      "norender|noother|ct24reuse|latedrain|nosync|gpuslow|glstate|winbuf|ownpub|"
                      "blklower|qpblock|blkbranch|blksplit|blkchain|blktail0|eeslow|chainpool|"
                      "histcur|qpseg|lockskip|capmove|clsmemo|g510both|texrun|texprobe|clsprobe|"
@@ -1142,6 +1167,10 @@ static const char *g419AbLeverName(int lever)
     case kG611LeverVuOps: return "vuops";
     case kG611LeverVuQSplit: return "vuqsplit";
     case kG612LeverVuRegion: return "vureg";
+    case kG614LeverSprFast: return "sprfast";
+    case kG615LeverPrivZ: return "privz";
+    case kG617LeverBlendFill: return "blendfill";
+    case kG617LeverT4hh: return "t4hh";
     case kG491LeverRbFmt: return "rbfmt";
     case kG491LeverRbSpin: return "rbspin";
     case kG492LeverNoRender: return "norender";
@@ -1373,6 +1402,10 @@ static uint64_t g438ArmHoldFrames()
                  sel == kG555LeverHot1110 || sel == kG552LeverRttTri ||
                  sel == kG568LeverBitAlias || sel == kG573LeverTri13b ||
                  sel == kG580LeverTri13bFast || sel == kG588LeverSolidSprite ||
+                 // G614's inlined sprite leaves sit in the same drawSprite hook as G588's.
+                 sel == kG614LeverSprFast ||
+                 // G615's private-Z admission sits in the SAME drawSprite hook as both of those.
+                 sel == kG615LeverPrivZ ||
                  sel == kG589LeverDrainMemo || sel == kG590LeverZWin ||
                  sel == kG591LeverPrivZ || sel == kG591LeverColWin ||
                  sel == kG592LeverPubCons ||
@@ -2268,6 +2301,75 @@ int g580Tri13bFastArm()
 int g588SolidSpriteArm()
 {
     if (g419AbLever() != static_cast<int>(kG588LeverSolidSprite))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G614's three inlined sprite leaves run on every replay lane, once per drawSprite. Same shape as
+// G588's: at most one relaxed RMW per lane and A/B tick, never one per sprite or per pixel.
+int g614SprFastArm()
+{
+    if (g419AbLever() != static_cast<int>(kG614LeverSprFast))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G615's private-Z admission is read once per drawSprite on the replay lane — identical shape and
+// cost to G588's and G614's arms above (one relaxed RMW per lane per A/B tick, never per pixel).
+int g615PrivZArm()
+{
+    if (g419AbLever() != static_cast<int>(kG615LeverPrivZ))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G617's two sprite levers are read once per drawSprite on the replay lane — identical shape and
+// cost to G588's, G614's and G615's arms above (one relaxed RMW per lane per A/B tick, never one
+// per pixel). ⛔ Both call sites read the arm UNCONDITIONALLY, before any state conjunct: behind a
+// short-circuited `&&` the arm is sampled on the lever's own schedule and the estimator loses the
+// intervals it needs (G615 §6).
+int g617BlendFillArm()
+{
+    if (g419AbLever() != static_cast<int>(kG617LeverBlendFill))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g617T4hhArm()
+{
+    if (g419AbLever() != static_cast<int>(kG617LeverT4hh))
         return -1;
     const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
     const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);

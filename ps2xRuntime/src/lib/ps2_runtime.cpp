@@ -13,3 +13,4 @@
 // G482: runtime_g482_memo_census.inc added — memo-key price arm + full-identity census (force
 // recompile v2; MSBuild does not track .inc dependencies).
 // G541: exact VU1 kick corpus + asynchronous GPU compute transport prototype (force recompile v1).
+// G616: RTSS presentation synchronization and frame-gated display loop (force recompile v1).

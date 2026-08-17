@@ -167,6 +167,17 @@ void GSRasterizer::drawSprite(GS *gs)
     }
     // G530 decomposition probes — see g530_sprite_span.inc. Loop-invariant, default-off, and each
     // one produces knowingly incorrect pixels; they price the per-pixel classes before any lever.
+    // ⛔⛔ G617: BOTH A/B ARMS ARE READ HERE, AT drawSprite ENTRY — NOT INSIDE THE BRANCH EACH
+    // LEVER LIVES IN. G615 §6's law is "read the arm unconditionally, before any state conjunct",
+    // and revision 1 obeyed the letter of it (each arm was the first statement of its own branch)
+    // while breaking the intent: `g617BlendFillOn()` sat inside `else { /* untextured */ }`, which
+    // IS the lever's footprint, so the arm was still sampled on the LEVER's schedule. The gate
+    // reproduced G615's exact signature — `used(0=228 1=77 2=56 3=0)` with `blocked(w=2)`, i.e. 228
+    // of 361 intervals saw neither arm and the estimator had 2 windows. ⭐ THE ARM MUST BE READ ON
+    // A PATH EVERY MEMBER OF THE FRAME'S DRAW POPULATION TAKES, which for a sprite lever is the top
+    // of drawSprite, before the `tme` split.
+    const bool g617FillArm = g617BlendFillOn();
+    const bool g617T4hhArmOn = g617T4hhOn();
     const bool g530NoZ    = g530ProbeNoZ();
     const bool g530NoWr   = g530ProbeNoWr();
     const bool g530NoUv   = g530ProbeNoUv();
@@ -332,7 +343,7 @@ void GSRasterizer::drawSprite(GS *gs)
                          static_cast<uint8_t>((ctx.test >> 17) & 0x3u),
                          gs->m_prim.iip != 0u, gs->m_prim.fst != 0u, gs->m_prim.abe != 0u,
                          gs->m_prim.fge != 0u, gs->m_pabe != 0u, (ctx.fba & 0x1ull) != 0ull,
-                         g403DisplayZ);
+                         g403DisplayZ, gs->m_prim.tme != 0u);
     }
 
     // G219 (default-off, DC2_G219_SKYPX=1): log any SPRITE touching Z inside the zoom black
@@ -687,6 +698,24 @@ void GSRasterizer::drawSprite(GS *gs)
                          : !g248SpecialFilterOff      ? kG529SprRFilter
                                                       : kG529SprROk,
                          tex1UsesLinearFilter(ctx.tex1), g248Psm);
+        // ⭐⭐⭐ G617 (b): THE PSMT4HH DISPLAY SPRITE, the LARGEST single item in `dungeon1`'s replay.
+        // `[G615:privz] spanRej(samp=102994)` and `[G529:sprwhy] psm=102873 psm(c:102873)` agree
+        // that ONE conjunct refuses this whole population — `g248FastPsm`, which admits CT32/CT24/T8
+        // — and the split leaf census prices what that refusal costs: `disp spr-slow` is 37.4% of
+        // the route's replay at **819.0 cyc/inside**, 5.3x the admitted `disp sprite` leaf's 155.3.
+        //
+        // ⛔ `g248FastPsm` is NOT widened. It gates `g248FastSample`, whose `g248SamplePoint` has
+        // exactly two arms (CT32/CT24, else assume PSMT8) — widening it would send a T4HH draw that
+        // the span kernel later refuses into a sampler that reads it as PSMT8. The admission is a
+        // SEPARATE predicate with the same shape, and only the span kernel (which gets a real T4HH
+        // tap below) consumes it. Fail-closed by construction.
+        //
+        // ⛔⛔ The arm (`g617T4hhArmOn`) is read at drawSprite ENTRY, before the `tme` split — see
+        // the note there. State terms are AND-ed onto it here (G615 §6).
+        const bool g617T4hhSprite =
+            g617T4hhArmOn && s_g248FastSprite && g526FastSpriteTarget(ctx.frame.fbp) &&
+            gs->m_prim.fst && g248Psm == GS_PSM_T4HH && tex.tbw != 0u && g248TraceOff &&
+            g248SpecialFilterOff;
         const uint8_t g248WrapU = static_cast<uint8_t>(ctx.clamp & 0x3u);
         const uint8_t g248WrapV = static_cast<uint8_t>((ctx.clamp >> 2u) & 0x3u);
         const int g248MinU = static_cast<int>((ctx.clamp >> 4u) & 0x3FFu);
@@ -694,8 +723,15 @@ void GSRasterizer::drawSprite(GS *gs)
         const int g248MinV = static_cast<int>((ctx.clamp >> 24u) & 0x3FFu);
         const int g248MaxV = static_cast<int>((ctx.clamp >> 34u) & 0x3FFu);
         const bool g248Linear = tex1UsesLinearFilter(ctx.tex1);
+        // G617 (b): the T4HH tap is a CLUT lookup exactly as the T8 tap is, so it takes the same
+        // per-draw 256-entry cache. ⚠️ Widening this is safe ONLY because `g248ClutLookup` is
+        // reached from `g248SamplePoint` (which never runs for T4HH — `g248FastSampleSprite` is
+        // false for it) and from the G617 tap below. `lookupCLUT`'s other inputs (cbp/cpsm/csm/csa
+        // and the source psm, which drives `resolveClutIndex`'s T4 arm) are draw constants, so
+        // caching on the raw index is the identity for this draw.
         const bool g248UseClutCache =
-            g248FastSampleSprite && g248Psm == GS_PSM_T8 && !s_g248NoClutCache;
+            ((g248FastSampleSprite && g248Psm == GS_PSM_T8) || g617T4hhSprite) &&
+            !s_g248NoClutCache;
         // Thread-local avoids growing/clearing every drawSprite stack frame while the prototype is
         // disabled.  Each eligible paletted draw explicitly invalidates its own entries below.
         static thread_local uint32_t g248Clut[256];
@@ -786,8 +822,6 @@ void GSRasterizer::drawSprite(GS *gs)
 
         // Everything above this line is the PROLOGUE the [G530:cyc] census books separately.
         g530cyc.setFast(g248FastSampleSprite);
-        g530cyc.markLoop();
-        g605cyc.markLoop();
         // ============================ G530: THE SPAN KERNEL ============================
         // Full rationale + the exactness argument: g530_sprite_span.inc. Admission is by PROPERTY,
         // never by address (G526/G527's law): the kernel runs when the draw is an axis-aligned
@@ -795,12 +829,54 @@ void GSRasterizer::drawSprite(GS *gs)
         // sub-pixel/round override is active, no per-pixel diagnostic is armed, and no G529/G530
         // probe is armed. Anything else falls through to the proven generic nest below, unchanged.
         bool g530Handled = false;
-        if (g530SpanOn() && !g530AnyProbe() && g530Quiet() && g248FastSampleSprite &&
+        // ⭐⭐⭐ G615 (b): `!g403DisplayZ` USED TO BE A HARD REFUSAL HERE, and it excluded the entire
+        // display-target sprite population — 23.7% of `dungeon1`'s replay at 701.5 cyc/inside
+        // against 322.8 for the identical leaf on a target without the private mirror. It existed
+        // for a real reason (the kernel's Z-read arm below reads guest VRAM Z, which is the WRONG
+        // authority for a private-mirror draw), so the conjunct is replaced by the lever that
+        // supplies the missing arm — never simply deleted. Fail-closed: with the lever rolled back
+        // the predicate is bit-identical to the shipped one.
+        // ⚠️ READ ONCE PER DRAW — each of these is a function-local `static const bool`, i.e. a
+        // per-ACCESS TLS init guard (`g609_function_local_static_is_a_per_access_tls_guard`).
+        //
+        // ⭐⭐⭐ THE LEVER IS THAT `!g403DisplayZ` WAS OVER-BROAD, NOT THAT IT WAS WRONG. It rejected
+        // every draw whose depth AUTHORITY is the private mirror — including the ones whose depth
+        // OPERATION is a proven no-op. On `dungeon1` that is the whole population: `[G615:privz]`
+        // measured `zRd=0 zSt=0` over 37.5 M admitted pixels, because these draws carry
+        // ZTST=ALWAYS with ZMSK set, so `sZActive` is false by drawSprite's own fast-skip rule.
+        // Admitting exactly the no-op subset needs NO new code in the pixel loop: the kernel's
+        // `if (sZActive)` read is not taken, and its `spriteZStore` self-guards on `!sZWrite`. The
+        // draw's pixels are then covered verbatim by `[G530:span] bad=0`, the kernel's own oracle.
+        //
+        // ⛔⛔ THE ARM IS READ FIRST, UNCONDITIONALLY, AND THE STATE TERMS ARE AND-ED ONTO IT.
+        // Written as `g403DisplayZ && g615ZNoop && g615SpanOn()`, C++ short-circuits and the A/B arm
+        // is only ever OBSERVED on draws inside the lever's own footprint — which on this route is a
+        // localized spike region. The first `DC2_G419_AB=privz` leg read `used(0=4175 1=119 2=147
+        // 3=0)` with `blocked(w=4)`: 4,175 of 4,440 intervals saw NEITHER arm and were dropped, so
+        // the estimator had 4 windows instead of ~26. An A/B arm must be sampled on the same
+        // schedule as the frames it is attributed to. (G614's `g614SprFastOn()` is read
+        // unconditionally two hundred lines below for exactly this reason.)
+        const bool g615SpanArm = g615SpanOn();
+        const bool g615ZNoop = !sZActive && !sZWrite; // mirror provably neither read nor written
+        const bool g615Span = g615SpanArm && g403DisplayZ && g615ZNoop;
+        const bool g615Stat = g615StatOn();
+        // ⭐⭐ G617: the admission is now a NAMED BOOLEAN evaluated BEFORE `markLoop()`, so the
+        // census can book this draw to the leaf that is about to run it. A `setLeaf` after
+        // `markLoop` would split one draw across two leaves (its prologue into one column, its loop
+        // into another) — the mirror image of the defect G615 found in `pro%`.
+        const bool g530Admit =
+            g530SpanOn() && !g530AnyProbe() && g530Quiet() &&
+            (g248FastSampleSprite || g617T4hhSprite) &&
             !s_g248Verify &&
             (ctx.frame.psm == GS_PSM_CT32 || ctx.frame.psm == GS_PSM_CT24) &&
-            !g403DisplayZ && !(gs->m_prim.fge && g364FogEnabled()) &&
-            drawX1 >= drawX0 && drawY1 >= drawY0 && gs->m_vram != nullptr)
+            (!g403DisplayZ || g615Span) && !(gs->m_prim.fge && g364FogEnabled()) &&
+            drawX1 >= drawX0 && drawY1 >= drawY0 && gs->m_vram != nullptr;
+        g605cyc.setLeaf(g530Admit ? kG605LeafSprite : kG605LeafSpriteSlow);
+        g530cyc.markLoop();
+        g605cyc.markLoop();
+        if (g530Admit)
         {
+            // (the G615 span refusal census for this population lives just below the block)
             // --- the alpha test as an interval, verified exhaustively per distinct TEST value ---
             const G530AlphaGate g530Gate = g530BuildAlphaGate(ctx.test);
             bool g530GateOk = true;
@@ -895,6 +971,12 @@ void GSRasterizer::drawSprite(GS *gs)
             const uint32_t g530PageBwT8 =
                 ((tex.tbw >> 1u) != 0u) ? (tex.tbw >> 1u) : 1u;
             const uint32_t g530TexTbw = (tex.tbw != 0u) ? tex.tbw : 1u;
+            // G617 (b): read once per draw, never inside the loop — each is a per-ACCESS TLS init
+            // guard (`g609_function_local_static_is_a_per_access_tls_guard`). Declared here because
+            // the T4HH tap lambda below closes over them.
+            const bool g617Vfy = g617VerifyOn();
+            const bool g617Stat = g617StatOn();
+            uint64_t g617TapN = 0u;
             // The post-wrap half of g248SamplePoint — the wrap itself is already in the U/V tables.
             // For the 32-bit formats the address is computed INLINE with GSPSMCT32::addrPSMCT32,
             // the same expression writePixel uses and the one this file's own F62 note records as
@@ -938,6 +1020,41 @@ void GSRasterizer::drawSprite(GS *gs)
                 return g248UseClutCache
                     ? g248ClutLookup(idx)
                     : lookupCLUT(gs, idx, tex.cbp, tex.cpsm, tex.csm, tex.csa, tex.psm);
+            };
+            // ⭐⭐⭐ G617 (b): the PSMT4HH tap. `PixelStorageTraits<P4HH>` has the SAME PageExtent
+            // {64,32}, BlockExtent {8,4} and ColumnExtent {8,8} as C32 and reads through the SAME
+            // `PageTableC32`; its ONLY difference is `BitOffset() == 28`. With `UnpackedBitWidth`
+            // 32 and `PackedT` = u8 that makes `byte_addr = pixel_addr*4 + 3` and `shift = 4`, and
+            // `addrPSMCT32` is exactly `pixel_addr*4` (proven termwise: the traits' `blockId*256`
+            // equals `(blockId>>5)<<13 + (blockId&31)*256` because 32*256 == 1<<13). So the tap is
+            // ONE byte load and a shift, with the row half of the address hoisted to the scanline —
+            // the same lowering G614(b) made for PSMT8, one format over.
+            // ⚠️ `tbw` goes in UNHALVED: P4HH's page is 64 wide like C32's, unlike PSMT8 (128) and
+            // plain PSMT4 (128), both of which need `tbw >> 1`. That is the whole trap in this
+            // format family and it is why the reference call below passes `g530TexTbw` too.
+            auto g617TapT4hh = [&](int su, const G530RowAddr &texRow, int svForVfy) -> uint32_t {
+                const uint32_t off = g617T4hhNibbleOff(texRow, static_cast<uint32_t>(su));
+                const uint8_t idx = static_cast<uint8_t>((gs->m_vram[off] >> 4u) & 0x0Fu);
+                if (g617Vfy)
+                {
+                    // ORACLE: the SHIPPED GSMem reader is authoritative for every tap.
+                    const uint8_t ref = static_cast<uint8_t>(
+                        GSMem::ReadP4HH(gs->m_vram, tex.tbp0, g530TexTbw,
+                                        static_cast<uint32_t>(su),
+                                        static_cast<uint32_t>(svForVfy)));
+                    if (ref != idx)
+                    {
+                        const uint64_t bad =
+                            g_g617T4hhBad.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                        if (bad <= 16u)
+                            std::fprintf(stderr,
+                                "[G617:vfy] T4HH TAP MISMATCH uv=(%d,%d) tbp=0x%x tbw=%u "
+                                "ref=%02x fast=%02x off=0x%x\n",
+                                su, svForVfy, tex.tbp0, g530TexTbw, ref, idx, off);
+                    }
+                }
+                ++g617TapN;
+                return g248ClutLookup(idx);
             };
             // writePixel's 32-bit tail, statement for statement, with every loop-invariant term
             // hoisted and the (already-satisfied) scissor test and (already-computed) alpha-test
@@ -990,6 +1107,67 @@ void GSRasterizer::drawSprite(GS *gs)
                 return pixel;
             };
 
+            // ⛔ G614 CEILING PROBE — read ONCE per draw, never a correctness switch. See
+            // g614_sprite_scan.inc for the level table and the exactness/denominator argument.
+            const G614Ceil g614C = g614CeilFlags();
+            uint32_t g614Sink = 0u;
+
+            // ⭐⭐⭐ G614: the three INLINED leaves the ceiling probe named (81.4% of this pixel).
+            // Every predicate is read ONCE here — each is a function-local `static const bool`,
+            // i.e. a per-ACCESS thread-safe-init guard, and reading one per pixel is precisely the
+            // defect being deleted. Each leaf is admitted only where its substitution is the
+            // IDENTITY: the filter only when all three G529 selectors read their shipped default,
+            // the tap only for the PSMT8/CLUT-cache source the fast address form covers.
+            const bool g614Vfy = g614VerifyOn();
+            // ⚠️ The ceiling probe is deliberately ORTHOGONAL to the lever: every CEIL level guards
+            // its own stage above the fast/slow choice, so an arm prices a stage of the SHIPPED
+            // pixel. (The §5 ranking table in the fix log was taken on the pre-lever binary and is
+            // the price of the PRE-G614 pixel; re-run the sweep to re-rank the current one.)
+            const bool g614On = g614SprFastOn();
+            const bool g614FastLerp = g614On && g248Linear &&
+                                      g529FastLerpOn() && !g529NoLerpOn() && !g529LerpVfyOn();
+            const bool g614FastTap = g614On && g248Psm == GS_PSM_T8 && g248UseClutCache;
+            const bool g614FastComb = g614On;
+            const uint8_t g614Tfx = tex.tfx;
+            const bool g614Tcc = tex.tcc != 0u;
+            uint64_t g614TapN = 0u, g614LerpN = 0u, g614SlideN = 0u;
+            if (g614StatOn())
+            {
+                if (g614On)
+                    g_g614Draws.fetch_add(1u, std::memory_order_relaxed);
+                else
+                    g_g614Reject.fetch_add(1u, std::memory_order_relaxed);
+            }
+            // The PSMT8 source address with every y-dependent term hoisted to the scanline. Only
+            // the two rows this draw's bilinear quad reads are ever built.
+            G614T8Row g614RowV0, g614RowV1;
+            G530RowAddr g617TexRowV0, g617TexRowV1; // G617 (b): the P4HH source rows
+            const uint32_t g614TexBlock = tex.tbp0;
+            const uint32_t g614TexTbwRaw = (tex.tbw != 0u) ? tex.tbw : 1u;
+            auto g614TapT8 = [&](int su, const G614T8Row &row, int svForVfy) -> uint32_t {
+                const uint32_t off = g614T8Off(row, static_cast<uint32_t>(su)) &
+                                     static_cast<uint32_t>(GSMem::MEMORY_SIZE - 1u);
+                const uint8_t idx = gs->m_vram[off];
+                if (g614Vfy)
+                {
+                    const uint8_t ref = static_cast<uint8_t>(
+                        GSMem::ReadP8(gs->m_vram, tex.tbp0, g530PageBwT8,
+                                      static_cast<uint32_t>(su), static_cast<uint32_t>(svForVfy)));
+                    if (ref != idx)
+                    {
+                        const uint64_t bad =
+                            g_g614BadTap.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                        if (bad <= 16u)
+                            std::fprintf(stderr,
+                                "[G614:vfy] T8 TAP MISMATCH uv=(%d,%d) tbp=0x%x tbw=%u "
+                                "ref=%02x fast=%02x off=0x%x\n",
+                                su, svForVfy, tex.tbp0, g614TexTbwRaw, ref, idx, off);
+                    }
+                }
+                ++g614TapN;
+                return g248ClutLookup(idx);
+            };
+
             uint64_t g530PxDone = 0u;
             for (int y = drawY0; y <= drawY1; ++y)
             {
@@ -1019,6 +1197,25 @@ void GSRasterizer::drawSprite(GS *gs)
                 }
                 const G530RowAddr g530Row =
                     g530RowAddr(g530Block, g530Fbw, static_cast<uint32_t>(y));
+                // ⭐ G614 (b): the two source scanlines this row's bilinear quad reads. Everything
+                // in the PSMT8 address that depends only on v is resolved here, once per row.
+                if (g614FastTap)
+                {
+                    g614RowV0 = g614T8Row(g614TexBlock, g614TexTbwRaw,
+                                          static_cast<uint32_t>(g530V0));
+                    g614RowV1 = g614T8Row(g614TexBlock, g614TexTbwRaw,
+                                          static_cast<uint32_t>(g530V1));
+                }
+                // ⭐ G617 (b): the two SOURCE scanlines this row's tap(s) read, in the C32 page
+                // geometry P4HH shares. Everything in the address that depends only on v resolves
+                // here, once per row; the per-tap remainder is a table load and six ALU ops.
+                if (g617T4hhSprite)
+                {
+                    g617TexRowV0 = g530RowAddr(tex.tbp0, g530TexTbw,
+                                               static_cast<uint32_t>(g530V0));
+                    g617TexRowV1 = g530RowAddr(tex.tbp0, g530TexTbw,
+                                               static_cast<uint32_t>(g530V1));
+                }
                 bool g530QuadValid = false;
                 int g530LastU0 = 0, g530LastU1 = 0;
                 uint32_t q00 = 0u, q10 = 0u, q01 = 0u, q11 = 0u;
@@ -1032,11 +1229,73 @@ void GSRasterizer::drawSprite(GS *gs)
                     const int xEnd = (drawX1 < (x | 7)) ? drawX1 : (x | 7);
                     for (; x <= xEnd; ++x)
                     {
+                        if (g614C.noPixel) // ⛔ CEIL=7: bound the whole per-pixel body
+                            continue;
                         const size_t i = static_cast<size_t>(x - drawX0);
                         const int su0 = g530U.u0[i];
                         const int su1 = g530U.u1[i];
-                        if (!g530QuadValid || su0 != g530LastU0 || su1 != g530LastU1)
+                        if (!g614C.noTap && // ⛔ CEIL=1/2/5: delete the four VRAM taps
+                            (!g530QuadValid || su0 != g530LastU0 || su1 != g530LastU1))
                         {
+                            // ⭐⭐⭐ G614 (d) — THE COLUMN SLIDE. `[G614:spr]` measured taps/px =
+                            // 3.999 on this route: the (u0,u1) memo NEVER hits, because u advances
+                            // about one texel per screen pixel here. But that is exactly the case
+                            // in which this column's LEFT pair is the previous column's RIGHT pair:
+                            // when su0 == the previous su1, tap(su0,V0) and tap(su0,V1) are the
+                            // SAME function of the SAME arguments that produced q10 and q11 one
+                            // pixel ago. Reusing them is a memo, not an approximation — it cannot
+                            // change a result either way — and it halves the tap count.
+                            if (g614FastTap && g248Linear && g530QuadValid && su0 == g530LastU1)
+                            {
+                                const uint32_t s00 = q10, s01 = q11;
+                                q10 = g614TapT8(su1, g614RowV0, g530V0);
+                                q11 = g614TapT8(su1, g614RowV1, g530V1);
+                                if (g614Vfy)
+                                {
+                                    const uint32_t r00 = g614TapT8(su0, g614RowV0, g530V0);
+                                    const uint32_t r01 = g614TapT8(su0, g614RowV1, g530V1);
+                                    if (r00 != s00 || r01 != s01)
+                                    {
+                                        const uint64_t bad =
+                                            g_g614BadSlide.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                                        if (bad <= 16u)
+                                            std::fprintf(stderr,
+                                                "[G614:vfy] SLIDE MISMATCH xy=(%d,%d) u0=%d u1=%d "
+                                                "prevU1=%d ref=%08x/%08x slid=%08x/%08x\n",
+                                                x, y, su0, su1, g530LastU1, r00, r01, s00, s01);
+                                    }
+                                }
+                                q00 = s00;
+                                q01 = s01;
+                                ++g614SlideN;
+                            }
+                            else if (g614FastTap)
+                            {
+                                q00 = g614TapT8(su0, g614RowV0, g530V0);
+                                if (g248Linear)
+                                {
+                                    q10 = g614TapT8(su1, g614RowV0, g530V0);
+                                    q01 = g614TapT8(su0, g614RowV1, g530V1);
+                                    q11 = g614TapT8(su1, g614RowV1, g530V1);
+                                }
+                            }
+                            // ⭐ G617 (b). ⚠️ NO COLUMN SLIDE: this population is POINT-sampled
+                            // (`lin=0`, `tex1=0x1`/`0x201`), so there is no quad to slide and the
+                            // linear arm below exists only so the kernel stays correct if a linear
+                            // T4HH draw ever appears. G614's slide is a memo over a bilinear quad's
+                            // right pair and has nothing to reuse when there is one tap per pixel.
+                            else if (g617T4hhSprite)
+                            {
+                                q00 = g617TapT4hh(su0, g617TexRowV0, g530V0);
+                                if (g248Linear)
+                                {
+                                    q10 = g617TapT4hh(su1, g617TexRowV0, g530V0);
+                                    q01 = g617TapT4hh(su0, g617TexRowV1, g530V1);
+                                    q11 = g617TapT4hh(su1, g617TexRowV1, g530V1);
+                                }
+                            }
+                            else
+                            {
                             q00 = g530Tap(su0, g530V0);
                             if (g248Linear)
                             {
@@ -1044,12 +1303,75 @@ void GSRasterizer::drawSprite(GS *gs)
                                 q01 = g530Tap(su0, g530V1);
                                 q11 = g530Tap(su1, g530V1);
                             }
+                            }
                             g530LastU0 = su0;
                             g530LastU1 = su1;
                             g530QuadValid = true;
                         }
                         uint32_t texel;
-                        if (g248Linear)
+                        if (g614C.noLerp) // ⛔ CEIL=1/2/4: delete the four lerpChannel calls
+                        {
+                            texel = q00;
+                        }
+                        // ⭐ G614 (a): the bilinear filter, inlined. `g609Lerp8` is G609's own
+                        // already-shipped, already-proven-exact copy of `lerpChannel`'s statements
+                        // with the CRT rounding call replaced by G529's identity — and the three
+                        // per-call `static const bool` init guards gone (twelve per texel).
+                        else if (g614FastLerp)
+                        {
+                            const float fxv = g530U.fx[i];
+                            const uint8_t lr = g609Lerp8(
+                                static_cast<uint8_t>(q00 & 0xFFu), static_cast<uint8_t>(q10 & 0xFFu),
+                                static_cast<uint8_t>(q01 & 0xFFu), static_cast<uint8_t>(q11 & 0xFFu),
+                                fxv, g530Fy);
+                            const uint8_t lg = g609Lerp8(
+                                static_cast<uint8_t>((q00 >> 8) & 0xFFu), static_cast<uint8_t>((q10 >> 8) & 0xFFu),
+                                static_cast<uint8_t>((q01 >> 8) & 0xFFu), static_cast<uint8_t>((q11 >> 8) & 0xFFu),
+                                fxv, g530Fy);
+                            const uint8_t lb = g609Lerp8(
+                                static_cast<uint8_t>((q00 >> 16) & 0xFFu), static_cast<uint8_t>((q10 >> 16) & 0xFFu),
+                                static_cast<uint8_t>((q01 >> 16) & 0xFFu), static_cast<uint8_t>((q11 >> 16) & 0xFFu),
+                                fxv, g530Fy);
+                            const uint8_t la = g609Lerp8(
+                                static_cast<uint8_t>((q00 >> 24) & 0xFFu), static_cast<uint8_t>((q10 >> 24) & 0xFFu),
+                                static_cast<uint8_t>((q01 >> 24) & 0xFFu), static_cast<uint8_t>((q11 >> 24) & 0xFFu),
+                                fxv, g530Fy);
+                            texel = static_cast<uint32_t>(lr) | (static_cast<uint32_t>(lg) << 8) |
+                                    (static_cast<uint32_t>(lb) << 16) | (static_cast<uint32_t>(la) << 24);
+                            ++g614LerpN;
+                            if (g614Vfy)
+                            {
+                                // The SHIPPED lerpChannel is authoritative; the inline copy is
+                                // compared against what it returns, channel by channel.
+                                const uint8_t rr = lerpChannel(
+                                    static_cast<uint8_t>(q00 & 0xFFu), static_cast<uint8_t>(q10 & 0xFFu),
+                                    static_cast<uint8_t>(q01 & 0xFFu), static_cast<uint8_t>(q11 & 0xFFu),
+                                    fxv, g530Fy);
+                                const uint8_t rg = lerpChannel(
+                                    static_cast<uint8_t>((q00 >> 8) & 0xFFu), static_cast<uint8_t>((q10 >> 8) & 0xFFu),
+                                    static_cast<uint8_t>((q01 >> 8) & 0xFFu), static_cast<uint8_t>((q11 >> 8) & 0xFFu),
+                                    fxv, g530Fy);
+                                const uint8_t rb = lerpChannel(
+                                    static_cast<uint8_t>((q00 >> 16) & 0xFFu), static_cast<uint8_t>((q10 >> 16) & 0xFFu),
+                                    static_cast<uint8_t>((q01 >> 16) & 0xFFu), static_cast<uint8_t>((q11 >> 16) & 0xFFu),
+                                    fxv, g530Fy);
+                                const uint8_t ra = lerpChannel(
+                                    static_cast<uint8_t>((q00 >> 24) & 0xFFu), static_cast<uint8_t>((q10 >> 24) & 0xFFu),
+                                    static_cast<uint8_t>((q01 >> 24) & 0xFFu), static_cast<uint8_t>((q11 >> 24) & 0xFFu),
+                                    fxv, g530Fy);
+                                if (rr != lr || rg != lg || rb != lb || ra != la)
+                                {
+                                    const uint64_t bad =
+                                        g_g614BadLerp.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                                    if (bad <= 16u)
+                                        std::fprintf(stderr,
+                                            "[G614:vfy] LERP MISMATCH xy=(%d,%d) fx=%.9g fy=%.9g "
+                                            "ref=%02x%02x%02x%02x fast=%02x%02x%02x%02x\n",
+                                            x, y, fxv, g530Fy, ra, rb, rg, rr, la, lb, lg, lr);
+                                }
+                            }
+                        }
+                        else if (g248Linear)
                         {
                             const float fxv = g530U.fx[i];
                             const uint8_t lr = lerpChannel(
@@ -1075,12 +1397,51 @@ void GSRasterizer::drawSprite(GS *gs)
                         {
                             texel = q00;
                         }
-                        const TextureCombineResult color = combineTexture(
+                        // ⛔ CEIL=2/3: delete the per-pixel combineTexture call. The substitute
+                        // keeps the texel observable so the sampler above is not deleted with it.
+                        // ⭐ G614 (c): combineTexture, inlined — same switch, same statements, with
+                        // tfx/tcc as plain locals so the switch hoists out of the pixel loop.
+                        const TextureCombineResult color = g614C.noComb
+                            ? TextureCombineResult{static_cast<uint8_t>(texel & 0xFFu),
+                                                   static_cast<uint8_t>((texel >> 8) & 0xFFu),
+                                                   static_cast<uint8_t>((texel >> 16) & 0xFFu),
+                                                   static_cast<uint8_t>((texel >> 24) & 0xFFu)}
+                            : g614FastComb
+                            ? g614Combine(
+                            g614Tfx, g614Tcc, r, g, b, a,
+                            static_cast<uint8_t>(texel & 0xFFu),
+                            static_cast<uint8_t>((texel >> 8) & 0xFFu),
+                            static_cast<uint8_t>((texel >> 16) & 0xFFu),
+                            static_cast<uint8_t>((texel >> 24) & 0xFFu))
+                            : combineTexture(
                             tex, r, g, b, a,
                             static_cast<uint8_t>(texel & 0xFFu),
                             static_cast<uint8_t>((texel >> 8) & 0xFFu),
                             static_cast<uint8_t>((texel >> 16) & 0xFFu),
                             static_cast<uint8_t>((texel >> 24) & 0xFFu));
+                        if (g614Vfy && g614FastComb)
+                        {
+                            // The SHIPPED combineTexture is authoritative.
+                            const TextureCombineResult ref = combineTexture(
+                                tex, r, g, b, a,
+                                static_cast<uint8_t>(texel & 0xFFu),
+                                static_cast<uint8_t>((texel >> 8) & 0xFFu),
+                                static_cast<uint8_t>((texel >> 16) & 0xFFu),
+                                static_cast<uint8_t>((texel >> 24) & 0xFFu));
+                            if (ref.r != color.r || ref.g != color.g ||
+                                ref.b != color.b || ref.a != color.a)
+                            {
+                                const uint64_t bad =
+                                    g_g614BadComb.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                                if (bad <= 16u)
+                                    std::fprintf(stderr,
+                                        "[G614:vfy] COMBINE MISMATCH xy=(%d,%d) tfx=%u tcc=%u "
+                                        "ref=%02x%02x%02x%02x fast=%02x%02x%02x%02x\n",
+                                        x, y, g614Tfx, g614Tcc ? 1u : 0u,
+                                        ref.a, ref.b, ref.g, ref.r,
+                                        color.a, color.b, color.g, color.r);
+                            }
+                        }
                         // Z test — identical to spriteZPass, with the read skipped for the two
                         // ZTST codes that provably ignore it (NEVER / ALWAYS). That skip is exact:
                         // the generic lambda reads zdst and then never looks at it in those cases.
@@ -1091,6 +1452,14 @@ void GSRasterizer::drawSprite(GS *gs)
                                 zpass = false;
                             else if (sZtst != 1u)
                             {
+                                // ⚠️ G615: this arm reads GUEST VRAM Z, which is the wrong authority
+                                // for a g403DisplayZ draw — which is why `!g403DisplayZ` was a
+                                // refusal conjunct in the first place. G615 does NOT supply a
+                                // private-mirror arm here: it admits only the subset whose depth
+                                // operation is a proven no-op (`g615ZNoop`), for which `sZActive` is
+                                // false and this whole block is unreachable. A mirror arm would be
+                                // an UNEXERCISED path on every route measured so far — `bad=0` with
+                                // `checks=0` is a failed run, not a proof.
                                 const uint32_t zdst =
                                     sZ16 ? GSMem::ReadZ16(gs->m_vram, sZbp, sZbw,
                                                           static_cast<uint32_t>(x), static_cast<uint32_t>(y))
@@ -1119,7 +1488,14 @@ void GSRasterizer::drawSprite(GS *gs)
                         {
                             const uint32_t off = g530GBase +
                                 static_cast<uint32_t>(g530Row.ct[x & 0x7u]) * 4u;
-                            if (off + 4u <= gs->m_vramSize)
+                            // ⛔ CEIL=3/6: delete the blend/mask/store. The address and the colour
+                            // stay observable through g614Sink so only the COMMIT is priced.
+                            if (g614C.noCommit)
+                            {
+                                g614Sink += off ^ static_cast<uint32_t>(color.r) ^
+                                            (static_cast<uint32_t>(color.a) << 8);
+                            }
+                            else if (off + 4u <= gs->m_vramSize)
                             {
                                 const uint32_t pixel =
                                     g530Commit(off, color.r, color.g, color.b, color.a, wpa);
@@ -1154,10 +1530,35 @@ void GSRasterizer::drawSprite(GS *gs)
                             }
                         }
                         if (wzb)
-                            spriteZStore(x, y);
+                            spriteZStore(x, y); // self-guards on !sZWrite, which g615ZNoop proves
                         ++g530PxDone;
                     }
                 }
+            }
+            if (g615Span && g615Stat)
+            {
+                g_g615SpanDraws.fetch_add(1u, std::memory_order_relaxed);
+                g_g615SpanPx.fetch_add(g530PxDone, std::memory_order_relaxed);
+                g615Report();
+            }
+            // ⭐ G617 (b) coverage. Booked ONLY for the population the lever admits, so `bad=0` can
+            // never be read off a path that was not taken (`g589_oracle_with_zero_checks`).
+            if (g617T4hhSprite && g617Stat)
+            {
+                g_g617T4hhDraws.fetch_add(1u, std::memory_order_relaxed);
+                g_g617T4hhPx.fetch_add(g530PxDone, std::memory_order_relaxed);
+                g_g617T4hhTaps.fetch_add(g617TapN, std::memory_order_relaxed);
+                g617Report();
+            }
+            if (g614C.any)
+                g_g614CeilSink.fetch_add(g614Sink, std::memory_order_relaxed);
+            if (g614StatOn())
+            {
+                g_g614Px.fetch_add(g530PxDone, std::memory_order_relaxed);
+                g_g614Taps.fetch_add(g614TapN, std::memory_order_relaxed);
+                g_g614Lerps.fetch_add(g614LerpN, std::memory_order_relaxed);
+                g_g614Slides.fetch_add(g614SlideN, std::memory_order_relaxed);
+                g614Report();
             }
             g_g530Px.fetch_add(g530Vfy ? 0u : g530PxDone, std::memory_order_relaxed);
             g_g530Draws.fetch_add(1u, std::memory_order_relaxed);
@@ -1166,6 +1567,25 @@ void GSRasterizer::drawSprite(GS *gs)
             }
         }
 
+        // ⭐ G615: the COVERAGE DENOMINATOR for (b). Every private-Z textured sprite that did NOT
+        // reach the span kernel is booked here with the conjunct that refused it, so "N draws
+        // admitted" can be read as a fraction instead of an absolute (`g536_coverage_denominator_
+        // for_a_defect_rate` — a CLEAN result needs a denominator too).
+        if (g615Stat && g403DisplayZ && !g530Handled && t_g144InReplay)
+        {
+            // ⚠️ G617: the sampler conjunct is now `g248FastSampleSprite || g617T4hhSprite`. Left
+            // as `!g248FastSampleSprite`, this census would book every PSMT4HH draw the G617 tap
+            // REFUSED for some other reason to `samp` — the exact mis-attribution that made
+            // `spanRej(samp=102994)` readable in the first place. A refusal census has to track its
+            // admission predicate or it starts naming the wrong conjunct.
+            g_g615SpanRej[!(g248FastSampleSprite || g617T4hhSprite) ? kG615SpanRejSamp
+                          : !(ctx.frame.psm == GS_PSM_CT32 || ctx.frame.psm == GS_PSM_CT24)
+                              ? kG615SpanRejFpsm
+                          : (gs->m_prim.fge && g364FogEnabled()) ? kG615SpanRejFog
+                                                                 : kG615SpanRejOther]
+                .fetch_add(1u, std::memory_order_relaxed);
+            g615Report();
+        }
         if (!g530Handled)
         for (int y = drawY0; y <= drawY1; ++y)
         {
@@ -1358,6 +1778,14 @@ void GSRasterizer::drawSprite(GS *gs)
     }
     else
     {
+        // ⛔⛔ G615 — THE CENSUS DEFECT THAT CREATED "TARGET K". drawSprite's ONLY `markLoop()` sits
+        // inside the `if (gs->m_prim.tme)` arm above, so before this line every UNTEXTURED sprite
+        // booked its whole fill loop into the PROLOGUE column of the `sprite` leaf. That is the
+        // entire content of `[G605:leaf] disp sprite pro% = 38.8 / 50.79 us/call` (G613 §5a), which
+        // ROADMAP then named as a per-DRAW prologue to decompose. It is a *second population*.
+        // Split it into its own leaf and mark its loop, so both columns mean what they say.
+        g605cyc.setLeaf(kG605LeafSpriteUntex);
+        g605cyc.markLoop();
         // G364: untextured sprite — flat colour, so fog once up front.
         uint8_t ur = r, ug = g, ub = b;
         if (gs->m_prim.fge && g364FogEnabled())
@@ -1371,6 +1799,26 @@ void GSRasterizer::drawSprite(GS *gs)
         const bool g588Layout = gs->m_vram != nullptr && ctx.frame.psm == GS_PSM_CT32 &&
                                 ctx.frame.fbmsk == 0u;
         const bool g588State = !gs->m_prim.abe && !sZActive && !sZWrite;
+        // ⛔⛔ G615: THE HYPOTHESIS THIS CENSUS REFUTED. `[G588:solid] draws=0` on `dungeon1` while
+        // 13.9% of the route's replay (19,352 draws, 59.5 M px at 312.8 cyc/inside) walks the
+        // generic per-pixel nest below to store a flat colour. The G588 reject class printed
+        // `state`, and `state` is the conjunction of THREE terms — so the phase assumed the depth
+        // terms and built a private-Z admission for it. Splitting the reason by conjunct says
+        // otherwise: **`rej(abe=19352, notpriv=0, ztst=0, nowrite=0)` — every single one is refused
+        // on ALPHA BLENDING**, which is not a depth question and is not a constant store either.
+        // The lever that population needs is an exact blended constant-source fill. Named, not built.
+        // ⭐⭐ A FIRST FAILING CONJUNCT IS NOT A REASON WHEN THE SITE IS A CONJUNCTION
+        // (`g603_admission_census_names_the_blocker`, applied to a census's own reason column).
+        const bool g615Stat = g615StatOn();
+        if (g615Stat && g588Selected && !g588State)
+        {
+            g_g615SolidRej[gs->m_prim.abe  ? kG615SolidRejAbe
+                           : !g403DisplayZ ? kG615SolidRejNotPriv
+                           : sZtst != 1u   ? kG615SolidRejZtst
+                                           : kG615SolidRejNoWrite]
+                .fetch_add(1u, std::memory_order_relaxed);
+            g615Report();
+        }
         // `writeDepth` is not a pixel-side requirement here: g588State already proves
         // sZWrite=false, so the generic spriteZStore call is a no-op regardless of AFAIL's depth
         // permission. Requiring !writeDepth rejected every ordinary alpha-test-disabled sprite.
@@ -1511,6 +1959,265 @@ void GSRasterizer::drawSprite(GS *gs)
             else if (!g588State) g_g588RejState.fetch_add(1u, std::memory_order_relaxed);
             else g_g588RejAlpha.fetch_add(1u, std::memory_order_relaxed);
             g588SolidSpriteReport();
+        }
+
+        // ================== ⭐⭐⭐ G617 (a): THE EXACT BLENDED UNTEXTURED FILL ==================
+        // 19,352 draws / 59,533,088 px / 323.8 cyc/inside on `dungeon1` — 25.2% of the route's whole
+        // CPU band replay — for a loop whose only per-pixel input is the DESTINATION word, and only
+        // when the blend actually reads it. G588 refuses all of them on `!abe`; the shape census,
+        // once it could see `tme`, showed HALF of them (`alpha=0x2a`, A=B=C=2 D=0) carry a blend
+        // that is algebraically `Cs`. Full rationale + the exactness argument: g617_sprite_fill.inc.
+        //
+        // ⛔⛔ The arm (`g617FillArm`) is read at drawSprite ENTRY, before the `tme` split — reading
+        // it here, at the top of the UNTEXTURED branch, still samples it on the lever's own
+        // schedule, which is what broke the first gate. See the note at the entry.
+        const bool g617Stat = g617StatOn();
+        const bool g617Vfy = g617VerifyOn();
+        {
+            // Every conjunct is a per-DRAW constant. `g588Quiet` is exactly the right predicate:
+            // it is the AND of every per-pixel diagnostic the generic nest can service and a
+            // specialized commit cannot (`g530Quiet` + no G530 probe armed).
+            const bool fillLayout = gs->m_vram != nullptr && ctx.frame.psm == GS_PSM_CT32;
+            // ⭐⭐⭐ THE DEPTH ARM — AND WHY THIS PHASE IS ALLOWED TO BUILD ONE WHEN G615 WAS NOT.
+            //
+            // G615 refused to wire in its private-Z row accessor and said exactly what would
+            // license it: "`zRd`/`zSt` going non-zero is the signal that the retained accessor in
+            // `g615_privz_row.inc` is finally worth wiring in." Revision 1 of THIS kernel shipped
+            // with G615's no-op-only rule (`!sZActive && !sZWrite`) and its census fired that
+            // signal on the first run: **`[G617:fill] rej(z=18176)` of ~19,352 draws** — 94% of
+            // Target N BY DRAW writes depth, and every one is a private-mirror (`prz=1`) draw.
+            // Those refused draws are shape rows #01/#02, which are also the ones carrying
+            // `ALPHA=0x2a` — the identity blend whose committed word is a draw CONSTANT. So the
+            // depth arm is not an unexercised path bought on faith: it is the precondition for the
+            // constant-word group store, and `[G617:fill] const(draws=0 px=0)` in revision 1 is the
+            // measurement proving the group store was otherwise DEAD CODE on this route.
+            //
+            // Admission covers the two shapes whose depth work needs no READ:
+            //   * the proven no-op        (`!sZActive && !sZWrite`), G615's subset; and
+            //   * ZTST=ALWAYS + a write   — the test passes every pixel without reading `zdst`
+            //     (`spriteZPass`'s `case 1: return true`), so only the STORE remains, and it is
+            //     admitted only when the destination is the private MIRROR, whose accessor is
+            //     exact and already written.
+            // ⛔ A guest-VRAM Z write (GSMem::WriteZ16/24/32) is refused: that is a different
+            // address space and would be a second unexercised arm.
+            const bool fillZNoop = !sZActive && !sZWrite;
+            const bool fillZMirrorWrite = sZtst == 1u && sZWrite && g403DisplayZ;
+            const bool fillZOk = fillZNoop || fillZMirrorWrite;
+            // The alpha test's only pixel-varying input is `a`, which is FLAT for an untextured
+            // sprite, so `g588Alpha` (already classified above) is the whole draw's verdict.
+            const bool fillAlpha = g588Alpha.writeFramebuffer;
+            const bool fillSelected = g617FillArm && t_g144InReplay;
+            const bool fillExact =
+                fillSelected && g588Quiet && fillLayout && fillZOk && fillAlpha;
+            if (g617Stat && fillSelected && !fillExact)
+            {
+                g_g617FillRej[!g588Quiet    ? kG617FillRejQuiet
+                              : !fillLayout ? kG617FillRejLayout
+                              : !fillZOk    ? kG617FillRejZ
+                                            : kG617FillRejAlpha]
+                    .fetch_add(1u, std::memory_order_relaxed);
+                g617Report();
+            }
+            if (fillExact && drawX1 >= drawX0 && drawY1 >= drawY0)
+            {
+                // --- per DRAW: the blend classification, the committed colour, the address base ---
+                const G617Blend g617Bl =
+                    g617ClassifyBlend(ctx.alpha, gs->m_prim.abe != 0u, gs->m_pabe != 0u, a);
+                const bool g617PreserveA = g588Alpha.preserveDestinationAlpha;
+                const uint32_t g617Mask = ctx.frame.fbmsk;
+                const bool g617Fba = ((ctx.fba & 0x1ull) != 0ull) && ctx.frame.psm != GS_PSM_CT24;
+                // The destination word is needed per pixel only when the blend reads it, when the
+                // fbmsk merges it, or when AFAIL=RGB_ONLY preserves its alpha.
+                const bool g617NeedDst =
+                    !g617Bl.destIndependent || g617Mask != 0u || g617PreserveA;
+                uint8_t g617A = a;
+                if (!g617PreserveA && g617Fba)
+                    g617A = static_cast<uint8_t>(g617A | 0x80u);
+                // The dest-independent colour, computed ONCE. For a dest-reading blend this is the
+                // unblended source and the loop recomputes the channels per pixel.
+                uint8_t g617R = ur, g617G = ug, g617B = ub;
+                if (g617Bl.destIndependent)
+                    g617BlendRgb(g617Bl, a, 0u, 0u, 0u, 0u, g617R, g617G, g617B);
+                const uint32_t g617Const = static_cast<uint32_t>(g617R) |
+                                           (static_cast<uint32_t>(g617G) << 8u) |
+                                           (static_cast<uint32_t>(g617B) << 16u) |
+                                           (static_cast<uint32_t>(g617A) << 24u);
+                const uint64_t g617ConstPair = static_cast<uint64_t>(g617Const) |
+                                               (static_cast<uint64_t>(g617Const) << 32u);
+                const uint32_t g617Block = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
+                const uint32_t g617Fbw = (ctx.frame.fbw != 0u) ? ctx.frame.fbw : 1u;
+                uint64_t g617Px = 0u;
+                // ⭐ The private-mirror depth store, hoisted. `g615ZBase()` calls the
+                // function-local-`static` `std::vector` accessor ONCE PER DRAW instead of once per
+                // pixel access, and `g615ZRowFor` resolves the `y` half of
+                // `g403DisplayZWrite`'s bounds predicate once per ROW — leaving `row.p != nullptr`
+                // to carry `0 <= y < 512` and the `x` compare unchanged. Exact, statement for
+                // statement, against the shipped writer (which ignores its `fbp` argument).
+                // ⚠️ `writeDepth` is the ALPHA TEST's depth permission and it is a draw constant
+                // here for the same reason `writeFramebuffer` is: `a` is flat.
+                const bool g617ZWrite = fillZMirrorWrite && g588Alpha.writeDepth;
+                uint32_t *const g617ZBasePtr = g617ZWrite ? g615ZBase() : nullptr;
+
+                // `writePixel`'s 32-bit tail for ONE pixel whose source colour is a draw constant.
+                // `existing` is loaded once and reused for the blend, the fbmsk merge and the AFAIL
+                // alpha preserve — `writePixel` re-loads it for each, with no store in between, so
+                // one load is the same value three times.
+                // ⚠️ It COMPUTES the word and returns it; under the oracle it must not STORE, because
+                // the proven path has to be the one that writes (`g513_oracle_compares_decisions`).
+                const auto g617Word = [&](uint32_t off) -> uint32_t {
+                    uint32_t pixel = g617Const;
+                    if (g617NeedDst)
+                    {
+                        uint32_t existing = 0u;
+                        std::memcpy(&existing, gs->m_vram + off, 4);
+                        uint8_t rr = ur, gg = ug, bb = ub;
+                        if (!g617Bl.destIndependent)
+                            g617BlendRgb(g617Bl, a,
+                                         static_cast<uint8_t>(existing & 0xFFu),
+                                         static_cast<uint8_t>((existing >> 8) & 0xFFu),
+                                         static_cast<uint8_t>((existing >> 16) & 0xFFu),
+                                         static_cast<uint8_t>((existing >> 24) & 0xFFu),
+                                         rr, gg, bb);
+                        else
+                        {
+                            rr = g617R; gg = g617G; bb = g617B;
+                        }
+                        pixel = static_cast<uint32_t>(rr) | (static_cast<uint32_t>(gg) << 8u) |
+                                (static_cast<uint32_t>(bb) << 16u) |
+                                (static_cast<uint32_t>(g617A) << 24u);
+                        if (g617Mask != 0u)
+                            pixel = (pixel & ~g617Mask) | (existing & g617Mask);
+                        if (g617PreserveA)
+                            pixel = (pixel & 0x00FFFFFFu) | (existing & 0xFF000000u);
+                    }
+                    return pixel;
+                };
+
+                for (int y = drawY0; y <= drawY1; ++y)
+                {
+                    const G530RowAddr row =
+                        g530RowAddr(g617Block, g617Fbw, static_cast<uint32_t>(y));
+                    // The depth store is a CONSTANT over the whole rect (`sZi` is the flat sprite
+                    // Z), the test is ALWAYS so every pixel reaches it, and the mirror row is
+                    // linear — so the per-pixel `g615ZStore` loop collapses to one run per row.
+                    // Each pixel is still written exactly once with exactly the same value.
+                    const G615ZRow zrow =
+                        g617ZWrite ? g615ZRowFor(g617ZBasePtr, y) : G615ZRow{nullptr};
+                    const int zx0 = (drawX0 > 0) ? drawX0 : 0;
+                    const int zx1 = (drawX1 < static_cast<int>(kG403DisplayZW) - 1)
+                                        ? drawX1
+                                        : static_cast<int>(kG403DisplayZW) - 1;
+                    if (zrow.p != nullptr)
+                        for (int zx = zx0; zx <= zx1; ++zx)
+                            zrow.p[static_cast<size_t>(zx)] = sZi;
+                    int x = drawX0;
+                    const auto one = [&](int sx) {
+                        const uint32_t ux = static_cast<uint32_t>(sx);
+                        const uint32_t off = g530GroupBase(row, ux) +
+                                             static_cast<uint32_t>(row.ct[ux & 0x7u]) * 4u;
+                        if (off + 4u > gs->m_vramSize)
+                            return;
+                        const uint32_t want = g617Word(off);
+                        if (g617Vfy)
+                        {
+                            // ⭐⭐ THE DEPTH ARM'S ORACLE IS A SET EQUALITY, NOT A VALUE COMPARE.
+                            // Both paths store the same constant `sZi`, so comparing the stored
+                            // WORD proves nothing — a row fill that covered the wrong pixels would
+                            // pass it. What has to hold is that the run this kernel writes is
+                            // exactly the set of pixels the shipped `spriteZStore` would write:
+                            // `sZWrite` AND inside the mirror's 512x512 bounds, gated by the alpha
+                            // test's depth permission.
+                            const bool wantZ = sZWrite && g588Alpha.writeDepth &&
+                                               sx >= 0 && y >= 0 &&
+                                               sx < static_cast<int>(kG403DisplayZW) &&
+                                               y < static_cast<int>(kG403DisplayZH);
+                            const bool didZ =
+                                (zrow.p != nullptr) && sx >= zx0 && sx <= zx1;
+                            if (wantZ != didZ)
+                            {
+                                const uint64_t bad =
+                                    g_g617FillZBad.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                                if (bad <= 16u)
+                                    std::fprintf(stderr,
+                                        "[G617:vfy] FILL ZSET MISMATCH xy=(%d,%d) want=%u did=%u "
+                                        "ztst=%u zwr=%u prz=%u\n",
+                                        sx, y, wantZ ? 1u : 0u, didZ ? 1u : 0u, sZtst,
+                                        sZWrite ? 1u : 0u, g403DisplayZ ? 1u : 0u);
+                            }
+                            // ORACLE: the PROVEN path performs the store; the kernel's word is
+                            // compared against what it actually wrote, so a kernel defect can never
+                            // author a pixel while the oracle is on.
+                            writePixel(gs, sx, y, ur, ug, ub, a);
+                            uint32_t after = 0u;
+                            std::memcpy(&after, gs->m_vram + off, 4);
+                            if (after != want)
+                            {
+                                const uint64_t bad =
+                                    g_g617FillBad.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                                if (bad <= 16u)
+                                    std::fprintf(stderr,
+                                        "[G617:vfy] FILL MISMATCH xy=(%d,%d) off=0x%x ref=%08x "
+                                        "fast=%08x fbp=0x%x alpha=%llx mask=%08x\n",
+                                        sx, y, off, after, want, ctx.frame.fbp,
+                                        static_cast<unsigned long long>(ctx.alpha), g617Mask);
+                            }
+                        }
+                        else
+                        {
+                            std::memcpy(gs->m_vram + off, &want, 4);
+                        }
+                        ++g617Px;
+                    };
+                    // ⭐ The constant-word case is G588's promoted commit: every columnTable32 row
+                    // is four ADJACENT word pairs, so a full aligned 8-pixel group is four 8-byte
+                    // stores instead of eight 4-byte stores and eight address/branch iterations.
+                    // Byte-for-byte the same little-endian commit (the pair is two identical words).
+                    if (!g617NeedDst && !g617Vfy && g617ColumnPairsAdjacent())
+                    {
+                        while (x <= drawX1 && (x & 7) != 0)
+                        {
+                            one(x);
+                            ++x;
+                        }
+                        for (; x + 7 <= drawX1; x += 8)
+                        {
+                            const uint32_t base =
+                                g530GroupBase(row, static_cast<uint32_t>(x));
+                            for (unsigned p = 0; p < 4u; ++p)
+                            {
+                                const uint32_t off =
+                                    base + static_cast<uint32_t>(row.ct[p * 2u]) * 4u;
+                                if (off + 8u <= gs->m_vramSize)
+                                {
+                                    std::memcpy(gs->m_vram + off, &g617ConstPair, 8);
+                                    g617Px += 2u;
+                                }
+                                else if (off + 4u <= gs->m_vramSize)
+                                {
+                                    std::memcpy(gs->m_vram + off, &g617Const, 4);
+                                    ++g617Px;
+                                }
+                            }
+                        }
+                    }
+                    for (; x <= drawX1; ++x)
+                        one(x);
+                }
+                if (g617Stat)
+                {
+                    g_g617FillDraws.fetch_add(1u, std::memory_order_relaxed);
+                    g_g617FillPx.fetch_add(g617Px, std::memory_order_relaxed);
+                    if (!g617NeedDst)
+                    {
+                        g_g617FillConstDraws.fetch_add(1u, std::memory_order_relaxed);
+                        g_g617FillConstPx.fetch_add(g617Px, std::memory_order_relaxed);
+                    }
+                    if (g617ZWrite)
+                        g_g617FillZDraws.fetch_add(1u, std::memory_order_relaxed);
+                    g617Report();
+                }
+                return;
+            }
         }
         for (int y = drawY0; y <= drawY1; ++y)
             for (int x = drawX0; x <= drawX1; ++x)

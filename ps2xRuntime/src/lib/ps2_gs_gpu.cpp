@@ -31,8 +31,10 @@ int g596CopyArm();
 // deswizzle read, so every visible pixel is in m_vram at that instant; hashing all 512 pages and
 // diffing two arms localizes a visual defect to its pages without a hypothesis. `g_dc2ScriptFrame`
 // is defined in ps2_memory.cpp and declared HERE, above every anonymous namespace, or it would bind
-// to an internal-linkage symbol and fail to link (the appendix's anon-namespace trap). revision: 1
+// G616: RTSS presentation synchronization support (force recompile v1).
 #include <atomic>
+#include <condition_variable>
+#include <chrono>
 extern std::atomic<uint32_t> g_dc2ScriptFrame;
 // G602: Layer-4 (GIF decode) hot-path SHAPE. Every default-off diagnostic that used to sit inline in
 // processGIFPacket / writeRegisterPacked / writeRegister / vertexKick now lives behind a
