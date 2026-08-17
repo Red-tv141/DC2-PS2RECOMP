@@ -452,10 +452,46 @@ extern int g532FlagHeadArm();
 #define DC2_G502_SPLIT_PROBE 0
 #endif
 
+// G610: the three stage-deletion ceiling instantiations of the block leaf.
+//
+// ⛔⛔ COMPILED OUT, AND THE PROBE IS STRUCTURALLY INVALID — not merely spent. Deleting a slot from
+// an interpreter pair changes the microprogram's own trip counts, because the deleted slot writes
+// its loop induction variables: the no-lower arm took `[G483:runprof] pairs/call` from **1379 to
+// 61242** and the no-both arm deadlocked the two worker threads (`gsStallMs/f = 682.2` of a 693.4
+// "busy"). It is kept in source as the RECORD of that finding and must never be quoted as a price.
+// Compiling it out also removes its three tests from `run()`'s hook, and `run()`'s text is a shared
+// resource (G490 §5 measured 6,196 B of never-selected copy at 1.35 ms/f).
+#ifndef DC2_G610_CEIL_ARMS
+#define DC2_G610_CEIL_ARMS 0
+#endif
+
 namespace
 {
+    // G610: `DC2_G610_CEIL` = 1 (no lower) / 2 (no upper) / 3 (neither). Read ONCE, at the first
+    // call, and held for the process — it selects a whole leaf copy, never a per-pair test.
+    int g610CeilMode()
+    {
+#if DC2_G610_CEIL_ARMS
+        static const int s_mode = [] {
+            const char *v = std::getenv("DC2_G610_CEIL");
+            if (v == nullptr || v[0] < '1' || v[0] > '3')
+                return 0;
+            return static_cast<int>(v[0] - '0');
+        }();
+        return s_mode;
+#else
+        return 0;
+#endif
+    }
+
     // Minimum run length worth the call boundary. 2 mirrors G475 so the two are comparable.
     constexpr uint32_t G490_MIN_RUN = 2u;
+#if DC2_G610_JIT_BACKEND
+    // G610: defined below, beside the compiled-block entry; called from the END of
+    // g490RebuildRunLengths() so a compiled body is discarded and re-emitted by the SAME event that
+    // rewrites the pair it was compiled from.
+    void g610CompileAll(uint32_t dataSize);
+#endif
     // G531 reuses the existing one-byte branch-tail sidecar instead of growing the hot
     // thread_local compiled cache. Values 0/1/2 retain their G500 meaning; 3 is one compiled
     // flag-consumer pair. Control arms sanitize 3 back to zero before entering a block.
@@ -1381,6 +1417,19 @@ namespace
             }
         }
         g547RefreshSignatures();
+#if DC2_G610_JIT_BACKEND
+        // G610: LAST in this pass, so the translator reads the run lengths, the G516 sidecars and
+        // the fused records this pass has just rewritten — never a mixture. VU1 data RAM is a fixed
+        // 16 KB (`PS2Memory` allocates exactly PS2_VU1_DATA_SIZE), and the compiled-block entry
+        // re-checks the caller's `dataSize` against the value baked here before executing anything.
+        g610CompileAll(PS2_VU1_DATA_SIZE);
+#if DC2_G612_REGION_BACKEND
+        // G612: LAST of all, so the CFG walk reads the run lengths, the G500 tail codes and the
+        // fused records this pass has just rewritten — never a mixture, and never a state G610's
+        // own pass could still be changing.
+        g612CompileAll(PS2_VU1_DATA_SIZE, PS2_VU1_CODE_SIZE);
+#endif
+#endif
     }
 
     // ---------------------------------------------------------------------------------------
@@ -2281,7 +2330,13 @@ namespace
               bool G516Verify = false, bool G516Peel4 = false, bool G517PtrInd = false,
               bool G517StampInd = false, bool G517Verify = false,
               bool G531FlagTail = false, bool G531Verify = false,
-              bool G532FlagHead = false, bool G532Verify = false>
+              bool G532FlagHead = false, bool G532Verify = false,
+              // G610 CEILING PROBE. 0 = the shipped body, byte-identical (every guard below folds
+              // to `true` and emits nothing). 1 = delete the LOWER slot, 2 = delete the UPPER slot
+              // (and with it the G430 history push), 3 = delete BOTH, leaving only the loop, the
+              // fused fetch, the Q/P segmentation and the G425 zero re-pin. Renders GARBAGE — it
+              // exists only to bound what a compiled backend could recover. Never shipped ON.
+              int G610Ceil = 0>
     void g490BlockBody(VU1State &st, uint32_t firstIndex, uint32_t count,
                               uint8_t *vuData, uint32_t dataSize,
                               int *qDelay, int *pDelay,
@@ -2590,7 +2645,11 @@ namespace
 #endif
                     g516CheckLow(g516LowBase[firstIndex + j], fp.pair);
             }
-            if constexpr (G516Up)
+            if constexpr (G610Ceil == 2 || G610Ceil == 3)
+            {
+                // G610 ceiling: the UPPER slot and its G430 history push are deleted.
+            }
+            else if constexpr (G516Up)
             {
                 // ONE 32-bit load whose address is the PAIR INDEX. `cls == 0` is `upperKind ==
                 // 0x6f` for a block-eligible pair (eligibility admits VNOP or `cls != 0`, and
@@ -2624,7 +2683,11 @@ namespace
                                                    g504Slot);
 #endif
 
-            if constexpr (G499FastLower)
+            if constexpr (G610Ceil == 1 || G610Ceil == 3)
+            {
+                // G610 ceiling: the LOWER slot is deleted.
+            }
+            else if constexpr (G499FastLower)
             {
                 // G480: g422FastLower's NOP case is exactly `return;` — do not call it.
                 // G481: the three block-eligible hot integer kinds run inline; no call at all.
@@ -3484,6 +3547,609 @@ namespace
                       false, true, false, true, false, false, false, true, true>(
             st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCode);
     }
+
+    // =========================================================================================
+    // G610 — THE COMPILED-BLOCK ENTRY.
+    //
+    // Lives here, beside `g490ExecuteBlock`, because the oracle has to be able to call the shipped
+    // GENERIC executor; the encoder and translator live in vu1_g610_native_jit.inc, which is
+    // included earlier (it needs only the G410 cache and the G421 descriptor table).
+    //
+    // EVERYTHING IN THIS FUNCTION IS PER BLOCK, NEVER PER PAIR. It is `noinline` for the same
+    // reason every other block entry is (G481's inline-budget cliff binds `run()`'s text), and the
+    // hook only calls it when the slot ALREADY holds a compiled body — so the fallback population
+    // pays one array load and one test, not a call.
+    //
+    // Preconditions 2 and 3 of the header are enforced here:
+    //   * `tailCode != 0` -> the generic body owns branch and flag-consumer tails (tested by the
+    //     caller, which has `g500Tail` live).
+    //   * a Q/P segment split inside the block -> `st.q`/`st.p` would be republished mid-block and
+    //     the compiled body has them baked as "constant across the block". Tested BEFORE anything
+    //     is mutated, so a refusal leaves the caller's state exactly as it found it.
+    // =========================================================================================
+#if DC2_G610_JIT_BACKEND
+    // The Q/P segment arithmetic of `g490BlockBody`'s G506QpSeg arm, folded to `j == 0` and
+    // `g506Run == count`.
+    //
+    // ⭐ AN UNOBSERVED PUBLICATION DOES NOT NEED A SEGMENT. The first revision refused any block in
+    // which either counter would publish mid-block, and the census read `fbSeg = 2,402,989` against
+    // 5.26 M native blocks — 31% of every block entry, thrown away. But the publication is only
+    // OBSERVABLE if a pair between the block entry and the publishing pair reads the register, and:
+    //
+    //   * `st.p` is read by NOTHING G490 can admit — MFP decodes to `G422_LK_NONE`, so a pair that
+    //     reads P is never block-eligible in the first place. P's timing is never observable.
+    //   * `st.q` is read only by an upper with descriptor `src == 1` (MULq/ADDq/MADDq/SUBq/MSUBq/
+    //     MULAq/...). The translator records whether ANY pair of the block is one, once, at
+    //     translation time (`readsQ`).
+    //
+    // When the publication is unobservable, publishing it AT ENTRY leaves exactly the state the
+    // segmented generic loop leaves: `st.q = s_vuQPending` and the counter at 0 (once a counter
+    // reaches 0 the generic loop's `if (qd > 1) qd -= run` never touches it again). So the only
+    // remaining refusal is a mid-block Q publication in a block that actually reads Q.
+    // ⭐⭐ G611 REFINES THE OBSERVABILITY TEST FROM "DOES THIS BLOCK READ Q" TO "DOES IT READ Q
+    // BEFORE THE PUBLICATION". A counter holding v publishes BEFORE pair v-1, so pairs 0..v-2 see
+    // the OLD q and pairs v-1..count-1 see the new one. Publishing at ENTRY is therefore exact
+    // whenever no pair in [0, v-2] reads Q — which `qMask` (bit j = pair j reads Q, indices >= 63
+    // folded into bit 63) answers with one AND. G610 refused on `readsQ` alone, i.e. on the
+    // existence of a reader anywhere in the block, including readers AFTER the publication that see
+    // exactly the right value either way.
+    //
+    // Returns 0 = single segment, state updated; 1 = genuinely observable, state UNTOUCHED and the
+    // caller may split at `*splitN1 = v - 1`; the caller falls back if it cannot.
+    static DC2_G330_FORCEINLINE int g610QpSingleSegment(VU1State &st, uint32_t count,
+                                                        int *qDelay, int *pDelay, bool readsQ,
+                                                        uint64_t qMask, uint32_t *splitN1)
+    {
+        int qd = *qDelay;
+        int pd = *pDelay;
+        // A counter holding v publishes BEFORE pair v-1; `v-1 < count` means that pair is inside.
+        const bool qIn = (qd > 1 && (uint32_t)(qd - 1) < count);
+        const bool pIn = (pd > 1 && (uint32_t)(pd - 1) < count);
+        if (qIn && readsQ)
+        {
+            const uint32_t n1 = (uint32_t)(qd - 1);
+            const uint64_t prefix = (n1 >= 64u) ? ~0ull : ((1ull << n1) - 1ull);
+            if ((qMask & prefix) != 0ull)
+            {
+                *splitN1 = n1;
+                return 1;                     // genuinely observable
+            }
+        }
+        if (qd == 1) { qd = 0; st.q = s_vuQPending; }
+        if (pd == 1) { pd = 0; st.p = s_vuPPending; }
+        if (qIn)      { qd = 0; st.q = s_vuQPending; }
+        else if (qd > 1) qd -= (int)count;
+        if (pIn)      { pd = 0; st.p = s_vuPPending; }
+        else if (pd > 1) pd -= (int)count;
+        *qDelay = qd;
+        *pDelay = pd;
+        return 0;
+    }
+
+    // G611 — the Q-OBSERVABLE SPLIT. When a publication really is observed inside the block, the
+    // block is executed as TWO compiled sub-bodies with the publication between them, which is
+    // exactly what the segmented generic loop does — only compiled.
+    //
+    // Both sub-bodies are acquired BEFORE any state is mutated, and the acquisition passes
+    // `allowReset = false` so a translation triggered here can never unbind the very slot the
+    // caller is standing on.
+    static bool g611AcquireSplit(uint32_t firstIndex, uint32_t count, uint32_t n1,
+                                 uint32_t dataSize, G610SlotRec &s)
+    {
+        if (n1 == 0u || n1 >= count)
+            return false;
+        if (s.splitN1 == (uint16_t)n1 && s.splitFn1 != nullptr && s.splitFn2 != nullptr)
+            return true;
+        if (s.splitN1 == (uint16_t)n1)
+            return false;                      // memoised NEGATIVE for this split point
+        const G610CacheEnt *e1 = g610CacheLookup(firstIndex, n1, dataSize, false);
+        const G610CacheEnt *e2 = g610CacheLookup(firstIndex + n1, count - n1, dataSize, false);
+        s.splitN1 = (uint16_t)n1;
+        s.splitFn1 = (e1 != nullptr) ? e1->fn : nullptr;
+        s.splitFn2 = (e2 != nullptr) ? e2->fn : nullptr;
+        return s.splitFn1 != nullptr && s.splitFn2 != nullptr;
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    bool g610RunNativeBlock(VU1State &st, uint32_t firstIndex, uint32_t count,
+                            uint8_t *vuData, uint32_t dataSize,
+                            int *qDelay, int *pDelay, int64_t stampBase, G430HistBlock *hb,
+                            bool g611QSplit)
+    {
+        G610SlotRec &s = s_g610.slot[firstIndex];
+        // The body was emitted for one exact pair count. The hook usually asks for exactly that
+        // (`g490Count == g490Avail`), but a cycle-budget clamp can shorten a block, and a body that
+        // executes 8 pairs must never be asked for 5.
+        if (s.count != (uint16_t)count)
+        {
+            ++s_g610FbCount;
+            return false;
+        }
+        // The baked `& (dataSize - 1)` address masks belong to one VU RAM size.
+        if (dataSize != s_g610.dataSize)
+        {
+            ++s_g610FbNone;
+            return false;
+        }
+
+        const bool verify = g610VerifyOn();
+        if (verify)
+        {
+            s_g610SnapPre.st = st;
+            s_g610SnapPre.hb = *hb;
+            s_g610SnapPre.qd = *qDelay;
+            s_g610SnapPre.pd = *pDelay;
+            s_g610SnapPre.ram.assign(vuData, vuData + dataSize);
+        }
+
+        uint32_t g611N1 = 0u;
+        bool g611Split = false;
+        if (g610QpSingleSegment(st, count, qDelay, pDelay, s.readsQ != 0u, s.qMask, &g611N1) != 0)
+        {
+            // The publication is genuinely observed inside this block. G611 splits it in two;
+            // G610's behaviour (and the `vuqsplit` control arm) is to hand it to the generic body.
+            if (!g611QSplit || !g611AcquireSplit(firstIndex, count, g611N1, dataSize, s))
+            {
+                ++s_g610FbSeg;
+                s_g610FbSegPairs += count;
+                if (g611QSplit)
+                    ++s_g611SplitFail;
+                return false;
+            }
+            g611Split = true;
+            // Everything the single-segment path would have done EXCEPT the Q publication, which
+            // now happens between the two sub-bodies. P is never read by anything G490 admits, so
+            // its publication stays at entry (G610 §3.6).
+            int pd = *pDelay;
+            const bool pIn = (pd > 1 && (uint32_t)(pd - 1) < count);
+            if (pd == 1) { pd = 0; st.p = s_vuPPending; }
+            if (pIn)      { pd = 0; st.p = s_vuPPending; }
+            else if (pd > 1) pd -= (int)count;
+            *pDelay = pd;
+        }
+
+        if (g611Split)
+        {
+            s.splitFn1(&st, vuData, stampBase, hb);
+            st.q = s_vuQPending;
+            *qDelay = 0;
+            s.splitFn2(&st, vuData, stampBase + (int64_t)g611N1, hb);
+            ++s_g611SplitBlocks;
+            s_g611SplitPairs += count;
+        }
+        else
+        {
+            s.fn(&st, vuData, stampBase, hb);
+        }
+        if (verify)
+        {
+            s_g610SnapJit.st = st;
+            s_g610SnapJit.hb = *hb;
+            s_g610SnapJit.qd = *qDelay;
+            s_g610SnapJit.pd = *pDelay;
+            s_g610SnapJit.ram.assign(vuData, vuData + dataSize);
+
+            // Restore the true pre-state and run the AUTHORITATIVE shipped generic executor.
+            st = s_g610SnapPre.st;
+            *hb = s_g610SnapPre.hb;
+            *qDelay = s_g610SnapPre.qd;
+            *pDelay = s_g610SnapPre.pd;
+            std::memcpy(vuData, s_g610SnapPre.ram.data(), dataSize);
+            g531ExecuteBlockTailFlag(st, firstIndex, count, vuData, dataSize, qDelay, pDelay,
+                                     stampBase, hb, 0u);
+
+            const char *what = "?";
+            long at = -1;
+            if (!g610StatesEqual(s_g610SnapJit.st, st, s_g610SnapJit.hb, *hb,
+                                 s_g610SnapJit.ram.data(), vuData, dataSize, &what, &at))
+            {
+                // G611: print the two values side by side before aborting. `hist.vec` is the one
+                // field where "wrong" has several possible mechanisms (a wrong result, a wrong ring
+                // slot, or G546's canonicalisation of the masked-off lanes), and the RAW BITS
+                // separate them at a glance.
+                if (at >= 0 && at < G430_HIST &&
+                    (std::strcmp(what, "hist.vec") == 0))
+                    std::fprintf(stderr,
+                                 "[G610:verify-BAD] hist.vec[%ld] jit=%08x %08x %08x %08x "
+                                 "gen=%08x %08x %08x %08x dest=%u kind=%u head jit=%d gen=%d\n",
+                                 at,
+                                 *(const uint32_t *)&s_g610SnapJit.hb.vec[at][0],
+                                 *(const uint32_t *)&s_g610SnapJit.hb.vec[at][1],
+                                 *(const uint32_t *)&s_g610SnapJit.hb.vec[at][2],
+                                 *(const uint32_t *)&s_g610SnapJit.hb.vec[at][3],
+                                 *(const uint32_t *)&hb->vec[at][0],
+                                 *(const uint32_t *)&hb->vec[at][1],
+                                 *(const uint32_t *)&hb->vec[at][2],
+                                 *(const uint32_t *)&hb->vec[at][3],
+                                 (unsigned)hb->dest[at], (unsigned)hb->kind[at],
+                                 (int)s_g610SnapJit.hb.head, (int)hb->head);
+                g610VerifyFail(what, firstIndex, count, at);
+            }
+            if (s_g610SnapJit.qd != *qDelay || s_g610SnapJit.pd != *pDelay)
+                g610VerifyFail("qpDelay", firstIndex, count, -1);
+            g610VerifyPass();
+        }
+
+        ++s_g610Blocks;
+        s_g610Pairs += count;
+        if (g610StatOn())
+        {
+            // G611's coverage census rides the ONE `g610StatOn()` read this function already made,
+            // so a stat-off run pays exactly what G610 shipped.
+            if (s.g611 != 0u)
+            {
+                ++s_g611OpsBlocks;
+                s_g611OpsPairs += count;
+            }
+            if ((s_g610Blocks & 0x3FFFFFull) == 0ull)
+                g610Report();
+        }
+        return true;
+    }
+
+#if DC2_G612_REGION_BACKEND
+    // ===========================================================================================
+    // G612 — THE REGION ENTRY, ITS ORACLE, AND THE TWO CONSTANTS THE TRANSLATOR MIRRORS
+    // ===========================================================================================
+    //
+    // `vu1_g612_native_region.inc` is included BEFORE this file (it needs G610's emitter, which is
+    // included before it), so it cannot see `G490_MIN_RUN` or `G531_FLAG_TAIL`. It re-declares both
+    // and they are tied together HERE, beside the definitions, so a change to either is a build
+    // error rather than a silently divergent admission rule.
+    static_assert(G612_MIN_ENTRY == G490_MIN_RUN, "G612: entry threshold must track G490_MIN_RUN");
+    static_assert(G612_FLAG_TAIL == G531_FLAG_TAIL, "G612: flag-tail code must track G531");
+
+    // -------------------------------------------------------------------------------------------
+    // THE ORACLE'S REFERENCE STEPPER (DC2_G612_VERIFY=1).
+    //
+    // ⭐ WHAT MAKES THIS AN ORACLE AND NOT A SECOND IMPLEMENTATION. It executes pairs ONLY through
+    // `g531ExecuteBlockTailFlag` — the shipped generic block body, the same one G610's oracle
+    // treats as authoritative — and it derives its own control flow from the shipped sidecars
+    // (`g490RunLen`, `g502TailAt`) plus the pair loop's own branch protocol, copied statement for
+    // statement from the hook in vu1_g435_pair_loop.inc. It never reads the region's CFG. So a
+    // region that mis-computes a branch condition, mis-orders a delay slot, links a back-edge to
+    // the wrong block, or emits one wrong byte anywhere lands in a different architectural state
+    // than this does, and the whole-state comparison says so.
+    //
+    // It is driven to EXACTLY the pair count the region consumed. That is deliberate: where the
+    // region STOPS is a coverage question (measured by `[G612:exit]`), not a correctness one, and
+    // an oracle that also had to predict the stopping point would have to import the CFG and stop
+    // being independent. What it does check, and what a wrong stop point would break, is that the
+    // resulting `st.pc` agrees — a region that ran the right number of pairs down the wrong path
+    // cannot land on the right pc.
+    // -------------------------------------------------------------------------------------------
+    uint32_t g612RefRun(VU1State &st, uint32_t startSlot, uint8_t *vuData, uint32_t dataSize,
+                        int *qDelay, int *pDelay, int64_t stampBase, G430HistBlock *hb,
+                        uint32_t wantPairs, uint32_t codeSize)
+    {
+        uint32_t pc = startSlot * 8u;
+        uint32_t consumed = 0u;
+        while (consumed < wantPairs)
+        {
+            const uint32_t idx = pc >> 3u;
+            if (idx >= s_g410Cache.g490RunLen.size())
+                break;
+            const uint32_t left = wantPairs - consumed;
+            const uint32_t avail = (uint32_t)s_g410Cache.g490RunLen[idx];
+            uint32_t count = avail < left ? avail : left;
+            uint32_t tail = 0u;
+            uint32_t bpc = 0u;
+            // ⚠️ NO `count >= G490_MIN_RUN` CONJUNCT HERE, and that is not an oversight. The pair
+            // loop's hook needs it because a one-pair block does not pay for its round trip; the
+            // REGION has no round trip to pay for, so it emits a branch after a single plain pair
+            // and after none at all. The first oracle run said so in one line — `pairs jit=22
+            // ref=1 pc=0x1c8`, a slot whose `g490RunLen` is 1 — and a reference that cannot
+            // reproduce the region's own admission rule reports a defect that is entirely its own.
+            // `g531ExecuteBlockTailFlag` instantiates `G506QpSeg = true`, whose segment loop opens
+            // with `if (j >= count) break;`, so `count == 0` with a tail is well-defined.
+            if (count == avail)
+            {
+                uint32_t t = (uint32_t)s_g410Cache.g502TailAt[idx];
+                if (t == G531_FLAG_TAIL)
+                    t = 0u;                       // a region never covers a flag-consumer tail
+                if (t != 0u)
+                {
+                    bpc = pc + 8u * avail;
+                    if (bpc + 8u > codeSize)
+                        t = 0u;
+                    else
+                    {
+                        if (t == 2u && bpc + 16u > codeSize)
+                            t = 1u;
+                        if (avail + t > left)
+                            t = 0u;
+                    }
+                    tail = t;
+                }
+            }
+            if (count == 0u && tail == 0u)
+                break;
+            g531ExecuteBlockTailFlag(st, idx, count, vuData, dataSize, qDelay, pDelay,
+                                     stampBase + (int64_t)consumed, hb, tail);
+            consumed += count + tail;
+            uint32_t next;
+            if (tail == 0u)
+                next = pc + 8u * count;
+            else
+            {
+                const bool taken = (st.pc != bpc);
+                if (tail == 2u)
+                    next = taken ? (st.pc + 8u) : (bpc + 16u);
+                else
+                {
+                    // A `tail == 1` leaves a PENDING branch target, which a region can never do
+                    // (precondition 2). Stop rather than model it.
+                    next = bpc + 8u;
+                    pc = (next >= codeSize) ? 0u : next;
+                    break;
+                }
+            }
+            pc = (next >= codeSize) ? 0u : next;
+        }
+        st.pc = pc;
+        return consumed;
+    }
+
+    thread_local G610Snap s_g612SnapPre, s_g612SnapJit;
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    uint32_t g612RunRegion(VU1State &st, uint32_t firstIndex, uint8_t *vuData, uint32_t dataSize,
+                           uint32_t codeSize, int *qDelay, int *pDelay, int64_t stampBase,
+                           G430HistBlock *hb, uint32_t budget)
+    {
+        const G612SlotRec &s = s_g612.slot[firstIndex];
+        // Precondition 4. The baked `& (dataSize - 1)` address masks and every emitted PC constant
+        // belong to one pair of sizes.
+        if (dataSize != s_g612.dataSize || codeSize != s_g612.codeSize)
+        {
+            ++s_g612SkipSize;
+            return 0u;
+        }
+        // Precondition 6, caller half: the ENTRY block must fit, so a region always makes progress
+        // and the pair loop can never spin on a zero-pair return.
+        if (budget < (uint32_t)s.pairs)
+        {
+            ++s_g612SkipBudget;
+            return 0u;
+        }
+
+        const bool verify = g612VerifyOn();
+        const int qEntry = *qDelay;
+        const int pEntry = *pDelay;
+        if (verify)
+        {
+            s_g612SnapPre.st = st;
+            s_g612SnapPre.hb = *hb;
+            s_g612SnapPre.qd = qEntry;
+            s_g612SnapPre.pd = pEntry;
+            s_g612SnapPre.ram.assign(vuData, vuData + dataSize);
+        }
+
+        const uint32_t n = s.fn(&st, vuData, stampBase, hb, budget);
+        if (n == 0u)
+            return 0u;                            // structurally impossible; fail closed anyway
+
+        // ⭐ THE DEFERRED SCALAR-PIPE PUBLICATION (precondition 3, relaxed exactly as far as it is
+        // provable). The generic per-pair form is `if (d > 0 && --d == 0) publish`, so over `n`
+        // pairs a counter holding `v` publishes iff `v <= n` and otherwise ends at `v - n`. That is
+        // what these two lines compute. Doing it at the EXIT rather than at pair `v` is
+        // unobservable because:
+        //   * NOTHING G490 admits reads `st.p` (MFP decodes to G422_LK_NONE), so P always defers;
+        //   * Q defers only when the region contains no `src == 1` upper anywhere — the caller's
+        //     `readsQ` test, which is G611 §3's prefix argument taken over the whole body.
+        // Nothing a region emits can ARM either counter, so neither can be re-armed in between.
+        int qd = qEntry, pd = pEntry;
+        if (pd > 0)
+        {
+            if ((uint32_t)pd <= n) { pd = 0; st.p = s_vuPPending; }
+            else                    pd -= (int)n;
+            *pDelay = pd;
+        }
+        if (qd > 0)
+        {
+            if ((uint32_t)qd <= n) { qd = 0; st.q = s_vuQPending; }
+            else                    qd -= (int)n;
+            *qDelay = qd;
+        }
+
+        if (verify)
+        {
+            s_g612SnapJit.st = st;
+            s_g612SnapJit.hb = *hb;
+            s_g612SnapJit.qd = qd;
+            s_g612SnapJit.pd = pd;
+            s_g612SnapJit.ram.assign(vuData, vuData + dataSize);
+
+            st = s_g612SnapPre.st;
+            *hb = s_g612SnapPre.hb;
+            *qDelay = s_g612SnapPre.qd;
+            *pDelay = s_g612SnapPre.pd;
+            std::memcpy(vuData, s_g612SnapPre.ram.data(), dataSize);
+            const uint32_t nRef = g612RefRun(st, firstIndex, vuData, dataSize, qDelay, pDelay,
+                                             stampBase, hb, n, codeSize);
+
+            const char *what = "?";
+            long at = -1;
+            if (nRef != n)
+            {
+                std::fprintf(stderr, "[G612:verify-BAD] pairs jit=%u ref=%u pc=0x%x\n", n, nRef,
+                             firstIndex * 8u);
+                g610VerifyFail("pairs", firstIndex, n, -1);
+            }
+            if (!g610StatesEqual(s_g612SnapJit.st, st, s_g612SnapJit.hb, *hb,
+                                 s_g612SnapJit.ram.data(), vuData, dataSize, &what, &at))
+            {
+                std::fprintf(stderr,
+                             "[G612:verify-BAD] %s at=%ld pc=0x%x pairs=%u pcJit=0x%x pcRef=0x%x "
+                             "afterOk=%llu\n",
+                             what, at, firstIndex * 8u, n, s_g612SnapJit.st.pc, st.pc,
+                             (unsigned long long)s_g612Verified);
+                g610VerifyFail(what, firstIndex, n, at);
+            }
+            // Precondition 3, CHECKED rather than asserted. The reference advanced both counters
+            // pair by pair inside the shipped block body and published at the exact pair; the
+            // region deferred both to the exit. If the deferral were ever observable the two would
+            // disagree here — and this is also what proves no emitted pair re-armed either.
+            if (s_g612SnapJit.qd != *qDelay || s_g612SnapJit.pd != *pDelay)
+            {
+                std::fprintf(stderr,
+                             "[G612:verify-BAD] qp jit=(%d,%d) ref=(%d,%d) entry=(%d,%d) "
+                             "pc=0x%x pairs=%u\n",
+                             s_g612SnapJit.qd, s_g612SnapJit.pd, *qDelay, *pDelay, qEntry, pEntry,
+                             firstIndex * 8u, n);
+                g610VerifyFail("qp", firstIndex, n, -1);
+            }
+            const uint64_t v = ++s_g612Verified;
+            if (v == 1u || (v % 2000000u) == 0u)
+            {
+                std::fprintf(stderr, "[G612:verify] regions=%llu bad=0 pairs=%llu\n",
+                             (unsigned long long)v, (unsigned long long)s_g612Pairs);
+                std::fflush(stderr);
+            }
+        }
+
+        ++s_g612Runs;
+        s_g612Pairs += n;
+        if (g612StatOn())
+        {
+            if ((uint64_t)n > s_g612MaxPairs)
+                s_g612MaxPairs = (uint64_t)n;
+            const uint32_t ex = st.pc >> 3u;
+            if (ex < s_g612ExitAt.size())
+                ++s_g612ExitAt[ex];
+            if ((s_g612Runs & 0x3FFFFFull) == 0ull)
+                g612Report();
+        }
+        return n;
+    }
+#endif // DC2_G612_REGION_BACKEND
+
+    // Eager translation, run at the END of the cold rebuild pass — the same pass, on the same two
+    // invalidation paths, that rewrites g490RunLen / g500Tail / g516*. A compiled body therefore
+    // can never describe a stale encoding: it is discarded and re-emitted by the same event that
+    // rewrote the pair it came from. (Lazy compilation would need a per-block-entry `tried` test on
+    // the hot path; this needs none, so the hook is one array load.)
+    void g610CompileAll(uint32_t dataSize)
+    {
+        // PROCESS-level, never the per-run() arm: both arms of `DC2_G419_AB=vujit` must find the
+        // same populated slot table.
+        if (!g610BackendEnabled())
+            return;
+        g610CheckMaskTable();
+        g610UnbindAll(dataSize);
+        ++s_g610Rebuilds;
+        for (size_t i = 0u; i < s_g410Cache.g490RunLen.size(); ++i)
+        {
+            const uint32_t run = (uint32_t)s_g410Cache.g490RunLen[i];
+            if (run < G490_MIN_RUN)
+                continue;
+            // ⚠️ Slots whose run ends in a branch/flag TAIL are bound too, even though the hook
+            // currently refuses them (precondition 3). Binding them is what makes `[G610:why]
+            // fbTail` a MEASUREMENT of the tail population instead of a structural zero — and a
+            // loop body always ends in its own back-edge, so this is where the coverage is.
+
+            // Code cache: hit on the exact source words and this body is already emitted.
+            // NEGATIVE entries (fn == nullptr) are cached too. Without them a refused block is
+            // re-translated on every rebuild — 362,117 wasted attempts over 2,103 rebuilds in the
+            // run that measured this — and each one walks its pairs until it hits the unsupported
+            // one. G611 moved the probe/insert into `g610CacheLookup` so the Q-split path can use
+            // the same cache for its SUB-BLOCK bodies.
+            const G610CacheEnt *ce = g610CacheLookup((uint32_t)i, run, dataSize, true);
+            if (ce != nullptr && ce->fn != nullptr)
+            {
+                s_g610.slot[i].fn = ce->fn;
+                s_g610.slot[i].count = ce->count;
+                s_g610.slot[i].readsQ = ce->readsQ;
+                s_g610.slot[i].g611 = ce->g611;
+                s_g610.slot[i].qMask = ce->qMask;
+            }
+        }
+        // One flush for the whole newly-emitted region rather than one per body: x86-64 keeps
+        // instruction and data caches coherent for same-thread write-then-execute (the `call` into
+        // the body is the serialising branch), so this is belt-and-braces, not a requirement.
+#if defined(_WIN32)
+        if (s_g610.arena != nullptr && s_g610.used != 0u)
+            FlushInstructionCache(GetCurrentProcess(), s_g610.arena, s_g610.used);
+#endif
+        if (g610StatOn() && (s_g610Rebuilds % 4096u) == 1u)
+            g610Report();
+    }
+#endif // DC2_G610_JIT_BACKEND
+
+    // G610 CEILING PROBE ARMS (`DC2_G610_CEIL=1|2|3`).
+    //
+    // WHY THESE EXIST. ROADMAP Target A asks for a VU1 microprogram translator, and G607 priced its
+    // headroom as "the interpreter's own overhead, 13.2-14.4 ns/pair ~= 53 cycles per VU pair" — a
+    // WHOLE-PROGRAM average taken before G490's block executor, G515/G516's dispatch levers and the
+    // G533/G547-G551 static handlers were all in the shipped path. Before emitting a single byte of
+    // native code, RANK THE PAIR'S STAGES BY DELETING THEM (the G609 law): run the promoted block
+    // leaf with the lower slot gone, with the upper slot gone, and with both gone, against the same
+    // route and the same denominators. What survives at `Ceil=3` is the part a translator CANNOT
+    // remove (the loop, the fused fetch, the Q/P segmentation, the G425 re-pin); the difference is
+    // the part it can.
+    //
+    // Each arm is a SEPARATE INSTANTIATION of the shipped arm-23 body (G436/G593: a default-off
+    // diagnostic must never branch inside the loop it observes), reached through a loop-invariant
+    // arm read at the caller, exactly like every other arm in this file.
+    //
+    // ⛔ RENDERS GARBAGE. Never a correctness run, never quoted as a lever.
+#if DC2_G610_CEIL_ARMS
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g610ExecuteBlockCeilNoLower(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                     uint8_t *vuData, uint32_t dataSize,
+                                     int *qDelay, int *pDelay,
+                                     int64_t stampBase, G430HistBlock *hb, uint32_t tailCode)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, true, false, true, false, false, false, true, false, false, false,
+                      1>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCode);
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g610ExecuteBlockCeilNoUpper(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                     uint8_t *vuData, uint32_t dataSize,
+                                     int *qDelay, int *pDelay,
+                                     int64_t stampBase, G430HistBlock *hb, uint32_t tailCode)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, true, false, true, false, false, false, true, false, false, false,
+                      2>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCode);
+    }
+
+#if defined(_MSC_VER)
+    __declspec(noinline)
+#elif defined(__GNUC__) || defined(__clang__)
+    __attribute__((noinline))
+#endif
+    void g610ExecuteBlockCeilEmpty(VU1State &st, uint32_t firstIndex, uint32_t count,
+                                   uint8_t *vuData, uint32_t dataSize,
+                                   int *qDelay, int *pDelay,
+                                   int64_t stampBase, G430HistBlock *hb, uint32_t tailCode)
+    {
+        g490BlockBody<true, false, true, true, false, false, true, true, true, false, true,
+                      false, true, false, true, false, false, false, true, false, false, false,
+                      3>(
+            st, firstIndex, count, vuData, dataSize, qDelay, pDelay, stampBase, hb, tailCode);
+    }
+#endif // DC2_G610_CEIL_ARMS
 
     // G533 arms 27/28: immutable-image specialization. Admission is one rebuild-time exact-source
     // plan bit plus the block identity already live at this call site. No per-pair plan stream, hash,

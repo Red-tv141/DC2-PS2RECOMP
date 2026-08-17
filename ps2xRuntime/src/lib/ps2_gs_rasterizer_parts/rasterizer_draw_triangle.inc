@@ -1562,6 +1562,48 @@ void GSRasterizer::drawTriangle(GS *gs)
     uint64_t g605TriPx = 0u;
     uint64_t g605TriBad = 0u;
 
+    // ================== G609: the tight scanline for the admitted triangle ====================
+    // Same admission, same lowering — a different PLACE to run it. `g605Tri` already proved every
+    // per-draw conjunct the outlined kernel resolves away (see g609_tri_scan.inc's table), so the
+    // only extra predicates are (a) the lever, (b) the per-pixel diagnostics that sit between the Z
+    // test and the leaf and that the kernel does not reproduce, and (c) G605's OWN oracle, whose
+    // authority is a lambda local to this function and therefore unreachable from an outlined body.
+    const bool g609Scan =
+        g605Tri && !g605TriVerify && g609TriScanRequested() && g609TriScanQuiet();
+    const bool g609Verify = g609Scan && g609TriScanVerifyOn();
+    G609TriScan g609S{};
+    if (g609Scan)
+    {
+        g609S.v0 = &v0;
+        g609S.v1 = &v1;
+        g609S.v2 = &v2;
+        g609S.fx0 = fx0; g609S.fy0 = fy0;
+        g609S.fx1 = fx1; g609S.fy1 = fy1;
+        g609S.fx2 = fx2; g609S.fy2 = fy2;
+        g609S.winding = winding;
+        g609S.invAbsDenom = invAbsDenom;
+        g609S.edgeEpsilon = kEdgeEpsilon;
+        g609S.vram = gs->m_vram;
+        g609S.vramSize = static_cast<uint32_t>(gs->m_vramSize);
+        g609S.tex0 = &ctx.tex0;
+        g609S.blend = g605Blend;
+        g609S.fog = g605Fog;
+        g609S.zWrite = g605ZWrite;
+        g609S.inlineCombine = g609InlineCombine();
+        // Slice B: the two per-draw constants the `noinline` samplers re-read per pixel. The
+        // admission already required `g580SharedSampleReady()`, so the pointer is non-null.
+        g609S.sample = t_g580SharedSample;
+        g609S.clut = (g609S.sample != nullptr &&
+                      g609S.sample->tableIndex < g_g580SharedCluts.size())
+                         ? g_g580SharedCluts[g609S.sample->tableIndex].data()
+                         : nullptr;
+        g609S.ceil = g609CeilProbe();
+        g609S.stat = g609TriScanStatOn();
+    }
+    // Slice B is admitted only when both hoists are valid — fail closed onto the `noinline` call.
+    const bool g609SampInl =
+        g609Scan && g609SamplerInline() && g609S.sample != nullptr && g609S.clut != nullptr;
+
     const bool g580Tri13bVerify = g580Tri13b && g580Tri13bVerifyOn();
     const uint32_t g580ColorBlock = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
     uint64_t g580Tri13bPx = 0u;
@@ -1851,6 +1893,36 @@ void GSRasterizer::drawTriangle(GS *gs)
             xStart = minX + static_cast<int>(tLoC);
             xEnd = minX + static_cast<int>(tHiC);
         }
+        // ================= G609: run the whole row in the outlined kernel =====================
+        // The row is eligible only when the CONSERVATIVE VRAM bound holds for every x on it, which
+        // is what licenses the kernel to drop the generic leaf's per-pixel `fastOff + 4 <=
+        // vramSize` test. If it does not hold the row falls through to the untouched generic path —
+        // fail closed, and counted, so a silent loss of population is impossible.
+        //   ⚠️ `py` is snapshotted here because the generic loop's G408 integer-pixel-center block
+        //   writes to it; that block is disarmed for an admitted draw (`g609TriScanQuiet`), and the
+        //   snapshot makes the kernel independent of that fact rather than dependent on it.
+        const float g609Py = py;
+        bool g609Row = false;
+        if (g609Scan && xEnd >= xStart)
+        {
+            g609Row = g609RowWithinVram(g605ColorRow, xEnd, static_cast<uint32_t>(gs->m_vramSize));
+            if (!g609Row)
+                g609NoteScanRow(0u, 0u, false);
+        }
+        if (g609Row && !g609Verify)
+        {
+            const long g609InsideBefore = insideAcc;
+            const uint64_t g609PxBefore = g605TriPx;
+            g609TriScanRow(g609S, g605Fst, g609SampInl, y, g609Py, xStart, xEnd,
+                           g605ColorRow, g605DepthRow,
+                           insideAcc, drawnAcc, g605TriPx);
+            g609NoteScanRow(static_cast<uint64_t>(insideAcc - g609InsideBefore),
+                            g605TriPx - g609PxBefore, true,
+                            static_cast<uint64_t>(xEnd - xStart + 1), g609SampInl);
+            continue;
+        }
+        if (g609Row && !g609VerifySave(g609S, xStart, xEnd, g605ColorRow, g605DepthRow))
+            g609Row = false;
         // G570: evaluate four shadow-mask depth candidates at once. Coverage remains the exact
         // G408 12.4 fixed-point top-left rule; each lane then executes the original float
         // barycentric operation sequence, just in SSE lanes. Color commits remain ordered and
@@ -3150,6 +3222,26 @@ void GSRasterizer::drawTriangle(GS *gs)
             }
             ++drawnAcc;
         }
+        // ============ G609 ORACLE: the same row again, in the kernel, and compared ============
+        // The generic loop above has just written the AUTHORITATIVE result for this row. Capture
+        // it, put the row back exactly as it was, re-run the row through `g609TriScanRowT`, compare
+        // word for word and depth for depth, and then restore the authoritative result either way —
+        // so a kernel defect cannot reach a pixel while the oracle is armed (G530 §5.1's contract,
+        // one level up: it verifies the WHOLE ROW rather than one leaf).
+        if (g609Row && g609Verify)
+        {
+            g609VerifyCaptureAndRestore(g609S, g605DepthRow);
+            long g609VInside = 0;
+            int g609VDrawn = 0;
+            uint64_t g609VPx = 0u;
+            g580BeginSharedSampleRow();
+            g609TriScanRow(g609S, g605Fst, g609SampInl, y, g609Py, xStart, xEnd,
+                           g605ColorRow, g605DepthRow,
+                           g609VInside, g609VDrawn, g609VPx);
+            g609VerifyCompare(g609S, g605DepthRow);
+            g609NoteScanRow(static_cast<uint64_t>(g609VInside), g609VPx, true,
+                            static_cast<uint64_t>(xEnd - xStart + 1), g609SampInl);
+        }
         }
     };
     // G143 dispatch: sequential unless DC2_G143_THREADS>1 AND the triangle is big enough AND no
@@ -3211,6 +3303,8 @@ void GSRasterizer::drawTriangle(GS *gs)
         g580NoteTri13b(g580Tri13bPx, g580Tri13bBad);
     if (g605Tri)
         g605NoteTriSpan(g605TriPx, g605TriBad, g605Fst);
+    if (g609Scan)
+        g609NoteScanDraw();
 
     // G141 sub-profile flush (one atomic add per triangle, gated).
     {

@@ -1070,6 +1070,37 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     const bool g554Hot0900Run = g499BlkArmRaw == 35;
     const bool g555Hot1110Run = g499BlkArmRaw == 36;
     const int g499BlkArm = g533StaticRun ? 23 : g499BlkArmRaw;
+    // G610: the stage-deletion ceiling arm, read once per run() like every arm above it. Selects a
+    // whole leaf copy at the hook, never a per-pair test. ⛔ Renders garbage; probe only.
+#if DC2_G610_CEIL_ARMS
+    const int g610Ceil = g490BlockRun ? g610CeilMode() : 0;
+#else
+    constexpr int g610Ceil = 0;
+#endif
+    // G610: the NATIVE COMPILED-BLOCK arm. Read once per run() on the VU1 worker, like every arm
+    // above. When false the whole hook folds to one loop-invariant, perfectly-predicted test that is
+    // present in BOTH arms of the paired A/B, so it cancels in the paired estimator (G436's law).
+#if DC2_G610_JIT_BACKEND
+    const bool g610Jit = g490BlockRun && g610JitRun();
+    // G611: the two COVERAGE arms, read once per run() beside it. `g611Ops` gates blocks whose
+    // translation needed a G611 op form (CLIPw / OPMSUB / OPMULA / MIN-MAX partial dest);
+    // `g611QSplit` gates the Q-observable two-sub-body split. Both are loop invariants and both are
+    // present in BOTH arms of their paired A/B.
+    const bool g611Ops = g610Jit && g611OpsRun();
+    const bool g611QSplit = g610Jit && g611QSplitRun();
+#else
+    constexpr bool g610Jit = false;
+    constexpr bool g611Ops = false;
+    constexpr bool g611QSplit = false;
+#endif
+    // G612: the NATIVE COMPILED REGION arm — a whole control-flow graph per call instead of one
+    // straight-line block. Read once per run() on the VU1 worker, exactly like `g610Jit` above,
+    // and present in BOTH arms of its paired A/B so it cancels in the paired estimator.
+#if DC2_G612_REGION_BACKEND && DC2_G610_JIT_BACKEND
+    const bool g612Reg = g490BlockRun && g612RegionRunOn();
+#else
+    constexpr bool g612Reg = false;
+#endif
     // G502: the block-round-trip ceiling probe's arm and the block-entry census. Read ONCE per
     // run() like every other thread-level arm (G479's rule), and both memoised behind a
     // function-local `static const` on their default paths (G500 §4's blind spot).

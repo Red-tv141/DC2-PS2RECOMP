@@ -776,6 +776,26 @@ enum G419Lever
     // read/writeTransferPixel pair. It runs on the GS worker inside performLocalToLocalTransfer:
     // hold 16.
     kG596LeverFastCopy = 122,
+    // G610: the NATIVE VU1 BLOCK COMPILATION BACKEND. Alternates whether the hook executes the
+    // emitted machine-code body for a block or the shipped generic block executor. Both arms of one
+    // process have the SAME compiled bodies (translation is unconditional in the cold rebuild pass,
+    // so a flip to the candidate arm can never find an empty slot table — the G490 §2
+    // structurally-unmeasurable-lever trap). It runs on the VU1 worker inside run(): hold 16.
+    kG610LeverVuJit = 123,
+    // G611: the two COVERAGE levers on top of that backend. Both alternate at the block HOOK, never
+    // at translation — the bodies exist in both arms of one process for exactly G610's reason.
+    //   `vuops`   — blocks whose translation needed a G611 op form (CLIPw, OPMSUB/OPMULA, MIN/MAX
+    //               with a partial dest). The control arm runs them generically, as G610 shipped.
+    //   `vuqsplit`— blocks refused by the Q/P segment test, executed as two compiled sub-blocks
+    //               with the publication between them.
+    kG611LeverVuOps = 124,
+    kG611LeverVuQSplit = 125,
+    // G612: the NATIVE REGION backend — a whole control-flow graph (native branches, delay slots
+    // and back-edges) per call instead of one straight-line block. Same shape as `vujit`: the
+    // regions are emitted in the cold rebuild pass on BOTH arms of one process, and only the HOOK
+    // alternates, so the candidate arm can never draw an empty slot table. Read once per run() on
+    // the VU1 worker: hold 16.
+    kG612LeverVuRegion = 126,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -888,6 +908,14 @@ static int g419AbLever()
             return static_cast<int>(kG489LeverPcSkip);
         if (std::strcmp(value, "blockrun") == 0)
             return static_cast<int>(kG490LeverBlockRun);
+        if (std::strcmp(value, "vujit") == 0)
+            return static_cast<int>(kG610LeverVuJit);
+        if (std::strcmp(value, "vuops") == 0)
+            return static_cast<int>(kG611LeverVuOps);
+        if (std::strcmp(value, "vuqsplit") == 0)
+            return static_cast<int>(kG611LeverVuQSplit);
+        if (std::strcmp(value, "vureg") == 0)
+            return static_cast<int>(kG612LeverVuRegion);
         if (std::strcmp(value, "rbfmt") == 0)
             return static_cast<int>(kG491LeverRbFmt);
         if (std::strcmp(value, "rbspin") == 0)
@@ -1045,7 +1073,8 @@ static int g419AbLever()
                      "narrow|pack|lanes|all|zero|packlanes|pool|all420|narrowtouch|matunpack|"
                      "vu1slow|gsslow|coalesce|earlykick|kickall|spinwait|wspin|spinboth|async1|"
                      "rb_all|rb_l2l|rb_resync|rb_display|uvpred|simdmerge|vnoptrace|pagebump|"
-                     "leanfetch|pcreg|widevf0|flaglower|fastop|pcskip|blockrun|rbfmt|rbspin|"
+                     "leanfetch|pcreg|widevf0|flaglower|fastop|pcskip|blockrun|vujit|vuops|"
+                     "vuqsplit|vureg|rbfmt|rbspin|"
                      "norender|noother|ct24reuse|latedrain|nosync|gpuslow|glstate|winbuf|ownpub|"
                      "blklower|qpblock|blkbranch|blksplit|blkchain|blktail0|eeslow|chainpool|"
                      "histcur|qpseg|lockskip|capmove|clsmemo|g510both|texrun|texprobe|clsprobe|"
@@ -1109,6 +1138,10 @@ static const char *g419AbLeverName(int lever)
     case kG488LeverFastOp: return "fastop";
     case kG489LeverPcSkip: return "pcskip";
     case kG490LeverBlockRun: return "blockrun";
+    case kG610LeverVuJit: return "vujit";
+    case kG611LeverVuOps: return "vuops";
+    case kG611LeverVuQSplit: return "vuqsplit";
+    case kG612LeverVuRegion: return "vureg";
     case kG491LeverRbFmt: return "rbfmt";
     case kG491LeverRbSpin: return "rbspin";
     case kG492LeverNoRender: return "norender";
@@ -1353,6 +1386,15 @@ static uint64_t g438ArmHoldFrames()
                  // G506's law again: the G596 arm runs on the GS worker inside
                  // GS::performLocalToLocalTransfer.
                  sel == kG596LeverFastCopy ||
+                 // G506's law again: G610's compiled-block arm is read once per run() on the VU1
+                 // worker, exactly like G490's `blockrun`, so it takes the same block hold.
+                 sel == kG610LeverVuJit ||
+                 // G506's law again: both G611 coverage arms are read once per run() on the VU1
+                 // worker, in the same hook as `vujit`.
+                 sel == kG611LeverVuOps || sel == kG611LeverVuQSplit ||
+                 // G506's law again, EIGHTH firing: G612's region arm is read once per run() on
+                 // the VU1 worker, in the same hook family as `vujit` / `vuops` / `vuqsplit`.
+                 sel == kG612LeverVuRegion ||
                  sel == kG541LeverVuNull ||
                 sel == kG439LeverCoalesce || sel == kG445LeverEarlyKick ||
                 sel == kG445LeverKickAll || sel == kG447LeverSpinWait || sel == kG447LeverWSpin ||
@@ -1636,6 +1678,83 @@ int g489PcSkipArm()
 int g490BlockRunArm()
 {
     if (g419AbLever() != static_cast<int>(kG490LeverBlockRun))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G610 selects whether the hook executes the EMITTED MACHINE-CODE body for a block or the shipped
+// generic block executor. Read once per run() on the VU1 worker, with the same G438 block hold and
+// the same per-frame-sequence memo as g490BlockRunArm directly above.
+//
+// ⚠️ The compiled bodies themselves are emitted UNCONDITIONALLY in the cold rebuild pass whenever
+// `DC2_G419_AB=vujit` is set, so the candidate arm can never draw an empty slot table. That is
+// G490 §2's structurally-unmeasurable-lever trap and it has already cost this project three
+// phases; the cost lands on BOTH arms of the same process, so it cancels in the paired estimator.
+int g610JitArm()
+{
+    if (g419AbLever() != static_cast<int>(kG610LeverVuJit))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G611 — the two COVERAGE arms on top of G610's backend. Same shape as `g610JitArm` above; the
+// only difference is which lever id selects them. Both are read once per run() on the VU1 worker.
+//
+// ⚠️ Like `vujit`, the bodies these arms gate are emitted UNCONDITIONALLY when the lever is
+// selected, so the candidate arm can never draw an empty slot table. The control arm runs those
+// blocks through the shipped generic executor — i.e. exactly what G610 shipped.
+int g611OpsArm()
+{
+    if (g419AbLever() != static_cast<int>(kG611LeverVuOps))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G612 — the NATIVE REGION arm. Same shape as `g610JitArm`; the region bodies are emitted
+// unconditionally whenever the lever is selected, so the candidate arm can never draw an empty
+// slot table and the control arm runs exactly what G611 shipped.
+int g612RegionArm()
+{
+    if (g419AbLever() != static_cast<int>(kG612LeverVuRegion))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g611QSplitArm()
+{
+    if (g419AbLever() != static_cast<int>(kG611LeverVuQSplit))
         return -1;
     const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
     const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);

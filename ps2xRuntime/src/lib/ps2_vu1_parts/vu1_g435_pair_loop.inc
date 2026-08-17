@@ -737,6 +737,53 @@
                 static_cast<uint32_t>(s_g410Cache.g490RunLen[currentPc >> 3u]);
             const uint32_t g490Budget = maxCycles - cycle;
             uint32_t g490Count = g490Avail < g490Budget ? g490Avail : g490Budget;
+#if DC2_G612_REGION_BACKEND
+            // G612 — THE NATIVE COMPILED REGION. It sits at the very TOP of the dispatch chain
+            // (the G490 §2 copy-chain law: an arm is only measurable if it is above every arm its
+            // own predicate does not exclude) and, unlike every arm below it, it does not need the
+            // G500 tail lookup, the G502 clamp or any of the block bookkeeping — a region carries
+            // its own control flow, so the branch that ends the run is INSIDE the emitted body.
+            //
+            // THE FALLBACK POPULATION PAYS ONE ARRAY LOAD AND TWO TESTS, NOT A CALL. The two
+            // scalar-pipe counters are precondition 3: a region's pair count is dynamic, so it may
+            // only start where there is nothing pending to publish. Nothing it emits can arm
+            // either counter, so both are still zero at every exit — and `DC2_G612_VERIFY=1`
+            // checks that rather than asserting it.
+            //
+            // ⚠️ LIKE G610's TAIL, THIS MOVES `[G490:block] cover/avg` BETWEEN THE TWO A/B ARMS:
+            // one region call replaces many block calls plus the pair-loop iterations between
+            // them. The invariant that survives is `[G483:runprof] pairs/call`, which counts every
+            // executed pair whoever executes it.
+            if (g612Reg && s_g612.slot[currentPc >> 3u].fn != nullptr)
+            {
+                // Precondition 3, in its measured form. A pending P publication is ALWAYS
+                // deferrable (nothing G490 admits reads `st.p`); a pending Q publication is
+                // deferrable whenever this region contains no `src == 1` upper at all, which is a
+                // translate-time property carried in the same slot record the line above loaded.
+                // The first bring-up run refused 62% of entries on the naive `qd == 0 && pd == 0`
+                // form — `[G612:why] skipQp = 6,877,254` against `runs = 4,194,304`.
+                if (*s_qDelayP == 0 || s_g612.slot[currentPc >> 3u].readsQ == 0u)
+                {
+                    const uint32_t g612N =
+                        g612RunRegion(m_state, currentPc >> 3u, vuData, dataSize, codeSize,
+                                      s_qDelayP, s_pDelayP, g430Base + (int64_t)cycle, g436Hb,
+                                      g490Budget);
+                    if (g612N != 0u)
+                    {
+                        // The emitted body has already written the architectural PC — a region
+                        // exits only at a slot boundary with no pending branch target, which is
+                        // precondition 2's whole purpose.
+                        G483_PC_SET(m_state.pc);
+                        if (g490Stat)
+                            g490NoteBlock(g612N);
+                        cycle += g612N - 1u;
+                        continue;
+                    }
+                }
+                else
+                    ++s_g612SkipQp;
+            }
+#endif
 #if DC2_G532_FLAGHEAD
             // G532: a typed flag consumer followed by an ordinary run enters the SAME block call
             // that the next pair would already have made. This scoped prologue adds no live state
@@ -1047,6 +1094,79 @@
                 // G533/G547: arm 27's exact blocks bypass G531 here. Every miss was canonicalised
                 // to arm 23 once per run(), so it follows the shipped call path below with no
                 // candidate wrapper/function-return tax.
+#if DC2_G610_JIT_BACKEND
+                // G610 — THE NATIVE COMPILED BLOCK. Sits at the TOP of the chain (the G490 §2
+                // copy-chain law: an arm is only measurable if it is above every arm its own
+                // predicate does not exclude) and subsumes the G533/G547–G551 hand-written
+                // fragment handlers below it for the blocks it admits.
+                //
+                // THE FALLBACK POPULATION PAYS ONE ARRAY LOAD AND TWO TESTS, NOT A CALL: the
+                // `noinline` entry is only reached when the slot already holds an emitted body and
+                // this block has no branch/flag tail. `g610RunNativeBlock` may still refuse (a Q/P
+                // segment split, a clamped pair count, a stale `dataSize`), in which case it has
+                // mutated nothing and the chain below runs the block exactly as it always has.
+                // G611: `g611Ops` is a loop invariant and `g611` is a byte of the SAME slot record
+                // the line above already loaded, so the added conjunct is one test on a register
+                // pair — per BLOCK entry, never per pair — and it is present in both arms.
+                if (g610Jit && s_g610.slot[currentPc >> 3u].fn != nullptr &&
+                    (g611Ops || s_g610.slot[currentPc >> 3u].g611 == 0u) &&
+                    g610RunNativeBlock(m_state, currentPc >> 3u, g490Count, vuData, dataSize,
+                                       s_qDelayP, s_pDelayP, g430Base + (int64_t)cycle, g436Hb,
+                                       g611QSplit))
+                {
+                    // ⭐ THE TAIL IS NOT CONSUMED — IT IS LEFT TO THE PAIR LOOP.
+                    //
+                    // The first revision refused every block whose run ends in a branch or
+                    // flag-consumer tail, and the census read `fbTail = 161,253,967` against
+                    // 117,440,512 native blocks: 45% of every block entry that HAD a compiled body,
+                    // thrown away — and they are the LONG blocks, because a loop body always ends in
+                    // its own back-edge.
+                    //
+                    // So the native body runs the `g490Count` eligible pairs and then this arm takes
+                    // the G500 `tail == 0` exit verbatim: pc advances by `8 * count`, the cycle
+                    // budget by `count`, and the branch/flag pair is executed by the pair loop on
+                    // its next iterations — which is exactly what happened before G500 attached it
+                    // to the block. Nothing about that pair's semantics changes; it merely pays the
+                    // per-pair envelope again instead of riding inside the block.
+                    //
+                    // ⚠️ THIS MOVES `[G490:block] cover/avg` BETWEEN THE TWO A/B ARMS, by exactly
+                    // `tailPairs x nativeBlocks`. The standing "cover must be unchanged" cross-check
+                    // does NOT apply to this lever; the invariant that does is `[G483:runprof]
+                    // pairs/call`, which counts every executed pair whoever executes it.
+                    if (g500Tail != 0u)
+                        ++s_g610FbTail;
+                    const uint32_t g610Next = currentPc + 8u * g490Count;
+                    m_state.pc = g610Next;
+                    G483_PC_SET(g610Next);
+                    if (g490Stat)
+                        g490NoteBlock(g490Count);
+                    cycle += g490Count - 1u;
+                    continue;
+                }
+                // The `continue` above already makes the chain below unreachable on a native block,
+                // but the `else` is kept so this arm still binds correctly if the G517 copy chain
+                // directly above it is ever compiled in (its trailing `else` would otherwise
+                // dangle onto this `if` and leave the chain below running unconditionally).
+                else
+#endif
+#if DC2_G610_CEIL_ARMS
+                // G610 CEILING: sits ABOVE every arm it does not exclude (the G490 §2 copy-chain
+                // law) so it deletes the stage for EVERY block, whichever handler would have run.
+                // ⛔ Renders garbage.
+                if (g610Ceil == 1)
+                    g610ExecuteBlockCeilNoLower(m_state, currentPc >> 3u, g490Count, vuData,
+                                                dataSize, s_qDelayP, s_pDelayP,
+                                                g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g610Ceil == 2)
+                    g610ExecuteBlockCeilNoUpper(m_state, currentPc >> 3u, g490Count, vuData,
+                                                dataSize, s_qDelayP, s_pDelayP,
+                                                g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else if (g610Ceil == 3)
+                    g610ExecuteBlockCeilEmpty(m_state, currentPc >> 3u, g490Count, vuData,
+                                              dataSize, s_qDelayP, s_pDelayP,
+                                              g430Base + (int64_t)cycle, g436Hb, g500Tail);
+                else
+#endif
                 if (g533StaticRun &&
                     g533Hot3088Runnable(currentPc >> 3u, g490Count, g500Tail,
                                          vuData, dataSize, g436Hb))

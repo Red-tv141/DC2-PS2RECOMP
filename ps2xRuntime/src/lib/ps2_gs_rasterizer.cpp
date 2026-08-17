@@ -1,4 +1,7 @@
-﻿// G597: DC2_G597_OWNCHK=1 -> [G597:own]. Counts EVERY conjunct of g536CollectGuestOwnedPages'
+﻿// G612: this TU gains only the `vureg` A/B arm in g419_ab_instrument.inc (the native VU1 REGION
+// backend lives in the VU1 TU), so this content edit is what forces MSBuild to consume the .inc
+// (G359). revision: 1
+// G597: DC2_G597_OWNCHK=1 -> [G597:own]. Counts EVERY conjunct of g536CollectGuestOwnedPages'
 // fail-closed gate separately, plus pagesScanned/pagesMoved, because G596 measured that guard
 // firing on 0.28-0.38% of publications while guest VRAM moved under 38-80% of them. Behaviour-pure.
 // G597 FIX (DC2_G597_SCOPEDANCHOR=1, rollback DC2_G597_NO_SCOPEDANCHOR=1): g264FlushMirror re-anchors
@@ -495,6 +498,14 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // member function body and cannot open a namespace), and must follow g528_flush_publish.inc, whose
 // g528ClassifyFbp/kG528Cls* it uses. Default-off: DC2_G605_CYC=1.
 #include "ps2_gs_rasterizer_parts/g605_replay_leaf_census.inc"
+
+// G609 revision: 1 — the TIGHT SCANLINE for the G605/G608-admitted replayed triangle. Same
+// lowering, given its own outlined `noinline` row loop so the admitted pixel stops walking the
+// generic per-pixel nest (three thread-safe-static init guards, an out-of-line trace call and ~12
+// per-draw-constant branches) to reach it. Must follow g605_tri_span.inc (it calls both sampler
+// leaves, g605CommitWord and G605Blend) and g530_sprite_span.inc (G530RowAddr/g530GroupBase), and
+// must precede rasterizer_draw_triangle.inc, which is a FRAGMENT of the member function body.
+#include "ps2_gs_rasterizer_parts/g609_tri_scan.inc"
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_draw_sprite.inc"

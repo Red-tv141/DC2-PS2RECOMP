@@ -231,17 +231,43 @@ bool passesAlphaTest(uint64_t testReg, uint8_t alpha)
     // round UP across the tie and change the answer for values just below x.5). Four instructions,
     // no call, no libm.
     //
-    //   DC2_G529_FASTLERP=1  the lever (bring-up default: OFF)
-    //   DC2_G529_NO_FASTLERP=1  rollback once promoted
+    //   DC2_G529_FASTLERP=1  retained bring-up spelling; now a no-op (PROMOTED DEFAULT-ON by G609)
+    //   DC2_G529_NO_FASTLERP=1  the rollback
     //   DC2_G529_LERPVFY=1   ORACLE. Runs BOTH forms per channel and counts disagreements. Any
     //                        nonzero `bad` means the identity above is violated on this host.
     //   DC2_G529_NOLERP=1    CEILING PROBE, KNOWINGLY INCORRECT OUTPUT, NEVER PROMOTE. Returns the
     //                        c00 tap unfiltered, deleting the entire bilinear filter. Bounds every
     //                        lever that could ever be built here (g511_probe_bounds_the_gate).
+    //
+    // ⭐ PROMOTED DEFAULT-ON BY G609. Rollback: DC2_G529_NO_FASTLERP=1.
+    // ⭐⭐⭐ WHY IT TOOK TWO PHASES: G529 built this, proved it exact, and measured it at 0.00 ms/f —
+    // on a WHOLE-FRAME gate, which cannot resolve a sub-ms lever (`g594_frame_gate_cannot_resolve_
+    // sub_ms`). G609 built `[G605:leaf] cyc/inside` denominators and a stage CEILING PROBE, and the
+    // probe said the four `lerpChannel` calls are **50.1%** of the admitted triangle pixel
+    // (`DC2_G609_CEIL=6`: 526.7 -> 262.9 cyc/inside) against only 8.1% for the four VRAM taps. The
+    // lever did not change; the INSTRUMENT did.
+    // Gates:
+    //   mechanism  — `[G605:leaf]`, `DC2_G605_CYC=1` only, both arms. On `s05`, `discov sprite`
+    //                (90.0% of that route's replay CPU) goes **691.5 -> 428.7 cyc/inside (-38.0%)**
+    //                on IDENTICAL denominators (n=669,462, px=599,236,608 in both arms), i.e.
+    //                130,204.8 -> 80,737.7 ms of LOOP wall. On `s03` the same leaf goes
+    //                59.5 -> 40.4 (-32.1%).
+    //   exactness  — `DC2_G529_LERPVFY=1`: **bad=0 on 1,677,721,600 channel roundings**, both forms
+    //                computed per channel. Independently, G609's row oracle compared the kernel's
+    //                inlined copy of this identity against the shipped `std::lround` path and
+    //                returned **bad=0 on 687,795,440 per-pixel colour+depth comparisons**.
+    //   payoff     — order-balanced A B B A on `s05` (the GS-worker-bound route), two estimators
+    //                agreeing to 0.002 ms/f: `[G154:perf]` **-0.274 ms/f (-1.27%)** se 0.039 and
+    //                `[G146:frame]` **-0.276 (-1.27%)** se 0.036. FOUR order blocks, all negative
+    //                (-0.331 / -0.223 / -0.329 / -0.221).
+    //   distribution — `s05` windows over 33.33 ms **21 -> 13**; p95 33.85 -> 33.26.
+    // ⚠️ On `s03` the same lever is NOT A RESULT at the frame (blocks disagree, +0.021 / -0.304)
+    // even though its mechanism is confirmed there too — because post-G609 `s03` is **77.4%
+    // VU1-poled**, so GS-side wall removed in a VU1-poled window buys nothing
+    // (`g593_frame_is_max_vu1_gs`). Gate a GS lever on a GS-poled route.
     inline bool g529FastLerpOn()
     {
-        static const bool on = envFlagEnabled("DC2_G529_FASTLERP") &&
-                               !envFlagEnabled("DC2_G529_NO_FASTLERP");
+        static const bool on = !envFlagEnabled("DC2_G529_NO_FASTLERP");
         return on;
     }
     inline bool g529LerpVfyOn()

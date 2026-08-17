@@ -1,6 +1,6 @@
 ﻿// G520: `macscan` — g430ResolveAt (vu1_g421_fast_upper.inc) resolves the architectural MAC with a
 // branchless tree reduction instead of a serial branchy scan of the 8-slot history ring. Content
-// edit here forces MSBuild to consume the .inc (G359). revision: 27 (G607 pc profile)
+// edit here forces MSBuild to consume the .inc (G359). revision: 28 (G612 native region backend)
 #include "ps2_vu1_parts/vu1_helpers_and_tables.inc"
 #include "ps2_vu1_parts/vu1_g370_store_watch.inc"
 #include "ps2_g480_packet_pool.inc"
@@ -12,6 +12,16 @@
 #include "ps2_vu1_parts/vu1_g426_fused_upper.inc"
 #include "ps2_vu1_parts/vu1_g421_census.inc"
 #include "ps2_vu1_parts/vu1_g475_vnop_trace.inc"
+// G610: the NATIVE VU1 BLOCK COMPILATION BACKEND — x86-64 emitter + translator. Must come AFTER
+// vu1_g421_fast_upper.inc (it reads `g421DescTableConst` and `g421MaskTableConst`) and BEFORE
+// vu1_g490_block_run.inc, which holds the compiled-block ENTRY and calls `g610CompileAll` from the
+// same cold rebuild pass that maintains g490RunLen.
+#include "ps2_vu1_parts/vu1_g610_native_jit.inc"
+// G612: the NATIVE VU1 REGION backend — the same emitter, given a control-flow graph. Must come
+// AFTER vu1_g610_native_jit.inc (it CALLS `g610EmitUpper` / `g610EmitLower` rather than
+// re-deriving one line of arithmetic) and BEFORE vu1_g490_block_run.inc, which holds the region
+// ENTRY, the oracle, and the `g612CompileAll` call in the same cold rebuild pass.
+#include "ps2_vu1_parts/vu1_g612_native_region.inc"
 // G490: after vu1_g421_fast_upper.inc — its eligibility test reads `g421DescTableConst`, and its
 // block body calls the inlined g421FastUpper / g422FastLower directly.
 #include "ps2_vu1_parts/vu1_g490_block_run.inc"
