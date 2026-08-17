@@ -78,7 +78,8 @@ StRead sectors total, audio samples total" — four numbers localize the dead le
 ## §4 Post-Skip Verification
 
 After ANY skip/stub, verify the handoff, not just "no hang":
-1. Game reaches the NEXT scene (title/menu) — the golden smoke metric advances.
+1. Game reaches the intended NEXT state; assert it with a game-state marker or downstream behavior.
+   Do not require a title screenshot or host-tick pixel count because the capture may still be FMV.
 2. No stream left open (next file I/O works — load a save, enter a level).
 3. Audio still alive after the skipped video (first menu SFX plays / audio counters move).
 4. Record in the state file: which file(s) skipped, which tier, kill-switch name, evidence.

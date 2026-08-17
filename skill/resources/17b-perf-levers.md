@@ -174,6 +174,48 @@ Check these IN ORDER — the cheap wins come first. Confirm each with the profil
 ---
 
 
+### 2.x ⭐⭐⭐ A REFUTED LEVER IS REFUTED *BY AN INSTRUMENT*, AND INSTRUMENTS IMPROVE
+
+"Buys nothing" is a statement about a lever **on one route with one measurement apparatus**, and it
+expires when either improves. Two distinct ways a shelved lever comes back, both cheap to check
+before starting anything new:
+
+- **A NEW ROUTE IS A NEW INSTRUMENT.** A lever parked because the available route had −0.83 ms/f of
+  headroom is re-pricable the day a route with **+18 ms/f** is registered. *Nothing about the lever
+  changed; the gate did.* Registering a route that isolates your subsystem can be worth more than a
+  phase of implementation — and a route is also the cheapest thing to acquire.
+- **A BETTER PROBE RE-PRICES A REFUSAL.** A lever refuted because a probe measured its subject at
+  "~0" should be re-checked whenever the probe is replaced, and *especially* if a promoted default
+  has since removed the thing the old probe was measuring.
+
+⛔ Keep the scope of every refutation in the sentence that records it: *"buys nothing **on route
+X, measured with instrument Y, at binary Z**"*. A bare "refuted" costs a future phase the whole
+re-derivation.
+
+### 2.y ⭐⭐⭐ RANK A DEFECT BY BLAST RADIUS, NOT BY HOW OFTEN IT FIRES
+
+A rare path that **mutates state shared with the fast path** outranks a frequent one that only
+returns a wrong answer locally. The question is not "how many times does this run?" but *"when it
+runs, how much else becomes wrong?"*
+
+The worst shape is a **fallback that writes shared state on its way out** — it fires rarely, so a
+frequency census ranks it last, and each firing corrupts the fast path's assumptions for everything
+downstream. Rank candidate defects by (items affected per firing) × (how far the effect propagates),
+and treat "a fallback that mutates shared state" as automatically top-tier regardless of rate.
+
+### 2.z ⭐⭐ AN INVARIANT PROTECTS ONLY THE EDGES THAT TEST IT
+
+A checked invariant (`escaped == 0`, `conflict == 0`, an ownership assertion) certifies exactly the
+call sites that call the checker — not the property. Every new consumer edge added after the check
+was written is unprotected, and the invariant will keep reporting clean.
+
+- When you add a consumer of a guarded resource, **add the check at that edge in the same edit.**
+- ⭐ **The LAST UNSCOPED CONSUMER EDGE is a standing lever**: as long as one edge can reach the
+  resource without the test, the whole guard is advisory, and closing it is usually small.
+- The same logic applies to admission predicates: a criterion of the form "for all X, P(X)" is
+  **satisfied vacuously by an empty footprint**. Print the count of X alongside the verdict, or a
+  draw that touches nothing will certify itself.
+
 ---
 
 ## §3 What NOT to Do

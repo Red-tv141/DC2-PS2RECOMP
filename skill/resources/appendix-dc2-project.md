@@ -90,15 +90,11 @@ cmake --build D:\ps2r\dc2\build64 --config Release --target dc2_runner -- /m:1 /
 ```
 D:/ps2r/dc2/build64/Release/dc2_runner.exe D:/ps2r/dc2/SCUS_972.13
 ```
-**Golden title smoke** (post-G139 natural render: `frame_001500 PixelNonZero ≈ 211646 ±4` — the
-count is the gate, NOT a byte hash; the title pans/animates so per-pixel differs run-to-run. The old
-`633662–634384` was the pre-G138 forced-draw era, reproduce with
-`DC2_G100_FORCE_DRAW=1 DC2_VU1_NO_FMSWAPFIX=1 DC2_VU1_NO_MACPIPE=1`):
-```powershell
-powershell -ExecutionPolicy Bypass -File D:\ps2r\dc2\tools\run_30s_diagnose.ps1
-```
-> Note: `run_30s_diagnose.ps1` presses Cross ~frame 120 → navigates INTO a map; for a stable held
-> TITLE frame use `tools/run_g100_cap.ps1 -PadInput '99000..99001:Up'` (clears frame dumps first).
+**Do not use the boot/title capture as a required correctness gate.** The runner can still be in
+FMV playback at a selected host tick, so `frame_001500` and its historical nonzero count do not
+reliably identify title rendering. Select the **single gameplay route most likely to break** from
+the changed mechanism using `appendix-dc2-test-routes.md`, assert arrival by game state, and compare
+its full-frame distribution and representative images from the same executable/route.
 
 > Run harnesses in `tools/*.ps1` DO write logs to files and grep them — that's the intended
 > headless test pattern here (the skill's "never redirect output" prohibition is about *build*
@@ -111,6 +107,8 @@ powershell -ExecutionPolicy Bypass -File D:\ps2r\dc2\tools\run_30s_diagnose.ps1
 | Active phase, next targets, standing perf gate | `plans/ROADMAP.MD` |
 | Rules, paths, build, open technical gaps | `PS2_PROJECT_STATE.md` |
 | Every graphics/audio test route + harness + what it proves | `appendix-dc2-test-routes.md` |
+| **How to attribute a measured cost** (a layer, the GS worker, its blocked half, a surface, a sub-noise lever) | `appendix-dc2-attribution-recipes.md` |
+| **How to capture frames / gate a change on pixels** | `appendix-dc2-capture-and-gates.md` |
 | Any `DC2_*` env flag (rollback / instrument / ceiling probe) | `plans/env-flags.md` |
 | Why one phase did what it did | `plans/phase-<ID>-fix-log.md` |
 | Closed veins, NO-GO table, superseded numbers, old thread rankings | `plans/phase-history.md` — **grep it, never read top-to-bottom** |
@@ -127,7 +125,9 @@ during the 2026-07-31 documentation pass. The per-phase lessons kept below are t
 | Proven graphics facts (~50 diagnosed defects) + historical renderer snapshots | **`appendix-dc2-graphics-facts.md`** |
 | Runtime contracts: pad, audio, boot sinit, GS transfers, EE double/float, EABI, regen, guest lock, symbols/PR map | **`appendix-dc2-runtime-architecture.md`** (2026-08-03 split, moved out of `PS2_PROJECT_STATE.md`) |
 | Graphics + audio test route matrices, golden gate, route-selection table | **`appendix-dc2-test-routes.md`** (2026-08-03 split, moved out of `PS2_PROJECT_STATE.md`) |
-| Generic perf method distilled out of the DC2 arc | `17a-perf-measurement.md` §2, `17b-perf-levers.md` §2, **`17d-hot-loop-and-codegen-laws.md`**, **`17e-perf-measurement-traps.md`** |
+| The ten "how to attribute X" recipes (G583–G595), `§1.3d`–`§1.3l` | **`appendix-dc2-attribution-recipes.md`** (2026-08-17 split, G617 — they are method, not routes, and were the bulk of the route file) |
+| Capture/dump discipline + gate methodology (`§3.2a`–`§3.2d`, `§G610`, `correct_light` non-determinism) | **`appendix-dc2-capture-and-gates.md`** (2026-08-17 split, G617) |
+| Generic perf method distilled out of the DC2 arc | `17a-perf-measurement.md` §2, `17b-perf-levers.md` §2, **`17d-hot-loop-and-codegen-laws.md`**, **`17e-perf-measurement-traps.md`** (traps I) + **`17f-ab-gate-and-oracle-traps.md`** (traps II, 2026-08-17 split) |
 | DC2's closed perf veins + NO-GO table (what not to re-chase) | `plans/phase-history.md` → "Perf arc — CLOSED VEINS" |
 | Every `DC2_*` env flag | `plans/env-flags.md` (in the game workspace, not the skill) |
 

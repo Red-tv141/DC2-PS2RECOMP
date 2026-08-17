@@ -5,26 +5,26 @@
 > target frame is never reached. Do NOT load this while a correctness bug is open: optimizing a
 > wrong pipeline wastes the work and destroys your A/B baselines.
 >
-> **This is the ENTRY file: doctrine + a router.** The substance lives in five siblings —
+> **This is the ENTRY file: doctrine + a router.** The substance lives in six siblings —
 > `17a-perf-measurement.md`, `17b-perf-levers.md`, `17c-perf-gs-pipeline.md`,
-> `17d-hot-loop-and-codegen-laws.md`, `17e-perf-measurement-traps.md`. Load one or two of those
-> per §2 below; never all of them.
+> `17d-hot-loop-and-codegen-laws.md`, `17e-perf-measurement-traps.md`,
+> `17f-ab-gate-and-oracle-traps.md`. Load one or two of those per §2 below; never all of them.
 
 ---
 
 ## §1 Doctrine — The Five Laws
 
-0. ⭐⭐⭐ **A LEVER THAT CHANGES *WHO OWNS* PIXELS MUST BE GATED ON SCENES WHERE THE GUEST *WRITES*
+0. ⭐⭐⭐ **CHOOSE EXACTLY ONE GRAPHICS ROUTE: THE ROUTE MOST LIKELY TO BREAK FROM THE CHANGED
+   MECHANISM. A LEVER THAT CHANGES *WHO OWNS* PIXELS MUST USE A ROUTE WHERE THE GUEST *WRITES*
    PIXELS.** Residency, ownership, page-authority and cache-admission levers do not change *how
    fast* a frame draws, they change *which writer wins* — so they only misbehave where two writers
-   race, i.e. under **player-controlled motion, jumps, dashes and animation transitions**. A gate
-   set of scripted-camera cutscenes, static screens and golden title frames **cannot see that
-   class at all**.
-   *Real cost:* a phase promoted a residency widening past four green gates (golden title exact,
+   race, i.e. under **player-controlled motion, jumps, dashes and animation transitions**. A
+   scripted-camera or static route **cannot see that class at all**.
+   *Real cost:* a phase promoted a residency widening past four then-used checks (historical title exact,
    sky-defect detector 0 defects, two dungeon/town routes pixel-identical) and shipped a defect the
    user hit **every time the player jumped**. Every gate passed; none contained a jump.
-   → **Add one player-motion route to the gate set of any ownership lever, and require the user to
-   drive it if it cannot be scripted.**
+   → **For an ownership lever, make the one selected graphics gate a player-motion route when
+   motion is the likeliest failure trigger; require the user to drive it if it cannot be scripted.**
 0a. ⭐⭐⭐ **AN OWNERSHIP-INVARIANT COUNTER IS A CORRECTNESS GATE THAT MUST READ ZERO — NEVER A COST
    TO TRADE AGAINST ms/f.** In the same phase the runtime printed 2,505 `escaped writer` lines per
    run (0 with the rollback). They were tabulated as *the mechanism of a +3.4% slowdown* and the
@@ -64,7 +64,8 @@ work (one real arc spent seven consecutive phases optimizing the wrong thread th
 | "Measurement named a target — what mechanism do I build, and what will it really cost?" | **`17b-perf-levers.md`** — hotspot classes in a recompiled runtime, hot-loop/interpreter levers, cache & residency design rules, what NOT to do. |
 | "Measurement says the GS path is the pole." | **`17c-perf-gs-pipeline.md`** — parallel software rasterizer, GPU LLE, native-renderer admission/aliasing/presentation, each with its correctness contract. |
 | "The pole is a hot INTERPRETER / rasteriser loop — what shape of change actually wins?" | **`17d-hot-loop-and-codegen-laws.md`** — the live-value law, the inline-budget cliff, call-boundary pricing, store-forwarding bounds, the `/MAP`+capstone method, and how to design an A/B arm that cannot bias itself. |
-| "My measurement contradicts another measurement / a correct lever measured backwards." | **`17e-perf-measurement-traps.md`** — pole naming, censuses that move what they measure, pricing before building, running the A/B, harness hygiene. |
+| "My measurement contradicts another measurement — BEFORE the lever runs." | **`17e-perf-measurement-traps.md`** — pole naming, censuses that move what they measure (incl. a bucket spanning an admission boundary), pricing before building. Its §6 one-screen summary indexes both trap files. |
+| "The lever IS running and the GATE misbehaves — it read backwards, or `bad=0`, or a flag leaked." | **`17f-ab-gate-and-oracle-traps.md`** — arm scheduling (a branch is a conjunct), early prints that lie with huge `t`, **the subsystem-ceiling law**, blocked vs raw estimators, harness clear-lists, oracles that never ran. |
 | "Is this a *correctness* bug rather than a slow one?" | Stop. `15-vu1-interpreter-correctness.md` or `15b-gs-state-and-capture-ab.md`. Never optimize around an open correctness bug. |
 | "The threads deadlock / starve rather than run slowly." | `16-runtime-concurrency-threading.md`. |
 

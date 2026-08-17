@@ -147,8 +147,9 @@ whole-batch CPU fallback. Use this protocol:
    must materialize it. Generation equality alone is insufficient if a later writer republishes an
    older version.
 4. **An internal oracle does not prove final composition.** Batch-local CPU/GPU equality can pass
-   while a downstream consumer sees the wrong temporal version. Gate promotion on normal composed
-   frame dumps/window output across transitions and multiple routes.
+   while a downstream consumer sees the wrong temporal version. Choose exactly one graphics route:
+   the normal composed-output route most likely to expose the changed temporal boundary. Inspect
+   its full-frame distribution across that route's transition.
 5. **Make the presentation gate reference-backed.** When hardware/PCSX2 reference images exist,
    record the exact reference path, route state marker, capture clock/tick, and a landmark checklist
    covering the whole image — including left/right edges and background geometry, not only the
@@ -267,8 +268,8 @@ route that motivated it *and* on at least one other.
 Admitting more targets means more pages the GPU owns while the guest CPU is still writing. When the
 two collide the port logs an ownership-invariant escape and materializes to recover — and that
 recovery is a *repair*, not a design. One such widening measured a clean perf win on its motivating
-route and shipped a **user-visible graphical defect on every player jump/dash**, because the gate set
-contained no player-controlled motion. See `17 §1 Laws 0/0a`. **Gate residency on a motion route,
+route and shipped a **user-visible graphical defect on every player jump/dash**, because the chosen
+gate contained no player-controlled motion. See `17 §1 Laws 0/0a`. **Gate residency on a motion route,
 and require the ownership-invariant counter to read ZERO.**
 
 ### 4.4 An alias family is admitted WHOLE or not at all

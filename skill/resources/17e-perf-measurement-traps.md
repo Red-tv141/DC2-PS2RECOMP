@@ -1,11 +1,19 @@
-# 17e — Performance Measurement Traps
+# 17e — Performance Measurement Traps (I) — NAMING · CENSUSES · PRICING
 
 > **Generic (game-agnostic).** Every entry is a way a measurement lied, caught in a real port.
 > Read this WITH `17a-perf-measurement.md` (which defines the instruments) — `17a` says how to
 > measure, this file says how measurement goes wrong.
+>
+> ⭐ **This file covers everything BEFORE you have a lever running: naming the pole (§1), censuses
+> that move what they measure (§2), and pricing a lever before building it (§3).** The traps that
+> bite once you are RUNNING the gate — the A/B itself, harness hygiene, and oracles that report
+> "clean" because they never ran — moved to **`17f-ab-gate-and-oracle-traps.md`** (2026-08-17,
+> G617). §6's one-screen summary below indexes BOTH files.
+>
 > Companions: `17d-hot-loop-and-codegen-laws.md`, `17b-perf-levers.md`, `17c-perf-gs-pipeline.md`.
 
 ---
+
 
 ## §1 NAMING THE POLE
 
@@ -62,9 +70,89 @@ lever on the pole converts to frame time only until that happens (`17a` §2 law 
   because that increment moves the thread off the pole. Re-derive the arc's arithmetic from the new
   census before continuing it.
 
+### 1.8 ⭐⭐⭐ HEADROOM GOES STALE AFTER A PROMOTION — AND IT HAS CHANGED THE POLE MORE THAN ONCE
+
+§1.7 says a big win re-ranks the threads. The operational form of it: **the number that decides
+whether your next lever can pay — `pole − runnerUp` — is invalidated by your own last promotion**,
+and re-deriving it is one census run.
+
+One arc landed three consecutive VU1 promotions worth ~1.8, ~5 and ~2 ms/f of that thread's time.
+Each was real and each was measured on the thread. But the route's headroom was only ~1 ms/f, so
+after the first one **VU1 crossed BELOW the other worker** and the frame stopped following it: a
+mechanism reading **−23.7% of the pair loop** gated at **NULL (+0.023 ± 0.081)**. Two phases later
+the same route had flipped from 12.4% to **0% VU1-poled**, which un-shelved every lever previously
+parked for want of budget on the other unit.
+
+- **Re-derive the pole on the SHIPPED binary at the top of every phase.** Not from last phase's
+  table, and never from a table taken before a promotion that landed since.
+- **Quote the paired gate in %, never the level** — two census runs summarise different window
+  populations and their means are not comparable across sessions. Only the within-run derivative
+  (what fraction of windows each unit poled) is quotable.
+- A lever's prize is the **HEADROOM**, not the pole's busy time. Below the runner-up it buys nothing.
+
+### 1.9 ⭐⭐⭐ A SHARE OF A SUBSYSTEM IS NOT A PRICE, AND A SUBSYSTEM'S WALL TIME CAPS EVERY LEVER IN IT
+
+Two different errors with the same shape — a percentage read as if it were milliseconds.
+
+**(a) A share is not a price.** "This stage is 70% of the backend" does not license "removing it
+saves 70% of anything" until you know what the backend is in ms/f *of the frame*.
+
+**(b) The subsystem's total wall time is the CEILING on every lever inside it — check it BEFORE
+building.** One port cut the four largest leaves of one CPU replay lane by **−33%, −58%, −86% and
+−21% `cyc/inside`** across three phases, every one exact and every one confirmed in the lane. **Every
+frame gate after the first read null**, because the entire lane was **~1.1 ms/f of wall inside a
+34 ms frame** — and a lane saving is additionally divided by the lane fan-out before it reaches the
+frame.
+
+> Before building: convert the target population's lane time to wall
+> (`lane ms ÷ lanes ÷ frames`) and compare it to what your gate resolves (`17f §4.2a`). If the WHOLE
+> subsystem is below that, no lever inside it can produce a frame result — **decide on that basis and
+> say so in advance**, rather than reporting a surprised null afterwards.
+
+⭐ **The corollary is the valuable half.** If the subsystem you have been optimising is small and the
+thread's own time is large, **the time is somewhere you have not decomposed yet.** In that port,
+`GS own = 30.70 ms/f` against a band replay of ~1.1 — which proved the thread's 21.4 ms/f "front"
+interval was *not* the thing three phases had been optimising, and made decomposing it the only
+remaining question on the route.
+
+### 1.10 ⭐⭐⭐ A PC-SAMPLE BUCKET THAT CANNOT NAME A MODULE IS NOT "WAIT"
+
+A sampling profiler that reports a large bucket with no symbol — or one attributed to a generic
+`ntdll`/`kernel32` frame — is reporting **that it could not resolve the frame**, not that the thread
+was blocked. Naming it "wait" and then designing a lever to remove the wait is designing against the
+profiler's own failure mode.
+
+**Resolve it or discard it:** get the module name (`/MAP`, a symbol server, a manual return-address
+walk), or replace the inference with a *direct* measurement — a wall-clock bracket on the suspected
+blocking edge, which also tells you the count. A bucket you cannot name is not evidence for either
+answer.
+
 ---
 
 ## §2 CENSUSES AND INSTRUMENTS THAT MOVE WHAT THEY MEASURE
+
+### 2.0 ⭐⭐⭐ A BUCKET THAT SPANS AN ADMISSION BOUNDARY IS TWO POPULATIONS, AND ITS MEAN DESCRIBES NEITHER (G617)
+
+Once any fast path can REFUSE a work item, a census bucket that ignores the refusal averages two
+loops with different per-unit prices, weighted invisibly. One row read "≈15% of the workload at
+366–855 cyc/unit, and its items are small so rank it second"; split by admission it was **37.4% at
+819 cyc/unit — the largest single item present**, at 5.3× the admitted path's price.
+
+Two rules, both cheap:
+
+1. **Put the admission in the census KEY.** Derive the leaf from the admission boolean, and hoist
+   that boolean **above** the scope's loop mark, so one item cannot book its prologue to one bucket
+   and its loop to another.
+2. **Key a "shape"/state table on what SELECTS a kernel** — the sampler-enable bit, the format, the
+   filter — never on the primitive/type enum. A table keyed on type let textured and untextured
+   items share rows whenever the stale state matched.
+
+⭐ **The detector is free and should be run on every such table: the shape rows' unit counts must sum
+to the leaf's own.** Here they summed to **1.9×** it, in plain sight, for four phases.
+
+⚠️ **And a cumulative census is only PAIRED if both arms are read at the same boundary.** If it
+prints at fixed call counts, the two arms' final prints usually land on different ones — cumulative
+columns (`share%`, total ms) are then incomparable. Read the longer run's *earlier* block instead.
 
 ### 2.1 A census inflates its OWN bucket
 Timers around a stage charge that stage for the clock reads. A backend census read a readback bucket
@@ -326,245 +414,25 @@ removal ADDS**, and confirm with the site's own timer.
 
 ---
 
-## §4 RUNNING THE A/B
-
-### 4.1 Cross-run A/B can be DEAD on a host
-When run-to-run drift exceeds the effect, only a **within-process randomized A/B** can measure it.
-Randomize the arm inside one process and difference away the level.
-
-### 4.2 A paired A/B cancels the LEVEL, not the effect SIZE
-The paired form removes run-level drift; it does not make a small effect big. Power still matters:
-two runs of the same binary 20 minutes apart read **−0.12 (t = −1.1)** and **−0.75 (t = −11.9)**, and
-the null run's own standard error was 3× larger. **Promote — and refute — only on a run whose own
-`se` is in the usual band. Re-run before believing a null.**
-
-### 4.2a The DRIFT-CONTAMINATED estimator and the BLOCKED estimator can disagree — the blocked one wins
-A paired instrument usually reports two things: a raw pooled `delta` over the whole run, and a
-**blocked** estimate that differences each short window's two arm means before averaging. The raw
-delta still carries within-run drift; the blocked one is what the pairing was built for. One lever
-read a raw delta that was negative in **4 runs out of 4** (−0.110 / −0.036 / −0.067 / −0.453) while
-its blocked estimate flipped sign (−0.049 / **+0.089** / **+0.005** / −0.064) with |t| ≤ 0.96 and a
-favouring count indistinguishable from chance. **Verdict: neutral.** Sign consistency on the
-contaminated estimator is not evidence, and quoting "negative 4/4" would have promoted noise.
-
-*Corollary — price the lever before spending the runs.* That same lever removed a **measured**
-0.25 ms/f of work on an edge whose conversion had already been measured at 62%, i.e. ≈0.16 ms/f of
-frame — below the instrument's floor, and computable from the census before four A/B runs were
-spent. Multiply the removed work by the edge's known conversion first; if the product is under your
-floor, you already have the answer.
-
-### 4.2b A BIMODAL CONTROL makes a small paired gate read any sign you like — gate against BOTH modes
-
-A paired A/B assumes the two arms are sampled from distributions that differ only by the lever. When
-the **control** arm is bimodal and the candidate is not, a 2-pair or 4-pair gate is really sampling
-*which mode the control visited*, and its sign is close to a coin toss.
-
-Worked example (DC2 G528). Six runs of the identical rollback configuration on one route produced
-**36.99 · 37.19 ‖ 42.01 · 42.21 · 42.37 · 42.61** — two clusters 5.6 ms/f (14%) apart — while the
-candidate produced a single cluster. The first confirmation gate happened to draw one control run
-from each cluster and reported **mean −0.03%, 1/2 negative**, with one pair at **+6.92%**. Two more
-pairs, one of which caught the control in its *fast* mode, read **−4.55% and −5.42%**. Pooled: 9 of
-10 paired runs negative.
-
-**The decisive test is not more pairs, it is a pair against the control's FAVOURABLE mode.** If the
-candidate beats the control when the control is at its best, mode selection cannot explain the win.
-Diagnose the shape first: sort each arm's per-run medians and look for clustering before averaging —
-a bimodal arm is visible in six numbers and invisible in a mean.
-
-Corollary: **"route X is the stable one" expires.** The same route that repeated to 0.36 ms/f in one
-gate spanned 14.6% two hours later. Stability is a property of the host at that moment. Re-derive it
-from the run medians in the gate you are actually quoting, never from a previous phase's claim.
-
-### 4.3 An absolute ms/f from a LOADED host is not a baseline
-Mid-session readings rose to 27–39 ms/f and drifted upward *inside a single run* (29.9 → 39.4 on
-identical frames) with a browser and editors resident. Quiet-host runs on the same binary read
-25.15–26.03, flat. **Check the trend WITHIN the run before believing any level**; this is exactly what
-the paired within-process form exists for.
-
-### 4.4 Ballast is a SCREEN, not a gate
-Repeating a site's work N times measures the site's critical-path SENSITIVITY — multiply an isolated
-saving by it before promising frame payoff. It screens out insensitive sites; it does not promote.
-
-### 4.5 An in-binary switch is not a control for a SHAPE change
-A runtime selector pollutes both arms' code layout. Test code/data **shape** changes against a saved
-control binary, or against a compile-time loop COPY (`17d §6.4`).
-
-### 4.6 A "neutral" verdict EXPIRES with the pole — but check the arm is still REACHABLE first
-A lever measured on an insensitive thread was never measured; re-price shelved levers when the pole
-moves, and expect **both** signs (`17a` §2 law 7d).
-
-**But the re-price can be invalid in the same way the original was.** The worked case here is a
-cautionary one, because the skill carried its wrong conclusion for twelve phases. A shelved
-run-executor lever was re-priced on the new pole and read **+0.34 ms/f SLOWER, 6/6 windows** — a
-clean, well-powered, entirely consistent result, recorded as *"an old neutral was hiding a real
-regression"* and promoted into the NO-GO table, where it became the gate on an architectural arc.
-
-It was measuring nothing. The lever's arms sat below an `if/else if` loop-copy arm whose predicate had
-been **promoted to default-true two phases after the lever was shelved**, so the candidate flag could
-no longer select the candidate copy — it only dropped the run onto an older, slower copy. Both arms
-were pre-promotion bodies. Rebuilt correctly, the mechanism was worth **−1.91 ms/f** and moved the
-pole off that thread entirely.
-
-**So the re-price protocol is:** (a) confirm the arm can still be SELECTED — re-read the selector
-chain (`17d` §6.4a) and require a proof-of-selection line from **both** arms of the paired run
-(`17d` §7); (b) confirm the CONTROL arm is the current shipped default, not a body that has been
-superseded since; only then (c) believe the sign. A consistent, high-`t` result from an arm that is
-not the arm you think it is looks exactly like a real finding.
-
-### 4.7 Verify by FULL-FRAME DISTRIBUTION, never a single golden sample
-Aggregate pixel counts are blind to dropouts over opaque scenes. Review multiple frames and check
-edges/background as well as the main subject.
 
 ---
-
-## §5 HARNESS HYGIENE
-
-### 5.1 A flag not in the harness's CLEAR-LIST leaks into every later run
-A harness that saves/restores only the variables it lists will let a census flag armed once persist
-for the rest of the session — running later A/Bs on a different, slower code path — while the
-harness's own environment echo looks perfectly clean, **because it echoes only what THIS invocation
-set. The echo proves what was set, never what was already there.** Add every census/verify/proof flag
-to the clear-list in the same edit that adds the flag.
-
-### 5.2 Invoke a perf harness IN-PROCESS, never through a nested shell
-`powershell -ExecutionPolicy Bypass -File script.ps1 -Set 'A=1','B=1','C=1'` is a **native command
-line**: it flattens the array argument into the SINGLE string `A=1,B=1,C=1`, so the script sets only
-`A` — to the truthy garbage value `1,B=1,C=1` — and silently drops every later flag, while the
-harness's own echo still looks plausible. A nested `powershell -File` can also no-op entirely and
-leave you reading a stale log.
-**Call the script directly in the current session**: `& 'path\script.ps1' -Set @('A=1','B=1')`.
-
-### 5.3 An up-to-date target does NOT relink
-`cmake --build` reports success without relinking, so `$env:LINK='/MAP:…'` silently produces no map.
-Force a recompile before any link-time diagnostic.
-
-### 5.4 Never pixel-diff same-numbered frames across two runs
-Frame filenames are host ticks, not guest frames. Cross-check the route reached the intended mode via
-a state trace before comparing anything.
-
-### 5.5 ⭐⭐⭐ WHEN A LEVER CHANGES SPEED, EVERY CLOCK INDEXED BY ELAPSED FRAMES DESYNCS
-On a fixed-wall-clock scripted route the faster arm **plays more of the game**. Both the perf number
-and the pixel comparison are then computed over *different scenes*, and both lie — in opposite
-directions.
-
-*Perf:* one arm reached 6,452 frames where the other reached 5,847 in the same 200 s. Three ways of
-computing the same delta: naive whole-run mean **−9.4%**; bucketed by script position, all common
-buckets **−10.7%** (inflated — the extra tail buckets are ones the slow arm barely entered, 32
-samples against 273); bucketed **and restricted to buckets with matched sample counts** → **−9.9%**,
-the only honest one.
-
-*Pixels:* a per-tick comparison of the same cutscene showed median mean-byte **−9.76** with 145/176
-frames differing — which reads as a severe rendering regression. The faster arm was simply rendering
-**1.42× more guest frames per tick**, i.e. showing a *later moment*. Fitting the time scale (best
-fit **1.450**, matching the measured ratio) collapsed it to median **+0.23**, mean **−0.20**,
-21/122 — no divergence at all.
-
-**Method.** Find the clock the *script* uses (the pad-replay frame index), not the guest frame
-counter or the host tick:
-1. bucket frame times by script position (e.g. `scriptFrame // 200`);
-2. **drop any bucket where `min(nA,nB) < 0.95 · max(nA,nB)`**;
-3. report the pooled mean, the fraction of buckets favouring the candidate, and the per-run means so
-   their ranges can be checked for overlap;
-4. for pixels, fit the scale factor between the two dump sequences and compare **fitted pairs**,
-   reporting the signed mean (bias) as well as the absolute.
-
-If the arms cannot be aligned, the route cannot decide the lever — say so rather than quoting the
-naive number.
-
-### 5.6 ⭐⭐⭐ "TAG X PRECEDES 63% OF SPIKES" IS NOTHING WITHOUT THE BASE RATE
-Hunting isolated frame spikes, one log tag preceded **55 of 87** of them. Decisive-looking — and
-wrong: the run emitted 2,505 of those lines over 3,525 frames (**0.71/frame**), so ~50% of *any*
-frame class has one before it. The control settled it outright: the arm that emits **zero** such
-lines had **86** spikes against the other's 87. Same spikes, unrelated mechanism.
-
-**Always compute enrichment against a normal-frame control:**
-`enrichment = (occurrences per SPIKE frame) ÷ (occurrences per NORMAL frame)`, and report both
-columns. Doing that left exactly one enriched tag — and it covered 7 of 86 spikes, so the honest
-conclusion was **"~90% of these spikes emit nothing; no shipped instrument covers them"**, not a
-false attribution.
-⚠️ Corollary: a tag firing thousands of times per run is a **background process**, not an **event**.
-Spike causes are rare by construction — rank candidates by *rarity × enrichment*, never raw count.
-
-### 5.7 ⚠️ A BUNDLE OF FLAGS FLIPPED IN ONE EDIT IS ONE LEVER WITH N UNKNOWNS
-Four residency flags were promoted together on a **−22.0%** route-aligned result. A parallel session
-had independently measured one of them, **alone**, as "pixel-exact but slightly *slower*" on that
-same route. Both can be true: three positives can carry a negative. A bundle result licenses the
-bundle and nothing else — **re-gate any member you intend to rely on, cite, or build upon
-individually.**
-
----
-
-## §5.4 AN INSTRUMENT WHOSE FAILURE LOOKS LIKE ONE OF ITS ANSWERS
-
-**A ballast the implementation may legally DISCARD is not an instrument.** A derivative probe injects
-a known cost and divides the frame's response by it. If the injected work can be optimised away by a
-compiler, a driver or the hardware, the probe injects nothing and reads **sensitivity ≈ 0** — which is
-also the reading for a genuine "this unit has slack" verdict. The probe then cannot be falsified, and
-the phase concludes the opposite of the truth.
-
-Worked example (DC2 G496). The proposed GPU ballast was to re-issue the geometry with
-`glColorMask(0,0,0,0)`, `glDepthMask(GL_FALSE)` and the depth test disabled — "the GPU redoes the
-full fragment work and not one byte changes". Windows GL drivers are documented (and were already
-documented *inside that project's own renderer*) to **elide a fragment invocation whose only
-framebuffer output is fully masked**. The admissible shape was an **identity blend** —
-`glBlendFuncSeparate(GL_ZERO, GL_ONE, GL_ZERO, GL_ONE)` ⇒ `dst = 0*src + 1*dst = dst` — with depth
-writes masked: every fragment is rasterized, shaded, blended and **written**, so nothing can elide it,
-and the byte written is the byte that was already there. It measured 0.70, not 0.
-
-General forms of the same trap: a CPU ballast the optimiser can hoist or dead-code away (sink it
-through a `volatile` or an atomic), a memory-traffic ballast that the cache absorbs (stride past the
-cache), and any "idempotent repeat" whose second execution the target is free to skip.
-
-**The rule:** before building any probe, ask *"if this silently did nothing, what would it print?"*
-If the answer is one of the readings you intend to act on, redesign it.
-
-### §5.4b AN ORACLE MUST ASSERT THE INVARIANT, NOT THE ABSENCE OF SUBSEQUENT WORK
-
-When the lever's whole purpose is **to stop doing work that was not needed**, the tempting oracle is
-"run the new path, then run the old path, and assert the old path finds nothing left to do." That
-oracle is guaranteed to fail, and it fails **exactly in proportion to how well the lever works.**
-
-*"The old path would still do something"* and *"the new path skipped something REQUIRED"* are
-different propositions. Only the second is a defect. An oracle that cannot tell them apart reports
-100% of the intended saving as a correctness failure.
-
-Worked example (DC2 G528). The lever scopes a whole-state publication edge to the ranges the
-consuming batch actually touches. Its first oracle ran the whole-state publish afterwards and counted
-the work it still did: **`miss(disp=344 depth=344)` on 2,000 batches** — a 17% "failure rate" that
-was entirely the disjoint batches correctly leaving a display readback coalesced, which is the
-documented, intended behaviour of the very function being called.
-
-The fix is to state the safety property and test *it*: the consumer reads and writes exactly the
-pages in its own read/write sets, so a publication was required **iff a region the producer still
-owns INTERSECTS those pages**. Re-stated that way — enumerate every still-pending producer-owned
-region and test overlap against the subject's own ranges, counting an unresolvable range as a miss —
-the same run read **0/0/0/0**.
-
-**The rule:** an oracle for a "do less" lever must quantify over the SUBJECT's requirements, never
-over the old path's behaviour. Write down the invariant in one sentence before writing the check; if
-the sentence mentions the old code rather than the data, the oracle is wrong.
-
-Corollary, and cheap: report the arm-selection counters next to the miss counts
-(`scoped / whole / unknown / null`). A lever that fails closed on most calls gates at zero and is
-indistinguishable from a broken one; G528's `scoped=2000 whole=0 unknown=0 null=0` is what proves the
-0/0/0/0 was earned on the full population rather than on a handful of calls.
-
-### §5.4a THE DETERMINISM CONTROL — before you believe any A-vs-B artefact diff
-
-A byte-identical output comparison is only a parity oracle if the pipeline is deterministic at the
-granularity you are comparing. Run the **same binary with the same flags twice** and diff those first.
-
-DC2 G496: candidate-vs-rollback frame dumps differed on **99 of 103** frames — and the same-config
-control differed on **97 of 103**, because the routes are wall-clock driven and the animation phase at
-a given dump tick is not reproducible. The admissible test is the **quantile-matched distribution** of
-a per-frame scalar (there, `PixelNonZero`) over every captured frame, with the requirement that the
-arm difference sits inside the control's spread. It did: meanΔ 69 px between arms against 111 px
-between two identical runs.
 
 ## §6 THE ONE-SCREEN SUMMARY
 
 | Before you… | …first |
 |---|---|
+| build ANY lever inside a subsystem | convert the SUBSYSTEM's total time to wall ms/f and compare it to what your gate resolves — if the whole subsystem is under that, no lever in it can pay (§1.9) |
+| start a phase | re-derive the pole on the SHIPPED binary; your own last promotion invalidated the headroom (§1.8) |
+| rank buckets from a census | check no bucket spans an ADMISSION boundary, and that the shape rows' counts sum to the leaf's (§2.0) |
+| call a profiler bucket "wait" | resolve its module — an unnamed bucket is a profiler failure, not a blocked thread (§1.10) |
+| carry a stage ranking to another population | don't — a stage's share belongs to the LEAF that implements it and to its hit rate (`17d §9a.2`) |
+| profile a hot leaf | grep it for function-local `static`/`…On()` flag accessors first — each is a per-access TLS guard (`17d §9a.1`) |
+| dismiss a memo whose hit rate is ~0 | ask why the key never repeats; a re-keying may be exact and halve the work (`17d §9a.3`) |
+| rank an INTERPRETER's stages by deletion | don't — the deleted slot writes the guest's own induction variables (`17d §9b`) |
+| report a NULL A/B | print how many times the candidate arm took the NEW path — exact levers can measure null by never diverging (`17f §4.8`) |
+| compare two arms' captured output | run ON/ON′/OFF/OFF′ and read the PAIRED EXCESS; two runs of one binary do not agree (`17f §4.9`) |
+| re-open a "refuted" lever | check whether the ROUTE or the PROBE that refuted it has since improved (`17b §2.x`) |
+| rank defects to fix | rank by BLAST RADIUS, not firing rate; a rare fallback that mutates shared state is top-tier (`17b §2.y`) |
 | rank threads | take the LIGHT occupancy census; probes are secondary (§1.3, §2.2) |
 | trust a profiler row | install a call/visit counter (§3.1) |
 | build a memo/cache | compute the FULL identity's hit rate (§3.5) |
@@ -600,75 +468,8 @@ between two identical runs.
 
 ---
 
-## §6 ORACLES THAT NEVER RAN — the failure mode that reports "clean"
+> ⭐ **§4 (running the A/B), §5 (harness hygiene), §6 (oracles that never ran) and §7 (weak-key
+> reuse) are in `17f-ab-gate-and-oracle-traps.md`.** Section numbers there are unchanged, so every
+> bare `§4.x`, `§5.x`, `§7.x` reference in the table ABOVE resolves in that file; bare `§1.x`,
+> `§2.x`, `§3.x` resolve here.
 
-An exactness oracle is a *conditional* instrument: it compares only the items its activation
-predicate selects. Every way that predicate can select **nothing** produces the same output as a
-perfect pass. One port hit **four distinct instances in a single arc**, each costing a run.
-
-### 6.1 ⭐⭐⭐ The optimization under test CHANGED the activation predicate
-The oracle was set to fire on "batches with ≥64 entries", to skip the cheap startup traffic and
-reach the dense population. It never fired. **Because the residency lever being tested coalesces
-that target into ONE-ENTRY GPU batches** — so the very success of the optimization made the
-oracle's size trigger unsatisfiable, and the census reported nothing rather than an error.
-
-The fix was to re-key the trigger on something the lever cannot move (a *late-route attempt count*:
-compare after the 10,000th batch, regardless of size).
-
-**Rule: an oracle's activation predicate must be expressed in a quantity the lever under test cannot
-change.** Batch size, draw count, buffer occupancy and path-taken flags are all things a lever
-routinely alters. Wall-clock position, route position, and cumulative attempt counts are not.
-
-### 6.2 The oracle's own plumbing DISABLED the mechanism it was comparing
-Twice, in the same arc:
-- the diagnostic switch that enabled the comparison **disabled GPU residency globally**, so the
-  "GPU" arm was really a CPU arm and every comparison was CPU-vs-CPU;
-- after that was fixed, a second switch still **forced every RTT batch back to the CPU on GPU
-  success**, even on batches the oracle had skipped.
-
-Both times the output looked plausible. **Check that an armed oracle run still takes the promoted
-path** (`§2.4`) by printing a one-shot line naming the code path that actually executed, and assert
-that the comparison count is non-zero before reading any verdict.
-
-### 6.3 The oracle refused the batches by CONTRACT and reported zero comparisons
-A colour-only RTT oracle was pointed at a target whose late traffic carries **guest depth**. The
-oracle is specified to refuse depth batches, so it executed, refused everything, and printed a
-comparison count of **zero** — not an error, and not a pass. Recognised correctly here ("comparison
-count stays zero by design — no false pass"), but only because the count was printed.
-
-### 6.4 The verifier's own writes contaminated the comparison
-A candidate's early loads read RAM that the *generic* arm's tail stores had already modified, so the
-two arms did not start from identical state and the oracle reported a mismatch that was an artefact.
-Isolating the two exact store targets fixed it — **without** copying 16 KB per hit.
-
-### 6.5 THE STANDING RULE
-> **Print the comparison COUNT beside every `bad=` figure, and treat `compared=0` as a FAILED run.**
-
-`bad=0 compared=0` and `bad=0 compared=1,600,000,000` are the same string minus the count, and only
-one of them is evidence. This is the oracle-side twin of "a null A/B needs a path counter proving
-the arms diverged".
-
----
-
-## §7 A WEAK-KEY REUSE RATE IS NOT A MEMOIZATION OPPORTUNITY
-
-A census reported same-frame state reuse of **26–28%** and previous-frame reuse of **14–33%** on a
-heavy route, explicitly noted as reversing the lean baseline's premise — a strong-looking case for
-memoizing the executor.
-
-The full-identity census (hashing **two 16 KB state images plus registers** per invocation, and
-verifying that identical pre-keys really do produce identical post-state) then found **zero valid
-same-frame repeats**. The 26–28% was entirely an artefact of a key that ignored most of the state.
-
-**Rule: a reuse rate is only actionable at the granularity of the FULL key you would have to compare
-at runtime.** Before designing a cache, take the census with the complete key — including the state
-you are hoping does not matter — and require it to *also* verify that equal keys imply equal
-results. A weak key inflates the rate and a memo built on it is a correctness bug, not a speedup.
-
-Related: a rate is not a price (`§3`), and a partial key is the same error as a colliding histogram
-index (`§2.5`).
-| build the 2nd/3rd implementation of a refuted lever | first check whether all arms cost the SAME — identical penalties mean the ADMISSION TEST is the cost, not the body (`17d §11`) |
-| read `bad=0` from an oracle | read the COMPARISON COUNT beside it; `compared=0` is a failed run, not a pass (§6.5) |
-| set an oracle's activation trigger | express it in a quantity the LEVER CANNOT CHANGE — the lever coalesced batches to 1 entry and the "size >= 64" trigger never fired (§6.1) |
-| design a cache from a reuse rate | re-take it with the FULL runtime key; a 26-28% weak-key rate went to ZERO under full identity (§7) |
-| add a GPU residency slot | enumerate every CONSUMER's index bound first; check `waves ~= materializations`, which means the content dies on arrival (`17c §4.1`) |

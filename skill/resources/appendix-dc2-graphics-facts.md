@@ -19,6 +19,26 @@
 > `15b-gs-state-and-capture-ab.md` (pixel-class).
 
 Proven fixes and operating facts (some unconditional, some retired, others kill-switch gated):
+- **`s05` Monica's hair-band flicker fixed (G601, 2026-08-16):** an **EMPTY FOOTPRINT SATISFIES A
+  "FOR ALL TAPS" ADMISSION CRITERION — IT DOES NOT FAIL IT.** The band is a two-pass offscreen
+  effect: the guest clears `x=403..492 y=125..211` of `FRAME fbp=0x13a fbw=8 CT32` to
+  **`RGBA=(0,0,0,0)`** (so the RTT's ALPHA is the mask), draws the band mesh into it with
+  `TEX0 tbp=0x2720/T8/tbw1 64x64`, then composites it onto the display with **51 sprites** reading
+  `TEX0 tbp=0x2740 tbw=8 CT32 512x512 TCC=1 TFX=0`, `ALPHA=(Cs−Cd)*As+Cd`, `TEX1=0x261` (bilinear),
+  `CLAMP=0x5`, `fst=1`, `iip=0`. Two vertex colours only: **3 sprites at `(128,128,128,128)`** — a
+  native-colour copy, i.e. the band itself — and **48 at `(80,60,0,128)`** — the gold rim. The band
+  is **not** in the `0x139` scene RTT, so losing that read deletes it outright.
+  ⭐ On every 4th guest frame one composite sprite is sub-pixel on one axis and covers **no GL pixel
+  centre**, so it has no nonzero-weight tap; `g263BilinearSpriteBind` returned false
+  (*"nothing provable"*), its fallback ran `g261Materialize(0x13a)`, the G536 page-ownership guard
+  withheld **73 pages** (exactly `0x13a`'s guest-VRAM overlap with sibling `0x159`, published two
+  targets earlier in the SAME per-entry pass) — and `dirty` was cleared anyway, so the other 50
+  sprites hit `if (!r.dirty) continue;` and decoded **black**. Fix: admit the empty primitive; a
+  tap-bounds QUERY still fails closed. Rollback `DC2_G601_NO_EMPTYBIND=1`.
+  ⚠️ **Still true and still armed:** `g261Materialize` clears `dirty` even for guard-withheld pages,
+  and `0x13a`/`0x159` overlap by 73 pages while both hold full-height 512×416 residency windows
+  (the guest only renders rows ~125..211 of `0x13a`). On hardware there is no conflict — the guest
+  consumes `0x159` before it writes `0x13a`.
 - **Map 125 shadow-edge residue fixed (G408, 2026-07-29):** treat a textured alias pass as
   a consumer until the source bytes are proven clean. Here, the visible T8 pass
   (`TBP=0x2720`) reads the same live memory as shadow target `FBP=0x139`
@@ -167,6 +187,44 @@ Proven fixes and operating facts (some unconditional, some retired, others kill-
   ⚠️ **`[G261:invariant]` silence does NOT exonerate a publication** — that check never runs at the
   publication edge. ⛔ Do not re-chase G530/G526/G291/G310/G264/G522/G289 for this class; each was
   refuted by its own arm. See `plans/phase-G536-fix-log.md`.
+- **⭐⭐⭐ MAP-15 TOTAL background replacement — a SECOND, distinct defect at the same address; it is
+  a DEPTH defect (G598 diagnosis REFUTED by G599, 2026-08-15):** for scriptFrames **~1958–2440** (~5.4 s,
+  script-deterministic) the whole MAP-15 exterior background — sky *and* distant hills — is replaced
+  by a smooth stretched stone/crack texture with a soft dark block. **This is not G536's variant:**
+  G536's was 256×64 page blocks whose content **changed every frame**; this one's sky-band
+  frame-to-frame delta is **0.00** while the camera pans (whole-frame delta 4.7), i.e. a **stale
+  read**, not live FBO data.
+  **The guest is innocent (G598, stands):** both arms gated at the same script instant
+  (`DC2_G598_GS_AT_SF`, `sf=1981 n=902`), `(fbp,tbp,psm)` census reads **`fbp=0x13b tbp=0x2720
+  psm=19 (PSMT8)` = 14,352 in both, delta 0**. Whatever is wrong is entirely in the port.
+  ⭐⭐⭐ **CAUSE (G599, 2026-08-15): the shared ZBP `0xd0` GPU DEPTH — NOT the VRAM content.**
+  Five arms take it **8/28 → 0/28**: `DC2_G411_NO_GPU_SHARED_Z=1` (80.8 ms/f),
+  `DC2_G265_NO_DISPLAY_ZWAVE=1` (76.6), `DC2_G262_NO_WIDE=1`, `DC2_G203_LEGACY_Z=1` (69.5),
+  `DC2_G400_NO_RESIDENT_139=1` (45.6). All are 1.8–3.3× too slow to ship. The broken band is **near
+  cliff geometry winning the depth test**: `DC2_G534_NOSKIP=1` (re-upload the CPU mirror over the
+  retained GPU depth) turns the **whole frame** into that same rock, which also proves the retained
+  texture is the current copy and the mirror the stale one.
+  ⛔ **G598's cause is REFUTED.** `[G599:who]` fingerprints the pages the sky's PSMT8 view occupies:
+  **one distinct hash per page, identical in the 8/28 arm and the 0/28 arm**, 550 reads each.
+  Deleting the ENTIRE guest-VRAM write of every 0x139 publication (`DC2_G599_NOPUB=139`, **at the
+  control's own 25.4 vs 24.8 ms/f**) reads 8/28, as does forcing the VRAM→FBO upload
+  (`DC2_G599_FORCEUP=139`). Denying every FBO texture source (`DC2_G599_NOBIND=1`) makes it **worse**
+  (15/28) — the bind is protective.
+  ⛔ **REFUTED at 8/28, do not re-chase:** `G536_NO_PAGEOWN`, `G528_NO_PUB`, `G310_NO_T8_VIEW`,
+  `G310_NO_LOGICAL`, `G310_NO_ALIAS_RETIRE`, `G260_NO_SKIP`, `G283_NO_AUTHORITY`, `G264_NO_UP_FBO`,
+  `G288_NO_GPU_CONSUMER`, the whole READ side (`DC2_G598_T8ANY=1`, which reads `dirty=0 anyDirty=0`
+  at the 128×128 consumer), `G591_NO_PRIVZ`, `G535_NO_EDGEPUB`, `G534_ZSRC_VRAM`,
+  `G588_NO_SOLID_SPRITE`, `G534_FULLZ` (9/28), and the 512-wide T8 view `DC2_G599_T8WIDE=1` (built,
+  **admitted** — `[G598:t8why] ADMIT … 512x512` — still broken).
+  ⛔⛔ **`DC2_G400_NO_RESIDENT=13b` IS AN INERT ARM** — `g400NoResident()` switches only on
+  `{0x139,0x13c,0x143,0x146,0x155}`. G598 quoted it as the control that killed the frame-rate
+  confound; it measured the control binary. The confound is instead killed by `DC2_G599_T8WIDE=1`
+  being **broken at 135.6 ms/f**, slower than every fixing arm.
+  ⚠️ **The control flow does NOT discriminate the window** — `[G599:flush]`/`[G599:zseq]` are
+  identical clean vs broken (same targets, counts, depth keys, `skip=1 pend=1 eligible=1`), so the
+  next phase must compare depth **content**. Note the wide 0x139 scene batch reads `guestDepth=0
+  zbp=0x0` although G404's header says the guest renders it against ZBP `0xd0`.
+  See `plans/phase-G599-fix-log.md` (and `phase-G598-fix-log.md` for the script clock).
 - **MAP-0 environment Z promoted with lifecycle guard** (G202): real HW z-tests town display
   geometry with `ZBUF_1 zbp=0xd0`, `PSMZ24`, `ZTST=GEQUAL`. The runtime honors that only for
   ready town/edit frames (`LoopNo==1`, live scene/camera/map) and clears Z24 page `0xd0` to
@@ -186,8 +244,9 @@ Proven fixes and operating facts (some unconditional, some retired, others kill-
   stored raw edge-vector float bits = the "beam shard" spanning triangles. Kill
   `DC2_VU1_NO_PAIRHAZ`. Rasterizer band-aids retired default-off: G89 guard
   (`DC2_G89_FORCE_GUARD_CULL=1`), G104/G125 near-plane tri clip (`DC2_G104_FORCE_TRI_CLIP=1`),
-  G128 behind-drop (`DC2_G128_FORCE_BEHIND_DROP=1`); the G125 title Z stays default-ON. Golden
-  title smoke now `PixelNonZero=211646`. See `plans/phase-G139-fix-log.md`.
+  G128 behind-drop (`DC2_G128_FORCE_BEHIND_DROP=1`); the G125 title Z stays default-ON. The
+  historical G139 title capture measured `PixelNonZero=211646`; it is not a current required gate.
+  See `plans/phase-G139-fix-log.md`.
 - **Title water / clipped geometry restored — G64 band-aid RETIRED** (G140): the HW dump's
   1012 "trifan" verts are the **VU1 polygon CLIPPER's output**, not a `0x1c50` object route.
   Title VU program layout (decoded G140): PRE-dispatcher at VU `0x5e0` routes selector-bit1
@@ -197,7 +256,8 @@ Proven fixes and operating facts (some unconditional, some retired, others kill-
   The June G64 "enable fix" (IAND patch at pc 0x30d8/0x30f8/0x3168) had inverted the clipper's
   inside/outside test — retired default-OFF, re-enable `DC2_G64_FORCE_ENABLE_FIX=1`. Census
   lever `DC2_G140_CLIP`; the `[G39:code]` microcode dump now covers the FULL program. Golden
-  smoke unchanged `211646`. **Title render is COMPLETE vs `ref/dumps/new_game_via_debug.png`.**
+  historical capture count stayed `211646`. **Title render is COMPLETE vs
+  `ref/dumps/new_game_via_debug.png`.** This is historical evidence, not a required smoke.
   See `plans/phase-G140-fix-log.md`.
 - **GS rasterizer PERFORMANCE (G141-G145, the DC2 instance of `17-performance-optimization.md`
   `17c-perf-gs-pipeline.md` §1)** — measured: the GS software rasterizer is ~53% of the title frame; `DC2_PERF=1` prints the
@@ -224,8 +284,11 @@ Proven fixes and operating facts (some unconditional, some retired, others kill-
     default 211644, G144 tilebin 211650, G145 opt-in 211646, kill-switch fallback 211644. Dirty stats
     proved the lever is active (`flush=545 skip=479` sampled), but perf is modest/noisy and dungeon
     3D soak is still required before promotion.
-  - **All perf wins gate on nonzero-count `211646±4` + visual A/B (NOT byte-hash — the title animates).**
-    Open: dungeon-3D tile-binned soak before promoting any default-OFF lever to default-ON.
+  - **Historical title counts are not a current required gate:** a host-tick capture can still be
+    FMV. Gate a perf win on the single gameplay route most likely to break from its mechanism,
+    state-confirmed arrival, that route's full-frame distribution, and visual review. Open:
+    dungeon-3D tile-binned soak before promoting any
+    default-OFF lever to default-ON.
     Detail `plans/phase-G14{1,2,3,4,5}-fix-log.md`.
 - **Presentation model = frame-boundary snapshot ONLY (G175):** the host present thread must never
   call `latchHostPresentationFrame()` per tick — that snapshots live VRAM mid-frame (~10×/guest
@@ -318,7 +381,7 @@ Proven fixes and operating facts (some unconditional, some retired, others kill-
   the sign, or any presentation route regresses, remove the behavior path completely; keep only
   cached default-off diagnostics, record the blocker, and open the smallest new ownership mechanism.
 - **Presentation-gate blindness + gen-sum slack conventions (G277, durable):** PixelNonZero (and
-  therefore the dense-title gate) CANNOT see a character dropout over an opaque scene — MAP-0's
+  therefore the historical dense-title check) CANNOT see a character dropout over an opaque scene — MAP-0's
   count stayed 211650 while Max's body toggled on half the frames. Any display-color/residency
   lever must gate on a dense MAP-0 body-presence/content-diff check (frame-to-frame changed-pixel
   bbox, or a body-box non-grass classifier). Also: `g178BumpRectImpl`/`g178GenSumRect` both use a
@@ -488,15 +551,17 @@ archived in `plans/phase-history.md`; do not act on old snapshots of it.
   zbp=0xd0 — honest, UNBOUNDED, own phase); (e) pillar-1 compact GIF parse (~160 ms, largest
   untouched bucket). Do NOT widen the classifier on drain evidence (G266 refuted) or re-chase
   the fbw split as a ms win (proven neutral; it is GPU-coverage substrate).
-- Baseline title gate: held-menu `frame_001500 PixelNonZero=211646 ±4`, `h=415`, FULL-FRAME
-  DISTRIBUTION + visual review, never one sample, never byte hashes (title animates). For
-  threading/pipelining/deferral levers, dense soak `DC2_FRAME_DUMP_EVERY=1` (G174/G249: 60-tick
-  cadence misses transient races and temporal dropouts).
+- Do not require the historical held-menu `frame_001500` title count: host tick 1500 can still be
+  FMV. Use the single state-confirmed gameplay route most likely to break, FULL-FRAME DISTRIBUTION
+  + visual review on that route, never one sample. For threading/pipelining/deferral levers, dense
+  soak on that route with `DC2_FRAME_DUMP_EVERY=1`
+  (G174/G249: 60-tick cadence misses transient races and temporal dropouts).
 - Perf A/B point: `tools/run_g194_map0.ps1` steady DngStatus=0 windows (`[G154:perf]`), ≥3
   reps/arm, claim only non-overlapping arms. 60fps accelerant for 30fps routes:
   `DC2_PATCH_60FPS=1` (opt-in, no-op on title).
-- Smoke: `tools/run_30s_diagnose.ps1` (pins `DC2_PAD_INPUT`); validate
-  `captures/frame_001500.ppm` with `skill/scripts/ppm_nonzero.py`.
+- Smoke: select exactly one gameplay route from `appendix-dc2-test-routes.md`—the route most likely
+  to break from the change; assert arrival by game state and validate its captured distribution
+  with `skill/scripts/ppm_nonzero.py`.
 - Use the build wrappers (`build_rt.bat`/`build_runner.bat`) and read `BUILD_EXIT` from
   `build_out.txt` / `runner_out.txt`; the wrapper process exit code is not reliable.
 - Loop-state legend (`LoopNo@0x00376FCC`): 0=boot, **1=town/edit loop (EditInit@0x1A9F40 /

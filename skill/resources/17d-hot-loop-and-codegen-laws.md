@@ -82,6 +82,33 @@ carrying 24.8% of the profile — measured **−0.008 ms/f**. The value had been
 iteration's own tail*, so it was an L1 store-to-load forward with a whole loop body of independent
 work in between; the loop's ILP already hid it.
 
+### 2.1b ⭐⭐⭐ The prologue is set by the COLDEST code in the function (G602)
+
+§2.1 prices the call boundary. **This is where that price comes from**, and it is usually not the
+work. MSVC allocates the callee-saved register file — including the ten nonvolatile XMMs — and the
+`/GS` cookie for the **whole function**, based on what any path in it needs. So a large,
+**never-executed, default-off diagnostic block that formats floats** taxes every call:
+
+| symbol (GS front end) | calls/f | before | after outlining the cold blocks |
+|---|---:|---|---|
+| vertex kick | 24,569 | 8 pushes + `sub rsp,0x148` + **NINE** `movaps` (xmm6..xmm14) | 3 pushes + `sub rsp,0x60` + **0** |
+| packed-descriptor dispatch | 141,000 | 5 pushes + `sub rsp,0x100` + **4** `movaps` | 5 pushes + `sub rsp,0x90` + **0** |
+| register write | 55,800 | 7 pushes + `sub rsp,0x130` + 2 `movaps` + **/GS cookie** | 7 pushes + `sub rsp,0x80` + **0**, no cookie |
+
+Measured payoff, on the layer's own thread-local sub-timer: **−0.986 ms/f (−11.78%)**, 25/25 windows
+in **both** order blocks, with the decode arithmetic completely unchanged.
+
+- **The fix is `__declspec(noinline)` on the cold block, not a faster hot path.** Source stays
+  single-copy, so the two cannot drift.
+- **Two cheap co-conspirators, both worth finding with the same `/MAP` read:** a function-local
+  `static const bool` in a hot path is an `_Init_thread_epoch` **TLS** compare per call (§2.1's G488
+  again — one hot function tested the same accessor **three times** per call); and **any stack
+  array** — even `uint8_t buf[8]` — buys the function a `/GS` cookie plus a
+  `__security_check_cookie` call on every return. A 16-entry nibble table read straight out of the
+  word it came from removed both the array and the cookie.
+- **Corollary for the rollback:** see §4 — a `#define` that swaps `__declspec(noinline)` for plain
+  `inline` does **not** restore the old shape, because MSVC declines the big ones.
+
 ### 2.3 Fuse what the FETCH READS (not what it computes)
 G479: a loop's critical chain hung off one load and forked into TWO address computations and THREE
 loads (two from the code array, one from a parallel predecode sidecar). Storing the 64-bit
@@ -417,6 +444,88 @@ refutation **at the site**, not only in the fix log.
   the anchors directly took it to 349 MiB/s. **Read your own iteration count first.**
 
 ---
+
+## §9a ⭐⭐⭐ THREE COSTS THAT ARE INVISIBLE IN THE SOURCE AND OWN THE LOOP ANYWAY
+
+Each of these was found by a deletion/inlining probe after the arithmetic had already been ruled
+out. None is visible by reading the loop body.
+
+### 9a.1 A function-local `static` is a PER-ACCESS THREAD-SAFE-INIT GUARD, not a constant
+
+`inline bool f() { static const bool v = getenv("X") != nullptr; return v; }` is the standard way to
+cache a flag — and it is correct. But **every call re-checks the initialised-yet guard** (MSVC: a
+TLS-indexed epoch load + compare + conditional branch). That is nothing at a per-draw site and it is
+enormous at a per-pixel one.
+
+One port's bilinear filter called three such accessors per channel: **twelve guard checks per
+texel**, in the hottest leaf on the route. Inlining the body — arithmetic completely unchanged, the
+identical statements — cut the whole pixel by a third.
+
+- **Rule: read every such flag ONCE per draw/batch into a plain `const bool` hoisted above the loop
+  nest, and never call one inside the loop.**
+- A "default-off diagnostic" that reads its flag per iteration is the same defect wearing a
+  disguise: the flag is off, the *check* is not free.
+- Grep the hot leaf for `static const` / `static bool` / any `…On()` accessor before profiling it.
+
+### 9a.2 A CALL BOUNDARY is a VEHICLE, not a price — inline the leaf, then re-measure
+
+When a per-item stage lives in another translation unit, its cost is not "a call": it is everything
+the boundary *forces* — the callee re-deriving arguments the caller already had, no hoisting of
+loop-invariants across the boundary, and a register spill/reload at the seam. The same stage
+implemented in the same TU can cost a fraction of it.
+
+⭐⭐⭐ The consequence for RANKING: **a stage's share is a property of the LEAF THAT IMPLEMENTS IT and
+of its hit rate, not of the stage.** One port measured the *same two stages* on two populations:
+
+| stage | population A | population B | why |
+|---|---:|---:|---|
+| bilinear filter | **50.1%** | 40.1% | — |
+| the four texture taps | **8.1%** | **35.7%** (4.4×) | B's tap leaves the TU through a cross-module reader; A's is inlined. And B's tap-quad memo hit rate is **zero** |
+
+A had correctly optimised the filter and left the taps alone. Carrying that ranking to B would have
+missed half the prize. **Re-run the stage decomposition per population; never carry another
+population's ranking across.**
+
+### 9a.3 A MEMO's HIT RATE is a LEVER, not a constant
+
+`taps/px = 3.999` against a theoretical 4.0 looks like a null result — "the memo never hits, delete
+it". It was the opposite: it *named* the fix. The memo was keyed on the whole quad, and the quad
+never repeated; but when the source coordinate advances ~one unit per output unit, **this column's
+LEFT pair is the previous column's RIGHT pair**. Re-keying on that halved the tap count at a 98.6%
+hit rate.
+
+**A near-zero hit rate is a question ("why does the key never repeat?"), not an answer.** The
+re-keying is exact by construction — it reuses a value produced by the same function of the same
+arguments — so it needs no numeric tolerance.
+
+---
+
+## §9b ⭐⭐⭐ A LOWERING IS EXACT BY CONSTRUCTION — AND THAT IS A DESIGN RULE, NOT A CLAIM
+
+The safest large win available in a hot nest is not a better algorithm: it is **moving each
+computation to the outermost loop level at which its inputs are constant**, evaluating the
+*identical expression* there.
+
+| level | what belongs there |
+|---|---|
+| per DRAW / batch | anything depending only on state: tables, gates as intervals, blend selectors, base addresses, every flag (§9a.1) |
+| per ROW | anything depending only on the row index: row bases, the row's source coordinates, the vertical weight |
+| per ITEM | only what genuinely varies: the taps, the filter, the commit |
+
+Why it is *exact*: the expression is not re-derived, re-associated, or approximated — it is the same
+source expression evaluated fewer times. **No rounding identity is assumed and no reciprocal is
+substituted for a divide**, so there is no numeric argument to make. Contrast with per-item
+interpolation or a DDA rewrite, which are *not* exact and are a different (much riskier) lever.
+
+⚠️ The corollary that makes this cheap: because a lowering changes only *how often*, its oracle is
+free — the existing per-item oracle already covers every item the lowered path produces.
+
+⛔⛔ **DO NOT RANK AN INTERPRETER'S STAGES BY DELETING THEM.** The deletion-ranking method (`17e
+§3.3a`) is for a *data-plane* loop, where a deleted stage changes only outputs. In an interpreter the
+deleted slot writes the guest program's own **loop induction variables**: one port's "delete the
+lower op" arm took work per call from **1,379 to 61,242 pairs (44×)**, and its "delete both" arm
+deadlocked two worker threads. Price an interpreter lever by BUILDING a slice and gating it, with a
+workload invariant (`pairs/call`) printed to prove the two arms did the same work.
 
 ## §10 CHECKLIST BEFORE BUILDING ANY HOT-LOOP LEVER
 
