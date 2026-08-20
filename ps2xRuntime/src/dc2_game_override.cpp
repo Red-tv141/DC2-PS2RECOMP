@@ -8,9 +8,8 @@
 
 #include "game_overrides.h"
 #include "ps2_runtime.h"
-// G598: script-frame-keyed frame capture (frame_end_and_core_helpers.inc). Included HERE, at file
-// scope — everything below line 492 lives in an anonymous namespace, so a declaration written
-// inside the .inc would define `(anonymous)::dc2::dumpFramePpm` and fail to link.
+#include "lib/ps2_runtime_parts/dc2_logger.inc"
+#include "lib/ps2_runtime_parts/dc2_crash_reporter.inc"
 #include "ps2_frame_dump.h"
 #include <cstdio>
 #include <cstdlib>
@@ -506,6 +505,10 @@ extern void SearchSndDataID__6CSceneFi_0x2a6c30(uint8_t *rdram, R5900Context *ct
 namespace
 {
 #include "dc2_game_override_parts/common_state.inc"
+// G619: must follow common_state.inc (it uses dc2_env_flag_enabled) and precede every probe file
+// that reads one of the cached flags. See the file header for why `getenv` was 20.7% of the EE
+// thread on `dungeon1`.
+#include "dc2_game_override_parts/g619_env_flag_cache.inc"
 #include "dc2_game_override_parts/texture_probes.inc"
 #include "dc2_game_override_parts/title_camera_and_map.inc"
 #include "dc2_game_override_parts/frontend_loops.inc"

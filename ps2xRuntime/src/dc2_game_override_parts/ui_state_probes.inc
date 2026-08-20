@@ -326,8 +326,9 @@ static void g91_drawmgr_flush_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtim
     const uint32_t packet = getRegU32(ctx, 6);
     const uint32_t ra = getRegU32(ctx, 31);
     const bool inTitle = g67_title_scope(rdram, ctx);
-    const bool g91 = (std::getenv("DC2_G91_FLUSH") != nullptr) && inTitle;
-    const bool g195Block = dc2_env_flag_enabled("DC2_G195_BLOCK_TRACE");
+    // G619: per-flush env reads, same defect class as title_render_probes_b.inc.
+    const bool g91 = g619EnvSet(g_g619G91Flush, "DC2_G91_FLUSH") && inTitle;
+    const bool g195Block = g619EnvFlag(g_g619G195BlockTrace, "DC2_G195_BLOCK_TRACE");
 
     if (g91 || g195Block)
     {
@@ -604,7 +605,8 @@ static void g67_addpacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *r
     const bool addScope = g67_addpacket_scope(rdram, ctx, self, state);
     const bool g135Src = g135_src_trace_enabled() && addScope;
     const bool g95AddMini = g95_add_mini_tex0_enabled() && g67_title_scope(rdram, ctx);
-    const bool g195Block = dc2_env_flag_enabled("DC2_G195_BLOCK_TRACE");
+    // G619: per-packet-add env read (getenv + five strcmps), same defect class.
+    const bool g195Block = g619EnvFlag(g_g619G195BlockTrace, "DC2_G195_BLOCK_TRACE");
 
     G67TexHit stateHits[6]{};
     G67TexHit packetHits[6]{};

@@ -17,6 +17,16 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     // Without this, the runtime enters a crash loop on missing-function recovery.
     runtime.registerFunction(0x0029FC78u, nop_stub);
 
+    if (std::getenv("DC2_DISABLE_SHADOW") != nullptr)
+    {
+        runtime.registerFunction(0x00143190u, nop_stub); // mgBeginDrawShadow
+        runtime.registerFunction(0x001432D0u, nop_stub); // mgEndDrawShadow
+        runtime.registerFunction(0x001A7750u, nop_stub); // EditDrawShadowChara
+        runtime.registerFunction(0x002C9280u, nop_stub); // DrawCharaShadow
+        runtime.registerFunction(0x0016BA70u, nop_stub); // DrawShadowDirect__12CActionCharaFv
+        runtime.registerFunction(0x00173610u, nop_stub); // DrawShadowDirect__11CCharacter2Fv
+    }
+
     // -------------------------------------------------------------------------
     // Group D ג€” Debug console (sceDevFont / sceDevCons): return 0 is correct
     // -------------------------------------------------------------------------

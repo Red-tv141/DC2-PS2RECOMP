@@ -16,7 +16,10 @@ static void g78_frame_clipinbox_fix(uint8_t *rdram, R5900Context *ctx, PS2Runtim
     // to A/B the projection SCALE vs HW (HW vp[0x3b8]=(256,208), guard ֲ±2047). The title rock streaks
     // = geometry fanned to the guard band ֲ±2047 => the runner's NDC->screen scale or perspective
     // divide diverges from HW even though lightInfo (+0x400) is byte-identical. DC2_G88_VP, title scope.
-    if (std::getenv("DC2_G88_VP") != nullptr && g67_title_scope(rdram, ctx))
+    // G619: this override is `mgClipInBoxW@0x12F380` — once per scene node per frame — and the six
+    // env reads below were UNCACHED, which the G503 EE PC sampler measured at 18.9% of the whole
+    // EE thread on `dungeon1`. Cached at load; DC2_G619_LIVE_ENVREAD=1 restores the per-call read.
+    if (g619EnvSet(g_g619G88Vp, "DC2_G88_VP") && g67_title_scope(rdram, ctx))
     {
         static bool s_done = false;
         if (!s_done)
@@ -42,7 +45,7 @@ static void g78_frame_clipinbox_fix(uint8_t *rdram, R5900Context *ctx, PS2Runtim
     //   +0x10  View*Proj combined (the MVP-no-world the else-branch multiplies by LW)
     //   +0x110 projection (focal 480)   +0x150 view*aspect   +0x1a0 view   +0x260 viewport scale
     // DC2_G92_MTX, title scope.
-    if (std::getenv("DC2_G92_MTX") != nullptr && g67_title_scope(rdram, ctx))
+    if (g619EnvSet(g_g619G92Mtx, "DC2_G92_MTX") && g67_title_scope(rdram, ctx))
     {
         // G93: dump at a LATER (steady-state) frame, not frame-1 (the title camera is
         // still at ctor defaults on frame 1). Fire once around the 400th title-clip call.
@@ -89,7 +92,7 @@ static void g78_frame_clipinbox_fix(uint8_t *rdram, R5900Context *ctx, PS2Runtim
     // off-screen (7.4%) coverage jumps toward HW (~48%) under this lever, it PROVES the off-screen
     // projection is the wrong renderinfo camera (runner focal 800 + camera at origin) vs HW
     // (focal 480 + camera 661 back), not a viewport/VU-apply bug. DC2_G92_FORCEMTX, title scope.
-    if (std::getenv("DC2_G92_FORCEMTX") != nullptr && g67_title_scope(rdram, ctx))
+    if (g619EnvSet(g_g619G92ForceMtx, "DC2_G92_FORCEMTX") && g67_title_scope(rdram, ctx))
     {
         const uint32_t base = 0x00380ec0u;
         auto wf = [&](uint32_t off, float v) { uint32_t u; std::memcpy(&u, &v, 4); dc2_write_u32(rdram, base + off, u); };
@@ -124,7 +127,7 @@ static void g78_frame_clipinbox_fix(uint8_t *rdram, R5900Context *ctx, PS2Runtim
     // blocks (0,1,3,6,7) so we can A/B block->VRAM tbp + texture sizes vs HW (tools/pcsx2tex.py).
     // HW cursor[0]=0x2720; each block reloads contiguously from there by texture size. The runner
     // misses HW's 0x2b20/0x2f20/0x3320 (the 1024-block big rock walls) -> cursor/size math diverges.
-    if (std::getenv("DC2_G90_TEXMGR") != nullptr && g67_title_scope(rdram, ctx))
+    if (g619EnvSet(g_g619G90TexMgr, "DC2_G90_TEXMGR") && g67_title_scope(rdram, ctx))
     {
         static bool s_done = false;
         if (!s_done)
@@ -172,7 +175,7 @@ static void g78_frame_clipinbox_fix(uint8_t *rdram, R5900Context *ctx, PS2Runtim
     // override only sees the early indirect path). HW ref @ New Game menu: phase 0, dist 1198.75,
     // height -214, pos(-70.1,66.8,707.7), ref(-70.1,280.8,-493.0). Reads the camera globals at
     // fixed addresses: TitleCamera ptr @0x377E38 -> distance(+0x90)/height(+0x94)/pos(+0)/ref(+0x10).
-    if (std::getenv("DC2_G81_CAM") != nullptr && g67_title_scope(rdram, ctx))
+    if (g619EnvSet(g_g619G81Cam, "DC2_G81_CAM") && g67_title_scope(rdram, ctx))
     {
         static std::atomic<uint32_t> s_camN{0};
         const uint32_t cn = s_camN.fetch_add(1u, std::memory_order_relaxed) + 1u;
@@ -196,7 +199,7 @@ static void g78_frame_clipinbox_fix(uint8_t *rdram, R5900Context *ctx, PS2Runtim
     // because the per-vertex shade is wrong; HW's rock vertex colour == its AMBIENT (46.5,69,61.5)
     // (TitleMapDraw: GetLightInfo(TitleMap) -> *1.5 -> mgSetAmbient). lightInfo = 0x380ec0 +
     // idx*0x150 + 0x400 (idx=*(0x380ec0+0x3f4)); ambient=lightInfo+0x80, lightcol=+0x00, lightdir=+0x40.
-    if (std::getenv("DC2_G82_LIGHT") != nullptr && g67_title_scope(rdram, ctx))
+    if (g619EnvSet(g_g619G82Light, "DC2_G82_LIGHT") && g67_title_scope(rdram, ctx))
     {
         static std::atomic<uint32_t> s_litN{0};
         const uint32_t ln = s_litN.fetch_add(1u, std::memory_order_relaxed) + 1u;
@@ -598,7 +601,8 @@ static void g67_mgenddraw_reload_probe(uint8_t *rdram, R5900Context *ctx, PS2Run
 
     // G90: per-block reload diagnostics ג€” find why blocks 1/3/6/7 never get tbps written.
     // Capture mgr remap + texMgr cache/cursor BEFORE, the recompiled return AFTER.
-    const bool g90 = (std::getenv("DC2_G90_RELOAD") != nullptr) && g67_title_scope(rdram, ctx);
+    // G619: per-reload env read, same defect class as the six in g78_frame_clipinbox_fix.
+    const bool g90 = g619EnvSet(g_g619G90Reload, "DC2_G90_RELOAD") && g67_title_scope(rdram, ctx);
     uint32_t mgr0 = 0u, mgr1 = 0u, remap = 0u, tmCache = 0u, tmCursor = 0u, tmCount = 0u, headTbp = 0u;
     if (g90)
     {

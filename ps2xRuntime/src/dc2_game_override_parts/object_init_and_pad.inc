@@ -2180,7 +2180,9 @@ static void g16_createpacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime
     // fires and A/Bs against HW's 4 bit2=0 (drawing-route) objects 0x979710/0x9826f0/0x984990/
     // 0x9870d0). bit2 = (desc+0x2c != 0); bit2=0 => the copy/trifan DRAWING route. Env
     // DC2_G120_SEL; first 200 calls; quiet by default.
-    if (std::getenv("DC2_G120_SEL") != nullptr && info)
+    // G619: same defect class as title_render_probes_b.inc — a default-off diagnostic reading the
+    // environment on a per-object override path. Cached at load; DC2_G619_LIVE_ENVREAD restores.
+    if (g619EnvSet(g_g619G120Sel, "DC2_G120_SEL") && info)
     {
         static std::atomic<uint32_t> s_g120n{0};
         const uint32_t n = s_g120n.fetch_add(1u, std::memory_order_relaxed);
@@ -2199,7 +2201,7 @@ static void g16_createpacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime
     // tristrip0x1c50 / copy0x1b68) and WHICH render-state flag drives it. The fix target is the
     // field that makes the runner never produce bit2==0 && bit0==1 (tristrip). Title-scoped,
     // default-off (DC2_G115_SEL), first 48 calls. A/B vs HW (PCSX2 breakpoint @0x1404d0, read a3).
-    if (std::getenv("DC2_G115_SEL") != nullptr && g67_title_scope(rdram, ctx))
+    if (g619EnvSet(g_g619G115Sel, "DC2_G115_SEL") && g67_title_scope(rdram, ctx))
     {
         static std::atomic<uint32_t> s_g115n{0};
         const uint32_t n = s_g115n.fetch_add(1u, std::memory_order_relaxed);
@@ -2294,7 +2296,7 @@ static void g16_createpacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime
     // (captures exactly what this call will upload, or would skip uploading if fc4==0 -- in
     // which case VU1 addr 30 keeps whatever a PRIOR object's kick left there). Default-off
     // (DC2_G199_QW30), unscoped (need both title and map data), first 300 + every 500th call.
-    if (std::getenv("DC2_G199_QW30") != nullptr && info)
+    if (g619EnvSet(g_g619G199Qw30, "DC2_G199_QW30") && info)
     {
         static std::atomic<uint32_t> s_g199n{0};
         const uint32_t n = s_g199n.fetch_add(1u, std::memory_order_relaxed) + 1u;
@@ -2317,7 +2319,7 @@ static void g16_createpacket_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime
     const uint32_t ret = getRegU32(ctx, 2); // v0 = qword count
     // G93: steady-state LW (param_3 = a2 model matrix) + ViewProj (info+0x10) dump, title
     // scope, to localize why the transform path lands off-screen despite an HW-correct camera.
-    if (std::getenv("DC2_G93_LW") != nullptr && g67_title_scope(rdram, ctx))
+    if (g619EnvSet(g_g619G93Lw, "DC2_G93_LW") && g67_title_scope(rdram, ctx))
     {
         static std::atomic<uint32_t> s_lwN{0};
         const uint32_t ln = s_lwN.fetch_add(1u, std::memory_order_relaxed) + 1u;
