@@ -62,6 +62,10 @@ void G512ReadRowP8(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, 
 void G512ReadRowP4(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint8_t *);
 void G512ReadRowP4HL(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint8_t *);
 void G512ReadRowP4HH(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint8_t *);
+// G620: the PSMCT32 group reader's exactness-oracle counters (DC2_G620_VERIFY=1). Defined beside
+// the reader in g512_texdecode_row_readers.inc; declared here for the same reason as the readers.
+extern std::atomic<std::uint64_t> g_g620RowVerifyN;
+extern std::atomic<std::uint64_t> g_g620RowVerifyBad;
 }
 
 // G512: the fast-decode arm accessor, its exactness-oracle gate and its psm census sink. All four
@@ -121,6 +125,79 @@ bool g310_backend_copy_logical_pages(uint32_t srcFbp,
 bool g310_backend_build_logical_composite(
     const std::vector<uint32_t> &pageMap,
     const std::vector<uint32_t> &basePixels);
+
+struct DC2NativeRenderConfig
+{
+    bool isConfigured = false;
+    bool isNativeHighRes = false;
+    bool isFullscreen = false;
+    int requestedWidth = 0;
+    int requestedHeight = 0;
+    float scaleX = 1.0f;
+    float scaleY = 1.0f;
+};
+
+inline DC2NativeRenderConfig &getDC2NativeRenderConfig()
+{
+    static DC2NativeRenderConfig s_config = []()
+    {
+        DC2NativeRenderConfig cfg{};
+        const char *wEnv = std::getenv("DC2_RESOLUTION_WIDTH");
+        const char *hEnv = std::getenv("DC2_RESOLUTION_HEIGHT");
+        const char *fsEnv = std::getenv("DC2_FULLSCREEN");
+
+        int w = 0, h = 0;
+        if (wEnv && wEnv[0] != '\0')
+            w = std::atoi(wEnv);
+        if (hEnv && hEnv[0] != '\0')
+            h = std::atoi(hEnv);
+
+        cfg.isFullscreen = (fsEnv && fsEnv[0] != '\0' && std::strcmp(fsEnv, "0") != 0);
+
+        if (w > 0 && h > 0 && (w != 512 || h != 448) && (w != 640 || h != 448))
+        {
+            cfg.requestedWidth = w;
+            cfg.requestedHeight = h;
+            cfg.scaleX = static_cast<float>(w) / 640.0f;
+            cfg.scaleY = static_cast<float>(h) / 448.0f;
+            cfg.isNativeHighRes = true;
+        }
+        else if (w > 0 && h > 0)
+        {
+            cfg.requestedWidth = w;
+            cfg.requestedHeight = h;
+            cfg.scaleX = 1.0f;
+            cfg.scaleY = 1.0f;
+            cfg.isNativeHighRes = false;
+        }
+        else
+        {
+            cfg.requestedWidth = 640;
+            cfg.requestedHeight = 448;
+            cfg.scaleX = 1.0f;
+            cfg.scaleY = 1.0f;
+            cfg.isNativeHighRes = false;
+        }
+        cfg.isConfigured = true;
+        return cfg;
+    }();
+    return s_config;
+}
+
+inline bool dc2IsNativeHighResActive()
+{
+    return getDC2NativeRenderConfig().isNativeHighRes;
+}
+
+inline float dc2GetNativeScaleX()
+{
+    return getDC2NativeRenderConfig().scaleX;
+}
+
+inline float dc2GetNativeScaleY()
+{
+    return getDC2NativeRenderConfig().scaleY;
+}
 
 // G141: measure-first perf scope (skill 17-performance-optimization.md), env-gated
 // (DC2_PERF=1), aggregate-only print. Self-contained per-TU; drawPrimitive runs on the

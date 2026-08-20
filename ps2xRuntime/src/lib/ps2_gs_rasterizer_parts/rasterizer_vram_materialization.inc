@@ -1551,6 +1551,30 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     s_states.clear();
     s_states.reserve(g_g144List.size());
     int rowLo = kFbH, rowHi = -1;
+    // ===== G621: the batch's PRODUCER-scoped row window ==========================================
+    // `rowLo/rowHi` is the union of the entries' SCISSORS. It is what the colour readback transfers
+    // and what the VRAM pack loop publishes — and on `dungeon1` it is far wider than anything this
+    // batch can write: `[G621:span]` measures the 0x13b+z population (75% of all readback batches,
+    // ~2.5/frame) reading **416 rows to write 89.7** (`keep=21.6%`, 93% of them in the 1/8..2/8
+    // bucket). The single-draw 0x13b population is a genuine full-screen post-process (`keep=99.4%`)
+    // and this window leaves it alone by construction.
+    //
+    // The tight union below is the SAME quantity `g282RowLo/g282RowHi` already carries for the
+    // g282/g290/g570/g586/g587/g604 alias batches, where it has been the published window (and
+    // oracle-verified) for many phases. G621 only widens its ADMISSION to every batch: the pair
+    // `max(scY0, e.minY) .. min(scY1, e.maxY)` is built from `crawMinY/crawMaxY`, which G144 capture
+    // computes "EXACTLY as drawTriangle/drawSprite (same ofy + scissor clamp) so the band prefilter
+    // is tight and NEVER NARROWER than the real coverage".
+    //
+    // EXACTNESS. A row outside this union is written by no draw in the batch, so the FBO still holds
+    // whatever it held at batch entry — and at batch entry the FBO equals guest VRAM over the window
+    // (either `uploadFb` copied VRAM in, or the gen snapshot proved they were already equal). Reading
+    // such a row back and packing it into guest VRAM therefore writes the bytes that are already
+    // there: the identity. Oracle `DC2_G621_WRSPAN_VERIFY=1` asserts exactly that by checksumming the
+    // window's VRAM bytes across a narrowed publish followed by the legacy one.
+    // Rollback `DC2_G621_NO_WRSPAN=1`; counters `DC2_G621_WRSPAN_STAT=1`.
+    int g621WrLo = kFbH, g621WrHi = -1;
+    bool g621WrUsable = true; // cleared by any entry whose written extent cannot be bounded
     int depthRowLo = kFbH, depthRowHi = -1;
     int g282RowLo = kFbH, g282RowHi = -1;
     int g282DepthLo = kFbH, g282DepthHi = -1;
@@ -1757,6 +1781,16 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         {
             rowLo = std::min(rowLo, static_cast<int>(st.scY0));
             rowHi = std::max(rowHi, static_cast<int>(st.scY1));
+            // G621: the same tight extent the g282 family folds below, accumulated for EVERY batch.
+            // An entry whose bbox is degenerate against its own scissor writes nothing and is
+            // skipped; anything the bound cannot describe fails closed onto the scissor union.
+            if (g282EntryHi >= g282EntryLo)
+            {
+                g621WrLo = std::min(g621WrLo, g282EntryLo);
+                g621WrHi = std::max(g621WrHi, g282EntryHi);
+            }
+            else
+                g621WrUsable = false; // fail closed: an extent this bound cannot describe
             if ((g282Candidate || g290Candidate || g570Candidate || g586MeasuredShape ||
                  g587MeasuredShape || g604MeasuredShape ||
                  g570Private139Candidate) &&
@@ -2534,6 +2568,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     s_batch.fboKey = g351RouteB ? kG351Sprite139 : 0u;
     s_batch.fbW = fbW;
     s_batch.fbH = kFbH;
+    // G620: `clear()` destroys every element, i.e. it FREES exactly the decoded-texel buffers the
+    // backend's async recycle just handed back. Move them into the pool first; the next decode
+    // takes one back at its exact size and pays neither the allocation nor `resize`'s
+    // value-initialisation of texels it is about to overwrite in full.
+    for (auto &g620Up : s_batch.texUploads)
+        g620RecyclePx(std::move(g620Up.px));
     s_batch.texUploads.clear();
     s_batch.verts.clear();
     s_batch.draws.clear();
@@ -3776,7 +3816,18 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     static std::vector<uint64_t> s_g281ViewKey;
     static std::vector<int8_t> s_g281ViewSrc;
     static std::unordered_set<uint64_t> s_g310BuiltViews;
+    // G622: the per-FLUSH source-key -> uploaded-key map. Cleared UNCONDITIONALLY here, above the
+    // G261 bind block, because the texture pass that fills it and the draw pass that reads it both
+    // run below this point on every flush that reaches them — keying a draw off a previous flush's
+    // mint would reference a texture this batch never uploaded.
+    g622ResetFlush();
+    // G623: the per-flush "which entry WOULD have bound" table. ORACLE ONLY — a no-op unless
+    // DC2_G623_VERIFY is set, so the shipped path never allocates it.
+    g623ResetFlush(g_g144List.size());
     bool g261AnyBind = false;
+    // G623: did the bind pre-pass's entry loop run for THIS flush? G598's lesson one level up —
+    // "rejected on shape" and "the decision point never ran" must not share one bucket.
+    bool g623PrePassRan = false;
     if ((g261WaveOn() && g261AnyDirty()) || g289DirectDisplaySrc != 0u ||
         g289OwnerViewReady)
     {
@@ -4066,6 +4117,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         static const bool s_g599NoBind = envFlagEnabled("DC2_G599_NOBIND");
         if (s_g599NoBind)
             g261MaterializeAllDirty(kG261MatTexAlias);
+        g623PrePassRan = !s_g599NoBind;
         for (size_t i = 0; i < g_g144List.size() && !s_g599NoBind; ++i)
         {
             const G178EntryState &st = s_states[i];
@@ -4256,6 +4308,25 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 if (g280Fbp != 0u)
                 {
                     s_g261FboSrc[i] = g280Fbp;
+                    g261AnyBind = true;
+                    g_g261FboBinds.fetch_add(1u, std::memory_order_relaxed);
+                    continue;
+                }
+            }
+            // ===== G623: PRODUCER-SURFACE DIRECT CONSUMPTION =====
+            // The read's base IS a transient producer surface's base and the sampled window is
+            // provably still equal to that producer's FBO (version + alias + format + window +
+            // liveness — see g623_producer_surface.inc). Bind the FBO instead of hashing 1 MiB,
+            // decoding it on the CPU and re-uploading it. This MUST sit above the per-target loop:
+            // that loop MATERIALIZES any dirty resident target overlapping the read, which bumps
+            // the very page generations G623's version test reads, so a decision taken after it
+            // could never be clean.
+            {
+                const uint32_t g623Src =
+                    g623TryBind(fbp, i, e, st, s_g261FboSrc[i] != 0u);
+                if (g623Src != 0u)
+                {
+                    s_g261FboSrc[i] = g623Src;
                     g261AnyBind = true;
                     g_g261FboBinds.fetch_add(1u, std::memory_order_relaxed);
                     continue;
@@ -4540,6 +4611,33 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         s_g281ViewKey.clear();
         s_g281ViewSrc.clear();
         s_g310BuiltViews.clear();
+        // ===== G623: the bind pre-pass above did NOT run for this flush =====
+        // `[G623:pc]` on the shipped G622 binary measured this exactly: 1.44 M reads of a produced
+        // surface's base reached the texture pass with `unconsidered=1`, i.e. the display batch that
+        // samples the 0x13b post-process target arrives on a flush where NO resident target is
+        // dirty, so `(g261WaveOn() && g261AnyDirty()) || g289DirectDisplaySrc || g289OwnerViewReady`
+        // is false and the whole pre-pass is skipped. G623 therefore needs its own pass here.
+        //
+        // It is SAFE precisely because the legacy pre-pass did not run: no per-target overlap loop
+        // ran, so nothing materialized, so no page generation moved behind G623's version test — and
+        // no resident target is dirty at all on this path, which is the alias conjunct's premise.
+        if (g623Tracked() && g623HaveSurfaces() && !g_g144List.empty())
+        {
+            s_g261FboSrc.assign(g_g144List.size(), 0u);
+            g623PrePassRan = true;
+            for (size_t i = 0; i < g_g144List.size(); ++i)
+            {
+                const uint32_t g623Src =
+                    g623TryBind(fbp, i, g_g144List[i], s_states[i], false);
+                if (g623Src == 0u)
+                    continue;
+                s_g261FboSrc[i] = g623Src;
+                g261AnyBind = true;
+                g_g261FboBinds.fetch_add(1u, std::memory_order_relaxed);
+            }
+            if (!g261AnyBind)
+                s_g261FboSrc.clear();
+        }
     }
     const bool g261HaveFboSrc = g261AnyBind; // s_g261FboSrc sized to the list only when true
 
@@ -4577,6 +4675,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const bool g511Probe = g511TexProbeActive();
     const bool g511Census = g511CensusOn();
     const bool g511Split = g511TexSplitOn();
+    // G620: read the census arm ONCE per flush and pass it down, exactly like the G511 arms above.
+    const bool g620Dec = g620TexDecOn();
     uint64_t g511Present = 0u;
     uint64_t g511Entries = 0u, g511Probes = 0u, g511RunRep = 0u, g511ProbeSink = 0u;
     uint64_t g511HashNs = 0u, g511HashN = 0u, g511DecodeNs = 0u, g511DecodeN = 0u;
@@ -4725,6 +4825,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g600NoteBigEntry(g_g144List[i], st.texW, st.texH, st.texKey,
                          (g261HaveFboSrc && !s_g261FboSrc.empty()) ? s_g261FboSrc[i] : 0u,
                          s_g281ViewKey.empty() ? 0u : s_g281ViewKey[i], st.skip);
+        // G623: the population the bind pre-pass never SAW — a read whose base is a produced
+        // surface's base on a flush whose pre-pass did not run at all. Counted separately from
+        // every shape rejection so the two can never be confused.
+        g623NoteUnconsidered(g_g144List[i], st,
+                             g623PrePassRan ||
+                                 (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u));
         if (g511Census)
             ++g511Entries;
         if (g261HaveFboSrc && s_g261FboSrc[i] != 0u)
@@ -4890,7 +4996,15 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                            static_cast<uint32_t>(st.texW), static_cast<uint32_t>(st.texH)) +
             g178GenSumRect(ctx.tex0.cbp, 1, GS_PSM_CT32, 0, 0, 64, 32); // CLUT page(s)
         auto it = g_g178TexReg.find(st.texKey);
-        const bool backendHas = g178_backend_has_tex(st.texKey);
+        // G622: the registry stays keyed by the DESCRIPTOR (so the gen tier, which runs before any
+        // content hash exists, is unchanged and still answers in one probe) but the image may be
+        // resident under a content-derived VARIANT key. `regKey` is the key the backend actually
+        // holds it under; it is `st.texKey` for every texture that has never cycled, which is the
+        // shipped behaviour and both arms' behaviour for the large majority of keys.
+        const uint64_t regKey =
+            (it != g_g178TexReg.end() && it->second.varKey != 0u) ? it->second.varKey : st.texKey;
+        const bool backendHas = g178_backend_has_tex(regKey);
+        g620NoteTexVisit(g620Dec);
         if (g511Split)
         {
             g511GenNs += static_cast<uint64_t>(
@@ -4907,6 +5021,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         {
             g_g178TexHits.fetch_add(1u, std::memory_order_relaxed);
             g600NoteTexHit(e, st.texW, st.texH, st.texKey, "gen");
+            g620NoteTexHit(g620Dec, st.texKey, false);
+            g622NoteFlushKey(st.texKey, regKey); // G622: draws must reference the resident key
             continue;
         }
         // Gen mismatch (or unknown): DC2 re-uploads texture data every frame, usually byte-
@@ -4990,19 +5106,117 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             it->second.genSum = genNow;
             g_g178TexHashHits.fetch_add(1u, std::memory_order_relaxed);
             g600NoteTexHit(e, st.texW, st.texH, st.texKey, "hash");
+            g620NoteTexHit(g620Dec, st.texKey, true);
+            g622NoteFlushKey(st.texKey, regKey); // G622: draws must reference the resident key
             continue;
         }
+        // ===== G622: the CONTENT-ADDRESSED variant tier ==========================================
+        // Both shipped tiers have said "re-decode". Ask the one question they cannot: has this
+        // descriptor key produced THESE EXACT BYTES before, and is that image still on the GPU?
+        // `g622NoteContent` records the hash and reports the repeat on BOTH arms, so the candidate
+        // carries no bookkeeping the control does not (G520's arm-symmetry law); only the KEY
+        // CHOICE below is the variable.
+        const uint8_t g622HashVar = static_cast<uint8_t>(g513Fast ? 1u : 0u);
+        const bool g622Repeat = g622NoteContent(st.texKey, hashNow);
+        const bool g622Arm = g622TexVarActive();
+        const bool g622Mint = g622Arm && !g401ForceDecode && !g600TexPaintOn() &&
+                              (g622Repeat || g622KeyCycles(st.texKey));
+        const uint64_t g622Key =
+            g622Mint ? g622VariantKey(st.texKey, hashNow, g622HashVar) : st.texKey;
+        bool g622Hit = false;
+        if (g622Mint)
+        {
+            g_g622Probes.fetch_add(1u, std::memory_order_relaxed);
+            if (g622Key != st.texKey)
+                g_g622Mints.fetch_add(1u, std::memory_order_relaxed);
+            g622Hit = g178_backend_has_tex(g622Key);
+        }
+        // Under the oracle a hit is RECORDED BUT NOT TAKEN: the decode below runs anyway and its
+        // texels are compared against the digest stored when this variant was uploaded. A verify
+        // run therefore always ships the pre-G622 bytes.
+        const bool g622Verify = g622TexVarVerifyOn();
+        if (g622Hit && !g622Verify)
+        {
+            // The resident image under `g622Key` was decoded from a source with this same content
+            // hash under this same hash body, and the decode is a pure function of (descriptor,
+            // source bytes, CLUT) — the descriptor is in `st.texKey` and the bytes are in `hashNow`.
+            g_g622Hits.fetch_add(1u, std::memory_order_relaxed);
+            g_g622HitPx.fetch_add(static_cast<uint64_t>(st.texW) *
+                                      static_cast<uint64_t>(st.texH),
+                                  std::memory_order_relaxed);
+            g_g178TexReg[st.texKey] =
+                G178TexReg{genNow, hashNow, st.texW, st.texH, g622HashVar, g622Key};
+            g622NoteFlushKey(st.texKey, g622Key);
+            g622TexVarReport();
+            continue;
+        }
+        // G620: classify the decode BEFORE it happens, while `it`/`backendHas`/`hashNow` still hold
+        // the values the two cache tests were decided from.
+        g620NoteTexDecode(g620Dec, st.texKey, it != g_g178TexReg.end(), backendHas, hashNow,
+                          st.texW, st.texH, ctx.tex0.tbp0, ctx.tex0.cbp,
+                          static_cast<uint32_t>(ctx.tex0.psm), ctx.tex0.tbw);
         const auto g511DecT0 = g511Split ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
+        const auto g620DecT0 = g620Dec ? std::chrono::steady_clock::now()
+                                       : std::chrono::steady_clock::time_point{};
         G178TexUpload up;
-        up.key = st.texKey;
+        up.key = g622Key; // G622: == st.texKey unless this descriptor key has been seen to cycle
         up.w = st.texW;
         up.h = st.texH;
-        up.px.resize(static_cast<size_t>(st.texW) * st.texH);
+        up.px = g620AcquirePx(static_cast<size_t>(st.texW) * static_cast<size_t>(st.texH));
+        const auto g620S1 = g620Dec ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+        if (g620Dec)
+            g620NoteStage(true, 0u,
+                          static_cast<uint64_t>(
+                              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  g620S1 - g620DecT0).count()));
         g178DecodeWhole(self, gs, vram, ctx, e.texa, e.texclut, st.texW, st.texH, up.px.data());
+        g620PoisonCheck(up.px, static_cast<size_t>(st.texW) * static_cast<size_t>(st.texH));
+        const auto g620S2 = g620Dec ? std::chrono::steady_clock::now()
+                                    : std::chrono::steady_clock::time_point{};
+        if (g620Dec)
+            g620NoteStage(true, 1u,
+                          static_cast<uint64_t>(
+                              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  g620S2 - g620S1).count()));
+        // G623 ORACLE (DC2_G623_VERIFY=1, never valid in a timing run — it adds a blocking
+        // GPU->CPU read of the producer's covered window to every decode it checks). Taken HERE,
+        // on the raw decode, above the HD-replacement hook, so what it compares is exactly the
+        // texels the shipped path derives from guest VRAM. `g623TryBind` returned 0 under the
+        // oracle, so this decode is the one the shipped path would have run either way.
+        g623VerifyDecode(i, st, up.px);
+        // HD Texture Replacement & Dumping
+        // G620: `init()` early-returns on `m_initialized`, but only AFTER taking its mutex, and it
+        // was called on every decode. This pass runs on the GS worker only, so a plain file-static
+        // bool (zero-initialised, hence no MSVC thread-safe-static guard) removes the acquire.
+        {
+            static bool s_g620ReplInit = false;
+            if (!s_g620ReplInit)
+            {
+                dc2_tex::TextureReplacementManager::instance().init();
+                s_g620ReplInit = true;
+            }
+        }
+        dc2_tex::TextureReplacementManager::instance().tryReplaceTexture(
+            vram, vramSize, ctx, e.texa, e.texclut,
+            (g261HaveFboSrc && !s_g261FboSrc.empty() && s_g261FboSrc[i] != 0u),
+            (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u),
+            up.w, up.h, up.px);
         // G600 (default OFF, except DC2_G600_TEXFILL which is a knowingly-incorrect ceiling probe):
         // dump / mark the texels that are about to be uploaded.
         g600DumpDecoded(e, st.texW, st.texH, st.texKey, up.px);
+        if (g620Dec)
+            g620NoteStage(true, 2u,
+                          static_cast<uint64_t>(
+                              std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                  std::chrono::steady_clock::now() - g620S2).count()));
+        if (g620Dec)
+            g620NoteTexDecodeNs(true, static_cast<uint32_t>(ctx.tex0.psm),
+                                static_cast<uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - g620DecT0).count()),
+                                static_cast<uint64_t>(st.texW) * static_cast<uint64_t>(st.texH));
         if (g511Split)
         {
             g511DecodeNs += static_cast<uint64_t>(
@@ -5042,12 +5256,34 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                  ? s_g261FboSrc[i] : 0u);
             }
         }
+        // G622 ORACLE (DC2_G622_TEXVAR_VERIFY=1, never valid in a timing run — it decodes on the
+        // very population the lever exists to skip). Asserts the identity the shortcut claims: that
+        // the texels resident under `g622Key` ARE this decode. `g622Hit` is true only when the
+        // shortcut WOULD have been taken, so `checks` counts exactly the skipped decodes.
+        if (g622Verify && g622Key != st.texKey)
+        {
+            const uint64_t dig = g622ShadowDigest(up.px);
+            if (g622Hit)
+            {
+                const auto sIt = g_g622Shadow.find(g622Key);
+                g_g622VerifyChecks.fetch_add(1u, std::memory_order_relaxed);
+                if (sIt == g_g622Shadow.end() || sIt->second != dig)
+                    g_g622VerifyBad.fetch_add(1u, std::memory_order_relaxed);
+            }
+            g_g622Shadow[g622Key] = dig;
+        }
         s_batch.texUploads.push_back(std::move(up));
         g_g178TexReg[st.texKey] =
             G178TexReg{genNow, hashNow, st.texW, st.texH,
-                       static_cast<uint8_t>(g513Fast ? 1u : 0u)};
+                       static_cast<uint8_t>(g513Fast ? 1u : 0u), g622Key};
         g_g178TexDecodes.fetch_add(1u, std::memory_order_relaxed);
+        g622NoteFlushKey(st.texKey, g622Key);
+        g622TexVarReport();
     }
+    // G620: one report per DC2_G620_TEXDEC_EVERY flushes, outside the per-entry walk.
+    g620TexDecReport(g620Dec);
+    g620RowVerifyReport();
+    g623Report();
     // G511: one relaxed add per counter per FLUSH (33.4/frame), never per entry — a per-entry
     // counter would inflate the very loop it prices (G502).
     if (g511Probe)
@@ -5165,9 +5401,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // space instead of the declared texture dims; the V axis is flipped after the push
         // (GS row y lives at GL row 511-y in the persistent FBO).
         const bool g261Bound = g261HaveFboSrc && s_g261FboSrc[i] != 0u;
+        // G622: a T8/CT24 VIEW key wins as before (a view is built on the GPU and never carries a
+        // guest-VRAM content hash); otherwise the draw must reference the key the texture pass
+        // actually uploaded this image under, which is `st.texKey` on every flush that minted
+        // nothing — i.e. the whole control arm and most of the candidate.
         const uint64_t drawTexKey =
             (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u)
-                ? s_g281ViewKey[i] : st.texKey;
+                ? s_g281ViewKey[i] : g622DrawKey(st.texKey);
         int pushTexW = st.texW, pushTexH = st.texH;
         if (g261Bound)
         {
@@ -5184,7 +5424,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             else
             {
                 const int srcTi = g248TargetIndex(s_g261FboSrc[i]);
-                pushTexW = g_g261Res[srcTi].fbW;
+                // G623: a PRODUCER SURFACE is not a residency slot, so it has no G261Res to read
+                // its width from — `g248TargetIndex` returns -1 for it. Take the width from the
+                // surface record instead; every other srcFbp value reaching here is a resident
+                // target by construction.
+                pushTexW = (srcTi >= 0) ? g_g261Res[srcTi].fbW
+                                        : g623SurfaceFbW(s_g261FboSrc[i]);
                 pushTexH = 512;
             }
         }
@@ -5390,6 +5635,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             for (int k = first; k < first + count; ++k)
                 s_batch.verts[static_cast<size_t>(k)].tq =
                     1.0f - s_batch.verts[static_cast<size_t>(k)].tq;
+            // G624: ⛔ THIS FLIP IS EXACT FOR THE COORDINATE AND WRONG FOR THE ROUNDING STATE that
+            // travels beside it. `g406Round` is expressed in GS V; the backend now undoes the flip
+            // before applying it (`uUvFlipV`). Count the population so "no other srcFbp consumer
+            // carries rounding flags" is a measurement, not a source-reading claim.
+            g624NoteBound(g406Round.flagsU, g406Round.flagsV,
+                          g623SurfaceFbW(s_g261FboSrc[i]) > 0);
         }
         if (!g256ExactRttOn() && !s_batch.draws.empty() &&
             g178StateEqual(s_states[i], s_states[i - 1]) &&
@@ -5641,7 +5892,44 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // same full-height buffer. Rows outside the window were already copied out of the FBO and
     // discarded. Published unconditionally: the backend honours it only when its arm is on, and
     // the census needs the window even in the control arm.
-    g415_backend_set_color_window(kFbH - 1 - rowHi, rowHi - rowLo + 1);
+    // G621: narrow that window from the scissor union to the union of what the batch's draws can
+    // actually WRITE. Every other consumer of rowLo/rowHi (the FBO snapshot, the coalesced display
+    // pend, the page-generation bumps, the depth window) deliberately keeps the wide scissor form —
+    // widening those is conservative, so this phase moves exactly one variable: which rows travel
+    // GPU->CPU and get packed into guest VRAM.
+    // ⚠️ The nine post-submit `g255StageGpuVerify` arms stage the WHOLE `readback` buffer as their
+    // comparison copy, so a narrowed read would hand them rows left over from an earlier batch and
+    // they would report divergence that does not exist. Every one of them is `*VerifyOn()`-gated
+    // and false in any normal run, so this costs the default path nothing — but it means an ORACLE
+    // RUN MEASURES THE LEGACY WINDOW, which is correct: an oracle run is not a timing run anyway.
+    const bool g621RbOracleArmed =
+        (g255Rtt && !guestDepth && g255VerifyThis) ||
+        (g286Transient && !guestDepth && g286VerifyOn()) ||
+        g604ExactDisp || g604VerifyDsc ||
+        (g583Exact13b && g583Verify13bOn()) ||
+        (g586Exact141 && g586Verify141On()) ||
+        (g587Exact15d && g587Verify15dOn()) ||
+        (g570Exact13d && g570Verify13dOn()) ||
+        (g570Exact139 && g570Verify139On());
+    const bool g621WrSpan = g621WrSpanOn() && !g621RbOracleArmed && g621WrUsable &&
+                            g621WrHi >= g621WrLo && rowHi >= rowLo;
+    const int g621PubLo = g621WrSpan ? std::max(rowLo, g621WrLo) : rowLo;
+    const int g621PubHi = g621WrSpan ? std::min(rowHi, g621WrHi) : rowHi;
+    const bool g621Narrowed = g621WrSpan && g621PubHi >= g621PubLo &&
+                              (g621PubLo > rowLo || g621PubHi < rowHi);
+    // The oracle needs the FULL window in the buffer so it can prove the excluded rows were the
+    // identity, so it publishes the legacy window and narrows only the pack.
+    const bool g621Verify = g621WrSpanVerifyOn();
+    const int g621RdLo = (g621Narrowed && !g621Verify) ? g621PubLo : rowLo;
+    const int g621RdHi = (g621Narrowed && !g621Verify) ? g621PubHi : rowHi;
+    if (g621WrSpanStatOn())
+    {
+        if (!g621WrUsable && !s_batch.skipReadback)
+            g_g621Unusable.fetch_add(1u, std::memory_order_relaxed);
+        g621NoteBatch(fbp, s_batch.skipReadback, rowLo, rowHi, g621PubLo, g621PubHi,
+                      g621Narrowed);
+    }
+    g415_backend_set_color_window(kFbH - 1 - g621RdHi, g621RdHi - g621RdLo + 1);
     // G493 LATE DRAIN. Everything above this line — batch building, materialization, the G310
     // freeze, argument validation and the colour-window publication — is the front-end CPU the
     // previous packet's render was supposed to overlap with, and under the shipped top-of-flush
@@ -6000,7 +6288,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         {
             g_g276ColorRbN.fetch_add(1u, std::memory_order_relaxed);
             g_g276ColorRbWinRows.fetch_add(
-                static_cast<uint64_t>(rowHi - rowLo + 1), std::memory_order_relaxed);
+                static_cast<uint64_t>(g621PubHi - g621PubLo + 1), std::memory_order_relaxed);
             g_g276ColorRbFullRows.fetch_add(static_cast<uint64_t>(kFbH),
                                             std::memory_order_relaxed);
         }
@@ -6014,20 +6302,26 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             const bool g418Fast = g418Ballast > 0 ? false : g418Pick;
             const auto g418T0 = g418Profile ? std::chrono::steady_clock::now()
                                             : std::chrono::steady_clock::time_point{};
+            // G621: pack exactly the rows the readback transferred. When the oracle is armed the
+            // backend still read the whole legacy window, so the excluded rows are present in the
+            // buffer and the checksum below can prove that publishing them changes nothing.
             g418UnpackColorRows(vram, vramSize, s_batch.readback, fbBlock, fbw, fbW, kFbH,
-                                rowLo, rowHi, !g418Fast);
+                                g621PubLo, g621PubHi, !g418Fast);
+            if (g621Narrowed && g621Verify)
+                g621VerifyExcluded(vram, vramSize, s_batch.readback, fbBlock, fbw, fbW, kFbH,
+                                   rowLo, rowHi, g621PubLo, g621PubHi, fbp, !g418Fast);
             if (g418Ballast > 0 && g418Pick)
                 for (int i = 0; i < g418Ballast; ++i)
                     g418UnpackColorRows(vram, vramSize, s_batch.readback, fbBlock, fbw, fbW,
-                                        kFbH, rowLo, rowHi, true);
+                                        kFbH, g621PubLo, g621PubHi, true);
             if (g418Profile)
-                g418NoteUnpack(fbp, rowHi - rowLo + 1, fbW,
+                g418NoteUnpack(fbp, g621PubHi - g621PubLo + 1, fbW,
                                static_cast<uint64_t>(
                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
                                        std::chrono::steady_clock::now() - g418T0).count()));
             if (g418VerifyOn())
                 g418VerifyUnpack(vram, vramSize, s_batch.readback, fbBlock, fbw, fbW, kFbH,
-                                 rowLo, rowHi);
+                                 g621PubLo, g621PubHi);
         }
         // The color and depth backends are distinct even when their GS storage aliases. The
         // admitted write windows are disjoint, so this cannot overwrite pending dirty Z rows;
@@ -6249,6 +6543,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // lever's clothes.
     g591ColStamp(g351RouteB ? kG351Sprite139 : fbp, fbBlock, fbw, snap.genSum, snap.rowLo,
                  snap.rowHi);
+    // G623: the ONE instant at which FBO(fbp) == VRAM(pages of fbp) is KNOWN for the rows this
+    // flush just published. Only the TRANSIENT population is recorded (g623NotePublished refuses
+    // residents and the two display buffers), and `published` is the same condition the unpack
+    // above tested — a coalesced or skipped readback leaves VRAM behind the FBO and must not stamp.
+    g623NotePublished(fbp, fbBlock, fbw, fbW, kFbH, rowLo, rowHi,
+                      s_batch.readback.size() == static_cast<size_t>(fbW) * kFbH);
     if (g277GenMoveOn() && fbp == 0x68u)
     {
         for (int i = 0; i < 13; ++i)

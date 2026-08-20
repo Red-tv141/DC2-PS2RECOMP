@@ -1220,6 +1220,12 @@ void GSRasterizer::drawTriangle(GS *gs)
     // G203: in universal-Z mode the game's own clear-sprite populates VRAM Z — no artificial clear.
     if (!g203Uni && g106TitleZ && g106TitleZPrivateEnabled() && !t_g144InReplay)
         g106TitleZClearIfNeeded(ctx.frame.fbp);
+    // G620: from here this triangle may reach g106TitleZWrite, so the next clear of that buffer has
+    // real content to erase. Marked here rather than inside the per-pixel writer so the private-Z
+    // dirty bit costs one relaxed store per TRIANGLE, not per pixel; and outside the
+    // `!t_g144InReplay` guard because a parallel band replay writes the buffer without clearing it.
+    if (!g203Uni && g106TitleZ && g106TitleZPrivateEnabled())
+        g106TitleZMarkDirty(ctx.frame.fbp);
     const uint32_t zte  = static_cast<uint32_t>((ctx.test >> 16) & 0x1u);
     const uint32_t ztst = static_cast<uint32_t>((ctx.test >> 17) & 0x3u);
     // ZBUF.ZBP is a page base; GSMem Z addressing wants a block base (page<<5), matching

@@ -2114,6 +2114,12 @@ struct G178TexReg
     // guaranteed MISS at best and, if the two ever collided, a STALE texture at worst. Recording
     // which body wrote the stamp turns an arm switch into one honest re-decode per key instead.
     uint8_t hashVar = 0xFFu;
+    // G622: the key this entry's image is actually RESIDENT under in the backend. Equal to the map
+    // key for every texture whose descriptor key has never been observed to cycle between contents
+    // (i.e. the shipped behaviour); a content-derived variant key otherwise. The registry stays
+    // keyed by the DESCRIPTOR so the gen tier — which runs before any content hash exists — is
+    // unchanged and still answers in one probe.
+    uint64_t varKey = 0u;
 };
 std::unordered_map<uint64_t, G178TexReg> g_g178TexReg;
 

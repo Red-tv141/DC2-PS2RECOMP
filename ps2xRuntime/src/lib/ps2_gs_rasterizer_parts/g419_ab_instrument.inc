@@ -813,6 +813,18 @@ enum G419Lever
     // G617 (b): the PSMT4HH tap leaf, which admits the LARGEST single replay item on that route
     // (`disp spr-slow`, 37.4% at 819.0 cyc/inside) into the G530/G614 span kernel. Same shape.
     kG617LeverT4hh = 130,
+    // G622: CONTENT-ADDRESSED texture variants. Selects whether a texture whose key has been
+    // observed to CYCLE between images is uploaded under a content-derived key (so the alternating
+    // images coexist on the GPU and the alternation hits) or under the shipped descriptor-only key
+    // (so every alternation re-decodes and re-uploads). Read once per decode DECISION in the flush
+    // texture pass on the GS worker, so it takes the same thread-level block hold as G594/G595/G596.
+    kG622LeverTexVar = 131,
+    // G623: PRODUCER-SURFACE DIRECT CONSUMPTION. Selects whether a texture read whose base IS a
+    // transient producer surface's base, and whose sampled window is provably still equal to that
+    // producer's FBO, samples the FBO directly or takes the shipped hash + CPU decode + re-upload.
+    // Read once per candidate ENTRY in the flush bind pre-pass on the GS worker, so it takes the
+    // same thread-level block hold as G594/G595/G596/G622.
+    kG623LeverProdSrc = 132,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -941,6 +953,10 @@ static int g419AbLever()
             return static_cast<int>(kG617LeverBlendFill);
         if (std::strcmp(value, "t4hh") == 0)
             return static_cast<int>(kG617LeverT4hh);
+        if (std::strcmp(value, "texvar") == 0)
+            return static_cast<int>(kG622LeverTexVar);
+        if (std::strcmp(value, "prodsrc") == 0)
+            return static_cast<int>(kG623LeverProdSrc);
         if (std::strcmp(value, "rbfmt") == 0)
             return static_cast<int>(kG491LeverRbFmt);
         if (std::strcmp(value, "rbspin") == 0)
@@ -1099,7 +1115,7 @@ static int g419AbLever()
                      "vu1slow|gsslow|coalesce|earlykick|kickall|spinwait|wspin|spinboth|async1|"
                      "rb_all|rb_l2l|rb_resync|rb_display|uvpred|simdmerge|vnoptrace|pagebump|"
                      "leanfetch|pcreg|widevf0|flaglower|fastop|pcskip|blockrun|vujit|vuops|"
-                     "vuqsplit|vureg|sprfast|privz|rbfmt|rbspin|"
+                     "vuqsplit|vureg|sprfast|privz|blendfill|t4hh|texvar|rbfmt|rbspin|"
                      "norender|noother|ct24reuse|latedrain|nosync|gpuslow|glstate|winbuf|ownpub|"
                      "blklower|qpblock|blkbranch|blksplit|blkchain|blktail0|eeslow|chainpool|"
                      "histcur|qpseg|lockskip|capmove|clsmemo|g510both|texrun|texprobe|clsprobe|"
@@ -1171,6 +1187,8 @@ static const char *g419AbLeverName(int lever)
     case kG615LeverPrivZ: return "privz";
     case kG617LeverBlendFill: return "blendfill";
     case kG617LeverT4hh: return "t4hh";
+    case kG622LeverTexVar: return "texvar";
+    case kG623LeverProdSrc: return "prodsrc";
     case kG491LeverRbFmt: return "rbfmt";
     case kG491LeverRbSpin: return "rbspin";
     case kG492LeverNoRender: return "norender";
@@ -1419,6 +1437,12 @@ static uint64_t g438ArmHoldFrames()
                  // G506's law again: the G596 arm runs on the GS worker inside
                  // GS::performLocalToLocalTransfer.
                  sel == kG596LeverFastCopy ||
+                 // G506's law again: G622's texture-variant arm is read once per decode DECISION
+                 // in the flush texture pass, on the GS worker, exactly like G594's three.
+                 sel == kG622LeverTexVar ||
+                 // G506's law again: G623's producer-surface arm is read once per candidate ENTRY
+                 // in the flush bind pre-pass, on the GS worker, exactly like G622's.
+                 sel == kG623LeverProdSrc ||
                  // G506's law again: G610's compiled-block arm is read once per run() on the VU1
                  // worker, exactly like G490's `blockrun`, so it takes the same block hold.
                  sel == kG610LeverVuJit ||

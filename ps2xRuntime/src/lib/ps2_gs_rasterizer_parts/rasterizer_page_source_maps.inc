@@ -108,6 +108,9 @@ static bool g310On()
     // The logical surface replaces the default five-target publication path. It deliberately
     // does not combine with the older overlay/fan-out experiment, whose copied FBO pages have a
     // separate ownership model. A user forcing both gets the older arm and G310 stays inert.
+    // In native high-res mode, G310 is bypassed to preserve exact high-res FBO sampling.
+    if (dc2IsNativeHighResActive())
+        return false;
     return g310Requested() && g261WaveOn() && !g280AliasOn();
 }
 

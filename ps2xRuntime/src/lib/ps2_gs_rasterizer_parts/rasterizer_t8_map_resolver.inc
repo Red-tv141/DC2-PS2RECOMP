@@ -99,6 +99,370 @@ static bool g281BuildT8MapCold(const G144Entry &e, int srcTi, int texW, int texH
     return true;
 }
 
+// ===== G618: the same map, with the PER-PAGE work lifted out of the PER-TEXEL loop =====
+//
+// WHY THIS LOOP. The G618 premise gate measured `dungeon1`'s entry/run window (n=241..1081, the
+// 60-75 ms/f frames the route was recorded for) at **801.8 `g281` cache MISSES per frame** against
+// **0.00/frame** in the steady tail — and a GS-worker PC sample resolves 18.45% of all samples into
+// this builder's inner loop plus 3.01% into the out-of-line `GSMem::AddressP8` it calls per texel.
+// Capstone on the hottest PC names the mechanism exactly: **6.57% of every sample in the run lands
+// on the instruction immediately after `div dword ptr [r13+0x14]`** — the skid of one 32-bit
+// HARDWARE DIVIDE executed once per texel for `pageOff / src.fbw` and `pageOff % src.fbw`.
+//
+// Neither quantity is a function of the texel. `pageRow`/`pageCol` depend only on `pageBlock`, which
+// is exactly the key the shipped `pageOk[]` accept-memo is already keyed on — the loop was
+// memoizing the ACCEPT VERDICT for a page and then re-deriving that same page's row/column with a
+// divide on every one of its texels. Extending the existing memo to carry the two derived terms is
+// therefore exact BY CONSTRUCTION: single-threaded, and nothing inside the loop mutates
+// `g_g261Res`, so a page's verdict and its terms are both constant for the whole call.
+//
+// The second lowering removes the cross-TU call. `AddressP8` lives in ps2_gs_memory.cpp, so it can
+// never inline here. ⭐ The table is NOT hand-derived from the PSMT8 layout — it is built by
+// PROBING THE SHIPPED `GSMem::AddressP8`, exactly the way `G281Ct32Inverse` above probes
+// `addrPSMCT32` (g594's law), and then the page decomposition is SELF-TESTED against that same
+// shipped function over a grid that crosses pages in both axes and includes non-page-aligned `bp`.
+// A failing self-test simply leaves the fast path off forever (fail-closed, like
+// `g617ColumnPairsAdjacent`), so a future layout change cannot silently produce wrong texels.
+//
+// Rollback DC2_G618_NO_FAST_T8MAP=1 · oracle DC2_G618_VERIFY=1 · census DC2_G618_STAT=1.
+static bool g618FastT8MapOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G618_NO_FAST_T8MAP");
+    return on;
+}
+static bool g618T8MapVerifyOn()
+{
+    static const bool on = envFlagEnabled("DC2_G618_VERIFY");
+    return on;
+}
+static bool g618T8MapStatOn()
+{
+    static const bool on = envFlagEnabled("DC2_G618_STAT");
+    return on;
+}
+
+// The 128x64 PSMT8 page permutation, probed out of the shipped reader, plus the one-time proof that
+// AddressP8(bp,bw,x,y) == bp*256 + ((y>>6)*bw + (x>>7))*8192 + perm[(y&63)*128 + (x&127)].
+struct G618P8Page
+{
+    std::array<uint16_t, 128u * 64u> perm{};
+    bool ok = false;
+    G618P8Page()
+    {
+        for (uint32_t yy = 0u; yy < 64u; ++yy)
+            for (uint32_t xx = 0u; xx < 128u; ++xx)
+            {
+                const uint32_t off = GSMem::AddressP8(0u, 1u, xx, yy);
+                if (off >= 8192u)
+                    return;
+                perm[yy * 128u + xx] = static_cast<uint16_t>(off);
+            }
+        // A page must be a bijection onto its 8192 bytes, or the "one page == one 8 KiB block run"
+        // premise the accept-memo rests on is false.
+        std::array<uint8_t, 8192> seen{};
+        for (const uint16_t v : perm)
+        {
+            if (seen[v] != 0u)
+                return;
+            seen[v] = 1u;
+        }
+        static const uint32_t kBp[] = {0u, 1u, 7u, 32u, 0x2720u, 0x3420u};
+        static const uint32_t kBw[] = {1u, 2u, 4u, 8u};
+        for (const uint32_t bp : kBp)
+            for (const uint32_t bw : kBw)
+                for (uint32_t yy = 0u; yy < 128u; ++yy)
+                    for (uint32_t xx = 0u; xx < 256u; ++xx)
+                    {
+                        const uint32_t want = GSMem::AddressP8(bp, bw, xx, yy);
+                        const uint32_t got = bp * 256u +
+                                             (((yy >> 6u) * bw + (xx >> 7u)) << 13u) +
+                                             perm[(yy & 63u) * 128u + (xx & 127u)];
+                        if (want != got)
+                            return;
+                    }
+        ok = true;
+    }
+};
+
+static std::atomic<uint64_t> g_g618Calls{0}, g_g618Texels{0}, g_g618Ns{0};
+static std::atomic<uint64_t> g_g618Checks{0}, g_g618Bad{0}, g_g618Decline{0};
+// ⭐ THE COVERAGE DENOMINATOR. `g_g618Texels` counts only ACCEPTED builds, and the first oracle run
+// showed it frozen at 77,824 while `calls` passed 660,000 — i.e. this builder is overwhelmingly a
+// REJECTED ADMISSION TEST, not a map build, and its cost is the texels it walks BEFORE refusing.
+// `g_g618Visited` is that denominator; the rej* counters name which conjunct refused
+// (g603_admission_census_names_the_blocker), so a conjunct decidable without the walk can be
+// hoisted out of it.
+static std::atomic<uint64_t> g_g618Visited{0}, g_g618Built{0};
+static std::atomic<uint64_t> g_g618RejPre{0}, g_g618RejPage{0}, g_g618RejWord{0},
+    g_g618RejSx{0}, g_g618RejSy{0};
+// Refusal-ring counters (the ring itself needs G326G281Key and is defined further down).
+static std::atomic<uint64_t> g_g618NegHit{0}, g_g618NegMiss{0};
+
+// ⛔ The self-test verdict must be read by the DISPATCHER, not by the kernel. A kernel that
+// answered `false` on a failed self-test would be telling its caller "this view has no valid map",
+// which is a BEHAVIOUR change (the T8 alias view would be refused), not a fallback. Fail-closed
+// here means "run the shipped builder", so the verdict is a separate accessor.
+static const G618P8Page &g618P8Page()
+{
+    static const G618P8Page s_page;
+    return s_page;
+}
+
+enum : int
+{
+    kG618RejNone = 0,
+    kG618RejPre = 1,   // refused before the walk (shape / source residency)
+    kG618RejPage = 2,  // a sampled physical page is out of range or foreign-owned
+    kG618RejWord = 3,  // the CT32 inverse has no entry for this word
+    kG618RejSx = 4,    // source X outside the source framebuffer width
+    kG618RejSy = 5     // source Y outside the source target's RESIDENT COVERAGE rows
+};
+
+// `rej`/`visited` are census out-params only; they cost nothing in the loop because the visited
+// count at a refusal is just the loop indices. Behaviour is identical with or without them.
+static bool g618BuildT8MapFast(const G144Entry &e, int srcTi, int texW, int texH,
+                               std::vector<uint32_t> &out, int &rej, uint64_t &visited)
+{
+    rej = kG618RejNone;
+    visited = 0u;
+    static const G281Ct32Inverse s_inv;
+    const G618P8Page &s_page = g618P8Page();
+    if (!s_inv.ok || !s_page.ok || srcTi < 0 || srcTi >= static_cast<int>(kG248TargetCount) ||
+        texW <= 0 || texH <= 0 || texW > g599T8MaxW() || texH > 512)
+    {
+        rej = kG618RejPre;
+        return false;
+    }
+    const G261Res &src = g_g261Res[srcTi];
+    if (!src.dirty || !src.range.valid || src.fbw == 0u || src.fbW <= 0 || src.fbW > 512)
+    {
+        rej = kG618RejPre;
+        return false;
+    }
+    const uint32_t srcBase = framePageBaseToBlock(kG261Fbp[srcTi]);
+    const uint32_t pageBwT8 = std::max<uint32_t>(1u, e.ctx.tex0.tbw >> 1u);
+    out.resize(static_cast<size_t>(texW) * texH);
+
+    constexpr uint32_t kG599PageMemo = 256u;
+    uint8_t pageOk[kG599PageMemo] = {};
+    int32_t pageColTerm[kG599PageMemo] = {};
+    int32_t pageRowTerm[kG599PageMemo] = {};
+    // A page ABOVE the memo window is never cached by the shipped loop, so it re-ran the whole
+    // 14-target walk AND the divide on every one of its texels. One entry is enough: the loop walks
+    // a row at a time and a PSMT8 page is 128 texels wide.
+    uint32_t farBlock = 0xFFFFFFFFu;
+    int32_t farCol = 0, farRow = 0;
+
+    const uint32_t bpBase = e.ctx.tex0.tbp0 * 256u;
+    const int fbW = src.fbW;
+    const int covLo = src.covLo, covHi = src.covHi;
+    const uint32_t fbwSrc = src.fbw;
+    const int16_t *const invX = s_inv.x.data();
+    const int16_t *const invY = s_inv.y.data();
+    const uint16_t *const perm = s_page.perm.data();
+    const size_t invN = s_inv.x.size();
+    uint32_t *const dst = out.data();
+
+    for (int vv = 0; vv < texH; ++vv)
+    {
+        const uint32_t yPageTerm = (static_cast<uint32_t>(vv) >> 6u) * pageBwT8;
+        const uint16_t *const permRow = perm + (static_cast<uint32_t>(vv) & 63u) * 128u;
+        uint32_t *const dstRow = dst + static_cast<size_t>(vv) * texW;
+        for (int uu = 0; uu < texW; ++uu)
+        {
+            const uint32_t off = bpBase +
+                                 ((yPageTerm + (static_cast<uint32_t>(uu) >> 7u)) << 13u) +
+                                 permRow[static_cast<uint32_t>(uu) & 127u];
+            const uint32_t pageBlock = (off >> 13u) << 5u;
+            const uint32_t memoIdx = pageBlock >= srcBase ? ((pageBlock - srcBase) >> 5u)
+                                                          : kG599PageMemo;
+            int32_t colTerm, rowTerm;
+            if (memoIdx < kG599PageMemo && pageOk[memoIdx] != 0u)
+            {
+                colTerm = pageColTerm[memoIdx];
+                rowTerm = pageRowTerm[memoIdx];
+            }
+            else if (memoIdx >= kG599PageMemo && pageBlock == farBlock)
+            {
+                colTerm = farCol;
+                rowTerm = farRow;
+            }
+            else
+            {
+                const G144BlockRange page{pageBlock, pageBlock + 31u, true};
+                if (page.last > 0x3FFFu || page.first < src.range.first ||
+                    page.last > src.range.last || pageBlock < srcBase ||
+                    ((pageBlock - srcBase) & 31u) != 0u)
+                {
+                    rej = kG618RejPage;
+                    visited = static_cast<uint64_t>(vv) * texW + uu;
+                    return false;
+                }
+                for (uint32_t t = 0; t < kG248TargetCount; ++t)
+                {
+                    if (static_cast<int>(t) == srcTi || !g_g261Res[t].dirty)
+                        continue;
+                    if (!g_g261Res[t].range.valid ||
+                        g280DirtyTargetOwnsPage(static_cast<int>(t), pageBlock))
+                    {
+                        rej = kG618RejPage;
+                        visited = static_cast<uint64_t>(vv) * texW + uu;
+                        return false;
+                    }
+                }
+                const uint32_t pageOff = (pageBlock - srcBase) >> 5u;
+                colTerm = static_cast<int32_t>(pageOff % fbwSrc) * 64;
+                rowTerm = static_cast<int32_t>(pageOff / fbwSrc) * 32;
+                if (memoIdx < kG599PageMemo)
+                {
+                    pageOk[memoIdx] = 1u;
+                    pageColTerm[memoIdx] = colTerm;
+                    pageRowTerm[memoIdx] = rowTerm;
+                }
+                else
+                {
+                    farBlock = pageBlock;
+                    farCol = colTerm;
+                    farRow = rowTerm;
+                }
+            }
+
+            const uint32_t word = (off & 8191u) >> 2u;
+            if (word >= invN)
+            {
+                rej = kG618RejWord;
+                visited = static_cast<uint64_t>(vv) * texW + uu;
+                return false;
+            }
+            const int sx = static_cast<int>(colTerm) + invX[word];
+            const int sy = static_cast<int>(rowTerm) + invY[word];
+            if (sx < 0 || sx >= fbW || sy < covLo || sy > covHi || sy < 0 || sy >= 512)
+            {
+                rej = (sx < 0 || sx >= fbW) ? kG618RejSx : kG618RejSy;
+                visited = static_cast<uint64_t>(vv) * texW + uu;
+                return false;
+            }
+            const uint32_t glY = static_cast<uint32_t>(511 - sy);
+            const uint32_t lane = off & 3u;
+            dstRow[uu] = (static_cast<uint32_t>(sx) & 0xFFu) |
+                         ((glY & 0xFFu) << 8u) |
+                         ((((glY >> 8u) & 1u) | (lane << 1u) |
+                           (((static_cast<uint32_t>(sx) >> 8u) & 1u) << 3u))
+                          << 16u) |
+                         0xFF000000u;
+        }
+    }
+    visited = static_cast<uint64_t>(texW) * static_cast<uint64_t>(texH);
+    return true;
+}
+
+// ⚠️ Keyed on calls + negative-cache HITS, not on calls alone: once the refusal ring works, `calls`
+// stops advancing and a calls-only cadence would print nothing on the very configuration the phase
+// exists to measure.
+static void g618Report()
+{
+    static uint64_t s_last = 0u;
+    const uint64_t calls = g_g618Calls.load(std::memory_order_relaxed);
+    const uint64_t negHit = g_g618NegHit.load(std::memory_order_relaxed);
+    const uint64_t events = calls + negHit;
+    if (events < s_last + 20000u)
+        return;
+    s_last = events;
+    const double ns = static_cast<double>(g_g618Ns.load(std::memory_order_relaxed));
+    const double vis = static_cast<double>(g_g618Visited.load(std::memory_order_relaxed));
+    std::fprintf(stderr,
+                 "[G618:t8map] calls=%llu built=%llu visited=%llu builtTexels=%llu "
+                 "ms=%.1f usPerCall=%.2f nsPerVisited=%.2f "
+                 "rej(pre=%llu page=%llu word=%llu sx=%llu sy=%llu) "
+                 "neg(hit=%llu ins=%llu) checks=%llu bad=%llu decline=%llu\n",
+                 static_cast<unsigned long long>(calls),
+                 static_cast<unsigned long long>(g_g618Built.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_g618Visited.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_g618Texels.load(std::memory_order_relaxed)),
+                 ns / 1.0e6, ns / 1.0e3 / std::max<double>(1.0, static_cast<double>(calls)),
+                 ns / std::max(1.0, vis),
+                 static_cast<unsigned long long>(g_g618RejPre.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_g618RejPage.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_g618RejWord.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_g618RejSx.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_g618RejSy.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(negHit),
+                 static_cast<unsigned long long>(g_g618NegMiss.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_g618Checks.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_g618Bad.load(std::memory_order_relaxed)),
+                 static_cast<unsigned long long>(g_g618Decline.load(std::memory_order_relaxed)));
+}
+
+// Dispatcher. Keeps `g281BuildT8MapCold` authoritative for the rollback arm AND as the oracle.
+static bool g618T8Map(const G144Entry &e, int srcTi, int texW, int texH,
+                      std::vector<uint32_t> &out)
+{
+    if (!g618FastT8MapOn() || !g618P8Page().ok)
+    {
+        if (g618FastT8MapOn())
+            g_g618Decline.fetch_add(1u, std::memory_order_relaxed);
+        return g281BuildT8MapCold(e, srcTi, texW, texH, out);
+    }
+
+    const bool stat = g618T8MapStatOn();
+    const auto t0 = stat ? std::chrono::steady_clock::now()
+                         : std::chrono::steady_clock::time_point{};
+    int rej = kG618RejNone;
+    uint64_t visited = 0u;
+    const bool ok = g618BuildT8MapFast(e, srcTi, texW, texH, out, rej, visited);
+    if (stat)
+    {
+        g_g618Ns.fetch_add(static_cast<uint64_t>(
+                               std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                   std::chrono::steady_clock::now() - t0).count()),
+                           std::memory_order_relaxed);
+        g_g618Calls.fetch_add(1u, std::memory_order_relaxed);
+        g_g618Visited.fetch_add(visited, std::memory_order_relaxed);
+        if (ok)
+        {
+            g_g618Built.fetch_add(1u, std::memory_order_relaxed);
+            g_g618Texels.fetch_add(static_cast<uint64_t>(texW) * static_cast<uint64_t>(texH),
+                                   std::memory_order_relaxed);
+        }
+        switch (rej)
+        {
+        case kG618RejPre: g_g618RejPre.fetch_add(1u, std::memory_order_relaxed); break;
+        case kG618RejPage: g_g618RejPage.fetch_add(1u, std::memory_order_relaxed); break;
+        case kG618RejWord: g_g618RejWord.fetch_add(1u, std::memory_order_relaxed); break;
+        case kG618RejSx: g_g618RejSx.fetch_add(1u, std::memory_order_relaxed); break;
+        case kG618RejSy: g_g618RejSy.fetch_add(1u, std::memory_order_relaxed); break;
+        default: break;
+        }
+        g618Report();
+    }
+
+    if (g618T8MapVerifyOn())
+    {
+        // ⭐ The oracle compares the WHOLE PRODUCT and the RETURN VALUE, because a builder that
+        // bails early leaves a partially-written `out` its caller never reads — so "same texels" is
+        // not the property; "same decision AND same texels when accepted" is.
+        static std::vector<uint32_t> s_ref;
+        const bool refOk = g281BuildT8MapCold(e, srcTi, texW, texH, s_ref);
+        g_g618Checks.fetch_add(1u, std::memory_order_relaxed);
+        if (refOk != ok || (ok && s_ref != out))
+        {
+            const uint64_t bad = g_g618Bad.fetch_add(1u, std::memory_order_relaxed);
+            if (bad < 16u)
+                std::fprintf(stderr,
+                             "[G618:bad] MISMATCH tbp=0x%x tbw=%u src=%d size=%dx%d "
+                             "fastOk=%d coldOk=%d fastN=%zu coldN=%zu\n",
+                             e.ctx.tex0.tbp0, static_cast<unsigned>(e.ctx.tex0.tbw), srcTi,
+                             texW, texH, ok ? 1 : 0, refOk ? 1 : 0, out.size(), s_ref.size());
+            // The shipped builder stays authoritative under the oracle.
+            if (!refOk)
+                return false;
+            out = s_ref;
+            return true;
+        }
+    }
+    return ok;
+}
+
 struct G326G281TargetKey
 {
     int32_t fbW = 0, dirtyLo = 0, dirtyHi = 0, covLo = 0, covHi = 0;
@@ -156,11 +520,80 @@ struct G326G281Plan
     uint64_t stamp = 0u;
 };
 
+// ===== G618: the REFUSAL ring =====
+// Rollback DC2_G618_NO_NEGCACHE=1 (independent of DC2_G618_NO_FAST_T8MAP, so the two halves of this
+// phase can be gated apart).
+static bool g618NegOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G618_NO_NEGCACHE");
+    return on;
+}
+
+// ⚠️ Hashed FIELD-WISE, never over the struct's bytes: `G326G281Key` is assigned member-by-member,
+// so its padding is indeterminate and a byte hash could differ for two keys `g326G281KeyEqual`
+// calls equal — which would silently degrade to a permanent miss. Every field hashed here is a
+// field that comparator reads, so equal keys always hash equal.
+static uint64_t g618KeyHash(const G326G281Key &k)
+{
+    uint64_t h = 1469598103934665603ull;
+    const auto mix = [&h](uint64_t v) {
+        h = (h ^ v) * 1099511628211ull;
+    };
+    mix(k.tbp0);
+    mix(static_cast<uint64_t>(static_cast<uint32_t>(k.srcTi)));
+    mix(static_cast<uint64_t>(static_cast<uint32_t>(k.texW)));
+    mix(static_cast<uint64_t>(static_cast<uint32_t>(k.texH)));
+    mix(k.tbw);
+    mix(k.psm);
+    for (uint32_t t = 0u; t < kG248TargetCount; ++t)
+    {
+        const G326G281TargetKey &x = k.targets[t];
+        mix(static_cast<uint64_t>(static_cast<uint32_t>(x.fbW)));
+        mix(static_cast<uint64_t>(static_cast<uint32_t>(x.dirtyLo)));
+        mix(static_cast<uint64_t>(static_cast<uint32_t>(x.dirtyHi)));
+        mix(static_cast<uint64_t>(static_cast<uint32_t>(x.covLo)));
+        mix(static_cast<uint64_t>(static_cast<uint32_t>(x.covHi)));
+        mix(x.rangeFirst);
+        mix(x.rangeLast);
+        mix(x.fbw);
+        mix(static_cast<uint64_t>(x.dirty ? 1u : 0u) |
+            (static_cast<uint64_t>(x.rangeValid ? 1u : 0u) << 1u));
+    }
+    return h;
+}
+
+struct G618NegEntry
+{
+    uint64_t hash = 0u;
+    bool used = false;
+    G326G281Key key{};
+};
+// Its own storage, sized well above the accept cache: a refusal must never evict a real map, and
+// the population being remembered is "every view this scene refuses", not "every view it builds".
+static G618NegEntry g_g618Neg[64];
+static uint32_t g_g618NegCursor = 0u;
+
+static bool g618NegFind(const G326G281Key &key, uint64_t h)
+{
+    for (const G618NegEntry &n : g_g618Neg)
+        if (n.used && n.hash == h && g326G281KeyEqual(n.key, key))
+            return true;
+    return false;
+}
+static void g618NegInsert(const G326G281Key &key, uint64_t h)
+{
+    G618NegEntry &slot = g_g618Neg[g_g618NegCursor];
+    g_g618NegCursor = (g_g618NegCursor + 1u) % 64u;
+    slot.hash = h;
+    slot.key = key;
+    slot.used = true;
+}
+
 static bool g281BuildT8Map(const G144Entry &e, int srcTi, int texW, int texH,
                             std::vector<uint32_t> &out)
 {
     if (!g326G281On())
-        return g281BuildT8MapCold(e, srcTi, texW, texH, out);
+        return g618T8Map(e, srcTi, texW, texH, out);
 
     static std::vector<G326G281Plan> s_cache;
     static uint64_t s_stamp = 0u;
@@ -204,7 +637,60 @@ static bool g281BuildT8Map(const G144Entry &e, int srcTi, int texW, int texH,
 
     if (g326DiagOn())
         ++g_g326.g281Miss;
-    if (!g281BuildT8MapCold(e, srcTi, texW, texH, out))
+
+    // ===== G618: THE REFUSAL IS THE POPULATION, AND IT WAS THE ONLY THING NOT CACHED =====
+    //
+    // `[G618:t8map]` on `dungeon1`: **660,000 calls, 7 built, 659,993 refused — 100% of them on the
+    // `sy` conjunct** (the source row falls outside the source target's resident coverage window),
+    // after walking **1.96 BILLION texels** to find out: 2,972 texels and 11.62 us per call, 7.67 s
+    // of GS-worker CPU, and essentially every one of those calls lands inside n=241..1081 — the
+    // window where this route runs at 60 ms/f instead of 28.7 and which is why the route was
+    // recorded at all.
+    //
+    // ⭐ The plan cache above is empty NOT because `G326G281Key` churns but because a refusal has no
+    // plan to store, so the identical refused view re-walks its texels ~802 times per frame forever.
+    // Caching the refusal rests on exactly the premise the ACCEPT cache already ships — that this
+    // key captures every input the builder reads — so it introduces no new assumption. It gets its
+    // own ring so a refusal can never evict a real map, and `DC2_G618_VERIFY=1` re-runs the shipped
+    // builder on every negative hit and reports any disagreement.
+    if (g618NegOn())
+    {
+        const uint64_t h = g618KeyHash(key);
+        if (g618NegFind(key, h))
+        {
+            if (g618T8MapStatOn())
+            {
+                g_g618NegHit.fetch_add(1u, std::memory_order_relaxed);
+                g618Report();
+            }
+            if (g618T8MapVerifyOn())
+            {
+                static std::vector<uint32_t> s_negRef;
+                g_g618Checks.fetch_add(1u, std::memory_order_relaxed);
+                if (g281BuildT8MapCold(e, srcTi, texW, texH, s_negRef))
+                {
+                    const uint64_t bad = g_g618Bad.fetch_add(1u, std::memory_order_relaxed);
+                    if (bad < 16u)
+                        std::fprintf(stderr,
+                                     "[G618:bad] NEGCACHE tbp=0x%x tbw=%u src=%d size=%dx%d "
+                                     "cached=refuse cold=ACCEPT\n",
+                                     e.ctx.tex0.tbp0, static_cast<unsigned>(e.ctx.tex0.tbw),
+                                     srcTi, texW, texH);
+                    out = s_negRef; // the shipped builder stays authoritative under the oracle
+                    return true;
+                }
+            }
+            return false;
+        }
+        if (!g618T8Map(e, srcTi, texW, texH, out))
+        {
+            g618NegInsert(key, h);
+            if (g618T8MapStatOn())
+                g_g618NegMiss.fetch_add(1u, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    else if (!g618T8Map(e, srcTi, texW, texH, out))
         return false;
     if (g326ForceColdOn())
         return true;

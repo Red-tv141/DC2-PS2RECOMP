@@ -682,10 +682,49 @@ void g50Record(uint32_t tbp, bool degen,
         return (g106TitleZIndex(fbp) == 0u) ? s_buf0 : s_buf68;
     }
 
+    // ===== G620: the private-Z clear that fills a buffer nobody wrote =====
+    //
+    // `g106TitleZClearIfNeeded` is called from the GPU flush path (vram_materialization.inc, inside
+    // the `classify.setup` window that `[G581:clssplit]` prices at 1.22 ms/f on `dungeon1`) on every
+    // change of `fbp`, WITHOUT the `g106TitleZScope` / `g106TitleZPrivateEnabled` tests that gate
+    // the only code which ever reads or writes these buffers. Each call was a 512x512x4 = 1 MiB
+    // `std::fill`. On a gameplay route the private Z is never written at all — `g106TitleZScope`
+    // requires `fbp == 0 || fbp == 0x68` AND `g104TitleRockTriangle` — so every one of those fills
+    // wrote zeros over zeros. Worse, `g106TitleZIndex` folds every fbp except 0x68 onto buffer 0
+    // while the guard compares the RAW fbp, so an 0x0 -> 0x139 -> 0x0 target cycle re-filled the
+    // SAME buffer twice per cycle.
+    //
+    // EXACTNESS.  A buffer that has not been written since its last fill is already all zeros, so
+    // filling it again is a no-op on every byte. The dirty bit is set at the ONE place a triangle
+    // can reach the private-Z write (`rasterizer_draw_triangle.inc`, beside the clear call itself),
+    // which is a strict superset of the pixels `g106TitleZWrite` can touch, so the bit is
+    // conservative in the safe direction: it can only cause an unnecessary fill, never skip a
+    // needed one. Both vectors are value-initialised to zero, so `false` is the correct initial
+    // state. Rollback: `DC2_G620_NO_ZCLEARSKIP=1` restores the unconditional fill.
+    //
+    // Namespace scope for the arm (G619): a function-local `static const bool` is a per-access
+    // thread-safe-static guard on MSVC.
+    std::atomic<bool> g_g620ZDirty[2] = {};
+    const bool g_g620ZClearSkip = (std::getenv("DC2_G620_NO_ZCLEARSKIP") == nullptr);
+    std::atomic<uint64_t> g_g620ZClearCalls{0};
+    std::atomic<uint64_t> g_g620ZClearFills{0};
+
+    void g106TitleZMarkDirty(uint32_t fbp)
+    {
+        g_g620ZDirty[g106TitleZIndex(fbp)].store(true, std::memory_order_relaxed);
+    }
+
     void g106TitleZClear(uint32_t fbp)
     {
+        const uint32_t bi = g106TitleZIndex(fbp);
+        g_g620ZClearCalls.fetch_add(1u, std::memory_order_relaxed);
+        if (g_g620ZClearSkip &&
+            !g_g620ZDirty[bi].load(std::memory_order_relaxed))
+            return; // already all zeros — the fill would write zeros over zeros
         auto &buf = g106TitleZBuf(fbp);
         std::fill(buf.begin(), buf.end(), 0u);
+        g_g620ZDirty[bi].store(false, std::memory_order_relaxed);
+        g_g620ZClearFills.fetch_add(1u, std::memory_order_relaxed);
     }
 
     void g106TitleZClearIfNeeded(uint32_t fbp)
