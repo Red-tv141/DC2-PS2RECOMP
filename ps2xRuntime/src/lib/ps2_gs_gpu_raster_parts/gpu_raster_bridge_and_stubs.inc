@@ -121,6 +121,12 @@ bool g280_backend_copy_color_rects(uint32_t srcFbp, uint32_t dstFbp,
     return G178Backend::instance().copyColor(srcFbp, dstFbp, rects6);
 }
 
+bool g178_backend_read_display_fbo(uint32_t fbp, uint32_t fallbackFbp, uint32_t &outW, uint32_t &outH,
+                                   std::vector<uint8_t> &outRgba)
+{
+    return G178Backend::instance().readDisplayFbo(fbp, fallbackFbp, outW, outH, outRgba);
+}
+
 bool g289_backend_copy_display_to_work(uint32_t srcFbp, uint32_t dstFbp)
 {
     static const std::vector<int32_t> s_rect = {

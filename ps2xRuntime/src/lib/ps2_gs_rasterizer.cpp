@@ -1,4 +1,4 @@
-﻿// G612: this TU gains only the `vureg` A/B arm in g419_ab_instrument.inc (the native VU1 REGION
+// G612: this TU gains only the `vureg` A/B arm in g419_ab_instrument.inc (the native VU1 REGION
 // backend lives in the VU1 TU), so this content edit is what forces MSBuild to consume the .inc
 // (G359). revision: 1
 // G597: DC2_G597_OWNCHK=1 -> [G597:own]. Counts EVERY conjunct of g536CollectGuestOwnedPages'
@@ -411,6 +411,33 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // rasterizer_gpu_alias_page_view.inc above, and must precede vram_materialization.inc, whose
 // texture loop carries all three call sites (source decision, registry hit, decode).
 #include "ps2_gs_rasterizer_parts/g600_sky_probe.inc"
+#include "ps2_gs_rasterizer_parts/ps2_texture_replacements.inc"
+
+// G620: why a texture RE-DECODES (default OFF). Same placement rule as g600_sky_probe.inc — the
+// three call sites (gen hit, hash hit, decode) all live in vram_materialization.inc's texture loop,
+// and it needs g599EnvU32/envFlagEnabled from above.
+#include "ps2_gs_rasterizer_parts/g620_decode_buffers.inc"
+#include "ps2_gs_rasterizer_parts/g620_texdecode_census.inc"
+
+// G621: the PRODUCER-scoped colour readback window. Must follow g418_readback_unpack.inc (its
+// oracle re-runs g418UnpackColorRows) and precede vram_materialization.inc, which holds both call
+// sites — the window publication and the VRAM pack.
+#include "ps2_gs_rasterizer_parts/g621_wrspan.inc"
+
+// G622: CONTENT-ADDRESSED texture variants. Must follow g419_ab_instrument.inc (it reads the paired
+// arm through g419AbArmFor) and precede vram_materialization.inc, which holds all of its call sites
+// — the two cache tiers and the decode in the flush texture pass, and the key lookup in the draw
+// pass.
+#include "ps2_gs_rasterizer_parts/g622_texvar.inc"
+
+// G623 revision: 1 — PRODUCER-SURFACE DIRECT CONSUMPTION. Must follow
+// rasterizer_rtt_census_and_waves.inc (kG248TargetCount / g_g261Res / g248TargetIndex),
+// rasterizer_command_graph.inc (g_g178PageGen / g144TextureRange / g144RangeOverlaps) and
+// g419_ab_instrument.inc (it reads the paired arm through g419AbArmFor), and it must precede
+// rasterizer_vram_materialization.inc, which holds all four call sites: the publication stamp, the
+// bind decision in the pre-pass, the unconsidered-population census in the texture pass, and the
+// oracle at the decode.
+#include "ps2_gs_rasterizer_parts/g623_producer_surface.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_vram_materialization.inc"
 

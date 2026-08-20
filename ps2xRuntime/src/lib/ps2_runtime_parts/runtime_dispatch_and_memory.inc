@@ -31,6 +31,11 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
         m_debugRa.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)), std::memory_order_relaxed);
         m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)), std::memory_order_relaxed);
         m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0)), std::memory_order_relaxed);
+        dc2_crash::updateActiveGuestContext(pc,
+                                           static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)),
+                                           static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)),
+                                           static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0)),
+                                           ctx);
 
         RecompiledFunction fn = lookupFunction(pc);
         const uint32_t dispatchedPc = pc;
@@ -38,7 +43,26 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
 
         {
             GuestExecutionScope guestExecution(this);
-            fn(rdram, ctx, this);
+#if ENABLE_PROFILER
+            if (dc2_profiler::profilerEnabled())
+            {
+                if (dc2_profiler::functionProfilingEnabled())
+                {
+                    dc2_profiler::FunctionCallTimer fnTimer(pc);
+                    dc2_profiler::EeCallTimer eeTimer;
+                    fn(rdram, ctx, this);
+                }
+                else
+                {
+                    dc2_profiler::EeCallTimer eeTimer;
+                    fn(rdram, ctx, this);
+                }
+            }
+            else
+#endif
+            {
+                fn(rdram, ctx, this);
+            }
         }
 
         // G58: capture the function whose execution left pc=0x9f84a0 (the robust title crash).
@@ -84,11 +108,30 @@ void PS2Runtime::enterGuestExecution()
     m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
     m_guestExecutionMutex.lock();
     m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
+    // G619: the slot table (no allocation); nullptr means "use the map" — see g619DepthCell.
+    if (uint32_t *cell = g619DepthCell(this, true))
+    {
+        ++*cell;
+        return;
+    }
     ++g_guestExecutionDepths[this];
 }
 
 void PS2Runtime::leaveGuestExecution()
 {
+    if (uint32_t *cell = g619DepthCell(this, false))
+    {
+        if (*cell == 0u)
+        {
+            return;
+        }
+        --*cell;
+        m_guestExecutionMutex.unlock();
+        // No erase: "absent" and "present with 0" are equivalent to every consumer, and erasing is
+        // what put a free() on this path.
+        return;
+    }
+
     auto it = g_guestExecutionDepths.find(this);
     if (it == g_guestExecutionDepths.end() || it->second == 0u)
     {
@@ -105,6 +148,21 @@ void PS2Runtime::leaveGuestExecution()
 
 uint32_t PS2Runtime::releaseGuestExecution()
 {
+    if (uint32_t *cell = g619DepthCell(this, false))
+    {
+        const uint32_t depth = *cell;
+        if (depth == 0u)
+        {
+            return 0u;
+        }
+        for (uint32_t i = 0; i < depth; ++i)
+        {
+            m_guestExecutionMutex.unlock();
+        }
+        *cell = 0u;
+        return depth;
+    }
+
     auto it = g_guestExecutionDepths.find(this);
     if (it == g_guestExecutionDepths.end() || it->second == 0u)
     {
@@ -124,6 +182,18 @@ void PS2Runtime::reacquireGuestExecution(uint32_t depth)
 {
     if (depth == 0u)
     {
+        return;
+    }
+
+    if (uint32_t *cell = g619DepthCell(this, true))
+    {
+        for (uint32_t i = 0; i < depth; ++i)
+        {
+            m_guestExecutionWaiters.fetch_add(1u, std::memory_order_acq_rel);
+            m_guestExecutionMutex.lock();
+            m_guestExecutionWaiters.fetch_sub(1u, std::memory_order_acq_rel);
+            ++*cell;
+        }
         return;
     }
 
@@ -357,7 +427,9 @@ void PS2Runtime::run()
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
     // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
+    const int frameInitW = dc2IsNativeHighResActive() ? dc2GetNativePhysicalDisplayWidth() : FB_WIDTH;
+    const int frameInitH = dc2IsNativeHighResActive() ? dc2GetNativePhysicalDisplayStorageHeight() : DEFAULT_DISPLAY_HEIGHT;
+    Image blank = GenImageColor(frameInitW, frameInitH, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
 
@@ -367,6 +439,7 @@ void PS2Runtime::run()
     std::thread gameThread([&]()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
+        dc2_log::setCurrentThreadName("GameThread");
         try
         {
             dispatchLoop(m_memory.getRDRAM(), &m_cpuContext);
@@ -388,10 +461,70 @@ void PS2Runtime::run()
     ps2_syscalls::EnsureVSyncWorkerRunning(m_memory.getRDRAM(), this);
 
     g189StartWatchdogOnce();
+#if ENABLE_PROFILER
+    dc2_profiler::initProfiler();
+#endif
     uint64_t tick = 0;
     while (!isStopRequested() && g_activeThreads.load(std::memory_order_relaxed) > 0)
     {
+#if ENABLE_PROFILER
+        if (dc2_profiler::profilerEnabled())
+        {
+            dc2_profiler::FrameProfiler::instance().beginFrame();
+        }
+#endif
+        // G616: RTSS presentation synchronization. Only call BeginDrawing/EndDrawing when a new
+        // guest frame was produced and uploaded, so RivaTuner/RTSS measures the real in-game FPS.
+        // Rollback: DC2_NO_PRESENT_SYNC=1 restores the legacy 60 Hz free-running presentation.
+        static const bool s_presentSync = [] {
+            const char *v = std::getenv("DC2_NO_PRESENT_SYNC");
+            return !(v && *v && *v != '0');
+        }();
+        static const bool s_g167StarveMain = (std::getenv("DC2_G167_STARVE_MAIN") != nullptr);
+        uint32_t presentWidth = static_cast<uint32_t>(frameInitW);
+        uint32_t presentHeight = static_cast<uint32_t>(dc2IsNativeHighResActive() ? getDC2NativeRenderConfig().requestedHeight : DEFAULT_DISPLAY_HEIGHT);
+        g_g189PresentStage.store(1, std::memory_order_relaxed);
+        bool newFrame = false;
+        if (!s_g167StarveMain)
+        {
+            DC2_PROFILE_SCOPE(Upload);
+            newFrame = UploadFrame(frameTex, this, presentWidth, presentHeight);
+        }
+        g_g189PresentStage.store(2, std::memory_order_relaxed);
+
+        if (s_presentSync && !newFrame)
+        {
+            {
+                DC2_PROFILE_SCOPE(Input);
+                if (g_g7_poll_live_pad_hook)
+                    g_g7_poll_live_pad_hook();
+                PollInputEvents();
+            }
+
+            if (WindowShouldClose())
+            {
+                RUNTIME_LOG("[run] window close requested, breaking out of loop");
+                requestStop();
+                break;
+            }
+
+            extern bool g176_wait_frame_latched(uint64_t lastGen, uint32_t timeoutMs);
+            extern uint64_t g176_present_latch_generation();
+            {
+                DC2_PROFILE_SCOPE(WaitFrame);
+                g176_wait_frame_latched(g176_present_latch_generation(), 1);
+            }
+#if ENABLE_PROFILER
+            if (dc2_profiler::profilerEnabled())
+            {
+                dc2_profiler::FrameProfiler::instance().endFrame();
+            }
+#endif
+            continue;
+        }
+
         tick++;
+        dc2_log::setFrameNumber(tick);
         g_g189PresentTick.store(tick, std::memory_order_relaxed);
         g_dc2PresentTick.store(tick, std::memory_order_relaxed);
         g_g189PresentStage.store(0, std::memory_order_relaxed);
@@ -476,26 +609,28 @@ void PS2Runtime::run()
         // touching the GPU, the hypothesis is confirmed; if unchanged, something else dominates.
         // Diagnostic only, never shipped as a real presentation path -- window goes black/frozen
         // while set. See plans/phase-G167-fix-log.md.
-        static const bool s_g167StarveMain = (std::getenv("DC2_G167_STARVE_MAIN") != nullptr);
-        uint32_t presentWidth = FB_WIDTH;
-        uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        g_g189PresentStage.store(1, std::memory_order_relaxed);
-        if (!s_g167StarveMain)
-            UploadFrame(frameTex, this, presentWidth, presentHeight);
-        g_g189PresentStage.store(2, std::memory_order_relaxed);
-
         BeginDrawing();
         ClearBackground(BLACK);
         g_g189PresentStage.store(3, std::memory_order_relaxed);
         if (!s_g167StarveMain)
         {
-        const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
-        const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
+        const float srcWidth = static_cast<float>(frameTex.width > 0 ? frameTex.width : (dc2IsNativeHighResActive() ? dc2GetNativePhysicalDisplayWidth() : FB_WIDTH));
+        const float srcHeight = static_cast<float>(frameTex.height > 0 ? frameTex.height : (dc2IsNativeHighResActive() ? dc2GetNativePhysicalDisplayHeight() : DEFAULT_DISPLAY_HEIGHT));
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
+        const float gameAspect = (srcHeight > 0.0f) ? (srcWidth / srcHeight) : (static_cast<float>(FB_WIDTH) / static_cast<float>(DEFAULT_DISPLAY_HEIGHT));
+        const float windowAspect = (screenHeight > 0.0f) ? (screenWidth / screenHeight) : gameAspect;
+        float dstWidth = 0.0f, dstHeight = 0.0f;
+        if (windowAspect >= gameAspect)
+        {
+            dstHeight = screenHeight;
+            dstWidth = dstHeight * gameAspect;
+        }
+        else
+        {
+            dstWidth = screenWidth;
+            dstHeight = dstWidth / gameAspect;
+        }
         const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
         const Rectangle dstRect{
             (screenWidth - dstWidth) * 0.5f,
@@ -503,10 +638,38 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+
+        static bool s_diagPrinted = false;
+        if (!s_diagPrinted)
+        {
+            s_diagPrinted = true;
+            const DC2NativeRenderConfig &cfg = getDC2NativeRenderConfig();
+            std::fprintf(stderr, "\n========== [DC2 RESOLUTION DIAGNOSTIC (PRESENTATION)] ==========\n");
+            std::fprintf(stderr, "Launcher requested width  = %d\n", cfg.requestedWidth);
+            std::fprintf(stderr, "Launcher requested height = %d\n", cfg.requestedHeight);
+            std::fprintf(stderr, "Window width              = %d\n", GetScreenWidth());
+            std::fprintf(stderr, "Window height             = %d\n", GetScreenHeight());
+            std::fprintf(stderr, "Swapchain/backbuffer width  = %d\n", GetRenderWidth());
+            std::fprintf(stderr, "Swapchain/backbuffer height = %d\n", GetRenderHeight());
+            std::fprintf(stderr, "Display/PCRTC target logical  = %d x %d (visible: %d x %d)\n", FB_WIDTH, 512, FB_WIDTH, DEFAULT_DISPLAY_HEIGHT);
+            std::fprintf(stderr, "Display/PCRTC target physical = %d x %d (visible: %d x %d)\n",
+                         dc2GetNativePhysicalDisplayWidth(), dc2GetNativePhysicalDisplayStorageHeight(),
+                         dc2GetNativePhysicalDisplayWidth(), dc2GetNativePhysicalDisplayHeight());
+            std::fprintf(stderr, "Final presentation source rectangle = (x=%.1f, y=%.1f, w=%.1f, h=%.1f)\n",
+                         srcRect.x, srcRect.y, srcRect.width, srcRect.height);
+            std::fprintf(stderr, "Final presentation destination rectangle = (x=%.1f, y=%.1f, w=%.1f, h=%.1f)\n",
+                         dstRect.x, dstRect.y, dstRect.width, dstRect.height);
+            std::fprintf(stderr, "Presentation frameTex ID    = %u (tex size: %d x %d)\n", frameTex.id, frameTex.width, frameTex.height);
+            std::fprintf(stderr, "Internal resolution scale X = %.4f\n", cfg.scaleX);
+            std::fprintf(stderr, "Internal resolution scale Y = %.4f\n", cfg.scaleY);
+            std::fprintf(stderr, "=================================================================\n\n");
+            std::fflush(stderr);
+        }
         }
 
         if (dc2HudEnabled())
         {
+            DC2_PROFILE_SCOPE(DrawHUD);
             const int hudX = 8;
             const int hudY = 8;
             DrawRectangle(hudX - 4, hudY - 4, 320, 70, Fade(BLACK, 0.55f));
@@ -537,6 +700,10 @@ void PS2Runtime::run()
                       << " v1=" << g_scpath_v1.load(std::memory_order_relaxed)
                       << " todo=" << g_scpath_todo.load(std::memory_order_relaxed)
                       << std::endl;
+        }
+
+        if (IsKeyPressed(KEY_F3)) {
+            dc2_profiler::toggleOverlay();
         }
 
         static bool s_forceBlank = false;
@@ -1042,7 +1209,20 @@ void PS2Runtime::run()
             }
         }
 
-        EndDrawing();
+        dc2_profiler::renderOverlay();
+
+        {
+            DC2_PROFILE_SCOPE(Present);
+            EndDrawing();
+        }
+
+#if ENABLE_PROFILER
+        if (dc2_profiler::profilerEnabled())
+        {
+            DC2_PROFILE_COUNT(HostPresentTick);
+            dc2_profiler::FrameProfiler::instance().endFrame();
+        }
+#endif
 
         if (WindowShouldClose())
         {
@@ -1053,6 +1233,15 @@ void PS2Runtime::run()
     }
 
     requestStop();
+
+#if ENABLE_PROFILER
+    if (dc2_profiler::profilerEnabled())
+    {
+        dc2_profiler::CsvWriter::instance().close();
+        std::fprintf(stderr, "\n[dc2_profiler] Final performance summary:\n");
+        dc2_profiler::FrameProfiler::instance().printSummary();
+    }
+#endif
 
     // G150 MTGS: drain + join the GS worker thread BEFORE the game thread join / GS teardown. Also
     // unblocks the game thread if it is parked in the frame-barrier backpressure wait. No-op unless

@@ -49,6 +49,29 @@ bool g545LiveShadowRequested()
     return on;
 }
 
+inline void dc2DumpPpm(const char *filepath, int w, int h, const uint32_t *rgbaPixels, bool flipY = false)
+{
+    FILE *f = std::fopen(filepath, "wb");
+    if (!f) return;
+    std::fprintf(f, "P6\n%d %d\n255\n", w, h);
+    std::vector<uint8_t> rgb(static_cast<size_t>(w) * 3u);
+    for (int y = 0; y < h; ++y)
+    {
+        const int srcY = flipY ? (h - 1 - y) : y;
+        const uint32_t *row = rgbaPixels + static_cast<size_t>(srcY) * w;
+        for (int x = 0; x < w; ++x)
+        {
+            uint32_t px = row[x];
+            rgb[x * 3 + 0] = static_cast<uint8_t>(px & 0xFF);
+            rgb[x * 3 + 1] = static_cast<uint8_t>((px >> 8) & 0xFF);
+            rgb[x * 3 + 2] = static_cast<uint8_t>((px >> 16) & 0xFF);
+        }
+        std::fwrite(rgb.data(), 1, rgb.size(), f);
+    }
+    std::fclose(f);
+    std::fprintf(stderr, "[SURFACE_DUMP] Saved %s (%dx%d)\n", filepath, w, h);
+}
+
 // G566 consumes the same exact persistent executor but publishes generated XGKICK bytes and skips
 // the CPU VU interpreter. It is experimental/default-off until every route and visual gate passes.
 bool g566VuAuthorityRequested()
@@ -478,6 +501,11 @@ static bool g560MultiDrawRequested()
                            !g158EnvFlag("DC2_G560_NO_MULTI_DRAW");
     return on;
 }
+
+// G624: rollback for the flip-aware G406/G407 V rounding on `srcFbp`-bound draws. Namespace scope,
+// not a function-local `static const bool` — G619 measured that form as a per-access TLS guard on
+// MSVC, and this predicate sits in the per-draw submit loop.
+static const bool s_g624NoUvFlip = g158EnvFlag("DC2_G624_NO_UVFLIP");
 
 static bool g561TextureRunsRequested()
 {
@@ -1125,6 +1153,34 @@ public:
         return wait.wait();
     }
 
+    // Native High-Res Presentation Read: read active display FBO directly at its native physical resolution.
+    bool readDisplayFbo(uint32_t fbp, uint32_t fallbackFbp, uint32_t &outW, uint32_t &outH,
+                        std::vector<uint8_t> &out)
+    {
+        if (!m_ready.load(std::memory_order_acquire))
+            return false;
+        SyncWait wait;
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.isDisplayFboRead = true;
+            item.colorFbp = fbp;
+            item.displayReadFallbackFbp = fallbackFbp;
+            item.displayOutW = &outW;
+            item.displayOutH = &outH;
+            item.displayOutRgba = &out;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
+            m_queue.push_back(std::move(item));
+        }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
+        m_cvWork.notify_one();
+        G447WaitScope g447Scope(1);
+        return wait.wait();
+    }
+
     // G289: same synchronous bit-exact color copy as G280, but the one measured work target may
     // be first-use. Allocate its 512x512 FBO on the worker before validating/copying.
     bool copyColorEnsureDest(uint32_t srcFbp, uint32_t dstFbp, int dstW, int dstH,
@@ -1393,6 +1449,40 @@ private:
         return wait.wait();
     }
 
+    static inline std::atomic<uint64_t> &dc2RenderEventCounter()
+    {
+        static std::atomic<uint64_t> s_count{0u};
+        return s_count;
+    }
+
+    static inline bool dc2ShouldExecuteRenderEvent(const char *type, uint32_t fbp, uint64_t texKey, uint32_t srcFbp,
+                                                  float minX, float minY, float maxX, float maxY,
+                                                  int verts, uint32_t blend, uint32_t ztst, uint32_t zw, int mode)
+    {
+        const uint64_t evId = dc2RenderEventCounter().fetch_add(1u, std::memory_order_relaxed) + 1u;
+        static const int s_eventLimit = [] {
+            const char *v = std::getenv("DC2_RENDER_EVENT_LIMIT");
+            return (v != nullptr) ? std::atoi(v) : -1;
+        }();
+        static const bool s_eventDump = (std::getenv("DC2_RENDER_EVENT_DUMP") != nullptr);
+
+        if (s_eventDump || (s_eventLimit >= 0 && evId <= static_cast<uint64_t>(s_eventLimit + 10)))
+        {
+            std::fprintf(stderr,
+                "[EVENT_DEBUG] ev=%llu type=%s FBP=0x%03x texKey=0x%llx srcFbp=0x%x "
+                "bounds=[(%.1f,%.1f)..(%.1f,%.1f)] verts=%d blend=%u ztst=%u zw=%u mode=%d%s\n",
+                static_cast<unsigned long long>(evId), type, fbp,
+                static_cast<unsigned long long>(texKey), srcFbp,
+                minX, minY, maxX, maxY, verts, blend, ztst, zw, mode,
+                (s_eventLimit >= 0 && evId > static_cast<uint64_t>(s_eventLimit)) ? " [SKIPPED BY LIMIT]" : "");
+            std::fflush(stderr);
+        }
+
+        if (s_eventLimit >= 0 && evId > static_cast<uint64_t>(s_eventLimit))
+            return false;
+        return true;
+    }
+
     struct QueueItem
     {
         std::shared_ptr<G541NullBatch> g541NullBatch;
@@ -1456,6 +1546,12 @@ private:
         std::chrono::steady_clock::time_point g299Enqueue{};
         uint8_t g324Class = 0u; // 1=G310 T8 view, 2=G310 logical composite
         std::chrono::steady_clock::time_point g324Enqueue{};
+        // Native High-Res Presentation Read job
+        bool isDisplayFboRead = false;
+        uint32_t displayReadFallbackFbp = 0u;
+        uint32_t *displayOutW = nullptr;
+        uint32_t *displayOutH = nullptr;
+        std::vector<uint8_t> *displayOutRgba = nullptr;
         std::chrono::steady_clock::time_point g571Enqueue{};
     };
     struct TexEntry
@@ -1478,15 +1574,18 @@ private:
     {
         GLuint fbo = 0, colorTex = 0, depthRb = 0;
         int w = 0, h = 0;
+        int physW = 0, physH = 0;
         // G415: one parked geometry per key. A target written at two widths (DC2's fbp=0x139 at
         // fbw=8 and fbw=2) otherwise destroys and reallocates both attachments on every flip.
         GLuint spareFbo = 0, spareColorTex = 0, spareDepthRb = 0;
         int spareW = 0, spareH = 0;
+        int sparePhysW = 0, sparePhysH = 0;
     };
     struct DepthEntry
     {
         GLuint tex = 0;
         int w = 0, h = 0;
+        int physW = 0, physH = 0;
         bool initialized = false;
     };
 
@@ -2033,6 +2132,10 @@ private:
                     ok = writeColorOnWorker(item.colorFbp, item.colorTexW, item.colorTexH,
                                             item.colorX, item.colorY, item.colorW,
                                             item.colorRows, *item.colorWrite);
+                else if (item.isDisplayFboRead)
+                    ok = readDisplayFboOnWorker(item.colorFbp, item.displayReadFallbackFbp,
+                                                *item.displayOutW, *item.displayOutH,
+                                                *item.displayOutRgba);
                 else if (item.depthReadback != nullptr && !item.renderThenReadDepth)
                     ok = readDepthOnWorker(item.depthKey, item.batch->fbW, item.batch->fbH,
                                            item.depthReadY, item.depthReadRows,
@@ -2756,6 +2859,8 @@ void main()
     {
         if (!m_g570Available || m_g570Prog == 0u)
             return false;
+        if (!dc2ShouldExecuteRenderEvent("g570Shadow", 0x139, 0, 0, 0, 0, 512, 512, 0, 0, 0, 0, 0))
+            return true;
 
         const bool g571On = g571ShadowSplitOn();
         auto g571Mark = std::chrono::steady_clock::now();
@@ -2975,34 +3080,31 @@ void main()
             "uniform int uWrapU;\n"
             "uniform int uWrapV;\n"
             "uniform vec2 uFbSize;\n"
+            "uniform vec2 uFbScale;\n"
             "uniform int uUvOriginX;\n"
             "uniform int uUvOriginY;\n"
             "uniform int uUvRoundU;\n"
             "uniform int uUvRoundV;\n"
+            // G624: nonzero when this draw samples a producer FBO through `srcFbp`, whose GL row
+            // h-1-v holds GS row v (the front end flipped T with `tq = 1 - tq`). See g406RoundUv.
+            "uniform int uUvFlipV;\n"
             "int wrapCoord(int p, int n, int mode){\n"
             "    if (mode != 0) return clamp(p, 0, n - 1);\n"
             "    int r = p % n; return r < 0 ? r + n : r;\n"
             "}\n"
             "int floorDiv16(int v){ return v >= 0 ? v / 16 : -((-v + 15) / 16); }\n"
-            "vec4 g309Owner(int owner, ivec2 p){\n"
-            "    if (owner == 0) return texelFetch(uTex, p, 0);\n"
-            "    if (owner == 1) return texelFetch(uG309Src1, p, 0);\n"
-            "    if (owner == 2) return texelFetch(uG309Src2, p, 0);\n"
-            "    if (owner == 3) return texelFetch(uG309Src3, p, 0);\n"
-            "    if (owner == 4) return texelFetch(uG309Src4, p, 0);\n"
-            "    if (owner == 5) return texelFetch(uG309Src5, p, 0);\n"
-            "    if (owner == 6) return texelFetch(uG309Src6, p, 0);\n"
-            "    return texelFetch(uG309Src7, p, 0);\n"
+            "vec4 g309Owner(int owner, vec2 p){\n"
+            "    if (owner == 0) return texture(uTex, p * uFbScale / vec2(textureSize(uTex, 0)));\n"
+            "    if (owner == 1) return texture(uG309Src1, p * uFbScale / vec2(textureSize(uG309Src1, 0)));\n"
+            "    if (owner == 2) return texture(uG309Src2, p * uFbScale / vec2(textureSize(uG309Src2, 0)));\n"
+            "    if (owner == 3) return texture(uG309Src3, p * uFbScale / vec2(textureSize(uG309Src3, 0)));\n"
+            "    if (owner == 4) return texture(uG309Src4, p * uFbScale / vec2(textureSize(uG309Src4, 0)));\n"
+            "    if (owner == 5) return texture(uG309Src5, p * uFbScale / vec2(textureSize(uG309Src5, 0)));\n"
+            "    if (owner == 6) return texture(uG309Src6, p * uFbScale / vec2(textureSize(uG309Src6, 0)));\n"
+            "    return texture(uG309Src7, p * uFbScale / vec2(textureSize(uG309Src7, 0)));\n"
             "}\n"
             "vec4 g309Filtered(int owner, vec2 p){\n"
-            "    if (owner == 0) return texture(uTex, p / vec2(textureSize(uTex,0)));\n"
-            "    if (owner == 1) return texture(uG309Src1, p / vec2(textureSize(uG309Src1,0)));\n"
-            "    if (owner == 2) return texture(uG309Src2, p / vec2(textureSize(uG309Src2,0)));\n"
-            "    if (owner == 3) return texture(uG309Src3, p / vec2(textureSize(uG309Src3,0)));\n"
-            "    if (owner == 4) return texture(uG309Src4, p / vec2(textureSize(uG309Src4,0)));\n"
-            "    if (owner == 5) return texture(uG309Src5, p / vec2(textureSize(uG309Src5,0)));\n"
-            "    if (owner == 6) return texture(uG309Src6, p / vec2(textureSize(uG309Src6,0)));\n"
-            "    return texture(uG309Src7, p / vec2(textureSize(uG309Src7,0)));\n"
+            "    return g309Owner(owner, p);\n"
             "}\n"
             "vec4 g309Pixel(ivec2 p){\n"
             "    p = clamp(p, ivec2(0), ivec2(511));\n"
@@ -3010,9 +3112,9 @@ void main()
             "    ivec2 page = ivec2(p.x >> 6, gsY >> 5);\n"
             "    ivec2 local = ivec2(p.x & 63, gsY & 31);\n"
             "    ivec4 m = clamp(ivec4(floor(texelFetch(uG309PageMap,page,0)*255.0+0.5)),0,255);\n"
-            "    if (m.r == 0) return texelFetch(uG309Base, p, 0);\n"
+            "    if (m.r == 0) return texture(uG309Base, (vec2(p) + vec2(0.5)) / 512.0);\n"
             "    ivec2 srcGs = ivec2(m.g * 64 + local.x, m.b * 32 + local.y);\n"
-            "    return g309Owner(m.r - 1, ivec2(srcGs.x, 511 - srcGs.y));\n"
+            "    return g309Owner(m.r - 1, vec2(srcGs.x, 511 - srcGs.y) + vec2(0.5));\n"
             "}\n"
             "vec4 g309Linear(vec2 uv){\n"
             "    vec2 q = uv * 512.0 - vec2(0.5);\n"
@@ -3051,13 +3153,30 @@ void main()
             "    float upNudge = legacy ? 0.25 : 0.0;\n"
             "    return down ? boundary - downNudge : (up ? boundary + upNudge : value);\n"
             "}\n"
+            // G624: `g406RoundAxis` is a statement about the GS V AXIS. Its boundary is
+            // `floor(v + 0.5)` (ties round toward increasing v) and its bias bits nudge by
+            // +upNudge / -downNudge along increasing v. A `srcFbp` bind hands this function the
+            // FLIPPED coordinate (GL row h-1-v), so both the tie-break and both nudge directions
+            // invert — that is G623's pixel-gate failure (5.2% identical against a 77% control
+            // band; `DC2_G406_NO_ACCURATE_UV=1` in both arms restored it to 97.5%).
+            //
+            // ⛔ A FRONT-END BIT SWAP CANNOT EXPRESS THE REPAIR. `flags & 2` means "bias DOWN
+            // except on the origin row, where it biases UP", so swapping bits 1 and 2 is not the
+            // mirror of the rule — it drops the origin-row exception. Undo the flip, evaluate the
+            // IDENTICAL function on the GS-space value, and re-flip the result: exact by
+            // construction. `uUvFlipV == 0` reproduces the pre-G624 expression bit for bit.
             "vec2 g406RoundUv(vec2 uvTex){\n"
             "    if ((uMode & 16384) == 0) return uvTex;\n"
-            "    int px = int(floor(gl_FragCoord.x));\n"
-            "    int py = int(floor(uFbSize.y - gl_FragCoord.y));\n"
+            "    int px = int(floor(gl_FragCoord.x / max(uFbScale.x, 1e-4)));\n"
+            "    int py = int(floor(uFbSize.y - (gl_FragCoord.y / max(uFbScale.y, 1e-4))));\n"
+            "    bool flipV = uUvFlipV != 0;\n"
+            "    float flipH = float(textureSize(uTex, 0).y);\n"
+            "    float vIn = flipV ? (flipH - uvTex.y) : uvTex.y;\n"
             "    vec2 rounded = vec2(g406RoundAxis(uvTex.x, px, uUvOriginX, uUvRoundU),\n"
-            "                        g406RoundAxis(uvTex.y, py, uUvOriginY, uUvRoundV));\n"
-            "    return uLinear != 0 ? trunc(rounded * 16.0) * (1.0 / 16.0) : rounded;\n"
+            "                        g406RoundAxis(vIn, py, uUvOriginY, uUvRoundV));\n"
+            "    if (uLinear != 0) rounded = trunc(rounded * 16.0) * (1.0 / 16.0);\n"
+            "    if (flipV) rounded.y = flipH - rounded.y;\n"
+            "    return rounded;\n"
             "}\n"
             "ivec4 sampleExact(vec2 uvTex){\n"
             "    ivec2 f16 = clamp(ivec2(floor(uvTex * 16.0 + 0.5001)), ivec2(0), ivec2(65535));\n"
@@ -3235,6 +3354,7 @@ void main()
         }
         m_f.glUseProgram_(m_prog);
         m_locFbSize = m_f.glGetUniformLocation_(m_prog, "uFbSize");
+        m_locFbScale = m_f.glGetUniformLocation_(m_prog, "uFbScale");
         m_locMode = m_f.glGetUniformLocation_(m_prog, "uMode");
         m_locFogCol = m_f.glGetUniformLocation_(m_prog, "uFogCol"); // G364
         m_locLinear = m_f.glGetUniformLocation_(m_prog, "uLinear");
@@ -3244,6 +3364,7 @@ void main()
         m_locUvOriginY = m_f.glGetUniformLocation_(m_prog, "uUvOriginY");
         m_locUvRoundU = m_f.glGetUniformLocation_(m_prog, "uUvRoundU");
         m_locUvRoundV = m_f.glGetUniformLocation_(m_prog, "uUvRoundV");
+        m_locUvFlipV = m_f.glGetUniformLocation_(m_prog, "uUvFlipV"); // G624
         const GLint locTex = m_f.glGetUniformLocation_(m_prog, "uTex");
         m_f.glUniform1i_(locTex, 0);
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Src1"), 1);
@@ -3310,6 +3431,12 @@ void main()
                                 "#define uUvRoundU ((vG560State.z >> 16) & 15)\n"
                                 "#define uUvOriginY (vG560State.w & 65535)\n"
                                 "#define uUvRoundV ((vG560State.w >> 16) & 15)\n"
+                                // G624: this build has no per-primitive slot left for the flip
+                                // flag, so it keeps the pre-G624 (unflipped) rounding. That is
+                                // only correct for draws that do not bind a producer FBO, which
+                                // is why `g623ProdSrcOn()` refuses to arm while G560 multidraw
+                                // is enabled. Both are opt-in; neither is in the shipped path.
+                                "#define uUvFlipV 0\n"
                                 "int wrapCoord(int p, int n, int mode){\n") ||
                     !replaceOne(g560Fs,
                                 "void main(){\n",
@@ -3382,6 +3509,7 @@ void main()
 
                 m_f.glUseProgram_(m_progG560);
                 m_locG560FbSize = m_f.glGetUniformLocation_(m_progG560, "uFbSize");
+                m_locG560FbScale = m_f.glGetUniformLocation_(m_progG560, "uFbScale");
                 m_locG560Mode = m_f.glGetUniformLocation_(m_progG560, "uMode");
                 m_locG560FogCol = m_f.glGetUniformLocation_(m_progG560, "uFogCol");
                 m_locG560Linear = m_f.glGetUniformLocation_(m_progG560, "uLinear");
@@ -3431,12 +3559,14 @@ void main()
             "uniform sampler2D uSrc;\n"
             "uniform sampler2D uMap;\n"
             "uniform sampler2D uClut;\n"
+            "uniform vec2 uFbScale;\n"
             "void main(){\n"
             "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
             "    ivec4 m = clamp(ivec4(floor(texelFetch(uMap,p,0)*255.0+0.5)),0,255);\n"
             "    ivec2 sp = ivec2(m.r | ((m.b & 8) << 5), m.g | ((m.b & 1) << 8));\n"
+            "    ivec2 physSp = ivec2(floor(vec2(sp) * uFbScale));\n"
             "    int lane = (m.b >> 1) & 3;\n"
-            "    ivec4 raw = clamp(ivec4(floor(texelFetch(uSrc,sp,0)*255.0+0.5)),0,255);\n"
+            "    ivec4 raw = clamp(ivec4(floor(texelFetch(uSrc,physSp,0)*255.0+0.5)),0,255);\n"
             "    int ix = lane==0 ? raw.r : (lane==1 ? raw.g : (lane==2 ? raw.b : raw.a));\n"
             "    o = texelFetch(uClut, ivec2(ix,0), 0);\n"
             "}\n";
@@ -3475,6 +3605,7 @@ void main()
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g281Prog, "uSrc"), 0);
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g281Prog, "uMap"), 1);
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g281Prog, "uClut"), 2);
+        m_locG281FbScale = m_f.glGetUniformLocation_(m_g281Prog, "uFbScale");
         std::fprintf(stderr, "[G281:backend] PASS: resident PSMT8 view program ready\n");
         return true;
     }
@@ -3502,10 +3633,12 @@ void main()
             "uniform int uSrcH;\n"
             "uniform int uTa0;\n"
             "uniform int uAem;\n"
+            "uniform vec2 uFbScale;\n"
             "void main(){\n"
             "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
             "    ivec2 sp = ivec2(p.x, (uSrcH - 1) - p.y);\n"
-            "    ivec4 raw = clamp(ivec4(floor(texelFetch(uSrc, sp, 0) * 255.0 + 0.5)), 0, 255);\n"
+            "    ivec2 physSp = ivec2(floor(vec2(sp) * uFbScale));\n"
+            "    ivec4 raw = clamp(ivec4(floor(texelFetch(uSrc, physSp, 0) * 255.0 + 0.5)), 0, 255);\n"
             "    bool rgb0 = (raw.r == 0 && raw.g == 0 && raw.b == 0);\n"
             "    int a = (uAem != 0 && rgb0) ? 0 : uTa0;\n"
             "    o = vec4(vec3(raw.rgb) * (1.0 / 255.0), float(a) * (1.0 / 255.0));\n"
@@ -3546,6 +3679,7 @@ void main()
         m_locG338SrcH = m_f.glGetUniformLocation_(m_g338Prog, "uSrcH");
         m_locG338Ta0 = m_f.glGetUniformLocation_(m_g338Prog, "uTa0");
         m_locG338Aem = m_f.glGetUniformLocation_(m_g338Prog, "uAem");
+        m_locG338FbScale = m_f.glGetUniformLocation_(m_g338Prog, "uFbScale");
         std::fprintf(stderr, "[G338:backend] PASS: resident CT24-alpha view program ready\n");
         return true;
     }
@@ -3556,6 +3690,8 @@ void main()
     bool prepareCt24ViewOnWorker(uint64_t texKey, uint32_t srcFbp, int srcFbW, int texW, int texH,
                                  int ta0, int aem, bool verify, uint64_t &verifyBad)
     {
+        if (!dc2ShouldExecuteRenderEvent("prepareCt24", 0, texKey, srcFbp, 0, 0, static_cast<float>(texW), static_cast<float>(texH), 0, 0, 0, 0, 0))
+            return true;
         static uint64_t s_failN = 0u;
         const auto fail = [&](const char *stage) {
             ++s_failN;
@@ -3662,6 +3798,10 @@ void main()
         m_f.glUniform1i_(m_locG338SrcH, src.h);
         m_f.glUniform1i_(m_locG338Ta0, ta0 & 0xFF);
         m_f.glUniform1i_(m_locG338Aem, aem != 0 ? 1 : 0);
+        if (m_locG338FbScale >= 0)
+            m_e.glUniform2f_(m_locG338FbScale,
+                             dc2IsNativeHighResActive() ? dc2GetNativeScaleX() : 1.0f,
+                             dc2IsNativeHighResActive() ? dc2GetNativeScaleY() : 1.0f);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         g496PassBallast(); // G496 GPU derivative probe, `pass` site (idempotent re-issue)
         if (g494GetError(kG494Ct24Err) != GL_NO_ERROR)
@@ -3736,26 +3876,27 @@ void main()
             "uniform sampler2D uSrc7;\n"
             "uniform sampler2D uPageMap;\n"
             "uniform sampler2D uBase;\n"
-            "vec4 fetchOwner(int owner, ivec2 p){\n"
-            "    if (owner == 0) return texelFetch(uSrc0, p, 0);\n"
-            "    if (owner == 1) return texelFetch(uSrc1, p, 0);\n"
-            "    if (owner == 2) return texelFetch(uSrc2, p, 0);\n"
-            "    if (owner == 3) return texelFetch(uSrc3, p, 0);\n"
-            "    if (owner == 4) return texelFetch(uSrc4, p, 0);\n"
-            "    if (owner == 5) return texelFetch(uSrc5, p, 0);\n"
-            "    if (owner == 6) return texelFetch(uSrc6, p, 0);\n"
-            "    return texelFetch(uSrc7, p, 0);\n"
+            "uniform vec2 uFbScale;\n"
+            "vec4 fetchOwner(int owner, vec2 p){\n"
+            "    if (owner == 0) return texture(uSrc0, p * uFbScale / vec2(textureSize(uSrc0, 0)));\n"
+            "    if (owner == 1) return texture(uSrc1, p * uFbScale / vec2(textureSize(uSrc1, 0)));\n"
+            "    if (owner == 2) return texture(uSrc2, p * uFbScale / vec2(textureSize(uSrc2, 0)));\n"
+            "    if (owner == 3) return texture(uSrc3, p * uFbScale / vec2(textureSize(uSrc3, 0)));\n"
+            "    if (owner == 4) return texture(uSrc4, p * uFbScale / vec2(textureSize(uSrc4, 0)));\n"
+            "    if (owner == 5) return texture(uSrc5, p * uFbScale / vec2(textureSize(uSrc5, 0)));\n"
+            "    if (owner == 6) return texture(uSrc6, p * uFbScale / vec2(textureSize(uSrc6, 0)));\n"
+            "    return texture(uSrc7, p * uFbScale / vec2(textureSize(uSrc7, 0)));\n"
             "}\n"
             "void main(){\n"
-            "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
-            "    int gsY = 511 - p.y;\n"
-            "    ivec2 page = ivec2(p.x >> 6, gsY >> 5);\n"
-            "    ivec2 local = ivec2(p.x & 63, gsY & 31);\n"
-            "    ivec4 m = clamp(ivec4(floor(texelFetch(uPageMap,page,0)*255.0+0.5)),0,255);\n"
-            "    if (m.r == 0) { o = texelFetch(uBase, p, 0); return; }\n"
+            "    vec2 p = gl_FragCoord.xy / uFbScale;\n"
+            "    float gsY = 511.0 - p.y;\n"
+            "    ivec2 page = ivec2(int(p.x) >> 6, int(gsY) >> 5);\n"
+            "    vec2 local = vec2(fract(p.x / 64.0) * 64.0, fract(gsY / 32.0) * 32.0);\n"
+            "    ivec4 m = clamp(ivec4(floor(texelFetch(uPageMap, page, 0) * 255.0 + 0.5)), 0, 255);\n"
+            "    if (m.r == 0) { o = texture(uBase, (p + vec2(0.5)) / 512.0); return; }\n"
             "    int owner = m.r - 1;\n"
-            "    ivec2 srcGs = ivec2(m.g * 64 + local.x, m.b * 32 + local.y);\n"
-            "    ivec2 srcGl = ivec2(srcGs.x, 511 - srcGs.y);\n"
+            "    vec2 srcGs = vec2(float(m.g) * 64.0 + local.x, float(m.b) * 32.0 + local.y);\n"
+            "    vec2 srcGl = vec2(srcGs.x, 511.0 - srcGs.y) + vec2(0.5);\n"
             "    o = fetchOwner(owner, srcGl);\n"
             "}\n";
         GLuint vs = 0u, fs = 0u;
@@ -3802,6 +3943,7 @@ void main()
                          static_cast<GLint>(kG309PageMapUnit));
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g309Prog, "uBase"),
                          static_cast<GLint>(kG309BaseUnit));
+        m_locG309FbScale = m_f.glGetUniformLocation_(m_g309Prog, "uFbScale");
         std::fprintf(stderr, "[G309:backend] PASS: authoritative-page composite program ready\n");
         return true;
     }
@@ -4292,7 +4434,11 @@ void main()
                         n, fbp, reuse ? "REUSE" : "RECREATE", e.w, e.h, e.fbo, w, h);
             }
         }
-        if (e.fbo != 0 && e.w == w && e.h == h)
+        const bool isMainTarget = (fbp == 0x000u || fbp == 0x068u || fbp == 0x139u);
+        const bool allowScale = !dc2NativeMainOnlyOn() || isMainTarget;
+        const int physW = allowScale ? dc2GetNativePhysicalWidth(w) : w;
+        const int physH = allowScale ? dc2GetNativePhysicalHeight(h) : h;
+        if (e.fbo != 0 && e.w == w && e.h == h && e.physW == physW && e.physH == physH)
             return e;
         // G415: recycle the parked geometry for this key instead of deleting and reallocating a
         // colour texture + depth renderbuffer on every width flip. The revived FBO is put into the
@@ -4303,13 +4449,15 @@ void main()
         if (g415FboRecycleOn())
         {
             if (e.spareFbo != 0 && e.spareColorTex != 0 && e.spareDepthRb != 0 &&
-                e.spareW == w && e.spareH == h)
+                e.spareW == w && e.spareH == h && e.sparePhysW == physW && e.sparePhysH == physH)
             {
                 std::swap(e.fbo, e.spareFbo);
                 std::swap(e.colorTex, e.spareColorTex);
                 std::swap(e.depthRb, e.spareDepthRb);
                 std::swap(e.w, e.spareW);
                 std::swap(e.h, e.spareH);
+                std::swap(e.physW, e.sparePhysW);
+                std::swap(e.physH, e.sparePhysH);
                 glBindTexture(GL_TEXTURE_2D, e.colorTex);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -4346,11 +4494,15 @@ void main()
                 e.spareDepthRb = e.depthRb;
                 e.spareW = e.w;
                 e.spareH = e.h;
+                e.sparePhysW = e.physW;
+                e.sparePhysH = e.physH;
                 e.fbo = 0;
                 e.colorTex = 0;
                 e.depthRb = 0;
                 e.w = 0;
                 e.h = 0;
+                e.physW = 0;
+                e.physH = 0;
                 ++m_g415FboParks;
             }
         }
@@ -4360,10 +4512,10 @@ void main()
         glBindTexture(GL_TEXTURE_2D, e.colorTex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, physW, physH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
         m_e.glGenRenderbuffers_(1, &e.depthRb);
         m_e.glBindRenderbuffer_(GL178_RENDERBUFFER, e.depthRb);
-        m_e.glRenderbufferStorage_(GL178_RENDERBUFFER, GL178_DEPTH_COMPONENT32F, w, h);
+        m_e.glRenderbufferStorage_(GL178_RENDERBUFFER, GL178_DEPTH_COMPONENT32F, physW, physH);
         m_f.glGenFramebuffers_(1, &e.fbo);
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, e.fbo);
         m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
@@ -4373,13 +4525,15 @@ void main()
         const GLenum status = m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER);
         if (status != GL158_FRAMEBUFFER_COMPLETE)
         {
-            std::fprintf(stderr, "[G178:backend] FAIL: FBO incomplete 0x%x (fbp=0x%x %dx%d)\n",
-                         status, fbp, w, h);
+            std::fprintf(stderr, "[G178:backend] FAIL: FBO incomplete 0x%x (fbp=0x%x %dx%d phys=%dx%d)\n",
+                         status, fbp, w, h, physW, physH);
             destroyFbo(e);
             return e;
         }
         e.w = w;
         e.h = h;
+        e.physW = physW;
+        e.physH = physH;
         // New FBO contents are undefined — force a depth clear; color comes from uploadFb (the
         // front-end always uploads on its first batch for an fbp, via the gen-snapshot mismatch).
         glDisable(GL_SCISSOR_TEST);
@@ -4392,7 +4546,9 @@ void main()
     DepthEntry &ensureDepth(uint64_t key, int w, int h)
     {
         DepthEntry &e = m_depths[key];
-        if (e.tex != 0 && e.w == w && e.h == h)
+        const int physW = dc2GetNativePhysicalWidth(w);
+        const int physH = dc2GetNativePhysicalHeight(h);
+        if (e.tex != 0 && e.w == w && e.h == h && e.physW == physW && e.physH == physH)
             return e;
         GLuint newTex = 0;
         glGenTextures(1, &newTex);
@@ -4404,12 +4560,14 @@ void main()
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL158_CLAMP_TO_EDGE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL158_CLAMP_TO_EDGE);
         glTexImage2D(GL_TEXTURE_2D, 0, GL178_DEPTH_COMPONENT32F,
-                     w, h, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
+                     physW, physH, 0, GL_DEPTH_COMPONENT, GL_FLOAT, nullptr);
         if (e.tex != 0)
             glDeleteTextures(1, &e.tex);
         e.tex = newTex;
         e.w = w;
         e.h = h;
+        e.physW = physW;
+        e.physH = physH;
         e.initialized = false;
         return e;
     }
@@ -4457,7 +4615,32 @@ void main()
         }
         if (!s_g433NoRb)
         {
-            g433DoReadPixels(m_f, glY, w, rows, out.data());
+            if (it->second.physW != w || it->second.physH != h)
+            {
+                const float sy = static_cast<float>(it->second.physH) / static_cast<float>(h);
+                const int physGlY = static_cast<int>(std::round(glY * sy));
+                const int physRows = std::max(1, static_cast<int>(std::round(rows * sy)));
+                const int physW = it->second.physW;
+                std::vector<uint32_t> physPx(static_cast<size_t>(physW) * physRows);
+                g433DoReadPixels(m_f, physGlY, physW, physRows, physPx.data());
+                for (int r = 0; r < rows; ++r)
+                {
+                    int pr = (r * physRows) / rows;
+                    if (pr >= physRows) pr = physRows - 1;
+                    const uint32_t *srcRow = physPx.data() + static_cast<size_t>(pr) * physW;
+                    uint32_t *dstRow = out.data() + static_cast<size_t>(r) * w;
+                    for (int x = 0; x < w; ++x)
+                    {
+                        int px = (x * physW) / w;
+                        if (px >= physW) px = physW - 1;
+                        dstRow[x] = srcRow[px];
+                    }
+                }
+            }
+            else
+            {
+                g433DoReadPixels(m_f, glY, w, rows, out.data());
+            }
         }
         if (g495On)
         {
@@ -4494,6 +4677,8 @@ void main()
                             int glX, int glY, int w, int rows,
                             const std::vector<uint32_t> &in)
     {
+        if (!dc2ShouldExecuteRenderEvent("writeColor", fbp, 0, 0, static_cast<float>(glX), static_cast<float>(glY), static_cast<float>(glX + w), static_cast<float>(glY + rows), 0, 0, 0, 0, 0))
+            return true;
         if (texW <= 0 || texH <= 0 || glX < 0 || glY < 0 || w <= 0 || rows <= 0 ||
             glX > texW || w > texW - glX || glY > texH || rows > texH - glY ||
             in.size() != static_cast<size_t>(w) * rows)
@@ -4503,9 +4688,98 @@ void main()
             it->second.h != texH)
             return false;
         glBindTexture(GL_TEXTURE_2D, it->second.colorTex);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, glX, glY, w, rows, GL_RGBA, GL_UNSIGNED_BYTE,
-                        in.data());
+        if (it->second.physW != it->second.w || it->second.physH != it->second.h)
+        {
+            const float sx = static_cast<float>(it->second.physW) / static_cast<float>(it->second.w);
+            const float sy = static_cast<float>(it->second.physH) / static_cast<float>(it->second.h);
+            const int physGlX = static_cast<int>(std::round(glX * sx));
+            const int physGlY = static_cast<int>(std::round(glY * sy));
+            const int physW = std::max(1, static_cast<int>(std::round(w * sx)));
+            const int physRows = std::max(1, static_cast<int>(std::round(rows * sy)));
+            std::vector<uint32_t> scaledIn(static_cast<size_t>(physW) * physRows);
+            for (int r = 0; r < physRows; ++r)
+            {
+                int srcR = (r * rows) / physRows;
+                if (srcR >= rows) srcR = rows - 1;
+                const uint32_t *srcRow = in.data() + static_cast<size_t>(srcR) * w;
+                uint32_t *dstRow = scaledIn.data() + static_cast<size_t>(r) * physW;
+                for (int c = 0; c < physW; ++c)
+                {
+                    int srcC = (c * w) / physW;
+                    if (srcC >= w) srcC = w - 1;
+                    dstRow[c] = srcRow[srcC];
+                }
+            }
+            glTexSubImage2D(GL_TEXTURE_2D, 0, physGlX, physGlY, physW, physRows,
+                            GL_RGBA, GL_UNSIGNED_BYTE, scaledIn.data());
+        }
+        else
+        {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, glX, glY, w, rows, GL_RGBA, GL_UNSIGNED_BYTE,
+                            in.data());
+        }
         return g494GetError(kG494WColErr) == GL_NO_ERROR;
+    }
+
+    // Native High-Res Presentation Read: read active display FBO directly at its native physical resolution.
+    bool readDisplayFboOnWorker(uint32_t fbp, uint32_t fallbackFbp, uint32_t &outW, uint32_t &outH,
+                                std::vector<uint8_t> &outRgba)
+    {
+        dc2RenderEventCounter().store(0u, std::memory_order_relaxed);
+        auto it = m_fbos.find(g349FboKey(fbp, 512));
+        if (it == m_fbos.end() || it->second.fbo == 0)
+            it = m_fbos.find(fbp);
+        if (it == m_fbos.end() || it->second.fbo == 0)
+            it = m_fbos.find(fallbackFbp);
+        if (it == m_fbos.end() || it->second.fbo == 0)
+            it = m_fbos.find(0x068u);
+        if (it == m_fbos.end() || it->second.fbo == 0)
+            it = m_fbos.find(0x000u);
+        if (it == m_fbos.end() || it->second.fbo == 0)
+            it = m_fbos.find(0x139u);
+        if (it == m_fbos.end() || it->second.fbo == 0)
+            it = m_fbos.find(kG309CompositeFbp);
+        if (it == m_fbos.end() || it->second.fbo == 0)
+            return false;
+
+        const FboEntry &fbo = it->second;
+        const int srcW = fbo.physW > 0 ? fbo.physW : fbo.w;
+        const int srcH = fbo.physH > 0 ? fbo.physH : fbo.h;
+        if (srcW <= 0 || srcH <= 0)
+            return false;
+
+        const int dispW = srcW;
+        const int dispH = srcH;
+
+        outW = static_cast<uint32_t>(dispW);
+        outH = static_cast<uint32_t>(dispH);
+        outRgba.resize(static_cast<size_t>(dispW) * dispH * 4u);
+
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, fbo.fbo);
+        glDisable(GL_SCISSOR_TEST);
+        std::vector<uint32_t> glPixels(static_cast<size_t>(srcW) * srcH);
+        glReadPixels(0, 0, srcW, srcH, GL_RGBA, GL_UNSIGNED_BYTE, glPixels.data());
+
+        // GL is bottom-origin, convert to top-origin presentation scanlines
+        for (int y = 0; y < dispH; ++y)
+        {
+            const int glY = srcH - 1 - (y * srcH) / dispH;
+            const uint32_t *srcRow = glPixels.data() + static_cast<size_t>(glY) * srcW;
+            uint32_t *dstRow = reinterpret_cast<uint32_t *>(outRgba.data() + static_cast<size_t>(y) * dispW * 4u);
+            if (dispW == srcW)
+            {
+                std::memcpy(dstRow, srcRow, static_cast<size_t>(dispW) * 4u);
+            }
+            else
+            {
+                for (int x = 0; x < dispW; ++x)
+                {
+                    const int srcX = (x * srcW) / dispW;
+                    dstRow[x] = srcRow[srcX];
+                }
+            }
+        }
+        return true;
     }
 
     // G280: copy aligned CT32 page tiles from one persistent target FBO into another target's
@@ -4517,6 +4791,8 @@ void main()
     bool copyColorRectsOnWorker(uint32_t srcFbp, uint32_t dstFbp,
                                 const std::vector<int32_t> &rects6)
     {
+        if (!dc2ShouldExecuteRenderEvent("copyColor", dstFbp, 0, srcFbp, 0, 0, 512, 512, 0, 0, 0, 0, 0))
+            return true;
         if (srcFbp == dstFbp || rects6.empty() || (rects6.size() % 6u) != 0u)
             return false;
         auto is = m_fbos.find(srcFbp);
@@ -4535,11 +4811,61 @@ void main()
                 sx > src.w - w || sy > src.h - h || dx > dst.w - w || dy > dst.h - h)
                 return false;
         }
+        static uint32_t s_l2lDiagPrints = 0u;
+        if (s_l2lDiagPrints++ < 2u)
+        {
+            std::fprintf(stderr, "\n========== [DC2 RESOLUTION DIAGNOSTIC (FRAMEBUFFER COPY)] ==========\n");
+            std::fprintf(stderr, "Logical source target      = 0x%03x (w=%d, h=%d)\n", srcFbp, src.w, src.h);
+            std::fprintf(stderr, "Logical destination target = 0x%03x (w=%d, h=%d)\n", dstFbp, dst.w, dst.h);
+            std::fprintf(stderr, "Host source resource size  = %d x %d\n", src.physW > 0 ? src.physW : src.w, src.physH > 0 ? src.physH : src.h);
+            std::fprintf(stderr, "Host destination resource size = %d x %d\n", dst.physW > 0 ? dst.physW : dst.w, dst.physH > 0 ? dst.physH : dst.h);
+            if (!rects6.empty())
+            {
+                const float sx = static_cast<float>(src.physW > 0 ? src.physW : src.w) / static_cast<float>(src.w);
+                const float sy = static_cast<float>(src.physH > 0 ? src.physH : src.h) / static_cast<float>(src.h);
+                const float dx = static_cast<float>(dst.physW > 0 ? dst.physW : dst.w) / static_cast<float>(dst.w);
+                const float dy = static_cast<float>(dst.physH > 0 ? dst.physH : dst.h) / static_cast<float>(dst.h);
+                std::fprintf(stderr, "GS source region           = (x=%d, y=%d, w=%d, h=%d)\n", rects6[0], rects6[1], rects6[4], rects6[5]);
+                std::fprintf(stderr, "GS destination region      = (x=%d, y=%d, w=%d, h=%d)\n", rects6[2], rects6[3], rects6[4], rects6[5]);
+                std::fprintf(stderr, "Mapped host source rect    = (x=%d, y=%d, w=%d, h=%d)\n",
+                             static_cast<int>(std::round(rects6[0] * sx)), static_cast<int>(std::round(rects6[1] * sy)),
+                             static_cast<int>(std::round(rects6[4] * sx)), static_cast<int>(std::round(rects6[5] * sy)));
+                std::fprintf(stderr, "Mapped host destination rect = (x=%d, y=%d, w=%d, h=%d)\n",
+                             static_cast<int>(std::round(rects6[2] * dx)), static_cast<int>(std::round(rects6[3] * dy)),
+                             static_cast<int>(std::round(rects6[4] * dx)), static_cast<int>(std::round(rects6[5] * dy)));
+                std::fprintf(stderr, "Texture coordinates        = [u0=%.4f, v0=%.4f, u1=%.4f, v1=%.4f]\n",
+                             static_cast<float>(rects6[0]) / static_cast<float>(src.w), static_cast<float>(rects6[1]) / static_cast<float>(src.h),
+                             static_cast<float>(rects6[0] + rects6[4]) / static_cast<float>(src.w), static_cast<float>(rects6[1] + rects6[5]) / static_cast<float>(src.h));
+            }
+            std::fprintf(stderr, "======================================================================\n\n");
+            std::fflush(stderr);
+        }
+
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, src.fbo);
         glBindTexture(GL_TEXTURE_2D, dst.colorTex);
-        for (size_t k = 0; k < rects6.size(); k += 6u)
-            glCopyTexSubImage2D(GL_TEXTURE_2D, 0, rects6[k + 2], rects6[k + 3],
-                                rects6[k], rects6[k + 1], rects6[k + 4], rects6[k + 5]);
+        if (src.physW != src.w || dst.physW != dst.w)
+        {
+            const float sx = static_cast<float>(src.physW) / static_cast<float>(src.w);
+            const float sy = static_cast<float>(src.physH) / static_cast<float>(src.h);
+            const float dx = static_cast<float>(dst.physW) / static_cast<float>(dst.w);
+            const float dy = static_cast<float>(dst.physH) / static_cast<float>(dst.h);
+            for (size_t k = 0; k < rects6.size(); k += 6u)
+            {
+                const int psx = static_cast<int>(std::round(rects6[k] * sx));
+                const int psy = static_cast<int>(std::round(rects6[k + 1] * sy));
+                const int pdx = static_cast<int>(std::round(rects6[k + 2] * dx));
+                const int pdy = static_cast<int>(std::round(rects6[k + 3] * dy));
+                const int pw = static_cast<int>(std::round(rects6[k + 4] * sx));
+                const int ph = static_cast<int>(std::round(rects6[k + 5] * sy));
+                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, pdx, pdy, psx, psy, pw, ph);
+            }
+        }
+        else
+        {
+            for (size_t k = 0; k < rects6.size(); k += 6u)
+                glCopyTexSubImage2D(GL_TEXTURE_2D, 0, rects6[k + 2], rects6[k + 3],
+                                    rects6[k], rects6[k + 1], rects6[k + 4], rects6[k + 5]);
+        }
         return g494GetError(kG494CopyErr) == GL_NO_ERROR;
     }
 
@@ -4550,6 +4876,8 @@ void main()
         bool forceDraw = false,
         uint32_t outputFbp = kG309CompositeFbp)
     {
+        if (!dc2ShouldExecuteRenderEvent("composite", outputFbp, 0, 0, 0, 0, 512, 512, 0, 0, 0, 0, 0))
+            return true;
         static uint64_t s_failN = 0u;
         const auto fail = [&](const char *stage) {
             ++s_failN;
@@ -4683,12 +5011,15 @@ void main()
             return g494GetError(kG494CompErr) == GL_NO_ERROR;
         }
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, out.fbo);
-        glViewport(0, 0, 512, 512);
+        glViewport(0, 0, out.physW > 0 ? out.physW : 512, out.physH > 0 ? out.physH : 512);
         glDisable(GL_SCISSOR_TEST);
         glDisable(GL_DEPTH_TEST);
         glDisable(GL_BLEND);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         m_f.glUseProgram_(m_g309Prog);
+        if (m_locG309FbScale >= 0)
+            m_e.glUniform2f_(m_locG309FbScale, dc2IsNativeHighResActive() ? dc2GetNativeScaleX() : 1.0f,
+                                               dc2IsNativeHighResActive() ? dc2GetNativeScaleY() : 1.0f);
         m_f.glBindVertexArray_(m_vao);
         for (uint32_t t = 0u; t < kG309SourceCount; ++t)
         {
@@ -4705,8 +5036,29 @@ void main()
             readback->resize(512u * 512u);
             m_f.glActiveTexture_(GL158_TEXTURE0);
             glBindTexture(GL_TEXTURE_2D, out.colorTex);
-            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                          readback->data());
+            if (out.physW > 0 && (out.physW != 512 || out.physH != 512))
+            {
+                std::vector<uint32_t> physPx(static_cast<size_t>(out.physW) * out.physH);
+                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, physPx.data());
+                for (int y = 0; y < 512; ++y)
+                {
+                    int py = (y * out.physH) / 512;
+                    if (py >= out.physH) py = out.physH - 1;
+                    const uint32_t *srcRow = physPx.data() + static_cast<size_t>(py) * out.physW;
+                    uint32_t *dstRow = readback->data() + static_cast<size_t>(y) * 512;
+                    for (int x = 0; x < 512; ++x)
+                    {
+                        int px = (x * out.physW) / 512;
+                        if (px >= out.physW) px = out.physW - 1;
+                        dstRow[x] = srcRow[px];
+                    }
+                }
+            }
+            else
+            {
+                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                              readback->data());
+            }
             if (g494GetError(kG494CompErr) != GL_NO_ERROR)
             {
                 readback->clear();
@@ -4723,6 +5075,8 @@ void main()
                                const std::vector<uint32_t> &clutRgba,
                                bool verify, uint64_t &verifyBad)
     {
+        if (!dc2ShouldExecuteRenderEvent("prepareT8", 0, texKey, srcFbp, 0, 0, static_cast<float>(texW), static_cast<float>(texH), 0, 0, 0, 0, 0))
+            return true;
         static uint64_t s_failN = 0u;
         const auto fail = [&](const char *stage) {
             ++s_failN;
@@ -4881,6 +5235,10 @@ void main()
         glDisable(GL_BLEND);
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         m_f.glUseProgram_(m_g281Prog);
+        if (m_locG281FbScale >= 0)
+            m_e.glUniform2f_(m_locG281FbScale,
+                             dc2IsNativeHighResActive() ? dc2GetNativeScaleX() : 1.0f,
+                             dc2IsNativeHighResActive() ? dc2GetNativeScaleY() : 1.0f);
         m_f.glBindVertexArray_(m_vao);
         m_f.glActiveTexture_(GL158_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, src.colorTex);
@@ -4962,7 +5320,32 @@ void main()
                                            GL178_RENDERBUFFER, scratch.depthRb);
             return false;
         }
-        glReadPixels(0, depthY, w, depthRows, GL_DEPTH_COMPONENT, GL_FLOAT, out.data());
+        if (it->second.physW != w || it->second.physH != h)
+        {
+            const float sy = static_cast<float>(it->second.physH) / static_cast<float>(h);
+            const int physDepthY = static_cast<int>(std::round(depthY * sy));
+            const int physDepthRows = std::max(1, static_cast<int>(std::round(depthRows * sy)));
+            const int physW = it->second.physW;
+            std::vector<float> physDepth(static_cast<size_t>(physW) * physDepthRows);
+            glReadPixels(0, physDepthY, physW, physDepthRows, GL_DEPTH_COMPONENT, GL_FLOAT, physDepth.data());
+            for (int r = 0; r < depthRows; ++r)
+            {
+                int pr = (r * physDepthRows) / depthRows;
+                if (pr >= physDepthRows) pr = physDepthRows - 1;
+                const float *srcRow = physDepth.data() + static_cast<size_t>(pr) * physW;
+                float *dstRow = out.data() + static_cast<size_t>(r) * w;
+                for (int x = 0; x < w; ++x)
+                {
+                    int px = (x * physW) / w;
+                    if (px >= physW) px = physW - 1;
+                    dstRow[x] = srcRow[px];
+                }
+            }
+        }
+        else
+        {
+            glReadPixels(0, depthY, w, depthRows, GL_DEPTH_COMPONENT, GL_FLOAT, out.data());
+        }
         m_e.glFramebufferRenderbuffer_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
                                        GL178_RENDERBUFFER, scratch.depthRb);
         return true;
@@ -5269,17 +5652,36 @@ void main()
         for (G178TexUpload &up : b.texUploads)
         {
             TexEntry &t = m_texCache[up.key];
+            bool fresh = false;
             if (t.id == 0)
             {
                 glGenTextures(1, &t.id);
                 if (t.id == 0)
                     return false;
+                fresh = true;
             }
             else
                 m_texBytes -= static_cast<size_t>(t.w) * t.h * 4u;
             glBindTexture(GL_TEXTURE_2D, t.id);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, up.w, up.h, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                         up.px.data());
+            // G620: a re-upload at the SAME dimensions does not need new storage. `glTexImage2D`
+            // reallocates the level every time — the driver frees and re-creates the mip-0 image,
+            // re-validates the format and drops any residency it had. DC2 re-uploads the same
+            // descriptor at the same size all frame long (the front-end key `up.key` is the whole
+            // TEX0 descriptor, so `w`/`h` cannot change without the key changing except through
+            // HD texture replacement, which is checked explicitly). `glTexSubImage2D` writes the
+            // identical texels into the identical storage.
+            //
+            // Exactness: the internal format is unconditionally `GL158_RGBA8` on both arms, mip 0
+            // is the only level this cache ever defines, and the sub-image covers the whole
+            // rectangle `[0,w) x [0,h)`. A first upload, or any size change, still takes
+            // `glTexImage2D`. Rollback: `DC2_G620_NO_SUBIMAGE=1`.
+            static const bool s_g620NoSubImage = g158EnvFlag("DC2_G620_NO_SUBIMAGE");
+            if (!s_g620NoSubImage && !fresh && t.w == up.w && t.h == up.h && up.w > 0 && up.h > 0)
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, up.w, up.h, GL_RGBA, GL_UNSIGNED_BYTE,
+                                up.px.data());
+            else
+                glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, up.w, up.h, 0, GL_RGBA,
+                             GL_UNSIGNED_BYTE, up.px.data());
             t.w = up.w;
             t.h = up.h;
             t.lastUse = m_batchCounter;
@@ -5293,19 +5695,66 @@ void main()
         // Protect every texture used by this batch from LRU eviction, then resolve all handles.
         // No texture-cache operation occurs after this point, so draw submission has no late
         // lookup failure path and pointers into the unordered_map remain stable.
-        for (const G178Draw &d : b.draws)
-            if (d.texKey != 0u)
-                m_texCache.find(d.texKey)->second.lastUse = m_batchCounter;
-        evictIfNeeded();
-        std::vector<TexEntry *> drawTextures(b.draws.size(), nullptr);
-        for (size_t i = 0; i < b.draws.size(); ++i)
+        //
+        // ===== G620: ONE hash lookup per DISTINCT texture, not two per DRAW =====
+        // `[G415:stage]` prices this mark (`tex`) at ~0.030 ms on the 0x0/0x68 skip populations,
+        // which upload almost nothing and carry ~40 draws — i.e. it is not the upload, it is
+        // **two `unordered_map::find` per draw**, ~4,000 lookups/frame across 45 flushes, ~0.89 ms/f.
+        //
+        // Three exact changes, none of which alters what is bound to any draw:
+        //   1. the two passes merge into one. The separation existed so `lastUse` was stamped
+        //      BEFORE `evictIfNeeded()` and the pointers taken AFTER it. Merging is still safe:
+        //      eviction never erases an entry whose `lastUse == m_batchCounter` (its own guard),
+        //      it performs no insertion, and erasing OTHER elements of an `unordered_map` does not
+        //      invalidate references to the ones that remain. So a pointer taken before the evict
+        //      is still valid after it — and it is a pointer to an entry eviction cannot touch.
+        //   2. the handle vector becomes a reused member instead of a per-flush heap allocation.
+        //   3. consecutive draws overwhelmingly share one texture (the front end coalesces on
+        //      `texKey`, see rasterizer_vram_materialization.inc), so a ONE-ENTRY memo answers most
+        //      draws with a compare instead of a hash probe.
+        // The old first pass also dereferenced `find()` without testing `end()`; the merged form
+        // takes the second pass's check, so it is strictly safer as well.
+        // Rollback: `DC2_G620_NO_TEXRESOLVE=1`.
+        static const bool s_g620NoTexResolve = g158EnvFlag("DC2_G620_NO_TEXRESOLVE");
+        m_g620DrawTex.assign(b.draws.size(), nullptr);
+        std::vector<TexEntry *> &drawTextures = m_g620DrawTex;
+        if (s_g620NoTexResolve)
         {
-            if (b.draws[i].texKey == 0u)
-                continue;
-            const auto it = m_texCache.find(b.draws[i].texKey);
-            if (it == m_texCache.end() || it->second.id == 0)
-                return false;
-            drawTextures[i] = &it->second;
+            for (const G178Draw &d : b.draws)
+                if (d.texKey != 0u)
+                    m_texCache.find(d.texKey)->second.lastUse = m_batchCounter;
+            evictIfNeeded();
+            for (size_t i = 0; i < b.draws.size(); ++i)
+            {
+                if (b.draws[i].texKey == 0u)
+                    continue;
+                const auto it = m_texCache.find(b.draws[i].texKey);
+                if (it == m_texCache.end() || it->second.id == 0)
+                    return false;
+                drawTextures[i] = &it->second;
+            }
+        }
+        else
+        {
+            uint64_t memoKey = 0u;
+            TexEntry *memoEnt = nullptr;
+            for (size_t i = 0; i < b.draws.size(); ++i)
+            {
+                const uint64_t k = b.draws[i].texKey;
+                if (k == 0u)
+                    continue;
+                if (k != memoKey)
+                {
+                    const auto it = m_texCache.find(k);
+                    if (it == m_texCache.end() || it->second.id == 0)
+                        return false;
+                    memoKey = k;
+                    memoEnt = &it->second;
+                }
+                memoEnt->lastUse = m_batchCounter;
+                drawTextures[i] = memoEnt;
+            }
+            evictIfNeeded();
         }
 
         // Allocate all caller-visible output storage before drawing. A bad_alloc is caught by the
@@ -5322,14 +5771,111 @@ void main()
         if (fbo.fbo == 0)
             return false;
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, fbo.fbo);
-        glViewport(0, 0, b.fbW, b.fbH);
+        const int viewportW = fbo.physW > 0 ? fbo.physW : b.fbW;
+        const int viewportH = fbo.physH > 0 ? fbo.physH : b.fbH;
+        glViewport(0, 0, viewportW, viewportH);
         g415Note(); // 2: FBO ensure/bind
 
+        static uint32_t s_3dScenePrints = 0u;
+        static uint32_t s_dispScenePrints = 0u;
+        const bool is3dWorldBatch = (b.fbp == 0x139u || (b.verts.size() > 50u && !b.draws.empty() && (b.draws[0].depthFunc & 0x0Fu) != 0));
+        const bool isDispBatch = (b.fbp == 0x068u || b.fbp == 0x000u);
+        if ((is3dWorldBatch && s_3dScenePrints++ < 2u) || (isDispBatch && s_dispScenePrints++ < 2u))
+        {
+            auto dIt = (depthKey != 0u) ? m_depths.find(depthKey) : m_depths.end();
+            const DepthEntry *depthPtr = (dIt != m_depths.end()) ? &dIt->second : nullptr;
+            std::fprintf(stderr, "\n========== [DC2 RESOLUTION DIAGNOSTIC (GS -> HOST RASTER)] ==========\n");
+            std::fprintf(stderr, "Batch FBP                   = 0x%03x (fboKey=0x%x, draws=%zu, verts=%zu, %s)\n",
+                         b.fbp, b.fboKey, b.draws.size(), b.verts.size(), is3dWorldBatch ? "3D_WORLD_SCENE" : "DISPLAY_COMPOSITE");
+            std::fprintf(stderr, "[GS TARGET] logical=%d x %d, physical=%d x %d, GL FBO=%u, ColorTex=%u\n",
+                         b.fbW, b.fbH, fbo.physW > 0 ? fbo.physW : fbo.w, fbo.physH > 0 ? fbo.physH : fbo.h, fbo.fbo, fbo.colorTex);
+            if (depthPtr && depthPtr->tex != 0)
+            {
+                std::fprintf(stderr, "[DEPTH TARGET] logical=%d x %d, physical=%d x %d, DepthTex=%u\n",
+                             depthPtr->w, depthPtr->h, depthPtr->physW > 0 ? depthPtr->physW : depthPtr->w, depthPtr->physH > 0 ? depthPtr->physH : depthPtr->h, depthPtr->tex);
+            }
+            else
+            {
+                std::fprintf(stderr, "[DEPTH TARGET] logical=%d x %d, physical=%d x %d (FBO depthRb=%u)\n",
+                             b.fbW, b.fbH, fbo.physW > 0 ? fbo.physW : fbo.w, fbo.physH > 0 ? fbo.physH : fbo.h, fbo.depthRb);
+            }
+            if (!b.draws.empty())
+            {
+                const G178Draw &d0 = b.draws[0];
+                const int scH = d0.scY1 - d0.scY0 + 1;
+                const float sx = static_cast<float>(fbo.physW > 0 ? fbo.physW : b.fbW) / static_cast<float>(b.fbW);
+                const float sy = static_cast<float>(fbo.physH > 0 ? fbo.physH : b.fbH) / static_cast<float>(b.fbH);
+                std::fprintf(stderr, "Logical GS scissor            = (x0=%d, y0=%d, x1=%d, y1=%d) [W=%d, H=%d]\n",
+                             d0.scX0, d0.scY0, d0.scX1, d0.scY1, d0.scX1 - d0.scX0 + 1, scH);
+                std::fprintf(stderr, "Physical host scissor         = (x0=%d, y0=%d, W=%d, H=%d)\n",
+                             static_cast<int>(std::round(d0.scX0 * sx)),
+                             static_cast<int>(std::round((b.fbH - 1 - d0.scY1) * sy)),
+                             static_cast<int>(std::round((d0.scX1 - d0.scX0 + 1) * sx)),
+                             static_cast<int>(std::round(scH * sy)));
+            }
+            std::fprintf(stderr, "Logical drawable area         = %d x %d\n", b.fbW, b.fbH);
+            std::fprintf(stderr, "Physical host viewport/drawable area = %d x %d\n", viewportW, viewportH);
+
+            if (b.verts.size() >= 3u)
+            {
+                std::fprintf(stderr, "--- [3D TRIANGLE TRACE (First Triangle)] ---\n");
+                for (size_t vi = 0; vi < 3u; ++vi)
+                {
+                    const G178Vtx &vtx = b.verts[vi];
+                    const float ndcX = vtx.x / static_cast<float>(b.fbW) * 2.0f - 1.0f;
+                    const float ndcY = 1.0f - vtx.y / static_cast<float>(b.fbH) * 2.0f;
+                    const float rasterPxX = (ndcX * 0.5f + 0.5f) * static_cast<float>(viewportW);
+                    const float rasterPxY = (1.0f - (ndcY * 0.5f + 0.5f)) * static_cast<float>(viewportH);
+                    std::fprintf(stderr, "  Vertex %u: GS raw=(x=%.2f, y=%.2f, z=%.4f) -> logical screen=(%.2f, %.2f) -> NDC=(%.4f, %.4f) -> host raster pixel=(%.1f, %.1f) in target(%dx%d)\n",
+                                 static_cast<unsigned>(vi), vtx.x, vtx.y, vtx.z, vtx.x, vtx.y, ndcX, ndcY, rasterPxX, rasterPxY, viewportW, viewportH);
+                }
+                std::fprintf(stderr, "--------------------------------------------\n");
+            }
+            std::fprintf(stderr, "--- [BATCH DRAWS SUMMARY (draws=%zu)] ---\n", b.draws.size());
+            for (size_t di = 0; di < std::min<size_t>(b.draws.size(), 20u); ++di)
+            {
+                const G178Draw &dr = b.draws[di];
+                float minX = 1e6f, minY = 1e6f, maxX = -1e6f, maxY = -1e6f;
+                for (int vi = 0; vi < dr.vtxCount; ++vi)
+                {
+                    const G178Vtx &vx = b.verts[static_cast<size_t>(dr.firstVtx + vi)];
+                    minX = std::min(minX, vx.x);
+                    minY = std::min(minY, vx.y);
+                    maxX = std::max(maxX, vx.x);
+                    maxY = std::max(maxY, vx.y);
+                }
+                std::fprintf(stderr, "  Draw %zu: verts=%d, texKey=0x%llx, srcFbp=0x%x, blend=%u, ztst=%u, zwrite=%u, sc=[%d,%d..%d,%d], bounds=[(%.1f,%.1f)..(%.1f,%.1f)]\n",
+                             di, dr.vtxCount, static_cast<unsigned long long>(dr.texKey), dr.srcFbp, dr.blend,
+                             dr.depthFunc & 0x0Fu, dr.depthWrite, dr.scX0, dr.scY0, dr.scX1, dr.scY1, minX, minY, maxX, maxY);
+            }
+            std::fprintf(stderr, "=======================================================================\n\n");
+            std::fflush(stderr);
+        }
+
         const int g417UploadRowsThis = b.uploadFb ? b.fbH : 0;
-        if (b.uploadFb)
+        if (b.uploadFb && dc2ShouldExecuteRenderEvent("uploadFb", b.fbp, 0, 0, 0, 0, static_cast<float>(b.fbW), static_cast<float>(b.fbH), 0, 0, 0, 0, 0))
         {
             glBindTexture(GL_TEXTURE_2D, fbo.colorTex);
-            if (g417ProfileOn())
+            if (fbo.physW != b.fbW || fbo.physH != b.fbH)
+            {
+                std::vector<uint32_t> scaledUpload(static_cast<size_t>(fbo.physW) * fbo.physH);
+                for (int py = 0; py < fbo.physH; ++py)
+                {
+                    int srcY = (py * b.fbH) / fbo.physH;
+                    if (srcY >= b.fbH) srcY = b.fbH - 1;
+                    const uint32_t *srcRow = b.fbPixels.data() + static_cast<size_t>(srcY) * b.fbW;
+                    uint32_t *dstRow = scaledUpload.data() + static_cast<size_t>(py) * fbo.physW;
+                    for (int px = 0; px < fbo.physW; ++px)
+                    {
+                        int srcX = (px * b.fbW) / fbo.physW;
+                        if (srcX >= b.fbW) srcX = b.fbW - 1;
+                        dstRow[px] = srcRow[srcX];
+                    }
+                }
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, fbo.physW, fbo.physH,
+                                GL_RGBA, GL_UNSIGNED_BYTE, scaledUpload.data());
+            }
+            else if (g417ProfileOn())
             {
                 const auto drainT0 = std::chrono::steady_clock::now();
                 glFinish();
@@ -5366,8 +5912,33 @@ void main()
             if (depthUpload != nullptr)
             {
                 glBindTexture(GL_TEXTURE_2D, depth.tex);
-                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, depthY, b.fbW, depthRows,
-                                GL_DEPTH_COMPONENT, GL_FLOAT, depthUpload->data());
+                if (depth.physW != b.fbW || depth.physH != b.fbH)
+                {
+                    const float sy = static_cast<float>(depth.physH) / static_cast<float>(b.fbH);
+                    const int physDepthY = static_cast<int>(std::round(depthY * sy));
+                    const int physDepthRows = std::max(1, static_cast<int>(std::round(depthRows * sy)));
+                    std::vector<float> scaledDepth(static_cast<size_t>(depth.physW) * physDepthRows);
+                    for (int py = 0; py < physDepthRows; ++py)
+                    {
+                        int srcY = (py * depthRows) / physDepthRows;
+                        if (srcY >= depthRows) srcY = depthRows - 1;
+                        const float *srcRow = depthUpload->data() + static_cast<size_t>(srcY) * b.fbW;
+                        float *dstRow = scaledDepth.data() + static_cast<size_t>(py) * depth.physW;
+                        for (int px = 0; px < depth.physW; ++px)
+                        {
+                            int srcX = (px * b.fbW) / depth.physW;
+                            if (srcX >= b.fbW) srcX = b.fbW - 1;
+                            dstRow[px] = srcRow[srcX];
+                        }
+                    }
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, physDepthY, depth.physW, physDepthRows,
+                                    GL_DEPTH_COMPONENT, GL_FLOAT, scaledDepth.data());
+                }
+                else
+                {
+                    glTexSubImage2D(GL_TEXTURE_2D, 0, 0, depthY, b.fbW, depthRows,
+                                    GL_DEPTH_COMPONENT, GL_FLOAT, depthUpload->data());
+                }
                 depth.initialized = true;
             }
             m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
@@ -5516,6 +6087,7 @@ void main()
                           static_cast<GLsizeiptrLocal>(b.verts.size() * sizeof(G178Vtx)),
                           b.verts.data(), GL178_STREAM_DRAW);
         const GLint locFbSize = g560MultiDraw ? m_locG560FbSize : m_locFbSize;
+        const GLint locFbScale = g560MultiDraw ? m_locG560FbScale : m_locFbScale;
         const GLint locMode = g560MultiDraw ? m_locG560Mode : m_locMode;
         const GLint locFogCol = g560MultiDraw ? m_locG560FogCol : m_locFogCol;
         const GLint locLinear = g560MultiDraw ? m_locG560Linear : m_locLinear;
@@ -5526,6 +6098,9 @@ void main()
         const GLint locUvRoundU = g560MultiDraw ? m_locG560UvRoundU : m_locUvRoundU;
         const GLint locUvRoundV = g560MultiDraw ? m_locG560UvRoundV : m_locUvRoundV;
         m_e.glUniform2f_(locFbSize, static_cast<GLfloat>(b.fbW), static_cast<GLfloat>(b.fbH));
+        if (locFbScale >= 0)
+            m_e.glUniform2f_(locFbScale, dc2IsNativeHighResActive() ? dc2GetNativeScaleX() : 1.0f,
+                                         dc2IsNativeHighResActive() ? dc2GetNativeScaleY() : 1.0f);
         m_f.glActiveTexture_(GL158_TEXTURE0);
         glEnable(GL_SCISSOR_TEST);
         const bool g257RealDiagnostic = g256Exact && g257ImageStoreTestOn() &&
@@ -5713,8 +6288,13 @@ void main()
                 s_last = s_acc;
             }
         }
+        static uint64_t s_globalDrawCount = 0;
+        const int drawLimit = dc2DrawLimit();
         for (size_t drawIndex = 0; drawIndex < b.draws.size(); ++drawIndex)
         {
+            if (drawLimit >= 0 && s_globalDrawCount >= static_cast<uint64_t>(drawLimit))
+                break;
+            ++s_globalDrawCount;
             const G178Draw &d = b.draws[drawIndex];
             size_t g560RunEnd = drawIndex + 1u;
             if (g560MultiDraw)
@@ -5727,7 +6307,20 @@ void main()
                                          : d.vtxCount;
             // GS scissor is inclusive, top-origin; GL is bottom-origin.
             const int scH = d.scY1 - d.scY0 + 1;
-            g496Scissor(d.scX0, b.fbH - 1 - d.scY1, d.scX1 - d.scX0 + 1, scH, g496GlCache);
+            if (fbo.physW > 0 && (fbo.physW != b.fbW || fbo.physH != b.fbH))
+            {
+                const float sx = static_cast<float>(fbo.physW) / static_cast<float>(b.fbW);
+                const float sy = static_cast<float>(fbo.physH) / static_cast<float>(b.fbH);
+                const int physScX0 = static_cast<int>(std::round(d.scX0 * sx));
+                const int physScY0 = static_cast<int>(std::round((b.fbH - 1 - d.scY1) * sy));
+                const int physScW  = static_cast<int>(std::round((d.scX1 - d.scX0 + 1) * sx));
+                const int physScH  = static_cast<int>(std::round(scH * sy));
+                g496Scissor(physScX0, physScY0, physScW, physScH, g496GlCache);
+            }
+            else
+            {
+                g496Scissor(d.scX0, b.fbH - 1 - d.scY1, d.scX1 - d.scX0 + 1, scH, g496GlCache);
+            }
             const uint8_t depthFunc = d.depthFunc & 0x0Fu;
             if (depthFunc == 0)
             {
@@ -5887,11 +6480,20 @@ void main()
                 }
                 else
                 {
+                    const uint32_t realSrcFbp = g289RealSourceFbp(d.srcFbp);
                     const FboEntry &src =
-                        m_fbos.find(g289RealSourceFbp(d.srcFbp))->second;
+                        m_fbos.find(realSrcFbp)->second;
                     // G496b: the BIND is cached; the four sampler params are NOT. An FboEntry
                     // colour texture is re-parameterised by the T8, CT24, composite-source and
                     // spare-swap paths, so a per-object record here could go stale.
+                    if (realSrcFbp == 0x139u)
+                    {
+                        static uint32_t s_dc2_139_sample_count = 0u;
+                        if (s_dc2_139_sample_count < 16u)
+                            std::fprintf(stderr, "[DC2_139_SAMPLE] n=%u batchFbp=0x%03x draw=%zu srcFbo=%u srcTex=%u blend=%u verts=%d\n",
+                                         s_dc2_139_sample_count, b.fbp, drawIndex, src.fbo, src.colorTex, d.blend, d.vtxCount);
+                        ++s_dc2_139_sample_count;
+                    }
                     g496BindTex(src.colorTex, g496GlCache);
                     const GLint filter = d.bilinear ? GL_LINEAR : GL_NEAREST;
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
@@ -5992,6 +6594,13 @@ void main()
             if (d.uvRoundU != 0u || d.uvRoundV != 0u)
             {
                 mode |= 16384;
+                // G624: a `srcFbp` bind samples the producer FBO bottom-first, so the front end
+                // flipped this draw's T. Tell the rounding rule, which is expressed in GS V.
+                // The G309 composite branch (bit 11) never reaches g406RoundUv; it is excluded
+                // for clarity, not for correctness.
+                g496Uniform1i(g496Uni, kG496UFlipV, m_locUvFlipV,
+                              (!s_g624NoUvFlip && d.srcFbp != 0u && (mode & 2048) == 0) ? 1 : 0,
+                              g496GlCache);
                 g496Uniform1i(g496Uni, kG496UOriginX, locUvOriginX,
                               static_cast<int>(d.uvOriginX), g496GlCache);
                 g496Uniform1i(g496Uni, kG496UOriginY, locUvOriginY,
@@ -6001,29 +6610,71 @@ void main()
                 g496Uniform1i(g496Uni, kG496URoundV, locUvRoundV,
                               static_cast<int>(d.uvRoundV), g496GlCache);
             }
-            if (!g560MultiDraw && g255RttAlpha && d.blend != 0u)
+            float minX = 1e6f, minY = 1e6f, maxX = -1e6f, maxY = -1e6f;
+            for (int vi = 0; vi < d.vtxCount; ++vi)
             {
-                // Fixed-function blending needs As/128 in the shader alpha channel, while PS2
-                // framebuffer alpha stores the unblended source A byte. Preserve RGB blending in
-                // pass one with alpha masked, then overwrite alpha only with the raw source value.
-                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
-                g496Uniform1i(g496Uni, kG496UMode, locMode, mode, g496GlCache);
-                glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
-                // Routed through the cache so the record tracks the real GL state: this branch
-                // disables blending after g496BlendOn enabled it, and the next draw must not
-                // believe blending is still on.
-                g496BlendOff(g496GlCache);
-                glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
-                g496Uniform1i(g496Uni, kG496UMode, locMode, mode | 32, g496GlCache);
-                glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
-                glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                const G178Vtx &vx = b.verts[static_cast<size_t>(d.firstVtx + vi)];
+                minX = std::min(minX, vx.x);
+                minY = std::min(minY, vx.y);
+                maxX = std::max(maxX, vx.x);
+                maxY = std::max(maxY, vx.y);
             }
-            else
+            if (dc2IsNativeHighResActive() && b.fbp == 0x139u && d.blend == 0u && (d.depthFunc & 0x0Fu) == 0u && d.texKey == 0u && d.srcFbp == 0u)
             {
-                if (g255RttAlpha)
-                    mode |= 32;
-                g496Uniform1i(g496Uni, kG496UMode, locMode, mode, g496GlCache);
-                glDrawArrays(GL_TRIANGLES, d.firstVtx, g560VtxCount);
+                static uint32_t s_dc2_139_clear_count = 0u;
+                if (s_dc2_139_clear_count < 16u)
+                    std::fprintf(stderr, "[DC2_139_CLEAR] n=%u draw=%d verts=%d bounds=(%.0f,%.0f..%.0f,%.0f) physW=%d physH=%d\n",
+                                 s_dc2_139_clear_count, drawIndex, d.vtxCount, minX, minY, maxX, maxY, fbo.physW, fbo.physH);
+                ++s_dc2_139_clear_count;
+                glDisable(GL_SCISSOR_TEST);
+                glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+                glClear(GL_COLOR_BUFFER_BIT);
+                glEnable(GL_SCISSOR_TEST);
+            }
+            const bool execDraw = dc2ShouldExecuteRenderEvent("draw", b.fbp, d.texKey, d.srcFbp, minX, minY, maxX, maxY, d.vtxCount, d.blend, d.depthFunc & 0x0Fu, d.depthWrite, mode);
+            if (execDraw)
+            {
+                if (!g560MultiDraw && g255RttAlpha && d.blend != 0u)
+                {
+                    // Fixed-function blending needs As/128 in the shader alpha channel, while PS2
+                    // framebuffer alpha stores the unblended source A byte. Preserve RGB blending in
+                    // pass one with alpha masked, then overwrite alpha only with the raw source value.
+                    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
+                    g496Uniform1i(g496Uni, kG496UMode, locMode, mode, g496GlCache);
+                    glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
+                    // Routed through the cache so the record tracks the real GL state: this branch
+                    // disables blending after g496BlendOn enabled it, and the next draw must not
+                    // believe blending is still on.
+                    g496BlendOff(g496GlCache);
+                    glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
+                    g496Uniform1i(g496Uni, kG496UMode, locMode, mode | 32, g496GlCache);
+                    glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
+                    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                }
+                else
+                {
+                    if (g255RttAlpha)
+                        mode |= 32;
+                    g496Uniform1i(g496Uni, kG496UMode, locMode, mode, g496GlCache);
+                    glDrawArrays(GL_TRIANGLES, d.firstVtx, g560VtxCount);
+                }
+            }
+            static uint32_t s_auditBatchCounter = 0;
+            if (m_batchCounter <= 300 && (m_batchCounter % 60 == 0))
+            {
+                float minX = 1e6f, minY = 1e6f, maxX = -1e6f, maxY = -1e6f;
+                for (int vi = 0; vi < d.vtxCount; ++vi)
+                {
+                    const G178Vtx &vx = b.verts[static_cast<size_t>(d.firstVtx + vi)];
+                    minX = std::min(minX, vx.x);
+                    minY = std::min(minY, vx.y);
+                    maxX = std::max(maxX, vx.x);
+                    maxY = std::max(maxY, vx.y);
+                }
+                std::fprintf(stderr, "[DRAW_AUDIT] batch=%llu FBP=0x%03x draw=%zu verts=%d mode=%d blend=%u texKey=0x%llx srcFbp=0x%x ztst=%u zw=%u bounds=[(%.1f,%.1f)..(%.1f,%.1f)] col0=(%u,%u,%u,%u)\n",
+                             static_cast<unsigned long long>(m_batchCounter), b.fbp, drawIndex, d.vtxCount, mode, d.blend,
+                             static_cast<unsigned long long>(d.texKey), d.srcFbp, d.depthFunc & 0x0Fu, d.depthWrite,
+                             minX, minY, maxX, maxY, b.verts[d.firstVtx].r, b.verts[d.firstVtx].g, b.verts[d.firstVtx].b, b.verts[d.firstVtx].a);
             }
             if (g560MultiDraw)
                 drawIndex = g560RunEnd - 1u;
@@ -6106,6 +6757,24 @@ void main()
         }
 
         glDisable(GL_SCISSOR_TEST);
+        if (dc2NativeResDiagOn())
+        {
+            static uint32_t s_diagDumpCount = 0;
+            if (m_batchCounter >= 60 && m_batchCounter <= 300 && s_diagDumpCount < 10)
+            {
+                if (b.fbp == 0x000u || b.fbp == 0x068u || b.fbp == 0x139u)
+                {
+                    ++s_diagDumpCount;
+                    std::vector<uint32_t> px(static_cast<size_t>(fbo.physW) * fbo.physH);
+                    glBindTexture(GL_TEXTURE_2D, fbo.colorTex);
+                    glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                    char fname[256];
+                    std::snprintf(fname, sizeof(fname), "d:/ps2r/dc2/captures/surface_batch_%llu_fbp_0x%03x.ppm",
+                                  static_cast<unsigned long long>(m_batchCounter), b.fbp);
+                    dc2DumpPpm(fname, fbo.physW, fbo.physH, px.data(), true);
+                }
+            }
+        }
         g415Note(); // 6: draw loop (+ exact-path epilogue)
         // G418 early kick: this batch leaves its GL work queued and never fences, so without a kick
         // the frame's one readback batch pays the whole backlog as drain. glFlush only guarantees
@@ -6178,7 +6847,51 @@ void main()
                     narrowY = std::max(0, std::min(narrowY, b.fbH - forced));
                 }
             }
-            if (narrow)
+            if (fbo.physW > 0 && (fbo.physW != b.fbW || fbo.physH != b.fbH))
+            {
+                const float sy = static_cast<float>(fbo.physH) / static_cast<float>(b.fbH);
+                if (narrow)
+                {
+                    const int physY = static_cast<int>(std::round(narrowY * sy));
+                    const int physRows = std::max(1, static_cast<int>(std::round(narrowRows * sy)));
+                    std::vector<uint32_t> physPx(static_cast<size_t>(fbo.physW) * physRows);
+                    glReadPixels(0, physY, fbo.physW, physRows, GL_RGBA, GL_UNSIGNED_BYTE, physPx.data());
+                    for (int r = 0; r < narrowRows; ++r)
+                    {
+                        int pr = (r * physRows) / narrowRows;
+                        if (pr >= physRows) pr = physRows - 1;
+                        const uint32_t *srcRow = physPx.data() + static_cast<size_t>(pr) * fbo.physW;
+                        uint32_t *dstRow = b.readback.data() + static_cast<size_t>(narrowY + r) * b.fbW;
+                        for (int x = 0; x < b.fbW; ++x)
+                        {
+                            int px = (x * fbo.physW) / b.fbW;
+                            if (px >= fbo.physW) px = fbo.physW - 1;
+                            dstRow[x] = srcRow[px];
+                        }
+                    }
+                    g415ReadRows = narrowRows;
+                }
+                else
+                {
+                    std::vector<uint32_t> physPx(static_cast<size_t>(fbo.physW) * fbo.physH);
+                    glReadPixels(0, 0, fbo.physW, fbo.physH, GL_RGBA, GL_UNSIGNED_BYTE, physPx.data());
+                    for (int r = 0; r < b.fbH; ++r)
+                    {
+                        int pr = (r * fbo.physH) / b.fbH;
+                        if (pr >= fbo.physH) pr = fbo.physH - 1;
+                        const uint32_t *srcRow = physPx.data() + static_cast<size_t>(pr) * fbo.physW;
+                        uint32_t *dstRow = b.readback.data() + static_cast<size_t>(r) * b.fbW;
+                        for (int x = 0; x < b.fbW; ++x)
+                        {
+                            int px = (x * fbo.physW) / b.fbW;
+                            if (px >= fbo.physW) px = fbo.physW - 1;
+                            dstRow[x] = srcRow[px];
+                        }
+                    }
+                    g415ReadRows = b.fbH;
+                }
+            }
+            else if (narrow)
             {
                 glReadPixels(0, narrowY, b.fbW, narrowRows,
                              GL_RGBA, GL_UNSIGNED_BYTE,
@@ -6229,6 +6942,16 @@ void main()
                     m_g420TouchScratch.resize(words);
                 std::memset(m_g420TouchScratch.data(), 0, words * sizeof(uint32_t));
             }
+            // G621 (default-off, DC2_G621_SPAN=1): of the rows this read transfers, how many could
+            // this batch's draws have WRITTEN? GS row y is GL row fbH-1-y, so the GL window
+            // [rdGlY, rdGlY+g415ReadRows) is the GS span below.
+            if (g621SpanCensusOn() && g415ReadRows > 0)
+            {
+                const int rdGlY = narrow ? narrowY : 0;
+                const int rdGsHi = b.fbH - 1 - rdGlY;
+                const int rdGsLo = rdGsHi - g415ReadRows + 1;
+                g621NoteReadback(b, rdGsLo < 0 ? 0 : rdGsLo, rdGsHi, depthKey != 0u);
+            }
             if (g415StatOn() && (++m_g415StatN % 300u) == 0u)
             {
                 const uint64_t nn = g_g415NarrowBatches.load(std::memory_order_relaxed);
@@ -6261,8 +6984,33 @@ void main()
         if (fusedDepthReadback != nullptr)
         {
             fusedDepthReadback->resize(static_cast<size_t>(b.fbW) * depthReadRows);
-            glReadPixels(0, depthReadY, b.fbW, depthReadRows,
-                         GL_DEPTH_COMPONENT, GL_FLOAT, fusedDepthReadback->data());
+            if (fbo.physW > 0 && (fbo.physW != b.fbW || fbo.physH != b.fbH))
+            {
+                const float sy = static_cast<float>(fbo.physH) / static_cast<float>(b.fbH);
+                const int physReadY = static_cast<int>(std::round(depthReadY * sy));
+                const int physReadRows = std::max(1, static_cast<int>(std::round(depthReadRows * sy)));
+                std::vector<float> physDepth(static_cast<size_t>(fbo.physW) * physReadRows);
+                glReadPixels(0, physReadY, fbo.physW, physReadRows,
+                             GL_DEPTH_COMPONENT, GL_FLOAT, physDepth.data());
+                for (int r = 0; r < depthReadRows; ++r)
+                {
+                    int pr = (r * physReadRows) / depthReadRows;
+                    if (pr >= physReadRows) pr = physReadRows - 1;
+                    const float *srcRow = physDepth.data() + static_cast<size_t>(pr) * fbo.physW;
+                    float *dstRow = fusedDepthReadback->data() + static_cast<size_t>(r) * b.fbW;
+                    for (int x = 0; x < b.fbW; ++x)
+                    {
+                        int px = (x * fbo.physW) / b.fbW;
+                        if (px >= fbo.physW) px = fbo.physW - 1;
+                        dstRow[x] = srcRow[px];
+                    }
+                }
+            }
+            else
+            {
+                glReadPixels(0, depthReadY, b.fbW, depthReadRows,
+                             GL_DEPTH_COMPONENT, GL_FLOAT, fusedDepthReadback->data());
+            }
         }
         if (g257RealDiagnostic)
         {
@@ -6349,23 +7097,30 @@ void main()
     std::vector<uint32_t> m_g566Readback;
     uint64_t m_g566Packets = 0ull, m_g566PacketBytes = 0ull;
     GLuint m_g338Prog = 0;
-    GLint m_locG338SrcH = -1, m_locG338Ta0 = -1, m_locG338Aem = -1;
+    GLint m_locG338SrcH = -1, m_locG338Ta0 = -1, m_locG338Aem = -1, m_locG338FbScale = -1;
+    GLint m_locG281FbScale = -1;
     GLuint m_vao = 0, m_vbo = 0;
     GLuint m_g281MapTex = 0, m_g281ClutTex = 0, m_g281Fbo = 0;
     GLuint m_g309MapTex = 0, m_g309BaseTex = 0;
-    GLint m_locFbSize = -1, m_locMode = -1, m_locLinear = -1, m_locFogCol = -1;
+    GLint m_locFbSize = -1, m_locFbScale = -1, m_locMode = -1, m_locLinear = -1, m_locFogCol = -1;
     GLint m_locWrapU = -1, m_locWrapV = -1;
-    GLint m_locG560FbSize = -1, m_locG560Mode = -1, m_locG560Linear = -1;
+    GLint m_locG560FbSize = -1, m_locG560FbScale = -1, m_locG560Mode = -1, m_locG560Linear = -1;
     GLint m_locG560FogCol = -1, m_locG560WrapU = -1, m_locG560WrapV = -1;
+    GLint m_locG309FbScale = -1;
     GLint m_locG560UvOriginX = -1, m_locG560UvOriginY = -1;
     GLint m_locG560UvRoundU = -1, m_locG560UvRoundV = -1;
     GLint m_locExactFbSize = -1, m_locExactMode = -1, m_locExactLinear = -1;
     GLint m_locExactWrapU = -1, m_locExactWrapV = -1;
     GLint m_locUvOriginX = -1, m_locUvOriginY = -1;
     GLint m_locUvRoundU = -1, m_locUvRoundV = -1;
+    GLint m_locUvFlipV = -1; // G624
     std::map<uint32_t, FboEntry> m_fbos;
     std::unordered_map<uint64_t, DepthEntry> m_depths;
     std::unordered_map<uint64_t, TexEntry> m_texCache;
+    // G620: the per-draw texture-handle vector, hoisted to a member so the submit path stops
+    // heap-allocating one per flush (45/frame). Owned by the submitting worker only, exactly like
+    // m_texCache.
+    std::vector<TexEntry *> m_g620DrawTex;
     size_t m_texBytes = 0;
     uint64_t m_batchCounter = 0;
     uint64_t m_g257RealBatches = 0;

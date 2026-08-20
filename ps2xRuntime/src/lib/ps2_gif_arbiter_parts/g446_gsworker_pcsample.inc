@@ -191,6 +191,14 @@ namespace
     uint64_t g_g446CallerTotal = 0;
     uint64_t g_g446CallerNone = 0;
 
+    // G619: the stack scan accepted any qword inside the IMAGE, and SizeOfImage covers .rdata and
+    // .data as well as .text. On the EE thread that let a stale DATA pointer (a vtable, a string
+    // literal, a global's address left in the frame) win over the real return address: 63% of the
+    // first caller report resolved into one folded pseudo-symbol in an unnamed region of the map,
+    // i.e. not code at all. Narrowing the accept window to the CODE section removes that class
+    // outright — a return address is always inside .text. Filled at arm time from the PE headers.
+    uint64_t g_g619CodeLo = 0, g_g619CodeHi = 0;
+
     void g446RecordInto(G446Bucket *table, uint64_t rip, uint64_t *distinct)
     {
         uint64_t h = rip * 0x9E3779B97F4A7C15ull;
@@ -344,6 +352,146 @@ namespace
                          100.0 * static_cast<double>(raw[i].count) / denom,
                          static_cast<unsigned long long>(raw[i].count),
                          static_cast<unsigned long long>(pref));
+        }
+
+        // ===== G619: THE OUT-OF-EXE LEAVES, NAMED =====
+        //
+        // `pref=0x0` above means "this PC is not in our image", which on the EE thread is 37.6% of
+        // the distribution and the single largest thing on it. Name those rows by MODULE+RVA (and
+        // by the nearest export when one resolves) so the leaf is identifiable at all — but read
+        // the export name as a HYPOTHESIS: a DLL without private symbols resolves to the nearest
+        // EXPORT BELOW the address, which folds every internal function onto the export in front
+        // of it. The RVA is the fact; the name is the guess. Bounded at 24 rows, so this costs 24
+        // SymFromAddr calls, not the 8,192-per-row scan that makes g446Report unusable here.
+        {
+            static G446Bucket ext[24];
+            size_t nExt = 0;
+            for (size_t i = 0; i < kG446Slots; ++i)
+            {
+                const G446Bucket &b = g_g446Table[i];
+                if (b.count == 0)
+                    continue;
+                if (b.rip >= g_g446ExeLo && b.rip < g_g446ExeHi)
+                    continue; // in our image — already covered by the [G483:rawpc] rows
+                if (nExt < 24)
+                    ext[nExt++] = b;
+                else
+                {
+                    size_t worst = 0;
+                    for (size_t j = 1; j < 24; ++j)
+                        if (ext[j].count < ext[worst].count)
+                            worst = j;
+                    if (ext[worst].count < b.count)
+                        ext[worst] = b;
+                }
+            }
+            if (nExt > 0)
+            {
+                std::sort(ext, ext + nExt,
+                          [](const G446Bucket &a, const G446Bucket &b) { return a.count > b.count; });
+                for (size_t i = 0; i < nExt; ++i)
+                {
+                    char name[560];
+                    g446Symbolize(ext[i].rip, name, sizeof(name));
+                    char modName[MAX_PATH] = {0};
+                    uint64_t rva = 0ull;
+                    HMODULE mod = nullptr;
+                    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           reinterpret_cast<LPCSTR>(ext[i].rip), &mod) &&
+                        GetModuleFileNameA(mod, modName, MAX_PATH) != 0)
+                    {
+                        const char *base = std::strrchr(modName, '\\');
+                        if (base)
+                            std::memmove(modName, base + 1, std::strlen(base + 1) + 1);
+                        rva = ext[i].rip - reinterpret_cast<uint64_t>(mod);
+                    }
+                    std::fprintf(stderr, "[G619:extleaf]   %5.2f%% n=%llu %s+0x%llx  (%s)\n",
+                                 100.0 * static_cast<double>(ext[i].count) / denom,
+                                 static_cast<unsigned long long>(ext[i].count),
+                                 modName[0] ? modName : "?",
+                                 static_cast<unsigned long long>(rva), name);
+                }
+            }
+        }
+
+        // ===== G619: OUR CALL SITES, in the raw-only report too =====
+        //
+        // The symbolised report already prints this block (see g446Report), but on the EE thread
+        // that report is unusable: it calls SymFromAddr once per occupied slot FOR EVERY one of the
+        // 40 top rows (8,192 x 40 lookups against a 155 MB PDB), and a 120 s route is killed after
+        // ~7 rows. The raw-only path exists precisely to skip DbgHelp — but it also skipped the
+        // caller table, which is the only thing that can attribute an out-of-exe leaf.
+        //
+        // On this thread that is not a detail: 37.6% of EE samples land outside our image and the
+        // single largest folded row is `getenv` at 20.8%, which a rip-only histogram can never
+        // attribute to a call site. Emitting the caller rips in PREFERRED-BASE form lets
+        // tools/g504_mapres.py resolve them offline against the linker /MAP, exactly as the
+        // [G483:rawpc] rows above are resolved.
+        //
+        // Same two exactness caveats as the symbolised block (see g446RecordInto): the stack scan
+        // is a HEURISTIC, not an unwind, and a public-symbol name is a fold until the /MAP says
+        // otherwise. Read a row as "our code that leads to this leaf" and confirm any row that
+        // selects a lever by reading the source at that address.
+        if (g_g446CallerTotal > 0)
+        {
+            static G446Bucket craw[32];
+            size_t nC = 0;
+            for (size_t i = 0; i < kG446Slots; ++i)
+            {
+                const G446Bucket &b = g_g446CallerTable[i];
+                if (b.count == 0)
+                    continue;
+                if (nC < 32)
+                    craw[nC++] = b;
+                else
+                {
+                    size_t worst = 0;
+                    for (size_t j = 1; j < 32; ++j)
+                        if (craw[j].count < craw[worst].count)
+                            worst = j;
+                    if (craw[worst].count < b.count)
+                        craw[worst] = b;
+                }
+            }
+            std::sort(craw, craw + nC,
+                      [](const G446Bucket &a, const G446Bucket &b) { return a.count > b.count; });
+            std::fprintf(stderr,
+                         "[G619:rawcaller] outOfExeSamples=%llu (%5.2f%% of all) unattributed=%llu "
+                         "(stack heuristic)\n",
+                         static_cast<unsigned long long>(g_g446CallerTotal),
+                         100.0 * static_cast<double>(g_g446CallerTotal) / denom,
+                         static_cast<unsigned long long>(g_g446CallerNone));
+            for (size_t i = 0; i < nC; ++i)
+            {
+                const uint64_t pref = (g_g446ExeLo != 0 && craw[i].rip >= g_g446ExeLo &&
+                                       craw[i].rip < g_g446ExeHi)
+                                          ? craw[i].rip - g_g446ExeLo + 0x140000000ull
+                                          : 0ull;
+                // 32 SymFromAddr + 32 SymGetLineFromAddr64 total — bounded, unlike g446Report's
+                // per-row full-table scan. FILE:LINE is what makes a row actionable, because the
+                // public-symbol name of a `static` is a fold (G497/G478) and the caller of a CRT
+                // leaf is very often exactly such a static helper.
+                char cname[560];
+                g446Symbolize(craw[i].rip, cname, sizeof(cname));
+                IMAGEHLP_LINE64 line{};
+                line.SizeOfStruct = sizeof(line);
+                DWORD lineDisp = 0;
+                const char *file = "?";
+                unsigned long lineNo = 0ul;
+                if (SymGetLineFromAddr64(GetCurrentProcess(), static_cast<DWORD64>(craw[i].rip),
+                                         &lineDisp, &line) != FALSE &&
+                    line.FileName != nullptr)
+                {
+                    const char *base = std::strrchr(line.FileName, '\\');
+                    file = base ? base + 1 : line.FileName;
+                    lineNo = line.LineNumber;
+                }
+                std::fprintf(stderr, "[G619:eecaller]   %5.2f%% n=%llu pref=0x%llx %s:%lu  %s\n",
+                             100.0 * static_cast<double>(craw[i].count) / denom,
+                             static_cast<unsigned long long>(craw[i].count),
+                             static_cast<unsigned long long>(pref), file, lineNo, cname);
+            }
         }
     }
 
@@ -634,8 +782,13 @@ namespace
                 {
                     ++g_g446CallerTotal;
                     uint64_t caller = 0ull;
+                    // G619: accept only CODE-section qwords (see g_g619CodeLo). Falls back to the
+                    // whole-image window when the section walk failed, so the old behaviour is
+                    // preserved rather than silently disabling the caller table.
+                    const uint64_t lo = (g_g619CodeHi != 0ull) ? g_g619CodeLo : g_g446ExeLo;
+                    const uint64_t hi = (g_g619CodeHi != 0ull) ? g_g619CodeHi : g_g446ExeHi;
                     for (size_t i = 0; i < nStack; ++i)
-                        if (stackWin[i] >= g_g446ExeLo && stackWin[i] < g_g446ExeHi)
+                        if (stackWin[i] >= lo && stackWin[i] < hi)
                         {
                             caller = stackWin[i];
                             break;
@@ -686,6 +839,13 @@ namespace
                 reinterpret_cast<const uint8_t *>(self) + dos->e_lfanew);
             g_g446ExeLo = reinterpret_cast<uint64_t>(self);
             g_g446ExeHi = g_g446ExeLo + nt->OptionalHeader.SizeOfImage;
+            // G619: the executable-code window, for the caller stack scan (see g_g619CodeLo).
+            // BaseOfCode/SizeOfCode is the linker's own answer and needs no section walk.
+            if (nt->OptionalHeader.SizeOfCode != 0u)
+            {
+                g_g619CodeLo = g_g446ExeLo + nt->OptionalHeader.BaseOfCode;
+                g_g619CodeHi = g_g619CodeLo + nt->OptionalHeader.SizeOfCode;
+            }
         }
         HANDLE dup = nullptr;
         if (!DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &dup,

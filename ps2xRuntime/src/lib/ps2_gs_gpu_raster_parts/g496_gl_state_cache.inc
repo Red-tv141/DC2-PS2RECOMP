@@ -171,7 +171,8 @@ enum
     kG496UOriginX = 5,
     kG496UOriginY = 6,
     kG496URoundU = 7,
-    kG496URoundV = 8
+    kG496URoundV = 8,
+    kG496UFlipV = 9 // G624: srcFbp draws sample a V-flipped producer FBO
 };
 
 static G496GlState g_g496Gl;

@@ -2,7 +2,7 @@
 // g607_translated_body.inc, v1). Prices the one term G606 left unmeasured.
 // G606: WIDE offline VU1 executor bench + kick-independence census (g606_wide_vu.inc, v1).
 // Content edit here forces MSBuild to consume the .inc changes (G359).
-// G566: GPU-authoritative VU1 packet publication and one-readback-per-16-kick prototype (v3).
+// Native High-Res Presentation Read Backend v11
 // G587: include transient 0x15d in the explicit raw-alpha two-pass (force .inc recompile v2).
 // G433: blocking colour-readback ceiling probe in lle_gpu_raster_backend.inc
 // (DC2_G433_NO_RB=1 skips only glReadPixels; DC2_G433_RBSTAT=1 times it). Content edit here
@@ -107,6 +107,7 @@ extern std::atomic<uint64_t> g_g604RawAlphaFbpBits[8];
 #include "ps2_gs_gpu_raster_parts/g495_readback_queue_census.inc"
 #include "ps2_gs_gpu_raster_parts/g496_gpu_ballast.inc"
 #include "ps2_gs_gpu_raster_parts/g496_gl_state_cache.inc"
+#include "ps2_gs_gpu_raster_parts/g621_readback_span_census.inc"
 #include "ps2_gs_gpu_raster_parts/lle_gpu_raster_backend.inc"
 #include "ps2_gs_gpu_raster_parts/gpu_raster_bridge_and_stubs.inc"
 // G425: readback-redundancy ceiling census added in lle_gpu_raster_backend.inc (force recompile v1).

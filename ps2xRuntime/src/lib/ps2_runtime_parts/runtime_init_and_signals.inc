@@ -17,8 +17,12 @@ bool PS2Runtime::initialize(const char *title)
 #if defined(PLATFORM_VITA)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
+        const DC2NativeRenderConfig &renderCfg = getDC2NativeRenderConfig();
+        unsigned int windowFlags = FLAG_WINDOW_RESIZABLE;
+        if (renderCfg.isFullscreen)
+            windowFlags |= FLAG_FULLSCREEN_MODE;
+        SetConfigFlags(windowFlags);
+        InitWindow(renderCfg.requestedWidth, renderCfg.requestedHeight, title);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif

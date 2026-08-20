@@ -116,6 +116,57 @@ namespace
     thread_local DispatchHistory g_dispatchHistory;
     thread_local std::unordered_map<PS2Runtime *, uint32_t> g_guestExecutionDepths;
 
+    // ===== G619: the guest-execution depth cell, without the per-dispatch heap round trip =====
+    //
+    // `g_guestExecutionDepths` is consulted on EVERY dispatch-loop iteration (GuestExecutionScope
+    // brackets the recompiled call in PS2Runtime::dispatchLoop) — and `leaveGuestExecution` ERASES
+    // the entry the moment the depth reaches 0, which it does on every balanced enter/leave pair.
+    // So the steady state was: `operator[]` allocates a node, `erase` frees it, once per dispatch,
+    // forever. The G503 EE sampler caught all three halves of that on `dungeon1`:
+    // `operator new` 1.57%, `leaveGuestExecution+0x144` 1.22%, `releaseGuestExecution+0x16e` 0.75%
+    // as callers of out-of-image leaves, with `_Hash<PS2Runtime*,uint32_t>::erase`/`_Try_emplace`
+    // themselves at 0.22%.
+    //
+    // A fixed thread-local slot table removes the allocator from the path entirely. It is EXACT:
+    //   * the map and the slots are never both live for the same (thread, runtime) pair — a slot,
+    //     once assigned, is never released, so the choice is stable for the process;
+    //   * "absent" and "present with depth 0" are already treated identically by all three
+    //     consumers (`it == end() || it->second == 0u`), so retaining a zeroed slot instead of
+    //     erasing the node is not an observable difference;
+    //   * overflow past kSlots falls back to the map, so more runtimes than slots on one thread is
+    //     handled rather than assumed away.
+    // Rollback: DC2_G619_NO_DEPTHSLOTS=1 restores the map on every path.
+    struct G619DepthSlots
+    {
+        static constexpr size_t kSlots = 4;
+        const void *owner[kSlots]{};
+        uint32_t depth[kSlots]{};
+    };
+    thread_local G619DepthSlots g_g619DepthSlots;
+    const bool g_g619NoDepthSlots = (std::getenv("DC2_G619_NO_DEPTHSLOTS") != nullptr);
+
+    // Returns the depth cell for `rt`, or nullptr when the caller must use the map (rollback armed,
+    // slot table full, or `create == false` and no slot has been assigned yet).
+    inline uint32_t *g619DepthCell(const void *rt, bool create)
+    {
+        if (g_g619NoDepthSlots)
+            return nullptr;
+        G619DepthSlots &s = g_g619DepthSlots;
+        for (size_t i = 0; i < G619DepthSlots::kSlots; ++i)
+            if (s.owner[i] == rt)
+                return &s.depth[i];
+        if (!create)
+            return nullptr;
+        for (size_t i = 0; i < G619DepthSlots::kSlots; ++i)
+            if (s.owner[i] == nullptr)
+            {
+                s.owner[i] = rt;
+                s.depth[i] = 0u;
+                return &s.depth[i];
+            }
+        return nullptr; // overflow — the map stays authoritative for this runtime on this thread
+    }
+
     // G58: fine-grained watch on TitleMapDraw's saved-$ra slot (0x1fff800). The title loop
     // dies after one frame because that slot is clobbered (0x2a1b88 -> 0x30003 -> 0x9f84a0)
     // by a callee whose frame overlaps it; the epilogue ld $ra then jr-jumps into data.
@@ -472,7 +523,7 @@ namespace
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+static bool UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
@@ -551,7 +602,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         ++s_g176Skips;
         outWidth = s_g176LastOutWidth;
         outHeight = s_g176LastOutHeight;
-        return;
+        return false;
     }
     ++s_g176Uploads;
 
@@ -568,15 +619,17 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
+        const int blankW = tex.width > 0 ? tex.width : FB_WIDTH;
+        const int blankH = tex.height > 0 ? tex.height : FB_HEIGHT;
+        Image blank = GenImageColor(blankW, blankH, MAGENTA);
         UpdateTexture(tex, blank.data);
         UnloadImage(blank);
-        outWidth = FB_WIDTH;
-        outHeight = DEFAULT_DISPLAY_HEIGHT;
+        outWidth = static_cast<uint32_t>(blankW);
+        outHeight = static_cast<uint32_t>(blankH);
         s_g176LastUploadedGen = g176Gen;
         s_g176LastOutWidth = outWidth;
         s_g176LastOutHeight = outHeight;
-        return;
+        return true;
     }
 
     PS2_IF_AGRESSIVE_LOGS({
@@ -629,33 +682,42 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
-    std::vector<uint8_t> uploadBuffer(DEFAULT_FB_SIZE, 0u);
+    const uint32_t texW = static_cast<uint32_t>(tex.width > 0 ? tex.width : (dc2IsNativeHighResActive() ? dc2GetNativePhysicalDisplayWidth() : FB_WIDTH));
+    const uint32_t texH = static_cast<uint32_t>(tex.height > 0 ? tex.height : (dc2IsNativeHighResActive() ? dc2GetNativePhysicalDisplayHeight() : DEFAULT_DISPLAY_HEIGHT));
+    const size_t uploadSize = static_cast<size_t>(texW) * texH * 4u;
+    std::vector<uint8_t> uploadBuffer(uploadSize, 0u);
     if (!scratch.empty() && width != 0u && height != 0u)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
-        const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
-        const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
-        for (uint32_t y = 0; y < copyHeight; ++y)
+        if (texW == width && texH == height)
         {
-            const size_t srcOffset = static_cast<size_t>(y) * srcRowBytes;
-            const size_t dstOffset = static_cast<size_t>(y) * dstRowBytes;
-            if (srcOffset + copyRowBytes > scratch.size() ||
-                dstOffset + copyRowBytes > uploadBuffer.size())
+            const size_t copyBytes = std::min(scratch.size(), uploadBuffer.size());
+            std::memcpy(uploadBuffer.data(), scratch.data(), copyBytes);
+        }
+        else
+        {
+            for (uint32_t y = 0; y < texH; ++y)
             {
-                break;
+                uint32_t srcY = (y * height) / texH;
+                if (srcY >= height) srcY = height - 1;
+                const uint32_t *srcRow = reinterpret_cast<const uint32_t *>(scratch.data() + static_cast<size_t>(srcY) * width * 4u);
+                uint32_t *dstRow = reinterpret_cast<uint32_t *>(uploadBuffer.data() + static_cast<size_t>(y) * texW * 4u);
+                for (uint32_t x = 0; x < texW; ++x)
+                {
+                    uint32_t srcX = (x * width) / texW;
+                    if (srcX >= width) srcX = width - 1;
+                    dstRow[x] = srcRow[srcX];
+                }
             }
-            std::memcpy(uploadBuffer.data() + dstOffset, scratch.data() + srcOffset, copyRowBytes);
         }
     }
 
     UpdateTexture(tex, uploadBuffer.data());
-    outWidth = width;
-    outHeight = height;
+    outWidth = texW;
+    outHeight = texH;
     s_g176LastUploadedGen = g176Gen;
     s_g176LastOutWidth = outWidth;
     s_g176LastOutHeight = outHeight;
+    return true;
 }
 
 PS2Runtime::PS2Runtime()
