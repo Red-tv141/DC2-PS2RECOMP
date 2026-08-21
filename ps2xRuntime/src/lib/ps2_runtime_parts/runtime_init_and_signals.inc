@@ -425,9 +425,93 @@ static void g186SpBalTrampoline(uint8_t *rdram, R5900Context *ctx, PS2Runtime *r
     }
 }
 
+// G625: monster-script (CRunScript "ext") call census. The monster AI is a byte-code VM
+// whose native commands live in one contiguous address block and are reached ONLY through
+// the indirect call in ext__10CRunScript@0x1870bc, so every one of them passes through
+// lookupFunction. Default-OFF; the enable test is a namespace-scope cached bool (G619 law:
+// a function-local `static const bool` would be a per-access TLS guard on this hot path).
+// The range spans all three VM command tables the fight uses: the MONSTER ext table
+// (0x1E0xxx-0x1E7xxx), the EFFECT-script table (0x27xxxx + 0x2E8xxx) and the player
+// ACTION-script table (0x2CExxx-0x2D1xxx). Non-ext indirect calls inside the range are
+// counted too; they are decoded (and discarded) offline against ref/index.
+static constexpr uint32_t kG625ExtLo = 0x00140000u;
+static constexpr uint32_t kG625ExtHi = 0x002F0000u;
+static const bool g_g625MosTrace = (std::getenv("DC2_G625_MOS") != nullptr);
+static std::atomic<uint32_t> g_g625ExtCount[(kG625ExtHi - kG625ExtLo) / 4u];
+static std::atomic<uint32_t> g_g625ExtTotal{0u};
+extern "C" void g625DumpMonsterExtCensus(unsigned frame)
+{
+    if (!g_g625MosTrace)
+        return;
+    const uint32_t total = g_g625ExtTotal.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "[G625:mosext] frame=%u total=%u\n", frame, total);
+    for (uint32_t i = 0; i < (kG625ExtHi - kG625ExtLo) / 4u; ++i)
+    {
+        const uint32_t c = g_g625ExtCount[i].load(std::memory_order_relaxed);
+        if (c)
+            std::fprintf(stderr, "[G625:mosext] fn=0x%08x n=%u\n", kG625ExtLo + i * 4u, c);
+    }
+}
+
+// G625 clobber hunt: DC2_G625_CLOB=<hex guest address> watches one 32-bit word on every indirect
+// dispatch and, the first time it changes, prints the last 8 dispatched function addresses. The
+// effect-script base headers this is aimed at are written by DIRECT-jal-only code (LoadFile2,
+// mgCMemory::Alloc, ...), which registerFunction cannot hook, so a dispatch-granularity ring is
+// the finest instrument available without touching a header.
+static const uint32_t g_g625ClobAddr = []() -> uint32_t {
+    const char *e = std::getenv("DC2_G625_CLOB");
+    return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 16)) : 0u;
+}();
+static const uint32_t g_g625ClobWant = []() -> uint32_t {
+    const char *e = std::getenv("DC2_G625_CLOB_WANT");
+    return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u;
+}();
+static uint32_t g_g625ClobRing[8] = {0};
+static uint32_t g_g625ClobRingN = 0u;
+static uint32_t g_g625ClobInit = 0u;
+static bool g_g625ClobArmed = false;
+static bool g_g625ClobDone = false;
+
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
+
+    if (g_g625ClobAddr != 0u && !g_g625ClobDone)
+    {
+        if (uint8_t *rd = m_memory.getRDRAM())
+        {
+            uint32_t v;
+            std::memcpy(&v, rd + (g_g625ClobAddr & 0x01FFFFFFu), 4);
+            // Arm only once the word actually HOLDS the expected id (BuildBase has run); before
+            // that the address is unallocated and churns for reasons that are not the defect.
+            if (!g_g625ClobArmed)
+            {
+                if (v == g_g625ClobWant)
+                {
+                    g_g625ClobInit = v;
+                    g_g625ClobArmed = true;
+                }
+            }
+            else if (v != g_g625ClobInit)
+            {
+                g_g625ClobDone = true;
+                std::fprintf(stderr, "[G625:clobpc] addr=0x%x was=0x%x now=0x%x lastDispatch=",
+                             g_g625ClobAddr, g_g625ClobInit, v);
+                for (uint32_t k = 0; k < 8u; ++k)
+                    std::fprintf(stderr, "0x%x,",
+                                 g_g625ClobRing[(g_g625ClobRingN + k) % 8u]);
+                std::fprintf(stderr, "\n");
+            }
+            g_g625ClobRing[g_g625ClobRingN % 8u] = address;
+            ++g_g625ClobRingN;
+        }
+    }
+
+    if (g_g625MosTrace && address >= kG625ExtLo && address < kG625ExtHi)
+    {
+        g_g625ExtCount[(address - kG625ExtLo) / 4u].fetch_add(1, std::memory_order_relaxed);
+        g_g625ExtTotal.fetch_add(1, std::memory_order_relaxed);
+    }
 
     // G58: detect the function that clobbers TitleMapDraw's saved-$ra slot (0x1fff800).
     static const bool s_g58 = (std::getenv("DC2_TRACE_G58") != nullptr);

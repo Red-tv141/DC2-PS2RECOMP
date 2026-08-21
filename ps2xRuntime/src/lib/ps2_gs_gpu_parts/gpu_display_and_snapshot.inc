@@ -54,6 +54,7 @@ void GS::reset()
     }
     // G176: reset clears the snapshot — advance the generation so present re-reads it.
     s_g176LatchGeneration.fetch_add(1ull, std::memory_order_release);
+    g176_notify_frame_latched();
     s_pendingImageBytes = 0u;
     s_f31UploadPresentationCandidate = {};
 
@@ -527,7 +528,11 @@ void GS::latchHostPresentationFrame()
     // change the snapshot. Destructs before the lock_guard releases s_g189HostPresentMutex.
     struct G176LatchBump
     {
-        ~G176LatchBump() { s_g176LatchGeneration.fetch_add(1ull, std::memory_order_release); }
+        ~G176LatchBump()
+        {
+            s_g176LatchGeneration.fetch_add(1ull, std::memory_order_release);
+            g176_notify_frame_latched();
+        }
     } g176Bump;
     (void)g176Bump;
     static const bool s_g397PresentTrace = envFlagEnabled("DC2_G397_PRESENT_TRACE");
@@ -671,6 +676,29 @@ void GS::latchHostPresentationFrame()
     uint32_t height2 = 0u;
     decodeDisplaySize(presentationRegs->display1, width1, height1);
     decodeDisplaySize(presentationRegs->display2, width2, height2);
+
+    static uint32_t s_dispRegLogCount = 0u;
+    if (s_dispRegLogCount++ < 5u)
+    {
+        std::fprintf(stderr, "\n========== [DC2 GS DISPLAY/DISPFB REGISTERS] ==========\n");
+        std::fprintf(stderr, "pmode=0x%llx smode2=0x%llx\n",
+                     static_cast<unsigned long long>(presentationRegs->pmode),
+                     static_cast<unsigned long long>(presentationRegs->smode2));
+        std::fprintf(stderr, "display1=0x%llx -> decoded width=%u, height=%u\n",
+                     static_cast<unsigned long long>(presentationRegs->display1), width1, height1);
+        std::fprintf(stderr, "dispfb1=0x%llx -> fbp=0x%x, fbw=%u, psm=0x%x, dbx=%u, dby=%u\n",
+                     static_cast<unsigned long long>(presentationRegs->dispfb1),
+                     displayFrame1.fbp, displayFrame1.fbw, static_cast<uint32_t>(displayFrame1.psm),
+                     displayOrigin1.x, displayOrigin1.y);
+        std::fprintf(stderr, "display2=0x%llx -> decoded width=%u, height=%u\n",
+                     static_cast<unsigned long long>(presentationRegs->display2), width2, height2);
+        std::fprintf(stderr, "dispfb2=0x%llx -> fbp=0x%x, fbw=%u, psm=0x%x, dbx=%u, dby=%u\n",
+                     static_cast<unsigned long long>(presentationRegs->dispfb2),
+                     displayFrame2.fbp, displayFrame2.fbw, static_cast<uint32_t>(displayFrame2.psm),
+                     displayOrigin2.x, displayOrigin2.y);
+        std::fprintf(stderr, "========================================================\n\n");
+        std::fflush(stderr);
+    }
 
     const bool validCrt1 = pmode.enableCrt1 && hasDisplaySetup(presentationRegs->display1, displayFrame1);
     const bool validCrt2 = pmode.enableCrt2 && hasDisplaySetup(presentationRegs->display2, displayFrame2);
@@ -1006,6 +1034,27 @@ void GS::latchHostPresentationFrame()
         m_hostPresentationUsedPreferred = false;
         m_hasHostPresentationFrame = false;
         return;
+    }
+
+    if (dc2IsNativeHighResActive())
+    {
+        uint32_t nativeW = 0u, nativeH = 0u;
+        std::vector<uint8_t> nativeRgba;
+        const uint32_t targetFbp = validCrt1 ? displayFrame1.fbp : (validCrt2 ? displayFrame2.fbp : 0u);
+        const uint32_t fallbackFbp = (validCrt1 && validCrt2) ? displayFrame2.fbp : (m_preferredDisplaySourceFrame.fbp ? m_preferredDisplaySourceFrame.fbp : 0x139u);
+        if (g178_backend_read_display_fbo(targetFbp, fallbackFbp, nativeW, nativeH, nativeRgba) &&
+            !nativeRgba.empty() && nativeW > 0 && nativeH > 0)
+        {
+            normalizePresentationAlpha(nativeRgba, nativeW, nativeH);
+            m_hostPresentationFrame.swap(nativeRgba);
+            m_hostPresentationWidth = nativeW;
+            m_hostPresentationHeight = nativeH;
+            m_hostPresentationDisplayFbp = targetFbp;
+            m_hostPresentationSourceFbp = targetFbp;
+            m_hostPresentationUsedPreferred = false;
+            m_hasHostPresentationFrame = true;
+            return;
+        }
     }
 
     if (validCrt1 && validCrt2)
@@ -1425,7 +1474,9 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
     outPixels.assign(packedRowBytes * static_cast<size_t>(outHeight), 0u);
     if (outWidth != 0u && outHeight != 0u)
     {
-        const size_t sourceRowBytes = static_cast<size_t>(kHostFrameWidth) * 4u;
+        const size_t sourceRowBytes = (m_hostPresentationWidth > 640u)
+                                          ? (static_cast<size_t>(m_hostPresentationWidth) * 4u)
+                                          : (static_cast<size_t>(kHostFrameWidth) * 4u);
         for (uint32_t y = 0; y < outHeight; ++y)
         {
             const size_t srcOffset = static_cast<size_t>(y) * sourceRowBytes;

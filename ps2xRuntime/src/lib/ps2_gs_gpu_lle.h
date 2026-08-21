@@ -114,3 +114,6 @@ bool g178_backend_write_color(uint32_t fbp, int width, int height, int glY, int 
 // fully inside both; the copy is a bit-exact same-format glCopyTexSubImage2D, no readback.
 bool g280_backend_copy_color_rects(uint32_t srcFbp, uint32_t dstFbp,
                                    const std::vector<int32_t> &rects6);
+// Native High-Res Presentation Read: read the active display FBO directly at its native physical resolution.
+bool g178_backend_read_display_fbo(uint32_t fbp, uint32_t fallbackFbp, uint32_t &outW, uint32_t &outH,
+                                   std::vector<uint8_t> &outRgba);

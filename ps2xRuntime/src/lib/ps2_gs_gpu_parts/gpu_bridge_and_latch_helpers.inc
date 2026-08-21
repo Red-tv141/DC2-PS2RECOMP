@@ -84,6 +84,155 @@ void g289_prepare_presentation_read(uint8_t *vram,
 // DC2_G446_ENVCENSUS=1) — names the getenv caller a PC sampler cannot.
 void g446NoteEnvRead(const char *name);
 
+// Native High-Res presentation bridge
+bool g178_backend_read_display_fbo(uint32_t fbp, uint32_t fallbackFbp, uint32_t &outW, uint32_t &outH,
+                                   std::vector<uint8_t> &outRgba);
+
+struct DC2NativeRenderConfig
+{
+    bool isConfigured = false;
+    bool isNativeHighRes = false;
+    bool isFullscreen = false;
+    int requestedWidth = 0;
+    int requestedHeight = 0;
+    float scaleX = 1.0f;
+    float scaleY = 1.0f;
+};
+
+inline DC2NativeRenderConfig &getDC2NativeRenderConfig()
+{
+    static DC2NativeRenderConfig s_config = []()
+    {
+        DC2NativeRenderConfig cfg{};
+        const char *wEnv = std::getenv("DC2_RESOLUTION_WIDTH");
+        const char *hEnv = std::getenv("DC2_RESOLUTION_HEIGHT");
+        const char *fsEnv = std::getenv("DC2_FULLSCREEN");
+
+        int w = 0, h = 0;
+        if (wEnv && wEnv[0] != '\0')
+            w = std::atoi(wEnv);
+        if (hEnv && hEnv[0] != '\0')
+            h = std::atoi(hEnv);
+
+        cfg.isFullscreen = (fsEnv && fsEnv[0] != '\0' && std::strcmp(fsEnv, "0") != 0);
+
+        if (w > 0 && h > 0 && (w != 512 || h != 448) && (w != 640 || h != 448))
+        {
+            cfg.requestedWidth = w;
+            cfg.requestedHeight = h;
+            cfg.scaleX = static_cast<float>(w) / 640.0f;
+            cfg.scaleY = static_cast<float>(h) / 448.0f;
+            cfg.isNativeHighRes = true;
+        }
+        else if (w > 0 && h > 0)
+        {
+            cfg.requestedWidth = w;
+            cfg.requestedHeight = h;
+            cfg.scaleX = 1.0f;
+            cfg.scaleY = 1.0f;
+            cfg.isNativeHighRes = false;
+        }
+        else
+        {
+            cfg.requestedWidth = 640;
+            cfg.requestedHeight = 448;
+            cfg.scaleX = 1.0f;
+            cfg.scaleY = 1.0f;
+            cfg.isNativeHighRes = false;
+        }
+        cfg.isConfigured = true;
+        return cfg;
+    }();
+    return s_config;
+}
+
+inline bool dc2IsNativeHighResActive()
+{
+    return getDC2NativeRenderConfig().isNativeHighRes;
+}
+
+inline float dc2GetNativeScaleX()
+{
+    return getDC2NativeRenderConfig().scaleX;
+}
+
+inline float dc2GetNativeScaleY()
+{
+    return getDC2NativeRenderConfig().scaleY;
+}
+
+inline int dc2GetNativePhysicalWidth(int logicalW)
+{
+    if (!dc2IsNativeHighResActive() || logicalW <= 0)
+        return logicalW;
+    if (logicalW == 512 || logicalW == 640)
+        return getDC2NativeRenderConfig().requestedWidth;
+    return std::max(1, static_cast<int>(std::round(static_cast<float>(logicalW) * dc2GetNativeScaleX())));
+}
+
+inline int dc2GetNativePhysicalHeight(int logicalH)
+{
+    if (!dc2IsNativeHighResActive() || logicalH <= 0)
+        return logicalH;
+    if (logicalH == 415 || logicalH == 416 || logicalH == 448 || logicalH == 512)
+        return getDC2NativeRenderConfig().requestedHeight;
+    return std::max(1, static_cast<int>(std::round(static_cast<float>(logicalH) * dc2GetNativeScaleY())));
+}
+
+inline int dc2GetNativePhysicalDisplayWidth()
+{
+    if (!dc2IsNativeHighResActive())
+        return 640;
+    return getDC2NativeRenderConfig().requestedWidth;
+}
+
+inline int dc2GetNativePhysicalDisplayHeight()
+{
+    if (!dc2IsNativeHighResActive())
+        return 448;
+    return getDC2NativeRenderConfig().requestedHeight;
+}
+
+inline int dc2GetNativePhysicalDisplayStorageHeight()
+{
+    if (!dc2IsNativeHighResActive())
+        return 448;
+    return getDC2NativeRenderConfig().requestedHeight;
+}
+
+inline bool dc2NativeResDiagOn()
+{
+    static const bool s_diag = (std::getenv("DC2_NATIVE_RES_DIAG") != nullptr);
+    return s_diag;
+}
+
+inline bool dc2NativeMainOnlyOn()
+{
+    static const bool s_mainOnly = (std::getenv("DC2_NATIVE_MAIN_ONLY") != nullptr);
+    return s_mainOnly;
+}
+
+inline bool dc2NativeDisableRttOn()
+{
+    static const bool s_noRtt = (std::getenv("DC2_NATIVE_DISABLE_RTT") != nullptr);
+    return s_noRtt;
+}
+
+inline bool dc2NativeDisableFbCopyScaleOn()
+{
+    static const bool s_noFbCopy = (std::getenv("DC2_NATIVE_DISABLE_FB_COPY_SCALE") != nullptr);
+    return s_noFbCopy;
+}
+
+inline int dc2DrawLimit()
+{
+    static const int s_limit = []() {
+        const char *v = std::getenv("DC2_DRAW_LIMIT");
+        return v ? std::atoi(v) : -1;
+    }();
+    return s_limit;
+}
+
 namespace
 {
     bool g146PerfEnabled()
@@ -868,9 +1017,12 @@ namespace
         }
         G440LatchScope g440(kG440SlotAlpha);
 
+        // Use actual width for row stride: for native high-res GPU path the frame
+        // is wider than kHostFrameWidth; the CRT merge fallback still uses kHostFrameWidth.
+        const size_t rowStride = (width > kHostFrameWidth) ? (static_cast<size_t>(width) * 4u) : (static_cast<size_t>(kHostFrameWidth) * 4u);
         for (uint32_t y = 0; y < height; ++y)
         {
-            uint8_t *row = pixels.data() + (y * kHostFrameWidth * 4u);
+            uint8_t *row = pixels.data() + (y * rowStride);
             for (uint32_t x = 0; x < width; ++x)
             {
                 row[x * 4u + 3u] = 255u;
@@ -1467,6 +1619,8 @@ void g124_note_stream(uint32_t sizeBytes)
 // reader racing an in-progress latch at worst re-uploads one duplicate frame, never misses one).
 // File-static + extern accessor — same no-header idiom as g150_*/g175_*.
 static std::atomic<uint64_t> s_g176LatchGeneration{0ull};
+static std::condition_variable s_g176LatchCv;
+static std::mutex s_g176LatchCvMutex;
 
 // G189 (2026-07-10): a DEDICATED mutex for the published host-presentation snapshot
 // (m_hostPresentationFrame + its w/h/fbp/preferred fields + m_hasHostPresentationFrame),
@@ -1492,6 +1646,24 @@ static std::mutex s_g189HostPresentMutex;
 uint64_t g176_present_latch_generation()
 {
     return s_g176LatchGeneration.load(std::memory_order_acquire);
+}
+
+void g176_notify_frame_latched()
+{
+    std::lock_guard<std::mutex> lk(s_g176LatchCvMutex);
+    s_g176LatchCv.notify_all();
+}
+
+bool g176_wait_frame_latched(uint64_t lastGen, uint32_t timeoutMs)
+{
+    if (s_g176LatchGeneration.load(std::memory_order_acquire) != lastGen)
+    {
+        return true;
+    }
+    std::unique_lock<std::mutex> lk(s_g176LatchCvMutex);
+    return s_g176LatchCv.wait_for(lk, std::chrono::milliseconds(timeoutMs), [lastGen] {
+        return s_g176LatchGeneration.load(std::memory_order_acquire) != lastGen;
+    });
 }
 
 GS::GS()

@@ -4,6 +4,7 @@
 #include "ps2_stubs.h"
 #include "ps2_syscalls.h"
 #include "ps2_log.h"
+#include "ps2_runtime_parts/dc2_logger.inc"
 #include <algorithm>
 #include <array>
 #include <cctype>
@@ -153,7 +154,7 @@ namespace ps2_game_overrides
     {
         if (!descriptor.apply)
         {
-            std::cerr << "[game_overrides] ignoring descriptor with null apply callback." << std::endl;
+            LOG_WARN(GameOverride, "Ignoring descriptor with null apply callback.");
             return;
         }
 
@@ -166,11 +167,16 @@ namespace ps2_game_overrides
         const auto resolved = resolveHandlerByName(handlerName);
         if (!resolved.has_value())
         {
-            std::cerr << "[game_overrides] unresolved handler '" << handlerName
-                      << "' for address 0x" << std::hex << address << std::dec << std::endl;
+            dc2_log::recordOverrideRegistration(address, handlerName, false);
+            if (dc2_log::shouldLogUnresolvedCall(address))
+            {
+                LOG_DEBUG(GameOverride, "Unresolved handler '%.*s' for address 0x%08X",
+                          static_cast<int>(handlerName.size()), handlerName.data(), address);
+            }
             return false;
         }
 
+        dc2_log::recordOverrideRegistration(address, handlerName, true);
         runtime.registerFunction(address, resolved.value());
         return true;
     }
@@ -227,7 +233,7 @@ namespace ps2_game_overrides
                     fileCrcValid = computeFileCrc32(elfPath, fileCrc32);
                     if (!fileCrcValid)
                     {
-                        std::cerr << "[game_overrides] failed to compute CRC32 for '" << elfPath << "'" << std::endl;
+                        LOG_WARN(GameOverride, "Failed to compute CRC32 for '%s'", elfPath.c_str());
                     }
                 }
 
@@ -240,14 +246,15 @@ namespace ps2_game_overrides
             const char *name = (descriptor.name && descriptor.name[0] != '\0')
                                    ? descriptor.name
                                    : "unnamed";
-            RUNTIME_LOG("[game_overrides] applying '" << name << "'");
+            LOG_INFO(GameOverride, "Applying '%s'", name);
             descriptor.apply(runtime);
             ++appliedCount;
         }
 
         if (appliedCount > 0)
         {
-            RUNTIME_LOG("[game_overrides] applied " << appliedCount << " matching override(s).");
+            LOG_INFO(GameOverride, "Applied %zu matching override(s).", appliedCount);
+            dc2_log::logOverrideSummary();
         }
     }
 }

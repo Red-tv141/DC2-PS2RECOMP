@@ -16,6 +16,11 @@ extern void g144FlushPendingUploadRange(uint32_t dbp,
 // G522: fail-safe replay of the local->local guest-VRAM publication that the range barrier skipped
 // on the promise of an FBO->FBO blit. A no-op unless that edge skipped AND the blit was not taken.
 extern void g144L2lLatePin();
+// G627: reconcile the l2l destination bytes the CPU pixel body just wrote into guest VRAM back into
+// the resident CT32 surface with a per-byte-lane masked patch. Armed only when the same edge took
+// that surface's publication off the dependency pin; a no-op otherwise.
+extern void g627ApplyPendingL2lPatch(uint8_t *vram, uint32_t vramSize);
+extern void g627DiscardPendingL2lPatch();
 extern void g144FlushPendingLocalTransferRange(uint32_t sbp,
                                                uint8_t sbw,
                                                uint8_t spsm,
@@ -231,6 +236,7 @@ void GS::performLocalToLocalTransfer()
     {
         if (g432L2lArmed)
             ++s_g432LGpuTaken;
+        g627DiscardPendingL2lPatch(); // no CPU copy ran, so no VRAM bytes to reconcile
         return; // exact logical write is versioned in fbp=0x13b's FBO
     }
 
@@ -374,6 +380,10 @@ void GS::performLocalToLocalTransfer()
         }
     }
     } // G432 body scope
+
+    // G627: guest VRAM now holds the copy's destination bytes. Reconcile exactly those byte lanes
+    // into the resident CT32 surface, which is why this edge was allowed to skip publishing it.
+    g627ApplyPendingL2lPatch(m_vram, m_vramSize);
 
     if (s_g285StatOn)
     {
@@ -1380,6 +1390,13 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
     {
         g289NoteUploadComplete(dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
         g314NoteImageComplete(dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        // G630: the guest IMAGE is now complete. Queue its exact CT32 pixels behind the producer
+        // in the raw-VRAM FIFO; no CPU publication or shared-queue wait is needed.
+        extern void (*g_g630UploadCompleteHook)(uint8_t *, uint32_t, uint32_t, uint32_t,
+                                                uint32_t, uint32_t, uint32_t, uint32_t);
+        if (g_g630UploadCompleteHook != nullptr)
+            g_g630UploadCompleteHook(m_vram, dbp, dbw, dpsm,
+                                     dsax, dsay, rrw, rrh);
     }
     if (s_g313Census)
     {
