@@ -221,6 +221,14 @@ extern void sndStep__Ff_0x18d650(uint8_t* rdram, R5900Context* ctx, PS2Runtime* 
 extern void StepSnd__6CSceneFv_0x2a7940(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void TitleDraw__Fv_0x2a0ab0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void GetPoly__8CEditMapFiP6CCPolyR9mgVu0FBOXi_0x1b0780(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+// G625: monster script _ESM_CREATE (the projectile-effect spawn command).
+extern void ps2__ESM_CREATE__FP12RS_STACKDATAi_0x1e6620(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void ps2__SET_DMG2__FP12RS_STACKDATAi_0x1e32f0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void ps2__SET_MOS__FP12RS_STACKDATAi_0x1e5f20(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CreateEffSpt__16CEffectScriptManFPcii_0x2e1260(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CreateEffSpt__16CEffectScriptManFiii_0x2e0d60(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void BuildBase__16CEffectScriptManFiP1iP1iP9mgCMemoryi_0x2e0420(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void ezTransToIOP2__FPvPvi_0x18b310(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 // G363: real SetCurrentDir body (wrapped by the DC2_G363_PATHTRACE probe).
 extern void SetCurrentDir__FPc_0x148760(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void Step__14CCameraControlFi_0x2ec110(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -530,6 +538,9 @@ namespace
 #include "dc2_game_override_parts/dungeon_runtime.inc"
 
 #include "dc2_game_override_parts/title_draw_runtime.inc"
+// G625: monster projectile / damage-path probes (default off). Must precede
+// frame_end_and_core_helpers.inc, whose per-frame [G625:hp] line reads g625_active_colprims().
+#include "dc2_game_override_parts/g625_monster_ai_probes.inc"
 // G412 force-recompile marker: frame_end captures immutable PCRTC state for depth-two MTGS.
 #include "dc2_game_override_parts/frame_end_and_core_helpers.inc"
 #include "dc2_game_override_parts/g363_spheda_probes.inc"

@@ -299,6 +299,13 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     }
     // PHASE F41: title_mode_key_stub retired. Real TitleModeKey__Fv at 0x002A1220
     // now runs via register_functions.cpp. F40 pad injection drives confirm via R1.
+    runtime.registerFunction(0x001E6620u, g625_esm_create_probe);    // G625: monster _ESM_CREATE
+    runtime.registerFunction(0x0018B310u, g625_eztrans_probe);        // G625: EE->IOP audio transfer source range
+    runtime.registerFunction(0x002E0420u, g625_buildbase_probe);      // G625: effect-script base build
+    runtime.registerFunction(0x002E0D60u, g625_create_effspt_i_probe); // G625: effect-script instance alloc/link
+    runtime.registerFunction(0x002E1260u, g625_create_effspt_probe); // G625: effect-script instance mint (name + accept/reject)
+    runtime.registerFunction(0x001E5F20u, g625_set_mos_probe);       // G625: monster motion frame vs damage windows
+    runtime.registerFunction(0x001E32F0u, g625_set_dmg2_probe);      // G625: monster _SET_DMG2 -> EntryDamage2 accept/reject
     runtime.registerFunction(0x001B0780u, g224_getpoly_probe);       // G224: camera-poly query result (DngMainKey camera block reach + fail signal)
     runtime.registerFunction(0x002EC110u, g224_camctl_step_probe);   // G224: scene camera Step (nextPos->pos commit) reach probe
     runtime.registerFunction(0x00131990u, g224_setfollow_probe);     // G224: follow-target value probe

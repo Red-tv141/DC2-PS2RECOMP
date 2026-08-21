@@ -1,3 +1,7 @@
+// G625: defined in ps2_runtime_parts/runtime_init_and_signals.inc (the monster-script ext census
+// lives beside lookupFunction, the only path those VM commands are reached through).
+extern "C" void g625DumpMonsterExtCensus(unsigned frame);
+
 // ===================== G598: SCRIPT-FRAME-KEYED FRAME CAPTURE (DEFAULT OFF) =====================
 //
 // ⛔ THE SHIPPED FRAME DUMP IS KEYED ON THE HOST PRESENT TICK, WHICH IS NOT A SCRIPT CLOCK.
@@ -755,6 +759,36 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
     g570_observe_frame(rdram, n, scriptFrame, loopNo);
     g202_update_town_depth_scope(rdram, n, scriptFrame, loopNo);
     dc2_apply_60fps_patch(rdram);
+    // G625: player HP observable + monster-script ext census dump. HP lives at
+    // GetSaveData()(gp-0x750c) + 0x1d2a0 (CUserDataManager) + 0x3f48 (chara 0 COMMON_GAGE)
+    // + 4 (the float `now` field GetHp reads). Full HP on this route is 32.0, so the
+    // enemy-projectile repro is "hp < 32". Default-off: DC2_G625_HP=1 / DC2_G625_MOS=1.
+    {
+        static const bool g625Hp = dc2_env_flag_enabled("DC2_G625_HP");
+        static const bool g625Mos = dc2_env_flag_enabled("DC2_G625_MOS");
+        if (g625Mos || g625Hp)
+            g625_watch_bases(rdram, n);
+        if ((g625Hp || g625Mos) && (n % 60u) == 0u)
+        {
+            const uint32_t save = dc2_read_u32(rdram, 0x00376FE4u);
+            float hp = -1.f, hpMax = -1.f;
+            if (save > 0x80000u && save < 0x2000000u)
+            {
+                hp = dc2_read_f32(rdram, save + 0x1D2A0u + 0x3F48u + 4u);
+                hpMax = dc2_read_f32(rdram, save + 0x1D2A0u + 0x3F48u);
+            }
+            if (g625Hp)
+                std::fprintf(stderr,
+                             "[G625:hp] n=%u sf=%u loop=%u hp=%.1f/%.1f colprims=%u eff(scene=%u "
+                             "mons=%u) badBases=%u\n",
+                             n, scriptFrame, loopNo, hp, hpMax, g625_active_colprims(rdram),
+                             g625_eff_count(rdram, dc2_read_u32(rdram, 0x003783BCu)),
+                             g625_eff_count(rdram, g625_monster_eff_man(rdram)),
+                             g625_bases_bad(rdram));
+            if (g625Mos && (n % 600u) == 0u)
+                g625DumpMonsterExtCensus(n);
+        }
+    }
     // G361 bisect aid: per-N-frame player world position + map number, so the
     // "__sinit_mainloop moves the MAP-0 spawn" regression can be measured as
     // numbers instead of screenshots. Default-off: DC2_G361_POS=1.
