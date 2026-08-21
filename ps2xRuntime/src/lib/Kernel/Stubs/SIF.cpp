@@ -328,8 +328,77 @@ namespace ps2_stubs
             return true;
         }
 
+        // G625: THE SYNTHETIC IOP HEAP MUST NOT ALIAS EE RAM.
+        //
+        // sceSifAllocIopHeap hands out "IOP addresses" from kIopHeapBase..kIopHeapLimit
+        // (0x01A00000..0x01F00000), and every EE->IOP SIF DMA then memcpy'd its payload to that
+        // address INSIDE EE RDRAM. On Dark Cloud 2 that window is live game memory: the dungeon /
+        // monster heap allocates straight through it, so an audio bank transfer of up to 0x3C4F0
+        // bytes to dest=0x01A00000 overwrote whatever the guest had there.
+        //
+        // Measured consequence on `dungeon1`: the four MONSTER effect-script base headers
+        // (ids 106, 107, 44, 39 at 0x1A02CC0 / 0x1A0FFC0 / 0x1A192C0 / 0x1A25FC0) were built
+        // correctly and then destroyed at guest frame 228 by the bank transfer. Base 44 is the
+        // Man-Eating Grass's poison spit, so every later CreateEffSpt("毒液2L") failed its
+        // base lookup, no projectile effect instance existed, its script never ran
+        // _COLPRIM_CREATE, and CheckDamage's CheckHit found zero live CColPrims -- the player
+        // could not be damaged by anything for the whole run.
+        //
+        // The IOP side is a sink here (the audio path captures from xfer.src, never from the IOP
+        // copy), but backing the window with its own store rather than dropping the write keeps
+        // IOP-addressed reads coherent. Rollback: DC2_G625_LEGACY_IOPHEAP=1.
+        std::vector<uint8_t> g_g625IopShadow;
+        const bool g_g625LegacyIopHeap = (std::getenv("DC2_G625_LEGACY_IOPHEAP") != nullptr);
+
+        uint8_t *g625IopShadowPtr(uint32_t addr, uint32_t sizeBytes)
+        {
+            if (g_g625LegacyIopHeap || sizeBytes == 0u)
+            {
+                return nullptr;
+            }
+            const uint32_t a = addr & 0x1FFFFFFFu;
+            if (a < kIopHeapBase || a >= kIopHeapLimit)
+            {
+                return nullptr;
+            }
+            if (static_cast<uint64_t>(a) + sizeBytes > kIopHeapLimit)
+            {
+                return nullptr;
+            }
+            if (g_g625IopShadow.empty())
+            {
+                g_g625IopShadow.assign(kIopHeapLimit - kIopHeapBase, 0u);
+            }
+            return g_g625IopShadow.data() + (a - kIopHeapBase);
+        }
+
         bool copyGuestByteRange(uint8_t *rdram, uint32_t dstAddr, uint32_t srcAddr, uint32_t sizeBytes)
         {
+            if (sizeBytes != 0u)
+            {
+                uint8_t *dstShadow = g625IopShadowPtr(dstAddr, sizeBytes);
+                const uint8_t *srcShadow = g625IopShadowPtr(srcAddr, sizeBytes);
+                if (dstShadow != nullptr || srcShadow != nullptr)
+                {
+                    if (!rdram)
+                    {
+                        return false;
+                    }
+                    for (uint32_t i = 0u; i < sizeBytes; ++i)
+                    {
+                        const uint8_t *src = srcShadow ? (srcShadow + i)
+                                                       : getConstMemPtr(rdram, srcAddr + i);
+                        uint8_t *dst = dstShadow ? (dstShadow + i) : getMemPtr(rdram, dstAddr + i);
+                        if (!src || !dst)
+                        {
+                            return false;
+                        }
+                        *dst = *src;
+                    }
+                    return true;
+                }
+            }
+
             if (!canCopyGuestByteRange(rdram, dstAddr, srcAddr, sizeBytes))
             {
                 return false;
@@ -759,6 +828,34 @@ namespace ps2_stubs
                     break;
                 }
 
+                // G625: the SIF "IOP heap" is a window carved out of EE RDRAM (kIopHeapBase
+                // 0x01A00000), which is live game memory on this title. Report any transfer whose
+                // DESTINATION lands there, since that memcpy overwrites whatever the guest itself
+                // allocated at the same address. Default-off: DC2_G625_SIF=1.
+                {
+                    static const bool s_g625Sif = (std::getenv("DC2_G625_SIF") != nullptr);
+                    if (s_g625Sif)
+                    {
+                        const uint32_t d = xfer.dest & 0x01FFFFFFu;
+                        const uint32_t s = xfer.src & 0x01FFFFFFu;
+                        const uint32_t n = static_cast<uint32_t>(xfer.size);
+                        const bool dstInIopWindow = (d + n > 0x01A00000u) && (d < 0x01F00000u);
+                        const bool srcInIopWindow = (s + n > 0x01A00000u) && (s < 0x01F00000u);
+                        if (dstInIopWindow || srcInIopWindow)
+                        {
+                            static uint32_t s_n = 0u;
+                            if (s_n < 64u)
+                            {
+                                ++s_n;
+                                std::fprintf(stderr,
+                                             "[G625:sif] n=%u src=0x%x dest=0x%x size=0x%x "
+                                             "dstInIopWindow=%d srcInIopWindow=%d\n",
+                                             s_n, xfer.src, xfer.dest, n,
+                                             dstInIopWindow ? 1 : 0, srcInIopWindow ? 1 : 0);
+                            }
+                        }
+                    }
+                }
                 g385TraceAndDumpAudioDma(rdram, dmatAddr, xfer);
                 if ((dmatAddr & 0x1FFFFFFFu) == kG385AudioDmaDescriptor)
                 {

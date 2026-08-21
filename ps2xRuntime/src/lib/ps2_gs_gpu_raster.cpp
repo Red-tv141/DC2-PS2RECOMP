@@ -1,3 +1,4 @@
+// G630: persistent raw-VRAM stream with separately clocked GPU job classes (force rebuild v2).
 // G607: TRANSLATED VU1 kernel throughput CEILING bench (g607_tbench.inc + the generated
 // g607_translated_body.inc, v1). Prices the one term G606 left unmeasured.
 // G606: WIDE offline VU1 executor bench + kick-independence census (g606_wide_vu.inc, v1).
@@ -50,6 +51,7 @@
 // The instrument contract lives in ps2_gs_rasterizer_parts/g419_ab_instrument.inc.
 
 #include "ps2_gs_gpu_lle.h" // G178: private front-end<->backend interface (both build branches)
+#include "ps2_gs_g630_packet.inc"
 
 #if defined(_WIN32) && !defined(PLATFORM_VITA)
 
@@ -155,6 +157,21 @@ bool g570_backend_shadow139(const std::vector<uint32_t> &, const std::vector<uin
                             const std::vector<uint32_t> &, const std::vector<uint32_t> &,
                             const std::vector<uint32_t> &, const std::vector<uint32_t> &,
                             std::vector<uint32_t> &) { return false; }
+// G629: the no-GPU build's stub. Returning false is the fail-closed answer — the front-end then
+// runs the untouched CPU band replay, exactly as it does when the backend is unavailable at
+// runtime.
+bool g629_backend_replay(const std::vector<uint32_t> &, const std::vector<uint32_t> &,
+                         const std::vector<uint32_t> &, const std::vector<uint32_t> &,
+                         const std::vector<uint32_t> &, std::vector<uint32_t> &,
+                         std::vector<uint32_t> &, int, int, int, int, int, int, bool)
+{ return false; }
+bool g630_backend_submit(const std::shared_ptr<G630ReplayPacket> &) { return false; }
+bool g630_backend_prepare_ct32_view(const std::shared_ptr<G630ViewPacket> &) { return false; }
+bool g630_backend_submit_upload(const std::shared_ptr<G630UploadPacket> &) { return false; }
+bool g630_backend_prepare_t8_view(const std::shared_ptr<G630T8Packet> &) { return false; }
+bool g630_backend_poll(bool, std::vector<uint8_t> &out) { out.clear(); return false; }
+bool g630_backend_read_vram(std::vector<uint32_t> &) { return false; }
+bool g630_backend_read_depth(std::vector<uint32_t> &) { return false; }
 bool g541_backend_null_compute() { return false; }
 bool g545_backend_live_submit(std::vector<uint8_t> &&) { return false; }
 bool g566_backend_authority_submit(
@@ -171,6 +188,9 @@ bool g178_backend_read_color(uint32_t, int, int, int, int, std::vector<uint32_t>
 bool g178_backend_write_color(uint32_t, int, int, int, int, const std::vector<uint32_t> &) { return false; }
 bool g264_backend_write_color_rect(uint32_t, int, int, int, int, int, int,
                                    const std::vector<uint32_t> &) { return false; }
+bool g627_backend_write_color_rect_masked(uint32_t, int, int, int, int, int, int,
+                                          const std::vector<uint32_t> &,
+                                          const std::vector<uint32_t> &) { return false; }
 bool g280_backend_copy_color_rects(uint32_t, uint32_t, const std::vector<int32_t> &) { return false; }
 bool g309_backend_build_authoritative_composite(
     const std::vector<uint32_t> &, const std::vector<uint32_t> &,

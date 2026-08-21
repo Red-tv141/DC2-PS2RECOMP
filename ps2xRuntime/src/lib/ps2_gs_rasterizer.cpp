@@ -1,3 +1,4 @@
+// G630: large-view source attribution for the remaining residency break (force rebuild v9).
 // G612: this TU gains only the `vureg` A/B arm in g419_ab_instrument.inc (the native VU1 REGION
 // backend lives in the VU1 TU), so this content edit is what forces MSBuild to consume the .inc
 // (G359). revision: 1
@@ -236,6 +237,11 @@ bool g589MemoEnsureAtlas(bool (*real)());
 // Content edit here forces MSBuild to consume both .inc files (G359). revision: 1
 
 #include <deque>
+#include "ps2_gs_g630_packet.inc"
+
+// G630: installed by the internal residency domain and called after a complete CT32 IMAGE upload.
+void (*g_g630UploadCompleteHook)(uint8_t *, uint32_t, uint32_t, uint32_t,
+                                 uint32_t, uint32_t, uint32_t, uint32_t) = nullptr;
 
 // G599: the SCRIPT clock (defined in ps2_memory.cpp, written once per guest frame by the mgEndFrame
 // override). The MAP-15 sky defect occupies scriptFrames ~1958..2440 and its consumer is ~0.06% of
@@ -438,8 +444,18 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // bind decision in the pre-pass, the unconsidered-population census in the texture pass, and the
 // oracle at the decode.
 #include "ps2_gs_rasterizer_parts/g623_producer_surface.inc"
+// G630 reuses G623's exact tap-window proof, so it follows that unit and precedes every
+// materialization/texture-consumer call site it extends.
+#include "ps2_gs_rasterizer_parts/g630_gpu_domain.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_vram_materialization.inc"
+
+// G627 revision: 1 — PSMT8-in-CT32 local-transfer destinations without the destination-triggered
+// readback. MUST follow rasterizer_vram_materialization.inc (it uses g264InvPage's probed CT32 page
+// inverse, G261Res / g_g261Res / kG261Fbp and G264's mirror residency contract) and MUST precede
+// rasterizer_draw_sprite.inc, which holds its only call site inside
+// g144FlushPendingLocalTransferRange. Content edit here forces MSBuild to consume the .inc (G359).
+#include "ps2_gs_rasterizer_parts/g627_psmt8_lane_mirror.inc"
 
 
 // G592 revision: 1 — the private-mirror PUBLICATION's consumer test (the READ half of the
@@ -480,6 +496,15 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // OF GSRasterizer::drawPrimitive's BODY and cannot contain a namespace. Content edit forces MSBuild
 // to consume it (G359).
 #include "ps2_gs_rasterizer_parts/g603_admission_census.inc"
+
+// G629 revision: 1 — the GPU-RESIDENT BAND REPLAY admission census (default-off, DC2_G629_STAT=1).
+// Same placement constraints as G603/G529: it needs G144Entry + g528ClassifyFbp/kG528ClsName
+// (g528_flush_publish.inc) + g203UniversalZEnabled/g404SharedZScope/kG403DisplayZ*
+// (rasterizer_clipping_and_tex_checks.inc) + tex1UsesLinearFilter (rasterizer_row_pool.inc), and it
+// MUST precede rasterizer_tilebin_capture.inc, whose post-pool site is its only call site. It sits
+// BEFORE rasterizer_setup_and_perf_census.inc, which is a FRAGMENT OF drawPrimitive's BODY and
+// cannot contain a namespace.
+#include "ps2_gs_rasterizer_parts/g629_gpu_band_replay.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_setup_and_perf_census.inc"
 
@@ -533,6 +558,15 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // leaves, g605CommitWord and G605Blend) and g530_sprite_span.inc (G530RowAddr/g530GroupBase), and
 // must precede rasterizer_draw_triangle.inc, which is a FRAGMENT of the member function body.
 #include "ps2_gs_rasterizer_parts/g609_tri_scan.inc"
+
+// G629 revision: 1 — the GPU-resident batched replay's MARSHALLING side (default-off,
+// DC2_G629_GPU=1; oracle DC2_G629_VERIFY=1). Split from g629_gpu_band_replay.inc (which holds the
+// admission census and must precede rasterizer_tilebin_capture.inc, the call site) because the
+// marshalling needs g605BuildBlend/G605Blend (g605_tri_span.inc), g403DisplayZBuf and the CT32 row
+// helpers — all of which are defined AFTER that point. The entry points are forward-declared there
+// and defined here, in the same anonymous namespace and the same TU, exactly as
+// g529_replay_dispatch.inc already forward-declares the G570/G580 batch functions.
+#include "ps2_gs_rasterizer_parts/g629_gpu_kernel.inc"
 
 // G614 revision: 1 — the SPRITE twin of G609's stage decomposition. `dungeon1` (G613) is 99.8%
 // sprites and 67.04% of its replay cycles are ONE PSMT8/bilinear `discov sprite` shape family, so
