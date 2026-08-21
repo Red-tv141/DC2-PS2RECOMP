@@ -84,6 +84,19 @@
 //   DC2_G609_VERIFY=1      the same-run row oracle (implies the lever; NEVER in a timing run)
 //   DC2_G609_STAT=1        `[G609:scan]` coverage + rejection census
 //   DC2_G609_NO_COMBINE=1  keep the real `combineTexture` CALL inside the kernel
+//
+// ⭐⭐⭐ G628 REVISION — THE `tme=0` INSTANTIATION (Target J).
+// `g609TriScanRowT` gains `TEXTURED` as its FIRST template parameter. With `TEXTURED == false` the
+// sampler call, the bilinear quad memo, the CLUT indirection, the STQ/UV interpolation and
+// `combineTexture` are ABSENT from the instantiation — not skipped by a runtime branch — and the
+// Gouraud shade goes straight to the fog lerp and `g605CommitWord`. That is exactly what the
+// generic loop's own untextured arm does (`rasterizer_draw_triangle.inc:2652..2666` then :3033), so
+// the lowering is a DELETION licensed by the admission, never a rewrite
+// (`g605_lowering_is_exact_by_construction`). Coverage, the barycentrics, the Z interpolation and
+// test, the fog lerp and the commit are the SAME statements the textured instantiation ships.
+//   ⚠️ A TEMPLATE parameter, not a runtime bool, for the same reason slice B used one: a runtime
+//   switch would leave the sampler body in the untextured arm's register allocation and prologue
+//   (`g602_prologue_is_set_by_the_coldest_code`), which is the entire mechanism being bought.
 
 namespace
 {
@@ -232,6 +245,16 @@ static std::atomic<uint32_t> g_g609CeilSink{0}; // ⛔ ceiling probe 4's observa
 // misses/inside is the multiplier on whatever one tap costs, and it is the number that decides
 // whether the next lever is "make a tap cheaper" or "miss less often".
 static std::atomic<uint64_t> g_g609QuadMiss{0};
+// ⭐⭐ G628: the UNTEXTURED instantiation's OWN denominators. A pooled row/px/oracle count cannot
+// serve as this leaf's divergence proof or as its `bad=0` denominator — the textured population is
+// live and identical in BOTH arms of the G628 A/B, so a pooled `bad=0` would be dominated by pixels
+// the untextured kernel never touched (`g589_oracle_with_zero_checks`: `bad=0` on the WRONG
+// population is the same failure as `bad=0` with `checks=0`).
+static std::atomic<uint64_t> g_g609UntexRows{0};
+static std::atomic<uint64_t> g_g609UntexInside{0};
+static std::atomic<uint64_t> g_g609UntexPx{0};
+static std::atomic<uint64_t> g_g609UntexChecks{0};
+static std::atomic<uint64_t> g_g609UntexBad{0};
 
 __declspec(noinline) static void g609DumpScanCensus()
 {
@@ -243,7 +266,9 @@ __declspec(noinline) static void g609DumpScanCensus()
                  "[G609:scan] rows=%llu offered=%llu noBounds=%llu inside=%llu px=%llu "
                  "walked=%llu draws=%llu rowsPerDraw=%.2f walkedPerRow=%.2f insidePerRow=%.2f "
                  "inside/walked=%.3f quadMiss=%llu missPerInside=%.3f "
-                 "sampInlRows=%llu checks=%llu bad=%llu mode=%s\n",
+                 "sampInlRows=%llu checks=%llu bad=%llu "
+                 "untexRows=%llu untexInside=%llu untexPx=%llu untexChecks=%llu untexBad=%llu "
+                 "mode=%s\n",
                  (unsigned long long)rows,
                  (unsigned long long)g_g609Calls.load(std::memory_order_relaxed),
                  (unsigned long long)g_g609RowsNoBounds.load(std::memory_order_relaxed),
@@ -260,6 +285,11 @@ __declspec(noinline) static void g609DumpScanCensus()
                  (unsigned long long)g_g609SampInlRows.load(std::memory_order_relaxed),
                  (unsigned long long)g_g609Checks.load(std::memory_order_relaxed),
                  (unsigned long long)g_g609Bad.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g609UntexRows.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g609UntexInside.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g609UntexPx.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g609UntexChecks.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g609UntexBad.load(std::memory_order_relaxed),
                  g609TriScanVerifyOn() ? "verify" : "live");
 }
 
@@ -270,7 +300,7 @@ inline void g609NoteScanDraw()
 }
 
 inline void g609NoteScanRow(uint64_t inside, uint64_t px, bool bounded,
-                            uint64_t walked = 0u, bool sampInl = false)
+                            uint64_t walked = 0u, bool sampInl = false, bool untex = false)
 {
     if (!g609TriScanStatOn())
         return;
@@ -281,6 +311,12 @@ inline void g609NoteScanRow(uint64_t inside, uint64_t px, bool bounded,
         g_g609RowsNoBounds.fetch_add(1u, std::memory_order_relaxed);
     if (sampInl)
         g_g609SampInlRows.fetch_add(1u, std::memory_order_relaxed);
+    if (untex && bounded)
+    {
+        g_g609UntexRows.fetch_add(1u, std::memory_order_relaxed);
+        g_g609UntexInside.fetch_add(inside, std::memory_order_relaxed);
+        g_g609UntexPx.fetch_add(px, std::memory_order_relaxed);
+    }
     g_g609Inside.fetch_add(inside, std::memory_order_relaxed);
     g_g609Px.fetch_add(px, std::memory_order_relaxed);
     g_g609Walked.fetch_add(walked, std::memory_order_relaxed);
@@ -483,10 +519,18 @@ inline bool g609RowWithinVram(const G530RowAddr &row, int xEnd, uint32_t vramSiz
 // ---------------------------------------------------------------------------------------------
 // THE KERNEL. One scanline of an admitted triangle.
 //
-// Templated on the sampler arm so the per-draw `g605Fst` branch is resolved at compile time; both
-// instantiations are otherwise the same text. `noinline` keeps it out of `drawTriangle`'s own
-// register allocation and prologue, which is half the point of the slice.
-template <bool FST, bool SAMPINL>
+// Templated on the TEXTURE arm and the DEPTH arm (G628) and on the sampler arm, so every per-draw
+// branch is resolved at compile time; the instantiations are otherwise the same text. `noinline`
+// keeps it out of `drawTriangle`'s own register allocation and prologue, which is half the point of
+// the slice.
+//
+// ⭐⭐⭐ `ZPRIV == false` IS THE "DEPTH IS PROVABLY DEAD" ARM (G628). The `ridepod` untextured
+// population runs `ZTST=ALWAYS` with `ZMSK=1`: the test passes for every pixel whatever the buffer
+// holds, and nothing is ever written back. The generic loop still INTERPOLATES z, CLAMPS it, and
+// READS the destination (`GSMem::ReadZ24`) before discarding all three — so deleting the stage is
+// dead-code elimination licensed by the admission, not a semantic change. `depthRow` is legitimately
+// NULL in this instantiation and must never be dereferenced by it.
+template <bool TEXTURED, bool ZPRIV, bool FST, bool SAMPINL>
 #if defined(_MSC_VER)
 __declspec(noinline)
 #else
@@ -525,14 +569,18 @@ static void g609TriScanRowT(const G609TriScan &S, int y, float py,
         ++insideAcc;
 
         // --- depth: :2127..2190, with zEnabled / z24 / ztst==2 / g403DisplayZ resolved ---
-        float zf = v0.z * w0 + v1.z * w1 + v2.z * w2;
-        if (zf < 0.0f) zf = 0.0f;
-        const float zmax = 16777215.0f; // z24 by admission
-        if (zf > zmax) zf = zmax;
-        const uint32_t zi = static_cast<uint32_t>(zf);
-        const uint32_t zdst = depthRow[x];
-        if (!(zi >= zdst)) // ztst == 2 (GEQUAL) by admission
-            continue;
+        uint32_t zi = 0u;
+        if constexpr (ZPRIV)
+        {
+            float zf = v0.z * w0 + v1.z * w1 + v2.z * w2;
+            if (zf < 0.0f) zf = 0.0f;
+            const float zmax = 16777215.0f; // z24 by admission
+            if (zf > zmax) zf = zmax;
+            zi = static_cast<uint32_t>(zf);
+            const uint32_t zdst = depthRow[x];
+            if (!(zi >= zdst)) // ztst == 2 (GEQUAL) by admission
+                continue;
+        }
         if (S.ceil == 3) // ⛔ ceiling: coverage + Z only
         {
             ++pxAcc;
@@ -545,6 +593,21 @@ static void g609TriScanRowT(const G609TriScan &S, int y, float py,
         const uint8_t shadeG = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
         const uint8_t shadeB = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
         const uint8_t shadeA = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+
+        uint8_t fr, fg, fb, fa;
+        if constexpr (!TEXTURED)
+        {
+            // ⭐⭐⭐ G628 — THE `tme=0` SUBSET. The generic loop's untextured arm computes exactly
+            // these four values (`rasterizer_draw_triangle.inc:2652..2666`, the `gs->m_prim.iip`
+            // branch, which the admission pins) and then SKIPS the whole `if (gs->m_prim.tme)`
+            // block, so `combineTexture` is never called on the generic path either. Nothing is
+            // rewritten here; the sampler, the CLUT, the STQ/UV interpolation and the combiner are
+            // simply ABSENT FROM THIS INSTANTIATION.
+            (void)quad; (void)quadMiss;
+            fr = shadeR; fg = shadeG; fb = shadeB; fa = shadeA;
+        }
+        else
+        {
         uint32_t texel = 0xFFFFFFFFu; // ⛔ ceil 1/2's substitute (s_g141SkipSample's own)
         if (S.ceil != 1 && S.ceil != 2)
         {
@@ -575,7 +638,6 @@ static void g609TriScanRowT(const G609TriScan &S, int y, float py,
         const uint8_t tb = static_cast<uint8_t>((texel >> 16u) & 0xffu);
         const uint8_t ta = static_cast<uint8_t>((texel >> 24u) & 0xffu);
 
-        uint8_t fr, fg, fb, fa;
         if (S.ceil == 2) // ⛔ ceiling: MODULATE and the fog lerp deleted
         {
             fr = shadeR; fg = shadeG; fb = shadeB; fa = shadeA;
@@ -594,6 +656,7 @@ static void g609TriScanRowT(const G609TriScan &S, int y, float py,
             const TextureCombineResult color =
                 combineTexture(*S.tex0, shadeR, shadeG, shadeB, shadeA, tr, tg, tb, ta);
             fr = color.r; fg = color.g; fb = color.b; fa = color.a;
+        }
         }
         if (S.fog && S.ceil != 2)
         {
@@ -618,8 +681,13 @@ static void g609TriScanRowT(const G609TriScan &S, int y, float py,
             std::memcpy(&dstWord, S.vram + fastOff, sizeof(dstWord));
             const uint32_t fastPixel = g605CommitWord(S.blend, dstWord, fr, fg, fb, fa);
             std::memcpy(S.vram + fastOff, &fastPixel, sizeof(fastPixel));
-            if (S.zWrite)
-                depthRow[x] = zi;
+            // `S.zWrite` is false by admission whenever ZPRIV is false (ZMSK=1), but the guard is
+            // structural rather than argued: the null `depthRow` must be unreachable from here.
+            if constexpr (ZPRIV)
+            {
+                if (S.zWrite)
+                    depthRow[x] = zi;
+            }
         }
         else
         {
@@ -637,31 +705,44 @@ static void g609TriScanRowT(const G609TriScan &S, int y, float py,
         g_g609QuadMiss.fetch_add(quadMiss, std::memory_order_relaxed);
 }
 
-inline void g609TriScanRow(const G609TriScan &S, bool fst, bool sampInl, int y, float py,
+inline void g609TriScanRow(const G609TriScan &S, bool textured, bool zpriv, bool fst, bool sampInl,
+                           int y, float py,
                            int xStart, int xEnd,
                            const G530RowAddr &colorRow, uint32_t *depthRow,
                            long &insideAcc, int &drawnAcc, uint64_t &pxAcc)
 {
-    // Four instantiations, one per (sampler arm x slice-B arm). Both selectors are per-DRAW
-    // constants, so this dispatch is once per row, and neither instantiation carries the other's
-    // body — which is what makes the slice-B control a clean control.
+    // Six instantiations: TWO untextured (G628 — one per depth arm; `fst` and the slice-B arm are
+    // both meaningless without a sampler, so there is exactly one body each) and four textured, one
+    // per (sampler arm x slice-B arm), all of which the textured admission pins to `ZPRIV=true`.
+    // Every selector is a per-DRAW constant, so this dispatch is once per row, and no instantiation
+    // carries another's body — which is what makes each arm a clean control.
+    if (!textured)
+    {
+        if (zpriv)
+            g609TriScanRowT<false, true, false, false>(S, y, py, xStart, xEnd, colorRow, depthRow,
+                                                       insideAcc, drawnAcc, pxAcc);
+        else
+            g609TriScanRowT<false, false, false, false>(S, y, py, xStart, xEnd, colorRow, depthRow,
+                                                        insideAcc, drawnAcc, pxAcc);
+        return;
+    }
     if (fst)
     {
         if (sampInl)
-            g609TriScanRowT<true, true>(S, y, py, xStart, xEnd, colorRow, depthRow,
-                                        insideAcc, drawnAcc, pxAcc);
+            g609TriScanRowT<true, true, true, true>(S, y, py, xStart, xEnd, colorRow, depthRow,
+                                                    insideAcc, drawnAcc, pxAcc);
         else
-            g609TriScanRowT<true, false>(S, y, py, xStart, xEnd, colorRow, depthRow,
-                                         insideAcc, drawnAcc, pxAcc);
+            g609TriScanRowT<true, true, true, false>(S, y, py, xStart, xEnd, colorRow, depthRow,
+                                                     insideAcc, drawnAcc, pxAcc);
     }
     else
     {
         if (sampInl)
-            g609TriScanRowT<false, true>(S, y, py, xStart, xEnd, colorRow, depthRow,
-                                         insideAcc, drawnAcc, pxAcc);
+            g609TriScanRowT<true, true, false, true>(S, y, py, xStart, xEnd, colorRow, depthRow,
+                                                     insideAcc, drawnAcc, pxAcc);
         else
-            g609TriScanRowT<false, false>(S, y, py, xStart, xEnd, colorRow, depthRow,
-                                          insideAcc, drawnAcc, pxAcc);
+            g609TriScanRowT<true, true, false, false>(S, y, py, xStart, xEnd, colorRow, depthRow,
+                                                      insideAcc, drawnAcc, pxAcc);
     }
 }
 
@@ -713,7 +794,11 @@ inline bool g609VerifySave(const G609TriScan &S, int xStart, int xEnd,
         if (off + 4u <= S.vramSize)
             std::memcpy(&w, S.vram + off, sizeof(w));
         sh.savedColor[i] = w;
-        sh.savedDepth[i] = depthRow[x];
+        // G628: the "depth is provably dead" arm has NO depth row (ZTST=ALWAYS + ZMSK=1), and
+        // neither the generic path nor the kernel writes one — so there is nothing to snapshot and
+        // nothing to compare. The COLOUR half of the oracle is unaffected and still runs on every
+        // pixel of the row.
+        sh.savedDepth[i] = depthRow ? depthRow[x] : 0u;
     }
     return true;
 }
@@ -729,16 +814,17 @@ inline void g609VerifyCaptureAndRestore(const G609TriScan &S, uint32_t *depthRow
         if (sh.off[i] + 4u <= S.vramSize)
             std::memcpy(&w, S.vram + sh.off[i], sizeof(w));
         sh.refColor[i] = w;
-        sh.refDepth[i] = depthRow[x];
+        sh.refDepth[i] = depthRow ? depthRow[x] : 0u;
         if (sh.off[i] + 4u <= S.vramSize)
             std::memcpy(S.vram + sh.off[i], &sh.savedColor[i], sizeof(uint32_t));
-        depthRow[x] = sh.savedDepth[i];
+        if (depthRow)
+            depthRow[x] = sh.savedDepth[i];
     }
 }
 
 // Step 5 — compare, then hand the row back to the AUTHORITATIVE generic result either way, so a
 // kernel defect can never reach a pixel while the oracle is armed.
-inline void g609VerifyCompare(const G609TriScan &S, uint32_t *depthRow)
+inline void g609VerifyCompare(const G609TriScan &S, uint32_t *depthRow, bool untex = false)
 {
     G609RowShadow &sh = g609Shadow();
     uint64_t bad = 0u;
@@ -748,20 +834,29 @@ inline void g609VerifyCompare(const G609TriScan &S, uint32_t *depthRow)
         uint32_t w = 0u;
         if (sh.off[i] + 4u <= S.vramSize)
             std::memcpy(&w, S.vram + sh.off[i], sizeof(w));
-        if (w != sh.refColor[i] || depthRow[x] != sh.refDepth[i])
+        if (w != sh.refColor[i] || (depthRow && depthRow[x] != sh.refDepth[i]))
             ++bad;
         if (sh.off[i] + 4u <= S.vramSize)
             std::memcpy(S.vram + sh.off[i], &sh.refColor[i], sizeof(uint32_t));
-        depthRow[x] = sh.refDepth[i];
+        if (depthRow)
+            depthRow[x] = sh.refDepth[i];
     }
     g_g609Checks.fetch_add(static_cast<uint64_t>(sh.n), std::memory_order_relaxed);
+    // G628: the untextured leaf carries its OWN oracle denominator — see g_g609UntexChecks.
+    if (untex)
+    {
+        g_g609UntexChecks.fetch_add(static_cast<uint64_t>(sh.n), std::memory_order_relaxed);
+        if (bad != 0u)
+            g_g609UntexBad.fetch_add(bad, std::memory_order_relaxed);
+    }
     if (bad != 0u)
     {
         const uint64_t total = g_g609Bad.fetch_add(bad, std::memory_order_relaxed) + bad;
         static std::atomic<uint32_t> s_logs{0};
         if (s_logs.fetch_add(1u, std::memory_order_relaxed) < 16u)
-            std::fprintf(stderr, "[G609:verify] MISMATCH row x0=%d n=%d bad=%llu total=%llu\n",
-                         sh.x0, sh.n, (unsigned long long)bad, (unsigned long long)total);
+            std::fprintf(stderr, "[G609:verify] MISMATCH row x0=%d n=%d bad=%llu total=%llu untex=%u\n",
+                         sh.x0, sh.n, (unsigned long long)bad, (unsigned long long)total,
+                         untex ? 1u : 0u);
     }
 }
 

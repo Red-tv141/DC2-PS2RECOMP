@@ -138,6 +138,86 @@ inline bool g608TriFstEnabled()
     return on;
 }
 
+// ---------------------------------------------------------------------------------------------
+// ⭐⭐⭐ G628 — THE `tme=0` ADMISSION (Target J).
+//
+// WHAT THE MEASUREMENT SAID (G626 §3, route `ridepod`, `DC2_G605_CYC=1` → `[G605:leaf]`):
+//
+//   leaf                 share of replay CPU   calls        inside px/call   cyc/inside
+//   discov tri-fast            65.5%           25,810,722        43.1           324.3
+//   discov tri-untex           30.6%           13,790,824        11.8         ⭐ 961.9
+//
+// The UNTEXTURED leaf — which does no sampling at all and should be the CHEAPEST kernel in the
+// rasteriser — cost **3.0x the TEXTURED one per covered pixel**, because `tme=0` was refused by
+// construction: this whole lowering is built around the shared-CLUT T8 sampler, so every untextured
+// triangle fell into the generic per-pixel nest (G530's "~20 non-inlined calls per pixel").
+// 30.6% of a 3.77 ms/f subsystem = **≈1.15 ms/f** on a route whose GS converts at 1.05.
+//
+// ⭐ WHY THIS IS A LOWERING AND NOT A NEW KERNEL. An untextured draw is a mathematical SUBSET of the
+// textured one: same coverage, same barycentrics, same Z interpolation and GEQUAL test against the
+// G403/G411 private mirror, same fog lerp, same exact commit — minus the sampler, the CLUT, the
+// STQ/UV interpolation and the filter, none of which the generic path evaluates for `tme=0` either.
+// So `g609TriScanRowT<TEXTURED=false>` DELETES stages the admission proves dead; it rewrites none.
+//
+// ⛔ WHY THE ADMISSION LIVES PER-DRAW AND *NOT* IN `g605EntryRejectReason`.
+// G626 §7's design said "delete `!e.prim.tme` from `g605EntryRejectReason`". That function is not
+// only the entry predicate — it is ALSO the eligibility filter handed to `g580PrepareSharedClutsWith`
+// (via `g605SharedEntryEligible`), which builds ONE SHARED PALETTE PER DISTINCT CLUT KEY and only
+// for keys whose reference count reaches `minRefs`. Admitting untextured entries there would
+// (a) key a palette off a `tex0` the draw never reads, and (b) push untextured entries' refs into
+// the textured keys' counts, changing WHICH TEXTURED DRAWS get a shared palette — a second
+// architectural variable in the same edit, on a population worth 65.5% of the replay. An untextured
+// draw needs no palette at all, so its admission is independent of the batch CLUT machinery and
+// belongs where every other per-draw conjunct is read: `drawTriangle`. The entry predicate is left
+// byte-for-byte unchanged, which also keeps the textured population identical in both G628 arms and
+// therefore makes it this lever's same-run control.
+//
+// ⭐ PROMOTED DEFAULT-ON (G628). Rollback: DC2_G628_NO_TRI_UNTEX=1.
+// Gates, all on route `ridepod`:
+//   admission — `[G628:mask] rows=2 overflow=0`, BOTH rows `fail={ADMITTED}`: 100% of the untextured
+//               population (15.0 M draws/run, one single shape) now reaches the kernel.
+//   exactness — `DC2_G609_VERIFY=1`, the shipped generic loop authoritative: **untexBad=0 on
+//               388,260,458 per-pixel colour+depth comparisons** / 71.9 M rows / 153.6 M committed
+//               px, `noBounds=0`, `crashLines=0`. Pooled `bad=0` on 2,297,871,164 comparisons, so
+//               the textured population is unchanged too.
+//   mechanism — `[G605:leaf]`, `DC2_G605_CYC=1` armed identically in both arms, denominators matched
+//               to 0.48%: `discov tri-untex` **952.2 -> 501.3 cyc/inside (-47.4%)** over 174.8 M
+//               inside pixels; its LOOP wall 52,710.3 -> 27,823.4 ms (**-47.2%**, 24.9 s of replay
+//               lane time deleted) and its share of the replay 31.0% -> 22.8%. Untouched controls in
+//               the same runs: `discov tri-fast` 315.2 -> 316.2, `discov spr-untex` 10.4 -> 10.6,
+//               `legacy spr-untex` 3.9 -> 3.9.
+// ⛔⛔ AND THE FRAME GATE IS A **NULL** — NO PAYOFF IS CLAIMED FOR THIS ANYWHERE.
+//   Two order-balanced A B B A gates (8 whole runs, 2,340 presents matched exactly per arm,
+//   scriptFrame 4104..9153) read **-0.010 / -0.525 / +0.047 / +0.135 ms/f** — the signs disagree,
+//   and the 8-run pooled delta is -0.078 ms/f against a per-block spread of ~±0.3. That is
+//   `g594_frame_gate_cannot_resolve_sub_ms`: the lane arithmetic predicts ~0.28 ms/f (24.9 s of LANE
+//   time / 8 replay lanes / ~11 k presents) and this route cannot resolve it.
+//   ⚠️ It is NOT a coverage artefact — `[G609:scan]` untexRows grows at a constant ~3.6 M per 1,000
+//   script frames from sf ~2000, so the measured window holds a fully representative share of the
+//   population. The lever is simply smaller than the route's run-to-run noise.
+// It ships default-ON on the G620/G626 disposition: the kernel is EXACT and STRICTLY LESS WORK
+// (24.9 s of measured CPU deleted, nothing added), so it is kept with the null on the record.
+//
+// Flags (registered in `tools/run_g477_perf.ps1`'s `$clear` in the same edit that created them):
+//   DC2_G628_NO_TRI_UNTEX=1  ⭐ the rollback
+//   DC2_G628_TRI_UNTEX=1     retained as the bring-up spelling; it is now a no-op
+//   DC2_G628_STAT=1          `[G628:untexwhy]` / `[G628:untex]` / `[G628:mask]` / `[G628:bits]`
+// The row-level oracle is `DC2_G609_VERIFY=1`, unchanged: it snapshots the row, lets the SHIPPED
+// generic loop write the authoritative result, restores, re-runs the row through the kernel and
+// compares word for word and depth for depth — so an untextured kernel defect cannot reach a pixel
+// while it is armed. Its `untexChecks`/`untexBad` counters are this leaf's own denominator.
+inline bool g628TriUntexRequested()
+{
+    static const bool on = !envFlagEnabled("DC2_G628_NO_TRI_UNTEX");
+    return on;
+}
+
+inline bool g628TriUntexStatOn()
+{
+    static const bool on = envFlagEnabled("DC2_G628_STAT");
+    return on;
+}
+
 inline bool g605TriSpanSelected()
 {
     // ⛔ No DC2_G419_AB arm. This lever does not select an authority (the CPU replay stays
@@ -501,15 +581,26 @@ static uint32_t g608SampleSharedT8Uv(uint8_t *vram, uint16_t u, uint16_t v)
 // is live and identical in BOTH arms of the G608 A/B, so a pooled `bad=0` would be dominated by
 // pixels the G608 leaf never touched (g589_oracle_with_zero_checks, one level up —
 // `bad=0` on the WRONG population is the same failure as `bad=0` with `checks=0`).
-std::atomic<uint64_t> g_g605SpanTris[2];
-std::atomic<uint64_t> g_g605SpanPx[2];
-std::atomic<uint64_t> g_g605SpanBad[2];
+// ⭐⭐⭐ G628 ADDS A THIRD BUCKET (`k=2`, untextured) for the same reason G608 added the second:
+// the fst=0 and fst=1 populations are live and IDENTICAL in both arms of the G628 A/B, so a pooled
+// `bad=0` would be dominated by pixels the untextured leaf never touched.
+enum
+{
+    kG605SpanFst0 = 0,
+    kG605SpanFst1,
+    kG605SpanUntex,
+    kG605SpanN
+};
+std::atomic<uint64_t> g_g605SpanTris[kG605SpanN];
+std::atomic<uint64_t> g_g605SpanPx[kG605SpanN];
+std::atomic<uint64_t> g_g605SpanBad[kG605SpanN];
 
-inline void g605NoteTriSpan(uint64_t pixels, uint64_t bad, bool fst)
+inline void g605NoteTriSpan(uint64_t pixels, uint64_t bad, int k)
 {
     if (!g605TriSpanStatOn())
         return;
-    const int k = fst ? 1 : 0;
+    if (k < 0 || k >= kG605SpanN)
+        return;
     const uint64_t tris = g_g605SpanTris[k].fetch_add(1u, std::memory_order_relaxed) + 1u;
     const uint64_t px = g_g605SpanPx[k].fetch_add(pixels, std::memory_order_relaxed) + pixels;
     const uint64_t totalBad = g_g605SpanBad[k].fetch_add(bad, std::memory_order_relaxed) + bad;
@@ -518,8 +609,10 @@ inline void g605NoteTriSpan(uint64_t pixels, uint64_t bad, bool fst)
     // `s03` route — so the counter printed `tris=8` and then went silent, and the phase read that as
     // "the population never arrives" and went hunting for an admission blocker that did not exist.
     // A census stride must be smaller than the population it is meant to size.
+    static const char *const kSpanName[kG605SpanN] = {"fst0", "fst1", "untex"};
     if (tris <= 8u || (tris % 10000u) == 0u || firstBad)
-        std::fprintf(stderr, "[G605:trispan] fst=%d tris=%llu px=%llu bad=%llu mode=%s\n", k,
+        std::fprintf(stderr, "[G605:trispan] arm=%s tris=%llu px=%llu bad=%llu mode=%s\n",
+                     kSpanName[k],
                      static_cast<unsigned long long>(tris),
                      static_cast<unsigned long long>(px),
                      static_cast<unsigned long long>(totalBad),
@@ -620,6 +713,208 @@ static void g605NoteReject(uint32_t fbp, int reason, const G605RejectFacts &f)
         }
     std::fflush(stderr);
     g608DumpEntryCensus();
+}
+
+// ---------------------------------------------------------------------------------------------
+// G628 — the UNTEXTURED admission census. `[G628:untexwhy]` names the FIRST failing conjunct, so a
+// population that does not arrive can be diagnosed without a rebuild, and `[G628:untex]` sizes the
+// one that does. Bucketed by the SAME G528 batch class as `[G605:reject]`, for the same reason: a
+// whole-population count cannot say WHICH population is blocked, and on `ridepod` the untextured
+// triangles are `discov` while the `disp` batches carry their own shapes.
+// ⭐ Its periodic dump is driven off this function's OWN call counter, which advances on `ok` too —
+// G605's fix for a trigger that could only fire on a rejection (`[G605:reject]`'s note above).
+std::atomic<uint64_t> g_g628Rej[kG528ClsN][kG605RejN];
+std::atomic<uint64_t> g_g628RejOk[kG528ClsN];
+std::atomic<uint32_t> g_g628RejShown[kG528ClsN][kG605RejN];
+std::atomic<uint64_t> g_g628Calls{0u};
+
+// ⭐⭐⭐ THE FIRST-FAIL CENSUS WAS NOT ENOUGH, AND THE FIRST G628 RUN SAID SO.
+// `[G628:untex] discov ok=0 state=14000404` — the whole 14 M-draw untextured `discov` population
+// failed on `state`, which is a CONJUNCTION of eleven predicates, and a first-fail bucket cannot
+// say which of them is the blocker (nor whether it is one or nine). This is `g608_entry_predicate_
+// needs_its_own_census` one level down: when a rejection reason is a conjunction, census the
+// CONJUNCTS, not the conjunction. Each subject draw contributes a BITMASK of every predicate it
+// failed — so one run names the entire blocker set and its co-occurrence structure at once.
+enum
+{
+    kG628BitFpsm = 0, kG628BitFbw, kG628BitFbmsk, kG628BitFba, kG628BitPabe,
+    kG628BitIip, kG628BitAa1, kG628BitFbp139, kG628BitTrace, kG628BitExcl,
+    kG628BitAtest, kG628BitZte, kG628BitZ24, kG628BitZtst, kG628BitZbp,
+    kG628BitPrivz, kG628BitBounds, kG628BitN
+};
+static const char *const kG628BitName[kG628BitN] = {
+    "fpsm", "fbw", "fbmsk", "fba", "pabe", "iip", "aa1", "fbp139", "trace", "excl",
+    "atest", "zte", "z24", "ztst", "zbp", "privz", "bounds"};
+std::atomic<uint64_t> g_g628Bit[kG528ClsN][kG628BitN];
+
+// The MASK histogram. Fixed capacity, one mutex, no allocation on the replay path; overflow is
+// booked to a single row so the table can never silently under-report (`[G605:shape]`'s contract).
+struct G628MaskRow
+{
+    uint32_t mask = 0u;
+    uint8_t cls = 0u;
+    uint64_t n = 0u;
+    uint32_t fbp = 0u, fbw = 0u, fpsm = 0u;
+    uint64_t alpha = 0u, test = 0u, zbuf = 0u;
+    uint32_t iip = 0u, abe = 0u, fge = 0u, privz = 0u;
+    int minX = 0, minY = 0, maxX = 0, maxY = 0;
+};
+enum { kG628MaskCap = 32 };
+static G628MaskRow g_g628Mask[kG628MaskCap];
+static uint64_t g_g628MaskOverflow = 0u;
+static std::mutex g_g628MaskMtx;
+
+static void g628NoteMask(const G628MaskRow &r)
+{
+    std::lock_guard<std::mutex> lk(g_g628MaskMtx);
+    for (int i = 0; i < kG628MaskCap; ++i)
+    {
+        G628MaskRow &row = g_g628Mask[i];
+        if (row.n == 0u)
+        {
+            row = r;
+            return;
+        }
+        if (row.mask == r.mask && row.cls == r.cls)
+        {
+            ++row.n;
+            return;
+        }
+    }
+    ++g_g628MaskOverflow;
+}
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#endif
+static void g628DumpMaskCensus()
+{
+    G628MaskRow copy[kG628MaskCap];
+    uint64_t ov = 0u;
+    {
+        std::lock_guard<std::mutex> lk(g_g628MaskMtx);
+        for (int i = 0; i < kG628MaskCap; ++i)
+            copy[i] = g_g628Mask[i];
+        ov = g_g628MaskOverflow;
+    }
+    int order[kG628MaskCap];
+    int used = 0;
+    for (int i = 0; i < kG628MaskCap; ++i)
+        if (copy[i].n != 0u)
+            order[used++] = i;
+    for (int i = 0; i < used; ++i)
+        for (int j = i + 1; j < used; ++j)
+            if (copy[order[j]].n > copy[order[i]].n)
+            {
+                const int t = order[i]; order[i] = order[j]; order[j] = t;
+            }
+    std::fprintf(stderr, "[G628:mask] rows=%d overflow=%llu\n", used,
+                 static_cast<unsigned long long>(ov));
+    for (int i = 0; i < used && i < 12; ++i)
+    {
+        const G628MaskRow &r = copy[order[i]];
+        char why[256];
+        int p = 0;
+        why[0] = '\0';
+        for (int b = 0; b < kG628BitN; ++b)
+            if (r.mask & (1u << b))
+                p += std::snprintf(why + p, sizeof(why) - static_cast<size_t>(p), "%s%s",
+                                   p ? "," : "", kG628BitName[b]);
+        if (p == 0)
+            std::snprintf(why, sizeof(why), "ADMITTED");
+        std::fprintf(stderr,
+            "[G628:mask] #%02d %-6s n=%llu fail={%s} fbp=%03x fbw=%u fpsm=%x alpha=%llx test=%llx "
+            "zbuf=%llx iip=%u abe=%u fge=%u privz=%u bbox=%d,%d..%d,%d\n",
+            i, kG528ClsName[r.cls & 3u], static_cast<unsigned long long>(r.n), why,
+            r.fbp, r.fbw, r.fpsm,
+            static_cast<unsigned long long>(r.alpha), static_cast<unsigned long long>(r.test),
+            static_cast<unsigned long long>(r.zbuf), r.iip, r.abe, r.fge, r.privz,
+            r.minX, r.minY, r.maxX, r.maxY);
+    }
+    for (int c = 0; c < kG528ClsN; ++c)
+    {
+        uint64_t sum = 0u;
+        for (int b = 0; b < kG628BitN; ++b)
+            sum += g_g628Bit[c][b].load(std::memory_order_relaxed);
+        if (sum == 0u)
+            continue;
+        std::fprintf(stderr, "[G628:bits] %-6s", kG528ClsName[c]);
+        for (int b = 0; b < kG628BitN; ++b)
+            std::fprintf(stderr, " %s=%llu", kG628BitName[b],
+                         static_cast<unsigned long long>(
+                             g_g628Bit[c][b].load(std::memory_order_relaxed)));
+        std::fprintf(stderr, "\n");
+    }
+    std::fflush(stderr);
+}
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#endif
+static void g628NoteConjuncts(uint32_t fbp, uint32_t mask, const G605RejectFacts &f)
+{
+    const uint32_t kcls = g528ClassifyFbp(fbp);
+    const int cls =
+        (kcls < static_cast<uint32_t>(kG528ClsN)) ? static_cast<int>(kcls) : kG528ClsOther;
+    for (int b = 0; b < kG628BitN; ++b)
+        if (mask & (1u << b))
+            g_g628Bit[cls][b].fetch_add(1u, std::memory_order_relaxed);
+    G628MaskRow r;
+    r.mask = mask;
+    r.cls = static_cast<uint8_t>(cls);
+    r.n = 1u;
+    r.fbp = f.fbp; r.fbw = f.fbw; r.fpsm = f.fpsm;
+    r.alpha = f.alpha; r.test = f.test; r.zbuf = f.zbuf;
+    r.iip = f.iip; r.abe = f.abe; r.fge = f.fge; r.privz = f.privz;
+    r.minX = f.minX; r.minY = f.minY; r.maxX = f.maxX; r.maxY = f.maxY;
+    g628NoteMask(r);
+}
+
+#if defined(_MSC_VER)
+__declspec(noinline)
+#endif
+static void g628NoteAdmit(uint32_t fbp, int reason, const G605RejectFacts &f)
+{
+    const uint32_t kcls = g528ClassifyFbp(fbp);
+    const int cls =
+        (kcls < static_cast<uint32_t>(kG528ClsN)) ? static_cast<int>(kcls) : kG528ClsOther;
+    const uint64_t calls = g_g628Calls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (reason < 0)
+        g_g628RejOk[cls].fetch_add(1u, std::memory_order_relaxed);
+    else
+        g_g628Rej[cls][reason].fetch_add(1u, std::memory_order_relaxed);
+
+    if (reason >= 0 &&
+        g_g628RejShown[cls][reason].fetch_add(1u, std::memory_order_relaxed) == 0u)
+        std::fprintf(stderr,
+            "[G628:untexwhy] cls=%s reason=%s fbp=%03x fbw=%u fpsm=%x fbmsk=%08x fba=%u pabe=%u | "
+            "prim(iip=%u fge=%u aa1=%u abe=%u) | alpha=%llx test=%llx | "
+            "z(zbuf=%llx page=%03x psm=%x ztst=%u zte=%u zmsk=%u privz=%u) | bbox=%d,%d..%d,%d\n",
+            kG528ClsName[cls], kG605RejName[reason], f.fbp, f.fbw, f.fpsm, f.fbmsk, f.fba, f.pabe,
+            f.iip, f.fge, f.aa1, f.abe,
+            static_cast<unsigned long long>(f.alpha), static_cast<unsigned long long>(f.test),
+            static_cast<unsigned long long>(f.zbuf), f.zbpPage, f.zpsm, f.ztst, f.zte, f.zmsk,
+            f.privz, f.minX, f.minY, f.maxX, f.maxY);
+
+    if ((calls % 1000000ull) != 0ull)
+        return;
+    for (int c = 0; c < kG528ClsN; ++c)
+    {
+        uint64_t sum = g_g628RejOk[c].load(std::memory_order_relaxed);
+        for (int i = 0; i < kG605RejN; ++i)
+            sum += g_g628Rej[c][i].load(std::memory_order_relaxed);
+        if (sum == 0u)
+            continue;
+        std::fprintf(stderr, "[G628:untex] %-6s ok=%llu", kG528ClsName[c],
+                     static_cast<unsigned long long>(g_g628RejOk[c].load(std::memory_order_relaxed)));
+        for (int i = 0; i < kG605RejN; ++i)
+            std::fprintf(stderr, " %s=%llu", kG605RejName[i],
+                         static_cast<unsigned long long>(
+                             g_g628Rej[c][i].load(std::memory_order_relaxed)));
+        std::fprintf(stderr, "\n");
+    }
+    g628DumpMaskCensus();
+    std::fflush(stderr);
 }
 
 } // namespace

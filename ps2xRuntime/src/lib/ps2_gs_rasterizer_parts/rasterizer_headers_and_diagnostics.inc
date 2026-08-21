@@ -45,6 +45,39 @@ bool g570_backend_shadow139(const std::vector<uint32_t> &color,
                             const std::vector<uint32_t> &tileTris,
                             std::vector<uint32_t> &out);
 
+// G629 private .cpp-to-.cpp bridge, same contract as G570's above: the admitted CPU-band-replay
+// batch is packed into plain word vectors, submission is synchronous, and every caller-owned
+// vector stays live until the worker has read it.
+//   ⛔ It MUST be declared here, at GLOBAL scope above the first part include, not beside its
+//   call site. Every `.inc` below sits inside an anonymous namespace, so a declaration written
+//   there names an INTERNAL-LINKAGE symbol that the backend TU's definition can never satisfy —
+//   `LNK2019 ... "bool __cdecl `anonymous namespace'::g629_backend_replay(...)"`, which is exactly
+//   what this cost before it was moved (the trap `appendix-dc2-project.md` §3 and the G604 fix log
+//   §4.2 both name).
+bool g629_backend_replay(const std::vector<uint32_t> &recs,
+                         const std::vector<uint32_t> &texDesc,
+                         const std::vector<uint32_t> &texData,
+                         const std::vector<uint32_t> &tileOff,
+                         const std::vector<uint32_t> &tileRef,
+                         std::vector<uint32_t> &color,
+                         std::vector<uint32_t> &depth,
+                         int width, int height, int tilesX,
+                         int block, int fbw, int firstPage,
+                         bool wantDepth);
+
+// G630 persistent-domain bridge. Replay and view packets own every byte until the GL worker
+// retires them; poll(false) is non-blocking, while reads are explicit CPU-coherence boundaries.
+bool g630_backend_submit(const std::shared_ptr<G630ReplayPacket> &packet);
+bool g630_backend_prepare_ct32_view(const std::shared_ptr<G630ViewPacket> &packet);
+bool g630_backend_submit_upload(const std::shared_ptr<G630UploadPacket> &packet);
+bool g630_backend_prepare_t8_view(const std::shared_ptr<G630T8Packet> &packet);
+bool g630_backend_poll(bool wait, std::vector<uint8_t> &results);
+bool g630_backend_read_vram(std::vector<uint32_t> &out);
+// G631: band form of the above. `out.size()` tells the caller whether it got the requested band
+// (width*rowCount) or the whole-image fallback (width*512).
+bool g630_backend_read_vram_rows(uint32_t rowLo, uint32_t rowCount, std::vector<uint32_t> &out);
+bool g630_backend_read_depth(std::vector<uint32_t> &out);
+
 // Private live PSMT8 address helper (implemented in ps2_gs_memory.cpp, intentionally absent
 // from the public generated-target header).
 namespace GSMem
@@ -90,6 +123,16 @@ void g512PsmNote(std::uint8_t psm, std::uint64_t pixels, bool fast, int texW, in
 bool g264_backend_write_color_rect(uint32_t fbp, int texWidth, int texHeight,
                                    int glX, int glY, int width, int rows,
                                    const std::vector<uint32_t> &in);
+// G627 private .cpp-to-.cpp bridge: per-byte-lane masked FBO patch. `mask` carries one byte per
+// CT32 channel (non-zero => replace that byte lane from `in`), so a PSMT8 local-transfer
+// destination whose boundary CT32 words are only partially covered can be reconciled into the
+// resident surface without publishing it first. Declared HERE, in the true-global gap, for the
+// same reason g264_backend_write_color_rect above is: the call site sits inside an anonymous
+// namespace where a forward declaration would name a different, never-defined symbol (G568).
+bool g627_backend_write_color_rect_masked(uint32_t fbp, int texWidth, int texHeight,
+                                          int glX, int glY, int width, int rows,
+                                          const std::vector<uint32_t> &in,
+                                          const std::vector<uint32_t> &mask);
 // G281 private .cpp-to-.cpp bridge: build one decoded RGBA texture view directly from a
 // resident CT32 target FBO. `mapRgba` encodes {srcX,srcGlY,byteLane} per PSMT8 texel; the
 // backend combines those bytes with `clutRgba` on-GPU and installs the result under `texKey`.
@@ -470,28 +513,122 @@ namespace
         return g268LiveEnvRead() ? envFlagEnabled("DC2_G242_STAT") : cached;
     }
 
+    // ===== G626: THE PER-PIXEL DIAGNOSTIC PREDICATE CACHE (G619's law, in the pixel loop) =====
+    //
+    // WHAT THE MEASUREMENT SAID. `[G605:leaf]` on `ridepod` (the route's GS is the sole pole,
+    // injection sensitivity 1.05) ranks its whole CPU band replay as TWO triangle leaves:
+    //
+    //   discov tri-fast   65.5% of replay CPU   43.1 inside px/call    324.3 cyc/inside
+    //   discov tri-untex  30.6% of replay CPU   11.8 inside px/call  **961.9 cyc/inside**
+    //
+    // The UNTEXTURED leaf — which does no sampling at all and should be the cheapest kernel in the
+    // rasteriser — costs 3x per covered pixel what the TEXTURED one does. It costs that because
+    // `tme=0` is refused by G605's span kernel (`g605EntryRejectReason`: `if (!e.prim.tme) return
+    // kG608EntPrim`), so it runs the generic per-pixel nest, and that nest still pays the
+    // "~20 non-inlined calls per pixel" G530 named as the actual price of a replayed pixel.
+    //
+    // Six of those calls are DEFAULT-OFF DIAGNOSTIC PREDICATES, and every one of them held its
+    // flag in a FUNCTION-LOCAL `static const bool` — which on MSVC is an `_Init_global_epoch` TLS
+    // read plus a compare on EVERY call, behind a call the compiler cannot inline away because the
+    // function is defined in another part of the TU chain. That is exactly the defect G619 measured
+    // at **20.7% of the whole EE thread**, one level down: here it is per PIXEL, not per node.
+    //
+    //   g195ForegroundTraceTarget  DC2_G195_FG_TRACE          3 calls/px (tri nest + writePixel x2)
+    //   renderQualityTraceEnabled  DC2_TRACE_RENDER_QUALITY   6 calls/px (writePixel)
+    //   phaseDiagnosticsEnabled    DC2_PHASE_TRACE            4 calls/px (writePixel)
+    //   g407AutoScanEnabled        DC2_G407_AUTOSCAN          2 calls/px (writePixel)
+    //   g43FacePixelTraceEnabled   DC2_TRACE_G43_FACE_PIXEL   1 call/px  (writePixel)
+    //   g258TraceOn                DC2_G258_TRACE             1 call/px  (writePixel)
+    //
+    // EXACTNESS. Nothing here changes WHAT is decided, only WHERE the flag is read: the environment
+    // is process-constant in every DC2 harness (G268's premise, already shipped for the VIF1/VU1
+    // kick-mode reads and by G619 for the EE overrides), and the acceptance logic below is
+    // `envFlagEnabled`'s, character for character. The bodies, their arguments and their order are
+    // untouched. Rollback `DC2_G626_LIVE_PIXFLAG=1` restores the historical per-call read and is
+    // the CONTROL ARM of this lever's gate.
+    //
+    // These are NAMESPACE-scope statics deliberately (G619's own note): dynamic init at load time
+    // has no guard, so the shipped read is a plain load of a global that MSVC can hoist out of the
+    // pixel loop and predict.
+    //
+    // ⚠️ The initialiser must not use `envFlagEnabled` itself: that calls `g446NoteEnvRead`, which
+    // would run during dynamic initialisation, before the sampler's own state is constructed. This
+    // helper is CRT-only (`getenv` + `strcmp`) and therefore safe at static-init time.
+    static bool g626EnvOnce(const char *name)
+    {
+        const char *value = std::getenv(name);
+        return value != nullptr &&
+               value[0] != '\0' &&
+               std::strcmp(value, "0") != 0 &&
+               std::strcmp(value, "false") != 0 &&
+               std::strcmp(value, "FALSE") != 0 &&
+               std::strcmp(value, "off") != 0 &&
+               std::strcmp(value, "OFF") != 0;
+    }
+
+    static const bool g_g626LivePixFlag = g626EnvOnce("DC2_G626_LIVE_PIXFLAG");
+    static const bool g_g626PhaseTrace = g626EnvOnce("DC2_PHASE_TRACE");
+    static const bool g_g626RenderQuality = g626EnvOnce("DC2_TRACE_RENDER_QUALITY");
+    static const bool g_g626G195Dof = g626EnvOnce("DC2_G195_DOF_TRACE");
+    static const bool g_g626G195Fg = g626EnvOnce("DC2_G195_FG_TRACE");
+    static const bool g_g626G43FaceUv = g626EnvOnce("DC2_TRACE_G43_FACE_UV");
+    static const bool g_g626G43FacePixel = g626EnvOnce("DC2_TRACE_G43_FACE_PIXEL");
+    static const bool g_g626G44FaceZ = g626EnvOnce("DC2_TRACE_G44_FACE_Z");
+
+    // ⛔⛔⛔ THE CONTROL ARM MUST REPRODUCE THE ORIGINAL CODEGEN, NOT AN OLDER MECHANISM.
+    // The first spelling of this rollback was `g_g626LivePixFlag ? envFlagEnabled(name) : cached`,
+    // i.e. a LIVE `getenv` per pixel. That is not what the pre-G626 code did: it held a
+    // FUNCTION-LOCAL `static const bool`, which calls `envFlagEnabled` exactly ONCE and thereafter
+    // costs an `_Init_global_epoch` TLS read plus a compare. Measuring against a live `getenv`
+    // therefore does not price this lever — it prices a defect that never shipped, and it read
+    // `disp sprite` PRO 92 ms (candidate) against 9,185 ms (that bogus control), a 99x arm
+    // asymmetry that stopped the control run reaching the boss window at all.
+    //
+    // `G626_LEGACY_FLAG` restores the ORIGINAL construct verbatim — same storage class, same
+    // initialiser, same `envFlagEnabled` call — so the control arm's codegen is the shipped
+    // pre-G626 codegen and the paired delta is this lever's own.
+    //
+    // The candidate path is one `.bss` load and one not-taken branch; the extra branch is on the
+    // candidate side, so the measurement is CONSERVATIVE (it understates the saving).
+#define G626_LEGACY_FLAG(NAME)                                                                     \
+    do {                                                                                           \
+        if (g_g626LivePixFlag)                                                                     \
+        {                                                                                          \
+            static const bool legacy = envFlagEnabled(NAME);                                       \
+            return legacy;                                                                         \
+        }                                                                                          \
+    } while (0)
+
     bool phaseDiagnosticsEnabled()
     {
-        static const bool enabled = envFlagEnabled("DC2_PHASE_TRACE");
-        return enabled;
+        G626_LEGACY_FLAG("DC2_PHASE_TRACE");
+        return g_g626PhaseTrace;
     }
 
     bool renderQualityTraceEnabled()
     {
-        static const bool enabled = envFlagEnabled("DC2_TRACE_RENDER_QUALITY");
-        return enabled;
+        G626_LEGACY_FLAG("DC2_TRACE_RENDER_QUALITY");
+        return g_g626RenderQuality;
     }
 
     bool g195DofTraceEnabled()
     {
-        static const bool enabled = envFlagEnabled("DC2_G195_DOF_TRACE");
-        return enabled;
+        G626_LEGACY_FLAG("DC2_G195_DOF_TRACE");
+        return g_g626G195Dof;
     }
 
     bool g195ForegroundTraceTarget(const GSContext &ctx, int x, int y)
     {
-        static const bool enabled = envFlagEnabled("DC2_G195_FG_TRACE");
-        if (!enabled)
+        // G626: the flag test is now a plain global load, so the whole body folds to one predicted
+        // branch on the shipped default. Order of the remaining tests, and every value they
+        // compare, are unchanged. The control arm keeps the original function-local static.
+        if (g_g626LivePixFlag)
+        {
+            static const bool legacy = envFlagEnabled("DC2_G195_FG_TRACE");
+            if (!legacy)
+                return false;
+        }
+        else if (!g_g626G195Fg)
             return false;
         if (ctx.frame.fbp != 0u && ctx.frame.fbp != 0x68u)
             return false;
@@ -504,20 +641,20 @@ namespace
 
     bool g43FaceUvTraceEnabled()
     {
-        static const bool enabled = envFlagEnabled("DC2_TRACE_G43_FACE_UV");
-        return enabled;
+        G626_LEGACY_FLAG("DC2_TRACE_G43_FACE_UV");
+        return g_g626G43FaceUv;
     }
 
     bool g43FacePixelTraceEnabled()
     {
-        static const bool enabled = envFlagEnabled("DC2_TRACE_G43_FACE_PIXEL");
-        return enabled;
+        G626_LEGACY_FLAG("DC2_TRACE_G43_FACE_PIXEL");
+        return g_g626G43FacePixel;
     }
 
     bool g44FaceZTraceEnabled()
     {
-        static const bool enabled = envFlagEnabled("DC2_TRACE_G44_FACE_Z");
-        return enabled;
+        G626_LEGACY_FLAG("DC2_TRACE_G44_FACE_Z");
+        return g_g626G44FaceZ;
     }
 
     bool g44FaceZTargetTbp(uint32_t tbp)

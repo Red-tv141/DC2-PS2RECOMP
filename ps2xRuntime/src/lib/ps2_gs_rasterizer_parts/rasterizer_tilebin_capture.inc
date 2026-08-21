@@ -437,6 +437,32 @@
                     const auto g571ClearT = s_g571Split
                         ? std::chrono::steady_clock::now()
                         : std::chrono::steady_clock::time_point{};
+                    // G629 (default-off, DC2_G629_STAT=1): its own clock, because the G529 census
+                    // that already measures this wall is a SEPARATE arm and the two must be
+                    // readable independently — arming G529 to get G629's denominator would put
+                    // G529's per-lane clock reads inside the population G629 is pricing.
+                    const bool g629On = g629StatOn();
+                    const auto g629T0 = g629On ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
+                    // ⛔⛔⛔ G629 CEILING PROBE (DC2_G629_CEIL=1): skip the replay for every batch
+                    // the GPU backend would claim. KNOWINGLY WRONG PIXELS — timing only, never
+                    // promoted. It bounds every backend that could be built for this population
+                    // (G511's law), which is why it is measured BEFORE the backend is written.
+                    const bool g629Skip = g629CeilSkipBatch(g_g144List);
+                    // G629 (default-off, DC2_G629_GPU=1): the exact GPU-resident batched replay.
+                    // Returns true only when it has fully replayed the batch and committed it, so
+                    // every refusal — an inadmissible entry, an unavailable backend, a GL error —
+                    // simply leaves the untouched CPU pool below to run. Fail closed by
+                    // construction: there is no path on which both arms write, and none on which
+                    // neither does. Under DC2_G629_VERIFY=1 it deliberately returns FALSE after
+                    // producing its candidate, so the CPU arm still writes the authoritative
+                    // pixels and g629VerifyAfterCpu compares against them.
+                    const bool g629Gpu =
+                        !g629Skip && g629TryReplayGpu(g_g144List, rgs, rgs->m_vram,
+                                                      rgs->m_vramSize, g605ClutFill);
+                    if (!g629Skip && !g629Gpu)
+                    {
+                    g630PrepareCpuReplay();
                     GSRowPool::instance().run(y0, y1, g529Lanes,
                                               [self, rgs, g570Linear139,
                                                g570PreparedBatch,
@@ -625,7 +651,9 @@
                         t_g144TownDepthScopeOverride = false;
                         t_g144InReplay = false;
                         t_g144Banded = false;
-                    });
+                                              });
+                    g630NoteCpuReplay();
+                    }
                     const uint64_t g571ClearUs = s_g571Split
                         ? static_cast<uint64_t>(std::chrono::duration_cast<
                               std::chrono::microseconds>(
@@ -748,6 +776,18 @@
                                          wallNs, g529ZclrNs, g529ScanNs, g529Entries,
                                          g529Rows, g529Px, g529Lanes);
                     }
+                    // G629: book this batch's ADMISSIBILITY against the pool wall it just cost.
+                    // Placed AFTER the pool returns so the classification cannot perturb the wall
+                    // it is attributing (g526_draw_census.inc's rule).
+                    // G629 oracle: the CPU arm has now committed the authoritative pixels, so the
+                    // candidate captured before it ran can be compared against them.
+                    g629VerifyAfterCpu(rgs->m_vram);
+                    if (g629On)
+                        g629NoteBatch(g_g144List,
+                                      (uint64_t)std::chrono::duration_cast<
+                                          std::chrono::nanoseconds>(
+                                          std::chrono::steady_clock::now() - g629T0).count(),
+                                      g529Rows);
                 }
                 const auto g290T4 = g290P ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};

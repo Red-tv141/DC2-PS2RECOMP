@@ -1551,6 +1551,141 @@ void GSRasterizer::drawTriangle(GS *gs)
             g605NoteReject(ctx.frame.fbp, g605Reject, f);
         }
     }
+    // ============ G628: the `tme=0` SUBSET of the same lowering (Target J) ============
+    // G626 §3 priced this: `discov tri-untex` was 30.6% of `ridepod`'s CPU band replay at
+    // 961.9 cyc/inside — 3.0x the TEXTURED leaf's 324.3 — because `tme=0` was refused by
+    // construction and every untextured triangle fell into the generic ~20-call/pixel nest.
+    //
+    // The conjuncts below are G605's OWN, minus every one that only exists to license the SAMPLER
+    // (tex0 psm/tfx/tcc/cpsm/csm/csa/tbw, the linear filter, `g141FastSampleTri`, and the
+    // batch-shared palette `g580SharedSampleReady()`), because an untextured draw reads none of
+    // them. Two conjuncts that G605 got for free FROM `g141FastSampleTri` are therefore restated
+    // explicitly here: `ctx.frame.fbp != 0x139u` and `g141TraceOff`.
+    //   ⛔ NOT folded into `g605EntryRejectReason` — see g605_tri_span.inc's G628 note: that
+    //   predicate is also the shared-CLUT eligibility filter, and admitting untextured entries there
+    //   would change which TEXTURED keys reach `minRefs`. Leaving it untouched keeps the textured
+    //   population identical in both arms, which is what makes it this lever's same-run control.
+    const bool g628Subject =
+        g628TriUntexRequested() && g605TriSpanSelected() && t_g144InReplay &&
+        !g580Tri13b && !g570Cpu139 && gs->m_vram != nullptr && !gs->m_prim.tme &&
+        (gs->m_prim.type == GS_PRIM_TRIANGLE || gs->m_prim.type == GS_PRIM_TRISTRIP);
+    int g628Reject = kG605RejState;
+    bool g628Untex = false;
+    bool g628PrivZ = false;
+    if (g628Subject)
+    {
+        // ⭐ `fbw` IS NOT PINNED TO 8. G605 pins it because its measured population was the 512-wide
+        // display; the address math is fully general in width (`g530RowAddr`'s `pagesPerRow`, which
+        // is `writePixel`'s own `widthBlocks`), and `[G628:bits]` says the whole untextured `discov`
+        // population is `fbw=2` — a 128-wide discovered target. Pinning it here would refuse 100%
+        // of the population this phase exists to admit. The per-row VRAM bound
+        // (`g609RowWithinVram`) is what actually licenses dropping the per-pixel bounds test, and it
+        // is evaluated per row either way.
+        const bool stateOk =
+            ctx.frame.psm == GS_PSM_CT32 && ctx.frame.fbw != 0u && ctx.frame.fbmsk == 0u &&
+            ctx.fba == 0u && !gs->m_pabe && gs->m_prim.iip && !gs->m_prim.aa1 &&
+            ctx.frame.fbp != 0x139u && g141TraceOff &&
+            !g357FlatDraw && !g408ShadowVolume && !g232tri;
+        // ⭐⭐⭐ TWO ADMITTED DEPTH SHAPES.
+        //   PRIV — G605's own: PSMZ24 GEQUAL against the G403/G411 private mirror at ZBP 0xd0.
+        //   DEAD — `[G628:mask]`'s finding: the whole untextured `discov` population runs
+        //          `ZTST=ALWAYS` with `ZMSK=1` (`zbuf=0x1010000d0`, `test=0x3000b`). ALWAYS means
+        //          the test passes for every pixel whatever the buffer holds; ZMSK=1 means nothing
+        //          is written back. The generic loop still interpolates z, clamps it and READS the
+        //          destination before discarding all three, so deleting the whole stage is dead-code
+        //          elimination the admission proves — the same licence G609's table already uses for
+        //          the shadow-volume arm and the ztst switch, one conjunct further.
+        //   ⚠️ `!zWrite` is required, not assumed: `zWrite` is the generic path's OWN predicate
+        //   (`zEnabled && !zmsk && ztst != 0 && !g357FlatDraw`), so a ZTST=ALWAYS draw that DOES
+        //   write depth fails closed into the generic nest instead of silently losing its Z write.
+        const bool depthPrivOk =
+            zEnabled && z24 && ztst == 2u && zbpPage == 0xd0u && g403DisplayZ;
+        const bool depthDeadOk = (!zEnabled || ztst == 1u) && !zWrite;
+        const bool depthOk = depthPrivOk || depthDeadOk;
+        const bool boundsOk =
+            minY >= 0 && maxY < static_cast<int>(kG403DisplayZH) &&
+            minX >= 0 && maxX < static_cast<int>(kG403DisplayZW);
+        if (!stateOk)
+            g628Reject = kG605RejState;
+        else if (!g605AlphaTestAlwaysPasses(ctx.test))
+            g628Reject = kG605RejAlphaTest;
+        else if (!depthOk)
+            g628Reject = kG605RejDepth;
+        else if (!boundsOk)
+            g628Reject = kG605RejBounds;
+        else
+            g628Reject = -1;
+        g628Untex = (g628Reject < 0) && g605TriSpanQuiet();
+        // PRIV wins where both hold — it is the already-shipped, already-verified depth contract.
+        g628PrivZ = g628Untex && depthPrivOk;
+        if (g628TriUntexStatOn())
+        {
+            G605RejectFacts f{};
+            f.fbp = ctx.frame.fbp;
+            f.fbw = ctx.frame.fbw;
+            f.fbmsk = ctx.frame.fbmsk;
+            f.fpsm = static_cast<uint32_t>(ctx.frame.psm);
+            f.fba = static_cast<uint32_t>(ctx.fba & 0x1ull);
+            f.pabe = gs->m_pabe ? 1u : 0u;
+            f.iip = gs->m_prim.iip ? 1u : 0u;
+            f.fge = gs->m_prim.fge ? 1u : 0u;
+            f.aa1 = gs->m_prim.aa1 ? 1u : 0u;
+            f.abe = gs->m_prim.abe ? 1u : 0u;
+            f.alpha = ctx.alpha;
+            f.test = ctx.test;
+            f.zbuf = ctx.zbuf;
+            f.zbpPage = zbpPage;
+            f.zpsm = zpsm;
+            f.ztst = ztst;
+            f.zte = zte;
+            f.zmsk = zmsk ? 1u : 0u;
+            f.privz = g403DisplayZ ? 1u : 0u;
+            f.minX = minX; f.maxX = maxX; f.minY = minY; f.maxY = maxY;
+            g628NoteAdmit(ctx.frame.fbp, g628Reject, f);
+            // ⭐⭐⭐ AND the per-CONJUNCT mask. `state` is a conjunction of eleven predicates and the
+            // first-fail bucket cannot name which one blocks a population — see the G628 note in
+            // g605_tri_span.inc. Every failing conjunct is set here, independently.
+            uint32_t g628Mask = 0u;
+            if (ctx.frame.psm != GS_PSM_CT32)          g628Mask |= 1u << kG628BitFpsm;
+            if (ctx.frame.fbw == 0u)                   g628Mask |= 1u << kG628BitFbw;
+            if (ctx.frame.fbmsk != 0u)                 g628Mask |= 1u << kG628BitFbmsk;
+            if (ctx.fba != 0u)                         g628Mask |= 1u << kG628BitFba;
+            if (gs->m_pabe)                            g628Mask |= 1u << kG628BitPabe;
+            if (!gs->m_prim.iip)                       g628Mask |= 1u << kG628BitIip;
+            if (gs->m_prim.aa1)                        g628Mask |= 1u << kG628BitAa1;
+            if (ctx.frame.fbp == 0x139u)               g628Mask |= 1u << kG628BitFbp139;
+            if (!g141TraceOff)                         g628Mask |= 1u << kG628BitTrace;
+            if (g357FlatDraw || g408ShadowVolume || g232tri)
+                                                       g628Mask |= 1u << kG628BitExcl;
+            if (!g605AlphaTestAlwaysPasses(ctx.test))  g628Mask |= 1u << kG628BitAtest;
+            // The depth bits describe the PRIV shape only, and they are suppressed entirely when
+            // the DEAD shape admits the draw — otherwise the histogram would keep reporting a
+            // "blocker" for a population that is now taken.
+            if (!depthDeadOk)
+            {
+                if (!zEnabled)                         g628Mask |= 1u << kG628BitZte;
+                if (!z24)                              g628Mask |= 1u << kG628BitZ24;
+                if (ztst != 2u)                        g628Mask |= 1u << kG628BitZtst;
+                if (zbpPage != 0xd0u)                  g628Mask |= 1u << kG628BitZbp;
+                if (!g403DisplayZ)                     g628Mask |= 1u << kG628BitPrivz;
+            }
+            if (!(minY >= 0 && maxY < static_cast<int>(kG403DisplayZH) &&
+                  minX >= 0 && maxX < static_cast<int>(kG403DisplayZW)))
+                                                       g628Mask |= 1u << kG628BitBounds;
+            g628NoteConjuncts(ctx.frame.fbp, g628Mask, f);
+        }
+    }
+    // ⭐ `g605Texd` is the ONE bit that decides which of the two leaves a pixel takes. Everything
+    // below — the blend hoist, the colour-block, the fog predicate, the Z-write predicate, the
+    // per-row swizzle/private-Z hoists and the outlined G609 scanline — is shared verbatim.
+    const bool g605Texd = g605Tri;
+    g605Tri = g605Tri || g628Untex;
+    // Which DEPTH contract this admitted draw runs. The textured leaf only ever has one (G605's
+    // admission requires the private PSMZ24 GEQUAL mirror); G628's untextured leaf has two, and the
+    // "dead" one takes NO depth row at all — so this bit also decides whether the per-row mirror
+    // pointer below is built, and whether the generic in-nest depth branch claims this draw.
+    const bool g605PrivZ = g605Texd || g628PrivZ;
+
     const bool g605TriVerify = g605Tri && g605TriSpanVerifyOn();
     // Per-DRAW constants the generic per-pixel path re-derives inside writePixel.
     const G605Blend g605Blend =
@@ -1561,10 +1696,14 @@ void GSRasterizer::drawTriangle(GS *gs)
     // G608: which of the two sampler leaves this draw uses. A per-DRAW constant — the branch it
     // feeds inside the pixel loop is loop-invariant and perfectly predicted, and it replaces the
     // generic sampler's own `if (gs->m_prim.fst)` which the admitted population pays per pixel.
-    const bool g605Fst = g605Tri && gs->m_prim.fst != 0u;
+    // G628: `fst` selects between the two SAMPLER leaves, so it is meaningless without one — the
+    // untextured instantiation must never be dispatched through the fst arm.
+    const bool g605Fst = g605Texd && gs->m_prim.fst != 0u;
     // The alpha test is admitted only when it always passes, so `fragmentAlpha.writeDepth` is
     // always true and the generic condition `zWrite && fragmentAlpha.writeDepth` reduces to this.
-    const bool g605ZWrite = g605Tri && zWrite;
+    // G628: `g605PrivZ` is redundant here (the DEAD depth shape requires `!zWrite`) but stated, so
+    // the null mirror row is unreachable from the commit by CONSTRUCTION rather than by argument.
+    const bool g605ZWrite = g605Tri && g605PrivZ && zWrite;
     uint64_t g605TriPx = 0u;
     uint64_t g605TriBad = 0u;
 
@@ -1607,8 +1746,12 @@ void GSRasterizer::drawTriangle(GS *gs)
         g609S.stat = g609TriScanStatOn();
     }
     // Slice B is admitted only when both hoists are valid — fail closed onto the `noinline` call.
+    // G628: `g605Texd` gates it as well, because the untextured instantiation has no sampler to
+    // inline and its `sample`/`clut` are legitimately null (no batch-shared palette is bound for an
+    // entry the CLUT eligibility filter never admitted).
     const bool g609SampInl =
-        g609Scan && g609SamplerInline() && g609S.sample != nullptr && g609S.clut != nullptr;
+        g609Scan && g605Texd && g609SamplerInline() &&
+        g609S.sample != nullptr && g609S.clut != nullptr;
 
     const bool g580Tri13bVerify = g580Tri13b && g580Tri13bVerifyOn();
     const uint32_t g580ColorBlock = GSInternal::framePageBaseToBlock(ctx.frame.fbp);
@@ -1864,8 +2007,12 @@ void GSRasterizer::drawTriangle(GS *gs)
             g580BeginSharedSampleRow();
             g605ColorRow = g530RowAddr(g605ColorBlock, ctx.frame.fbw,
                                        static_cast<uint32_t>(y));
-            g605DepthRow = g403DisplayZBuf().data() +
-                           static_cast<size_t>(y) * kG403DisplayZW;
+            // G628: the "depth is provably dead" arm takes NO mirror row. Leaving the pointer null
+            // is what makes it structurally impossible for that arm to read or write depth, rather
+            // than merely unlikely to.
+            if (g605PrivZ)
+                g605DepthRow = g403DisplayZBuf().data() +
+                               static_cast<size_t>(y) * kG403DisplayZW;
         }
         int xStart = minX, xEnd = maxX;
         if (!s_g141NoXspan)
@@ -1919,12 +2066,12 @@ void GSRasterizer::drawTriangle(GS *gs)
         {
             const long g609InsideBefore = insideAcc;
             const uint64_t g609PxBefore = g605TriPx;
-            g609TriScanRow(g609S, g605Fst, g609SampInl, y, g609Py, xStart, xEnd,
+            g609TriScanRow(g609S, g605Texd, g605PrivZ, g605Fst, g609SampInl, y, g609Py, xStart, xEnd,
                            g605ColorRow, g605DepthRow,
                            insideAcc, drawnAcc, g605TriPx);
             g609NoteScanRow(static_cast<uint64_t>(insideAcc - g609InsideBefore),
                             g605TriPx - g609PxBefore, true,
-                            static_cast<uint64_t>(xEnd - xStart + 1), g609SampInl);
+                            static_cast<uint64_t>(xEnd - xStart + 1), g609SampInl, !g605Texd);
             continue;
         }
         if (g609Row && !g609VerifySave(g609S, xStart, xEnd, g605ColorRow, g605DepthRow))
@@ -2224,7 +2371,10 @@ void GSRasterizer::drawTriangle(GS *gs)
                         zdst = fastZ;
                     }
                 }
-                else if (g605Tri)
+                // G628: only the PRIV arm claims this branch. The "dead depth" arm falls through to
+                // the UNTOUCHED generic chain below — its `zdst` is discarded by `ztst == ALWAYS`
+                // either way, so the in-nest fallback path stays byte-for-byte what it is today.
+                else if (g605Tri && g605PrivZ)
                 {
                     // G605 lowering 2: one indexed load instead of an out-of-line call with four
                     // bounds compares. The row pointer is fixed by the loop and the x range is
@@ -2411,6 +2561,19 @@ void GSRasterizer::drawTriangle(GS *gs)
                 const uint8_t shadeG = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
                 const uint8_t shadeB = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
                 const uint8_t shadeA = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+                uint8_t fr, fg, fb, fa;
+                if (!g605Texd)
+                {
+                    // ⭐⭐⭐ G628 — the `tme=0` SUBSET, in the in-nest leaf. The generic loop's own
+                    // untextured arm is `r/g/b/a = clampU8(interpolated)` (the `gs->m_prim.iip`
+                    // branch, pinned by the admission) and then it SKIPS the whole
+                    // `if (gs->m_prim.tme)` block — `combineTexture` is never called for an
+                    // untextured draw on the generic path either. So this is the deletion of the
+                    // sampler and the combiner, not a substitute for them.
+                    fr = shadeR; fg = shadeG; fb = shadeB; fa = shadeA;
+                }
+                else
+                {
                 // G608: the two sampler leaves. Both branches reproduce the generic path's own
                 // interpolation for their arm statement for statement — `iu`/`iv` here are the
                 // identical expressions the `gs->m_prim.fst` branch below evaluates, and the
@@ -2443,8 +2606,8 @@ void GSRasterizer::drawTriangle(GS *gs)
                     static_cast<uint8_t>((texel >> 8u) & 0xffu),
                     static_cast<uint8_t>((texel >> 16u) & 0xffu),
                     static_cast<uint8_t>((texel >> 24u) & 0xffu));
-                uint8_t fr = color.r, fg = color.g, fb = color.b;
-                const uint8_t fa = color.a;
+                fr = color.r; fg = color.g; fb = color.b; fa = color.a;
+                }
                 if (g605Fog)
                 {
                     // Identical to the generic block below: F is Gouraud-interpolated regardless of
@@ -3241,12 +3404,12 @@ void GSRasterizer::drawTriangle(GS *gs)
             int g609VDrawn = 0;
             uint64_t g609VPx = 0u;
             g580BeginSharedSampleRow();
-            g609TriScanRow(g609S, g605Fst, g609SampInl, y, g609Py, xStart, xEnd,
+            g609TriScanRow(g609S, g605Texd, g605PrivZ, g605Fst, g609SampInl, y, g609Py, xStart, xEnd,
                            g605ColorRow, g605DepthRow,
                            g609VInside, g609VDrawn, g609VPx);
-            g609VerifyCompare(g609S, g605DepthRow);
+            g609VerifyCompare(g609S, g605DepthRow, !g605Texd);
             g609NoteScanRow(static_cast<uint64_t>(g609VInside), g609VPx, true,
-                            static_cast<uint64_t>(xEnd - xStart + 1), g609SampInl);
+                            static_cast<uint64_t>(xEnd - xStart + 1), g609SampInl, !g605Texd);
         }
         }
     };
@@ -3308,7 +3471,9 @@ void GSRasterizer::drawTriangle(GS *gs)
     if (g580Tri13b)
         g580NoteTri13b(g580Tri13bPx, g580Tri13bBad);
     if (g605Tri)
-        g605NoteTriSpan(g605TriPx, g605TriBad, g605Fst);
+        g605NoteTriSpan(g605TriPx, g605TriBad,
+                        !g605Texd ? kG605SpanUntex
+                                  : (g605Fst ? kG605SpanFst1 : kG605SpanFst0));
     if (g609Scan)
         g609NoteScanDraw();
 

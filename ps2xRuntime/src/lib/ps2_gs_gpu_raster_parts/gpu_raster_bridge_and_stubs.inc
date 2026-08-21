@@ -8,6 +8,67 @@ bool g178_backend_submit(G178Batch &batch)
     return G178Backend::instance().submit(batch);
 }
 
+// G629: the exact CPU-band-replay compute job. Private .cpp-to-.cpp bridge, exactly like G570's —
+// the frozen runtime headers stay untouched.
+bool g629_backend_replay(const std::vector<uint32_t> &recs,
+                         const std::vector<uint32_t> &texDesc,
+                         const std::vector<uint32_t> &texData,
+                         const std::vector<uint32_t> &tileOff,
+                         const std::vector<uint32_t> &tileRef,
+                         std::vector<uint32_t> &color,
+                         std::vector<uint32_t> &depth,
+                         int width, int height, int tilesX,
+                         int block, int fbw, int firstPage,
+                         bool wantDepth)
+{
+    return G178Backend::instance().submitG629(recs, texDesc, texData, tileOff, tileRef,
+                                              color, depth, width, height, tilesX,
+                                              block, fbw, firstPage, wantDepth);
+}
+
+bool g630_backend_submit(const std::shared_ptr<G630ReplayPacket> &packet)
+{
+    return G178Backend::instance().submitG630(packet);
+}
+
+bool g630_backend_prepare_ct32_view(const std::shared_ptr<G630ViewPacket> &packet)
+{
+    return G178Backend::instance().prepareG630Ct32View(packet);
+}
+
+bool g630_backend_submit_upload(const std::shared_ptr<G630UploadPacket> &packet)
+{
+    return G178Backend::instance().submitG630Upload(packet);
+}
+
+bool g630_backend_prepare_t8_view(const std::shared_ptr<G630T8Packet> &packet)
+{
+    return G178Backend::instance().prepareG630T8View(packet);
+}
+
+bool g630_backend_poll(bool wait, std::vector<uint8_t> &results)
+{
+    return G178Backend::instance().pollG630(wait, results);
+}
+
+bool g630_backend_read_vram(std::vector<uint32_t> &out)
+{
+    return G178Backend::instance().readG630(false, out);
+}
+
+// G631: read only rows [rowLo, rowLo+rowCount) of the raw-VRAM image (row p == guest page p).
+// The caller MUST size-check `out`: a backend that could not take the band path fills the whole
+// 2048x512 image instead, and `out.size()` is the only signal of which one it got.
+bool g630_backend_read_vram_rows(uint32_t rowLo, uint32_t rowCount, std::vector<uint32_t> &out)
+{
+    return G178Backend::instance().readG630(false, out, rowLo, rowCount);
+}
+
+bool g630_backend_read_depth(std::vector<uint32_t> &out)
+{
+    return G178Backend::instance().readG630(true, out);
+}
+
 bool g570_backend_shadow139(const std::vector<uint32_t> &color,
                             const std::vector<uint32_t> &depth,
                             const std::vector<uint32_t> &triWords,
@@ -112,6 +173,18 @@ bool g264_backend_write_color_rect(uint32_t fbp, int texWidth, int texHeight,
 {
     return G178Backend::instance().writeColor(fbp, texWidth, texHeight,
                                                glX, glY, width, rows, in);
+}
+
+// G627: per-byte-lane masked VRAM->FBO patch. `mask`'s channels select which bytes of each CT32
+// texel the patch replaces; the rest keep the FBO's value, so a PSMT8 copy that only partially
+// covers its boundary CT32 words needs no destination readback.
+bool g627_backend_write_color_rect_masked(uint32_t fbp, int texWidth, int texHeight,
+                                          int glX, int glY, int width, int rows,
+                                          const std::vector<uint32_t> &in,
+                                          const std::vector<uint32_t> &mask)
+{
+    return G178Backend::instance().writeColorMasked(fbp, texWidth, texHeight,
+                                                    glX, glY, width, rows, in, mask);
 }
 
 // G280: physical-alias page view resolve (GPU->GPU CT32 page-tile copies between target FBOs).

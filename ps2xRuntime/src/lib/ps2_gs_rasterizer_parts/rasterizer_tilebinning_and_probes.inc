@@ -604,10 +604,15 @@ static bool g265CensusOn()
     return on;
 }
 
+// G626: `writePixel` tests this FIRST in a per-committed-pixel guard, so the function-local
+// `static const bool` was an `_Init_global_epoch` TLS read + compare on every pixel of every
+// replayed draw. Namespace-scope cache; control arm `DC2_G626_LIVE_PIXFLAG=1`.
+static const bool g_g626G258Trace = g626EnvOnce("DC2_G258_TRACE");
+
 static bool g258TraceOn()
 {
-    static const bool on = envFlagEnabled("DC2_G258_TRACE");
-    return on;
+    G626_LEGACY_FLAG("DC2_G258_TRACE");
+    return g_g626G258Trace;
 }
 
 static bool g255VerifyOn()

@@ -80,8 +80,13 @@ static void g261MaterializeAllDirty(int cause)
 // touches BEFORE the caller mutates/reads guest bytes. Unknown ranges fail closed (all targets).
 static void g261MaterializeForRanges(const G144BlockRange &src, const G144BlockRange &dst,
                                      bool srcUnknown, bool dstUnknown, int cause,
-                                     uint32_t g264SkipMask = 0u)
+                                     uint32_t g264SkipMask = 0u,
+                                     bool g630GpuUploadPatch = false)
 {
+    // G630 owns the same physical 4 MiB address space. Resolve its raw-image authority before
+    // any legacy range gate can early-return on "no G261 target dirty".
+    if (!g630GpuUploadPatch)
+        g630MaterializeForRanges(src, dst, srcUnknown, dstUnknown, cause);
     if (!g261WaveOn() || !g261AnyDirty())
         return;
     if (srcUnknown || dstUnknown)
@@ -1006,8 +1011,6 @@ static void g286NoteCpuTransientWrites(uint8_t *vram)
 static void g261PrepareInline(const GSContext &ctx, const GSPrimReg &prim,
                               const GSTexClutReg &texclut)
 {
-    if (!g261WaveOn() || !g261AnyDirty())
-        return;
     G144Entry cand{};
     cand.ctx = ctx;
     cand.prim = prim;
@@ -1021,6 +1024,15 @@ static void g261PrepareInline(const GSContext &ctx, const GSPrimReg &prim,
     const bool unknown = (!color.valid &&
                           ctx.scissor.x1 >= ctx.scissor.x0 && ctx.scissor.y1 >= ctx.scissor.y0) ||
                          (depth.active && !depth.range.valid) || (tme && !tex.valid);
+    g630MaterializeForRanges(tex, color, unknown, unknown, kG261MatInline);
+    if (depth.active)
+        g630MaterializeForRanges(G144BlockRange{}, depth.range, false, !depth.range.valid,
+                                 kG261MatInline);
+    if (clut.valid)
+        g630MaterializeForRanges(clut, G144BlockRange{}, false, false, kG261MatInline);
+    g630MaterializeDepth();
+    if (!g261WaveOn() || !g261AnyDirty())
+        return;
     for (uint32_t i = 0; i < kG248TargetCount; ++i)
     {
         G261Res &r = g_g261Res[i];
@@ -3828,7 +3840,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // G623: did the bind pre-pass's entry loop run for THIS flush? G598's lesson one level up —
     // "rejected on shape" and "the decision point never ran" must not share one bucket.
     bool g623PrePassRan = false;
-    if ((g261WaveOn() && g261AnyDirty()) || g289DirectDisplaySrc != 0u ||
+    g630BeginTexturePass();
+    if ((g261WaveOn() && g261AnyDirty()) || g630HaveSurfaces() || g289DirectDisplaySrc != 0u ||
         g289OwnerViewReady)
     {
         s_g261FboSrc.assign(g_g144List.size(), 0u);
@@ -4185,6 +4198,19 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             if (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u)
                 continue; // G310 decoded this exact self-atlas snapshot before publication.
 
+            // G630: decode PSMT8 directly from persistent raw VRAM. FIFO order places the view
+            // before the native draw that consumes this texture key, with no publication/wait.
+            if (e.ctx.tex0.psm == GS_PSM_T8)
+            {
+                const uint64_t g630T8Key = g630TryT8View(e, st);
+                if (g630T8Key != 0u)
+                {
+                    s_g281ViewKey[i] = g630T8Key;
+                    s_g281ViewSrc[i] = -2;
+                    continue;
+                }
+            }
+
             // G281/G570: close the two measured format-crossing consumers before the generic
             // overlap loop materializes their CT32 source. Admission proves the exact PSMT8 byte
             // map belongs solely to that dirty FBO and the CLUT remains VRAM-authoritative. The
@@ -4322,6 +4348,15 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             // the very page generations G623's version test reads, so a decision taken after it
             // could never be clean.
             {
+                const uint32_t g630Src =
+                    g630TryBind(fbp, e, st, s_g261FboSrc[i] != 0u);
+                if (g630Src != 0u)
+                {
+                    s_g261FboSrc[i] = g630Src;
+                    g261AnyBind = true;
+                    g_g261FboBinds.fetch_add(1u, std::memory_order_relaxed);
+                    continue;
+                }
                 const uint32_t g623Src =
                     g623TryBind(fbp, i, e, st, s_g261FboSrc[i] != 0u);
                 if (g623Src != 0u)
@@ -4331,6 +4366,14 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     g_g261FboBinds.fetch_add(1u, std::memory_order_relaxed);
                     continue;
                 }
+            }
+            // G630 fallback: a CPU decode is a proven CPU-visible boundary. If the exact direct
+            // view gate declined, publish only the texture pages it is about to read.
+            if (e.prim.tme)
+            {
+                const G144BlockRange g630Tex = g144TextureRange(e);
+                g630MaterializeForRanges(g630Tex, G144BlockRange{}, !g630Tex.valid, false,
+                                         kG261MatTexAlias);
             }
             for (uint32_t t = 0; t < kG248TargetCount; ++t)
             {
@@ -4875,6 +4918,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         if (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u)
         {
             const int srcTi = s_g281ViewSrc[i];
+            if (srcTi == -2)
+                continue; // G630 raw-domain T8 decode is already queued ahead of this draw.
             static std::vector<uint32_t> s_map, s_clut;
             const bool srcOk = srcTi >= 0;
             const bool syncOk =
@@ -5429,7 +5474,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 // surface record instead; every other srcFbp value reaching here is a resident
                 // target by construction.
                 pushTexW = (srcTi >= 0) ? g_g261Res[srcTi].fbW
-                                        : g623SurfaceFbW(s_g261FboSrc[i]);
+                                        : std::max(g623SurfaceFbW(s_g261FboSrc[i]),
+                                                   g630SurfaceFbW(s_g261FboSrc[i]));
                 pushTexH = 512;
             }
         }

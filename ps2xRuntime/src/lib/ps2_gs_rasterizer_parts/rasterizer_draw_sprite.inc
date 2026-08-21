@@ -2876,6 +2876,8 @@ void g144FlushPendingUploadRange(uint32_t dbp,
         const uint32_t g264Mask = dstUnknown
             ? 0u
             : g264NoteUploadForMirror(dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        const bool g630UploadPatch =
+            g630CanPatchUpload(dbp, dbw, dpsm, dsax, dsay, rrw, rrh, dstUnknown);
         const uint64_t g327NoteNs = g327CensusOn()
             ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                   std::chrono::steady_clock::now() - g327T0).count())
@@ -2885,7 +2887,7 @@ void g144FlushPendingUploadRange(uint32_t dbp,
         if (g327CensusOn())
             g327T0 = std::chrono::steady_clock::now();
         g261MaterializeForRanges(G144BlockRange{}, dst, false, dstUnknown, kG261MatUpload,
-                                 g264Mask);
+                                 g264Mask, g630UploadPatch);
         const uint64_t g327MatNs = g327CensusOn()
             ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                   std::chrono::steady_clock::now() - g327T0).count())
@@ -3008,6 +3010,22 @@ void g144L2lLatePin()
                              t_g522Pin.dstUnknown, kG261MatLocal, consumed);
 }
 
+// G627: called by GS::performLocalToLocalTransfer immediately after the CPU pixel body, which is
+// where guest VRAM first holds the copy's result. A no-op unless this edge took the destination
+// publication off the l2l pin. Global-linkage wrapper for the same reason g144L2lLatePin is one:
+// the implementation lives in this TU's anonymous namespace and the caller is another TU.
+void g627ApplyPendingL2lPatch(uint8_t *vram, uint32_t vramSize)
+{
+    g627ApplyPendingL2lPatchImpl(vram, vramSize);
+}
+
+// The copy did not happen on the CPU after all (an FBO->FBO blit took it). Nothing wrote the
+// destination bytes into guest VRAM, so there is nothing to reconcile — drop the pin.
+void g627DiscardPendingL2lPatch()
+{
+    g627DisarmPin();
+}
+
 void g144FlushPendingLocalTransferRange(uint32_t sbp,
                                         uint8_t sbw,
                                         uint8_t spsm,
@@ -3022,6 +3040,7 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
                                         uint32_t rrh)
 {
     t_g522Pin.armed = false; // G522: every path below either re-arms it or leaves it disarmed
+    g627DisarmPin();         // G627: same contract — only g627TryTakeL2lDest below may re-arm it
     // G434 workload invariant: count every l2l edge on BOTH arms of the deletion probe below.
     {
         extern std::atomic<uint64_t> g_g434L2lEdges;
@@ -3152,6 +3171,23 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
             t_g522Pin.src = src; t_g522Pin.dst = dst;
             t_g522Pin.srcUnknown = srcUnknown; t_g522Pin.dstUnknown = dstUnknown;
         }
+        // G627 census (behaviour-pure, DC2_G627_CENSUS=1): the PSMT8-in-CT32 destination class.
+        // Runs HERE, immediately before the two calls that clear r.dirty, so it reads the same
+        // residency state the materialize is about to consume.
+        if (g627CensusOn())
+            g627NoteCensus(sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay,
+                           rrw, rrh, src, dst, srcUnknown, dstUnknown);
+        // ===== G627: take the DESTINATION-triggered publication off this edge =====
+        // A PSMT8 copy whose destination lands inside a dirty resident CT32 target publishes the
+        // whole dirty window (448 rows x 512 px on `ridepod`) to service 5,760 bytes it is about to
+        // overwrite. When every conjunct in g627TryTakeL2lDest holds, the returned targets are
+        // reconciled by a per-byte-lane VRAM->FBO patch after the copy body instead
+        // (g627ApplyPendingL2lPatch), and their kG261MatLocal materialize is skipped here.
+        const uint32_t g627Mask =
+            g522Skip ? 0u
+                     : g627TryTakeL2lDest(sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm,
+                                          dsax, dsay, rrw, rrh, src, dst,
+                                          srcUnknown, dstUnknown);
         const uint32_t g285Consumed =
             g522Skip ? 0u
                      : g285PrepareL2lConsume(
@@ -3160,7 +3196,7 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
         g432s.lap(g_g432EdgeStageNs[2]);
         if (!g522Skip)
             g261MaterializeForRanges(src, dst, srcUnknown, dstUnknown, kG261MatLocal,
-                                     g285Consumed);
+                                     g285Consumed | g627Mask);
         g432s.lap(g_g432EdgeStageNs[3]);
         if (g343On)
         {

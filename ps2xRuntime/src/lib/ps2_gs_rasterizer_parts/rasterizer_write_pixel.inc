@@ -193,10 +193,17 @@ void g407AutoScanPrevious(uint64_t tick)
 // load and one non-inlined call from EVERY framebuffer commit in the rasterizer (sprites, triangles
 // and lines alike) with no behavioural surface at all: when the flag IS set the guarded block is
 // entered and runs exactly as before.
+// G626: this predicate is read TWICE per committed pixel (here and at the commit short-circuit
+// below), and a function-local `static const bool` is an `_Init_global_epoch` TLS read plus a
+// compare on EVERY access under MSVC — the defect G619 measured at 20.7% of the EE thread, one
+// level down. Cached at namespace scope with the rest of the per-pixel predicate set; the
+// historical per-call read is the control arm `DC2_G626_LIVE_PIXFLAG=1`.
+static const bool g_g626G407AutoScan = g626EnvOnce("DC2_G407_AUTOSCAN");
+
 bool g407AutoScanEnabled()
 {
-    static const bool enabled = envFlagEnabled("DC2_G407_AUTOSCAN");
-    return enabled;
+    G626_LEGACY_FLAG("DC2_G407_AUTOSCAN");
+    return g_g626G407AutoScan;
 }
 
 void g407AutoRecord(const GSContext &ctx,

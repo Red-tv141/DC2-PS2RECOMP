@@ -65,11 +65,17 @@ enum G495Cls
     kG495ClsReadDepth = 6,
     kG495ClsRenderSkip = 7,  // render, skipReadback (leaves work queued)
     kG495ClsRenderRb = 8,    // render + readback (a fence)
-    kG495ClsCount = 9
+    kG495ClsG630Replay = 9,
+    kG495ClsG630View = 10,
+    kG495ClsG630Upload = 11,
+    kG495ClsG630T8 = 12,
+    kG495ClsG630Read = 13,
+    kG495ClsCount = 14
 };
 
 static const char *const kG495ClsName[kG495ClsCount] = {
-    "comp", "t8", "ct24", "copy", "rdcol", "wrcol", "rddep", "rend", "rendrb"};
+    "comp", "t8", "ct24", "copy", "rdcol", "wrcol", "rddep", "rend", "rendrb",
+    "630replay", "630view", "630upload", "630t8", "630read"};
 
 // GL-worker thread only — single owner, like every other resource in this backend.
 struct G495Ahead
