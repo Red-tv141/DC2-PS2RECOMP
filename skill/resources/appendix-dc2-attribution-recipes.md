@@ -342,3 +342,98 @@ batch on the GPU, restore, replay on the CPU, compare in-process) is immune to t
 measured two 420 s runs as **batch-for-batch identical** because the CPU replay stays
 authoritative under verification. Use that shape for any 0x13b/0x13d/0x139 authority change.
 
+
+---
+
+### §1.3q ⭐⭐⭐ How to attribute a GS pole that is NOT rasterization (added G638)
+
+The recipes above all assume the GS worker's cost is *drawing*. On `dragon` it is not: 44% of its
+33.8 ms/f pole is one target's **shadow-compute preparation**, and the CPU band replay — the thing
+G529/G605/G608/G609/G614/G615/G617/G637 all optimised — is **1.6 ms/f**. Four steps, in this order,
+each of which corrects a wrong answer the previous instrument would have given:
+
+```powershell
+# 1. name the thread. GS own = gsWorkerMs/f - gsStallMs/f, EE = [G182:ee] cpuMs/f (NOT busyMs/f)
+tools\g525_route.ps1 -Route dragon -Census -Tag pole
+# 2. split the DRAIN. Prints whole-run cumulative on a per-100-drains cadence => de-cumulate.
+tools\g525_route.ps1 -Route dragon -Tag drain -Set @('DC2_G290_PROBE=1','DC2_G299_PROFILE=1','DC2_G146_PERF=1')
+python tools\g638_drain.py captures\g477_drain_err.txt --lo 2400
+# 3. split the `replay` bucket, which is NOT rasterization (see below)
+tools\g525_route.ps1 -Route dragon -Tag prep -Set @('DC2_G638_PREP=1','DC2_G146_PERF=1')
+# 4. name WHICH barrier the pole thread sleeps in — all seven call sites, by return address
+tools\g525_route.ps1 -Route dragon -Tag pool -Set @('DC2_G638_POOL=1','DC2_G146_PERF=1')
+python tools\g638_pool.py captures\g477_pool_err.txt
+```
+
+The laws G638 established:
+
+- ⭐⭐⭐ **`[G290:probe]`'s `replay` bucket is the whole CPU-fallback TAIL, not the rasterization.**
+  On `dragon` it is 12.04 ms/f, of which `[G638:prep]` puts **1.611** in the row pool and
+  **10.0 in the G570 0x139 shadow path** (`g570gpubatch` 5.263 + `g570prep` 4.735). Never call the
+  `replay` bucket "band replay".
+- ⛔⛔ **`[G529:disp] wall` is NOT `GSRowPool::run`, despite its own header comment.** `g529T` is
+  reset after the bbox scan and read again after the entire `if (y1 >= y0)` body. On `dragon` that
+  is a **7× overstatement** (9,957 vs 134 µs/dispatch). Anything derived from it — including
+  G637 §1's `rt = wall − lane0 = "GS-thread SLEEP"` — inherits the error. **`[G638:pool]` is the
+  instrument that brackets the barrier itself.**
+- ⭐⭐ **Split a fork/join census by `wait`, not by `wall`.** `wall` contains the caller's own band,
+  which is real work no scheduling lever can delete. `[G638:pool]` ranks by `wall − lane`.
+- ⭐⭐ **A blocked pole thread is usually blocked on the GL BACKEND, not on the row pool.**
+  `[G446:gsprof] ofWhichKernelWait = 31.8%` on `dragon` decomposes as **≈9.9 ms/f of GL futures**
+  (`[G290:probe] gpuOk`, 46.9 synchronous submits/f @ 212 µs) against **1.84 ms/f of barrier**.
+  Check `[G299:backend] q=` first: at 8–12 µs the handoff is not the cost, the GL work is.
+- ⭐⭐⭐ **Identical GIF register COUNTS are not identical register VALUES.** `[G147:gif]`'s `tags` /
+  `packedRegs` / `imageKB` were byte-identical across every window of `dragon`'s static tail, and a
+  payload memo built on that premise measured **0 hits in 1,200 batches**. Gate a caching lever on a
+  census of the VALUES it memoizes.
+- ⛔ **`[G446:gsprof]`'s fn-base rows were not readable on this binary** — its top two were a
+  112-byte early-returning arm getter (16.5%) and a 48-byte three-field setter (12.9%), plus an
+  **audio** function on the GS worker at 2.1%, and the `.map` confirms those addresses and shows no
+  folded neighbours. Use its `[G446:stage]` kernel-wait split, and corroborate with a bracketed
+  instrument before selecting a lever from it.
+
+Full evidence: `plans/phase-G638-fix-log.md`.
+
+
+---
+
+### §1.3r ⭐⭐⭐ How to NOT be fooled by an instrument (added G639)
+
+G639 measured three standing roadmap targets out of existence without building any of them. Each
+failure mode is cheap to check and expensive to skip.
+
+**1. A PC sampler row in a module with no symbols is a MODULE name, not a function name.**
+`[G446:eeprof] getenv 2.07%` on the EE pole → `DC2_G446_ENVCENSUS=1` printed **nothing** over a full
+190 s run (< 27 hooked reads/frame), and every raw `getenv` in that TU is a one-shot `static`. The
+samples are in `ucrtbase.dll` (no PDB), so `SymFromAddr` returns the nearest **export**. ⭐ Before
+building against any `ucrtbase`/`ntdll`/driver row, get a **counting** instrument to agree. This is
+G638's fold trap one level up, and worse: the name it invents is real and greppable.
+
+**2. Grep the DEFINITION of a helper before wrapping it.**
+`envFlagEnabled` is **five separate anonymous-namespace copies** — `gs_stub_crt_and_config.inc:28`,
+`gpu_bridge_and_latch_helpers.inc:419`, `rasterizer_headers_and_diagnostics.inc:480`,
+`ps2_iop.cpp:52`, `memory_mmu_and_scratchpad.inc:71` — plus `dc2_env_flag_enabled` in the override
+TU. Wrapping one is exact and harmless and moves nothing, because the hot path calls another.
+
+**3. A reference arm must differ from the candidates ONLY in the thing under test.**
+G624's proposed reference (`DC2_G261_NO_WAVE=1`) sits **1.53** from both candidates, which differ
+from each other by **0.15**; the candidates are separated by **0.016** against it. ⭐ **Measure the
+reference's own divergence from the shipped arm first and require it to be SMALLER than the effect.**
+And when the question is per-texel, the instrument must be per-texel — a whole-frame diff cannot
+resolve it.
+
+**4. Size a slow arm's budget from ITS OWN measured rate.**
+A reference arm whose mechanism makes it 3.4× slower dumped **0 frames**: it never reached the
+window. A slower arm does not score worse, it produces *no score* (`g536_coverage_denominator`).
+
+**5. Read `common window:` and per-arm `pres` before quoting an A B B A.**
+One arm exiting early shrank a gate from 2,040 to **360** presents/arm; re-running that single arm
+widened it 5.7× and the two blocks converged. A short arm shrinks a gate silently.
+
+**6. Price a pruning lever against what the loop WALKS.**
+`[G605:leaf] bboxPerCall 143.9` vs `insidePerCall 43.1` looked like 3.4× waste; the kernel never
+iterates the bbox — an exact bracket already deletes ~76% of it. The residual `inside/walked = 0.543`
+is that bracket's own ±1 px margin on **3.95 covered px/row** slivers. Corrected ceiling:
+**0.007 ms/f**.
+
+Full evidence: `plans/phase-G639-fix-log.md`.

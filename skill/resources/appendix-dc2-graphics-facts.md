@@ -19,6 +19,17 @@
 > `15b-gs-state-and-capture-ab.md` (pixel-class).
 
 Proven fixes and operating facts (some unconditional, some retired, others kill-switch gated):
+- **G629–G636 GPU-Resident Renderer Arc & Defect Diagnoses (G636, 2026-08-22):**
+  - **Defect A: G630 `ridepod` Chassis Black / Character Polygon Loss:**
+    - *Root Cause:* The CPU rasterizer wrote the host private depth mirror `g403DisplayZBuf()` outside of band replays (e.g. between resident replays, ~12,000 words in rows 161..401 matching the ridepod silhouette). The resident GPU replay then performed depth testing against stale Z and rejected valid character polygons. Additionally, the resident replay linear mirror stored unconditionally across its whole dispatch grid into `m_fbos[fbp]`, erasing native draws in shared FBOs.
+    - *Repair:* Removed the persistent GPU depth mirror (batches requiring depth take the standard CPU band replay) and retired the linear FBO mirror.
+  - **Defect B: G634 Environment Dim / Stale Textures (0.77x brightness ratio):**
+    - *Root Cause:* `g634TryRawView` skipped the texture pre-pass without checking if dirty G261 resident FBO targets overlapped the sampled memory. Live texels remained in the native FBO while the raw image decoded stale data.
+    - *Repair:* `g636G261DirtyOverlaps()` arbitration predicate wired into `g634TryRawView`, `g630TryT8View`, `g630PrepareView`, and G633 equivalents to fail-closed and force materialization.
+  - **Defect C: G629 "Flashlight Flicker":**
+    - *Root Cause:* Also caused by the CPU private depth mirror in the non-resident compute replay arm (`DC2_G629_GPU=1`), causing occasional invalid depth tests and additive light blooms on the ridepod chassis.
+    - *Repair:* Unconditional refusal of depth batches in `g629_tri_replay`.
+  - **Final Disposition:** All three defects eliminated (**100% bit-exact 0.00/0.00/0.00** on 53 keys of `ridepod` opening sf 768..1392). However, end-to-end performance closed negative (+1.13 to +1.51 ms/f slower than control) because refusing private depth removed 57% of batches, leaving addressable wait savings (~1.2 ms/f) below added resident costs (~1.8 ms/f). **Prototype remains DEFAULT-OFF for measured performance reasons.**
 - **`s05` Monica's hair-band flicker fixed (G601, 2026-08-16):** an **EMPTY FOOTPRINT SATISFIES A
   "FOR ALL TAPS" ADMISSION CRITERION — IT DOES NOT FAIL IT.** The band is a two-pass offscreen
   effect: the guest clears `x=403..492 y=125..211` of `FRAME fbp=0x13a fbw=8 CT32` to

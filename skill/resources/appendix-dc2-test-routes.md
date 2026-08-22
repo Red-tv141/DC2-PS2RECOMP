@@ -36,6 +36,8 @@ Each row: reference dump → exact input route → harness → re-check triggers
 | `debug_menu.{gs,png}` | Debug menu → Down×2 → Down → Confirm (`DrawSub__8CEditMapFi@0x001B4130`) | `tools/run_30s_diagnose.ps1`<br>`DC2_DEBUG_MENU=1` | Preemption unwind (`g_dc2PreemptSuppressDepth`), vtable draw chain (G396) |
 | `map_15.{gs,png}` | Down@57 → R1@114 → Right×5 @187/243/296/351/404 → Circle@444 → MAP 15, then a scripted **moving-camera cutscene** (~f=449–2129) | `tools/run_g536_map15.ps1`<br>gate `tools/g596_skybroken.py <tag>` (⛔ **not** `g536_detect.py` alone)<br>cross-arm: **`-SfDump`** + `tools/g598_pair.py` (§3.2b, `appendix-dc2-capture-and-gates.md`) | **GPU-resident RTT publication ownership** (`g261Materialize`, `genAtSkip`, G264 mirror), texture-in-RTT-window aliasing (G536), 0x139-residency sky defect (G598) |
 
+| *(no reference dump yet)* | **`route13-heavy-new`** — recorded by the user 2026-08-22. Sleeping-dragon tent cutscene: `Down ×5 → Circle → Right ×9 → Down ×5 → Circle` into the map, then ~180 Cross taps through a long dialogue; 4,417 scriptFrames, then a **STATIC tail** | `tools/g525_route.ps1 -Route dragon` | ⭐⭐⭐ **THE LARGEST GS POLE IN THE SET** (GS own 33.2–33.8 vs VU1 24.0–25.5, headroom **+9.2 ms/f**) and the only content-static steady state. ⛔ Replay NEITHER stick. ⛔ Do NOT bring a CPU-band-replay lever here — see §1.3p |
+
 | *(no reference dump yet)* | **`route11-s03-cutscene`** — recorded by the user 2026-08-16. Stage `map/s/s03`, the Ch.1 forest cutscene (Flotsam's clown boss + Linda + the train wreck): `Circle → Down×5 → Circle → Right×3 → Circle` into the map, then ~30 Cross taps through the dialogue; 4,919 scriptFrames | `tools/g525_route.ps1 -Route s03` | **CPU BAND REPLAY / GPU admission on the DISPLAY buffer.** The only surveyed route whose display batches fall back in bulk (1,062 batches / 18.6 s of replay wall), and the route G603's blend mode 6 was measured on. ⛔ Do NOT replay its left stick (constant keyboard neutral `0x68,0x68`). ⚠️ The live `record_err.txt` is 30 FPS-capped — `run_record.bat` sets no `DC2_PATCH_60FPS` |
 | `s05.{gs,png}` | **`route10-s05-bandage`** — recorded 2026-08-15; last Cross at scriptFrame 6863, after which the cutscene parks on *"Right. Thanks, Master Utan"*, which IS the reference frame | `tools/run_g477_perf.ps1 -PadInput <replay string from plans/g525-routes/route10-s05-bandage.replay.txt>`<br>capture **per PRESENT**: `DC2_FRAME_DUMP=1 DC2_FRAME_DUMP_EVERY=1 DC2_G600_TICK_SF_LO=6900`<br>gate `python tools/g601_band.py <tag>` (find: `g601_flicker.py`) | **ONE-FRAME / ALTERNATING defects** (Monica's hair band, ✅ FIXED by G601; rollback `DC2_G601_NO_EMPTYBIND=1` reproduces it). ⛔ Do NOT replay its left stick. ⛔ `-SfDump` at the default cadence cannot see this class — see §3.2c in `appendix-dc2-capture-and-gates.md` |
 
@@ -90,6 +92,42 @@ a recorded channel that is a constant neutral must not be replayed (§1.3n rule 
 capped, every ~33 ms window is the cap") is stale — but recordings taken *before* the flag was added
 are still capped, so check the batch file rather than the doc.
 
+### §1.3p ⭐⭐⭐ `dragon` — the biggest GS pole in the set, and the only STATIC steady state (added G638)
+
+```powershell
+tools\g525_route.ps1 -Route dragon -Census -Tag <tag>      # three-thread pole
+tools\g525_route.ps1 -Route dragon -Tag <tag> -Set @('DC2_G638_PREP=1')   # what the pole IS
+```
+
+User recording 2026-08-22, preserved as `plans/g525-routes/route13-heavy-new.*`. Debug menu
+`Down ×5 → Circle → Right ×9 → Down ×5 → Circle`, then ~180 `Cross` taps through a long dialogue
+(405 input changes, scriptFrame 0..4417). Scene: a tent interior with a **sleeping blue dragon**.
+⛔ **Replay NEITHER stick** — both channels are dead-centre `0x80,0x80` for the whole recording.
+
+| window | frame | GS own | VU1 | EE cpu | verdict |
+|---|---:|---:|---:|---:|---|
+| static tail (sf ≳ 4600, host tick ≳ 2071) | 34.4–35.8 | ⭐ **33.2–33.8** | 24.0–25.5 | 15.6–17.7 | **SOLE GS POLE, headroom +9.2** |
+
+⭐ **Its tail is a STATIC screen** — after the last input the route parks on a dialogue frame. Nothing
+in the content depends on frame rate, so **a speed-changing candidate cannot move it**: this is the
+one route where G637's speed-perturbed control is unnecessary. Best **timing** gate in the set.
+
+⛔⛔ **It is NOT memoizable, and the reason is a trap.** `[G147:gif]` reports `tags` / `packedRegs` /
+`imageKB` **byte-identical** across every window of the tail — but those are register COUNTS, not
+VALUES. G638's payload memo measured **0 hits in 1,200 consecutive shadow batches**: the 0x139
+shadow geometry is re-emitted with different coordinates every frame while the screen holds still.
+
+⛔⛔⛔ **DO NOT BRING A CPU-BAND-REPLAY LEVER HERE.** `[G638:prep]` on the tail:
+`g570gpubatch` **5.263** + `g570prep` **4.735** vs `poolreplay` **1.611** ms/f — i.e. **~10 ms/f of
+the pole is the G570 0x139 shadow-compute preparation and band round trip**, and the replay every
+phase since G529 has been optimising is 1.6. `[G638:pool]` puts the whole `GSRowPool::run` barrier
+across all seven call sites at **1.84 ms/f**. The GS thread's real wait is the **GL backend future at
+≈9.9 ms/f** (`[G290:probe] gpuOk`, 46.9 synchronous submits/f @ 212 µs, `[G299:backend] q = 8–12 µs`
+so it is GL work, not handoff). ⛔ G637's payoff gate reads **NULL** here (blocks −0.197 / +0.026).
+
+⚠️ **8,044 GIF packets/frame** against lean MAP-0's 14 — this route stresses per-packet cost, not
+per-pixel cost. `DC2_G570_NO_GPU_139=1` costs **+2 ms/f**, so the GPU compute is paying for itself.
+
 ### §1.3n ⭐⭐⭐ `dungeon1` — the GS gate route (added G613)
 
 ```powershell
@@ -99,7 +137,51 @@ tools\g525_route.ps1 -Route dungeon1 -Census -Tag <tag>   # then tools/g605_pole
 `map/d/d02/f01` via debug-menu dungeon **index 1**, then a ~37 s analog run. Recording + full
 evidence: `plans/g525-routes/README.md` and `plans/phase-G613-fix-log.md`.
 
-⭐⭐⭐ **THIS IS THE ROUTE TO GATE A GS LEVER ON.** Measured on the shipped G612 binary, 108 windows:
+⛔⛔⛔ **SUPERSEDED BY G624 + G626 — `dungeon1` IS NO LONGER THE GS GATE.** It is CLOSED to
+single-thread levers (its `GS own` and `EE cpu` are LEVEL; injection **GS 0.69 / EE 0.14**,
+≈+0.3 ms/f left). ⭐⭐⭐ **The GS gate is now `ridepod`**, which G626 measured as a **SOLE** pole:
+`GS own` **21.14** vs VU1 17.72 vs EE 14.26, headroom **+3.42**, and **injection sensitivity 1.05**
+(a GS cut converts ~1:1 over multiple ms).
+
+⭐⭐⭐ **PIXEL GATE SCOPE (G635/G636): `ridepod`'s OPENING (sf 768..1392) IS A BIT-DETERMINISTIC PIXEL GATE (floor 0.00).**
+The older note ("`ridepod` grades TIMING ONLY") applied **only to its late gameplay / boss window (sf 2088+)**, where route motion drifts. The first ~10 seconds is a deterministic cutscene. When evaluated with `tools/g635_bisect.py` (temporal-min per-tile estimator, excluding the host-present opening fade at sf < 768), control-vs-control scores **p50 0.00 / p90 0.00 / max 0.00** across 53 shared keys. It is the premier pixel gate for GS rasterization, resident renderer, and triangle span kernel changes.
+
+⛔⛔ **G637 CORRECTION — THAT 0.00 FLOOR IS CONDITIONAL ON THE TWO ARMS RUNNING AT THE SAME SPEED.**
+The dialogue cursor and the particle sprites advance on **host presents**, so a FASTER arm lands on a
+different animation sub-phase inside the same script bucket and scores ~1.2–1.6 against a 0.00 floor
+with no rendering defect at all. Every prototype gated here before G637 was *slower* than control,
+which is why this never surfaced. A speed-changing candidate needs a speed-perturbed same-binary
+control (`DC2_G431_GS_SLOW_US=<n>`, ≈ +1.83 ms/f per unit) as a second axis — recipe and the three
+readings that settle it: `appendix-dc2-capture-and-gates.md` §3.2f.
+
+⚠️ **Do NOT set `DC2_FRAME_DUMP=1` when using `DC2_G598_DUMP_SF`**: the host-tick dumper silently preempts the script-clock dumper, producing incomparable host-tick files. Evidence: `plans/phase-G635-fix-log.md` and `plans/phase-G636-fix-log.md`.
+
+### ⚠️⚠️ `ridepod` — LIMITS THE NEXT PHASE MUST KNOW (added G628, refined G635/G636)
+
+**1. IT TERMINATES NON-DETERMINISTICALLY IN WHOLE RUNS, so a whole-run gate silently loses its window.**
+Eight identical 280 s runs ended at scriptFrame **25494 / 22173 / 13537 / 14201 / 9153 / 25893 /
+25627 / 23501**. Four hit the harness timeout; four exited on their own (`Window closed
+successfully`, `crashLines=0`), and the early exits hit BOTH arms of a paired gate (2 control,
+2 candidate) — it is route noise, not a lever. Consequence: **no arm-common script window reaches
+the boss window (sf 18000..22173)**, so `tools/g627_abba.py` (which intersects to
+`hi = min(ends)`) scores the *pre-boss* segment unless you notice. Pass `--lo` deliberately and
+read the printed `common window:` line before quoting anything.
+
+**2. IT IS THE ONLY ROUTE THAT EXERCISES THE LOWERED TRIANGLE SPAN KERNELS.** With
+`DC2_G609_VERIFY=1` armed, rows offered to `g609TriScanRowT`:
+
+| route | rows offered | verdict |
+|---|---:|---|
+| `ridepod` | **331,600,000** | the only usable gate |
+| `dungeon6v` | 4 | smoke only |
+| MAP-15 | **0** — `[G609:scan]` never printed | **zero coverage** |
+
+So a clean pixel comparison or a `bad=0` on MAP-15 says **nothing** about a G605/G608/G609/G628
+change (`g589_oracle_with_zero_checks` at route level). MAP-15 remains worth running as a
+*collateral-damage* check — just never quote it as coverage. Always confirm the census printed a
+non-trivial denominator before calling a result clean.
+
+⭐⭐⭐ **[HISTORICAL] This was the route to gate a GS lever on.** Measured on the shipped G612 binary, 108 windows:
 
 | | `dungeon1` | `ridepod` | `s05` | `s03` |
 |---|---:|---:|---:|---:|

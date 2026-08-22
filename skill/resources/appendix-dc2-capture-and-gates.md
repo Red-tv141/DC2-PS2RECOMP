@@ -234,3 +234,69 @@ same session. G612's reading:
 | `off` vs `off2` | nothing | 2/184 | 0.020 | 0.133 | 6.345 |
 | **`on` vs `off`** | **the lever** | 2/184 | **0.011** | **0.089** | 4.159 |
 | **`on` vs `off2`** | **the lever** | 5/184 | **0.011** | **0.076** | 4.091 |
+
+---
+
+### 3.2e ⭐⭐⭐ N-ARM PIXEL BISECTING ACROSS VARYING FRAME RATES (`tools/g635_bisect.py`, G635/G636)
+
+When comparing candidate arms that alter execution speed against control:
+1. **The scene and temporal misalignment swamp naive whole-frame diffs.** Scene motion between adjacent capture frames creates ~10 levels of delta; temporal phase shifts from differing frame rates make a naive diff look like total failure.
+2. **The Estimator that works:**
+   ```
+   for each 8x8 tile:  d(tile) = min over s in [-2..2] of  mean|arm[k] - ctl[k+s]|(tile)
+   frame score       = percentile-99 of that tile map
+   ```
+   A frame that is merely captured at a slightly different moment matches a neighboring control frame, collapsing the minimum. A localized rendering defect matches none and survives, while the 99th percentile prevents small defective regions from being washed out by large clean backgrounds.
+
+3. **Mandatory Second Control (`ctlB`):** Always run a second identical control run (`ctlB`) alongside candidate arms. The `ctlA vs ctlB` score is the **noise floor**. An arm passes when its `p50/p90/max` match the control floor.
+4. **The `ridepod` Opening Window (sf 768..1392):**
+   - The first ~10 seconds of `ridepod` is a scripted, bit-deterministic cutscene.
+   - **Opening Fade Rule:** Keys at `sf < 768` advance on **host present ticks**, showing a spatially uniform brightness ratio (IQR < 0.03) that converges to exactly 1.000 at sf 768.
+   - The usable gate window is **sf 768..1392**. On this window, `ctlB vs ctlA` scores **0.00 / 0.00 / 0.00** (exact bit-identity).
+5. **Execution Tools:**
+   - Capture script: `tools/g636_pixels.ps1` (sets only `DC2_G598_DUMP_SF=12`, never `DC2_FRAME_DUMP=1`).
+   - Bisecting tool: `python tools/g635_bisect.py ctlA ctlB arm1 arm2 ... --lo 768 --hi 1400`
+   - Visual inspection tool: `python tools/g635_look.py ctlA arm <key>` generates a contact sheet PNG with amplified differences and the worst tile boxed.
+
+
+---
+
+### 3.2f ⭐⭐⭐ THE OPENING IS DETERMINISTIC AT FIXED FRAME RATE ONLY — GATE A FASTER ARM AGAINST A SPEED-PERTURBED CONTROL (G637)
+
+§3.2e's `ctlA vs ctlB = 0.00 / 0.00 / 0.00` floor is real, and it is **conditional on the two runs
+being the same speed**. Some `ridepod` content advances on **host presents**, not on the script
+clock — the animated dialogue cursor and the particle sprites — so two arms at different frame rates
+land on different animation sub-phases *inside the same script-frame bucket*, and the ±2-key temporal
+minimum cannot collapse a **sub-key** offset.
+
+Every prototype gated on this window before G637 (G629/G630/G633/G634/G636) was **slower** than
+control by 1.1–1.5 ms/f and still scored 0.00, so the confound never appeared. G637 is the first
+candidate that is substantially **faster**, and it scores 1.24 — which reads as a defect and is not.
+
+⭐ **THE DISCRIMINATOR — a SPEED-ONLY control from the SAME binary.** `DC2_G431_GS_SLOW_US=<n>`
+injects a busy-spin per processed GIF window on the GS worker (`[G303:vu1w] windows/f ≈ 1834`, so
+`n=1` ≈ **+1.83 ms/f**). It changes **nothing** about the renderer. Capture two extra arms:
+
+```powershell
+tools\g636_pixels.ps1 -Arm ctlSlow  -Prefix <p> -Flags @('DC2_G431_GS_SLOW_US=2')
+tools\g636_pixels.ps1 -Arm armSlow  -Prefix <p> -Flags @('<your lever>','DC2_G431_GS_SLOW_US=2')
+```
+
+Then read three things, all measured on the shipped G637 configuration:
+
+| reading | G637's value | what it proves |
+|---|---|---|
+| `ctlSlow` vs `ctlA` — an **unmodified** renderer at a different speed | 0.00 / 0.11 / **1.62** | the window's residual at a speed delta; this is the **envelope**, and it is not a defect by construction |
+| candidate vs `ctlA` | 0.00 / 0.07 / **1.24** | **strictly inside** the envelope → not implicated |
+| candidate at BOTH speeds scored against each other / against `ctlA` | `coop` ≡ `coopSlow`, digit for digit (0.00 / 0.07 / 1.24, maxTile 46.68, same top keys) | the candidate's output is invariant to **speed AND to thread-scheduling order** — the empirical form of an exactness argument a partition oracle cannot give |
+
+(An earlier capture set at a different phase alignment gave the even cleaner pair
+`coop vs ctlSlow = 0.00 / 0.00 / 0.00` and `coopSlow vs ctlA = 0.00 / 0.00 / 0.00`. Either form is a
+pass; do not expect a particular one, because which speed lands on which animation sub-phase is not
+monotonic.)
+
+⚠️ **Always LOOK at the worst key** (`tools/g635_look.py`). The phase signature is unmistakable and
+different from a rendering defect: an animated **cursor sprite**, scattered **particle texels**, or a
+moving **silhouette edge** (a walk cycle one sub-frame apart) — never a wrong colour, never a missing
+draw, never a depth or blend artefact. G637's key 768 was 7 tiles over 20 out of 3,264, meanDiff
+0.113, all in the dialogue cursor and a few sparkles.

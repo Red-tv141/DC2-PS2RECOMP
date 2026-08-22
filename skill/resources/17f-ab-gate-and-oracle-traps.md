@@ -449,6 +449,32 @@ Isolating the two exact store targets fixed it — **without** copying 16 KB per
 one of them is evidence. This is the oracle-side twin of "a null A/B needs a path counter proving
 the arms diverged".
 
+### 6.6 ⭐⭐⭐ AN EXACTNESS ORACLE VALIDATES ARITHMETIC ON ONE PATH; IT CANNOT SEE PATH SELECTION, SOURCE STALENESS, OR ORDERING (G634/G635)
+
+An exactness oracle asks: *"Did this decoding/transformation function produce the exact expected bytes from this input buffer?"* It is **structurally blind** to whether the input buffer was the correct, current source the draw was supposed to sample, or whether a prior writer's data was properly sequenced.
+
+Worked example (DC2 G634/G635):
+- G634's oracle validated raw-VRAM decoding against C++ address translation across **1,097,826,304 comparisons with `bad=0`**.
+- The phase closed claiming "0 open correctness defects".
+- In reality, the median frame was **30 tile-levels defective** (diff of 986 / 3264 tiles) because `g634TryRawView` served textures from raw VRAM while live texels resided in dirty G261 FBO targets that had not been arbitrated.
+- The oracle verified exact arithmetic over the wrong bytes.
+
+> **The Rule:** If a lever changes *which* path handles a draw, *which* memory copy is sampled, or *when* state is synchronized, an exactness oracle cannot be the correctness gate. **PIXELS ARE THE ONLY ADMISSIBLE CORRECTNESS GATE FOR PATH-SELECTION CHANGES.**
+
+### 6.7 ⭐⭐⭐ AN ORACLE'S INDEPENDENT REFERENCE MUST BE SUPPLIED ON THE POPULATION THAT CAN FAIL (G635)
+
+G634's oracle attached its independent guest-VRAM reference under `!g630RangeHasGpuAuthority(tex)` — precisely the subset of pages where guest VRAM and raw VRAM were guaranteed to match by construction. On pages where the GPU domain held exclusive authority (the only pages where drift was possible), the independent reference was withheld. The check could not fail even in principle.
+
+> **The Rule:** Before quoting an oracle's comparison count, state the exact condition under which a mismatch could occur, and prove that the reference source is supplied on a non-empty subset of that population.
+
+### 6.8 ⭐⭐ RESTRICT THE ORACLE TO THE CLAIM (G636)
+
+An oracle that checks "everything" dilutes real signals with irrelevant state:
+- In G636, comparing all non-GPU pages between raw image and guest VRAM read **`bad = 2,142,594 / 3,538,944`** — a meaningless failure because most pages were never claimed as synced and are lazily patched on demand.
+- Restricted to the exact architectural claim (`syncedGen == pageGen`), the same check read **`bad = 0` on 291,676 page comparisons**, decisively confirming raw image coherence and isolating the real bug to the private depth mirror.
+
+> **The Rule:** State the safety property as an explicit code predicate, then test only the population that satisfies the claim's precondition.
+
 ---
 
 ## §7 A WEAK-KEY REUSE RATE IS NOT A MEMOIZATION OPPORTUNITY
