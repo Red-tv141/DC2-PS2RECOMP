@@ -569,6 +569,36 @@ static bool g629TryReplayGpu(std::vector<G144Entry> &list, GS *gs, uint8_t *vram
         return false;
     }
 
+    // ⭐⭐⭐ G636: refuse a private-depth batch HERE, before any work is done for it. The predicate
+    // is the record builder's `zPriv` expression copied verbatim (it is inline in `g629BuildRecords`
+    // and cannot be called from outside it — G629's "copy the body and say so" rule), and it needs
+    // only the captured entry, so it is decidable before the records exist. Refusing after the
+    // build wasted `g630PrepareGpuReplayInputs` plus a full record pass on 48% of all batches.
+    if (!s_g636ResidentZ)
+    {
+        bool wantsPrivZ = false;
+        for (const G144Entry &e : list)
+        {
+            const GSContext &ctx = e.ctx;
+            const uint32_t zte = static_cast<uint32_t>((ctx.test >> 16) & 0x1u);
+            const uint32_t ztst = static_cast<uint32_t>((ctx.test >> 17) & 0x3u);
+            const uint32_t zbpPage = static_cast<uint32_t>(ctx.zbuf & 0x1FFu);
+            const uint32_t zpsm = static_cast<uint32_t>((ctx.zbuf >> 24) & 0xFu);
+            const bool zEnabled = g203UniversalZEnabled() && zte != 0u;
+            const bool privMirror = g203UniversalZEnabled() &&
+                                    g404SharedZScope(ctx.frame.fbp, ctx.frame.fbw, zbpPage, zpsm);
+            if (zEnabled && (zpsm == 0x1u) && ztst == 2u && zbpPage == 0xd0u && privMirror)
+            { wantsPrivZ = true; break; }
+        }
+        if (wantsPrivZ)
+        {
+            g_g629Refused.fetch_add(1u, std::memory_order_relaxed);
+            g_g636ZRefused.fetch_add(1u, std::memory_order_relaxed);
+            s_g636BatchRefusedZ = true;
+            return false;
+        }
+    }
+
     // G630 keeps target aliases in one raw image. CPU-side PSMT8 decode remains the one admitted
     // sampler source, so publish only a rare GPU-owned texture/CLUT overlap before decoding it.
     g630PrepareGpuReplayInputs(list);
@@ -610,6 +640,22 @@ static bool g629TryReplayGpu(std::vector<G144Entry> &list, GS *gs, uint8_t *vram
         if (g_g629Recs[static_cast<size_t>(r) * kG629RecWords + kG629RFlags] & kG629FlagZPriv)
         { wantDepth = true; break; }
 
+    // ⭐⭐⭐ G636: THE GPU KERNEL DOES NOT GET THE PRIVATE DEPTH MIRROR RIGHT, IN EITHER ARM.
+    //   * Resident: the CPU rasterizer writes `g403DisplayZBuf()` between two resident replays and
+    //     both sides then hold real depth (`[G636:zwho]`: 1,082 of 1,082 stale detections had the
+    //     GPU copy still unpublished), so no after-the-fact merge is possible.
+    //   * Non-resident: the arm seeds and writes back per batch and STILL diverges — measured as
+    //     the user-reported "flashlight flicker", an extra additive glow on the ridepod's chest
+    //     (`captures/g635look_g636_g629_001200.png`, p90 1.73 / max 37.66 against a 0.00 floor).
+    // Refuse such a batch in BOTH arms: it takes the shipped CPU band replay, exactly as it does
+    // with the prototype disarmed, and the kernel keeps only the population it is exact on.
+    // `DC2_G636_RESIDENT_Z=1` re-admits them (both defects included).
+    if (wantDepth && !s_g636ResidentZ)
+    {
+        g_g629Refused.fetch_add(1u, std::memory_order_relaxed);
+        g_g636ZRefused.fetch_add(1u, std::memory_order_relaxed);
+        return false;
+    }
     if (g630DomainOn())
     {
         auto packet = g630TakeReplayPacket();

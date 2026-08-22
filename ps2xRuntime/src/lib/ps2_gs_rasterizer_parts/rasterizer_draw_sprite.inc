@@ -2876,8 +2876,15 @@ void g144FlushPendingUploadRange(uint32_t dbp,
         const uint32_t g264Mask = dstUnknown
             ? 0u
             : g264NoteUploadForMirror(dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        // G632: census the declining conjuncts here (and only here — the hook inside
+        // g630UploadCompleteInternal re-tests the same predicate and would double-count).
+        // G634b: `g634CanIngestUpload` is the SAME predicate the upload-complete hook consults, so
+        // publication is skipped here exactly when the hook will mirror the transfer into the raw
+        // image instead. It must be a call, not a paraphrase (G629's law) — the two decisions
+        // being identical is what makes skipping safe.
         const bool g630UploadPatch =
-            g630CanPatchUpload(dbp, dbw, dpsm, dsax, dsay, rrw, rrh, dstUnknown);
+            g630CanPatchUpload(dbp, dbw, dpsm, dsax, dsay, rrw, rrh, dstUnknown, true) ||
+            g634CanIngestUpload(dbp, dbw, dpsm, dsax, dsay, rrw, rrh, dstUnknown);
         const uint64_t g327NoteNs = g327CensusOn()
             ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                   std::chrono::steady_clock::now() - g327T0).count())

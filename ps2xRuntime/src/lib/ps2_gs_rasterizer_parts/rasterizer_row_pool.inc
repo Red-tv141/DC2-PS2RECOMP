@@ -332,6 +332,204 @@ bool passesAlphaTest(uint64_t testReg, uint8_t alpha)
 // dispatch below (and lets the G419 within-process instrument alternate it per frame).
 static bool g420PoolNarrowArm();
 
+// ===== G638: per-CALL-SITE census of the legacy equal-band barrier (DIAGNOSIS ONLY, default OFF) =====
+//
+// PREMISE. G637 replaced the equal-band barrier with a cooperative work-stealing engine for ONE of
+// the seven `GSRowPool::run` call sites (the CPU band replay). The other six — readback unpack,
+// VRAM materialization x3, texture decode, and the g143 row split — still cut equal rows and still
+// BLOCK their caller. When the caller is the GS worker and `gsStallMs/f == 0.00`, that block is
+// booked to `GS own` in full, which on a GS-poled route is frame time (PS2_PROJECT_STATE.md's
+// "Delete Work, Not Waiting" G637 exception). No instrument has ever said WHICH site owns it:
+// `[G446:gsprof]` names `GSRowPool::run` as a wait CALLER but cannot see who called `run`.
+//
+// This buckets by `_ReturnAddress()`, so no call site has to change and no site can be forgotten.
+// Per bucket it separates the three terms that select different levers:
+//   wall = the whole dispatch as the caller sees it
+//   lane = the caller's own band (real work — only deleting work shrinks it)
+//   wait = wall - lane = the caller ASLEEP at the join (what a scheduling lever can delete)
+// Prints preferred-base addresses (`pref=`), which resolve against build64/Release/dc2_runner.map
+// without paying DbgHelp's tens of seconds on this 155 MB image (G563's law).
+//
+// Arm with DC2_G638_POOL=1. Every hook is a no-op otherwise; the env read is cached at namespace
+// scope, never function-local (MSVC would emit a per-access TLS `_Init_global_epoch` guard).
+#include <intrin.h>
+
+static const bool g_g638PoolCensusOn = (std::getenv("DC2_G638_POOL") != nullptr);
+
+struct G638PoolSite
+{
+    std::atomic<uint64_t> pref{0ull};
+    std::atomic<uint64_t> calls{0ull};
+    std::atomic<uint64_t> wallNs{0ull};
+    std::atomic<uint64_t> laneNs{0ull};
+    std::atomic<uint64_t> rows{0ull};
+};
+static constexpr uint32_t kG638PoolSites = 64u;
+static G638PoolSite g_g638PoolSites[kG638PoolSites];
+static std::atomic<uint64_t> g_g638PoolCalls{0ull};
+
+// Return address -> the address the .map lists (the image is ASLR-relocated at load).
+// `__ImageBase` is the linker-provided base of THIS module, so no <windows.h> is needed here —
+// this .inc is pulled into ps2_gs_rasterizer.cpp long before any Win32 header.
+extern "C" char __ImageBase[];
+static uint64_t g638PrefOf(uint64_t rip)
+{
+    const uint64_t base = reinterpret_cast<uint64_t>(&__ImageBase[0]);
+    return (rip >= base) ? (rip - base + 0x140000000ull) : rip;
+}
+
+static void g638PoolReport()
+{
+    struct Row { uint64_t pref, calls, wall, lane, rows; };
+    Row rows[kG638PoolSites];
+    uint32_t n = 0u;
+    uint64_t totWall = 0ull, totWait = 0ull;
+    for (uint32_t i = 0; i < kG638PoolSites; ++i)
+    {
+        const uint64_t c = g_g638PoolSites[i].calls.load(std::memory_order_relaxed);
+        if (c == 0ull)
+            continue;
+        rows[n].pref = g_g638PoolSites[i].pref.load(std::memory_order_relaxed);
+        rows[n].calls = c;
+        rows[n].wall = g_g638PoolSites[i].wallNs.load(std::memory_order_relaxed);
+        rows[n].lane = g_g638PoolSites[i].laneNs.load(std::memory_order_relaxed);
+        rows[n].rows = g_g638PoolSites[i].rows.load(std::memory_order_relaxed);
+        totWall += rows[n].wall;
+        totWait += (rows[n].wall > rows[n].lane) ? (rows[n].wall - rows[n].lane) : 0ull;
+        ++n;
+    }
+    // Rank by WAIT, not wall: wall includes the caller's own real work, which no scheduling
+    // lever can delete. The lever this census selects is paid out of `wait`.
+    for (uint32_t i = 1u; i < n; ++i)
+        for (uint32_t j = i; j > 0u; --j)
+        {
+            const uint64_t a = (rows[j].wall > rows[j].lane) ? rows[j].wall - rows[j].lane : 0ull;
+            const uint64_t b = (rows[j - 1].wall > rows[j - 1].lane) ? rows[j - 1].wall - rows[j - 1].lane : 0ull;
+            if (a <= b)
+                break;
+            const Row t = rows[j]; rows[j] = rows[j - 1]; rows[j - 1] = t;
+        }
+    std::fprintf(stderr,
+                 "[G638:pool] sites=%u calls=%llu cumWallMs=%.1f cumWaitMs=%.1f (cumulative; "
+                 "de-cumulate a window against the nearest [G146:frame] n=)\n",
+                 n, (unsigned long long)g_g638PoolCalls.load(std::memory_order_relaxed),
+                 totWall / 1e6, totWait / 1e6);
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        const double wall = rows[i].wall / 1e6;
+        const double lane = rows[i].lane / 1e6;
+        const double wait = (wall > lane) ? (wall - lane) : 0.0;
+        std::fprintf(stderr,
+                     "[G638:pool]   pref=0x%llx calls=%llu wallMs=%.1f laneMs=%.1f waitMs=%.1f "
+                     "(%5.2f%% of wait) us/call=%.2f rows/call=%.1f\n",
+                     (unsigned long long)rows[i].pref, (unsigned long long)rows[i].calls,
+                     wall, lane, wait,
+                     totWait ? 100.0 * wait * 1e6 / (double)totWait : 0.0,
+                     rows[i].calls ? (wall * 1000.0 / (double)rows[i].calls) : 0.0,
+                     rows[i].calls ? ((double)rows[i].rows / (double)rows[i].calls) : 0.0);
+    }
+}
+
+static void g638PoolNote(uint64_t rip, uint64_t wallNs, uint64_t laneNs, uint64_t rowCount)
+{
+    const uint64_t pref = g638PrefOf(rip);
+    uint32_t idx = static_cast<uint32_t>((pref >> 4) ^ (pref >> 13)) & (kG638PoolSites - 1u);
+    for (uint32_t probe = 0; probe < kG638PoolSites; ++probe)
+    {
+        uint64_t have = g_g638PoolSites[idx].pref.load(std::memory_order_relaxed);
+        if (have == 0ull)
+        {
+            uint64_t expect = 0ull;
+            if (!g_g638PoolSites[idx].pref.compare_exchange_strong(expect, pref,
+                                                                   std::memory_order_relaxed))
+                have = expect;
+            else
+                have = pref;
+        }
+        if (have == pref)
+        {
+            g_g638PoolSites[idx].calls.fetch_add(1ull, std::memory_order_relaxed);
+            g_g638PoolSites[idx].wallNs.fetch_add(wallNs, std::memory_order_relaxed);
+            g_g638PoolSites[idx].laneNs.fetch_add(laneNs, std::memory_order_relaxed);
+            g_g638PoolSites[idx].rows.fetch_add(rowCount, std::memory_order_relaxed);
+            break;
+        }
+        idx = (idx + 1u) & (kG638PoolSites - 1u);
+    }
+    const uint64_t t = g_g638PoolCalls.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+    if ((t % 20000ull) == 0ull)
+        g638PoolReport();
+}
+
+// ===== G638b: PHASE lap of the CPU-fallback dispatch window (DIAGNOSIS ONLY, default OFF) =====
+//
+// PREMISE. On `dragon`'s static tail `[G529:cls]` books ONE `legacy` dispatch per frame at
+// 9,957 us, and `[G290:probe]`'s `replay` bucket at 12.04 ms/f — but `[G638:pool]` measures the
+// GSRowPool::run inside it at ~0.13 ms. So ~9.8 ms/f of the GS pole is inside `g529BeginDispatch()
+// .. g529EndDispatch()` and is NOT the parallel rasterization. `[G529:cls]`'s own `zclr`/`scan`
+// laps are 1.0 / 66.8 ms CUMULATIVE over a whole run, so they are not it either, and the shared-
+// CLUT build is refuted by its own census (`[G580:clut] keys=1..2`, so the linear key scan runs
+// 1-2 compares per entry and the 256-entry fill runs once or twice per batch).
+//
+// ⛔ The G529 header comment calls its `wall` "GSRowPool::run, caller-observed". That is STALE:
+// `g529T` is reset after the bbox scan and read again after the whole `if (y1 >= y0)` body, so its
+// `wall` also contains g570 preparation, CLUT selection, the G629 admission walk and the G570 GPU
+// batch block. G637 §1's "rt = wall - lane0 = GS-thread SLEEP" inherits that overstatement.
+// `[G638:pool]` brackets the pool itself and is the instrument to quote for the barrier.
+//
+// Arm with DC2_G638_PREP=1. Cumulative ns per phase; de-cumulate against `[G146:frame] n=`.
+static const bool g_g638PrepCensusOn = (std::getenv("DC2_G638_PREP") != nullptr);
+enum G638Phase : int
+{
+    kG638PhG570Prep = 0,   // g570Cpu139LinearBatchCandidate + g570Batch139Prepare + depth tiles
+    kG638PhClut = 1,       // g580/g605 shared-CLUT selection + build (incl. the eligibility walk)
+    kG638PhG629 = 2,       // g629CeilSkipBatch + g629TryReplayGpu admission walk
+    kG638PhPool = 3,       // g630PrepareCpuReplay + g637RunReplay (the parallel rasterization)
+    kG638PhG570Gpu = 4,    // the g570GpuBatch settle/read/replay/write block
+    kG638PhTail = 5,       // g629VerifyAfterCpu + g629NoteBatch + g529EndDispatch
+    // Sub-laps of kG638PhG570Prep, charged from inside g570Batch139Prepare. They are NOT summed
+    // into the total below (that would double-count) — read them against `g570prep`.
+    kG638PhG570Tris = 6,     // the per-triangle validate + fixed-point setup + span push loop
+    kG638PhG570Payload = 7,  // g570Batch139BuildGpuPayload (tile binning + GPU buffer fill)
+    kG638PhCount = 8,
+    kG638PhSummed = 6        // phases [0, kG638PhSummed) partition the dispatch window
+};
+static const char *const kG638PhaseName[kG638PhCount] = {
+    "g570prep", "clut", "g629admit", "poolreplay", "g570gpubatch", "tail",
+    "  ^tris", "  ^payload"};
+static std::atomic<uint64_t> g_g638PhaseNs[kG638PhCount];
+static std::atomic<uint64_t> g_g638PhaseBatches{0ull};
+
+static void g638PrepReport()
+{
+    uint64_t tot = 0ull;
+    for (int i = 0; i < kG638PhSummed; ++i)
+        tot += g_g638PhaseNs[i].load(std::memory_order_relaxed);
+    const uint64_t n = g_g638PhaseBatches.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "[G638:prep] batches=%llu totalMs=%.1f (cumulative)\n",
+                 (unsigned long long)n, tot / 1e6);
+    for (int i = 0; i < kG638PhCount; ++i)
+    {
+        const uint64_t v = g_g638PhaseNs[i].load(std::memory_order_relaxed);
+        std::fprintf(stderr, "[G638:prep]   %-13s %9.1f ms (%5.2f%%) %8.1f us/batch\n",
+                     kG638PhaseName[i], v / 1e6, tot ? 100.0 * (double)v / (double)tot : 0.0,
+                     n ? (double)v / 1e3 / (double)n : 0.0);
+    }
+}
+
+static void g638PrepNote(int phase, uint64_t ns)
+{
+    if (phase >= 0 && phase < kG638PhCount)
+        g_g638PhaseNs[phase].fetch_add(ns, std::memory_order_relaxed);
+}
+
+static void g638PrepEndBatch()
+{
+    const uint64_t n = g_g638PhaseBatches.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+    if ((n % 400ull) == 0ull)
+        g638PrepReport();
+}
+
 class GSRowPool
 {
 public:
@@ -344,11 +542,29 @@ public:
 
     void run(int y0, int y1, int lanes, const std::function<void(int, int)> &job)
     {
+        // G638 (no-op unless DC2_G638_POOL=1): read the CALL SITE first, before any branch can
+        // change the frame, so each of the seven `run` sites is attributed to itself.
+        const uint64_t g638Rip =
+            g_g638PoolCensusOn ? reinterpret_cast<uint64_t>(_ReturnAddress()) : 0ull;
+        const std::chrono::steady_clock::time_point g638T0 =
+            g_g638PoolCensusOn ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
+        const uint64_t g638Rows =
+            (y1 >= y0) ? static_cast<uint64_t>(y1 - y0 + 1) : 0ull;
         lanes = std::max(1, std::min(lanes, laneCap()));
         if (lanes <= 1 || y1 < y0)
         {
             if (y1 >= y0)
                 job(y0, y1);
+            if (g_g638PoolCensusOn)
+            {
+                // Serial path: the caller does all of it, so wall == lane and wait is zero. It
+                // still has to be booked, or a site that mostly takes this path looks free.
+                const uint64_t ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - g638T0).count());
+                g638PoolNote(g638Rip, ns, ns, g638Rows);
+            }
             return;
         }
         const int total = y1 - y0 + 1;
@@ -369,6 +585,7 @@ public:
 
         {
             std::lock_guard<std::mutex> lk(m_mtx);
+            m_coop = false; // G637: this generation is a legacy equal-band dispatch
             m_job = &job;
             m_y0 = y0;
             m_total = total;
@@ -383,10 +600,147 @@ public:
 
         // Caller runs lane 0 itself (no wasted thread).
         job(bound(0), bound(1) - 1);
+        const std::chrono::steady_clock::time_point g638TLane =
+            g_g638PoolCensusOn ? std::chrono::steady_clock::now()
+                               : std::chrono::steady_clock::time_point{};
 
-        std::unique_lock<std::mutex> lk(m_mtx);
-        m_cvDone.wait(lk, [&] { return m_pending == 0; });
-        m_job = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            m_cvDone.wait(lk, [&] { return m_pending == 0; });
+            m_job = nullptr;
+        }
+        if (g_g638PoolCensusOn)
+        {
+            const auto now = std::chrono::steady_clock::now();
+            g638PoolNote(g638Rip,
+                         static_cast<uint64_t>(
+                             std::chrono::duration_cast<std::chrono::nanoseconds>(now - g638T0).count()),
+                         static_cast<uint64_t>(
+                             std::chrono::duration_cast<std::chrono::nanoseconds>(g638TLane - g638T0).count()),
+                         g638Rows);
+        }
+    }
+
+    // ===== G637: cooperative, over-decomposed, work-stealing dispatch =====
+    //
+    // ⭐⭐⭐ WHY run() ABOVE CANNOT BE FIXED IN PLACE. It splits [y0,y1] into `lanes` EQUAL ROW bands
+    // and blocks the caller after lane 0. Equal rows are not equal work: `[G529:disp]` on `ridepod`
+    // measures the caller's own band at 0.318 ms against a 1.692 ms mean WORKER band (5.3x) while
+    // the dispatch wall is 3.45 ms — i.e. the join waits for ONE unlucky band and the GS thread,
+    // which is that route's SOLE pole, spends 6.47 of every 7.12 ms/f of replay wall asleep. No
+    // choice of `lanes` repairs that, because the defect is the STATIC EQUAL-ROW PARTITION, not the
+    // lane count (G529 already refuted the lane-count lever in the direction it was built).
+    //
+    // runCoop() takes an explicit, caller-computed partition — `bounds[0..chunks]`, a strictly
+    // increasing row fence with bounds[0] == y0 and bounds[chunks] == y1+1 — and lets EVERY
+    // participant, the caller included, claim chunks from ONE shared cursor until the batch is
+    // exhausted. Over-decomposition (chunks > lanes) plus dynamic claiming converts the join from
+    // "wait for the worst band" into "wait for the worst CHUNK", and the caller keeps rasterizing
+    // instead of sleeping.
+    //
+    // ⭐ EXACTNESS IS THE SAME ARGUMENT run() ALREADY RELIES ON, unchanged: every chunk is a
+    // contiguous row range, the chunks are disjoint and cover [y0,y1] exactly once, and the job
+    // replays the WHOLE entry list in submission order clipped to its own range. Disjoint rows =>
+    // disjoint framebuffer/Z writes; in-order inside a range => blend/Z order preserved. Nothing
+    // about WHICH pixels a row produces depends on how the rows were grouped.
+    //
+    // The cursor packs generation<<32 | index into ONE atomic, so a worker still finishing the
+    // PREVIOUS generation can never claim a chunk of the next one — it fails the generation test and
+    // leaves. That is G420's `m_gen`-re-check-under-the-mutex guarantee without a mutex round trip
+    // per claim, which matters here precisely because there are now many more claims than lanes.
+    //
+    // `seats` bounds how many WORKERS may join (the caller is always a participant), so the total
+    // concurrency stays exactly what the lane policy asked for even though the pool owns more
+    // threads than that.
+    void runCoop(const int *bounds, int chunks, int seats,
+                 const std::function<void(int, int)> &job,
+                 uint32_t *outCallerChunks = nullptr)
+    {
+        if (outCallerChunks)
+            *outCallerChunks = 0u;
+        if (!bounds || chunks <= 0)
+            return;
+        if (chunks == 1 || seats <= 0 || m_threads.empty())
+        {
+            // Same serial path run() takes at lanes<=1: no notify_all, no join, no worker wake.
+            for (int i = 0; i < chunks; ++i)
+                if (bounds[i + 1] - 1 >= bounds[i])
+                    job(bounds[i], bounds[i + 1] - 1);
+            if (outCallerChunks)
+                *outCallerChunks = static_cast<uint32_t>(chunks);
+            return;
+        }
+
+        uint32_t gen;
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_coop = true;
+            m_coopBounds = bounds;
+            m_coopChunks = chunks;
+            m_coopJob = &job;
+            m_coopRemaining.store(chunks, std::memory_order_relaxed);
+            m_coopSeats.store(seats, std::memory_order_relaxed);
+            gen = static_cast<uint32_t>(++m_gen);
+            m_coopCursor.store(static_cast<uint64_t>(gen) << 32, std::memory_order_release);
+        }
+        m_cvWork.notify_all();
+
+        uint32_t mine = 0;
+        for (;;)
+        {
+            const int idx = coopClaim(gen, chunks);
+            if (idx < 0)
+                break;
+            ++mine;
+            coopRunChunk(idx, bounds, &job);
+        }
+        if (outCallerChunks)
+            *outCallerChunks = mine;
+
+        if (m_coopRemaining.load(std::memory_order_acquire) != 0)
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            m_cvDone.wait(lk, [&] { return m_coopRemaining.load(std::memory_order_acquire) == 0; });
+        }
+        // Every claimed chunk has COMPLETED (that is what the countdown counts), so no worker is
+        // inside the job body and the caller's `bounds`/`job` may now die with this frame.
+    }
+
+private:
+    // Lock-free claim. Returns the chunk index, or -1 when this generation is exhausted or has
+    // already been superseded (a late worker from the previous dispatch).
+    int coopClaim(uint32_t gen, int chunks)
+    {
+        uint64_t cur = m_coopCursor.load(std::memory_order_acquire);
+        for (;;)
+        {
+            if (static_cast<uint32_t>(cur >> 32) != gen)
+                return -1;
+            const uint32_t idx = static_cast<uint32_t>(cur);
+            if (idx >= static_cast<uint32_t>(chunks))
+                return -1;
+            if (m_coopCursor.compare_exchange_weak(cur,
+                                                   (static_cast<uint64_t>(gen) << 32) | (idx + 1u),
+                                                   std::memory_order_acq_rel,
+                                                   std::memory_order_acquire))
+                return static_cast<int>(idx);
+        }
+    }
+
+    // Runs one claimed chunk and reports it. The countdown must be decremented for EVERY claimed
+    // chunk including an empty one, or the join never reaches zero.
+    void coopRunChunk(int idx, const int *bounds, const std::function<void(int, int)> *job)
+    {
+        const int a = bounds[idx];
+        const int b = bounds[idx + 1] - 1;
+        if (job && b >= a)
+            (*job)(a, b);
+        if (m_coopRemaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
+        {
+            // Taken so the waiter cannot evaluate its predicate between our store and its wait.
+            std::lock_guard<std::mutex> lk(m_mtx);
+            m_cvDone.notify_all();
+        }
     }
 
 private:
@@ -420,6 +774,28 @@ private:
             if (m_stop)
                 return;
             seen = m_gen;
+            if (m_coop)
+            {
+                // G637 cooperative generation. Take a seat if the lane policy left one; a worker
+                // that misses out simply goes back to sleep, so the pool's thread count never
+                // widens the concurrency the caller asked for.
+                if (m_coopSeats.fetch_sub(1, std::memory_order_relaxed) <= 0)
+                    continue;
+                const uint32_t cgen = static_cast<uint32_t>(seen);
+                const int chunks = m_coopChunks;
+                const int *bounds = m_coopBounds;
+                const std::function<void(int, int)> *cjob = m_coopJob;
+                lk.unlock();
+                for (;;)
+                {
+                    const int idx = coopClaim(cgen, chunks);
+                    if (idx < 0)
+                        break;
+                    coopRunChunk(idx, bounds, cjob);
+                }
+                lk.lock();
+                continue;
+            }
             const std::function<void(int, int)> *job = m_job;
             const int y0 = m_y0, total = m_total, lanes = m_lanes;
             const bool narrow = m_narrow;
@@ -466,4 +842,14 @@ private:
     std::atomic<int> m_nextLane{0};
     uint64_t m_gen = 0;
     bool m_stop = false;
+    // G637 cooperative dispatch state. All four scalars are written by the dispatcher under m_mtx
+    // and read by a worker under m_mtx at its wake, so they need no atomicity of their own; the
+    // cursor and the two counters are the lock-free part.
+    bool m_coop = false;
+    const int *m_coopBounds = nullptr;
+    int m_coopChunks = 0;
+    const std::function<void(int, int)> *m_coopJob = nullptr;
+    std::atomic<uint64_t> m_coopCursor{0}; // generation<<32 | next chunk index
+    std::atomic<int> m_coopRemaining{0};   // chunks not yet COMPLETED
+    std::atomic<int> m_coopSeats{0};       // worker seats still available this generation
 };

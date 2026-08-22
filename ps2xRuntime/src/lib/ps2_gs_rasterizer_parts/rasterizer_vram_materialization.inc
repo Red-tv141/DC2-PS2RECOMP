@@ -2638,6 +2638,23 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // is inside the rows we have ever uploaded/read back (FBO rows outside that are undefined).
     // GL row order = bottom-first: buffer row r = GS row (kFbH-1-r).
     const int rows = rowHi - rowLo + 1;
+    // ⭐⭐⭐ G636 DEFECT A — THE `uploadFb` SEED READS GUEST VRAM AND NOTHING SETTLES G630 FIRST.
+    // The G261 guard a few lines below ("a GPU-dirty target must NEVER be overwritten by an
+    // uploadFb from (stale) VRAM") detects a CPU WRITER, because a CPU writer bumps
+    // `g_g178PageGen`. A G630-authoritative page is stale in guest VRAM with its generation
+    // UNCHANGED, so that guard is structurally blind to it and `g419PackFbRows` below seeds this
+    // FBO with bytes the GPU replay already superseded — the `ridepod` chassis rendering black.
+    // Publish the raw image for this target's rect HERE, before `fbGenNow` and before the upload
+    // decision, so every generation this batch reasons about describes settled memory.
+    // `g630MaterializeForRanges` costs 8 word-ANDs when nothing under the rect is authoritative.
+    if (!s_g636NoFbSeed && g630DomainOn() && g630AnyDirty() && fbW > 0)
+    {
+        const G144BlockRange g636Fb =
+            g144RangeForRect(fbBlock, GS_PSM_CT32, fbw, 0u, 0u,
+                             static_cast<uint32_t>(fbW), static_cast<uint32_t>(kFbH));
+        g630MaterializeForRanges(g636Fb, G144BlockRange{}, !g636Fb.valid, false, kG261MatUpload);
+        if (s_g636Stat) g_g636FbSeed.fetch_add(1u, std::memory_order_relaxed);
+    }
     // G351: the Owner-B sprite tracks FBO↔VRAM equality for ITS sibling FBO, not the scene's.
     G178FbSnap &snap = g_g178FbSnap[g351RouteB ? kG351Sprite139 : fbp];
     // G277-R exact snapshot gen window: for the G273-measured display tuple, color rows 0..415 map
@@ -4131,6 +4148,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         if (s_g599NoBind)
             g261MaterializeAllDirty(kG261MatTexAlias);
         g623PrePassRan = !s_g599NoBind;
+        // ===== G632: the texture bind pre-pass is one coherence epoch ==========================
+        // Every `tex` publication this loop issues is for a consumer that runs AFTER the whole
+        // pass (the decode/upload section further down), so the union can travel in one round
+        // trip. Unlike the two prepare passes this body is NOT pure — `g261Materialize` writes
+        // guest VRAM and the bind gates read page generations — so the arm is separate and the
+        // reorder it implies is COUNTED (`[G632:conflict]`), never assumed away.
+        G632EpochScope g632TexEpoch(g632TexEpochOn(), 2);
         for (size_t i = 0; i < g_g144List.size() && !s_g599NoBind; ++i)
         {
             const G178EntryState &st = s_states[i];
@@ -4200,9 +4224,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
 
             // G630: decode PSMT8 directly from persistent raw VRAM. FIFO order places the view
             // before the native draw that consumes this texture key, with no publication/wait.
+            // G632: keep the gate's reject bitmask so the `tex` break census below reads the
+            // admission that actually ran, not a recomputation of it.
+            uint32_t g632T8Mask = ~0u;
             if (e.ctx.tex0.psm == GS_PSM_T8)
             {
-                const uint64_t g630T8Key = g630TryT8View(e, st);
+                const uint64_t g630T8Key = g630TryT8View(e, st, &g632T8Mask);
                 if (g630T8Key != 0u)
                 {
                     s_g281ViewKey[i] = g630T8Key;
@@ -4347,9 +4374,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             // that loop MATERIALIZES any dirty resident target overlapping the read, which bumps
             // the very page generations G623's version test reads, so a decision taken after it
             // could never be clean.
+            uint32_t g632BindMask = ~0u;
             {
                 const uint32_t g630Src =
-                    g630TryBind(fbp, e, st, s_g261FboSrc[i] != 0u);
+                    g630TryBind(fbp, e, st, s_g261FboSrc[i] != 0u, &g632BindMask);
                 if (g630Src != 0u)
                 {
                     s_g261FboSrc[i] = g630Src;
@@ -4367,13 +4395,50 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     continue;
                 }
             }
+            // ===== G634: THE GPU-NATIVE TEXTURE READ =====
+            // Every direct-FBO bind above declined. Before conceding a guest-VRAM authority
+            // transition, decode the texture out of the persistent raw image with TEX0 addressing.
+            // This sits BELOW the FBO binds on purpose: a bind that succeeds costs no GPU work at
+            // all, while this costs one cached compute dispatch per texture per pass — but it is
+            // unconditionally cheaper than the synchronous publication it replaces, and it needs
+            // neither a resident surface, nor `fst`, nor a per-draw UV containment proof.
+            {
+                uint32_t g634Mask = ~0u;
+                const uint64_t g634Key = g634TryRawView(e, st, &g634Mask);
+                if (g634Key != 0u)
+                {
+                    s_g281ViewKey[i] = g634Key;
+                    s_g281ViewSrc[i] = -2; // decoded inside the GPU domain; no CPU build follows
+                    continue;
+                }
+            }
             // G630 fallback: a CPU decode is a proven CPU-visible boundary. If the exact direct
             // view gate declined, publish only the texture pages it is about to read.
             if (e.prim.tme)
             {
-                const G144BlockRange g630Tex = g144TextureRange(e);
-                g630MaterializeForRanges(g630Tex, G144BlockRange{}, !g630Tex.valid, false,
-                                         kG261MatTexAlias);
+                const G633TexturePlan *g633Plan = g633PlansOn()
+                    ? g633TexturePlanConst(st.residencyPlan) : nullptr;
+                const G144BlockRange g630Tex = g633Plan != nullptr
+                    ? g633Plan->texRange : g144TextureRange(e);
+                // G632 census: WHY both direct-view gates declined, as one per-draw bitmask
+                // (G628's law). `auth=1` marks the draws that are real `tex` breaks — the ones
+                // whose texture pages are actually GPU-authoritative right now.
+                if (g632StatOn())
+                {
+                    if (g632T8Mask == ~0u)
+                        g632T8Mask = g630T8RejectMask(e, st, nullptr, nullptr);
+                    if (g632BindMask == ~0u)
+                        g632BindMask = kG632BindOff;
+                    g632NoteTexReject(g632BindMask, g632T8Mask,
+                                      g633Plan != nullptr
+                                          ? g633TexturePlanHasAuthority(st.residencyPlan)
+                                          : g630RangeHasGpuAuthority(g630Tex),
+                                      static_cast<uint32_t>(e.ctx.tex0.psm));
+                }
+                if (g633Plan == nullptr ||
+                    !g633MaterializeTexturePlan(st.residencyPlan, kG261MatTexAlias))
+                    g630MaterializeForRanges(g630Tex, G144BlockRange{}, !g630Tex.valid, false,
+                                             kG261MatTexAlias);
             }
             for (uint32_t t = 0; t < kG248TargetCount; ++t)
             {
@@ -4571,6 +4636,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                                    : std::chrono::steady_clock::time_point{};
                         const auto g323MatT0 = g323Armed ? std::chrono::steady_clock::now()
                                                          : std::chrono::steady_clock::time_point{};
+                        // G632: this is the OTHER writer of guest VRAM inside the tex epoch. If it
+                        // ever lands while a G630 publication is deferred, the two writers of the
+                        // same page have been reordered. Count it, and count the overlapping
+                        // subset — `overlapping=0` is the evidence the deferral is unobservable.
+                        g632NoteG261InEpoch(r.range);
                         g261Materialize(static_cast<int>(t), kG261MatTexAlias);
                         if (g342On)
                             g342NoteTexAlias(
@@ -4682,6 +4752,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 s_g261FboSrc.clear();
         }
     }
+    // G633: a later pre-pass ownership event can invalidate a view admitted earlier in this pass.
+    // Repair only those event-queued consumers now, after all coherence preparation and before any
+    // native draw consumes the resident token.
+    g633FinalizeTexturePass();
     const bool g261HaveFboSrc = g261AnyBind; // s_g261FboSrc sized to the list only when true
 
     const auto g298T3 = s_g298Profile ? std::chrono::steady_clock::now()

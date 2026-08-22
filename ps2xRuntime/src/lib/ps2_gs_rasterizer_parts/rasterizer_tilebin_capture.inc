@@ -353,6 +353,19 @@
                         g529T = t;
                         g529BeginDispatch();
                     }
+                    // G638b (no-op unless DC2_G638_PREP=1): lap the phases of THIS window. It is
+                    // the same bracket `[G529:cls] wall` uses, so the laps sum to that wall and
+                    // name the ~9.8 ms/f of `dragon`'s legacy dispatch that is not rasterization.
+                    auto g638T = g_g638PrepCensusOn ? std::chrono::steady_clock::now()
+                                                    : std::chrono::steady_clock::time_point{};
+                    const auto g638Lap = [&g638T](int phase) {
+                        if (!g_g638PrepCensusOn)
+                            return;
+                        const auto now = std::chrono::steady_clock::now();
+                        g638PrepNote(phase, static_cast<uint64_t>(
+                            std::chrono::duration_cast<std::chrono::nanoseconds>(now - g638T).count()));
+                        g638T = now;
+                    };
                     GS *rgs = g_g144LastGs;
                     const bool g570Linear139 = g570Cpu139LinearBatchCandidate();
                     static const bool s_g570BatchStat =
@@ -408,6 +421,7 @@
                         g_g144List.front().ctx.frame.fbp == 0x139u;
                     if (g570Cpu139Batch && !g570PreparedBatch)
                         g570Cpu139PrepareDepthTiles();
+                    g638Lap(kG638PhG570Prep);
                     // G605: one palette-decode pass per batch, whichever leaf claims it. G580's
                     // single 0x13b shape wins when present (it is the narrower contract); otherwise
                     // G605's property-admitted family gets the same tables. They must never both
@@ -434,6 +448,7 @@
                         g605SharedClutBatchSelected(g_g144List) &&
                         g605PrepareSharedCluts(g_g144List, g605ClutFill);
                     const bool g605AnySharedClut = g580SharedClutBatch || g605SharedClutBatch;
+                    g638Lap(kG638PhClut);
                     const auto g571ClearT = s_g571Split
                         ? std::chrono::steady_clock::now()
                         : std::chrono::steady_clock::time_point{};
@@ -460,10 +475,18 @@
                     const bool g629Gpu =
                         !g629Skip && g629TryReplayGpu(g_g144List, rgs, rgs->m_vram,
                                                       rgs->m_vramSize, g605ClutFill);
+                    g638Lap(kG638PhG629);
                     if (!g629Skip && !g629Gpu)
                     {
                     g630PrepareCpuReplay();
-                    GSRowPool::instance().run(y0, y1, g529Lanes,
+                    // G637 (default-off, DC2_G637_COOP=1): the cooperative, weight-balanced,
+                    // work-stealing replacement for the fixed equal-row eight-lane barrier. With
+                    // the lever off this forwards to the very same
+                    // `GSRowPool::instance().run(y0, y1, g529Lanes, job)` call, so the shipped path
+                    // is unchanged; with it on, the SAME job body runs over a different set of
+                    // contiguous disjoint row ranges (exactness argument unchanged — see
+                    // g637_coop_replay.inc §0 and GSRowPool::runCoop).
+                    g637RunReplay(y0, y1, g529Lanes, g_g144List,
                                               [self, rgs, g570Linear139,
                                                g570PreparedBatch,
                                                g570GpuBatch,
@@ -639,8 +662,27 @@
                         }
                         else
                         {
-                            for (const auto &e : g_g144List)
-                                g570DrawEntry(e);
+                            // G637: replay only the entries whose bbox can reach this chunk's rows.
+                            // The bucket membership predicate IS `e.maxY < a || e.minY > b` — the
+                            // same test g570DrawEntry applies on its first line — evaluated ONCE per
+                            // (entry, chunk) on the dispatcher instead of once per entry per chunk
+                            // here, and filled in submission order, so both the visited SET and its
+                            // ORDER are identical to the full walk. When the index is absent
+                            // (lever off, DC2_G637_NO_INDEX=1, or the legacy pool path) this falls
+                            // through to that walk unchanged.
+                            const int g637Chunk = g_g637IdxEnt ? g637ChunkOf(a) : -1;
+                            if (g637Chunk >= 0)
+                            {
+                                const uint32_t g637Lo = g_g637IdxOff[g637Chunk];
+                                const uint32_t g637Hi = g_g637IdxOff[g637Chunk + 1];
+                                for (uint32_t g637K = g637Lo; g637K < g637Hi; ++g637K)
+                                    g570DrawEntry(g_g144List[g_g637IdxEnt[g637K]]);
+                            }
+                            else
+                            {
+                                for (const auto &e : g_g144List)
+                                    g570DrawEntry(e);
+                            }
                         }
                         if (g570Linear139)
                             g570Cpu139LinearEnd(rgs->m_vram, rgs->m_vramSize);
@@ -654,6 +696,7 @@
                                               });
                     g630NoteCpuReplay();
                     }
+                    g638Lap(kG638PhPool);
                     const uint64_t g571ClearUs = s_g571Split
                         ? static_cast<uint64_t>(std::chrono::duration_cast<
                               std::chrono::microseconds>(
@@ -663,6 +706,12 @@
                     {
                         constexpr int g570Y0 = 0;
                         constexpr int g570Y1 = static_cast<int>(kG403DisplayZH) - 1;
+                        // ⭐⭐⭐ G636: this block reads target 0x139's whole colour band out of
+                        // GUEST VRAM and the shared depth mirror, and writes the band back — and
+                        // it runs even when the resident GPU replay took this flush. Settle both
+                        // resident authorities first or it commits pre-replay bytes over the
+                        // replay's own output (the measured `ridepod` chassis loss).
+                        g636SettleSurfaceBand(0x139u, 8u, g570Y0, g570Y1, true);
                         std::vector<uint32_t> initial, candidate;
                         auto g571PhaseT = s_g571Split
                             ? std::chrono::steady_clock::now()
@@ -766,6 +815,7 @@
                                          gpuOk ? 1u : 0u);
                         }
                     }
+                    g638Lap(kG638PhG570Gpu);
                     if (g529On)
                     {
                         g529EndDispatch();
@@ -788,6 +838,9 @@
                                           std::chrono::nanoseconds>(
                                           std::chrono::steady_clock::now() - g629T0).count(),
                                       g529Rows);
+                    g638Lap(kG638PhTail);
+                    if (g_g638PrepCensusOn)
+                        g638PrepEndBatch();
                 }
                 const auto g290T4 = g290P ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
@@ -851,6 +904,14 @@
                 s_seq.m_vram = rgs->m_vram;
                 s_seq.m_vramSize = rgs->m_vramSize;
                 s_seq.m_privRegs = rgs->m_privRegs;
+                // ⭐⭐⭐ G636: THE SEQUENTIAL DRAIN NEVER HAD G630'S CONTRACT. It is the frame-end
+                // tail closure and it runs the identical CPU rasterizer over `g_g144List` — reading
+                // and writing guest VRAM and the shared `g403DisplayZBuf()` depth mirror — with no
+                // publication in front of it and no invalidation behind it. The parallel closure
+                // above has had both since G630; this one was simply missed, so under
+                // `DC2_G630_RESIDENT` it read pre-replay bytes and left the GPU depth mirror
+                // believing it was still current.
+                g630PrepareCpuReplay();
                 t_g144InReplay = true;
                 t_g144Banded = false; // full row range
                 for (const auto &e : g_g144List)
@@ -885,6 +946,7 @@
                 t_g144TitleRockScopeOverride = false;
                 t_g144TownDepthScopeOverride = false;
                 t_g144InReplay = false;
+                g630NoteCpuReplay(); // G636: the missing other half of the contract (see above)
                 g242NoteCpuReplayWrites(g_g144LastGs->m_vram);
                 // G261: the wave arm disables the G260 pre-execution RTT generation bump (it
                 // would poison GPU-resident targets); publish the replay's RTT writes here,

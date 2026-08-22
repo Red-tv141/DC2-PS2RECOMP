@@ -548,6 +548,20 @@ static uint32_t g349FboKey(uint32_t fbp, int w)
 {
     return (g349DecolOn() && fbp == 0x139u && w != 512) ? kG349Narrow139 : fbp;
 }
+// ⭐⭐⭐ G636: the resident G629 replay used to mirror its result into `ensureFbo(fbp, ...)` — the
+// SAME per-`fbp` FBO the native renderer draws into — and the shader's `imageStore(gLinearView,..)`
+// runs for EVERY invocation of the `width x height` dispatch grid, not only for pixels a record
+// covered. So one resident batch overwrote that whole rect of the native FBO with raw-image
+// content, destroying any native draw the raw image does not contain. That is the measured
+// `ridepod` chassis loss. RETIRED BY DEFAULT: the mirror is written to a private key and the
+// shader's view store is disabled, so the raw image reaches the native renderer only through the
+// guest-VRAM publication that `g636` now settles before every FBO seed.
+// `DC2_G636_LINVIEW=1` restores the pre-G636 behaviour verbatim (defect included).
+static bool g636LinViewOn()
+{
+    static const bool on = g158EnvFlag("DC2_G636_LINVIEW");
+    return on;
+}
 static uint32_t g289RealSourceFbp(uint32_t fbp)
 {
     if (fbp == kG289ZeroFbpToken)
@@ -1188,7 +1202,268 @@ void main()
         m_locG630T8Tbp = m_f.glGetUniformLocation_(m_g630T8Prog, "uTbp");
         m_locG630T8Tbw = m_f.glGetUniformLocation_(m_g630T8Prog, "uTbw");
         return m_locG630T8Width >= 0 && m_locG630T8Height >= 0 &&
-               m_locG630T8Tbp >= 0 && m_locG630T8Tbw >= 0;
+               m_locG630T8Tbp >= 0 && m_locG630T8Tbw >= 0 && setupG634RawView();
+    }
+
+    // ===== G634: CT32/CT24 TEXTURE decode straight out of the persistent raw-VRAM image ==========
+    //
+    // `ct32Word` is the SAME word address expression the G630 CT32 surface view uses (G631/G630
+    // verified it at bad=0 over 430,952,960 words) — it is copied verbatim rather than re-derived,
+    // per G629's "do not RESTATE a shipped predicate" law. The only differences from that program
+    // are the ones that make this a TEXTURE rather than a surface mirror:
+    //   * `uBlock` is TEX0.TBP0 (already a block address) and `uFbw` is TEX0.TBW, so no FRAME/
+    //     surface has to exist for the consumer to be served;
+    //   * the output is exactly texW x texH with GS row 0 at output row 0 (no V flip), so
+    //     `textureSize(uTex,0)` downstream IS the declared texture size and every wrap / 12.4
+    //     rounding rule keeps operating on the dimensions the guest declared;
+    //   * PSMCT24 substitutes TEXA alpha with the exact `applyTexa` rule
+    //     (`a = (AEM && rgb==0) ? 0 : TA0`).
+    bool setupG634RawView()
+    {
+        static const char *kCS = R"GLSL(#version 430 core
+layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
+layout(r32ui, binding=0) readonly uniform uimage2D gVram;
+layout(r32ui, binding=1) readonly uniform uimage2D gPageMap;
+layout(rgba8, binding=2) writeonly uniform image2D gOut;
+uniform int uBlock;
+uniform int uFbw;
+uniform int uWidth;
+uniform int uHeight;
+uniform int uCt24;
+uniform int uTa0;
+uniform int uAem;
+ivec2 dc2048(uint i) { return ivec2(int(i & 2047u), int(i >> 11u)); }
+uint ct32Word(int x, int y)
+{
+    int page = (uBlock >> 5) + (y >> 5) * uFbw + (x >> 6);
+    uint local = uint((y & 31) * 64 + (x & 63));
+    return uint(page) * 2048u + imageLoad(gPageMap, ivec2(int(local), 0)).r;
+}
+void main()
+{
+    ivec2 p = ivec2(gl_GlobalInvocationID.xy);
+    if (p.x >= uWidth || p.y >= uHeight) return;
+    uint w = imageLoad(gVram, dc2048(ct32Word(p.x, p.y) & 1048575u)).r;
+    uint a = (w >> 24u) & 255u;
+    if (uCt24 != 0)
+    {
+        bool rgbZero = (w & 16777215u) == 0u;
+        a = (uAem != 0 && rgbZero) ? 0u : uint(uTa0);
+    }
+    vec4 c = vec4(float(w & 255u), float((w >> 8u) & 255u),
+                  float((w >> 16u) & 255u), float(a)) / 255.0;
+    imageStore(gOut, p, c);
+}
+)GLSL";
+        GLuint cs = 0u;
+        std::string log;
+        if (!g158CompileShader(m_f, GL541_COMPUTE_SHADER, kCS, cs, log))
+        {
+            std::fprintf(stderr, "[G634:gpu] raw view compile failed: %s\n", log.c_str());
+            return false;
+        }
+        m_g634RawProg = m_f.glCreateProgram_();
+        m_f.glAttachShader_(m_g634RawProg, cs);
+        m_f.glLinkProgram_(m_g634RawProg);
+        GLint linked = 0;
+        m_f.glGetProgramiv_(m_g634RawProg, GL158_LINK_STATUS, &linked);
+        m_f.glDeleteShader_(cs);
+        if (!linked)
+        {
+            GLint len = 0;
+            m_f.glGetProgramiv_(m_g634RawProg, GL158_INFO_LOG_LENGTH, &len);
+            std::vector<char> buf(len > 0 ? static_cast<size_t>(len) : 1u, 0);
+            m_f.glGetProgramInfoLog_(m_g634RawProg, static_cast<GLsizei>(buf.size()), nullptr,
+                                     buf.data());
+            std::fprintf(stderr, "[G634:gpu] raw view link failed: %s\n", buf.data());
+            m_f.glDeleteProgram_(m_g634RawProg);
+            m_g634RawProg = 0u;
+            return false;
+        }
+        m_locG634RawBlock = m_f.glGetUniformLocation_(m_g634RawProg, "uBlock");
+        m_locG634RawFbw = m_f.glGetUniformLocation_(m_g634RawProg, "uFbw");
+        m_locG634RawWidth = m_f.glGetUniformLocation_(m_g634RawProg, "uWidth");
+        m_locG634RawHeight = m_f.glGetUniformLocation_(m_g634RawProg, "uHeight");
+        m_locG634RawCt24 = m_f.glGetUniformLocation_(m_g634RawProg, "uCt24");
+        m_locG634RawTa0 = m_f.glGetUniformLocation_(m_g634RawProg, "uTa0");
+        m_locG634RawAem = m_f.glGetUniformLocation_(m_g634RawProg, "uAem");
+        // A missing uniform location here would silently decode from block 0: fail the whole
+        // G629/G630 setup instead, which leaves the prototype unavailable rather than wrong.
+        return m_locG634RawBlock >= 0 && m_locG634RawFbw >= 0 && m_locG634RawWidth >= 0 &&
+               m_locG634RawHeight >= 0 && m_locG634RawCt24 >= 0 && m_locG634RawTa0 >= 0 &&
+               m_locG634RawAem >= 0 && setupG634RawUpload();
+    }
+
+    // ===== G634b: Host->Local IMAGE ingestion for ANY pixel format ===============================
+    // One masked read-modify-write per DISTINCT raw-VRAM word. The front end guarantees exactly one
+    // op per word, so the dispatch has no intra-pass write conflict and needs no atomics.
+    bool setupG634RawUpload()
+    {
+        static const char *kCS = R"GLSL(#version 430 core
+layout(local_size_x=64, local_size_y=1, local_size_z=1) in;
+layout(r32ui, binding=0) uniform uimage2D gVram;
+layout(r32ui, binding=1) readonly uniform uimage2D gOps;
+uniform int uOpCount;
+ivec2 dc2048(uint i) { return ivec2(int(i & 2047u), int(i >> 11u)); }
+void main()
+{
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= uint(uOpCount)) return;
+    uint b = i * 3u;
+    uint idx  = imageLoad(gOps, dc2048(b)).r & 1048575u;
+    uint val  = imageLoad(gOps, dc2048(b + 1u)).r;
+    uint mask = imageLoad(gOps, dc2048(b + 2u)).r;
+    ivec2 p = dc2048(idx);
+    uint dst = imageLoad(gVram, p).r;
+    imageStore(gVram, p, uvec4((dst & ~mask) | (val & mask), 0u, 0u, 0u));
+}
+)GLSL";
+        GLuint cs = 0u;
+        std::string log;
+        if (!g158CompileShader(m_f, GL541_COMPUTE_SHADER, kCS, cs, log))
+        {
+            std::fprintf(stderr, "[G634:gpu] raw upload compile failed: %s\n", log.c_str());
+            return false;
+        }
+        m_g634UpProg = m_f.glCreateProgram_();
+        m_f.glAttachShader_(m_g634UpProg, cs);
+        m_f.glLinkProgram_(m_g634UpProg);
+        GLint linked = 0;
+        m_f.glGetProgramiv_(m_g634UpProg, GL158_LINK_STATUS, &linked);
+        m_f.glDeleteShader_(cs);
+        if (!linked)
+        {
+            GLint len = 0;
+            m_f.glGetProgramiv_(m_g634UpProg, GL158_INFO_LOG_LENGTH, &len);
+            std::vector<char> buf(len > 0 ? static_cast<size_t>(len) : 1u, 0);
+            m_f.glGetProgramInfoLog_(m_g634UpProg, static_cast<GLsizei>(buf.size()), nullptr,
+                                     buf.data());
+            std::fprintf(stderr, "[G634:gpu] raw upload link failed: %s\n", buf.data());
+            m_f.glDeleteProgram_(m_g634UpProg);
+            m_g634UpProg = 0u;
+            return false;
+        }
+        m_locG634UpCount = m_f.glGetUniformLocation_(m_g634UpProg, "uOpCount");
+        return m_locG634UpCount >= 0;
+    }
+
+    bool prepareG634RawUpload(const std::shared_ptr<G634RawUploadPacket> &p)
+    {
+        if (!p || m_g634UpProg == 0u || !m_ready.load(std::memory_order_acquire) ||
+            p->ops.empty() || (p->ops.size() % 3u) != 0u)
+            return false;
+        auto promise = std::make_shared<std::promise<bool>>();
+        std::future<bool> future = promise->get_future();
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.g634Up = p;
+            item.promise = promise;
+            m_queue.push_back(std::move(item));
+            m_g630Futures.push_back(std::move(future));
+        }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
+        m_cvWork.notify_one();
+        return true;
+    }
+
+    bool runG634RawUploadOnWorker(const G634RawUploadPacket &p)
+    {
+        if (m_g634UpProg == 0u || m_g629ColorTex == 0u || m_g629ColorRows != 512u ||
+            p.ops.empty() || (p.ops.size() % 3u) != 0u)
+            return false;
+        while (glGetError() != GL_NO_ERROR) {}
+        if (!g629Upload(m_g634UpOpsTex, m_g634UpOpsRows, 2048u, p.ops, m_g634UpOpsPad))
+            return false;
+        const GLint count = static_cast<GLint>(p.ops.size() / 3u);
+        m_f.glUseProgram_(m_g634UpProg);
+        m_e.glBindImageTexture_(0u, m_g629ColorTex, 0, GL_FALSE, 0,
+                                GL178_READ_WRITE, GL541_R32UI);
+        m_e.glBindImageTexture_(1u, m_g634UpOpsTex, 0, GL_FALSE, 0,
+                                GL542_READ_ONLY, GL541_R32UI);
+        m_f.glUniform1i_(m_locG634UpCount, count);
+        m_e.glDispatchCompute_(static_cast<GLuint>((count + 63) / 64), 1u, 1u);
+        m_e.glMemoryBarrier_(GL178_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                             GL178_TEXTURE_FETCH_BARRIER_BIT);
+        if (glGetError() != GL_NO_ERROR) return false;
+        ++m_g634RawUploads;
+        m_g634RawUploadOps += static_cast<uint64_t>(count);
+
+        // Oracle (DC2_G634_VERIFY): read the touched rows back and assert that every MASKED bit in
+        // the raw image now equals the value the guest transfer produced. Unmasked bits are
+        // deliberately not compared — they belong to whatever the GPU already owned.
+        if (p.verify && !p.ops.empty())
+        {
+            uint32_t lo = 0xFFFFFFFFu, hi = 0u;
+            for (size_t i = 0; i < p.ops.size(); i += 3u)
+            {
+                const uint32_t row = (p.ops[i] & 1048575u) >> 11u;
+                lo = std::min(lo, row); hi = std::max(hi, row);
+            }
+            if (lo <= hi && hi < 512u)
+            {
+                std::vector<uint32_t> raw;
+                if (readG630ImageOnWorker(false, raw, lo, hi - lo + 1u))
+                {
+                    const bool full = raw.size() >= static_cast<size_t>(512u) * 2048u;
+                    const uint32_t base = full ? 0u : lo;
+                    if (full || raw.size() == static_cast<size_t>(hi - lo + 1u) * 2048u)
+                    {
+                        uint64_t bad = 0u;
+                        for (size_t i = 0; i < p.ops.size(); i += 3u)
+                        {
+                            const uint32_t idx = p.ops[i] & 1048575u;
+                            const size_t j = static_cast<size_t>(idx) -
+                                             static_cast<size_t>(base) * 2048u;
+                            if (j >= raw.size()) { ++bad; continue; }
+                            if ((raw[j] & p.ops[i + 2u]) != (p.ops[i + 1u] & p.ops[i + 2u]))
+                                ++bad;
+                        }
+                        m_g634UpVerifyChecks += p.ops.size() / 3u;
+                        m_g634UpVerifyBad += bad;
+                        ++m_g634UpVerifyRuns;
+                        if (bad != 0u || m_g634UpVerifyRuns <= 8u ||
+                            (m_g634UpVerifyRuns % 256u) == 0u)
+                            std::fprintf(stderr,
+                                         "[G634:upvfy] runs=%llu checks=%llu bad=%llu "
+                                         "(this: psm=%u ops=%zu bad=%llu)\n",
+                                         (unsigned long long)m_g634UpVerifyRuns,
+                                         (unsigned long long)m_g634UpVerifyChecks,
+                                         (unsigned long long)m_g634UpVerifyBad,
+                                         p.psm, p.ops.size() / 3u,
+                                         (unsigned long long)bad);
+                    }
+                }
+            }
+            while (glGetError() != GL_NO_ERROR) {}
+        }
+        return true;
+    }
+
+    bool prepareG634RawView(const std::shared_ptr<G634RawViewPacket> &p)
+    {
+        if (!p || m_g634RawProg == 0u || !m_ready.load(std::memory_order_acquire) ||
+            p->texKey == 0u || p->width <= 0 || p->height <= 0 || p->tbw == 0u ||
+            (!p->pageWords.empty() && p->pageWords.size() != 64u * 32u) ||
+            p->patchWords.size() != p->patchPages.size() * 2048u)
+            return false;
+        auto promise = std::make_shared<std::promise<bool>>();
+        std::future<bool> future = promise->get_future();
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.g634Raw = p;
+            item.promise = promise;
+            m_queue.push_back(std::move(item));
+            m_g630Futures.push_back(std::move(future));
+        }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
+        m_cvWork.notify_one();
+        return true;
     }
 
     bool setupG630View()
@@ -2020,6 +2295,8 @@ private:
         std::shared_ptr<G630ViewPacket> g630View;
         std::shared_ptr<G630UploadPacket> g630Upload;
         std::shared_ptr<G630T8Packet> g630T8;
+        std::shared_ptr<G634RawViewPacket> g634Raw;
+        std::shared_ptr<G634RawUploadPacket> g634Up;
         std::vector<uint32_t> *g630ReadVram = nullptr;
         std::vector<uint32_t> *g630ReadDepth = nullptr;
         // G631: row band of the persistent raw-VRAM image to read back (row p == guest page p).
@@ -2527,8 +2804,10 @@ private:
                     g495Cls = kG495ClsG630View;
                 else if (item.g630Upload != nullptr)
                     g495Cls = kG495ClsG630Upload;
-                else if (item.g630T8 != nullptr)
+                else if (item.g630T8 != nullptr || item.g634Raw != nullptr)
                     g495Cls = kG495ClsG630T8;
+                else if (item.g634Up != nullptr)
+                    g495Cls = kG495ClsG630Upload;
                 else if (item.g630ReadVram != nullptr || item.g630ReadDepth != nullptr)
                     g495Cls = kG495ClsG630Read;
                 else if (item.g570TriWords != nullptr)
@@ -2591,6 +2870,10 @@ private:
                     ok = runG630UploadOnWorker(*item.g630Upload);
                 else if (item.g630T8 != nullptr)
                     ok = runG630T8OnWorker(*item.g630T8);
+                else if (item.g634Raw != nullptr)
+                    ok = runG634RawViewOnWorker(*item.g634Raw);
+                else if (item.g634Up != nullptr)
+                    ok = runG634RawUploadOnWorker(*item.g634Up);
                 else if (item.g630ReadVram != nullptr)
                     ok = readG630ImageOnWorker(false, *item.g630ReadVram,
                                                item.g630ReadRowLo, item.g630ReadRowCount);
@@ -3789,7 +4072,10 @@ void main()
                              item.g629WantDepth ? *item.g629Depth : kEmptyDepth, pad))
             return false;
 
-        const uint32_t viewKey = item.g629Resident
+        // G636: only the restored legacy arm aims this at the shared per-fbp FBO. Otherwise it is
+        // the same private key the non-resident arm uses, and nothing is stored into it.
+        const bool g636LinView = item.g629Resident && g636LinViewOn();
+        const uint32_t viewKey = g636LinView
             ? (static_cast<uint32_t>(item.g629Block) >> 5u) : 0xFFFFFFFCu;
         FboEntry &linearView = ensureFbo(viewKey, item.g629Width, 512);
         if (linearView.colorTex == 0u || linearView.physW != item.g629Width ||
@@ -3814,7 +4100,7 @@ void main()
         m_f.glUniform1i_(m_locG629Block,     item.g629Block);
         m_f.glUniform1i_(m_locG629Fbw,       item.g629Fbw);
         m_f.glUniform1i_(m_locG629FirstPage, item.g629FirstPage);
-        m_f.glUniform1i_(m_locG629WriteView, item.g629Resident ? 1 : 0);
+        m_f.glUniform1i_(m_locG629WriteView, g636LinView ? 1 : 0);
         m_f.glUniform1i_(m_locG629ViewHeight, 512);
 
         const GLuint gx = static_cast<GLuint>((item.g629Width  + 7) / 8);
@@ -4041,6 +4327,180 @@ void main()
             m_resident.insert(p.texKey);
         }
         return true;
+    }
+
+    // G634: decode one CT32/CT24 texture out of the persistent raw-VRAM image into an ordinary
+    // texW x texH RGBA8 texture object in the shared cache, keyed by the front-end's view key.
+    // Nothing here touches guest VRAM: the pages that are still CPU-authoritative arrive as
+    // patches (identical run-coalesced transport as G630's T8 view) and the rest are already in
+    // the image, so the producer -> memory -> consumer chain stays inside the GPU domain.
+    bool runG634RawViewOnWorker(const G634RawViewPacket &p)
+    {
+        if (m_g634RawProg == 0u || m_g629ColorTex == 0u || m_g629ColorRows != 512u ||
+            p.tbw == 0u || p.width <= 0 || p.height <= 0 ||
+            (!p.pageWords.empty() && p.pageWords.size() != 64u * 32u) ||
+            p.patchWords.size() != p.patchPages.size() * 2048u)
+            return false;
+        while (glGetError() != GL_NO_ERROR) {}
+        if (!p.pageWords.empty())
+        {
+            if (!g629Upload(m_g630ViewMapTex, m_g630ViewMapRows, 2048u,
+                            p.pageWords, m_g630ViewMapPad))
+                return false;
+            m_g630ViewMapReady = true;
+            m_g634MapWords = p.pageWords;
+        }
+        if (!m_g630ViewMapReady) return false;
+        {
+            const bool g631Split = g631SplitOn();
+            const auto g631T0 = g631Split ? std::chrono::steady_clock::now()
+                                          : std::chrono::steady_clock::time_point{};
+            uint64_t g631Calls = 0u;
+            if (!g631UploadPatchPages(m_g629ColorTex, p.patchPages, p.patchWords, g631Calls))
+                return false;
+            if (g631Split)
+                g631NotePatch(kG631SiteT8, p.patchPages.size(), g631Calls,
+                              std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - g631T0).count(),
+                              0.0);
+        }
+
+        TexEntry &out = m_texCache[p.texKey];
+        if (out.id == 0u)
+        {
+            glGenTextures(1, &out.id);
+            if (out.id == 0u) { m_texCache.erase(p.texKey); return false; }
+        }
+        else
+            m_texBytes -= std::min(m_texBytes,
+                                   static_cast<size_t>(out.w) * out.h * 4u);
+        glBindTexture(GL_TEXTURE_2D, out.id);
+        if (out.w != p.width || out.h != p.height)
+        {
+            glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(GL158_RGBA8),
+                         p.width, p.height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                            static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                            static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+        }
+        out.w = p.width;
+        out.h = p.height;
+        out.lastUse = m_batchCounter + 1u;
+        m_texBytes += static_cast<size_t>(p.width) * p.height * 4u;
+
+        m_f.glUseProgram_(m_g634RawProg);
+        m_e.glBindImageTexture_(0u, m_g629ColorTex, 0, GL_FALSE, 0,
+                                GL542_READ_ONLY, GL541_R32UI);
+        m_e.glBindImageTexture_(1u, m_g630ViewMapTex, 0, GL_FALSE, 0,
+                                GL542_READ_ONLY, GL541_R32UI);
+        m_e.glBindImageTexture_(2u, out.id, 0, GL_FALSE, 0,
+                                GL178_WRITE_ONLY, GL158_RGBA8);
+        m_f.glUniform1i_(m_locG634RawBlock, static_cast<GLint>(p.tbp));
+        m_f.glUniform1i_(m_locG634RawFbw, static_cast<GLint>(p.tbw));
+        m_f.glUniform1i_(m_locG634RawWidth, p.width);
+        m_f.glUniform1i_(m_locG634RawHeight, p.height);
+        m_f.glUniform1i_(m_locG634RawCt24, p.psm == 1u ? 1 : 0);
+        m_f.glUniform1i_(m_locG634RawTa0, static_cast<GLint>(p.ta0 & 0xFFu));
+        m_f.glUniform1i_(m_locG634RawAem, p.aem != 0u ? 1 : 0);
+        m_e.glDispatchCompute_(static_cast<GLuint>((p.width + 7) / 8),
+                               static_cast<GLuint>((p.height + 7) / 8), 1u);
+        m_e.glMemoryBarrier_(GL178_SHADER_IMAGE_ACCESS_BARRIER_BIT |
+                             GL178_TEXTURE_FETCH_BARRIER_BIT);
+        if (glGetError() != GL_NO_ERROR)
+            return false;
+        ++m_g634RawViews;
+
+        if (p.verify)
+            verifyG634RawViewOnWorker(p, out.id);
+
+        {
+            std::lock_guard<std::mutex> lk(m_residentMtx);
+            m_resident.insert(p.texKey);
+        }
+        return true;
+    }
+
+    // G634 exactness oracle (DC2_G634_VERIFY=1, diagnosis only — it stalls the worker on two
+    // readbacks per view). Two independent references, because either alone has a blind spot:
+    //   1. `p.expected` — the front end's CPU decode of the SAME texture out of guest VRAM. It is
+    //      supplied only when the texture's pages carry NO GPU authority, i.e. when guest VRAM is
+    //      provably current, so it validates the whole TEX0 -> word address -> TEXA chain against
+    //      the shipped `GSMem::ReadCT32` + `applyTexa` path end to end.
+    //   2. the raw image itself — read back and re-addressed here in C++ with the page word map.
+    //      This one runs on EVERY view, including the GPU-authoritative ones the first reference
+    //      cannot see, and is the check for the G629 class of GLSL/C++ divergence.
+    void verifyG634RawViewOnWorker(const G634RawViewPacket &p, GLuint outTex)
+    {
+        if (outTex == 0u || m_g634MapWords.size() != 64u * 32u) return;
+        // Bound the oracle's own cost, or a verify run never reaches the scenes worth checking:
+        // the readback below is a synchronous round trip and every view pays one.
+        if (m_g634VerifyRuns >= 200000u) return;
+        const size_t texels = static_cast<size_t>(p.width) * p.height;
+        // Read back only the raw ROWS this texture's pages live in (row p IS guest page p). The
+        // page span of a CT32/CT24 texture is contiguous in page index, so this is one band.
+        const uint32_t pageLo = (p.tbp >> 5) & 511u;
+        const uint32_t pageHiRaw = (p.tbp >> 5) +
+                                   static_cast<uint32_t>((p.height - 1) >> 5) * p.tbw +
+                                   static_cast<uint32_t>((p.width - 1) >> 6);
+        if (pageHiRaw >= 512u || pageHiRaw < pageLo) return; // wrapped: outside this oracle's scope
+        const uint32_t rowCount = pageHiRaw - pageLo + 1u;
+        std::vector<uint32_t> outPx(texels, 0u);
+        glBindTexture(GL_TEXTURE_2D, outTex);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, outPx.data());
+        std::vector<uint32_t> raw;
+        if (!readG630ImageOnWorker(false, raw, pageLo, rowCount))
+        {
+            while (glGetError() != GL_NO_ERROR) {}
+            return;
+        }
+        const bool full = raw.size() >= static_cast<size_t>(512u) * 2048u;
+        if (!full && raw.size() != static_cast<size_t>(rowCount) * 2048u)
+        {
+            while (glGetError() != GL_NO_ERROR) {}
+            return;
+        }
+        const uint32_t base = full ? 0u : pageLo;
+        const bool haveRef = p.expected.size() == texels;
+        uint64_t bad = 0u;
+        for (int y = 0; y < p.height; ++y)
+            for (int x = 0; x < p.width; ++x)
+            {
+                const uint32_t page = static_cast<uint32_t>(
+                    (static_cast<int>(p.tbp) >> 5) + (y >> 5) * static_cast<int>(p.tbw) +
+                    (x >> 6));
+                const uint32_t local = m_g634MapWords[
+                    static_cast<size_t>((y & 31) * 64 + (x & 63))];
+                const uint32_t word = (page * 2048u + local) & 1048575u;
+                const size_t idxRaw = static_cast<size_t>(word) -
+                                      static_cast<size_t>(base) * 2048u;
+                if (idxRaw >= raw.size()) { ++bad; continue; }
+                const uint32_t w = raw[idxRaw];
+                uint32_t a = (w >> 24u) & 255u;
+                if (p.psm == 1u)
+                    a = (p.aem != 0u && (w & 0x00FFFFFFu) == 0u) ? 0u : (p.ta0 & 0xFFu);
+                const uint32_t expect = (w & 0x00FFFFFFu) | (a << 24u);
+                const size_t idx = static_cast<size_t>(y) * p.width + x;
+                if (outPx[idx] != expect) ++bad;
+                if (haveRef && p.expected[idx] != expect) ++bad;
+            }
+        m_g634VerifyChecks += texels * (haveRef ? 2ull : 1ull);
+        m_g634VerifyBad += bad;
+        if (haveRef) ++m_g634VerifyRef;
+        ++m_g634VerifyRuns;
+        if (bad != 0u || m_g634VerifyRuns <= 8u || (m_g634VerifyRuns % 256u) == 0u)
+            std::fprintf(stderr,
+                         "[G634:vfy] runs=%llu ref=%llu checks=%llu bad=%llu "
+                         "(this: tbp=0x%04x tbw=%u psm=%u %dx%d bad=%llu)\n",
+                         (unsigned long long)m_g634VerifyRuns,
+                         (unsigned long long)m_g634VerifyRef,
+                         (unsigned long long)m_g634VerifyChecks,
+                         (unsigned long long)m_g634VerifyBad,
+                         p.tbp, p.tbw, p.psm, p.width, p.height,
+                         (unsigned long long)bad);
+        while (glGetError() != GL_NO_ERROR) {}
     }
 
     // G631: `rowCount != 0` reads only rows [rowLo, rowLo+rowCount) of the persistent raw-VRAM
@@ -8706,6 +9166,21 @@ void main()
     GLint m_locG630T8Tbp = -1, m_locG630T8Tbw = -1;
     bool m_g630T8PermReady = false;
     std::vector<uint32_t> m_g630T8Pad;
+    // G634: the raw-VRAM CT32/CT24 TEXTURE view. Shares G630's CT32 page word map texture — the
+    // map is a property of the PSMCT32 page layout, not of any one consumer.
+    GLuint m_g634RawProg = 0u;
+    GLint m_locG634RawBlock = -1, m_locG634RawFbw = -1;
+    GLint m_locG634RawWidth = -1, m_locG634RawHeight = -1;
+    GLint m_locG634RawCt24 = -1, m_locG634RawTa0 = -1, m_locG634RawAem = -1;
+    uint64_t m_g634RawViews = 0u, m_g634VerifyChecks = 0u, m_g634VerifyBad = 0u;
+    uint64_t m_g634VerifyRuns = 0u, m_g634VerifyRef = 0u;
+    std::vector<uint32_t> m_g634MapWords; // oracle's own copy of the CT32 page word map
+    GLuint m_g634UpProg = 0u, m_g634UpOpsTex = 0u;
+    uint32_t m_g634UpOpsRows = 0u;
+    GLint m_locG634UpCount = -1;
+    std::vector<uint32_t> m_g634UpOpsPad;
+    uint64_t m_g634RawUploads = 0u, m_g634RawUploadOps = 0u;
+    uint64_t m_g634UpVerifyRuns = 0u, m_g634UpVerifyChecks = 0u, m_g634UpVerifyBad = 0u;
     GLuint m_g570Prog = 0;
     GLuint m_g570ColorTex = 0, m_g570DepthTex = 0, m_g570TriTex = 0;
     GLuint m_g570SpanTex = 0, m_g570TileOffsetTex = 0, m_g570TileTriTex = 0;

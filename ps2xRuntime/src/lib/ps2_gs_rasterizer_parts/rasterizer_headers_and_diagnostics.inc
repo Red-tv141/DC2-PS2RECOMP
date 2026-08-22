@@ -71,6 +71,10 @@ bool g630_backend_submit(const std::shared_ptr<G630ReplayPacket> &packet);
 bool g630_backend_prepare_ct32_view(const std::shared_ptr<G630ViewPacket> &packet);
 bool g630_backend_submit_upload(const std::shared_ptr<G630UploadPacket> &packet);
 bool g630_backend_prepare_t8_view(const std::shared_ptr<G630T8Packet> &packet);
+// G634: CT32/CT24 texture view decoded from the raw image, addressed by TEX0 rather than FRAME.
+bool g634_backend_prepare_raw_view(const std::shared_ptr<G634RawViewPacket> &packet);
+// G634b: format-agnostic Host->Local IMAGE ingestion as masked raw-VRAM word deltas.
+bool g634_backend_submit_raw_upload(const std::shared_ptr<G634RawUploadPacket> &packet);
 bool g630_backend_poll(bool wait, std::vector<uint8_t> &results);
 bool g630_backend_read_vram(std::vector<uint32_t> &out);
 // G631: band form of the above. `out.size()` tells the caller whether it got the requested band
@@ -284,6 +288,8 @@ std::atomic<uint64_t> g_g148LeafReads{0};    // total g141SamplePoint leaf reads
 // threads, so a thread_local decode would rebuild the texture up to 8x and can net-lose; the cache is
 // keyed on the full texture descriptor + a VRAM GENERATION counter (bumped on every image upload /
 // local transfer), built ONCE under a mutex per (key,gen), read lock-free by all band lanes.
+using G633GuestCommitHook = void (*)();
+G633GuestCommitHook g_g633GuestCommitHook = nullptr;
 std::atomic<uint64_t> g_g149VramGen{1};  // bumped by g149BumpVramGen() on every VRAM write
 std::atomic<uint64_t> g_g149Hits{0};     // cache hits (decoded buffer reused)
 std::atomic<uint64_t> g_g149Builds{0};   // decode builds (one per distinct texture/gen)
@@ -343,6 +349,7 @@ uint64_t g_g149MapGen = 0;
 void g149BumpVramGen()
 {
     g_g149VramGen.fetch_add(1u, std::memory_order_relaxed);
+    if (g_g633GuestCommitHook != nullptr) g_g633GuestCommitHook();
 }
 // Lock-free pointers into a lazily-filled decoded texture, valid only during a G144 band replay of an
 // eligible tri (set by the replay closures before drawTriangle; null otherwise). Read/written in

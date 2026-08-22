@@ -2377,6 +2377,23 @@ static void g261Materialize(int ti, int cause)
             g264FlushMirror(ti);
         return;
     }
+    // G636: the mirror of the FBO-seed hazard. This publication writes the FBO back OVER guest
+    // VRAM; a G630 publication of the same pages afterwards would then overwrite it with the OLDER
+    // raw content, because G630's authority is settled lazily and this write does not clear it.
+    // `g261MaterializeForRanges` already orders the two correctly, but a DIRECT `g261Materialize`
+    // (g261PrepareCpuReplay, g261MaterializeAllDirty, the T8 atlas builders, kG261MatResync) does
+    // not — so the ordering belongs here, where every caller gets it.
+    if (!s_g636NoMatPub && g630DomainOn() && g630AnyDirty() && r.fbW > 0 &&
+        r.dirtyHi >= r.dirtyLo)
+    {
+        const G144BlockRange g636Pub = g144RangeForRect(
+            framePageBaseToBlock(kG261Fbp[ti]), GS_PSM_CT32, r.fbw, 0u,
+            static_cast<uint32_t>(std::max(0, r.dirtyLo)),
+            static_cast<uint32_t>(r.fbW),
+            static_cast<uint32_t>(r.dirtyHi - r.dirtyLo + 1));
+        g630MaterializeForRanges(G144BlockRange{}, g636Pub, false, !g636Pub.valid, cause);
+        if (s_g636Stat) g_g636MatPub.fetch_add(1u, std::memory_order_relaxed);
+    }
     const bool g279Profile = g279ProfileOn();
     const auto g279T0 = g279Profile ? std::chrono::steady_clock::now()
                                     : std::chrono::steady_clock::time_point{};
@@ -3201,6 +3218,9 @@ static void g572BumpOwnedBlockRange(uint32_t firstBlock, uint32_t lastBlock)
         return;
     const uint32_t firstPage = firstBlock >> 5u;
     const uint32_t lastPage = lastBlock >> 5u;
+    if (g_g633GuestWriteHook != nullptr)
+        g_g633GuestWriteHook(firstPage, lastPage - firstPage + 1u,
+                             0u, 0u, 0u, lastPage - firstPage, true, 17u);
     const bool traceOn = g570BumpTraceOn();
     G570BumpTrace trace{};
     if (traceOn)

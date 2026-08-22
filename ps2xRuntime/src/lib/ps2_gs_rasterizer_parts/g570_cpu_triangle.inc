@@ -442,7 +442,340 @@ inline bool g570Batch139TileMayCover(const G570Batch139Tri &p, int tx, int ty)
     return true;
 }
 
+// ===== G639: the 0x139 GPU payload build, PARALLEL (bring-up DEFAULT OFF, DC2_G639_PAYPAR=1) =====
+//
+// PREMISE (G638 §2.2, measured on `dragon`'s static tail): `g570Batch139Prepare` is 4.735 ms/f of a
+// 33.8 ms/f **sole GS pole**, and `[G638:prep] ^payload` puts **76% of it (≈3.6 ms/f)** inside
+// `g570Batch139BuildGpuPayloadSerial` below — one thread, on the pole, once per frame.
+//
+// ⭐ WHY IT PARALLELISES EXACTLY. Every output offset is known BEFORE any word is written:
+//   * the tri header is a fixed 20-word stride, so triangle i owns `[i*20, i*20+20)`;
+//   * a triangle emits one 4-word span record per bbox ROW, and `maxY-minY+1` is already in the
+//     `G570Batch139Tri`, so a serial O(n) prefix pass fixes every triangle's span base — and that
+//     prefix IS the `gpuSpanOffset` the serial build writes into word 4 (it pushes
+//     `GpuSpans.size()/4` at that moment);
+//   * the tile bin is the only order-sensitive output, and it is a counting sort. Counting it
+//     PER CHUNK and prefix-summing **tile-major, chunk-minor** puts chunk c's triangles for tile t
+//     after chunk c-1's, and each chunk fills its own region in increasing triangle index — so the
+//     bin list is byte-identical to the serial cursor walk.
+// Every participant therefore writes a disjoint range. Nothing is reordered, nothing is recomputed,
+// no arithmetic changes: this is the same law G637 §3 used for the band replay (contiguous /
+// disjoint / in-order), applied to a build instead of a rasterization.
+//
+// ⭐ CHUNKING. Equal triangle COUNTS are not equal work — a triangle's cost is its bbox row count.
+// Per G637 §5 the answer is NOT a work estimator: over-decompose (4 chunks per lane) and let
+// `GSRowPool::runCoop` steal, with the caller participating. Same engine G638 promoted.
+//
+// ⛔ The serial build returns false on the first `fitsI32` overflow, leaving the vectors partly
+// written; the caller then sets reject reason 7 and the next `Prepare` clears them. The parallel
+// build sets an atomic flag and returns false after the join, so it may do more work before
+// bailing — the vectors are discarded either way, so the observable behaviour is identical.
+//
+// Oracle: DC2_G639_PAYPAR_VERIFY=1 runs BOTH and compares all four output vectors byte for byte.
+static bool g570Batch139BuildGpuPayloadSerial();
+
+// ⭐⭐⭐ PROMOTED DEFAULT-ON (G639). Exactness: `DC2_G639_PAYPAR_VERIFY=1` built every batch BOTH
+// ways and compared all four output vectors byte for byte — **bad=0 on 2,400 batches** (~10.9 M
+// triangles), zero MISMATCH lines. Payoff: order-balanced A B B A on `dragon`'s static tail,
+// 2,040 presents matched per arm, both order blocks agreeing in sign:
+//     block 1 (A1 vs B1): frame -2.333 ms/f (-6.84%)   GS own -2.344
+//     block 2 (A2 vs B2): frame -3.430 ms/f (-9.57%)   GS own -3.309
+//     POOLED: 34.975 -> 32.094 = -2.882 ms/f (-8.24%)  GS own 32.857 -> 30.030
+// Rollback: DC2_G639_NO_PAYPAR=1 -> g570Batch139BuildGpuPayloadSerial, which is the original
+// function renamed and otherwise byte-for-byte unchanged.
+static bool g639PayParOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G639_NO_PAYPAR");
+    return on;
+}
+
+static bool g639PayParVerifyOn()
+{
+    static const bool on = envFlagEnabled("DC2_G639_PAYPAR_VERIFY");
+    return on;
+}
+
+static bool g639PayParStatOn()
+{
+    static const bool on = envFlagEnabled("DC2_G639_PAYPAR_STAT") || g639PayParVerifyOn();
+    return on;
+}
+
+// Scratch, reused across frames (never reallocated in the steady state).
+static std::vector<uint32_t> g_g639SpanBase;        // per triangle, in 4-word span records
+static std::vector<uint32_t> g_g639ChunkTileCount;  // chunks * tileCount
+static std::vector<uint32_t> g_g639ChunkTileCursor; // chunks * tileCount
+static std::vector<int> g_g639Bounds;               // chunks+1 triangle fences
+static std::atomic<uint32_t> g_g639Fail{0u};
+static uint64_t g_g639ParBatches = 0ull, g_g639ParBad = 0ull;
+
+static bool g570Batch139BuildGpuPayloadParallel()
+{
+    constexpr int tileShift = 4;
+    constexpr int tileSize = 1 << tileShift;
+    constexpr int tilesX = static_cast<int>(kG403DisplayZW) / tileSize;
+    constexpr int tilesY = static_cast<int>(kG403DisplayZH) / tileSize;
+    constexpr size_t tileCount = static_cast<size_t>(tilesX) * tilesY;
+    constexpr size_t triStride = 20u;
+
+    const size_t n = g_g570Batch139Tris.size();
+    g_g570Batch139GpuTris.clear();
+    g_g570Batch139GpuSpans.clear();
+    g_g570Batch139GpuTileOffsets.clear();
+    g_g570Batch139GpuTileTris.clear();
+    if (n == 0u)
+        return false; // unreachable: the caller rejects an empty tri list first (reason 6)
+
+    const bool tileCull = g570Batch139TileCullOn();
+    const auto fitsI32 = [](int64_t value) {
+        return value >= std::numeric_limits<int32_t>::min() &&
+               value <= std::numeric_limits<int32_t>::max();
+    };
+
+    // ---- Phase 1 (serial, O(n)): fix every output offset up front.
+    g_g639SpanBase.resize(n);
+    uint32_t spanRecs = 0u;
+    for (size_t i = 0; i < n; ++i)
+    {
+        g_g639SpanBase[i] = spanRecs;
+        const G570Batch139Tri &p = g_g570Batch139Tris[i];
+        if (p.maxX >= p.minX)
+            spanRecs += static_cast<uint32_t>(p.maxY - p.minY + 1);
+    }
+    g_g570Batch139GpuTris.resize(n * triStride);
+    g_g570Batch139GpuSpans.resize(static_cast<size_t>(spanRecs) * 4u);
+
+    // ---- Chunking: over-decompose 4x the lane count, exactly as G637's replay does.
+    int lanes = (g_g144Threads > 1) ? g_g144Threads : 1;
+    const int cap = GSRowPool::instance().laneCap();
+    if (lanes > cap)
+        lanes = cap;
+    int chunks = lanes * 4;
+    if (chunks > static_cast<int>(n))
+        chunks = static_cast<int>(n);
+    if (chunks < 1)
+        chunks = 1;
+    g_g639Bounds.resize(static_cast<size_t>(chunks) + 1u);
+    for (int c = 0; c <= chunks; ++c)
+        g_g639Bounds[static_cast<size_t>(c)] =
+            static_cast<int>(static_cast<int64_t>(n) * c / chunks);
+    g_g639ChunkTileCount.assign(static_cast<size_t>(chunks) * tileCount, 0u);
+    g_g639Fail.store(0u, std::memory_order_relaxed);
+
+    const int *bounds = g_g639Bounds.data();
+    const auto chunkOf = [bounds, chunks](int a) {
+        int lo = 0, hi = chunks - 1;
+        while (lo < hi)
+        {
+            const int mid = (lo + hi + 1) >> 1;
+            if (bounds[mid] <= a) lo = mid; else hi = mid - 1;
+        }
+        return lo;
+    };
+
+    // ---- Phase 2 (parallel): headers + span records + per-chunk tile counts.
+    const std::function<void(int, int)> emit = [&](int a, int b) {
+        uint32_t *cnt = g_g639ChunkTileCount.data() +
+                        static_cast<size_t>(chunkOf(a)) * tileCount;
+        for (int i = a; i <= b; ++i)
+        {
+            const G570Batch139Tri &p = g_g570Batch139Tris[static_cast<size_t>(i)];
+            const uint32_t gpuSpanOffset = g_g639SpanBase[static_cast<size_t>(i)];
+            if (!fitsI32(p.step[0]) || !fitsI32(p.step[1]) || !fitsI32(p.step[2]))
+            {
+                g_g639Fail.store(1u, std::memory_order_relaxed);
+                return;
+            }
+            uint32_t *h = g_g570Batch139GpuTris.data() + static_cast<size_t>(i) * triStride;
+            h[0] = static_cast<uint32_t>(p.minX);
+            h[1] = static_cast<uint32_t>(p.maxX);
+            h[2] = static_cast<uint32_t>(p.minY);
+            h[3] = static_cast<uint32_t>(p.maxY);
+            h[4] = gpuSpanOffset;
+            h[5] = static_cast<uint32_t>(p.step[0]);
+            h[6] = static_cast<uint32_t>(p.step[1]);
+            h[7] = static_cast<uint32_t>(p.step[2]);
+            h[8] = static_cast<uint32_t>(p.topLeftMask) | (p.delta > 0 ? 0x100u : 0u);
+            h[9] = g570Batch139FloatBits(p.a0);
+            h[10] = g570Batch139FloatBits(p.b0);
+            h[11] = g570Batch139FloatBits(p.a1);
+            h[12] = g570Batch139FloatBits(p.b1);
+            h[13] = g570Batch139FloatBits(p.fx2);
+            h[14] = g570Batch139FloatBits(p.fy2);
+            h[15] = g570Batch139FloatBits(p.winding);
+            h[16] = g570Batch139FloatBits(p.invAbsDenom);
+            h[17] = g570Batch139FloatBits(p.z0);
+            h[18] = g570Batch139FloatBits(p.z1);
+            h[19] = g570Batch139FloatBits(p.z2);
+            if (p.maxX < p.minX)
+                continue;
+
+            const int64_t baseSx = static_cast<int64_t>(p.minX) * 16;
+            const int64_t baseSy = static_cast<int64_t>(p.minY) * 16;
+            int64_t rowEdge[3] = {
+                ((p.fx[2] - p.fx[1]) * (baseSy - p.fy[1]) -
+                 (p.fy[2] - p.fy[1]) * (baseSx - p.fx[1])) * p.sign,
+                ((p.fx[0] - p.fx[2]) * (baseSy - p.fy[2]) -
+                 (p.fy[0] - p.fy[2]) * (baseSx - p.fx[2])) * p.sign,
+                ((p.fx[1] - p.fx[0]) * (baseSy - p.fy[0]) -
+                 (p.fy[1] - p.fy[0]) * (baseSx - p.fx[0])) * p.sign,
+            };
+            const int64_t rowStep[3] = {
+                (p.fx[2] - p.fx[1]) * 16 * p.sign,
+                (p.fx[0] - p.fx[2]) * 16 * p.sign,
+                (p.fx[1] - p.fx[0]) * 16 * p.sign,
+            };
+            uint32_t *sp = g_g570Batch139GpuSpans.data() +
+                           static_cast<size_t>(gpuSpanOffset) * 4u;
+            for (int y = p.minY; y <= p.maxY; ++y)
+            {
+                const uint32_t packedSpan = g_g570Batch139Spans[
+                    static_cast<size_t>(p.spanOffset) + static_cast<size_t>(y - p.minY)];
+                const int xStart = static_cast<int16_t>(packedSpan & 0xffffu);
+                const int xEnd = static_cast<int16_t>(packedSpan >> 16u);
+                const int64_t startDx = static_cast<int64_t>(xStart - p.minX);
+                const int64_t edge0 = rowEdge[0] + p.step[0] * startDx;
+                const int64_t edge1 = rowEdge[1] + p.step[1] * startDx;
+                const int64_t edge2 = rowEdge[2] + p.step[2] * startDx;
+                const int64_t dx = std::max<int64_t>(0, xEnd - xStart);
+                const int64_t advance0 = p.step[0] * dx;
+                const int64_t advance1 = p.step[1] * dx;
+                const int64_t advance2 = p.step[2] * dx;
+                if (!fitsI32(edge0) || !fitsI32(edge1) || !fitsI32(edge2) ||
+                    !fitsI32(advance0) || !fitsI32(advance1) || !fitsI32(advance2) ||
+                    !fitsI32(edge0 + advance0) || !fitsI32(edge1 + advance1) ||
+                    !fitsI32(edge2 + advance2))
+                {
+                    g_g639Fail.store(1u, std::memory_order_relaxed);
+                    return;
+                }
+                sp[0] = packedSpan;
+                sp[1] = static_cast<uint32_t>(edge0);
+                sp[2] = static_cast<uint32_t>(edge1);
+                sp[3] = static_cast<uint32_t>(edge2);
+                sp += 4;
+                rowEdge[0] += rowStep[0];
+                rowEdge[1] += rowStep[1];
+                rowEdge[2] += rowStep[2];
+            }
+
+            const int tx0 = p.minX >> tileShift;
+            const int tx1 = p.maxX >> tileShift;
+            const int ty0 = p.minY >> tileShift;
+            const int ty1 = p.maxY >> tileShift;
+            for (int ty = ty0; ty <= ty1; ++ty)
+                for (int tx = tx0; tx <= tx1; ++tx)
+                    if (!tileCull || g570Batch139TileMayCover(p, tx, ty))
+                        ++cnt[static_cast<size_t>(ty) * tilesX + tx];
+        }
+    };
+    GSRowPool::instance().runCoop(bounds, chunks, lanes - 1, emit);
+    if (g_g639Fail.load(std::memory_order_relaxed) != 0u)
+        return false;
+
+    // ---- Phase 3 (serial, O(tiles * chunks) = 896 * 32): the counting-sort prefix.
+    g_g570Batch139GpuTileOffsets.assign(tileCount + 1u, 0u);
+    g_g639ChunkTileCursor.resize(static_cast<size_t>(chunks) * tileCount);
+    uint32_t running = 0u;
+    for (size_t t = 0; t < tileCount; ++t)
+    {
+        g_g570Batch139GpuTileOffsets[t] = running;
+        for (int c = 0; c < chunks; ++c)
+        {
+            const size_t k = static_cast<size_t>(c) * tileCount + t;
+            g_g639ChunkTileCursor[k] = running;
+            running += g_g639ChunkTileCount[k];
+        }
+    }
+    g_g570Batch139GpuTileOffsets[tileCount] = running;
+    g_g570Batch139GpuTileTris.resize(running);
+
+    // ---- Phase 4 (parallel): fill each chunk's own slice of every tile, in triangle order.
+    const std::function<void(int, int)> bin = [&](int a, int b) {
+        uint32_t *cur = g_g639ChunkTileCursor.data() +
+                        static_cast<size_t>(chunkOf(a)) * tileCount;
+        for (int i = a; i <= b; ++i)
+        {
+            const G570Batch139Tri &p = g_g570Batch139Tris[static_cast<size_t>(i)];
+            if (p.maxX < p.minX)
+                continue;
+            const int tx0 = p.minX >> tileShift;
+            const int tx1 = p.maxX >> tileShift;
+            const int ty0 = p.minY >> tileShift;
+            const int ty1 = p.maxY >> tileShift;
+            for (int ty = ty0; ty <= ty1; ++ty)
+                for (int tx = tx0; tx <= tx1; ++tx)
+                {
+                    if (tileCull && !g570Batch139TileMayCover(p, tx, ty))
+                        continue;
+                    const size_t tile = static_cast<size_t>(ty) * tilesX + tx;
+                    g_g570Batch139GpuTileTris[cur[tile]++] = static_cast<uint32_t>(i);
+                }
+        }
+    };
+    GSRowPool::instance().runCoop(bounds, chunks, lanes - 1, bin);
+
+    if (g_g570Batch139GpuTris.empty() || g_g570Batch139GpuSpans.empty() ||
+        g_g570Batch139GpuTileTris.empty())
+        return false;
+    g570Batch139PadGpuWords(g_g570Batch139GpuTris);
+    g570Batch139PadGpuWords(g_g570Batch139GpuSpans);
+    g570Batch139PadGpuWords(g_g570Batch139GpuTileOffsets);
+    g570Batch139PadGpuWords(g_g570Batch139GpuTileTris);
+    return true;
+}
+
 static bool g570Batch139BuildGpuPayload()
+{
+    if (!g639PayParOn())
+        return g570Batch139BuildGpuPayloadSerial();
+    if (!g639PayParVerifyOn())
+        return g570Batch139BuildGpuPayloadParallel();
+
+    // Oracle: build in PARALLEL, snapshot, rebuild SERIALLY, compare byte for byte. The serial
+    // arm writes last, so a defect in the parallel build cannot reach a pixel while this is armed.
+    const bool rPar = g570Batch139BuildGpuPayloadParallel();
+    std::vector<uint32_t> vTris = g_g570Batch139GpuTris;
+    std::vector<uint32_t> vSpans = g_g570Batch139GpuSpans;
+    std::vector<uint32_t> vOff = g_g570Batch139GpuTileOffsets;
+    std::vector<uint32_t> vBins = g_g570Batch139GpuTileTris;
+    const bool rSer = g570Batch139BuildGpuPayloadSerial();
+    ++g_g639ParBatches;
+    const bool eq = (rPar == rSer) && vTris == g_g570Batch139GpuTris &&
+                    vSpans == g_g570Batch139GpuSpans &&
+                    vOff == g_g570Batch139GpuTileOffsets &&
+                    vBins == g_g570Batch139GpuTileTris;
+    if (!eq)
+    {
+        ++g_g639ParBad;
+        if (g_g639ParBad <= 8ull)
+        {
+            size_t firstTris = static_cast<size_t>(-1), firstSpans = static_cast<size_t>(-1),
+                   firstBins = static_cast<size_t>(-1);
+            for (size_t i = 0; i < vTris.size() && i < g_g570Batch139GpuTris.size(); ++i)
+                if (vTris[i] != g_g570Batch139GpuTris[i]) { firstTris = i; break; }
+            for (size_t i = 0; i < vSpans.size() && i < g_g570Batch139GpuSpans.size(); ++i)
+                if (vSpans[i] != g_g570Batch139GpuSpans[i]) { firstSpans = i; break; }
+            for (size_t i = 0; i < vBins.size() && i < g_g570Batch139GpuTileTris.size(); ++i)
+                if (vBins[i] != g_g570Batch139GpuTileTris[i]) { firstBins = i; break; }
+            std::fprintf(stderr,
+                         "[G639:paypar] MISMATCH n=%llu tris=%zu/%zu@%zd spans=%zu/%zu@%zd "
+                         "off=%zu/%zu bins=%zu/%zu@%zd rPar=%u rSer=%u\n",
+                         (unsigned long long)g_g639ParBad,
+                         vTris.size(), g_g570Batch139GpuTris.size(), (ptrdiff_t)firstTris,
+                         vSpans.size(), g_g570Batch139GpuSpans.size(), (ptrdiff_t)firstSpans,
+                         vOff.size(), g_g570Batch139GpuTileOffsets.size(),
+                         vBins.size(), g_g570Batch139GpuTileTris.size(), (ptrdiff_t)firstBins,
+                         rPar ? 1u : 0u, rSer ? 1u : 0u);
+        }
+    }
+    if (g639PayParStatOn() && (g_g639ParBatches % 600ull) == 0ull)
+        std::fprintf(stderr, "[G639:paypar] batches=%llu bad=%llu\n",
+                     (unsigned long long)g_g639ParBatches, (unsigned long long)g_g639ParBad);
+    return rSer;
+}
+
+static bool g570Batch139BuildGpuPayloadSerial()
 {
     constexpr int tileShift = 4;
     constexpr int tileSize = 1 << tileShift;
@@ -710,7 +1043,291 @@ inline void g570Batch139ExactSpan(const G570Batch139Tri &p, const int64_t rowEdg
     xEnd = p.minX + static_cast<int>(hi);
 }
 
+// ===== G638: static-batch memo for the 0x139 shadow payload (BRING-UP DEFAULT OFF) =====
+//
+// PREMISE (measured, `dragon` static tail, `[G638:prep]`): `g570Batch139Prepare` is **4.735 ms/f**
+// of a 33.8 ms/f GS pole — 40% of the whole CPU-fallback dispatch window — and `[G638:prep] ^payload`
+// puts 76% of that inside `g570Batch139BuildGpuPayload`. What it rebuilds is a PURE FUNCTION of
+// `g_g144List`: the same ~4,544 shadow triangles are re-linearised into the same 20-word tri
+// records, the same 4-word span records and the same 896-tile bin index every frame, and
+// `[G147:gif]` reports byte-identical `tags` / `packedRegs` / `imageKB` window after window.
+//
+// ⭐ EXACT WITHOUT A HASH. The memo does not fingerprint the batch — it keeps the exact bytes of
+// every field the builder reads and compares them with `memcmp`, so there is no collision to
+// reason about. The correctness obligation is therefore ENUMERATION, not probability: a field the
+// builder reads and this key omits is a false HIT and a wrong pixel. The read set below is taken
+// from the builder line by line, and `DC2_G638_PAYCACHE_VERIFY=1` rebuilds anyway and compares all
+// four output vectors byte for byte so a missed field cannot survive a verified run.
+//
+// ⛔ The gates ABOVE the key (env flags, `g203UniversalZEnabled`, `g404SharedZScope`, the null
+// `g_g144LastGs`) are re-evaluated every frame and are NOT memoized — they read state the key
+// cannot see. A memo hit is only taken when they all pass, exactly as a rebuild would require.
+struct G638ShadowKey
+{
+    uint64_t test, zbuf, alpha, fba;
+    float x0, y0, z0, x1, y1, z1, x2, y2, z2;
+    uint32_t fbp, fbw, fbmsk, bits;
+    uint16_t sx0, sx1, sy0, sy1, ofx, ofy;
+    uint8_t r2, g2, b2, a2;
+};
+
+static std::vector<G638ShadowKey> g_g638ShadowKey;
+static bool g_g638PayCacheValid = false;
+static bool g_g638PayCacheResult = false;
+static int g_g638PayCacheReject = 0;
+static uint64_t g_g638PayCacheHits = 0ull, g_g638PayCacheMiss = 0ull, g_g638PayCacheBad = 0ull;
+
+// ⛔ THE MEMO NEEDS ITS OWN STORAGE. `g570Batch139PrepareBuild` clears the six shipped output
+// vectors on EVERY call, and `dragon`'s static tail runs ~12 CPU-fallback batches per frame of
+// which only one is the 0x139 shadow batch — so the eleven others would wipe a memo that aliased
+// them. These hold the last successful 0x139 payload and are copied back on a hit.
+static std::vector<G570Batch139Tri> g_g638MemoTris;
+static std::vector<uint32_t> g_g638MemoSpans, g_g638MemoGpuTris, g_g638MemoGpuSpans,
+    g_g638MemoTileOffsets, g_g638MemoTileTris;
+
+static void g638MemoStore()
+{
+    g_g638MemoTris = g_g570Batch139Tris;
+    g_g638MemoSpans = g_g570Batch139Spans;
+    g_g638MemoGpuTris = g_g570Batch139GpuTris;
+    g_g638MemoGpuSpans = g_g570Batch139GpuSpans;
+    g_g638MemoTileOffsets = g_g570Batch139GpuTileOffsets;
+    g_g638MemoTileTris = g_g570Batch139GpuTileTris;
+}
+
+static void g638MemoRestore()
+{
+    g_g570Batch139Tris = g_g638MemoTris;
+    g_g570Batch139Spans = g_g638MemoSpans;
+    g_g570Batch139GpuTris = g_g638MemoGpuTris;
+    g_g570Batch139GpuSpans = g_g638MemoGpuSpans;
+    g_g570Batch139GpuTileOffsets = g_g638MemoTileOffsets;
+    g_g570Batch139GpuTileTris = g_g638MemoTileTris;
+}
+
+static bool g638PayCacheOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G638_NO_PAYCACHE") &&
+                           (envFlagEnabled("DC2_G638_PAYCACHE") ||
+                            envFlagEnabled("DC2_G638_PAYCACHE_VERIFY"));
+    return on;
+}
+
+static bool g638PayCacheVerifyOn()
+{
+    static const bool on = envFlagEnabled("DC2_G638_PAYCACHE_VERIFY");
+    return on;
+}
+
+static bool g638PayCacheStatOn()
+{
+    static const bool on = envFlagEnabled("DC2_G638_PAYCACHE_STAT") || g638PayCacheVerifyOn();
+    return on;
+}
+
+// Field-group difference census. Namespace scope, never a function-local `static const bool` —
+// this is read once per ENTRY (thousands per frame) and MSVC emits a per-access TLS
+// `_Init_global_epoch` guard for the function-local form.
+static const bool g_g638KeyDiffOn = (std::getenv("DC2_G638_PAYCACHE_STAT") != nullptr) ||
+                                    (std::getenv("DC2_G638_PAYCACHE_VERIFY") != nullptr);
+// [0]=xy [1]=z [2]=rgba [3]=state [4]=scissor/offset [5]=entries differing [6]=entries compared
+static uint64_t g_g638KeyDiff[7] = {0, 0, 0, 0, 0, 0, 0};
+
+// Build this frame's key over `g_g144List` and report whether it equals the stored one. Always
+// leaves the stored key equal to this frame's, so a miss re-arms the memo for the next frame.
+static bool g638ShadowKeySameAndStore(const std::vector<G144Entry> &entries)
+{
+    const size_t n = entries.size();
+    bool same = (g_g638ShadowKey.size() == n);
+    if (!same)
+        g_g638ShadowKey.assign(n, G638ShadowKey{});
+    for (size_t i = 0; i < n; ++i)
+    {
+        const G144Entry &e = entries[i];
+        G638ShadowKey k{}; // zero-initialised, so trailing padding is identical in both keys
+        k.test = e.ctx.test;
+        k.zbuf = e.ctx.zbuf;
+        k.alpha = e.ctx.alpha;
+        k.fba = e.ctx.fba;
+        k.x0 = e.v[0].x; k.y0 = e.v[0].y; k.z0 = e.v[0].z;
+        k.x1 = e.v[1].x; k.y1 = e.v[1].y; k.z1 = e.v[1].z;
+        k.x2 = e.v[2].x; k.y2 = e.v[2].y; k.z2 = e.v[2].z;
+        k.fbp = e.ctx.frame.fbp;
+        k.fbw = e.ctx.frame.fbw;
+        k.fbmsk = e.ctx.frame.fbmsk;
+        k.bits = static_cast<uint32_t>(e.ctx.frame.psm) |
+                 (static_cast<uint32_t>(e.prim.type) << 8u) |
+                 (e.prim.iip ? 1u << 16u : 0u) |
+                 (e.prim.tme ? 1u << 17u : 0u) |
+                 (e.prim.abe ? 1u << 18u : 0u) |
+                 (e.prim.fge ? 1u << 19u : 0u) |
+                 (e.pabe ? 1u << 20u : 0u);
+        k.sx0 = e.ctx.scissor.x0; k.sx1 = e.ctx.scissor.x1;
+        k.sy0 = e.ctx.scissor.y0; k.sy1 = e.ctx.scissor.y1;
+        k.ofx = e.ctx.xyoffset.ofx; k.ofy = e.ctx.xyoffset.ofy;
+        k.r2 = e.v[2].r; k.g2 = e.v[2].g; k.b2 = e.v[2].b; k.a2 = e.v[2].a;
+        if (std::memcmp(&g_g638ShadowKey[i], &k, sizeof(k)) != 0)
+        {
+            // G638: a NULL memo is only useful if it says WHAT moved. Bucket the difference by
+            // field group, because the groups feed different halves of the payload: `xy` and
+            // `scissor` decide the spans AND the 896-tile bin index, `z` and `rgba` only reach the
+            // 20-word tri header, and `state` decides admission. A batch whose xy is stable but
+            // whose z moves would still admit a PARTIAL memo of the spans and the bin index.
+            if (g_g638KeyDiffOn)
+            {
+                const G638ShadowKey &o = g_g638ShadowKey[i];
+                if (o.x0 != k.x0 || o.y0 != k.y0 || o.x1 != k.x1 ||
+                    o.y1 != k.y1 || o.x2 != k.x2 || o.y2 != k.y2)
+                    ++g_g638KeyDiff[0];
+                if (o.z0 != k.z0 || o.z1 != k.z1 || o.z2 != k.z2)
+                    ++g_g638KeyDiff[1];
+                if (o.r2 != k.r2 || o.g2 != k.g2 || o.b2 != k.b2 || o.a2 != k.a2)
+                    ++g_g638KeyDiff[2];
+                if (o.test != k.test || o.zbuf != k.zbuf || o.alpha != k.alpha ||
+                    o.fba != k.fba || o.fbp != k.fbp || o.fbw != k.fbw ||
+                    o.fbmsk != k.fbmsk || o.bits != k.bits)
+                    ++g_g638KeyDiff[3];
+                if (o.sx0 != k.sx0 || o.sx1 != k.sx1 || o.sy0 != k.sy0 ||
+                    o.sy1 != k.sy1 || o.ofx != k.ofx || o.ofy != k.ofy)
+                    ++g_g638KeyDiff[4];
+                ++g_g638KeyDiff[5];
+            }
+            same = false;
+        }
+        if (g_g638KeyDiffOn)
+            ++g_g638KeyDiff[6];
+        g_g638ShadowKey[i] = k;
+    }
+    return same;
+}
+
+static void g638PayCacheReport()
+{
+    const uint64_t tot = g_g638PayCacheHits + g_g638PayCacheMiss;
+    std::fprintf(stderr,
+                 "[G638:paycache] batches=%llu hits=%llu misses=%llu hitRate=%.2f%% bad=%llu\n",
+                 (unsigned long long)tot, (unsigned long long)g_g638PayCacheHits,
+                 (unsigned long long)g_g638PayCacheMiss,
+                 tot ? 100.0 * (double)g_g638PayCacheHits / (double)tot : 0.0,
+                 (unsigned long long)g_g638PayCacheBad);
+    if (g_g638KeyDiffOn && g_g638KeyDiff[6] != 0ull)
+    {
+        static const char *const kName[5] = {"xy", "z", "rgba", "state", "scissor"};
+        const double denom = static_cast<double>(g_g638KeyDiff[6]);
+        std::fprintf(stderr,
+                     "[G638:keydiff] entries=%llu differing=%llu (%.2f%%)",
+                     (unsigned long long)g_g638KeyDiff[6],
+                     (unsigned long long)g_g638KeyDiff[5],
+                     100.0 * (double)g_g638KeyDiff[5] / denom);
+        for (int i = 0; i < 5; ++i)
+            std::fprintf(stderr, " %s=%.2f%%", kName[i],
+                         100.0 * (double)g_g638KeyDiff[i] / denom);
+        std::fprintf(stderr, "\n");
+    }
+}
+
+static bool g570Batch139PrepareBuild();
+
 static bool g570Batch139Prepare()
+{
+    if (!g638PayCacheOn())
+        return g570Batch139PrepareBuild();
+
+    // Re-evaluate the un-memoizable gates, INCLUDING the front-entry shape test that identifies a
+    // 0x139 shadow batch at all. Every other batch bypasses the memo entirely and goes to the
+    // builder unchanged — which is why the memo keeps its own copy of the outputs (see above).
+    // This is `g570Batch139PrepareBuild`'s own reason-1 and reason-2 test, unchanged.
+    const G144Entry *front = g_g144List.empty() ? nullptr : &g_g144List.front();
+    const bool shadowBatch =
+        g570Batch139On() && g570Cpu139Quiet() && !g570Cpu139On() &&
+        !envFlagEnabled("DC2_G408_LEGACY_SHADOW_COVERAGE") &&
+        g203UniversalZEnabled() && g_g144LastGs != nullptr && g_g144List.size() >= 2u &&
+        front != nullptr && front->ctx.frame.fbp == 0x139u && front->ctx.frame.fbw == 8u &&
+        front->ctx.frame.psm == GS_PSM_CT32 && front->prim.type == GS_PRIM_SPRITE &&
+        !front->prim.tme && !front->prim.abe && !front->prim.fge &&
+        front->ctx.test == 0x3000aull && front->ctx.zbuf == 0x1010000d0ull &&
+        g404SharedZScope(0x139u, 8u, 0x0d0u, 1u);
+    if (!shadowBatch)
+        return g570Batch139PrepareBuild();
+
+    const bool same = g638ShadowKeySameAndStore(g_g144List);
+    const bool hit = same && g_g638PayCacheValid;
+    if (hit && !g638PayCacheVerifyOn())
+    {
+        ++g_g638PayCacheHits;
+        if (g638PayCacheStatOn() && ((g_g638PayCacheHits + g_g638PayCacheMiss) % 600ull) == 0ull)
+            g638PayCacheReport();
+        g638MemoRestore();
+        g_g570Batch139RejectReason = g_g638PayCacheReject;
+        return g_g638PayCacheResult;
+    }
+
+    // VERIFY arm: on what WOULD have been a hit, snapshot the memoized outputs, rebuild, and
+    // compare all four vectors byte for byte. A single mismatch means the key is missing a field.
+    std::vector<G570Batch139Tri> vTris;
+    std::vector<uint32_t> vSpans, vGpuTris, vGpuSpans, vTileOff, vTileTris;
+    const bool checking = hit && g638PayCacheVerifyOn();
+    int prevReject = g_g638PayCacheReject;
+    bool prevResult = g_g638PayCacheResult;
+    if (checking)
+    {
+        // Compare against the MEMO, not the live vectors: on a hit the live ones still hold
+        // whichever non-shadow batch ran last.
+        vTris = g_g638MemoTris;
+        vSpans = g_g638MemoSpans;
+        vGpuTris = g_g638MemoGpuTris;
+        vGpuSpans = g_g638MemoGpuSpans;
+        vTileOff = g_g638MemoTileOffsets;
+        vTileTris = g_g638MemoTileTris;
+    }
+
+    const bool r = g570Batch139PrepareBuild();
+    g638MemoStore();
+
+    if (checking)
+    {
+        const bool eq =
+            (r == prevResult) && (g_g570Batch139RejectReason == prevReject) &&
+            vSpans == g_g570Batch139Spans && vGpuTris == g_g570Batch139GpuTris &&
+            vGpuSpans == g_g570Batch139GpuSpans &&
+            vTileOff == g_g570Batch139GpuTileOffsets &&
+            vTileTris == g_g570Batch139GpuTileTris &&
+            vTris.size() == g_g570Batch139Tris.size() &&
+            (vTris.empty() || std::memcmp(vTris.data(), g_g570Batch139Tris.data(),
+                                          vTris.size() * sizeof(G570Batch139Tri)) == 0);
+        if (!eq)
+        {
+            ++g_g638PayCacheBad;
+            if (g_g638PayCacheBad <= 8ull)
+                std::fprintf(stderr,
+                             "[G638:paycache] MISMATCH n=%llu entries=%zu tris=%zu/%zu "
+                             "spans=%zu/%zu gpuTris=%zu/%zu gpuSpans=%zu/%zu tileTris=%zu/%zu "
+                             "result=%u/%u reject=%d/%d\n",
+                             (unsigned long long)g_g638PayCacheBad, g_g144List.size(),
+                             vTris.size(), g_g570Batch139Tris.size(),
+                             vSpans.size(), g_g570Batch139Spans.size(),
+                             vGpuTris.size(), g_g570Batch139GpuTris.size(),
+                             vGpuSpans.size(), g_g570Batch139GpuSpans.size(),
+                             vTileTris.size(), g_g570Batch139GpuTileTris.size(),
+                             prevResult ? 1u : 0u, r ? 1u : 0u,
+                             prevReject, g_g570Batch139RejectReason);
+        }
+        ++g_g638PayCacheHits;
+    }
+    else
+    {
+        ++g_g638PayCacheMiss;
+    }
+
+    g_g638PayCacheValid = true;
+    g_g638PayCacheResult = r;
+    g_g638PayCacheReject = g_g570Batch139RejectReason;
+    if (g638PayCacheStatOn() && ((g_g638PayCacheHits + g_g638PayCacheMiss) % 600ull) == 0ull)
+        g638PayCacheReport();
+    return r;
+}
+
+static bool g570Batch139PrepareBuild()
 {
     g_g570Batch139RejectReason = 1;
     g_g570Batch139Tris.clear();
@@ -741,6 +1358,12 @@ static bool g570Batch139Prepare()
 
     const bool gpuSpans = g570Batch139GpuOn();
     const bool tightGpuSpans = gpuSpans && g570Batch139TightGpuSpansOn();
+    // G638b sub-lap (no-op unless DC2_G638_PREP=1): `[G638:prep] g570prep` is 4.735 ms/f of
+    // `dragon`'s static tail — 40% of the whole CPU-fallback dispatch window and the largest
+    // single-threaded item on the GS pole. Split it into the per-triangle setup loop below and
+    // g570Batch139BuildGpuPayload, because they need different levers.
+    const auto g638TrisT0 = g_g638PrepCensusOn ? std::chrono::steady_clock::now()
+                                               : std::chrono::steady_clock::time_point{};
     g_g570Batch139Tris.reserve(g_g144List.size() - 1u);
     for (size_t i = 1; i < g_g144List.size(); ++i)
     {
@@ -883,12 +1506,23 @@ static bool g570Batch139Prepare()
         }
         g_g570Batch139Tris.push_back(p);
     }
+    if (g_g638PrepCensusOn)
+        g638PrepNote(kG638PhG570Tris, static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g638TrisT0).count()));
     if (g_g570Batch139Tris.empty())
     {
         g_g570Batch139RejectReason = 6;
         return false;
     }
-    if (g570Batch139GpuOn() && !g570Batch139BuildGpuPayload())
+    const auto g638PayloadT0 = g_g638PrepCensusOn ? std::chrono::steady_clock::now()
+                                                  : std::chrono::steady_clock::time_point{};
+    const bool g638PayloadOk = !g570Batch139GpuOn() || g570Batch139BuildGpuPayload();
+    if (g_g638PrepCensusOn)
+        g638PrepNote(kG638PhG570Payload, static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g638PayloadT0).count()));
+    if (!g638PayloadOk)
     {
         g_g570Batch139RejectReason = 7;
         return false;

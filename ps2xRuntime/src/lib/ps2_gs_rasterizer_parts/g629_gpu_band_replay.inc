@@ -614,6 +614,13 @@ static bool g629CeilSkipBatch(const std::vector<G144Entry> &list)
 // perturb the wall it books. `wallNs` is the caller-observed pool wall G529 already measures.
 static void g629NoteBatch(const std::vector<G144Entry> &list, uint64_t wallNs, uint64_t rows)
 {
+    // G636: book this batch's pole-thread pool wall against WHY the GPU did not take it. `wallNs`
+    // is what the GS worker actually waited for, which is the only quantity a GPU backend can hope
+    // to delete. Unconditional (a couple of relaxed adds) so the split is available without arming
+    // the G629 census, which would otherwise change the population being priced.
+    (s_g636BatchRefusedZ ? g_g636ZRefusedWallNs : g_g636ZKeptWallNs)
+        .fetch_add(wallNs, std::memory_order_relaxed);
+    s_g636BatchRefusedZ = false;
     if (!g629StatOn() || list.empty())
         return;
     const G144Entry &e0 = list[0];

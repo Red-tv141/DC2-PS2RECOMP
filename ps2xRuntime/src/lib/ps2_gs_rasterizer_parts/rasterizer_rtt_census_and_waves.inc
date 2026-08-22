@@ -644,6 +644,7 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
                                   g587ExactEntry;
         st.wrapU = exactSampler ? wu : (st.bilinear ? wu : 1u);
         st.wrapV = exactSampler ? wv : (st.bilinear ? wv : 1u);
+        if (g_g633AttachTextureHook != nullptr) g_g633AttachTextureHook(e, st);
     }
 
     // G270 line entries deliberately retain drawLine's semantics: no texture and no depth

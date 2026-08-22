@@ -46,6 +46,16 @@ bool g630_backend_prepare_t8_view(const std::shared_ptr<G630T8Packet> &packet)
     return G178Backend::instance().prepareG630T8View(packet);
 }
 
+bool g634_backend_prepare_raw_view(const std::shared_ptr<G634RawViewPacket> &packet)
+{
+    return G178Backend::instance().prepareG634RawView(packet);
+}
+
+bool g634_backend_submit_raw_upload(const std::shared_ptr<G634RawUploadPacket> &packet)
+{
+    return G178Backend::instance().prepareG634RawUpload(packet);
+}
+
 bool g630_backend_poll(bool wait, std::vector<uint8_t> &results)
 {
     return G178Backend::instance().pollG630(wait, results);

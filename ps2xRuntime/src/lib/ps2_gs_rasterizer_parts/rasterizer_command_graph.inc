@@ -1545,6 +1545,15 @@ namespace
 constexpr uint32_t kG178PageCount = 512; // 4MB VRAM / 8KB GS page
 std::atomic<uint64_t> g_g178PageGen[kG178PageCount]; // zero-initialized
 
+// G633: optional event sink for the persistent raw-VRAM domain. The hook is installed only when
+// compiled residency is armed, so the shipped non-resident path pays one predictable null branch
+// per guest write rectangle and never enters the residency planner.
+using G633GuestWriteHook = void (*)(uint32_t basePage, uint32_t widthPages,
+                                    uint32_t py0, uint32_t py1,
+                                    uint32_t px0, uint32_t px1, bool exactAligned,
+                                    uint32_t source);
+G633GuestWriteHook g_g633GuestWriteHook = nullptr;
+
 // page geometry (pixels per GS page) by PSM — used only to compute conservative page RANGES.
 void g178PageDims(uint32_t psm, uint32_t &pw, uint32_t &ph)
 {
@@ -1953,6 +1962,9 @@ void g178BumpRectImpl(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
     const uint32_t py0 = pr.py0, py1 = pr.py1, px0 = pr.px0, px1 = pr.px1;
     const uint32_t basePage = pr.basePage;
     const bool exactAligned = g572ExactAlignedGenOn() && (bpBlocks & 31u) == 0u;
+    if (g_g633GuestWriteHook != nullptr)
+        g_g633GuestWriteHook(basePage, widthPages, py0, py1, px0, px1, exactAligned,
+                             g570Source & 0xffu);
     if (g582BumpCensusOn())
         g582NoteBump(g570Source, py1 - py0 + 1u,
                      px1 - px0 + 1u + (exactAligned ? 0u : 1u));
@@ -2685,4 +2697,14 @@ struct G178EntryState
     uint8_t zpsm = 0;
     bool guestDepth = false;
     bool skip = false; // valid but draws nothing (e.g. ZTST=NEVER)
+    // G633 immutable texture-state plan. G510 copies these fields with the rest of the classified
+    // state, so identical GS state does not recompile ranges or admission conjuncts per draw.
+    uint32_t residencyPlan = 0;
+    uint32_t residencyBindMask = 0;
+    uint32_t residencyT8Mask = 0;
 };
+
+// Installed by g633_compiled_residency.inc after the legacy predicates it memoizes. A hook avoids
+// coupling this anonymous-namespace state type to the later include unit's namespace boundary.
+using G633AttachTextureHook = void (*)(const G144Entry &e, G178EntryState &st);
+static G633AttachTextureHook g_g633AttachTextureHook = nullptr;
