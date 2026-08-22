@@ -169,6 +169,8 @@ bool g630_backend_submit(const std::shared_ptr<G630ReplayPacket> &) { return fal
 bool g630_backend_prepare_ct32_view(const std::shared_ptr<G630ViewPacket> &) { return false; }
 bool g630_backend_submit_upload(const std::shared_ptr<G630UploadPacket> &) { return false; }
 bool g630_backend_prepare_t8_view(const std::shared_ptr<G630T8Packet> &) { return false; }
+bool g634_backend_prepare_raw_view(const std::shared_ptr<G634RawViewPacket> &) { return false; }
+bool g634_backend_submit_raw_upload(const std::shared_ptr<G634RawUploadPacket> &) { return false; }
 bool g630_backend_poll(bool, std::vector<uint8_t> &out) { out.clear(); return false; }
 bool g630_backend_read_vram(std::vector<uint32_t> &) { return false; }
 bool g630_backend_read_depth(std::vector<uint32_t> &) { return false; }

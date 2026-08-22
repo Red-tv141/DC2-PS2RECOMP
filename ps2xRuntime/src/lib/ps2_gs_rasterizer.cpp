@@ -315,11 +315,19 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 
 #include "ps2_gs_rasterizer_parts/rasterizer_command_graph.inc"
 
-
 #include "ps2_gs_rasterizer_parts/rasterizer_g336_runway.inc"
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_rtt_census_and_waves.inc"
+
+// G636: the arms/counters for the two-authority arbitration, plus forward declarations of the three
+// G630 entry points the two EARLY repair sites need. Must sit at the SAME scope as
+// g630_gpu_domain.inc (i.e. AFTER rasterizer_rtt_census_and_waves.inc closes the anonymous
+// namespace draw_prim_probe opened — otherwise the declarations land inside it and every later call
+// is ambiguous) and PRECEDE rasterizer_gpu_alias_page_view.inc (the g261Materialize publish order)
+// and rasterizer_vram_materialization.inc (the uploadFb seed). The predicates themselves live in
+// g636_authority_arbitration.inc, inside g630_gpu_domain.inc, because they use its page helpers.
+#include "ps2_gs_rasterizer_parts/g636_arb_flags.inc"
 
 #include "ps2_gs_rasterizer_parts/g345_closure.inc"
 
@@ -487,6 +495,15 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // namespace constraint as G528: it must sit BEFORE rasterizer_setup_and_perf_census.inc, which is
 // a FRAGMENT OF GSRasterizer::drawPrimitive's BODY. Content edit forces MSBuild to consume it (G359).
 #include "ps2_gs_rasterizer_parts/g529_replay_dispatch.inc"
+
+// G637 revision: 1 — the CPU band replay's cooperative, weight-balanced, work-stealing execution
+// engine (default-off, DC2_G637_COOP=1). MUST follow rasterizer_row_pool.inc (GSRowPool::runCoop)
+// and rasterizer_tilebinning_and_probes.inc (G144Entry), and MUST precede
+// rasterizer_tilebin_capture.inc, whose parallel flush closure is its only call site. Same
+// namespace constraint as G528/G529/G603: it sits BEFORE rasterizer_setup_and_perf_census.inc,
+// which is a FRAGMENT OF drawPrimitive's BODY and cannot contain a namespace. Content edit here
+// forces MSBuild to consume the .inc files (G359).
+#include "ps2_gs_rasterizer_parts/g637_coop_replay.inc"
 
 // G603 revision: 1 — the CPU-fallback ADMISSION census (default-off, DC2_G603_ADMIT=1). MUST follow
 // rasterizer_rtt_census_and_waves.inc (g178ClassifyEntry / kG262Rej* / g_g266ClassifySite /
