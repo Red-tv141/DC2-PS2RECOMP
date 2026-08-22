@@ -47,7 +47,7 @@ static uint8_t  g_f40_lx             = 0x80u;
 static uint8_t  g_f40_ly             = 0x80u;
 static uint32_t g_f48_2_log_count   = 0u;
 static uint32_t g_f48_3_log_count   = 0u;
-static bool dc2_env_flag_enabled(const char *name)
+static bool dc2_env_flag_enabled_uncached(const char *name)
 {
     const char *value = std::getenv(name);
     return value != nullptr &&
@@ -57,6 +57,65 @@ static bool dc2_env_flag_enabled(const char *name)
            std::strcmp(value, "FALSE") != 0 &&
            std::strcmp(value, "off") != 0 &&
            std::strcmp(value, "OFF") != 0;
+}
+
+// ===== G639: process-wide memo for dc2_env_flag_enabled (bring-up DEFAULT OFF) =====
+//
+// PREMISE. G619 cached the SIX flags one hot override read per scene node, which was 18.9% of the
+// EE thread on `dungeon1`. It did not touch the other ~150 call sites, and the residual is still
+// measurable: the EE PC sampler on `s05` (this phase) reads **`getenv` 2.07% + `memcmp` 1.85%** of
+// every sample on that thread. `getenv` is not cheap — the UCRT implementation takes the
+// environment lock and linearly scans the environment block, and this harness sets a large one.
+//
+// EXACTNESS rests on the SAME premise G619 and G268 already ship: the environment is
+// process-constant here (nothing in the tree calls `putenv`/`_putenv`/`SetEnvironmentVariable`, and
+// every harness sets variables in the parent shell before `Start-Process`). The memo therefore
+// honours G619's own control — `DC2_G619_LIVE_ENVREAD=1` disables it, so that arm keeps meaning
+// "every read is live".
+//
+// ⭐ KEYED ON THE NAME POINTER, NOT THE STRING. Every call site passes a distinct string LITERAL, so
+// pointer identity is a valid key and a hit costs one compare instead of a lock plus a scan. The one
+// caller that passes a variable (`g619EnvFlag`) forwards a literal it received, so its pointer is
+// stable too. ⛔ A caller that ever passes a REUSED BUFFER (a `std::string::c_str()`, a stack array)
+// would alias two different names onto one slot — grep before adding one.
+//
+// Slots publish `value` before `name` with a release store and are read with an acquire load, so a
+// racing reader that observes the name observes the value. Two threads computing the same slot is
+// benign: they compute the same answer from the same immutable environment.
+static const bool g_g639EnvMemoOn =
+    (std::getenv("DC2_G639_NO_ENVMEMO") == nullptr) &&
+    (std::getenv("DC2_G639_ENVMEMO") != nullptr) &&
+    (std::getenv("DC2_G619_LIVE_ENVREAD") == nullptr);
+
+struct G639EnvSlot
+{
+    std::atomic<const char *> name{nullptr};
+    bool value = false;
+};
+static constexpr uint32_t kG639EnvSlots = 256u; // >> the ~150 distinct flag literals in this TU set
+static G639EnvSlot g_g639EnvSlots[kG639EnvSlots];
+
+static bool dc2_env_flag_enabled(const char *name)
+{
+    if (!g_g639EnvMemoOn || name == nullptr)
+        return dc2_env_flag_enabled_uncached(name);
+    const uintptr_t key = reinterpret_cast<uintptr_t>(name);
+    uint32_t idx = static_cast<uint32_t>((key >> 4) ^ (key >> 12)) & (kG639EnvSlots - 1u);
+    for (uint32_t probe = 0; probe < kG639EnvSlots; ++probe)
+    {
+        const char *have = g_g639EnvSlots[idx].name.load(std::memory_order_acquire);
+        if (have == name)
+            return g_g639EnvSlots[idx].value;
+        if (have == nullptr)
+        {
+            const bool v = dc2_env_flag_enabled_uncached(name);
+            g_g639EnvSlots[idx].value = v;
+            g_g639EnvSlots[idx].name.store(name, std::memory_order_release);
+            return v;
+        }
+        idx = (idx + 1u) & (kG639EnvSlots - 1u);
+    }
+    return dc2_env_flag_enabled_uncached(name); // table full: fail OPEN to the live read
 }
 
 static bool f33_trace_drawprim_enabled()
