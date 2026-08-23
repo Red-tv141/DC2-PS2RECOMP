@@ -472,6 +472,10 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                              n, s_perfWindow, avgFrameMs, eeCpuMs,
                              100.0 * eeCpuMs / std::max(0.001, avgFrameMs));
             }
+            // ⭐ G651 (ROADMAP P1 objective 2): the dispatch-family counting instrument, printed on
+            // the same cadence so its calls/f can be divided into the sampler's percentage share.
+            // No-ops unless DC2_G651_DISP_STAT=1.
+            g651DispatchReport(static_cast<uint64_t>(n));
             std::fprintf(stderr,
                          "[G146:g144] n=%u window=%u flush: mid=%.1fms/%.2fx upload=%.1fms/%.2fx frame=%.1fms/%.2fx\n",
                          n, s_perfWindow,

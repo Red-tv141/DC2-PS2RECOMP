@@ -56,6 +56,10 @@ static uint64_t g182ThreadCpuNs() { return 0ull; }
 // frame. Same declaration style as ps2_gif_arbiter.cpp's `extern int g438SlowArm(int)`.
 extern int g503EeSlowArm();
 extern void g503RegisterEeThread();
+// ⭐ G651 (ROADMAP P1 objective 2): the EE dispatch-family counting instrument, defined in
+// ps2_runtime_parts/runtime_init_and_signals.inc. Declared at GLOBAL scope, above the anonymous
+// namespace, so it binds to the external symbol (appendix-dc2-project.md §3's linkage trap).
+extern void g651DispatchReport(unsigned long long presents);
 
 // G183: statistical PC-sampling profiler. G182 found EE is 90-99% on-CPU with 92-93% of
 // that time inside the single mgEndFrame call -- but mgEndFrame is translated GUEST code
