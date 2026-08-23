@@ -97,6 +97,22 @@ static uint32_t g570Batch139GpuDebugAt(size_t index);
 static uint32_t g570Batch139CpuDebugAt(size_t index);
 static uint32_t g570Batch139PackedCoverageHash(int x, int y);
 
+// G641 declarations. The 0x139 shadow compute's producer-scoped window is derived from G570's tile
+// bins, so its implementation follows g570_cpu_triangle.inc while its only call site — the batch
+// dispatch in rasterizer_tilebin_capture.inc — precedes it.
+static void g641NoteBatch();
+static bool g641WinOn();
+static bool g641WinUsable();
+static bool g641WinVerifyOn();
+static bool g641ShadowRect(int &x, int &y, int &w, int &h);
+static void g641ReadShadowBand(const uint8_t *vram, size_t vramSize, int y0, int y1,
+                               std::vector<uint32_t> &out);
+static void g641WriteShadowBand(uint8_t *vram, size_t vramSize, int y0, int y1,
+                                const std::vector<uint32_t> &in);
+static void g641NoteWindowUse(bool narrowed);
+static void g641RunVerify(const std::vector<uint32_t> &initial,
+                          const std::vector<uint32_t> &narrow);
+
 // G580 declarations. The implementation follows G530's swizzle helpers, while the replay
 // dispatcher owns the candidate-only serial CLUT preparation and per-entry TLS binding.
 using G580ClutFillFn =

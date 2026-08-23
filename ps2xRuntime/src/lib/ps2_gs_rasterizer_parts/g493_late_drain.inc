@@ -73,8 +73,11 @@ static bool g493LateDrainActive()
     const int arm = g493LateDrainArm(); // -1 unless DC2_G419_AB=latedrain
     if (arm >= 0)
         return arm == 1;
+    // G640's master arm IMPLIES the late drain: the deep ring is pointless if the packet is retired
+    // at the top of the next flush, before that flush has done any of its own preparation.
+    // (g640AsyncOn is forward-declared above g305DrainRequired in the including file.)
     static const bool forced = (std::getenv("DC2_G493_LATE_DRAIN") != nullptr);
-    return forced;
+    return forced || g640AsyncOn();
 }
 
 // Raised when the late drain observed a backend failure. The record stays queued and the packet is

@@ -761,6 +761,7 @@ private:
         // premise gate re-opened the VU1 direction (sensitivity 0.80 vs the GS worker's 0.76), and
         // this thread has never had a sample distribution — only occupancy timers.
         g478RegisterVu1WorkerThread();
+        g650PinThread(1 /* G650_ROLE_VU1 */); // G650 P6
         // G442 CEILING PROBE (default OFF: DC2_G442_FTZ=1). Nothing in this tree touches MXCSR, so
         // the VU1 interpreter's SSE2 FMACs run with subnormal support ON and every subnormal
         // operand/result costs a microcode assist. Setting FTZ|DAZ on THIS thread only prices that

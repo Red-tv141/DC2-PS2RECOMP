@@ -1,3 +1,7 @@
+// G646: defined in runtime_init_and_signals.inc, which this TU includes AFTER this file. Same TU,
+// internal linkage — a forward declaration is all that is needed.
+static void g646ClearAll();
+
 static bool dc2HudEnabled()
 {
     static const bool enabled = runtimeEnvFlagEnabled("DC2_HUD");
@@ -179,8 +183,38 @@ namespace
 
     std::string formatDispatchHistory();
 
+    // ⭐ G649 (ROADMAP P6): namespace-scope, not a function-local `static const bool`. This runs on
+    // EVERY indirect guest dispatch (~73,000/frame on `s05`), and MSVC compiles a function-local
+    // `static const bool` into a per-ACCESS `_Init_thread_header` epoch check — the exact trap
+    // PS2_PROJECT_STATE.md's "Diagnostic Hygiene in Hot Loops" rule names. Hoisting it makes
+    // `pushDispatchPc` a plain thread-local ring store.
+    const bool g_g649HangTrace = (std::getenv("DC2_TRACE_HANG") != nullptr);
+
+    // ⭐ G651 (ROADMAP Priority 6) — the dispatch RING is a pure diagnostic, and it is the body of
+    // `lookupFunction`.
+    //
+    // MEASURED THIS PHASE, with the counting instrument ROADMAP P1 objective 2 requires:
+    //   s05       lookup = 151,190 calls/f   has = 145,351/f   preempt = 134,653/f   mapFallback = 0
+    //   `[G446:eeprof]` lookupFunction 5.24% of a 15.1 ms/f EE thread  ⇒ ~5.2 ns ≈ 19 cycles/call
+    // and `[G646:dispatch] rate = 100.00%` — the `unordered_map` behind the direct table is NEVER
+    // consulted, so what those 19 cycles buy is: this thread-local ring store, two global bool
+    // loads, a range test, one array load and the call/ret.
+    //
+    // The ring's ONLY consumers are `formatDispatchHistory()` in the first-bad-pc handler (a fatal
+    // path that fires once, after the port is already broken) and the `DC2_TRACE_HANG` locator.
+    // Neither runs in a healthy frame. So the store is armable, and it is armed by DEFAULT so no
+    // crash report silently loses its trace; `DC2_G651_NO_DISPTRACE=1` selects the arm without it.
+    //
+    // ⛔ NAMESPACE SCOPE, not a function-local `static const bool` — that is the per-access
+    // `_Init_thread_header` epoch check this predicate exists to avoid (G619's law, the same trap
+    // G649 fixed for `g_g649HangTrace` two lines up and G651 fixed in
+    // `shouldPreemptGuestExecution`).
+    const bool g_g651DispTrace = (std::getenv("DC2_G651_NO_DISPTRACE") == nullptr);
+
     void pushDispatchPc(uint32_t pc)
     {
+        if (!g_g651DispTrace)
+            return;
         DispatchHistory &h = g_dispatchHistory;
         h.pcs[h.next] = pc;
         h.next = (h.next + 1u) % static_cast<uint32_t>(h.pcs.size());
@@ -191,8 +225,7 @@ namespace
 
         // F50.2: env-gated hang locator. When DC2_TRACE_HANG is set, periodically
         // dump the dispatch ring so a no-crash spin loop reveals its repeating cycle.
-        static const bool s_hangTrace = (std::getenv("DC2_TRACE_HANG") != nullptr);
-        if (s_hangTrace)
+        if (g_g649HangTrace)
         {
             static uint64_t s_calls = 0u;
             static uint32_t s_dumps = 0u;
@@ -743,6 +776,7 @@ PS2Runtime::PS2Runtime()
     // Stack pointer (SP) and global pointer (GP) will be set by the loaded ELF
 
     m_functionTable.clear();
+    g646ClearAll(); // G646: the direct dispatch table mirrors the map's lifetime exactly
 
     m_loadedModules.clear();
     m_guestHeapBlocks.clear();
@@ -779,6 +813,7 @@ PS2Runtime::~PS2Runtime()
         m_loadedModules.clear();
 
         m_functionTable.clear();
+        g646ClearAll(); // G646: the direct dispatch table mirrors the map's lifetime exactly
     }
     catch (const std::exception &e)
     {

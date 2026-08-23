@@ -99,6 +99,9 @@ int g496GlStateArm();
 // written inside a part names an internal-linkage object that is never defined: C7631).
 #include <atomic>
 extern std::atomic<uint64_t> g_g604RawAlphaFbpBits[8];
+// G650 (ROADMAP P6): contention-aware core scheduler. Defined at GLOBAL scope in
+// ps2_runtime_parts/g650_thread_affinity.inc (ps2_runtime.cpp TU).
+extern void g650PinThread(int role);
 
 #include "ps2_gs_gpu_raster_parts/gpu_raster_infrastructure.inc"
 #include "ps2_gs_gpu_raster_parts/persistent_t8_decoder.inc"
@@ -156,7 +159,7 @@ bool g178_backend_submit(G178Batch &) { return false; }
 bool g570_backend_shadow139(const std::vector<uint32_t> &, const std::vector<uint32_t> &,
                             const std::vector<uint32_t> &, const std::vector<uint32_t> &,
                             const std::vector<uint32_t> &, const std::vector<uint32_t> &,
-                            std::vector<uint32_t> &) { return false; }
+                            std::vector<uint32_t> &, int, int, int, int, int) { return false; }
 // G629: the no-GPU build's stub. Returning false is the fail-closed answer — the front-end then
 // runs the untouched CPU band replay, exactly as it does when the backend is unavailable at
 // runtime.

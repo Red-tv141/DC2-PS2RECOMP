@@ -3849,31 +3849,57 @@ namespace
             if (count == avail)
             {
                 uint32_t t = (uint32_t)s_g410Cache.g502TailAt[idx];
-                if (t == G531_FLAG_TAIL)
-                    t = 0u;                       // a region never covers a flag-consumer tail
+                // ⭐ G651: a region now DOES cover one flag-consumer tail — FCGET, whose emission is
+                // argued beside `g651VuClipOn` in vu1_g612_native_region.inc. Under that arm the
+                // reference must be allowed to execute it through `g531ExecuteBlockTailFlag` (the
+                // shipped generic block body, which publishes the MAC line at the exact stamp and
+                // then runs the already-verified G487 fast lower), or the oracle would report a
+                // `pairs jit=N ref=M` defect that is entirely its own. Every OTHER flag consumer is
+                // still forced to 0, because a region still exits at those.
+                // ⛔ THE TAIL SLOT IS `idx + avail`, NOT `idx`. `g502TailAt[i]` is pre-joined as
+                // `g500Tail[i + g490RunLen[i]]`, so the pair the tail describes sits at the END of
+                // the run. Testing `uppers[idx]` reads the run's FIRST pair and lets every flag tail
+                // through — the first oracle run said so in one line, `pairs jit=87 ref=77 pc=0x2740`.
+                const size_t g651TailSlot = (size_t)idx + (size_t)avail;
+                if (t == G531_FLAG_TAIL &&
+                    !(g651VuClipOn() && g651TailSlot < s_g410Cache.uppers.size() &&
+                      s_g410Cache.uppers[g651TailSlot].lowerKind == G422_LK_FCGET))
+                    t = 0u;                       // a region never covers any OTHER flag tail
                 if (t != 0u)
                 {
                     bpc = pc + 8u * avail;
+                    // ⚠️ `G531_FLAG_TAIL` is a TYPE CODE (3), not a pair count — the flag tail is
+                    // ONE pair. Every arm in vu1_g435_pair_loop.inc spells this
+                    // `(tail == G531_FLAG_TAIL) ? 1u : tail`; do the same for the budget test and
+                    // for `consumed` below, or the reference over-counts by two per FCGET.
+                    const uint32_t tPairs = (t == G531_FLAG_TAIL) ? 1u : t;
                     if (bpc + 8u > codeSize)
                         t = 0u;
                     else
                     {
                         if (t == 2u && bpc + 16u > codeSize)
                             t = 1u;
-                        if (avail + t > left)
+                        if (avail + tPairs > left)
                             t = 0u;
                     }
                     tail = t;
                 }
             }
+            const uint32_t tailPairs = (tail == G531_FLAG_TAIL) ? 1u : tail;
             if (count == 0u && tail == 0u)
                 break;
             g531ExecuteBlockTailFlag(st, idx, count, vuData, dataSize, qDelay, pDelay,
                                      stampBase + (int64_t)consumed, hb, tail);
-            consumed += count + tail;
+            consumed += count + tailPairs;
             uint32_t next;
             if (tail == 0u)
                 next = pc + 8u * count;
+            else if (tail == G531_FLAG_TAIL)
+            {
+                // ⭐ G651: a flag consumer writes no pc. Control falls through to the next slot,
+                // exactly as the pair loop's own `g500Tail == G531_FLAG_TAIL` arm does.
+                next = bpc + 8u;
+            }
             else
             {
                 const bool taken = (st.pc != bpc);

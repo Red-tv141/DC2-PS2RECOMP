@@ -224,16 +224,38 @@ std::atomic<int> g_dc2PreemptSuppressDepth{0};
 // correlate an event (e.g. a collapsed skin matrix) with the dumped frame_NNNNNN.ppm number.
 std::atomic<uint64_t> g_dc2PresentTick{0};
 
+// ⭐ G651 (ROADMAP Priority 6) — the G57 preemption kill-switch, HOISTED TO NAMESPACE SCOPE.
+//
+// PREMISE, measured this phase. `[G446:eeprof]` on the two EE-poled routes, on the shipped G650
+// binary: `PS2Runtime::shouldPreemptGuestExecution` is **6.10% of the whole EE thread on
+// `dungeon6`** and 2.29% on `s05` — and this predicate runs on EVERY BACK EDGE of every recompiled
+// guest loop, which is the highest call rate anywhere in the runtime.
+//
+// ⛔ THE DEFECT. `s_noPreempt` was a FUNCTION-LOCAL `static const bool`. MSVC compiles that into a
+// per-ACCESS `_Init_thread_header` epoch check — a TLS base materialisation, a load of
+// `_Init_global_epoch`, a compare and a branch — on every single call, forever, to answer a
+// question that was settled at process start. This is precisely the trap
+// `PS2_PROJECT_STATE.md`'s "Diagnostic Hygiene in Hot Loops" names, that G619 measured, that G646
+// avoided for `s_g646DispatchOn`, and that G649 fixed for `g_g649HangTrace` in `pushDispatchPc` —
+// the same function-call chain, one predicate later.
+//
+// EXACTNESS. Identical semantics: the env var is read once per process either way, and a
+// namespace-scope `static const bool` is initialised during dynamic init, strictly before the
+// first guest dispatch (which cannot occur until `PS2Runtime::run` is entered from `main`).
+static const bool s_g651NoPreempt = [] {
+    const char *v = std::getenv("DC2_G57_NO_PREEMPT");
+    return v && v[0] && v[0] != '0';
+}();
+
 bool PS2Runtime::shouldPreemptGuestExecution()
 {
     // G57 experiment: allow disabling back-edge preemption entirely to confirm
     // a mid-loop preemption return is the corruption source. Env-gated.
-    static const bool s_noPreempt = [] {
-        const char *v = std::getenv("DC2_G57_NO_PREEMPT");
-        return v && v[0] && v[0] != '0';
-    }();
-    if (s_noPreempt)
+    // ⭐ G651: hoisted out of the function body — see the note above.
+    if (s_g651NoPreempt)
         return false;
+    if (g_g651DispStat)
+        g_g651PreemptCalls.fetch_add(1ull, std::memory_order_relaxed);
 
     // G57 fix: scoped suppression set by the title-draw override.
     if (g_dc2PreemptSuppressDepth.load(std::memory_order_relaxed) > 0)
@@ -440,6 +462,7 @@ void PS2Runtime::run()
                            {
         ThreadNaming::SetCurrentThreadName("GameThread");
         dc2_log::setCurrentThreadName("GameThread");
+        g650PinThread(0 /* G650_ROLE_EE */); // G650 P6
         try
         {
             dispatchLoop(m_memory.getRDRAM(), &m_cpuContext);
@@ -465,6 +488,7 @@ void PS2Runtime::run()
     dc2_profiler::initProfiler();
 #endif
     uint64_t tick = 0;
+    g650PinThread(4 /* G650_ROLE_MAIN */); // G650 P6
     while (!isStopRequested() && g_activeThreads.load(std::memory_order_relaxed) > 0)
     {
 #if ENABLE_PROFILER

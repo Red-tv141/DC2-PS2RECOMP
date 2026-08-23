@@ -368,13 +368,164 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
     setIoPaths(paths);
 }
 
+// ===== G646: a direct-mapped dispatch table in front of m_functionTable (ROADMAP Priority 9) ====
+//
+// PREMISE. `[G446:eeprof]` on `s05` (the EE-poled route) reads `PS2Runtime::hasFunction` 3.99% and
+// `PS2Runtime::lookupFunction` 3.64% of the whole EE thread — 7.63%, ≈1.1 ms/f — and the G504
+// `/MAP` + `[G483:rawpc]` pass localises hasFunction's share to `+0x51 .. +0x9e`, i.e. the
+// `std::unordered_map` bucket walk itself (hash, modulo, chase, compare). Every recompiled indirect
+// call (`jr $t9` / `jalr`) and every `PS2Runtime::isSpecialAddress` recovery path goes through it.
+//
+// THE KEYS ARE GUEST TEXT ADDRESSES: 4-byte aligned, and for this ELF inside
+// `text_range 0x00100008-0x00374D7B`. A flat array indexed by `(addr - lo) >> 2` answers in ONE
+// dependent load — no hash, no modulo, no bucket chase, no key compare. 0x00100000..0x00380000 is
+// 2.62 MB of text = 655,360 slots = 5.2 MB of function pointers, allocated once and never resized.
+//
+// ⭐ IT IS A PURE ACCELERATOR, NOT AN AUTHORITY. `m_functionTable` stays the single source of
+// truth: every write goes to both, both `clear()` sites clear both, and ANY miss — an address
+// outside the range, a misaligned address, a null registration, or a table that was cleared — falls
+// through to the map unchanged. So the answer is identical to the map's by construction; the array
+// can only ever short-circuit a HIT, and it can only hold a hit the map also holds.
+//
+// Rollback: DC2_G646_NO_DISPATCH=1. Census: DC2_G646_STAT=1 -> [G646:dispatch].
+static constexpr uint32_t kG646Lo = 0x00100000u;
+static constexpr uint32_t kG646Hi = 0x00380000u;
+static constexpr size_t kG646Slots = (kG646Hi - kG646Lo) >> 2;
+// File scope, not a function-local static: this is read on every indirect dispatch, where an MSVC
+// magic-static guard is itself measurable (G619's law).
+static const bool s_g646DispatchOn = (std::getenv("DC2_G646_NO_DISPATCH") == nullptr);
+static const bool s_g646StatOn = (std::getenv("DC2_G646_STAT") != nullptr);
+static PS2Runtime::RecompiledFunction *g_g646Direct = nullptr;
+static std::atomic<uint64_t> g_g646Hits{0ull}, g_g646Misses{0ull};
+
+// ============================================================================================
+// ⭐ G651 (ROADMAP Priority 1, objective 2) — THE INTERNAL COUNTING INSTRUMENT for the EE
+//    dispatch family. `[G446:eeprof]` on the shipped G650 binary reads, on the two EE-poled
+//    routes at the display cap:
+//
+//      dungeon6   lookupFunction 10.71%  shouldPreempt 6.10%  hasFunction 4.63%  isSpecial 0.92%
+//      s05        lookupFunction  5.24%  shouldPreempt 2.29%  hasFunction 2.37%  isSpecial 1.00%
+//
+//    ROADMAP P1 requires a PC-sampler row to be confirmed by a counting instrument before any
+//    lever is built off it (`appendix-dc2-attribution-recipes.md` §1.3r — a sampler row that
+//    names a symbol in a module without a PDB is a FOLD, not a leaf). These counters are exact,
+//    are gated on a namespace-scope bool so the default path pays one predicted branch, and they
+//    print calls-per-present so a share can be converted into ns/call.
+//
+//    `distinct` is a Bloom-ish coverage estimate of how many DIFFERENT dispatch targets a window
+//    touches — it decides whether the 5.2 MB direct table is being streamed (a cache-miss lever)
+//    or re-hit (not one).
+// ============================================================================================
+static const bool g_g651DispStat = (std::getenv("DC2_G651_DISP_STAT") != nullptr);
+static std::atomic<uint64_t> g_g651LookupCalls{0ull};
+static std::atomic<uint64_t> g_g651HasCalls{0ull};
+std::atomic<uint64_t> g_g651PreemptCalls{0ull}; // defined here, used in runtime_dispatch_and_memory.inc
+static std::atomic<uint64_t> g_g651LookupSlow{0ull};
+// 64 Ki bits = one bit per 32 dispatch slots; population count approximates the touched span.
+static constexpr size_t kG651SeenWords = 8192u;
+static std::atomic<uint64_t> g_g651Seen[kG651SeenWords];
+
+static inline void g651NoteTarget(uint32_t address)
+{
+    const uint32_t slot = (address - kG646Lo) >> 2;
+    const size_t w = (slot >> 6) % kG651SeenWords;
+    const uint64_t bit = 1ull << (slot & 63u);
+    if ((g_g651Seen[w].load(std::memory_order_relaxed) & bit) == 0ull)
+        g_g651Seen[w].fetch_or(bit, std::memory_order_relaxed);
+}
+
+void g651DispatchReport(uint64_t presents)
+{
+    if (!g_g651DispStat)
+        return;
+    uint64_t bits = 0ull;
+    for (size_t i = 0; i < kG651SeenWords; ++i)
+    {
+        uint64_t v = g_g651Seen[i].load(std::memory_order_relaxed);
+        while (v)
+        {
+            v &= v - 1ull;
+            ++bits;
+        }
+    }
+    const double p = presents ? static_cast<double>(presents) : 1.0;
+    std::fprintf(stderr,
+                 "[G651:disp] presents=%llu lookup=%llu (%.0f/f) has=%llu (%.0f/f) "
+                 "preempt=%llu (%.0f/f) mapFallback=%llu distinctTargets~=%llu\n",
+                 (unsigned long long)presents,
+                 (unsigned long long)g_g651LookupCalls.load(std::memory_order_relaxed),
+                 g_g651LookupCalls.load(std::memory_order_relaxed) / p,
+                 (unsigned long long)g_g651HasCalls.load(std::memory_order_relaxed),
+                 g_g651HasCalls.load(std::memory_order_relaxed) / p,
+                 (unsigned long long)g_g651PreemptCalls.load(std::memory_order_relaxed),
+                 g_g651PreemptCalls.load(std::memory_order_relaxed) / p,
+                 (unsigned long long)g_g651LookupSlow.load(std::memory_order_relaxed),
+                 (unsigned long long)bits);
+    std::fflush(stderr);
+}
+
+static inline bool g646InRange(uint32_t address)
+{
+    return address >= kG646Lo && address < kG646Hi && (address & 3u) == 0u;
+}
+
+static void g646Set(uint32_t address, PS2Runtime::RecompiledFunction func)
+{
+    if (!s_g646DispatchOn || !g646InRange(address))
+        return;
+    if (g_g646Direct == nullptr)
+    {
+        // Deliberately leaked, like every other process-lifetime runtime table here: a dispatch
+        // may still be in flight on another thread at teardown.
+        g_g646Direct = new PS2Runtime::RecompiledFunction[kG646Slots]();
+    }
+    g_g646Direct[(address - kG646Lo) >> 2] = func;
+}
+
+static void g646ClearAll()
+{
+    if (g_g646Direct != nullptr)
+        std::memset(g_g646Direct, 0,
+                    kG646Slots * sizeof(PS2Runtime::RecompiledFunction));
+}
+
+static inline PS2Runtime::RecompiledFunction g646Get(uint32_t address)
+{
+    if (g_g646Direct == nullptr || !g646InRange(address))
+        return nullptr;
+    return g_g646Direct[(address - kG646Lo) >> 2];
+}
+
+static inline void g646Note(bool hit)
+{
+    if (!s_g646StatOn)
+        return;
+    (hit ? g_g646Hits : g_g646Misses).fetch_add(1ull, std::memory_order_relaxed);
+    const uint64_t h = g_g646Hits.load(std::memory_order_relaxed);
+    const uint64_t m = g_g646Misses.load(std::memory_order_relaxed);
+    if (((h + m) % 4000000ull) == 0ull)
+        std::fprintf(stderr, "[G646:dispatch] hits=%llu misses=%llu rate=%.2f%%\n",
+                     static_cast<unsigned long long>(h), static_cast<unsigned long long>(m),
+                     100.0 * static_cast<double>(h) / static_cast<double>(h + m));
+}
+
 void PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 {
     m_functionTable[address] = func;
+    g646Set(address, func);
 }
 
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
+    if (g_g651DispStat)
+        g_g651HasCalls.fetch_add(1ull, std::memory_order_relaxed);
+    if (g646Get(address) != nullptr)
+    {
+        g646Note(true);
+        return true;
+    }
+    g646Note(false);
+
     auto it = m_functionTable.find(address);
     if (it != m_functionTable.end())
     {
@@ -472,13 +623,38 @@ static uint32_t g_g625ClobInit = 0u;
 static bool g_g625ClobArmed = false;
 static bool g_g625ClobDone = false;
 
-PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
-{
-    pushDispatchPc(address);
+// ===== ⭐ G649 (ROADMAP P6): the dispatch-boundary DIAGNOSTIC preamble, out of line ===========
+//
+// PREMISE (`[G446:eeprof]` on `s05`, post-G646): `lookupFunction` still reads **3.13%** of the EE
+// thread while the table lookup itself is one array load at a 100.00% hit rate — i.e. the cost is
+// the PREAMBLE, not the lookup. Five independent dispatch-boundary watches (G625 clobber, G625
+// monster-ext census, G58 saved-$ra watch, F64 indirect-call discovery, G186 word watch) sat inline
+// in the function body. Each was flag-gated, but:
+//   * two of the gates were function-local `static const bool`s, which MSVC compiles into a
+//     per-ACCESS `_Init_thread_header` epoch check — ~73,000 of them per frame, on the hot path
+//     (PS2_PROJECT_STATE.md's "Diagnostic Hygiene in Hot Loops" rule); and
+//   * the bodies live in the same frame as the hot path, so the hot path pays their stack and
+//     register pressure on every dispatch (17d's live-value-pressure law).
+//
+// The lever is ONE loop-invariant, namespace-scope predicate in front of ALL of them, with the
+// bodies moved into a `noinline` cold function. Exact by construction: `g_g649DispatchDiagOn` is
+// the OR of the five gates, so whenever any diagnostic could have produced an effect the whole
+// original preamble still runs, verbatim and in the original order; when none can, the preamble was
+// a no-op by inspection.
+//
+// Rollback: DC2_G649_NO_DISPATCHLEAN=1 forces the preamble to run on every dispatch again.
+static const bool g_g649TraceG58 = (std::getenv("DC2_TRACE_G58") != nullptr);
+static const bool g_g649TraceF64 = (std::getenv("DC2_TRACE_F64") != nullptr);
+static const bool g_g649NoDispatchLean = (std::getenv("DC2_G649_NO_DISPATCHLEAN") != nullptr);
+static const bool g_g649DispatchDiagOn =
+    g_g649NoDispatchLean || g_g625ClobAddr != 0u || g_g625MosTrace || g_g649TraceG58 ||
+    g_g649TraceF64 || g_g186WatchAddr != 0u;
 
+static __declspec(noinline) void g649DispatchDiagnostics(uint32_t address, uint8_t *rdramBase)
+{
     if (g_g625ClobAddr != 0u && !g_g625ClobDone)
     {
-        if (uint8_t *rd = m_memory.getRDRAM())
+        if (uint8_t *rd = rdramBase)
         {
             uint32_t v;
             std::memcpy(&v, rd + (g_g625ClobAddr & 0x01FFFFFFu), 4);
@@ -514,7 +690,9 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
     }
 
     // G58: detect the function that clobbers TitleMapDraw's saved-$ra slot (0x1fff800).
-    static const bool s_g58 = (std::getenv("DC2_TRACE_G58") != nullptr);
+    // G649: `s_g58` was a function-local static (a per-access TLS guard); it is now the
+    // namespace-scope `g_g649TraceG58`, which is also a disjunct of `g_g649DispatchDiagOn`.
+    const bool s_g58 = g_g649TraceG58;
     if (s_g58 && g_g58Rdram && address == 0x002A2280u)
     {
         // One-shot title-scene camera-state dump on TitleMapDraw entry. HW (live): scene
@@ -561,10 +739,11 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
     // addresses against ref/decompiled.txt to name the sound-state query. Gated
     // DC2_TRACE_F64 (default OFF, quiet otherwise).
     {
-        static const bool s_f64disc = (std::getenv("DC2_TRACE_F64") != nullptr);
+        // G649: was a function-local static (a per-access TLS guard) — now namespace scope.
+        const bool s_f64disc = g_g649TraceF64;
         if (s_f64disc)
         {
-            uint8_t *rd = m_memory.getRDRAM();
+            uint8_t *rd = rdramBase;
             if (rd)
             {
                 int32_t status;
@@ -598,7 +777,7 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
     {
         static uint32_t s_lastVal = 0u;
         static uint32_t s_prevAddr = 0u;
-        uint8_t *rd = m_memory.getRDRAM();
+        uint8_t *rd = rdramBase;
         if (rd)
         {
             const uint32_t v = readGuestU32Wrapped(rd, g_g186WatchAddr);
@@ -626,6 +805,36 @@ PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
         }
         s_prevAddr = address;
     }
+}
+
+PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
+{
+    pushDispatchPc(address);
+
+    // G649: one predicate, one cold call. See g649DispatchDiagnostics above.
+    if (g_g649DispatchDiagOn)
+        g649DispatchDiagnostics(address, m_memory.getRDRAM());
+
+    // ⭐ G651 (ROADMAP P1 objective 2): the counting instrument the sampler row needs.
+    if (g_g651DispStat)
+    {
+        g_g651LookupCalls.fetch_add(1ull, std::memory_order_relaxed);
+        g651NoteTarget(address);
+    }
+
+    // G646: one dependent load instead of the unordered_map bucket walk. A miss (out of range,
+    // misaligned, cleared table, or a null registration) falls straight through to the map, so the
+    // returned pointer is identical either way.
+    if (const RecompiledFunction direct = g646Get(address))
+    {
+        if (!g_g186SpBal)
+            return direct;
+        g_g186SpStack.push_back({direct, address});
+        return g186SpBalTrampoline;
+    }
+
+    if (g_g651DispStat)
+        g_g651LookupSlow.fetch_add(1ull, std::memory_order_relaxed);
 
     auto it = m_functionTable.find(address);
     if (it != m_functionTable.end())

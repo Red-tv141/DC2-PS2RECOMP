@@ -548,6 +548,12 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // swizzle helpers and therefore must follow g530_sprite_span.inc; drawTriangle is its only caller.
 #include "ps2_gs_rasterizer_parts/g570_cpu_triangle.inc"
 
+// G641: the 0x139 shadow compute's producer-scoped window. It reads G570's tile bins
+// (`g_g570Batch139GpuTileOffsets`) and the G570 batch globals, so it must follow g570_cpu_triangle.inc;
+// the batch site in rasterizer_tilebin_capture.inc reaches it through the forward declarations in
+// g529_replay_dispatch.inc.
+#include "ps2_gs_rasterizer_parts/g641_shadow_window.inc"
+
 // G580 revision: 2 - exact Z24/CT32 leaves plus a candidate-only batch-shared T8 CLUT for the
 // replayed Ridepod 0x13b triangle state. It reuses G530's CT32 row helper, so it must follow
 // G530/G570 and precede drawTriangle; forward declarations let the replay dispatcher bind it.

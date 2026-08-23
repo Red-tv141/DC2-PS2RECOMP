@@ -11,6 +11,14 @@ G480PktBin &g480PktBin()
     static G480PktBin *s_bin = new G480PktBin();
     return *s_bin;
 }
+#include <mutex>
+#include "ps2_gif_arbiter_parts/g645_ee_packet_pool.inc"
+// G645: the per-window outer-vector bin, leaked for the same reason as G480's.
+G645WinBin &g645WinBin()
+{
+    static G645WinBin *s_bin = new G645WinBin();
+    return *s_bin;
+}
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -41,6 +49,9 @@ extern void g297CollectWindowPackets(std::vector<std::vector<uint8_t>> &out);
 // of the mechanism — the batch-buffer free list there and the packet-vector reuse in processWindow
 // here — must select the same arm on the same frame, so they share this one accessor.
 extern bool g497WinBufActive();
+// G650 (ROADMAP P6): contention-aware core scheduler. Defined in
+// ps2_runtime_parts/g650_thread_affinity.inc (ps2_runtime.cpp TU) at GLOBAL scope on purpose.
+extern void g650PinThread(int role);
 
 // G531: universal once-per-guest-frame A/B tick (defined in the rasterizer TU). This replaces
 // the route-specific colour-readback tick, which heavy routes can bypass entirely.
@@ -53,6 +64,15 @@ extern void g531FrameAbTick();
 #define NOMINMAX
 #endif
 #include <windows.h>
+// G650 (ROADMAP P6): the contention-aware core scheduler is DEFINED here, not in ps2_runtime.cpp,
+// because it needs <windows.h> and that TU includes raylib.h + ThreadNaming.h, both of which
+// collide with it (`Rectangle`, `CloseWindow`, `ShowCursor`, `HMODULE`). This TU already has
+// <windows.h> for the G446 PC sampler. Every other TU declares `extern void g650PinThread(int);`.
+// MSBuild does not reliably rebuild a .cpp when only an included .inc changed (the G359 trap), so
+// this marker must be touched whenever g650_thread_affinity.inc is edited.
+// g650_thread_affinity.inc revision: 2 (G651 adaptive topology: EfficiencyClass ranking,
+//                                       CPU-set fallback, hard-affinity refusal below 5 cores)
+#include "ps2_runtime_parts/g650_thread_affinity.inc"
 // G156: worker thread CPU-time (user+kernel) so we can compare it against wall-time and prove
 // whether the MTGS worker's ~130 ms/frame "busy" is real CPU work or scheduler/HT stall.
 static uint64_t g156ThreadCpuNs()
@@ -90,6 +110,11 @@ bool g412_cross_frame_enabled();
 // G447: GS-worker blocking-EDGE census (default-off, DC2_G447_EDGE=1). G446 proved the pole thread
 // is ~half blocked inside its own window branch but a PC sampler cannot name the edge that entered
 // the wait. This one puts a wall clock on each of them.
+// G640: the OVERLAP-WINDOW census (default-off, DC2_G640_OVL=1). G447 names WHICH edge blocks the
+// pole; this one measures how much runnable CPU follows each of them before the worker blocks
+// again, i.e. the ceiling on any asynchronous-submission architecture, by pipeline depth. Must
+// precede g447_edge_census.inc: g447NoteWait / g447ReportBoundary call into it.
+#include "ps2_gif_arbiter_parts/g640_overlap_census.inc"
 #include "ps2_gif_arbiter_parts/g447_edge_census.inc"
 
 namespace
@@ -1220,6 +1245,7 @@ namespace
             // G447: mark this thread so the blocking-edge census pools ONLY the GS worker (the EE
             // thread reaches several of the same backend entry points at the frame barrier).
             g447MarkGsWorkerThread();
+            g650PinThread(2 /* G650_ROLE_GS */); // G650 P6
 
             // G159 (default OFF, DC2_G158_GPURASTER=1; needs DC2_G150_MTGS=1 to run this thread
             // at all): empirical GL-context-sharing probe, run once before the worker's normal
@@ -1453,6 +1479,12 @@ namespace
                 {
                     std::fprintf(stderr, "[G150:mtgs] GS worker unknown exception\n");
                 }
+                // G645: processWindow has already staged every payload buffer back into the G480
+                // bin, so `item.packets` now holds husks. Park the outer vector too — otherwise the
+                // EE thread's next window regrows it from capacity 0. Nothing reads `item.packets`
+                // after this point.
+                g645GiveWindowVec(std::move(item.packets));
+                g645NoteWindow();
 
                 // G431: GS-worker derivative arm — the mirror of DC2_G303_VU1_SLOW_US. Inject a fixed
                 // busy-spin per processed window to slow ONLY the GS worker, so the frame's
@@ -2019,8 +2051,9 @@ void GifArbiter::submit(GifPathId pathId, const uint8_t *data, uint32_t sizeByte
             }
         }
     }
-    pkt.data.resize(sizeBytes);
-    std::memcpy(pkt.data.data(), data, sizeBytes);
+    // G645: take the payload from the shared bin the GS worker already returns every consumed
+    // packet buffer to (G480). Falls back to the exact pre-G645 resize + memcpy on a miss.
+    g645TakePacketBuf(pkt.data, data, sizeBytes);
     m_queue.push_back(std::move(pkt));
 }
 
@@ -2071,7 +2104,13 @@ void GifArbiter::drain()
         if (!m_queue.empty() || haveKicks)
         {
             g297OnWindowHandoff();
-            G150Mtgs::instance().enqueueWindow(m_processFn, std::move(m_queue), /*force=*/true);
+            // G645: `std::move(m_queue)` hands the outer vector's STORAGE away too, so without this
+            // the next window always restarted from capacity 0. Swap in a recycled empty vector
+            // instead; `out` then carries exactly the packets `std::move(m_queue)` would have.
+            std::vector<GifArbiterPacket> out;
+            g645TakeWindowVec(out);
+            out.swap(m_queue);
+            G150Mtgs::instance().enqueueWindow(m_processFn, std::move(out), /*force=*/true);
             m_queue.clear();
         }
         return;

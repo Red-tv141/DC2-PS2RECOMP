@@ -207,13 +207,59 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                 const uint32_t fullLoops = nDesc / nreg;
                 const uint32_t tailRegs = nDesc - fullLoops * nreg;
                 const uint8_t *p = data + offset;
-                for (uint32_t loop = 0; loop < fullLoops; ++loop)
+                // ===== ⭐ G650 (ROADMAP P3): the descriptor bodies, INLINE ====================
+                // The seven vertex-carrying descriptors execute here instead of through an
+                // out-of-line call into `writeRegisterPacked`'s 16-way switch. The bodies are the
+                // SAME MACROS that switch's `case` labels expand, so there is no second copy of
+                // the arithmetic. Everything else still takes the original call.
+                //
+                // ⚠️ The arm is a DUPLICATED LOOP, selected once per packet — never an in-loop
+                // ternary. G593 measured +0.64 ms/f for one loop-invariant branch inside exactly
+                // this loop, and G645 generalised it into a law.
+                if (g650GifInlineOn())
                 {
-                    for (uint32_t r = 0; r < nreg; ++r, p += 16)
+                    if (g650GifStatOn())
+                    {
+                        g_g650GifDesc.fetch_add(nDesc, std::memory_order_relaxed);
+                        for (uint32_t r = 0; r < nreg; ++r)
+                        {
+                            const uint8_t dd = G602_REGDESC(r);
+                            const uint32_t reps = (r < tailRegs) ? (fullLoops + 1u) : fullLoops;
+                            g_g650GifByDesc[dd & 0xFu].fetch_add(reps, std::memory_order_relaxed);
+                            const bool inl = (dd <= 0x05u && dd >= 0x01u) || dd == 0x0Au || dd == 0x0Fu;
+                            (inl ? g_g650GifInlined : g_g650GifCalled)
+                                .fetch_add(reps, std::memory_order_relaxed);
+                        }
+                        g650GifReport();
+                    }
+                    for (uint32_t loop = 0; loop < fullLoops; ++loop)
+                    {
+                        for (uint32_t r = 0; r < nreg; ++r, p += 16)
+                        {
+                            const uint8_t g650d = G602_REGDESC(r);
+                            const uint64_t g650lo = loadLE64(p);
+                            const uint64_t g650hi = loadLE64(p + 8);
+                            G650_PK_DISPATCH(g650d, g650lo, g650hi);
+                        }
+                    }
+                    for (uint32_t r = 0; r < tailRegs; ++r, p += 16)
+                    {
+                        const uint8_t g650d = G602_REGDESC(r);
+                        const uint64_t g650lo = loadLE64(p);
+                        const uint64_t g650hi = loadLE64(p + 8);
+                        G650_PK_DISPATCH(g650d, g650lo, g650hi);
+                    }
+                }
+                else
+                {
+                    for (uint32_t loop = 0; loop < fullLoops; ++loop)
+                    {
+                        for (uint32_t r = 0; r < nreg; ++r, p += 16)
+                            writeRegisterPacked(G602_REGDESC(r), loadLE64(p), loadLE64(p + 8));
+                    }
+                    for (uint32_t r = 0; r < tailRegs; ++r, p += 16)
                         writeRegisterPacked(G602_REGDESC(r), loadLE64(p), loadLE64(p + 8));
                 }
-                for (uint32_t r = 0; r < tailRegs; ++r, p += 16)
-                    writeRegisterPacked(G602_REGDESC(r), loadLE64(p), loadLE64(p + 8));
                 offset += nDesc * 16u;
                 g147PackedRegs += nDesc;
                 if (truncated)
@@ -396,7 +442,6 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         writeRegister(GS_REG_PRIM, lo & 0x7FF);
         break;
     case 0x01:
-    {
         // G52: the Select-Costume Max model (skinned, fbp=0x139 RTT) occasionally emits a
         // FULLY-ZERO RGBAQ for a skin vertex — a VU1/packet artifact. HW's red_vest.gs NEVER
         // emits a zero RGBAQ for this model (every model vertex has alpha=0x80, color>=0x50),
@@ -404,146 +449,28 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
         // RETAIN the previous (valid) vertex color. Triangles interpolating from these zero
         // verts produced the long-deferred dark "face/hand speckle". Scope: only the costume
         // model context (fbp=0x139 textured tristrip). Kill switch DC2_G52_HOLDCOLOR=0.
-        if (!(G602_GATE_PK_G52HOLD && (lo == 0u && hi == 0u) &&
-              m_prim.type == GS_PRIM_TRISTRIP &&
-              m_ctx[m_prim.ctxt & 1u].frame.fbp == 0x139u))
-        {
-            m_curR = static_cast<uint8_t>(lo & 0xFF);
-            m_curG = static_cast<uint8_t>((lo >> 32) & 0xFF);
-            m_curB = static_cast<uint8_t>(hi & 0xFF);
-            m_curA = static_cast<uint8_t>((hi >> 32) & 0xFF);
-        }
-        // G602: [G52:rgba] + [F31:packed-rgbaq] moved out of line (g602_gif_cold_outline.inc).
-        if (G602_GATE_PK_RGBAQTRACE)
-            g602ColdPackedRgbaqTrace(static_cast<uint32_t>(m_prim.type),
-                                     m_ctx[m_prim.ctxt & 1u].frame.fbp,
-                                     m_curR, m_curG, m_curB, m_curA, lo, hi);
+        // G650 (P3): the body is now a macro shared with processGIFPacket's inline walk, so the
+        // two dispatch paths cannot drift. [G52:rgba] + [F31:packed-rgbaq] are inside it.
+        G650_PK_RGBAQ(lo, hi);
         break;
-    }
     case 0x02:
-    {
-        uint32_t sBits = static_cast<uint32_t>(lo & 0xFFFFFFFF);
-        uint32_t tBits = static_cast<uint32_t>((lo >> 32) & 0xFFFFFFFF);
-        uint32_t qBits = static_cast<uint32_t>(hi & 0xFFFFFFFF);
-        std::memcpy(&m_curS, &sBits, 4);
-        std::memcpy(&m_curT, &tBits, 4);
-        std::memcpy(&m_curQ, &qBits, 4);
-        if (m_curQ == 0.0f)
-            m_curQ = 1.0f;
+        G650_PK_ST(lo, hi); // G650 (P3): shared body, incl. the Q==0 => 1.0 normalisation
         break;
-    }
     case 0x03:
-        m_curU = static_cast<uint16_t>(lo & 0xFFFFu);
-        m_curV = static_cast<uint16_t>((lo >> 32) & 0xFFFFu);
+        G650_PK_UV(lo); // G650 (P3): shared body
         break;
     case 0x04:
-    {
-        uint16_t x = static_cast<uint16_t>(lo & 0xFFFF);
-        uint16_t y = static_cast<uint16_t>((lo >> 32) & 0xFFFF);
-        uint32_t z = static_cast<uint32_t>((hi >> 4) & 0xFFFFFF);
-        uint8_t f = static_cast<uint8_t>((hi >> 36) & 0xFF);
-        bool adk = ((hi >> 47) & 1) != 0;
-        if (G602_GATE_PK_FORCEDRAW)
-            adk = false;
-        bool g105Restart = false;
-        // G602: the G105 synthetic-ADC scissor guard (the only float arithmetic in this switch that
-        // is not the vertex unpack) moved out of line — see g602_gif_cold_outline.inc.
-        if (!adk && G602_GATE_PK_SYNTHADC &&
-            g602ColdPackedSynthAdc(x, y, m_ctx[m_prim.ctxt & 1u],
-                                   static_cast<uint32_t>(m_prim.type), m_prim.tme, g105Restart))
-        {
-            adk = true;
-        }
-        // G602: [G52:seq] + [G31:xyzf2] moved out of line.
-        if (G602_GATE_PK_XYZTRACE)
-            g602ColdPackedXyzTrace(static_cast<uint32_t>(m_prim.type), m_ctx[m_prim.ctxt & 1u],
-                                   m_curR, m_curG, m_curB, m_curA, m_vtxCount, adk,
-                                   x, y, z, f, lo, hi, kMaxVerts);
-        PS2_IF_AGRESSIVE_LOGS({
-            const uint32_t debugIndex = s_debugGsPackedVertexCount.fetch_add(1, std::memory_order_relaxed);
-            if (debugIndex < 64u)
-            {
-                RUNTIME_LOG("[gs:packed-xyzf] idx=" << debugIndex
-                                                    << " x=" << x
-                                                    << " y=" << y
-                                                    << " z=0x" << std::hex << z
-                                                    << std::dec
-                                                    << " fog=" << static_cast<uint32_t>(f)
-                                                    << " kick=" << static_cast<uint32_t>(!adk ? 1u : 0u)
-                                                    << " prim=" << static_cast<uint32_t>(m_prim.type)
-                                                    << std::endl);
-            }
-        });
-        GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
-        vtx.x = static_cast<float>(x) / 16.0f;
-        vtx.y = static_cast<float>(y) / 16.0f;
-        vtx.z = static_cast<float>(z);
-        vtx.r = m_curR;
-        vtx.g = m_curG;
-        vtx.b = m_curB;
-        vtx.a = m_curA;
-        vtx.q = m_curQ;
-        vtx.s = m_curS;
-        vtx.t = m_curT;
-        vtx.u = m_curU;
-        vtx.v = m_curV;
-        vtx.fog = f;
-        vertexKick(!adk);
-        if (g105Restart)
-            m_vtxCount = 0;
+        // G650 (P3): shared body — carries the G105 synthetic-ADC guard, G602_GATE_PK_FORCEDRAW,
+        // the [G52:seq]/[G31:xyzf2] trace and the g105Restart postcondition. The two
+        // PS2_IF_AGRESSIVE_LOGS blocks that used to sit here are `((void)0)` in every Release
+        // configuration (AGRESSIVE_LOGS is not defined) and are not carried into the macro.
+        G650_PK_XYZF2(lo, hi);
         break;
-    }
     case 0x05:
-    {
-        uint16_t x = static_cast<uint16_t>(lo & 0xFFFF);
-        uint16_t y = static_cast<uint16_t>((lo >> 32) & 0xFFFF);
-        uint32_t z = static_cast<uint32_t>(hi & 0xFFFFFFFF);
-        bool adk = ((hi >> 47) & 1) != 0;
-        if (G602_GATE_PK_FORCEDRAW)
-            adk = false;
-        bool g105Restart = false;
-        // G602: same out-of-line G105 synthetic-ADC guard as descriptor 0x04.
-        if (!adk && G602_GATE_PK_SYNTHADC &&
-            g602ColdPackedSynthAdc(x, y, m_ctx[m_prim.ctxt & 1u],
-                                   static_cast<uint32_t>(m_prim.type), m_prim.tme, g105Restart))
-        {
-            adk = true;
-        }
-        PS2_IF_AGRESSIVE_LOGS({
-            const uint32_t debugIndex = s_debugGsPackedVertexCount.fetch_add(1, std::memory_order_relaxed);
-            if (debugIndex < 64u)
-            {
-                RUNTIME_LOG("[gs:packed-xyz] idx=" << debugIndex
-                                                   << " x=" << x
-                                                   << " y=" << y
-                                                   << " z=0x" << std::hex << z
-                                                   << std::dec
-                                                   << " kick=" << static_cast<uint32_t>(!adk ? 1u : 0u)
-                                                   << " prim=" << static_cast<uint32_t>(m_prim.type)
-                                                   << std::endl);
-            }
-        });
-        GSVertex &vtx = m_vtxQueue[m_vtxCount % kMaxVerts];
-        vtx.x = static_cast<float>(x) / 16.0f;
-        vtx.y = static_cast<float>(y) / 16.0f;
-        vtx.z = static_cast<float>(z);
-        vtx.r = m_curR;
-        vtx.g = m_curG;
-        vtx.b = m_curB;
-        vtx.a = m_curA;
-        vtx.q = m_curQ;
-        vtx.s = m_curS;
-        vtx.t = m_curT;
-        vtx.u = m_curU;
-        vtx.v = m_curV;
-        vtx.fog = m_curFog;
-        vertexKick(!adk);
-        if (g105Restart)
-            m_vtxCount = 0;
+        G650_PK_XYZ2(lo, hi); // G650 (P3): shared body
         break;
-    }
     case 0x0A:
-        m_curFog = static_cast<uint8_t>((hi >> 36) & 0xFF);
+        G650_PK_FOG(hi); // G650 (P3): shared body
         break;
     case 0x0C:
     {

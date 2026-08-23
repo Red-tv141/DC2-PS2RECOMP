@@ -85,10 +85,12 @@ bool g570_backend_shadow139(const std::vector<uint32_t> &color,
                             const std::vector<uint32_t> &spanWords,
                             const std::vector<uint32_t> &tileOffsets,
                             const std::vector<uint32_t> &tileTris,
-                            std::vector<uint32_t> &out)
+                            std::vector<uint32_t> &out,
+                            int rectX, int rectY, int rectW, int rectH, int deriveSpan)
 {
     return G178Backend::instance().submitG570Shadow139(
-        color, depth, triWords, spanWords, tileOffsets, tileTris, out);
+        color, depth, triWords, spanWords, tileOffsets, tileTris, out,
+        rectX, rectY, rectW, rectH, deriveSpan);
 }
 
 // G541: asynchronous, no-readback VU1 transport probe. Private cpp-to-cpp bridge keeps the frozen

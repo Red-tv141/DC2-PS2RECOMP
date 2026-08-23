@@ -137,6 +137,66 @@ bool g571ShadowSplitOn()
     return on;
 }
 
+// G641 (diagnosis only, default OFF): `[G571:gpuwork] read=2.978` is a FUSED lap — the compute's
+// execution, the 1 MiB transfer and the sync stall are all charged to one `glGetTexImage`. Nothing
+// can be priced off it: if the 2.98 ms is mostly the shader running, narrowing the transfer buys
+// nothing. This arms a `glFinish()` between the memory barrier and the read, which changes no
+// result, no GL state and no command order (G495's rule) but moves the compute's execution out of
+// the read lap and into its own. Never valid in a timing run.
+bool g641ShadowSplitOn()
+{
+    static const bool on = g158EnvFlag("DC2_G641_SHSPLIT");
+    return on;
+}
+
+// ⛔ ===== G647: the producer-surface sampler-parameter cache — MEASURED NULL, DEFAULT-OFF =====
+// The mechanism works exactly as designed: `[G647:srcparam]` on `dragon` reports **98.8–99.3% of
+// the four `glTexParameteri` calls per `srcFbp` draw skipped**, ~2,970 GL calls per frame deleted
+// over 11.9 M observed. The PAYOFF is not there. Two order-balanced A B B A gates on `dragon`'s
+// static tail produced three readable blocks (the fourth was drift-dominated: its two control arms
+// disagreed by 3.1 ms/f) and all three read **+0.12 to +0.31 ms/f**, i.e. no better than control.
+//
+// ⭐ THE LAW: on this backend the render bucket is NOT command-rate-bound. G496 already deduped
+// every other state write, G640 priced the whole render-batch GL bucket at ≈1.7 ms/f for 47
+// batches and 14,526 draws (≈120 ns/draw — already the driver's floor), and a redundant
+// `glTexParameteri` whose value is unchanged costs essentially nothing. Deleting GL CALLS from this
+// loop cannot buy frame time; only deleting GPU work or transfers can.
+//
+// Retained as its own probe: DC2_G647_SRCPARAM=1 arms it, DC2_G647_STAT=1 prints the census.
+// File-scope const, not a function-local static: this is read once per srcFbp draw.
+static const bool s_g647SrcParamOn = (std::getenv("DC2_G647_SRCPARAM") != nullptr);
+inline bool g647SrcParamOn() { return s_g647SrcParamOn; }
+static const bool s_g647StatOn = (std::getenv("DC2_G647_STAT") != nullptr);
+static std::atomic<uint64_t> g_g647Issued{0ull}, g_g647Skipped{0ull};
+
+inline void g647NoteParam(uint32_t issued, uint32_t skipped)
+{
+    if (!s_g647StatOn)
+        return;
+    const uint64_t i = g_g647Issued.fetch_add(issued, std::memory_order_relaxed) + issued;
+    const uint64_t s = g_g647Skipped.fetch_add(skipped, std::memory_order_relaxed) + skipped;
+    if (((i + s) % 2000000ull) < 4ull)
+        std::fprintf(stderr, "[G647:srcparam] issued=%llu skipped=%llu saved=%.1f%%\n",
+                     static_cast<unsigned long long>(i), static_cast<unsigned long long>(s),
+                     (i + s) ? 100.0 * static_cast<double>(s) / static_cast<double>(i + s) : 0.0);
+}
+
+// ===== G643: the 0x139 kernel's DATA PATH (default-ON) =====
+// `[G641:sh] comp = 1.57 ms/f` is the largest single item left in the shadow chain and the second
+// largest in the whole GL worker. Its inner loop fetches up to 26 words per triangle reference, and
+// every one of them goes through `imageLoad` on an `r32ui` `image2D` — a texel path that pays
+// coordinate decomposition (`i & 1023`, `i >> 10`), image-format plumbing and the texture cache
+// rather than the buffer cache. The payload arrays are plain flat `uint` vectors, so `std430`
+// SSBOs describe them exactly and index them with the linear index the producer already computes.
+// ⚠️ `precise float` stays: it is the exactness contract with the CPU kernel, and the SSBO arm
+// changes ONLY where the four accessor functions read from.
+// Rollback: DC2_G643_NO_SSBO=1.
+bool g643SsboOn()
+{
+    static const bool on = !g158EnvFlag("DC2_G643_NO_SSBO");
+    return on;
+}
+
 // G324 diagnostics mirror the front-end armed/census split. They time only the existing logical
 // composite and T8-view QueueItems; default runs pay cached-boolean branches only.
 bool g324BackendCensusOn()
@@ -600,6 +660,9 @@ typedef void(APIENTRY *PFN178BINDIMAGETEXTURE)(GLuint, GLuint, GLint, GLboolean,
 typedef void(APIENTRY *PFN178MEMORYBARRIER)(GLbitfield);
 typedef void(APIENTRY *PFN178GETINTERNALFORMATIV)(GLenum, GLenum, GLenum, GLsizei, GLint *);
 typedef void(APIENTRY *PFN541DISPATCHCOMPUTE)(GLuint, GLuint, GLuint);
+// G643: the two entry points the SSBO data path for the 0x139 compute needs beyond GLFns.
+typedef void(APIENTRY *PFN643BINDBUFFERBASE)(GLenum, GLuint, GLuint);
+typedef void(APIENTRY *PFN643BUFFERSUBDATA)(GLenum, GLsizeiptrLocal, GLsizeiptrLocal, const void *);
 
 struct G178GLExt
 {
@@ -615,6 +678,8 @@ struct G178GLExt
     PFN178MEMORYBARRIER glMemoryBarrier_ = nullptr;
     PFN178GETINTERNALFORMATIV glGetInternalformativ_ = nullptr;
     PFN541DISPATCHCOMPUTE glDispatchCompute_ = nullptr;
+    PFN643BINDBUFFERBASE glBindBufferBase_ = nullptr;
+    PFN643BUFFERSUBDATA glBufferSubData_ = nullptr;
 };
 
 bool g178LoadGLExt(G178GLExt &e)
@@ -650,6 +715,13 @@ bool g178LoadGLExt(G178GLExt &e)
         g606WideBenchRequested() || g607TBenchRequestedFwd() || g570Shadow139Requested() ||
         g629BackendRequested())
         (void)loadProc(e.glDispatchCompute_, "glDispatchCompute");
+    // G643: optional, like the compute pointers above — a driver without them keeps the proven
+    // image2D data path for the 0x139 kernel instead of disabling anything.
+    if (g570Shadow139Requested())
+    {
+        (void)loadProc(e.glBindBufferBase_, "glBindBufferBase");
+        (void)loadProc(e.glBufferSubData_, "glBufferSubData");
+    }
     return ok;
 }
 
@@ -666,12 +738,24 @@ constexpr GLenum GL178_WRITE_ONLY = 0x88B9;
 constexpr GLbitfield GL178_SHADER_IMAGE_ACCESS_BARRIER_BIT = 0x00000020;
 constexpr GLbitfield GL178_TEXTURE_FETCH_BARRIER_BIT = 0x00000008;
 constexpr GLbitfield GL178_TEXTURE_UPDATE_BARRIER_BIT = 0x00000100;
+constexpr GLenum GL643_SHADER_STORAGE_BUFFER = 0x90D2;
+constexpr GLenum GL643_DYNAMIC_DRAW = 0x88E8;
+constexpr GLbitfield GL643_SHADER_STORAGE_BARRIER_BIT = 0x00002000;
 constexpr GLbitfield GL178_FRAMEBUFFER_BARRIER_BIT = 0x00000400;
 constexpr GLenum GL541_COMPUTE_SHADER = 0x91B9;
 constexpr GLenum GL541_R32UI = 0x8236;
 constexpr GLenum GL541_RED_INTEGER = 0x8D94;
 constexpr GLenum GL257_SHADER_IMAGE_LOAD = 0x82A4;
 constexpr GLenum GL257_SHADER_IMAGE_STORE = 0x82A5;
+// G641: the pixel-store strides that let a sub-rectangle travel straight out of / into a
+// full-surface caller buffer, with no CPU compaction. Core since GL 1.1, but the minimal GL header
+// this TU uses does not declare them.
+constexpr GLenum GL641_UNPACK_ROW_LENGTH = 0x0CF2;
+constexpr GLenum GL641_UNPACK_SKIP_ROWS = 0x0CF3;
+constexpr GLenum GL641_UNPACK_SKIP_PIXELS = 0x0CF4;
+constexpr GLenum GL641_PACK_ROW_LENGTH = 0x0D02;
+constexpr GLenum GL641_PACK_SKIP_ROWS = 0x0D03;
+constexpr GLenum GL641_PACK_SKIP_PIXELS = 0x0D04;
 // G631: run-coalesced raw-VRAM page patch upload. Included HERE (not from ps2_gs_gpu_raster.cpp)
 // because it needs GL541_RED_INTEGER, which is declared two lines above.
 #include "g631_page_patch.inc"
@@ -951,7 +1035,10 @@ public:
                              const std::vector<uint32_t> &spanWords,
                              const std::vector<uint32_t> &tileOffsets,
                              const std::vector<uint32_t> &tileTris,
-                             std::vector<uint32_t> &out)
+                             std::vector<uint32_t> &out,
+                             int rectX = 0, int rectY = 0,
+                             int rectW = 512, int rectH = 512,
+                             int deriveSpan = 0)
     {
         constexpr size_t surfacePixels = 512u * 512u;
         if (!g570Shadow139Requested() || !m_g570Available ||
@@ -975,6 +1062,15 @@ public:
             item.g570TileOffsets = &tileOffsets;
             item.g570TileTris = &tileTris;
             item.g570Out = &out;
+            // G641: fail closed onto the whole surface for anything the caller cannot describe as
+            // a rectangle inside the surface.
+            if (rectW > 0 && rectH > 0 && rectX >= 0 && rectY >= 0 &&
+                rectX + rectW <= 512 && rectY + rectH <= 512)
+            {
+                item.g570RectX = rectX; item.g570RectY = rectY;
+                item.g570RectW = rectW; item.g570RectH = rectH;
+            }
+            item.g570DeriveSpan = deriveSpan;
             item.promise = wait.promise;
             item.doneFlag = &wait.done;
             if (g571ShadowSplitOn())
@@ -1661,9 +1757,31 @@ void main()
     // guard only trips on a contract violation. All calls are on the single GS-worker/front-end
     // thread, so m_asyncPending / m_asyncFut / m_asyncSlot need no cross-thread synchronization
     // beyond the queue mutex that hands the slot to the worker.
+    // G640: the ring depth. One slot unless DC2_G640_ASYNC is armed, so every historical arm
+    // (DC2_G305_ASYNC / DC2_G444_ASYNC / the g452 A/B) keeps its measured depth-1 behaviour byte for
+    // byte. Must agree with the front end's g640Depth(): both read DC2_G640_SLOTS and clamp to 1..8,
+    // because the front end drains g_g305Pending back to depth-1 before each submit and a
+    // disagreement would let a submit find the ring full and fall to the CPU replay.
+    static size_t g640BackendSlots()
+    {
+        static const size_t n = [] {
+            if (std::getenv("DC2_G640_ASYNC") == nullptr ||
+                std::getenv("DC2_G640_NO_ASYNC") != nullptr)
+                return static_cast<size_t>(1u);
+            const char *v = std::getenv("DC2_G640_SLOTS");
+            long long k = (v != nullptr) ? std::atoll(v) : 0LL;
+            if (k <= 0LL)
+                k = 4LL;
+            if (k > 8LL)
+                k = 8LL;
+            return static_cast<size_t>(k);
+        }();
+        return n;
+    }
+
     bool submitAsync(G178Batch &batch)
     {
-        static constexpr size_t kAsyncSlots = 1u;
+        const size_t kAsyncSlots = g640BackendSlots();
         if (!m_ready.load(std::memory_order_acquire) || m_asyncSlots.size() >= kAsyncSlots)
             return false;
         // G415: an async packet is skip-readback by contract, so no colour window can apply.
@@ -1679,11 +1797,18 @@ void main()
             // Scalar fields deliberately remain copied in `batch`: the optimistic epilogue reads
             // them after submission, exactly as it did under the original move-assignment.
             G178Batch next = std::move(batch);
-            batch.fbPixels = std::move(m_asyncRecycle.fbPixels);
-            batch.texUploads = std::move(m_asyncRecycle.texUploads);
-            batch.verts = std::move(m_asyncRecycle.verts);
-            batch.draws = std::move(m_asyncRecycle.draws);
-            batch.readback = std::move(m_asyncRecycle.readback);
+            // G640: with N slots in flight there are N+1 buffer sets, so the single recycle slot
+            // becomes a free list. Behaviour at depth 1 is identical: one entry in, one entry out.
+            if (!m_asyncRecycle.empty())
+            {
+                G178Batch &r = m_asyncRecycle.front();
+                batch.fbPixels = std::move(r.fbPixels);
+                batch.texUploads = std::move(r.texUploads);
+                batch.verts = std::move(r.verts);
+                batch.draws = std::move(r.draws);
+                batch.readback = std::move(r.readback);
+                m_asyncRecycle.pop_front();
+            }
             AsyncSlot slot;
             slot.batch = std::move(next);
             slot.future = std::move(fut);
@@ -1710,7 +1835,10 @@ void main()
         AsyncSlot &slot = m_asyncSlots.front();
         try { ok = slot.future.get(); }
         catch (...) { ok = false; }
-        m_asyncRecycle = std::move(slot.batch);
+        // G640: the free list holds at most one spare per slot; anything beyond that is storage the
+        // pipeline will never need again, so let it go rather than growing without bound.
+        if (m_asyncRecycle.size() < g640BackendSlots() + 1u)
+            m_asyncRecycle.push_back(std::move(slot.batch));
         m_asyncSlots.pop_front();
         return true;
     }
@@ -2277,6 +2405,11 @@ private:
         const std::vector<uint32_t> *g570TileOffsets = nullptr;
         const std::vector<uint32_t> *g570TileTris = nullptr;
         std::vector<uint32_t> *g570Out = nullptr;
+        // G641: the sub-rectangle of the 512x512 surface that actually travels. (0,0,512,512) is
+        // the legacy whole-surface chain and is what every unarmed run carries.
+        int g570RectX = 0, g570RectY = 0, g570RectW = 512, g570RectH = 512;
+        // G642: 1 when the payload carries no per-row span table and the shader derives it.
+        int g570DeriveSpan = 0;
         // G629 exact CPU-band-replay compute job. All vectors are caller-owned and synchronous:
         // the front-end blocks on this exactly as it blocked on the CPU row pool it replaces, so
         // the batch's ordering contract with the rest of the flush is unchanged.
@@ -2358,6 +2491,7 @@ private:
 
     void worker()
     {
+        g650PinThread(3 /* G650_ROLE_GL */); // G650 P6
         HGLRC rc = wglCreateContext(s_g158MainDC);
         if (!rc || !wglShareLists(s_g158MainRC, rc) || !wglMakeCurrent(s_g158MainDC, rc))
         {
@@ -2798,6 +2932,9 @@ private:
             {
                 uint64_t g495Draws = 0ull, g495Verts = 0ull, g495TexN = 0ull;
                 uint64_t g495TexBytes = 0ull, g495FbBytes = 0ull;
+                // G644: the surface window this item touches, for the sequence dump.
+                uint32_t g495Fbp = 0u;
+                int g495Y = -1, g495Rows = 0;
                 if (item.g629Recs != nullptr)
                     g495Cls = kG495ClsG630Replay;
                 else if (item.g630View != nullptr)
@@ -2831,11 +2968,17 @@ private:
                 {
                     g495Cls = kG495ClsReadColor;
                     g495Fence = true;
+                    g495Fbp = item.colorFbp;
+                    g495Y = item.colorY;
+                    g495Rows = item.colorRows;
                 }
                 else if (item.colorWrite != nullptr)
                 {
                     g495Cls = kG495ClsWriteColor;
                     g495TexBytes = static_cast<uint64_t>(item.colorWrite->size()) * 4ull;
+                    g495Fbp = item.colorFbp;
+                    g495Y = item.colorY;
+                    g495Rows = item.colorRows;
                 }
                 else if (item.depthReadback != nullptr && !item.renderThenReadDepth)
                 {
@@ -2852,8 +2995,10 @@ private:
                     for (const auto &u : item.batch->texUploads)
                         g495TexBytes += static_cast<uint64_t>(u.px.size()) * 4ull;
                     g495FbBytes = static_cast<uint64_t>(item.batch->fbPixels.size()) * 4ull;
+                    g495Fbp = item.batch->fbp;
                 }
-                g495NoteItem(g495Cls, g495Draws, g495Verts, g495TexN, g495TexBytes, g495FbBytes);
+                g495NoteItem(g495Cls, g495Draws, g495Verts, g495TexN, g495TexBytes, g495FbBytes,
+                             g495Fbp, g495Y, g495Rows);
             }
             // G495b GPU-side clock (DC2_G495_GPU=1): GL_TIME_ELAPSED around this item's whole GL
             // body, so the per-class sum is GPU busy ms/f. Never quote a frame time from this run.
@@ -2888,7 +3033,9 @@ private:
                     ok = runG570Shadow139OnWorker(
                         *item.g570Color, *item.g570Depth, *item.g570TriWords,
                         *item.g570SpanWords, *item.g570TileOffsets,
-                        *item.g570TileTris, *item.g570Out);
+                        *item.g570TileTris, *item.g570Out,
+                        item.g570RectX, item.g570RectY,
+                        item.g570RectW, item.g570RectH, item.g570DeriveSpan);
                     if (g571On)
                     {
                         const auto done = std::chrono::steady_clock::now();
@@ -3212,6 +3359,10 @@ private:
                 glDeleteTextures(1, &tex);
         if (m_g570Prog != 0)
             m_f.glDeleteProgram_(m_g570Prog);
+        if (m_g643Prog != 0)
+            m_f.glDeleteProgram_(m_g643Prog);
+        if (m_g643Ssbo[0] != 0u && m_f.glDeleteBuffers_ != nullptr)
+            m_f.glDeleteBuffers_(4, m_g643Ssbo);
         const GLuint g570Textures[] = {
             m_g570ColorTex, m_g570DepthTex, m_g570TriTex,
             m_g570SpanTex, m_g570TileOffsetTex, m_g570TileTriTex
@@ -4572,26 +4723,52 @@ void main()
         return glGetError() == GL_NO_ERROR;
     }
 
-    bool setupG570Shadow139()
+    // G643: ONE kernel body, TWO data paths. The four read-only payload arrays are reached either
+    // through `imageLoad` on `r32ui` `image2D`s (the proven G570 path) or through `std430` SSBOs.
+    // The body below is character-for-character identical in both programs — only the four accessor
+    // functions and the declarations differ — so the SSBO arm cannot change any arithmetic.
+    static const char *g643KernelBody()
     {
-        if (m_e.glDispatchCompute_ == nullptr || m_e.glBindImageTexture_ == nullptr ||
-            m_e.glMemoryBarrier_ == nullptr)
-            return false;
-
-        static const char *kCS = R"GLSL(#version 430 core
+        return R"GLSL(
 layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
 layout(r32ui, binding=0) uniform uimage2D gColor;
 layout(r32ui, binding=1) uniform uimage2D gDepth;
+
+#if G643_SSBO
+layout(std430, binding=2) readonly buffer G643Tris        { uvec4 bTris4[]; };
+layout(std430, binding=3) readonly buffer G643Spans       { uint bSpans[]; };
+layout(std430, binding=4) readonly buffer G643TileOffsets { uint bTileOffsets[]; };
+layout(std430, binding=5) readonly buffer G643TileTris    { uint bTileTris[]; };
+// ⭐ G649: the header is seven `uvec4`s (28 words), hot-first — one 16-byte load per stage instead
+// of two to nine scalar ones. See the layout note beside kG642TriStride in g570_cpu_triangle.inc.
+uvec4 triQuad(uint tri, uint q) { return bTris4[tri * 7u + q]; }
+uint spanWord(uint i) { return bSpans[i]; }
+uint offsetWord(uint i) { return bTileOffsets[i]; }
+uint tileTriWord(uint i) { return bTileTris[i]; }
+#else
 layout(r32ui, binding=2) readonly uniform uimage2D gTris;
 layout(r32ui, binding=3) readonly uniform uimage2D gSpans;
 layout(r32ui, binding=4) readonly uniform uimage2D gTileOffsets;
 layout(r32ui, binding=5) readonly uniform uimage2D gTileTris;
-
 ivec2 dataCoord(uint i) { return ivec2(int(i & 1023u), int(i >> 10u)); }
 uint triWord(uint i) { return imageLoad(gTris, dataCoord(i)).r; }
 uint spanWord(uint i) { return imageLoad(gSpans, dataCoord(i)).r; }
 uint offsetWord(uint i) { return imageLoad(gTileOffsets, dataCoord(i)).r; }
 uint tileTriWord(uint i) { return imageLoad(gTileTris, dataCoord(i)).r; }
+// G649: the rollback data path has no vector load, so it reassembles the same quad word by word.
+// The SLOT layout is identical on both arms; only the fetch width differs.
+uvec4 triQuad(uint tri, uint q)
+{
+    uint b = tri * 28u + q * 4u;
+    return uvec4(triWord(b), triWord(b + 1u), triWord(b + 2u), triWord(b + 3u));
+}
+#endif
+
+// G642: 1 => there is no per-row span table; every span is the triangle's own bbox and the three
+// edge values come from `edgeBase + rowStep*dy` (header words 23..25 / 20..22). Uniform over the
+// whole dispatch, so the branch below is not divergent.
+uniform int uDeriveSpan;
+
 void main()
 {
     ivec2 ip = ivec2(gl_GlobalInvocationID.xy);
@@ -4605,36 +4782,70 @@ void main()
     for (uint ref = first; ref < last; ++ref)
     {
         uint tri = tileTriWord(ref);
-        uint b = tri * 20u;
-        int minY = int(triWord(b + 2u));
-        int maxY = int(triWord(b + 3u));
+        // G649 quad 0: the whole bbox in ONE load. The row test rejects most refs right here, and
+        // it now costs a single 16-byte fetch instead of two scalar ones spread across the record.
+        uvec4 q0 = triQuad(tri, 0u);
+        int minY = int(q0.z);
+        int maxY = int(q0.w);
         if (ip.y < minY || ip.y > maxY)
             continue;
-        uint spanBase = (triWord(b + 4u) + uint(ip.y - minY)) * 4u;
-        uint packedSpan = spanWord(spanBase);
-        int xStart = int(packedSpan << 16u) >> 16;
-        int xEnd = int(packedSpan) >> 16;
-        if (ip.x < xStart || ip.x > xEnd)
-            continue;
+        int xStart;
+        int xEnd;
+        int e0;
+        int e1;
+        int e2;
+        uvec4 q1; // step0..2, mode — fetched only AFTER the column test can no longer reject
+        if (uDeriveSpan != 0)
+        {
+            xStart = int(q0.x);
+            xEnd = int(q0.y);
+            if (ip.x < xStart || ip.x > xEnd)
+                continue;
+            q1 = triQuad(tri, 1u);
+            uvec4 q2 = triQuad(tri, 2u); // rowStep0..2, spanOffset
+            uvec4 q3 = triQuad(tri, 3u); // edgeBase0..2
+            // uint arithmetic wraps modulo 2^32 by definition (signed overflow does not), and the
+            // producer proved the true value fits int32 at all four bbox corners, so the bitcast
+            // back is exact.
+            uint dyu = uint(ip.y - minY);
+            uint dxu = uint(ip.x - xStart);
+            e0 = int(q3.x + q2.x * dyu + q1.x * dxu);
+            e1 = int(q3.y + q2.y * dyu + q1.y * dxu);
+            e2 = int(q3.z + q2.z * dyu + q1.z * dxu);
+        }
+        else
+        {
+            uint spanBase = (triQuad(tri, 2u).w + uint(ip.y - minY)) * 4u;
+            uint packedSpan = spanWord(spanBase);
+            xStart = int(packedSpan << 16u) >> 16;
+            xEnd = int(packedSpan) >> 16;
+            if (ip.x < xStart || ip.x > xEnd)
+                continue;
 
-        int dx = ip.x - xStart;
-        int e0 = int(spanWord(spanBase + 1u)) + int(triWord(b + 5u)) * dx;
-        int e1 = int(spanWord(spanBase + 2u)) + int(triWord(b + 6u)) * dx;
-        int e2 = int(spanWord(spanBase + 3u)) + int(triWord(b + 7u)) * dx;
-        uint mode = triWord(b + 8u);
+            q1 = triQuad(tri, 1u);
+            int dx = ip.x - xStart;
+            e0 = int(spanWord(spanBase + 1u)) + int(q1.x) * dx;
+            e1 = int(spanWord(spanBase + 2u)) + int(q1.y) * dx;
+            e2 = int(spanWord(spanBase + 3u)) + int(q1.z) * dx;
+        }
+        uint mode = q1.w;
         if (e0 < 0 || (e0 == 0 && (mode & 1u) == 0u) ||
             e1 < 0 || (e1 == 0 && (mode & 2u) == 0u) ||
             e2 < 0 || (e2 == 0 && (mode & 4u) == 0u))
             continue;
 
-        precise float a0 = uintBitsToFloat(triWord(b + 9u));
-        precise float b0 = uintBitsToFloat(triWord(b + 10u));
-        precise float a1 = uintBitsToFloat(triWord(b + 11u));
-        precise float b1 = uintBitsToFloat(triWord(b + 12u));
-        precise float lx2 = uintBitsToFloat(triWord(b + 13u));
-        precise float ly2 = uintBitsToFloat(triWord(b + 14u));
-        precise float winding = uintBitsToFloat(triWord(b + 15u));
-        precise float invDenom = uintBitsToFloat(triWord(b + 16u));
+        // G649 quads 4..6: COLD. Nothing below this point is fetched by a rejected ref.
+        uvec4 q4 = triQuad(tri, 4u); // a0 b0 a1 b1
+        uvec4 q5 = triQuad(tri, 5u); // fx2 fy2 winding invDenom
+        uvec4 q6 = triQuad(tri, 6u); // z0 z1 z2
+        precise float a0 = uintBitsToFloat(q4.x);
+        precise float b0 = uintBitsToFloat(q4.y);
+        precise float a1 = uintBitsToFloat(q4.z);
+        precise float b1 = uintBitsToFloat(q4.w);
+        precise float lx2 = uintBitsToFloat(q5.x);
+        precise float ly2 = uintBitsToFloat(q5.y);
+        precise float winding = uintBitsToFloat(q5.z);
+        precise float invDenom = uintBitsToFloat(q5.w);
         precise float px = float(ip.x);
         precise float py = float(ip.y);
         precise float px2 = px - lx2;
@@ -4651,9 +4862,9 @@ void main()
         precise float w1 = w1w * invDenom;
         precise float oneMinusW0 = 1.0 - w0;
         precise float w2 = oneMinusW0 - w1;
-        precise float z0 = uintBitsToFloat(triWord(b + 17u));
-        precise float z1 = uintBitsToFloat(triWord(b + 18u));
-        precise float z2 = uintBitsToFloat(triWord(b + 19u));
+        precise float z0 = uintBitsToFloat(q6.x);
+        precise float z1 = uintBitsToFloat(q6.y);
+        precise float z2 = uintBitsToFloat(q6.z);
         precise float zm0 = z0 * w0;
         precise float zm1 = z1 * w1;
         precise float za = zm0 + zm1;
@@ -4682,33 +4893,106 @@ void main()
     imageStore(gColor, ip, uvec4(color, 0u, 0u, 0u));
 }
 )GLSL";
+    }
+
+    // Build one of the two programs. `ssbo` only picks the `#define`; nothing else differs.
+    bool g643BuildShadowProgram(bool ssbo, GLuint &prog, GLint &deriveLoc)
+    {
+        std::string src = "#version 430 core\n#define G643_SSBO ";
+        src += ssbo ? "1\n" : "0\n";
+        src += g643KernelBody();
 
         GLuint cs = 0u;
         std::string log;
-        if (!g158CompileShader(m_f, GL541_COMPUTE_SHADER, kCS, cs, log))
+        if (!g158CompileShader(m_f, GL541_COMPUTE_SHADER, src.c_str(), cs, log))
         {
-            std::fprintf(stderr, "[G570:gpu139] compute compile failed: %s\n", log.c_str());
+            std::fprintf(stderr, "[G570:gpu139] compute compile failed (ssbo=%u): %s\n",
+                         ssbo ? 1u : 0u, log.c_str());
             return false;
         }
-        m_g570Prog = m_f.glCreateProgram_();
-        m_f.glAttachShader_(m_g570Prog, cs);
-        m_f.glLinkProgram_(m_g570Prog);
+        prog = m_f.glCreateProgram_();
+        m_f.glAttachShader_(prog, cs);
+        m_f.glLinkProgram_(prog);
         GLint linked = 0;
-        m_f.glGetProgramiv_(m_g570Prog, GL158_LINK_STATUS, &linked);
+        m_f.glGetProgramiv_(prog, GL158_LINK_STATUS, &linked);
         m_f.glDeleteShader_(cs);
         if (!linked)
         {
             GLint len = 0;
-            m_f.glGetProgramiv_(m_g570Prog, GL158_INFO_LOG_LENGTH, &len);
+            m_f.glGetProgramiv_(prog, GL158_INFO_LOG_LENGTH, &len);
             std::vector<char> buf(len > 0 ? static_cast<size_t>(len) : 1u, 0);
-            m_f.glGetProgramInfoLog_(m_g570Prog, static_cast<GLsizei>(buf.size()),
-                                     nullptr, buf.data());
-            std::fprintf(stderr, "[G570:gpu139] compute link failed: %s\n", buf.data());
-            m_f.glDeleteProgram_(m_g570Prog);
-            m_g570Prog = 0u;
+            m_f.glGetProgramInfoLog_(prog, static_cast<GLsizei>(buf.size()), nullptr, buf.data());
+            std::fprintf(stderr, "[G570:gpu139] compute link failed (ssbo=%u): %s\n",
+                         ssbo ? 1u : 0u, buf.data());
+            m_f.glDeleteProgram_(prog);
+            prog = 0u;
             return false;
         }
+        deriveLoc = m_f.glGetUniformLocation_(prog, "uDeriveSpan");
         return true;
+    }
+
+    bool setupG570Shadow139()
+    {
+        if (m_e.glDispatchCompute_ == nullptr || m_e.glBindImageTexture_ == nullptr ||
+            m_e.glMemoryBarrier_ == nullptr)
+            return false;
+
+        if (!g643BuildShadowProgram(false, m_g570Prog, m_locG570DeriveSpan))
+            return false;
+
+        // G643: the SSBO arm is OPTIONAL. A driver that refuses it (or a build without the two
+        // buffer entry points) keeps the proven image2D program and this phase is simply inert.
+        if (g643SsboOn() && m_e.glBindBufferBase_ != nullptr && m_e.glBufferSubData_ != nullptr &&
+            m_f.glGenBuffers_ != nullptr && m_f.glBindBuffer_ != nullptr &&
+            m_f.glBufferData_ != nullptr)
+        {
+            if (g643BuildShadowProgram(true, m_g643Prog, m_locG643DeriveSpan))
+            {
+                m_f.glGenBuffers_(4, m_g643Ssbo);
+                for (int i = 0; i < 4; ++i)
+                    if (m_g643Ssbo[i] == 0u)
+                    {
+                        m_g643Prog = 0u;
+                        break;
+                    }
+            }
+            else
+                m_g643Prog = 0u;
+        }
+        std::fprintf(stderr, "[G643:ssbo] program=%s\n",
+                     m_g643Prog != 0u ? "READY" : "OFF (image2D data path)");
+        return true;
+    }
+
+    // G643: upload one payload array into its SSBO.
+    // ⚠️ GROW-ONLY, and that is the whole design. The first cut reallocated whenever the byte count
+    // merely CHANGED, and since the batch's triangle and bin counts move every frame that meant a
+    // fresh driver allocation for all four arrays on every batch — measured +3.6 ms/f WORSE than the
+    // image path, with VU1 +3.5 and EE +2.0 (threads this lever cannot touch, i.e. the driver's
+    // allocator stealing CPU from them). `g570UploadWords` never had that cost because
+    // `allocatedRows` is a high-water mark. Match it: allocate once at a rounded-up capacity and
+    // then only ever `glBufferSubData` into it.
+    bool g643UploadSsbo(int slot, const std::vector<uint32_t> &words)
+    {
+        if (words.empty())
+            return false;
+        const GLsizeiptrLocal bytes =
+            static_cast<GLsizeiptrLocal>(words.size() * sizeof(uint32_t));
+        m_f.glBindBuffer_(GL643_SHADER_STORAGE_BUFFER, m_g643Ssbo[slot]);
+        if (m_g643SsboBytes[slot] < bytes)
+        {
+            // Round the capacity up to 256 KB so a slowly growing batch does not reallocate every
+            // frame on its way up.
+            constexpr GLsizeiptrLocal kGrain = 256 * 1024;
+            const GLsizeiptrLocal cap = ((bytes + kGrain - 1) / kGrain) * kGrain;
+            m_f.glBufferData_(GL643_SHADER_STORAGE_BUFFER, cap, nullptr, GL643_DYNAMIC_DRAW);
+            if (glGetError() != GL_NO_ERROR)
+                return false;
+            m_g643SsboBytes[slot] = cap;
+        }
+        m_e.glBufferSubData_(GL643_SHADER_STORAGE_BUFFER, 0, bytes, words.data());
+        return glGetError() == GL_NO_ERROR;
     }
 
     bool g570UploadWords(GLuint &tex, uint32_t &allocatedRows, uint32_t width,
@@ -4744,13 +5028,108 @@ void main()
         return true;
     }
 
+    // G641: upload one sub-rectangle of a full-surface source vector WITHOUT compacting it on the
+    // CPU. `GL_UNPACK_ROW_LENGTH/SKIP_ROWS/SKIP_PIXELS` make the driver stride over the caller's
+    // 512-wide buffer, so the narrowed chain costs zero extra CPU work. The texture is allocated
+    // once at full size (content outside the rect is stale, which is safe: the kernel is the
+    // identity there and the rect is the only thing ever read back). Store state is restored.
+    bool g641UploadRect(GLuint &tex, uint32_t &allocatedRows, const std::vector<uint32_t> &words,
+                        int x, int y, int w, int h)
+    {
+        if (words.size() != 512u * 512u || w <= 0 || h <= 0)
+            return false;
+        if (tex == 0u)
+        {
+            glGenTextures(1, &tex);
+            if (tex == 0u)
+                return false;
+            glBindTexture(GL_TEXTURE_2D, tex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        }
+        else
+            glBindTexture(GL_TEXTURE_2D, tex);
+        if (allocatedRows < 512u)
+        {
+            glTexImage2D(GL_TEXTURE_2D, 0, static_cast<GLint>(GL541_R32UI), 512, 512, 0,
+                         GL541_RED_INTEGER, GL_UNSIGNED_INT, words.data());
+            allocatedRows = 512u;
+            return glGetError() == GL_NO_ERROR;
+        }
+        glPixelStorei(GL641_UNPACK_ROW_LENGTH, 512);
+        glPixelStorei(GL641_UNPACK_SKIP_ROWS, y);
+        glPixelStorei(GL641_UNPACK_SKIP_PIXELS, x);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, x, y, static_cast<GLsizei>(w),
+                        static_cast<GLsizei>(h), GL541_RED_INTEGER, GL_UNSIGNED_INT,
+                        words.data());
+        const bool ok = glGetError() == GL_NO_ERROR;
+        glPixelStorei(GL641_UNPACK_ROW_LENGTH, 0);
+        glPixelStorei(GL641_UNPACK_SKIP_ROWS, 0);
+        glPixelStorei(GL641_UNPACK_SKIP_PIXELS, 0);
+        return ok;
+    }
+
+    // The mirror image on the way back. `glGetTexImage` has no sub-rectangle form, so the rect read
+    // attaches the colour texture to a scratch FBO and uses `glReadPixels` — the same trick
+    // `readG630ImageOnWorker` (G631) uses, where framebuffer coordinate (x,y) IS texel (x,y) for a
+    // texture attachment, so no flip is involved. Fails closed onto the whole-image read.
+    bool g641ReadRect(GLuint tex, std::vector<uint32_t> &out, int x, int y, int w, int h)
+    {
+        // Sticky refusal: on a driver that will not give us a complete R32UI colour attachment the
+        // rect read errors and the caller falls back to the whole-image read. Retrying it every
+        // batch would make such a driver pay for BOTH, so the first failure retires the path for
+        // the process and the shipped whole-surface chain runs unmodified from then on.
+        if (m_g641RectDead)
+            return false;
+        if (m_f.glGenFramebuffers_ == nullptr || m_f.glBindFramebuffer_ == nullptr ||
+            m_f.glFramebufferTexture2D_ == nullptr)
+        {
+            m_g641RectDead = true;
+            return false;
+        }
+        if (m_g641ReadFbo == 0u)
+            m_f.glGenFramebuffers_(1, &m_g641ReadFbo);
+        if (m_g641ReadFbo == 0u)
+        {
+            m_g641RectDead = true;
+            return false;
+        }
+        while (glGetError() != GL_NO_ERROR) {}
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g641ReadFbo);
+        m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0,
+                                    GL_TEXTURE_2D, tex, 0);
+        glPixelStorei(GL641_PACK_ROW_LENGTH, 512);
+        glPixelStorei(GL641_PACK_SKIP_ROWS, y);
+        glPixelStorei(GL641_PACK_SKIP_PIXELS, x);
+        glReadPixels(x, y, static_cast<GLsizei>(w), static_cast<GLsizei>(h),
+                     GL541_RED_INTEGER, GL_UNSIGNED_INT, out.data());
+        const bool ok = glGetError() == GL_NO_ERROR;
+        glPixelStorei(GL641_PACK_ROW_LENGTH, 0);
+        glPixelStorei(GL641_PACK_SKIP_ROWS, 0);
+        glPixelStorei(GL641_PACK_SKIP_PIXELS, 0);
+        m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0,
+                                    GL_TEXTURE_2D, 0u, 0);
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, 0);
+        if (!ok)
+        {
+            while (glGetError() != GL_NO_ERROR) {}
+            m_g641RectDead = true;
+            std::fprintf(stderr, "[G641:rect] sub-rect read refused by the driver; "
+                                 "falling back to the whole-image read for this process\n");
+        }
+        return ok;
+    }
+
     bool runG570Shadow139OnWorker(const std::vector<uint32_t> &color,
                                   const std::vector<uint32_t> &depth,
                                   const std::vector<uint32_t> &triWords,
                                   const std::vector<uint32_t> &spanWords,
                                   const std::vector<uint32_t> &tileOffsets,
                                   const std::vector<uint32_t> &tileTris,
-                                  std::vector<uint32_t> &out)
+                                  std::vector<uint32_t> &out,
+                                  int rectX = 0, int rectY = 0,
+                                  int rectW = 512, int rectH = 512,
+                                  int deriveSpan = 0)
     {
         if (!m_g570Available || m_g570Prog == 0u)
             return false;
@@ -4770,46 +5149,157 @@ void main()
         uint64_t g571SpanUs = 0u, g571OffsetUs = 0u, g571TileUs = 0u;
         uint64_t g571DispatchUs = 0u, g571ReadUs = 0u;
 
-        if (!g570UploadWords(m_g570ColorTex, m_g570ColorRows, 512u, color))
+        // G641: `narrowed` is the ONE architectural variable of this arm — which rectangle of the
+        // colour and depth surfaces crosses the bus. Everything below (the bindings, the dispatch,
+        // the shader) is untouched, so a pixel outside the rect is still visited by the kernel,
+        // still lies in a tile with `first == last`, and is still stored back unchanged.
+        const bool narrowed = (rectX != 0 || rectY != 0 || rectW != 512 || rectH != 512);
+        if (narrowed)
+        {
+            if (!g641UploadRect(m_g570ColorTex, m_g570ColorRows, color,
+                                rectX, rectY, rectW, rectH))
+                return false;
+        }
+        else if (!g570UploadWords(m_g570ColorTex, m_g570ColorRows, 512u, color))
             return false;
         if (g571On) g571ColorUs = g571LapUs();
-        if (!g570UploadWords(m_g570DepthTex, m_g570DepthRows, 512u, depth))
+        if (narrowed)
+        {
+            if (!g641UploadRect(m_g570DepthTex, m_g570DepthRows, depth,
+                                rectX, rectY, rectW, rectH))
+                return false;
+        }
+        else if (!g570UploadWords(m_g570DepthTex, m_g570DepthRows, 512u, depth))
             return false;
         if (g571On) g571DepthUs = g571LapUs();
-        if (!g570UploadWords(m_g570TriTex, m_g570TriRows, 1024u, triWords))
-            return false;
-        if (g571On) g571TriUs = g571LapUs();
-        if (!g570UploadWords(m_g570SpanTex, m_g570SpanRows, 1024u, spanWords))
-            return false;
-        if (g571On) g571SpanUs = g571LapUs();
-        if (!g570UploadWords(m_g570TileOffsetTex, m_g570TileOffsetRows, 1024u, tileOffsets))
-            return false;
-        if (g571On) g571OffsetUs = g571LapUs();
-        if (!g570UploadWords(m_g570TileTriTex, m_g570TileTriRows, 1024u, tileTris))
-            return false;
-        if (g571On) g571TileUs = g571LapUs();
+        // G643: the four read-only payload arrays go either into SSBOs or into the legacy r32ui
+        // images. `m_g643Dead` retires the SSBO arm for the process on the first refusal, so a
+        // driver that cannot serve it degrades to the proven path instead of failing the batch.
+        const bool ssbo = m_g643Prog != 0u && !m_g643Dead;
+        if (ssbo)
+        {
+            const bool ok = g643UploadSsbo(0, triWords) && g643UploadSsbo(1, spanWords) &&
+                            g643UploadSsbo(2, tileOffsets) && g643UploadSsbo(3, tileTris);
+            if (g571On) g571TriUs = g571LapUs();
+            if (!ok)
+            {
+                while (glGetError() != GL_NO_ERROR) {}
+                m_g643Dead = true;
+                std::fprintf(stderr, "[G643:ssbo] upload refused by the driver; "
+                                     "falling back to the image2D data path for this process\n");
+                m_f.glBindBuffer_(GL643_SHADER_STORAGE_BUFFER, 0u);
+                return false;
+            }
+            m_f.glBindBuffer_(GL643_SHADER_STORAGE_BUFFER, 0u);
+        }
+        else
+        {
+            if (!g570UploadWords(m_g570TriTex, m_g570TriRows, 1024u, triWords))
+                return false;
+            if (g571On) g571TriUs = g571LapUs();
+            if (!g570UploadWords(m_g570SpanTex, m_g570SpanRows, 1024u, spanWords))
+                return false;
+            if (g571On) g571SpanUs = g571LapUs();
+            if (!g570UploadWords(m_g570TileOffsetTex, m_g570TileOffsetRows, 1024u, tileOffsets))
+                return false;
+            if (g571On) g571OffsetUs = g571LapUs();
+            if (!g570UploadWords(m_g570TileTriTex, m_g570TileTriRows, 1024u, tileTris))
+                return false;
+            if (g571On) g571TileUs = g571LapUs();
+        }
 
-        m_f.glUseProgram_(m_g570Prog);
+        m_f.glUseProgram_(ssbo ? m_g643Prog : m_g570Prog);
+        // G642: the producer says which encoding its payload uses. In derive mode `spanWords` is a
+        // single padded row that keeps unit 3 bound and is never sampled.
+        const GLint deriveLoc = ssbo ? m_locG643DeriveSpan : m_locG570DeriveSpan;
+        if (deriveLoc >= 0)
+            m_f.glUniform1i_(deriveLoc, deriveSpan != 0 ? 1 : 0);
         m_e.glBindImageTexture_(0u, m_g570ColorTex, 0, GL_FALSE, 0,
                                 GL178_READ_WRITE, GL541_R32UI);
         m_e.glBindImageTexture_(1u, m_g570DepthTex, 0, GL_FALSE, 0,
                                 GL542_READ_ONLY, GL541_R32UI);
-        m_e.glBindImageTexture_(2u, m_g570TriTex, 0, GL_FALSE, 0,
-                                GL542_READ_ONLY, GL541_R32UI);
-        m_e.glBindImageTexture_(3u, m_g570SpanTex, 0, GL_FALSE, 0,
-                                GL542_READ_ONLY, GL541_R32UI);
-        m_e.glBindImageTexture_(4u, m_g570TileOffsetTex, 0, GL_FALSE, 0,
-                                GL542_READ_ONLY, GL541_R32UI);
-        m_e.glBindImageTexture_(5u, m_g570TileTriTex, 0, GL_FALSE, 0,
-                                GL542_READ_ONLY, GL541_R32UI);
+        if (ssbo)
+        {
+            for (GLuint slot = 0; slot < 4u; ++slot)
+                m_e.glBindBufferBase_(GL643_SHADER_STORAGE_BUFFER, 2u + slot, m_g643Ssbo[slot]);
+        }
+        else
+        {
+            m_e.glBindImageTexture_(2u, m_g570TriTex, 0, GL_FALSE, 0,
+                                    GL542_READ_ONLY, GL541_R32UI);
+            m_e.glBindImageTexture_(3u, m_g570SpanTex, 0, GL_FALSE, 0,
+                                    GL542_READ_ONLY, GL541_R32UI);
+            m_e.glBindImageTexture_(4u, m_g570TileOffsetTex, 0, GL_FALSE, 0,
+                                    GL542_READ_ONLY, GL541_R32UI);
+            m_e.glBindImageTexture_(5u, m_g570TileTriTex, 0, GL_FALSE, 0,
+                                    GL542_READ_ONLY, GL541_R32UI);
+        }
+        // G641: a THIRD lap. `glFinish()` after the dispatch drains EVERYTHING, so the first split
+        // could not tell the compute apart from the GL work still in flight ahead of it (the
+        // frame's render batches leave draws queued and unfenced). Draining BEFORE the dispatch
+        // separates them: `pre` is the backlog the shadow item inherits, `comp` is the compute's
+        // own execution. Behaviour-pure, and never valid in a timing run.
+        uint64_t g641PreUs = 0u;
+        const bool g641Split = g641ShadowSplitOn();
+        if (g641Split)
+        {
+            const auto t = std::chrono::steady_clock::now();
+            glFinish();
+            g641PreUs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - t).count());
+        }
         m_e.glDispatchCompute_(64u, 64u, 1u);
         m_e.glMemoryBarrier_(GL178_SHADER_IMAGE_ACCESS_BARRIER_BIT |
                              GL178_TEXTURE_UPDATE_BARRIER_BIT);
         if (g571On) g571DispatchUs = g571LapUs();
+        // G641 (DC2_G641_SHSPLIT=1): drain the pipeline before the read so the compute's own
+        // execution stops hiding inside the readback lap. Behaviour-pure — glFinish changes no
+        // result and no command order; it only moves wall time between two laps, which is the point.
+        uint64_t g641DrainUs = 0u;
+        if (g641Split)
+        {
+            // Stamp unconditionally: `g571Mark` is only advanced by `g571LapUs()`, which does not
+            // run unless DC2_G571_SPLIT is also armed. Without this the drain lap would start at
+            // function entry and swallow the six uploads.
+            g571Mark = std::chrono::steady_clock::now();
+            glFinish();
+            g641DrainUs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - g571Mark).count());
+            g571Mark = std::chrono::steady_clock::now();
+        }
         const size_t surfacePixels = 512u * 512u;
         out.resize(surfacePixels);
-        glBindTexture(GL_TEXTURE_2D, m_g570ColorTex);
-        glGetTexImage(GL_TEXTURE_2D, 0, GL541_RED_INTEGER, GL_UNSIGNED_INT, out.data());
+        // G641: the narrowed arm publishes only the rect. It fails closed onto the legacy
+        // whole-image read, which is byte-for-byte what every unarmed run does.
+        if (!narrowed || !g641ReadRect(m_g570ColorTex, out, rectX, rectY, rectW, rectH))
+        {
+            glBindTexture(GL_TEXTURE_2D, m_g570ColorTex);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL541_RED_INTEGER, GL_UNSIGNED_INT, out.data());
+        }
+        if (g641Split)
+        {
+            const uint64_t xferUs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - g571Mark).count());
+            static uint64_t s_n = 0ull, s_pre = 0ull, s_comp = 0ull, s_xfer = 0ull;
+            static uint64_t s_lastN = 0ull, s_lastPre = 0ull, s_lastComp = 0ull,
+                            s_lastXfer = 0ull;
+            ++s_n; s_pre += g641PreUs; s_comp += g641DrainUs; s_xfer += xferUs;
+            if (s_n - s_lastN >= 240ull)
+            {
+                const double n = static_cast<double>(s_n - s_lastN);
+                std::fprintf(stderr,
+                             "[G641:sh] n=%.0f pre=%.3f comp=%.3f xfer=%.3f MBps=%.0f\n",
+                             n, static_cast<double>(s_pre - s_lastPre) / 1000.0 / n,
+                             static_cast<double>(s_comp - s_lastComp) / 1000.0 / n,
+                             static_cast<double>(s_xfer - s_lastXfer) / 1000.0 / n,
+                             (static_cast<double>(surfacePixels) * 4.0 * n) /
+                                 (static_cast<double>(s_xfer - s_lastXfer) + 1.0));
+                s_lastN = s_n; s_lastPre = s_pre; s_lastComp = s_comp; s_lastXfer = s_xfer;
+            }
+        }
         if (g571On)
         {
             g571ReadUs = g571LapUs();
@@ -8357,6 +8847,22 @@ void main()
         }
         static uint64_t s_globalDrawCount = 0;
         const int drawLimit = dc2DrawLimit();
+        // ===== G647: the producer-surface sampler-parameter cache (ROADMAP Priority 7) ==========
+        // Every other GL state write in this loop already goes through the G496 cache; the FOUR
+        // `glTexParameteri` calls on the `srcFbp` (producer-surface) branch are the one hole left,
+        // and G496b left them open for a documented reason: an `FboEntry` colour texture is
+        // re-parameterised by the T8, CT24, composite-source and spare-swap paths, so a per-OBJECT
+        // record could go stale.
+        //
+        // ⭐ THE FIX IS TO SCOPE THE RECORD, NOT TO ENUMERATE THE WRITERS. Those other paths are
+        // separate BACKEND QUEUE ITEMS: the whole batch below runs inside one item on the single GL
+        // worker, so nothing outside this loop can touch a texture between two of its draws, and
+        // nothing inside it re-parameterises an FBO colour texture except this site. A record that
+        // is keyed on the GL texture NAME and RESET at batch entry is therefore exact without any
+        // writer enumeration at all — the same shape of argument G641 used for the shadow window.
+        // Rollback: DC2_G647_NO_SRCPARAM=1. Census: DC2_G647_STAT=1 -> [G647:srcparam].
+        GLuint g647ParamTex = 0u;
+        GLint g647MinF = 0, g647MagF = 0, g647WrapS = 0, g647WrapT = 0;
         for (size_t drawIndex = 0; drawIndex < b.draws.size(); ++drawIndex)
         {
             if (drawLimit >= 0 && s_globalDrawCount >= static_cast<uint64_t>(drawLimit))
@@ -8563,15 +9069,57 @@ void main()
                     }
                     g496BindTex(src.colorTex, g496GlCache);
                     const GLint filter = d.bilinear ? GL_LINEAR : GL_NEAREST;
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
                     const bool ownerSource = g289SourceIsOwner(d.srcFbp);
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
-                                    ownerSource && d.wrapU == 0u
-                                        ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE));
-                    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
-                                    ownerSource && d.wrapV == 0u
-                                        ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+                    const GLint wrapS = ownerSource && d.wrapU == 0u
+                                            ? GL_REPEAT
+                                            : static_cast<GLint>(GL158_CLAMP_TO_EDGE);
+                    const GLint wrapT = ownerSource && d.wrapV == 0u
+                                            ? GL_REPEAT
+                                            : static_cast<GLint>(GL158_CLAMP_TO_EDGE);
+                    // G647: first sight of this texture inside this batch (or the rollback arm)
+                    // issues all four exactly as before; a repeat issues only what changed.
+                    if (!g647SrcParamOn() || g647ParamTex != src.colorTex)
+                    {
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
+                        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT);
+                        g647NoteParam(4u, 0u);
+                        g647ParamTex = src.colorTex;
+                        g647MinF = filter;
+                        g647MagF = filter;
+                        g647WrapS = wrapS;
+                        g647WrapT = wrapT;
+                    }
+                    else
+                    {
+                        uint32_t issued = 0u;
+                        if (g647MinF != filter)
+                        {
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
+                            g647MinF = filter;
+                            ++issued;
+                        }
+                        if (g647MagF != filter)
+                        {
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+                            g647MagF = filter;
+                            ++issued;
+                        }
+                        if (g647WrapS != wrapS)
+                        {
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
+                            g647WrapS = wrapS;
+                            ++issued;
+                        }
+                        if (g647WrapT != wrapT)
+                        {
+                            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT);
+                            g647WrapT = wrapT;
+                            ++issued;
+                        }
+                        g647NoteParam(issued, 4u - issued);
+                    }
                 }
                 mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
                 if (g289SourceIsCt24(d.srcFbp))
@@ -9182,6 +9730,14 @@ void main()
     uint64_t m_g634RawUploads = 0u, m_g634RawUploadOps = 0u;
     uint64_t m_g634UpVerifyRuns = 0u, m_g634UpVerifyChecks = 0u, m_g634UpVerifyBad = 0u;
     GLuint m_g570Prog = 0;
+    GLint m_locG570DeriveSpan = -1; // G642
+    GLuint m_g643Prog = 0;              // G643: the std430 twin of m_g570Prog (0 = unavailable)
+    GLint m_locG643DeriveSpan = -1;
+    GLuint m_g643Ssbo[4] = {0u, 0u, 0u, 0u};                // tris / spans / tileOffsets / tileTris
+    GLsizeiptrLocal m_g643SsboBytes[4] = {0, 0, 0, 0};
+    bool m_g643Dead = false;            // ...retired for the process after any upload refusal
+    GLuint m_g641ReadFbo = 0;   // G641: scratch FBO for the sub-rect colour read
+    bool m_g641RectDead = false; // ...retired for the process after any refusal
     GLuint m_g570ColorTex = 0, m_g570DepthTex = 0, m_g570TriTex = 0;
     GLuint m_g570SpanTex = 0, m_g570TileOffsetTex = 0, m_g570TileTriTex = 0;
     uint32_t m_g570ColorRows = 0, m_g570DepthRows = 0, m_g570TriRows = 0;
@@ -9274,7 +9830,8 @@ void main()
     // G452: stable deque storage keeps QueueItem::batch pointers valid while up to eight packets
     // are in flight. Legacy G305 still drains at every flush and therefore uses this as one slot.
     std::deque<AsyncSlot> m_asyncSlots;
-    G178Batch m_asyncRecycle;
+    // G640: a FREE LIST, not one slot — a depth-N ring needs N+1 buffer sets in circulation.
+    std::deque<G178Batch> m_asyncRecycle;
 
     std::mutex m_residentMtx;
     std::unordered_set<uint64_t> m_resident;

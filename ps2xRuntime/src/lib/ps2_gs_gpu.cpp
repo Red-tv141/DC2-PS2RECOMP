@@ -53,6 +53,9 @@ extern std::atomic<uint32_t> g_dc2ScriptFrame;
 #include "ps2_gs_gpu_parts/g432_trxdir_census.inc"
 #include "ps2_gs_gpu_parts/gpu_g399_surface_probe.inc"
 #include "ps2_gs_gpu_parts/gpu_display_and_snapshot.inc"
+// G650 (ROADMAP P3): the PACKED descriptor bodies as macros, shared by writeRegisterPacked's
+// switch and processGIFPacket's inline walk. Must precede both.
+#include "ps2_gs_gpu_parts/g650_gif_packed_inline.inc"
 #include "ps2_gs_gpu_parts/gpu_gif_and_registers.inc"
 // G424: run-based host->local IMAGE upload writer, PROMOTED default-on
 // (-2.45 ms/f, -4.69%); kill DC2_G424_NO_FAST_IMAGE=1.

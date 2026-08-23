@@ -304,15 +304,150 @@
             {
                 const uint8_t *srcBase = data + pos;
                 uint32_t srcIndex = 0u;
-                for (uint32_t writeIndex = 0; writeIndex < writeVectorCount; ++writeIndex)
+                // ===== G645: strength-reduce the UNPACK cycle arithmetic =====================
+                // `writeIndex % wl` and `writeIndex / wl` are TWO hardware integer divisions per
+                // unpacked vector, on the EE thread's hottest loop. `wl` is a runtime register
+                // value so MSVC emits real `div r32` (~20-40 cycles each); the G504 `/MAP` +
+                // `[G483:rawpc]` pass put 1.18% + 0.51% of the whole EE thread on the two
+                // instructions that consume their results, inside a
+                // `?processVIF1Data@PS2Memory@@` row worth 12.50%.
+                //
+                // Both quantities advance by a trivial recurrence and `wl >= 1` is guaranteed by
+                // the STCYCL normalisation above, so the counters are EXACTLY equal on every
+                // iteration:  cyclePos = writeIndex % wl  and  blockBase = vuAddr + (writeIndex/wl)*cl.
+                // The step runs in the `for` INCREMENT clause, so the two `continue`s inside the
+                // body cannot skip it. Bounds: writeVectorCount <= 256 and cl <= 255, so
+                // `blockBase` cannot overflow before the `& 0x3FF`.
+                // Rollback: DC2_G645_NO_UNPACKSTEP=1 restores the two divisions.
+                const bool g645Step = g645UnpackStepOn();
+                const bool g645Blocked = (cl >= wl);
+                uint32_t g645Cycle = 0u;
+                uint32_t g645BlockBase = vuAddr;
+                const auto g645Advance = [&]() {
+                    if (++g645Cycle == wl)
+                    {
+                        g645Cycle = 0u;
+                        g645BlockBase += cl;
+                    }
+                };
+                // ===== ⭐ G649 (ROADMAP P4): the UNPACK per-lane write loop ===================
+                //
+                // PREMISE (`[G483:rawpc]` + the G504 `/MAP` pass, G645 §5.2): `processVIF1Data` is
+                // **12.5–13.5% of the EE thread**, and the bulk of it is THIS loop. G645 already
+                // refuted the two hardware divisions as the cost (its in-loop rollback ternary
+                // measured **+0.354 ms/f**). The two costs that remain named are:
+                //
+                //   1. the VIF MASK register is re-extracted PER LANE, PER WRITE VECTOR — a `shr`
+                //      + `and` off `vif1_regs.mask` inside the `field` loop. It is loop-invariant
+                //      per `cyclePos`, and `cyclePos` saturates at 3, so there are only SIXTEEN
+                //      distinct values in the whole command. `vif1_regs.mask` cannot change inside
+                //      the loop (the body writes only `vif1_regs.row[]`, in mode 2), so the whole
+                //      table is hoistable to here.
+                //
+                //   2. the lane array round-trips through MEMORY on every vector: four `movd`
+                //      stores into `lanes[]` followed by a 16-byte `movups` reload of the same
+                //      bytes for the destination `memcpy` — a store-forwarding stall per vector
+                //      (17d's store-forwarding law). Writing the four results straight to
+                //      `m_vu1Data + destOff` deletes both the reload and the second store.
+                //
+                // ⚠️ SINGLE-FORM BY CONSTRUCTION — G645's law. There is no in-loop arm select and
+                // no rollback ternary anywhere in the body: the table below IS the mask read, and
+                // the four scalar stores ARE the write. Nothing keeps two forms live.
+                //
+                // EXACTNESS: `g649MaskTab[c][f]` is literally `(vif1_regs.mask >> (((c*4)+f)*2))
+                // & 3` evaluated at `c = maskCycle`, and the unrolled lane computation reproduces
+                // the four-iteration `field` loop verbatim, including its `continue`
+                // (write-protect => keep the old lane) and its `!handledFormat` fall-through.
+                uint8_t g649MaskTab[4][4];
+                if (maskEnable)
                 {
-                    const uint32_t cyclePos = writeIndex % wl;
-                    const bool sourceAvailable = (cl >= wl) || (cyclePos < cl);
+                    for (uint32_t c = 0u; c < 4u; ++c)
+                        for (uint32_t f = 0u; f < 4u; ++f)
+                            g649MaskTab[c][f] = static_cast<uint8_t>(
+                                (vif1_regs.mask >> (((c * 4u) + f) * 2u)) & 0x3u);
+                }
+                else
+                {
+                    std::memset(g649MaskTab, 0, sizeof(g649MaskTab));
+                }
+                // ===== ⭐ G650 (ROADMAP P4): COMPILED UNPACK KERNELS =========================
+                //
+                // Every decision the loop below makes per WRITE VECTOR is a function of values
+                // that are fixed for the whole command. When the six admission conjuncts hold the
+                // command is one contiguous run of full-width decodes, so it is executed by a
+                // single-form kernel selected HERE — outside the loop, per G645's law — and the
+                // loop is skipped entirely. See vif1_g650_fast_unpack.inc for the derivation.
+                const G650UnpackKind g650Kind = g650SelectUnpackKind(vn, vl);
+                const uint32_t g650RunBytes = writeVectorCount * 16u;
+                uint8_t *const g650Dst = m_vu1Data + vuAddr * 16u;
+                bool g650Admit = g650FastUnpackOn() && g650Kind != G650_UK_NONE;
+                if (g650Admit)
+                {
+                    if (maskEnable)                                   { g650Admit = false; g650RejBump(0); }
+                    else if ((vif1_regs.mode & 3u) != 0u)             { g650Admit = false; g650RejBump(1); }
+                    else if (cl != wl)                                { g650Admit = false; g650RejBump(2); }
+                    else if (vuAddr + writeVectorCount > 0x400u)      { g650Admit = false; g650RejBump(3); }
+                    else if (g137Active)                              { g650Admit = false; g650RejBump(5); }
+                }
+                else if (g650FastUnpackOn())
+                {
+                    g650RejBump(4);
+                }
+                bool g650Handled = false;
+                bool g650Verifying = false;
+                std::vector<uint8_t> g650KernelResult;
+                if (g650Admit)
+                {
+                    if (g650FastUnpackVerify())
+                    {
+                        // The oracle: run the kernel, keep its output, restore the pre-state and
+                        // let the SHIPPED legacy loop below produce the reference from the
+                        // identical bytes. The comparison is after the loop.
+                        g650Verifying = true;
+                        const std::vector<uint8_t> g650Before(g650Dst, g650Dst + g650RunBytes);
+                        g650RunUnpackKernel(g650Kind, g650Dst, srcBase, writeVectorCount,
+                                            bytesPerVector, static_cast<uint32_t>(components),
+                                            zeroExtend);
+                        g650KernelResult.assign(g650Dst, g650Dst + g650RunBytes);
+                        std::memcpy(g650Dst, g650Before.data(), g650RunBytes);
+                    }
+                    else
+                    {
+                        g650RunUnpackKernel(g650Kind, g650Dst, srcBase, writeVectorCount,
+                                            bytesPerVector, static_cast<uint32_t>(components),
+                                            zeroExtend);
+                        // G301 MTVU ordered event. The run is contiguous, so ONE record carries
+                        // exactly the bytes the per-vector records used to — which is what G482's
+                        // coalescer would have merged them into anyway.
+                        g297NoteVuWrite(false, vuAddr * 16u, g650Dst, g650RunBytes);
+                        g650Handled = true;
+                    }
+                }
+                if (g650UnpackStatOn())
+                {
+                    g_g650UnpackCmds.fetch_add(1ull, std::memory_order_relaxed);
+                    g_g650UnpackVecs.fetch_add(writeVectorCount, std::memory_order_relaxed);
+                    if (g650Admit)
+                    {
+                        g_g650UnpackFastCmds.fetch_add(1ull, std::memory_order_relaxed);
+                        g_g650UnpackFastVecs.fetch_add(writeVectorCount, std::memory_order_relaxed);
+                        if (g650Kind == G650_UK_V4_32)
+                            g_g650UnpackMemcpyVecs.fetch_add(writeVectorCount, std::memory_order_relaxed);
+                    }
+                    g650UnpackReport();
+                }
+                if (!g650Handled)
+                for (uint32_t writeIndex = 0; writeIndex < writeVectorCount;
+                     ++writeIndex, g645Advance())
+                {
+                    const uint32_t cyclePos = g645Step ? g645Cycle : (writeIndex % wl);
+                    const bool sourceAvailable = g645Blocked || (cyclePos < cl);
 
                     uint32_t destVec = 0;
-                    if (cl >= wl)
+                    if (g645Blocked)
                     {
-                        destVec = (vuAddr + (writeIndex / wl) * cl + cyclePos) & 0x3FFu;
+                        destVec = (g645Step ? (g645BlockBase + cyclePos)
+                                            : (vuAddr + (writeIndex / wl) * cl + cyclePos)) & 0x3FFu;
                     }
                     else
                     {
@@ -465,60 +600,90 @@
                     const uint32_t colIdx = (cyclePos > 3u) ? 3u : cyclePos;
                     const uint32_t maskCycle = (cyclePos > 3u) ? 3u : cyclePos;
 
-                    for (uint32_t field = 0u; field < 4u; ++field)
-                    {
-                        uint32_t maskSpec = 0u;
-                        if (maskEnable)
-                        {
-                            const uint32_t shift = ((maskCycle * 4u) + field) * 2u;
-                            maskSpec = (vif1_regs.mask >> shift) & 0x3u;
-                        }
-
-                        // In fill-write cycles with suspended source reads, treat raw-data selections as row-fill.
+                    // G649: one row of the hoisted table replaces four `shr`/`and` pairs.
+                    const uint8_t *const g649Mask = g649MaskTab[maskCycle];
+                    const bool g649Accum = canAdd && (mode == 1u || mode == 2u);
+                    const bool g649AccumWrite = g649Accum && (mode == 2u);
+                    // G649: the four-iteration `field` loop, unrolled so the results stay in
+                    // registers instead of round-tripping through `lanes[]`. Byte-for-byte the same
+                    // selection: maskSpec 0 => decoded (optionally row-accumulated), 1 => row,
+                    // 2 => col, 3 => keep; `!decoded && maskSpec == 0` promotes to row-fill; and
+                    // `!handledFormat` under maskSpec 0 keeps the old lane, exactly as before.
+                    const auto g649Lane = [&](uint32_t field, uint32_t cur) -> uint32_t {
+                        uint32_t maskSpec = g649Mask[field];
                         if (!decoded && maskSpec == 0u)
                             maskSpec = 1u;
-
-                        uint32_t writeVal = lanes[field];
                         if (maskSpec == 0u)
                         {
-                            if (handledFormat)
+                            if (!handledFormat)
+                                return cur;
+                            uint32_t writeVal = decompressed[field];
+                            if (g649Accum)
                             {
-                                writeVal = decompressed[field];
-                                if (canAdd && (mode == 1u || mode == 2u))
-                                {
-                                    writeVal = writeVal + vif1_regs.row[field];
-                                    if (mode == 2u)
-                                        vif1_regs.row[field] = writeVal;
-                                }
+                                writeVal = writeVal + vif1_regs.row[field];
+                                if (g649AccumWrite)
+                                    vif1_regs.row[field] = writeVal;
                             }
+                            return writeVal;
                         }
-                        else if (maskSpec == 1u)
-                        {
-                            writeVal = vif1_regs.row[field];
-                        }
-                        else if (maskSpec == 2u)
-                        {
-                            writeVal = vif1_regs.col[colIdx];
-                        }
-                        else
-                        {
-                            continue; // write-protect
-                        }
+                        if (maskSpec == 1u)
+                            return vif1_regs.row[field];
+                        if (maskSpec == 2u)
+                            return vif1_regs.col[colIdx];
+                        return cur; // write-protect
+                    };
+                    const uint32_t g649L0 = g649Lane(0u, lanes[0]);
+                    const uint32_t g649L1 = g649Lane(1u, lanes[1]);
+                    const uint32_t g649L2 = g649Lane(2u, lanes[2]);
+                    const uint32_t g649L3 = g649Lane(3u, lanes[3]);
 
-                        lanes[field] = writeVal;
-                    }
-
-                    std::memcpy(m_vu1Data + destOff, lanes, sizeof(lanes));
-                    g297NoteVuWrite(false, destOff, reinterpret_cast<const uint8_t *>(lanes),
+                    // G649: four scalar stores straight to VU data memory. The old form built the
+                    // vector on the stack and reloaded all sixteen bytes to copy them here.
+                    std::memcpy(m_vu1Data + destOff + 0u, &g649L0, 4);
+                    std::memcpy(m_vu1Data + destOff + 4u, &g649L1, 4);
+                    std::memcpy(m_vu1Data + destOff + 8u, &g649L2, 4);
+                    std::memcpy(m_vu1Data + destOff + 12u, &g649L3, 4);
+                    // G301 MTVU ordered event. The destination now holds exactly what `lanes` used
+                    // to, so the recorded bytes are identical.
+                    g297NoteVuWrite(false, destOff, m_vu1Data + destOff,
                                     sizeof(lanes)); // G301 MTVU ordered event
                     if (g137Active)
                     {
+                        lanes[0] = g649L0; lanes[1] = g649L1;
+                        lanes[2] = g649L2; lanes[3] = g649L3;
                         g137_record_origin(g136Seq, destVec, pos - 4u,
                                             srcVec ? static_cast<uint32_t>(pos + (srcVec - srcBase)) : 0xFFFFFFFFu,
                                             static_cast<uint32_t>(opcode), imm, writeIndex, srcVecIndex,
                                             cl, wl, vif1_regs.mode & 3u,
                                             vif1_regs.tops & 0x3FFu, vif1_regs.top & 0x3FFu,
                                             lanes, srcVec, bytesPerVector);
+                    }
+                }
+                // G650 P4 oracle: the shipped legacy loop above just produced the reference from
+                // the same pre-state the kernel saw. Compare byte for byte.
+                if (g650Verifying)
+                {
+                    g_g650UnpackChecks.fetch_add(1ull, std::memory_order_relaxed);
+                    if (std::memcmp(g650KernelResult.data(), g650Dst, g650RunBytes) != 0)
+                    {
+                        const uint64_t bad = g_g650UnpackBad.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+                        if (bad <= 16ull)
+                        {
+                            uint32_t firstDiff = 0u;
+                            while (firstDiff < g650RunBytes &&
+                                   g650KernelResult[firstDiff] == g650Dst[firstDiff])
+                                ++firstDiff;
+                            std::fprintf(stderr,
+                                         "[G650:unpack-MISMATCH] kind=%u vn=%u vl=%u bpv=%u comp=%d zx=%u "
+                                         "dest=0x%x num=%u cl=%u wl=%u firstDiffByte=%u fast=0x%02x ref=0x%02x\n",
+                                         static_cast<unsigned>(g650Kind), static_cast<unsigned>(vn),
+                                         static_cast<unsigned>(vl), bytesPerVector, components,
+                                         zeroExtend ? 1u : 0u, vuAddr, writeVectorCount, cl, wl,
+                                         firstDiff,
+                                         firstDiff < g650RunBytes ? g650KernelResult[firstDiff] : 0u,
+                                         firstDiff < g650RunBytes ? g650Dst[firstDiff] : 0u);
+                            std::fflush(stderr);
+                        }
                     }
                 }
             }

@@ -4,6 +4,12 @@
 // G483: it also splits [G441:kick]'s exec bucket by kick kind ([G483:kind]) and by stop reason
 // ([G483:stop]).
 #include "ps2_runtime_parts/dc2_logger.inc"
+// G650 (ROADMAP P6): contention-aware core scheduler. ⛔ The DEFINITION deliberately does NOT live
+// in this TU — it needs <windows.h>, and pulling that in ahead of raylib.h / ThreadNaming.h
+// redefines `Rectangle`, `CloseWindow`, `ShowCursor` and `HMODULE`. It is compiled inside
+// ps2_gif_arbiter.cpp, which already includes <windows.h> for the G446 PC sampler. Global scope on
+// purpose (the appendix's anon-namespace linkage trap).
+extern void g650PinThread(int role);
 #include "ps2_runtime_parts/runtime_mtvu_and_env.inc"
 #include "ps2_runtime_parts/runtime_host_display.inc"
 #include "ps2_runtime_parts/runtime_init_and_signals.inc"

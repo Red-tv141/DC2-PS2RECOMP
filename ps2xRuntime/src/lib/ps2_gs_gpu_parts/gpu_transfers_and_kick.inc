@@ -707,7 +707,6 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
                 std::chrono::steady_clock::now() - g313StepT0).count());
         g313StepT0 = std::chrono::steady_clock::now();
     }
-
     // [G37:seq] GS-order trace of writes to the 0x2720 work page (uploads), shared with the
     // rasterizer's RTT-draw + composite events, to pin what clobbers the model RTT before the
     // display composite samples it. Gated by DC2_G37_SEQ.

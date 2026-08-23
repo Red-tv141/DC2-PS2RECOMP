@@ -15,6 +15,18 @@ void g124_note_stream(uint32_t sizeBytes);
 extern std::atomic<uint32_t> g_dc2G136TraceActive;
 std::atomic<uint64_t> g_g146Vif1Ns{0};
 
+// ⛔ G645 (ROADMAP Priority 5), REFUTED — kept DEFAULT-OFF as its own probe (DC2_G645_UNPACKSTEP=1).
+// The premise was right (two hardware `div r32` per unpacked vector, 1.69% of the EE thread between
+// the two instructions that consume them) but the lever measured NEGATIVE: order-balanced A B B A on
+// `s05`'s 60 FPS steady window (sf 14000..20313, 2,880 presents/arm, both blocks agreeing) read
+// frame +0.354 ms/f (+2.11%) with EE cpu +0.14 — i.e. it did not even move the thread it touches.
+// The rollback ternary keeps both forms live in the loop body and adds two loop-carried values to a
+// body that already spills (17d's live-value-pressure law); the divisions it deletes are cheaper
+// than the register pressure it adds. Re-open only with a single-form build (no in-loop arm).
+// File scope, not a function-local static: that would be an MSVC per-access TLS guard.
+static const bool s_g645UnpackStepOn = (std::getenv("DC2_G645_UNPACKSTEP") != nullptr);
+inline bool g645UnpackStepOn() { return s_g645UnpackStepOn; }
+
 // G301 MTVU: record a VU-RAM write (UNPACK/MPG/fog) as an ordered event so the VU1 worker replays it
 // onto its PERSISTENT VU RAM in program order (fixes the G297 per-kick-snapshot cross-kick drop).
 // No-op unless MTVU is active; VIF1 still writes live RAM (EE shadow) as before. Defined in ps2_runtime.cpp.

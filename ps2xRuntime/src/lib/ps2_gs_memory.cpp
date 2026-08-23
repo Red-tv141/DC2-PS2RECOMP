@@ -4,6 +4,10 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+// G651: SSE2 only, on purpose — the P4HL/P4HH word-group extraction in
+// g512_texdecode_row_readers.inc would be one `_mm_shuffle_epi8` under SSSE3, and this project
+// keeps one baseline (the same call g491_readback_format.inc made).
+#include <emmintrin.h>
 
 #include "runtime/ps2_gs_memory.h"
 
@@ -12,7 +16,8 @@
 // marker comment must be touched whenever g424_image_run_writers.inc is edited.
 // g424_image_run_writers.inc revision: 5 (G477 swizzle-row hoisted CT32/Z32/P4 run writers)
 // g477_fast_run_writers.inc revision: 7 (CT32 aligned-group stores + PSMT4 quad-gather)
-// g512_texdecode_row_readers.inc revision: 2 (G620 PSMCT32 aligned-group row reader + oracle)
+// g512_texdecode_row_readers.inc revision: 4 (G651 widened paletted group predicate 8/4/2 +
+//                                             P4HL/P4HH SSE2 word-group extraction + no-mask arm)
 
 // G477's paired within-process gate lives in the rasterizer TU. Declared at GLOBAL scope, above
 // `namespace GSMem`, so it binds to the external symbol rather than to a nested-namespace one

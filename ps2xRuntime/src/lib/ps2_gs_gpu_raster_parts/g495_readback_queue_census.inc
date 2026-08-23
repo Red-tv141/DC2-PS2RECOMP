@@ -179,17 +179,25 @@ static inline void g495AheadAdd(G495Ahead &a, const G495Ahead &b)
 
 // Called once per backend item at the worker's dispatch choke point, BEFORE the item runs, so a
 // readback never counts itself in its own "ahead" set.
+// G644: `fbp` / `glY` / `rows` describe the SURFACE WINDOW the item touches (0 / -1 / 0 when the
+// item class has none). Without them the sequence dump names only a class, so a "these two adjacent
+// reads overlap" claim is inferred rather than read — which is exactly how G641 §3.2 had to leave
+// the containment finding PLAUSIBLE instead of confirmed.
 static inline void g495NoteItem(int cls, uint64_t draws, uint64_t verts,
-                                uint64_t texN, uint64_t texBytes, uint64_t fbBytes)
+                                uint64_t texN, uint64_t texBytes, uint64_t fbBytes,
+                                uint32_t fbp = 0u, int glY = -1, int rows = 0)
 {
     if (!g495RbCensusOn())
         return;
     if (g495SeqOn() && g_g495Reads >= 60ull && g_g495SeqDumped < 300ull)
     {
         ++g_g495SeqDumped;
-        std::fprintf(stderr, "[G495:seq] %3llu %-6s draws=%llu verts=%llu texN=%llu texKB=%llu\n",
+        std::fprintf(stderr,
+                     "[G495:seq] %3llu %-6s fbp=0x%x rows=%d..%d draws=%llu verts=%llu "
+                     "texN=%llu texKB=%llu\n",
                      static_cast<unsigned long long>(g_g495SeqDumped),
                      (cls >= 0 && cls < kG495ClsCount) ? kG495ClsName[cls] : "?",
+                     fbp, glY, rows > 0 ? glY + rows - 1 : glY,
                      static_cast<unsigned long long>(draws),
                      static_cast<unsigned long long>(verts),
                      static_cast<unsigned long long>(texN),

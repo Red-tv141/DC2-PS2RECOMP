@@ -117,6 +117,11 @@ namespace
     constexpr uint32_t G612_MIN_ENTRY = 2u;   // == G490_MIN_RUN
     constexpr uint8_t G612_FLAG_TAIL = 3u;    // == G531_FLAG_TAIL
 
+    // ⭐ G651: the admission predicates in §3 run ahead of the flag block in §5, so the FCGET arm is
+    // forward-declared here. Its definition (and the whole exactness argument) is beside
+    // `g612VerifyOn`.
+    bool g651VuClipOn();
+
     constexpr uint32_t G612_MAX_BB = 48u;          // basic blocks per region
     constexpr uint32_t G612_MAX_PAIRS = 512u;      // emitted pairs per region
     constexpr size_t G612_MAX_REGION_BYTES = 96u * 1024u;
@@ -271,6 +276,11 @@ namespace
 
     bool g612LowerEmittable(uint8_t kind)
     {
+        // ⭐ G651: FCGET reads only `m_state.clip` under the constant its own decode pins. See the
+        // header note beside `g651VuClipOn`. Admitted only through `g651RegionClipPairOk`, which is
+        // the gate that also re-checks every non-flag clause of `g490BlockPairEligible`.
+        if (kind == G422_LK_FCGET)
+            return g651VuClipOn();
         switch (kind)
         {
         case G422_LK_NOP:
@@ -286,11 +296,36 @@ namespace
         }
     }
 
+    // ⭐ G651: the one class `g490BlockPairEligible` excludes for a reason that does not hold inside
+    // a region. EVERY OTHER clause of that predicate is re-checked here, by hand, in the same order:
+    // no E-bit / I-bit / LOI, no G239 prestall, no G139 pair hazard, an upper the emitter runs. The
+    // clause that is deliberately NOT re-checked is `G427_PF_FLAGREAD`, and the header note above is
+    // the argument for why. `G428_PF_STATUSREAD` IS refused — a STATUS reader is a different line
+    // with a different publication and this lever does not touch it.
+    bool g651RegionClipPairOk(uint32_t slot)
+    {
+        if (!g651VuClipOn() || slot >= G612_SLOTS)
+            return false;
+        const G410CompiledUpper &p = s_g410Cache.uppers[slot];
+        if (p.lowerKind != G422_LK_FCGET)
+            return false;
+        if (p.pairFlags != 0u)
+            return false;                               // E-bit / I-bit / LOI
+        if ((p.g425Flags & (G426_PF_PRESTALL | G426_PF_HAZ | G428_PF_STATUSREAD)) != 0u)
+            return false;
+        if (p.upperKind == 0x6fu)
+            return true;                                // VNOP: the loop skips the upper
+        return g421DescTableConst.e[p.upperKind].cls != 0u;
+    }
+
     // A PLAIN region pair: block-eligible by the shipped sidecar AND inside the emitted op set.
     bool g612PlainEmittable(uint32_t slot)
     {
-        if (slot >= G612_SLOTS || s_g410Cache.g490RunLen[slot] == 0u)
-            return false;                               // precondition 1
+        if (slot >= G612_SLOTS)
+            return false;
+        // precondition 1 — or, for FCGET only, the hand-checked equivalent above.
+        if (s_g410Cache.g490RunLen[slot] == 0u && !g651RegionClipPairOk(slot))
+            return false;
         const G479FusedPair &fp = s_g410Cache.fused[slot];
         return g612UpperEmittable(fp.pair.upperKind, (uint32_t)(fp.source >> 32)) &&
                g612LowerEmittable(fp.pair.lowerKind);
@@ -399,6 +434,57 @@ namespace
         static const bool s_on = f50_12_vu_env_flag("DC2_G612_VERIFY");
         return s_on;
     }
+    // ============================================================================================
+    // ⭐ G651 (ROADMAP Priority 3) — FCGET EMITTED INSIDE THE REGION BODY
+    //
+    // PREMISE (G650 §P7, re-stated). The VU1 backend is at 100% native COVERAGE (`refused = 0`,
+    // every `[G610:why]` / `[G612:why]` counter 0) and the remaining cost is not refusals but
+    // **931,135,488 REGION ROUND TRIPS on `georama`** at 19.68 pairs each. `[G612:exit]` names the
+    // program points, and the largest single one is a flag consumer:
+    //
+    //     0x30d0 : 225,966,473  lk=37 (FCGET)   <- 24% of every region entry on the VU1-poled route
+    //
+    // Each of those costs a region EXIT (store `st.pc`, return), one generic interpreter pair, and
+    // a fresh region ENTRY with its prologue — to execute `vi[it] = clip & 0xFFF`.
+    //
+    // ⭐ WHY FCGET IS ADMISSIBLE AND THE OTHER FLAG CONSUMERS ARE NOT.
+    // `G422_LK_FCGET` is only ever DECODED when `g487FlagLowerSupported()` holds, and that pins
+    // `DC2_VU1_NO_FMSWAPFIX` unset — i.e. `s_fmFixed == true`. Under that constant
+    // `VU1Interpreter::execLower` case 0x1C reduces to exactly `if (it) vi[it] = clip & 0xFFF`
+    // (`vu1_dispatch_and_sync.inc:331`): it reads `m_state.clip` and NOTHING else. `clip` is an
+    // architectural word the region ALREADY maintains in memory — G611's CLIPw emission ends with
+    // `shl [rcx+OFF_CLIP], 6` + `or` — so the whole body is three x86-64 instructions against a
+    // value the region owns, with no new emitter primitive.
+    //
+    // ⚠️ THE ONE SIDE EFFECT THAT IS SKIPPED, AND WHY IT IS DEAD. `g427LowerReadsFlags` marks 0x1C
+    // as a MAC reader *unconditionally* (its own comment says "reads MAC only under
+    // DC2_VU1_NO_FMSWAPFIX; kept unconditionally"), so the generic pair loop publishes
+    // `s_vuMacVisible = g430ResolveAt(...)` before executing it. An in-region FCGET does not.
+    // That publication is unobservable because **`s_vuMacVisible` is never a carried value**: every
+    // opcode that reads it (FMEQ 0x18, FMAND 0x1A, FMOR 0x1B, and 0x1C only when `!s_fmFixed`) is
+    // itself a `G427_PF_FLAGREAD` pair, and every path that can execute one republishes it from the
+    // G430 ring first — the pair loop at `vu1_g435_pair_loop.inc:1896/1921`, the G531/G532 typed
+    // flag tails at `vu1_g490_block_run.inc:2439/2974`, and the hand-written fragments at 4324.
+    // G490 blocks, G610 blocks and G612 regions all EXCLUDE flag readers, so none of them can
+    // observe a stale line either. The region keeps the ring cursor exact (precondition 5), so the
+    // republication a later consumer performs reads the same ring it would have read.
+    //
+    // ⛔ FCAND (0x12) and FCOR (0x13) are NOT built, and the reason is the ORACLE, not the emission.
+    // Neither sets `G427_PF_FLAGREAD`, so neither is `g531FlagTailEligible`, so `g502TailAt` is 0
+    // at their slot and `g612RefRun` — the reference executor `DC2_G612_VERIFY=1` compares against —
+    // has no path that advances over one. Building them would mean building a second reference, and
+    // `[G612:exit]` lists neither in its top eight on `georama`: the prize is FCGET's 226 M.
+    //
+    // Oracle `DC2_G612_VERIFY=1` (whole VU1State + the G430 ring + all of VU data RAM after every
+    // region). Rollback `DC2_G651_NO_VUCLIP=1`. Census `[G651:vuclip]`.
+    // ============================================================================================
+    bool g651VuClipOn()
+    {
+        static const bool s_on = !f50_12_vu_env_flag("DC2_G651_NO_VUCLIP");
+        return s_on;
+    }
+    thread_local uint64_t s_g651ClipEmitted = 0ull; // FCGET pairs emitted into region bodies
+    thread_local uint64_t s_g651ClipSlots = 0ull;   // distinct slots admitted
     bool g612Paired()
     {
         static const bool s_p = [] {
@@ -725,7 +811,28 @@ namespace
         bool used = false;
         if (!g610EmitUpper(e, upper, fp.pair.upperKind, j, usesHist, used, &why))
             return false;
-        if (!g610EmitLower(e, lower, fp.pair.lowerKind, dataSize, &why))
+        if (fp.pair.lowerKind == G422_LK_FCGET)
+        {
+            // ⭐ G651: `if (it != 0) st.vi[it] = (int32_t)(st.clip & 0xFFFu);`
+            // Three instructions, and the transcription is the interpreter's own statement:
+            //   mov eax, [rcx + OFF_CLIP]
+            //   and eax, 0xFFF
+            //   mov [rcx + OFF_VI + 4*it], eax        (raw: the value is 0..4095, so the int16
+            //                                          truncation the other integer lowers apply
+            //                                          would be the identity, and `Raw` is exact)
+            // `it == 0` writes nothing, exactly as the interpreter's guard says.
+            if (!g651RegionClipPairOk(slot))
+                return false;                          // precondition 7: the emitter is the authority
+            const unsigned it = LIT(lower);
+            if (it != 0u)
+            {
+                e.movLd32(G610_RAX, G610_RCX, G610_OFF_CLIP);
+                e.andImm(G610_RAX, 0x0FFF);
+                e.storeViRaw(it);
+            }
+            ++s_g651ClipEmitted;
+        }
+        else if (!g610EmitLower(e, lower, fp.pair.lowerKind, dataSize, &why))
             return false;
         g612EmitRepin(e, fp);
         return true;
@@ -1280,6 +1387,11 @@ namespace
                              (unsigned)s_g410Cache.uppers[topIdx[s]].lowerKind,
                              (unsigned)s_g410Cache.uppers[topIdx[s]].upperKind);
         std::fprintf(stderr, "\n");
+        // ⭐ G651: how many FCGET pairs the emitter actually placed inside region bodies. `on=0`
+        // with a non-zero `[G612:exit] lk=37` row means the arm is disarmed, not that the lever
+        // failed to find work.
+        std::fprintf(stderr, "[G651:vuclip] on=%u fcgetEmitted=%llu\n",
+                     g651VuClipOn() ? 1u : 0u, (unsigned long long)s_g651ClipEmitted);
         std::fflush(stderr);
     }
 } // namespace
