@@ -704,6 +704,10 @@
                         : 0u;
                     if (g570GpuBatch)
                     {
+                        // G641 (observer while DC2_G641_NEC is unset): classify how much of the
+                        // 0x139 round trip below the producer can actually write. Placed before the
+                        // gather so the window is available to every phase of the chain.
+                        g641NoteBatch();
                         constexpr int g570Y0 = 0;
                         constexpr int g570Y1 = static_cast<int>(kG403DisplayZH) - 1;
                         // ⭐⭐⭐ G636: this block reads target 0x139's whole colour band out of
@@ -716,8 +720,16 @@
                         auto g571PhaseT = s_g571Split
                             ? std::chrono::steady_clock::now()
                             : std::chrono::steady_clock::time_point{};
-                        g570Batch139ReadBand(rgs->m_vram, rgs->m_vramSize,
-                                             g570Y0, g570Y1, initial);
+                        // G641: narrowed to the producer's ragged tile extent when armed; the
+                        // legacy whole-surface gather otherwise. Under the oracle the FULL gather
+                        // runs, because the oracle needs the untouched `initial` for its
+                        // "outside the window nothing changed" half.
+                        if (g641WinUsable() && !g641WinVerifyOn())
+                            g641ReadShadowBand(rgs->m_vram, rgs->m_vramSize,
+                                               g570Y0, g570Y1, initial);
+                        else
+                            g570Batch139ReadBand(rgs->m_vram, rgs->m_vramSize,
+                                                 g570Y0, g570Y1, initial);
                         const uint64_t g571ReadUs = s_g571Split
                             ? static_cast<uint64_t>(std::chrono::duration_cast<
                                   std::chrono::microseconds>(
@@ -744,8 +756,15 @@
                         if (s_g571Split)
                             g571PhaseT = std::chrono::steady_clock::now();
                         if (gpuOk)
-                            g570Batch139WriteBand(rgs->m_vram, rgs->m_vramSize,
-                                                  g570Y0, g570Y1, candidate);
+                        {
+                            // G641: the oracle runs BEFORE the commit so it compares candidates,
+                            // not already-published VRAM, and so a failure is visible even though
+                            // the arm still publishes exactly what it would have published.
+                            g641RunVerify(initial, candidate);
+                            g641NoteWindowUse(g641WinUsable());
+                            g641WriteShadowBand(rgs->m_vram, rgs->m_vramSize,
+                                                g570Y0, g570Y1, candidate);
+                        }
                         else
                             replayCpuBatch();
                         const uint64_t g571CommitUs = s_g571Split

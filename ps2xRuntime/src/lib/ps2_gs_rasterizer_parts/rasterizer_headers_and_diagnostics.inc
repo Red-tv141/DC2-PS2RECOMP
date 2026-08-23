@@ -43,7 +43,13 @@ bool g570_backend_shadow139(const std::vector<uint32_t> &color,
                             const std::vector<uint32_t> &spanWords,
                             const std::vector<uint32_t> &tileOffsets,
                             const std::vector<uint32_t> &tileTris,
-                            std::vector<uint32_t> &out);
+                            std::vector<uint32_t> &out,
+                            // G641: the sub-rectangle that actually travels. (0,0,512,512) is the
+                            // legacy whole-surface chain and is what every unarmed run passes.
+                            int rectX = 0, int rectY = 0, int rectW = 512, int rectH = 512,
+                            // G642: 1 when `spanWords` is a placeholder and the shader must derive
+                            // every per-row span from header words 20..25 instead.
+                            int deriveSpan = 0);
 
 // G629 private .cpp-to-.cpp bridge, same contract as G570's above: the admitted CPU-band-replay
 // batch is packed into plain word vectors, submission is synchronous, and every caller-owned

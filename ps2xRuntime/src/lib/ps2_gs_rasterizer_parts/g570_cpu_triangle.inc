@@ -216,6 +216,124 @@ inline bool g570Batch139TightGpuSpansOn()
     return on;
 }
 
+// ===== G642: derive the per-row span array IN-SHADER instead of uploading it (default-ON) =====
+//
+// PREMISE (G641 §8): `gSpans` is the largest remaining CPU->GPU item in the 0x139 chain — 0.51 ms/f
+// and ~850 KB/frame. With `DC2_G570_TIGHT_SPAN_139` default-OFF, EVERY per-row span word is
+// (xStart = minX, xEnd = maxX) — constant per triangle and already present in header words 0/1 —
+// and the three edge values advance linearly in the row index (`rowEdge += rowStep`). So the whole
+// array is a function of six extra header words: `rowStep[3]` and `edgeBase[3]`.
+//
+// ⭐ WHY THE REFUSAL SET DOES NOT MOVE. The shader's edge value is
+//     e_k(dx, dy) = edgeBase[k] + rowStep[k]*dy + step[k]*dx
+// which is AFFINE in (dx, dy), so over the bbox rectangle [0, dxMax] x [0, dyMax] its extremes are
+// at the four corners. The legacy build checks, for every row: `edge_k` (that row's dx=0 corner),
+// `advance_k` (= step[k]*dxMax, row-independent) and `edge_k + advance_k` (that row's dx=dxMax
+// corner). The union of those over all rows is EXACTLY {four corners fit} + {advance fits}, so the
+// O(1) corner check below accepts and refuses precisely the batches the per-row loop did.
+//
+// ⭐ WHY TRUNCATING `rowStep` TO 32 BITS IS EXACT. The shader accumulates in `uint`, whose
+// arithmetic is defined modulo 2^32 (unlike GLSL signed overflow, which is undefined). Reduction
+// mod 2^32 is a ring homomorphism, so `uint(edgeBase) + uint(rowStep)*dy + uint(step)*dx` is the
+// true value mod 2^32 — and the corner check proves the true value fits int32, so the bitcast back
+// is exact. `rowStep` itself therefore needs no `fitsI32` guard (only the corners do), which is
+// what keeps the refusal set identical.
+//
+// Rollback: DC2_G642_NO_DERIVESPAN=1 restores the uploaded per-row array.
+inline bool g642DeriveSpanOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G642_NO_DERIVESPAN");
+    return on;
+}
+
+// The per-triangle header stride, shared by both payload builders and the compute shader. G642
+// grew it 20 -> 26: words 20..22 are `rowStep[0..2]`, words 23..25 are `edgeBase[0..2]`.
+//
+// ===== ⭐ G649 (ROADMAP P3): the header re-laid out HOT-FIRST and QUAD-ALIGNED, 26 -> 28 =========
+//
+// PREMISE: `[G641:sh] comp` is 1.12–1.13 ms/f after G643's SSBO move and is the largest single item
+// inside the GL worker after render issue. The kernel is a per-PIXEL walk of the tile's triangle
+// list, and the overwhelming majority of the refs it visits are REJECTED — by the row test, by the
+// column test, or by the edge test — before a single float is read.
+//
+// ⛔ ROADMAP P3's first proposal ("sort each tile's triangle list so the header fetches are
+// sequential") is a NO-OP on the shipped binary: the bin IS already a counting sort in ascending
+// triangle index, which is exactly why G639's parallel build could reproduce it byte for byte. The
+// walk is already monotonic. Do not re-attempt it.
+//
+// What IS true is P3's second proposal — the READ ORDER, i.e. the layout. Under the G642 layout a
+// pixel that rejects still straddles the whole 104-byte record, because its reject fields are words
+// 0..3, 5..8 AND 20..25. This layout puts all fourteen reject-stage words in words 0..15 and every
+// float that is only read PAST the edge test in words 16..27, and pads the stride to 28 = seven
+// `uvec4`s so the SSBO can be declared as a `uvec4[]` and each stage costs ONE vector load instead
+// of two to nine scalar ones:
+//     quad 0  minX maxX minY maxY          <- the row+column reject, one load
+//     quad 1  step0 step1 step2 mode       <- the edge test
+//     quad 2  rowStep0..2 spanOffset
+//     quad 3  edgeBase0..2 (pad)
+//     quad 4  a0 b0 a1 b1                  <- cold: only past the edge test
+//     quad 5  fx2 fy2 winding invDenom     <- cold
+//     quad 6  z0 z1 z2 (pad)               <- cold
+// The upload grows 7.7% (two words per triangle); the reject path's fetch drops from up to nine
+// scalar loads spread over two cache lines to one 16-byte load.
+//
+// ⚠️ `precise float` stays exactly as it was — this changes WHERE the words live, never how they
+// are computed. The G642 oracle and `DC2_G570_VERIFY_GPU_139` both still apply unchanged.
+constexpr size_t kG642TriStride = 28u;
+
+// G649: named slots, so the two CPU builders, the G642 oracle and the shader cannot drift apart.
+enum : size_t
+{
+    kG649HMinX = 0u, kG649HMaxX = 1u, kG649HMinY = 2u, kG649HMaxY = 3u,
+    kG649HStep0 = 4u, kG649HStep1 = 5u, kG649HStep2 = 6u, kG649HMode = 7u,
+    kG649HRowStep0 = 8u, kG649HRowStep1 = 9u, kG649HRowStep2 = 10u, kG649HSpanOff = 11u,
+    kG649HEdge0 = 12u, kG649HEdge1 = 13u, kG649HEdge2 = 14u, kG649HPad0 = 15u,
+    kG649HA0 = 16u, kG649HB0 = 17u, kG649HA1 = 18u, kG649HB1 = 19u,
+    kG649HFx2 = 20u, kG649HFy2 = 21u, kG649HWinding = 22u, kG649HInvDenom = 23u,
+    kG649HZ0 = 24u, kG649HZ1 = 25u, kG649HZ2 = 26u, kG649HPad1 = 27u,
+};
+
+// The derivation is only the identity when the spans are the full bbox, i.e. when G571's tight-span
+// slice is NOT armed. Tight spans keep the uploaded table.
+inline bool g642DeriveActive()
+{
+    return g642DeriveSpanOn() && !g570Batch139TightGpuSpansOn();
+}
+
+// ===== G648: stop BUILDING the CPU span array too (ROADMAP Priority 6) =========================
+//
+// G642 deleted the span array's UPLOAD but the CPU still built it, because the CPU band replay
+// reads it when the GPU path refuses. `[G638:prep]` re-taken after G642/G643 shows why that
+// matters: `g570prep`'s per-triangle setup loop `^tris` is now **19.83% of the whole CPU-fallback
+// dispatch window at 103.5 us/batch**, and G642's own census proves the loop writes
+// **5.35 MB/batch** into `g_g570Batch139Spans` (343 k rows x 4 bytes). Meanwhile
+// `[G570:gpu139] failed=0` — on this route the CPU fallback never runs.
+//
+// ⭐ THE SPLIT. This is the CPU/GPU workload division stated as a lever: the CPU currently does
+// 100% of the preparation for BOTH paths regardless of which one serves the batch. In the derive
+// configuration every row's span is (xStart = minX, xEnd = maxX), which are ALREADY fields of the
+// `G570Batch139Tri` the loop just built — so the array is pure redundancy. `g648SpanAt()` reads
+// those two fields instead, and the array is simply never materialised.
+//
+// ⭐ WHY THIS NEEDS NO "MATERIALISE BEFORE USE" PROTOCOL. The accessor is the only reader, it is
+// branch-free on a process-lifetime bool, and it is exact on BOTH arms — so the CPU band replay is
+// byte-identical whether or not the array exists, and no fork point has to be found or ordered.
+// (An enumerate-the-consumers-and-materialise design would have had exactly the failure mode
+// G636 documents: one missed consumer, silent corruption.)
+//
+// Rollback: DC2_G648_NO_LAZYSPAN=1. Automatically disabled under DC2_G642_VERIFY=1, whose oracle
+// compares the derivation AGAINST the eagerly built array.
+inline bool g648LazySpanOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G648_NO_LAZYSPAN");
+    return on;
+}
+
+// Set once per batch by g570Batch139PrepareBuild; read by g648SpanAt from the GS thread and from
+// every replay lane. Written before any lane starts and never during a dispatch.
+// (The accessor itself lives below, next to the arrays it reads.)
+static bool g_g648SpansDeferred = false;
+
 // G571: reject 16x16 bins that lie wholly outside at least one exact triangle half-plane.  This
 // is conservative (a bin is retained on any boundary ambiguity) and avoids per-pixel iteration
 // over bbox-only triangle references.  Default-on inside G570; rollback restores bbox binning.
@@ -233,26 +351,82 @@ inline bool g570Batch139On()
     return on;
 }
 
+// ===== ⭐ G649 (ROADMAP P7): the CPU-replay half is no longer STORED ===========================
+//
+// G648 established the principle — the CPU should not prepare what the GPU path will not read — and
+// applied it to the span array. The same argument applies to this struct. Seven of its members were
+// written by the setup loop on the GS pole thread purely so a CPU band replay could read them back:
+//     fx[3] fy[3] sign            84 bytes ... the SCALED integer vertices and the winding sign
+//     rawX[3] rawY[3] ofx ofy         ... the unscaled vertices and the XY offset
+// `[G570:gpu139] failed=0` on `dragon`: that replay never runs there.
+//
+// ⭐ Neither half needs a "materialise before use" protocol, because BOTH are recoverable EXACTLY:
+//
+//   1. `fx/fy/sign` only ever appear inside the edge functions, and G642 already proved that the
+//      edge function is AFFINE in (column, row):
+//          e_k(x,y) = edgeBase[k] + rowStep[k]*(y - minY) + step[k]*(x - minX)
+//      Substituting the definitions of `edgeBase`, `rowStep` and `step` turns
+//          ((fx[2]-fx[1])*(y*16 - fy[1]) - (fy[2]-fy[1])*(x*16 - fx[1])) * sign
+//      into exactly that expression — an INTEGER identity in int64, with intermediates no larger
+//      than the ones it replaces. So every consumer can read the three header fields it already has
+//      instead of the six it no longer does.
+//
+//   2. `rawX/rawY/ofx/ofy` are literal COPIES of `g_g144List[i+1].v[k].x/.y` and
+//      `ctx.xyoffset.ofx >> 4`. No arithmetic, so re-reading them from the entry list is bit-exact
+//      by construction — no MXCSR question, unlike the float setup the replay already recomputes
+//      per lane on purpose.
+//
+// The struct drops 232 -> 148 bytes, so the setup loop's stores, the `resize` that precedes them and
+// every later walk of the array all shrink by ~36%.
+//
+// ⚠️ ROLLBACK IS A BINARY, NOT A FLAG. A struct member cannot be removed under an env test without
+// keeping both forms live, which is exactly the shape G645 refuted. This lever is therefore gated
+// the way G602 gated its compile-time lever: an order-balanced A B B A across two saved executables
+// via `tools/g525_route.ps1 -Exe`. The control is `dc2_runner_g649p23.exe` (P2 + P3 + P4 + P6, no
+// P7), kept beside the shipped runner.
 struct G570Batch139Tri
 {
     int minX = 0, maxX = -1, minY = 0, maxY = -1;
-    int64_t fx[3]{};
-    int64_t fy[3]{};
     int64_t step[3]{};
     int64_t rowStep[3]{};
     int64_t edgeBase[3]{};
     uint8_t topLeftMask = 0u;
-    int sign = 1;
     int8_t delta = 0;
     uint32_t spanOffset = 0u;
-    int ofx = 0, ofy = 0;
-    float rawX[3]{};
-    float rawY[3]{};
     float a0 = 0.0f, b0 = 0.0f, a1 = 0.0f, b1 = 0.0f;
     float fx2 = 0.0f, fy2 = 0.0f;
     float winding = 1.0f, invAbsDenom = 0.0f;
     float z0 = 0.0f, z1 = 0.0f, z2 = 0.0f;
 };
+
+// G649: the three edge functions at an arbitrary pixel, from the header fields alone. Identical in
+// int64 to the `fx/fy/sign` expression it replaces — see the derivation above.
+static inline void g649EdgesAt(const G570Batch139Tri &p, int x, int y, int64_t e[3])
+{
+    const int64_t dx = static_cast<int64_t>(x) - p.minX;
+    const int64_t dy = static_cast<int64_t>(y) - p.minY;
+    e[0] = p.edgeBase[0] + p.rowStep[0] * dy + p.step[0] * dx;
+    e[1] = p.edgeBase[1] + p.rowStep[1] * dy + p.step[1] * dx;
+    e[2] = p.edgeBase[2] + p.rowStep[2] * dy + p.step[2] * dx;
+}
+
+// G649: the CPU replay's local-space vertices, straight from the entry the triangle was built from.
+// Triangle `i` is `g_g144List[i + 1]` in BOTH arms of the setup loop, and each field is a literal
+// copy — no arithmetic, so this cannot differ from what the removed members held.
+struct G649TriRaw
+{
+    float lx[3];
+    float ly[3];
+};
+static inline void g649TriRawAt(size_t triIndex, G649TriRaw &out)
+{
+    const G144Entry &e = g_g144List[triIndex + 1u];
+    const float ofx = static_cast<float>(e.ctx.xyoffset.ofx >> 4);
+    const float ofy = static_cast<float>(e.ctx.xyoffset.ofy >> 4);
+    out.lx[0] = e.v[0].x - ofx; out.ly[0] = e.v[0].y - ofy;
+    out.lx[1] = e.v[1].x - ofx; out.ly[1] = e.v[1].y - ofy;
+    out.lx[2] = e.v[2].x - ofx; out.ly[2] = e.v[2].y - ofy;
+}
 
 std::vector<G570Batch139Tri> g_g570Batch139Tris;
 std::vector<uint32_t> g_g570Batch139Spans;
@@ -263,6 +437,17 @@ std::vector<uint32_t> g_g570Batch139GpuTileTris;
 std::vector<uint32_t> g_g570Batch139GpuDebug;
 std::vector<uint32_t> g_g570Batch139CpuDebug;
 int g_g570Batch139RejectReason = 1;
+
+// G648: the one reader of a per-row span. Exact on BOTH arms — in the deferred configuration every
+// row's span IS the triangle's bbox, which `p` already carries. See the note beside g648LazySpanOn.
+static inline uint32_t g648SpanAt(const G570Batch139Tri &p, int y)
+{
+    if (g_g648SpansDeferred)
+        return static_cast<uint32_t>(p.minX & 0xffff) |
+               (static_cast<uint32_t>(p.maxX & 0xffff) << 16u);
+    return g_g570Batch139Spans[static_cast<size_t>(p.spanOffset) +
+                               static_cast<size_t>(y - p.minY)];
+}
 
 static int g570Batch139LastReject()
 {
@@ -285,8 +470,14 @@ static uint32_t g570Batch139CpuDebugAt(size_t index)
     return index < g_g570Batch139CpuDebug.size() ? g_g570Batch139CpuDebug[index] : 0u;
 }
 
+// ⚠️ STALE DIAGNOSTIC, currently unreferenced: its `* 23u` / `* 7u` strides predate the 20-word
+// header the payload builders have emitted since G571 (and the 26-word one since G642). It also
+// indexes `g_g570Batch139Spans` directly, which G648 may leave unbuilt — hence the early return.
+// Fix its strides before wiring it to any caller.
 static uint32_t g570Batch139PackedCoverageHash(int x, int y)
 {
+    if (g_g648SpansDeferred)
+        return 0u;
     if (x < 0 || y < 0 || x >= static_cast<int>(kG403DisplayZW) ||
         y >= static_cast<int>(kG403DisplayZH) ||
         g_g570Batch139GpuTileOffsets.empty())
@@ -352,14 +543,9 @@ static uint32_t g570Batch139PackedCoverageHash(int x, int y)
             const int xEnd = static_cast<int16_t>(packedSpan >> 16u);
             if (x >= xStart && x <= xEnd)
             {
-                const int64_t sx = static_cast<int64_t>(x) * 16;
-                const int64_t sy = static_cast<int64_t>(y) * 16;
-                const int64_t edge0 = ((p.fx[2] - p.fx[1]) * (sy - p.fy[1]) -
-                                       (p.fy[2] - p.fy[1]) * (sx - p.fx[1])) * p.sign;
-                const int64_t edge1 = ((p.fx[0] - p.fx[2]) * (sy - p.fy[2]) -
-                                       (p.fy[0] - p.fy[2]) * (sx - p.fx[2])) * p.sign;
-                const int64_t edge2 = ((p.fx[1] - p.fx[0]) * (sy - p.fy[0]) -
-                                       (p.fy[1] - p.fy[0]) * (sx - p.fx[0])) * p.sign;
+                int64_t edge[3];
+                g649EdgesAt(p, x, y, edge); // G649: same value, from the header fields
+                const int64_t edge0 = edge[0], edge1 = edge[1], edge2 = edge[2];
                 covered = !(edge0 < 0 || (edge0 == 0 && (p.topLeftMask & 1u) == 0u) ||
                             edge1 < 0 || (edge1 == 0 && (p.topLeftMask & 2u) == 0u) ||
                             edge2 < 0 || (edge2 == 0 && (p.topLeftMask & 4u) == 0u));
@@ -516,7 +702,7 @@ static bool g570Batch139BuildGpuPayloadParallel()
     constexpr int tilesX = static_cast<int>(kG403DisplayZW) / tileSize;
     constexpr int tilesY = static_cast<int>(kG403DisplayZH) / tileSize;
     constexpr size_t tileCount = static_cast<size_t>(tilesX) * tilesY;
-    constexpr size_t triStride = 20u;
+    constexpr size_t triStride = kG642TriStride;
 
     const size_t n = g_g570Batch139Tris.size();
     g_g570Batch139GpuTris.clear();
@@ -533,17 +719,23 @@ static bool g570Batch139BuildGpuPayloadParallel()
     };
 
     // ---- Phase 1 (serial, O(n)): fix every output offset up front.
+    // G642: in derive mode there ARE no span records — the array collapses to a single padded row
+    // that exists only to keep image unit 3 bound with something valid.
+    const bool derive = g642DeriveActive();
     g_g639SpanBase.resize(n);
     uint32_t spanRecs = 0u;
-    for (size_t i = 0; i < n; ++i)
-    {
-        g_g639SpanBase[i] = spanRecs;
-        const G570Batch139Tri &p = g_g570Batch139Tris[i];
-        if (p.maxX >= p.minX)
-            spanRecs += static_cast<uint32_t>(p.maxY - p.minY + 1);
-    }
+    if (derive)
+        std::fill(g_g639SpanBase.begin(), g_g639SpanBase.end(), 0u);
+    else
+        for (size_t i = 0; i < n; ++i)
+        {
+            g_g639SpanBase[i] = spanRecs;
+            const G570Batch139Tri &p = g_g570Batch139Tris[i];
+            if (p.maxX >= p.minX)
+                spanRecs += static_cast<uint32_t>(p.maxY - p.minY + 1);
+        }
     g_g570Batch139GpuTris.resize(n * triStride);
-    g_g570Batch139GpuSpans.resize(static_cast<size_t>(spanRecs) * 4u);
+    g_g570Batch139GpuSpans.resize(derive ? 1u : static_cast<size_t>(spanRecs) * 4u, 0u);
 
     // ---- Chunking: over-decompose 4x the lane count, exactly as G637's replay does.
     int lanes = (g_g144Threads > 1) ? g_g144Threads : 1;
@@ -587,43 +779,75 @@ static bool g570Batch139BuildGpuPayloadParallel()
                 return;
             }
             uint32_t *h = g_g570Batch139GpuTris.data() + static_cast<size_t>(i) * triStride;
-            h[0] = static_cast<uint32_t>(p.minX);
-            h[1] = static_cast<uint32_t>(p.maxX);
-            h[2] = static_cast<uint32_t>(p.minY);
-            h[3] = static_cast<uint32_t>(p.maxY);
-            h[4] = gpuSpanOffset;
-            h[5] = static_cast<uint32_t>(p.step[0]);
-            h[6] = static_cast<uint32_t>(p.step[1]);
-            h[7] = static_cast<uint32_t>(p.step[2]);
-            h[8] = static_cast<uint32_t>(p.topLeftMask) | (p.delta > 0 ? 0x100u : 0u);
-            h[9] = g570Batch139FloatBits(p.a0);
-            h[10] = g570Batch139FloatBits(p.b0);
-            h[11] = g570Batch139FloatBits(p.a1);
-            h[12] = g570Batch139FloatBits(p.b1);
-            h[13] = g570Batch139FloatBits(p.fx2);
-            h[14] = g570Batch139FloatBits(p.fy2);
-            h[15] = g570Batch139FloatBits(p.winding);
-            h[16] = g570Batch139FloatBits(p.invAbsDenom);
-            h[17] = g570Batch139FloatBits(p.z0);
-            h[18] = g570Batch139FloatBits(p.z1);
-            h[19] = g570Batch139FloatBits(p.z2);
+            // G649: hot-first, quad-aligned (see the layout note beside kG642TriStride).
+            h[kG649HMinX] = static_cast<uint32_t>(p.minX);
+            h[kG649HMaxX] = static_cast<uint32_t>(p.maxX);
+            h[kG649HMinY] = static_cast<uint32_t>(p.minY);
+            h[kG649HMaxY] = static_cast<uint32_t>(p.maxY);
+            h[kG649HStep0] = static_cast<uint32_t>(p.step[0]);
+            h[kG649HStep1] = static_cast<uint32_t>(p.step[1]);
+            h[kG649HStep2] = static_cast<uint32_t>(p.step[2]);
+            h[kG649HMode] = static_cast<uint32_t>(p.topLeftMask) | (p.delta > 0 ? 0x100u : 0u);
+            // G642: the six words that replace the whole per-row array. Truncation to 32 bits is
+            // exact under the shader's `uint` accumulation (see the note beside g642DeriveSpanOn).
+            h[kG649HRowStep0] = static_cast<uint32_t>(p.rowStep[0]);
+            h[kG649HRowStep1] = static_cast<uint32_t>(p.rowStep[1]);
+            h[kG649HRowStep2] = static_cast<uint32_t>(p.rowStep[2]);
+            h[kG649HSpanOff] = gpuSpanOffset;
+            h[kG649HEdge0] = static_cast<uint32_t>(p.edgeBase[0]);
+            h[kG649HEdge1] = static_cast<uint32_t>(p.edgeBase[1]);
+            h[kG649HEdge2] = static_cast<uint32_t>(p.edgeBase[2]);
+            h[kG649HPad0] = 0u;
+            h[kG649HA0] = g570Batch139FloatBits(p.a0);
+            h[kG649HB0] = g570Batch139FloatBits(p.b0);
+            h[kG649HA1] = g570Batch139FloatBits(p.a1);
+            h[kG649HB1] = g570Batch139FloatBits(p.b1);
+            h[kG649HFx2] = g570Batch139FloatBits(p.fx2);
+            h[kG649HFy2] = g570Batch139FloatBits(p.fy2);
+            h[kG649HWinding] = g570Batch139FloatBits(p.winding);
+            h[kG649HInvDenom] = g570Batch139FloatBits(p.invAbsDenom);
+            h[kG649HZ0] = g570Batch139FloatBits(p.z0);
+            h[kG649HZ1] = g570Batch139FloatBits(p.z1);
+            h[kG649HZ2] = g570Batch139FloatBits(p.z2);
+            h[kG649HPad1] = 0u;
             if (p.maxX < p.minX)
                 continue;
 
-            const int64_t baseSx = static_cast<int64_t>(p.minX) * 16;
-            const int64_t baseSy = static_cast<int64_t>(p.minY) * 16;
+            // G642: the O(1) four-corner guard. Exactly equivalent to the union of the legacy
+            // per-row checks below, so an admitted batch stays admitted and a refused one stays
+            // refused. Skipped when the row range is empty, because the per-row loop it replaces
+            // would then run zero iterations and check nothing.
+            if (derive)
+            {
+                if (p.maxY >= p.minY)
+                {
+                    const int64_t dxMax =
+                        std::max<int64_t>(0, static_cast<int64_t>(p.maxX) - p.minX);
+                    const int64_t dyMax = static_cast<int64_t>(p.maxY) - p.minY;
+                    for (int k = 0; k < 3; ++k)
+                    {
+                        const int64_t eTop = p.edgeBase[k];
+                        const int64_t eBot = p.edgeBase[k] + p.rowStep[k] * dyMax;
+                        const int64_t adv = p.step[k] * dxMax;
+                        if (!fitsI32(eTop) || !fitsI32(eBot) || !fitsI32(adv) ||
+                            !fitsI32(eTop + adv) || !fitsI32(eBot + adv))
+                        {
+                            g_g639Fail.store(1u, std::memory_order_relaxed);
+                            return;
+                        }
+                    }
+                }
+            }
+            else
+            {
+
+            // G649 (P7): these ARE `p.edgeBase` and `p.rowStep` — the setup loop computed them from
+            // the same `fx/fy/sign` at the same `(minX*16, minY*16)` base.
             int64_t rowEdge[3] = {
-                ((p.fx[2] - p.fx[1]) * (baseSy - p.fy[1]) -
-                 (p.fy[2] - p.fy[1]) * (baseSx - p.fx[1])) * p.sign,
-                ((p.fx[0] - p.fx[2]) * (baseSy - p.fy[2]) -
-                 (p.fy[0] - p.fy[2]) * (baseSx - p.fx[2])) * p.sign,
-                ((p.fx[1] - p.fx[0]) * (baseSy - p.fy[0]) -
-                 (p.fy[1] - p.fy[0]) * (baseSx - p.fx[0])) * p.sign,
+                p.edgeBase[0], p.edgeBase[1], p.edgeBase[2],
             };
             const int64_t rowStep[3] = {
-                (p.fx[2] - p.fx[1]) * 16 * p.sign,
-                (p.fx[0] - p.fx[2]) * 16 * p.sign,
-                (p.fx[1] - p.fx[0]) * 16 * p.sign,
+                p.rowStep[0], p.rowStep[1], p.rowStep[2],
             };
             uint32_t *sp = g_g570Batch139GpuSpans.data() +
                            static_cast<size_t>(gpuSpanOffset) * 4u;
@@ -658,6 +882,7 @@ static bool g570Batch139BuildGpuPayloadParallel()
                 rowEdge[1] += rowStep[1];
                 rowEdge[2] += rowStep[2];
             }
+            } // G642: end of the legacy per-row span build
 
             const int tx0 = p.minX >> tileShift;
             const int tx1 = p.maxX >> tileShift;
@@ -725,7 +950,75 @@ static bool g570Batch139BuildGpuPayloadParallel()
     return true;
 }
 
-static bool g570Batch139BuildGpuPayload()
+// ===== G642 oracle & census =====
+// The derivation rests on exactly two claims about the legacy payload, and this checks BOTH against
+// the legacy construction on the same batch:
+//   (a) every row's span is exactly the triangle bbox (xStart == minX, xEnd == maxX), and
+//   (b) the row's three edge values equal `edgeBase[k] + rowStep[k]*dy` in 32-bit two's complement.
+// The per-pixel `+ step[k]*dx` term is character-for-character the same expression in both shader
+// arms, so (a) and (b) close the argument. Strictly more work than either arm; never valid in a
+// timing run.
+static bool g642VerifyOn()
+{
+    static const bool on = envFlagEnabled("DC2_G642_VERIFY");
+    return on;
+}
+
+static bool g642StatOn()
+{
+    static const bool on = envFlagEnabled("DC2_G642_STAT") || g642VerifyOn();
+    return on;
+}
+
+static uint64_t g_g642Batches = 0ull, g_g642Rows = 0ull, g_g642Bad = 0ull;
+static uint64_t g_g642SavedWords = 0ull;
+
+static void g642VerifyBatch()
+{
+    const size_t n = g_g570Batch139Tris.size();
+    for (size_t i = 0; i < n; ++i)
+    {
+        const G570Batch139Tri &p = g_g570Batch139Tris[i];
+        if (p.maxX < p.minX || p.maxY < p.minY)
+            continue;
+        if ((i + 1u) * kG642TriStride > g_g570Batch139GpuTris.size())
+            break;
+        const uint32_t *h = g_g570Batch139GpuTris.data() + i * kG642TriStride;
+        int64_t rowEdge[3] = {p.edgeBase[0], p.edgeBase[1], p.edgeBase[2]};
+        for (int y = p.minY; y <= p.maxY; ++y)
+        {
+            ++g_g642Rows;
+            const uint32_t packedSpan = g_g570Batch139Spans[
+                static_cast<size_t>(p.spanOffset) + static_cast<size_t>(y - p.minY)];
+            const int xStart = static_cast<int16_t>(packedSpan & 0xffffu);
+            const int xEnd = static_cast<int16_t>(packedSpan >> 16u);
+            const uint32_t dy = static_cast<uint32_t>(y - p.minY);
+            bool ok = xStart == p.minX && xEnd == p.maxX &&
+                      h[kG649HMinX] == static_cast<uint32_t>(p.minX) &&
+                      h[kG649HMaxX] == static_cast<uint32_t>(p.maxX);
+            for (int k = 0; k < 3 && ok; ++k)
+                ok = static_cast<uint32_t>(rowEdge[k]) ==
+                     (h[kG649HEdge0 + static_cast<size_t>(k)] +
+                      h[kG649HRowStep0 + static_cast<size_t>(k)] * dy);
+            if (!ok && ++g_g642Bad <= 8ull)
+                std::fprintf(stderr,
+                             "[G642:vfy] BAD tri=%zu y=%d span=(%d,%d) bbox=(%d,%d) "
+                             "e=(%08x,%08x,%08x) derived=(%08x,%08x,%08x)\n",
+                             i, y, xStart, xEnd, p.minX, p.maxX,
+                             static_cast<uint32_t>(rowEdge[0]),
+                             static_cast<uint32_t>(rowEdge[1]),
+                             static_cast<uint32_t>(rowEdge[2]),
+                             h[kG649HEdge0] + h[kG649HRowStep0] * dy,
+                             h[kG649HEdge1] + h[kG649HRowStep1] * dy,
+                             h[kG649HEdge2] + h[kG649HRowStep2] * dy);
+            rowEdge[0] += p.rowStep[0];
+            rowEdge[1] += p.rowStep[1];
+            rowEdge[2] += p.rowStep[2];
+        }
+    }
+}
+
+static bool g570Batch139BuildGpuPayloadPick()
 {
     if (!g639PayParOn())
         return g570Batch139BuildGpuPayloadSerial();
@@ -775,13 +1068,37 @@ static bool g570Batch139BuildGpuPayload()
     return rSer;
 }
 
+static bool g570Batch139BuildGpuPayload()
+{
+    const bool ok = g570Batch139BuildGpuPayloadPick();
+    if (ok && g642DeriveActive() && g642StatOn())
+    {
+        ++g_g642Batches;
+        // The words the legacy chain would have uploaded, minus the six header words per triangle
+        // that replace them.
+        g_g642SavedWords += static_cast<uint64_t>(g_g570Batch139Spans.size()) * 4ull -
+                            std::min<uint64_t>(
+                                static_cast<uint64_t>(g_g570Batch139Spans.size()) * 4ull,
+                                static_cast<uint64_t>(g_g570Batch139Tris.size()) * 6ull);
+        if (g642VerifyOn())
+            g642VerifyBatch();
+        if ((g_g642Batches % 600ull) == 0ull)
+            std::fprintf(stderr,
+                         "[G642:span] batches=%llu rows=%llu bad=%llu savedKB=%.1f\n",
+                         (unsigned long long)g_g642Batches, (unsigned long long)g_g642Rows,
+                         (unsigned long long)g_g642Bad,
+                         static_cast<double>(g_g642SavedWords) * 4.0 / 1024.0);
+    }
+    return ok;
+}
+
 static bool g570Batch139BuildGpuPayloadSerial()
 {
     constexpr int tileShift = 4;
     constexpr int tileSize = 1 << tileShift;
     constexpr int tilesX = static_cast<int>(kG403DisplayZW) / tileSize;
     constexpr int tilesY = static_cast<int>(kG403DisplayZH) / tileSize;
-    constexpr size_t triStride = 20u;
+    constexpr size_t triStride = kG642TriStride;
     static_assert((kG403DisplayZW % tileSize) == 0u, "G570 tile width must divide surface");
     static_assert((kG403DisplayZH % tileSize) == 0u, "G570 tile height must divide surface");
 
@@ -795,6 +1112,7 @@ static bool g570Batch139BuildGpuPayloadSerial()
     std::array<uint32_t, tileCount> binCounts{};
     const bool tileCull = g570Batch139TileCullOn();
 
+    const bool derive = g642DeriveActive();
     const auto fitsI32 = [](int64_t value) {
         return value >= std::numeric_limits<int32_t>::min() &&
                value <= std::numeric_limits<int32_t>::max();
@@ -803,49 +1121,74 @@ static bool g570Batch139BuildGpuPayloadSerial()
     {
         const G570Batch139Tri &p = g_g570Batch139Tris[triIndex];
         const uint32_t gpuSpanOffset =
-            static_cast<uint32_t>(g_g570Batch139GpuSpans.size() / 4u);
+            derive ? 0u : static_cast<uint32_t>(g_g570Batch139GpuSpans.size() / 4u);
         if (!fitsI32(p.step[0]) || !fitsI32(p.step[1]) || !fitsI32(p.step[2]))
             return false;
 
-        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.minX));
-        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.maxX));
-        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.minY));
-        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.maxY));
-        g_g570Batch139GpuTris.push_back(gpuSpanOffset);
-        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.step[0]));
-        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.step[1]));
-        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.step[2]));
+        // G649: hot-first, quad-aligned (see the layout note beside kG642TriStride). Appended in
+        // SLOT order so this stays a pure sequential append, exactly as before.
         const uint32_t packedMode = static_cast<uint32_t>(p.topLeftMask) |
             (p.delta > 0 ? 0x100u : 0u);
-        g_g570Batch139GpuTris.push_back(packedMode);
-        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.a0));
-        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.b0));
-        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.a1));
-        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.b1));
-        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.fx2));
-        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.fy2));
-        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.winding));
-        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.invAbsDenom));
-        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.z0));
-        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.z1));
-        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.z2));
+        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.minX));      // kG649HMinX
+        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.maxX));      // kG649HMaxX
+        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.minY));      // kG649HMinY
+        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.maxY));      // kG649HMaxY
+        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.step[0]));   // kG649HStep0
+        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.step[1]));   // kG649HStep1
+        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.step[2]));   // kG649HStep2
+        g_g570Batch139GpuTris.push_back(packedMode);                         // kG649HMode
+        // G642's six words — see the note beside g642DeriveSpanOn.
+        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.rowStep[0]));  // kG649HRowStep0
+        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.rowStep[1]));  // kG649HRowStep1
+        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.rowStep[2]));  // kG649HRowStep2
+        g_g570Batch139GpuTris.push_back(gpuSpanOffset);                        // kG649HSpanOff
+        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.edgeBase[0])); // kG649HEdge0
+        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.edgeBase[1])); // kG649HEdge1
+        g_g570Batch139GpuTris.push_back(static_cast<uint32_t>(p.edgeBase[2])); // kG649HEdge2
+        g_g570Batch139GpuTris.push_back(0u);                                   // kG649HPad0
+        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.a0));          // kG649HA0
+        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.b0));          // kG649HB0
+        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.a1));          // kG649HA1
+        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.b1));          // kG649HB1
+        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.fx2));         // kG649HFx2
+        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.fy2));         // kG649HFy2
+        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.winding));     // kG649HWinding
+        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.invAbsDenom)); // kG649HInvDenom
+        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.z0));          // kG649HZ0
+        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.z1));          // kG649HZ1
+        g_g570Batch139GpuTris.push_back(g570Batch139FloatBits(p.z2));          // kG649HZ2
+        g_g570Batch139GpuTris.push_back(0u);                                   // kG649HPad1
 
         if (p.maxX < p.minX)
             continue;
-        const int64_t baseSx = static_cast<int64_t>(p.minX) * 16;
-        const int64_t baseSy = static_cast<int64_t>(p.minY) * 16;
+        if (derive)
+        {
+            // G642: the O(1) four-corner guard, exactly equivalent to the union of the per-row
+            // checks in the `else` arm below.
+            if (p.maxY >= p.minY)
+            {
+                const int64_t dxMax =
+                    std::max<int64_t>(0, static_cast<int64_t>(p.maxX) - p.minX);
+                const int64_t dyMax = static_cast<int64_t>(p.maxY) - p.minY;
+                for (int k = 0; k < 3; ++k)
+                {
+                    const int64_t eTop = p.edgeBase[k];
+                    const int64_t eBot = p.edgeBase[k] + p.rowStep[k] * dyMax;
+                    const int64_t adv = p.step[k] * dxMax;
+                    if (!fitsI32(eTop) || !fitsI32(eBot) || !fitsI32(adv) ||
+                        !fitsI32(eTop + adv) || !fitsI32(eBot + adv))
+                        return false;
+                }
+            }
+        }
+        else
+        {
+        // G649 (P7): these ARE `p.edgeBase` and `p.rowStep` — same operands, same base.
         int64_t rowEdge[3] = {
-            ((p.fx[2] - p.fx[1]) * (baseSy - p.fy[1]) -
-             (p.fy[2] - p.fy[1]) * (baseSx - p.fx[1])) * p.sign,
-            ((p.fx[0] - p.fx[2]) * (baseSy - p.fy[2]) -
-             (p.fy[0] - p.fy[2]) * (baseSx - p.fx[2])) * p.sign,
-            ((p.fx[1] - p.fx[0]) * (baseSy - p.fy[0]) -
-             (p.fy[1] - p.fy[0]) * (baseSx - p.fx[0])) * p.sign,
+            p.edgeBase[0], p.edgeBase[1], p.edgeBase[2],
         };
         const int64_t rowStep[3] = {
-            (p.fx[2] - p.fx[1]) * 16 * p.sign,
-            (p.fx[0] - p.fx[2]) * 16 * p.sign,
-            (p.fx[1] - p.fx[0]) * 16 * p.sign,
+            p.rowStep[0], p.rowStep[1], p.rowStep[2],
         };
         for (int y = p.minY; y <= p.maxY; ++y)
         {
@@ -874,6 +1217,7 @@ static bool g570Batch139BuildGpuPayloadSerial()
             rowEdge[1] += rowStep[1];
             rowEdge[2] += rowStep[2];
         }
+        } // G642: end of the legacy per-row span build
 
         const int tx0 = p.minX >> tileShift;
         const int tx1 = p.maxX >> tileShift;
@@ -911,6 +1255,10 @@ static bool g570Batch139BuildGpuPayloadSerial()
                     static_cast<uint32_t>(triIndex);
             }
     }
+    // G642: derive mode emits no span records. One word keeps image unit 3 bound with a valid
+    // (never-sampled) 1024-word texture, so the backend's non-empty/1024-multiple contract holds.
+    if (derive && g_g570Batch139GpuSpans.empty())
+        g_g570Batch139GpuSpans.push_back(0u);
     if (g_g570Batch139GpuTris.empty() || g_g570Batch139GpuSpans.empty() ||
         g_g570Batch139GpuTileTris.empty())
         return false;
@@ -1327,10 +1675,222 @@ static bool g570Batch139Prepare()
     return r;
 }
 
+// ===== ⭐ G649 (ROADMAP P2): the per-triangle setup loop, in parallel ==========================
+//
+// PREMISE — ⚠️ RE-TAKEN, because the ROADMAP's number was PRE-G648. `[G638:prep]` on `dragon`'s
+// static tail, measured on the shipped G648 binary:
+//     g570gpubatch  44.42%  201.5 us/batch
+//     poolreplay    35.46%  160.9 us/batch
+//     g570prep      16.60%   75.3 us/batch
+//       ^tris        8.13%   36.9 us/batch   <-- ROADMAP quotes 19.83% / 103.5 us/batch
+//       ^payload     6.95%   31.5 us/batch
+//     clut           3.46%   15.7 us/batch
+// G648 already deleted the span-array push that made up two thirds of `^tris`, so this lever's
+// ceiling is a THIRD of what ROADMAP P2 priced. What remains is still the largest SERIAL item in
+// `g570prep` and it still sits on the GS pole thread, which P1 re-qualified this phase at an
+// injection sensitivity of **0.953** — so it still converts.
+//
+// ⭐ WHY IT PARALLELISES EXACTLY (G639's argument, one step simpler). After G648 the loop body
+// writes exactly ONE output slot per input entry — `g_g570Batch139Tris[i]` for `g_g144List[i+1]` —
+// and reads nothing any other iteration writes. There is no prefix pass at all, because
+// `p.spanOffset` is the running `g_g570Batch139Spans.size()`, which is CONSTANT ZERO in the deferred
+// configuration (G648 never pushes a span). So the fences can be anywhere: contiguous, disjoint,
+// covering [0,n) once. That is why this arm is admitted ONLY when `deferSpans` holds — in the
+// eager configuration `spanOffset` IS a serial dependency and the original loop runs.
+//
+// ⚠️ THE FOUR REJECT REASONS. The serial loop `return false`s on the first refusing triangle, so the
+// reported `g_g570Batch139RejectReason` is the LOWEST-index failure. The parallel arm records
+// `(index << 3) | reason` into one atomic under a min-CAS and applies it after the join, which
+// reproduces that exactly — including reason 4 winning over reason 5 inside one triangle, because
+// the helper below tests them in the original order.
+//
+// Rollback: DC2_G649_NO_TRISPAR=1 -> the original serial loop, verbatim.
+static bool g649TrisParOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G649_NO_TRISPAR");
+    return on;
+}
+static bool g649TrisParVerifyOn()
+{
+    static const bool on = envFlagEnabled("DC2_G649_TRISPAR_VERIFY");
+    return on;
+}
+static bool g649TrisParStatOn()
+{
+    static const bool on = envFlagEnabled("DC2_G649_TRISPAR_STAT") || g649TrisParVerifyOn();
+    return on;
+}
+
+// Field-wise, because `G570Batch139Tri` carries padding bytes: the parallel arm's elements come
+// from `vector::resize` (value-init, padding zeroed) and the oracle's from a default-init local
+// (padding indeterminate), so a `memcmp` of the whole struct could differ on bytes nothing reads.
+static bool g649TriEq(const G570Batch139Tri &a, const G570Batch139Tri &b)
+{
+    return a.minX == b.minX && a.maxX == b.maxX && a.minY == b.minY && a.maxY == b.maxY &&
+           std::memcmp(a.step, b.step, sizeof(a.step)) == 0 &&
+           std::memcmp(a.rowStep, b.rowStep, sizeof(a.rowStep)) == 0 &&
+           std::memcmp(a.edgeBase, b.edgeBase, sizeof(a.edgeBase)) == 0 &&
+           a.topLeftMask == b.topLeftMask && a.delta == b.delta &&
+           a.spanOffset == b.spanOffset &&
+           std::memcmp(&a.a0, &b.a0, sizeof(float)) == 0 &&
+           std::memcmp(&a.b0, &b.b0, sizeof(float)) == 0 &&
+           std::memcmp(&a.a1, &b.a1, sizeof(float)) == 0 &&
+           std::memcmp(&a.b1, &b.b1, sizeof(float)) == 0 &&
+           std::memcmp(&a.fx2, &b.fx2, sizeof(float)) == 0 &&
+           std::memcmp(&a.fy2, &b.fy2, sizeof(float)) == 0 &&
+           std::memcmp(&a.winding, &b.winding, sizeof(float)) == 0 &&
+           std::memcmp(&a.invAbsDenom, &b.invAbsDenom, sizeof(float)) == 0 &&
+           std::memcmp(&a.z0, &b.z0, sizeof(float)) == 0 &&
+           std::memcmp(&a.z1, &b.z1, sizeof(float)) == 0 &&
+           std::memcmp(&a.z2, &b.z2, sizeof(float)) == 0;
+}
+
+static std::vector<int> g_g649TrisBounds;
+static std::atomic<uint64_t> g_g649TrisFail{~0ull};
+static uint64_t g_g649TrisBatches = 0ull, g_g649TrisCount = 0ull, g_g649TrisBad = 0ull;
+
+static inline bool g649FrameIs139(const G144Entry &e)
+{
+    return e.ctx.frame.fbp == 0x139u && e.ctx.frame.fbw == 8u &&
+           e.ctx.frame.psm == GS_PSM_CT32;
+}
+
+// The per-triangle body, shared VERBATIM by the serial and the parallel arm so the arithmetic
+// exists in exactly one place. Returns 0 on success (`degenerate` reports the |denom| test, which
+// the caller needs because only the non-degenerate branch owns span rows), or the reject reason.
+static inline int g649SetupTri(const G144Entry &e, uint32_t spanOffsetIn,
+                               G570Batch139Tri &p, bool &degenerate)
+{
+    degenerate = false;
+    const uint8_t alphaMode = static_cast<uint8_t>(e.ctx.alpha & 0xffu);
+    const GSVertex &v0 = e.v[0], &v1 = e.v[1], &v2 = e.v[2];
+    const bool flatUnit = !e.prim.iip && v2.r == 1u && v2.g == 1u &&
+                          v2.b == 1u && v2.a == 0x40u;
+    if (!g649FrameIs139(e) || e.prim.type != GS_PRIM_TRIFAN || e.prim.tme ||
+        !e.prim.abe || e.prim.fge || e.ctx.test != 0x5000aull ||
+        e.ctx.zbuf != 0x1010000d0ull ||
+        (alphaMode != 0x62u && alphaMode != 0x68u) ||
+        static_cast<uint8_t>((e.ctx.alpha >> 32u) & 0xffu) != 0x80u ||
+        !flatUnit || e.ctx.frame.fbmsk != 0u || e.ctx.fba != 0u || e.pabe)
+        return 4;
+
+    const int ofx = e.ctx.xyoffset.ofx >> 4;
+    const int ofy = e.ctx.xyoffset.ofy >> 4;
+    const float x0 = v0.x - static_cast<float>(ofx);
+    const float y0 = v0.y - static_cast<float>(ofy);
+    const float x1 = v1.x - static_cast<float>(ofx);
+    const float y1 = v1.y - static_cast<float>(ofy);
+    const float x2 = v2.x - static_cast<float>(ofx);
+    const float y2 = v2.y - static_cast<float>(ofy);
+    const float denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
+
+    // G649 (P7): `ofx/ofy/rawX/rawY` are no longer stored — the CPU band replay re-reads them from
+    // this very entry through `g649TriRawAt`, which is bit-exact because they are literal copies.
+    p.minX = std::max(static_cast<int>(e.ctx.scissor.x0),
+                      static_cast<int>(std::floor(std::min({x0, x1, x2}))));
+    p.maxX = std::min(static_cast<int>(e.ctx.scissor.x1),
+                      static_cast<int>(std::ceil(std::max({x0, x1, x2}))));
+    p.minY = std::max(static_cast<int>(e.ctx.scissor.y0),
+                      static_cast<int>(std::floor(std::min({y0, y1, y2}))));
+    p.maxY = std::min(static_cast<int>(e.ctx.scissor.y1),
+                      static_cast<int>(std::ceil(std::max({y0, y1, y2}))));
+    if (p.minX < 0 || p.maxX >= static_cast<int>(kG403DisplayZW) ||
+        p.minY < 0 || p.maxY >= static_cast<int>(kG403DisplayZH))
+        return 5;
+
+    // G649: `|=` below needs a zero base, and the parallel arm's storage is recycled.
+    p.topLeftMask = 0u;
+    p.delta = (alphaMode == 0x68u) ? 1 : -1;
+    if (std::fabs(denom) >= 0.001f)
+    {
+        // G649 (P7): `fx/fy/sign` are LOCALS now. They exist only to derive `step`, `rowStep`,
+        // `edgeBase` and `topLeftMask` below; every later consumer reads those three arrays through
+        // `g649EdgesAt`, which is the same value by the affine identity.
+        const int64_t fx[3] = {
+            static_cast<int64_t>(std::llround(x0 * 16.0f)),
+            static_cast<int64_t>(std::llround(x1 * 16.0f)),
+            static_cast<int64_t>(std::llround(x2 * 16.0f)),
+        };
+        const int64_t fy[3] = {
+            static_cast<int64_t>(std::llround(y0 * 16.0f)),
+            static_cast<int64_t>(std::llround(y1 * 16.0f)),
+            static_cast<int64_t>(std::llround(y2 * 16.0f)),
+        };
+        const int sign = denom >= 0.0f ? 1 : -1;
+        const auto topLeft = [&](int a, int b) {
+            int64_t dx = fx[b] - fx[a];
+            int64_t dy = fy[b] - fy[a];
+            if (sign < 0) { dx = -dx; dy = -dy; }
+            return dy < 0 || (dy == 0 && dx > 0);
+        };
+        if (topLeft(1, 2)) p.topLeftMask |= 1u;
+        if (topLeft(2, 0)) p.topLeftMask |= 2u;
+        if (topLeft(0, 1)) p.topLeftMask |= 4u;
+        p.step[0] = -(fy[2] - fy[1]) * 16 * sign;
+        p.step[1] = -(fy[0] - fy[2]) * 16 * sign;
+        p.step[2] = -(fy[1] - fy[0]) * 16 * sign;
+        p.rowStep[0] = (fx[2] - fx[1]) * 16 * sign;
+        p.rowStep[1] = (fx[0] - fx[2]) * 16 * sign;
+        p.rowStep[2] = (fx[1] - fx[0]) * 16 * sign;
+        p.a0 = y1 - y2; p.b0 = x2 - x1;
+        p.a1 = y2 - y0; p.b1 = x0 - x2;
+        p.fx2 = x2; p.fy2 = y2;
+        p.winding = denom < 0.0f ? -1.0f : 1.0f;
+        p.invAbsDenom = 1.0f / std::fabs(denom);
+        p.z0 = v0.z; p.z1 = v1.z; p.z2 = v2.z;
+        p.spanOffset = spanOffsetIn;
+        const int64_t baseSx = static_cast<int64_t>(p.minX) * 16;
+        const int64_t baseSy = static_cast<int64_t>(p.minY) * 16;
+        p.edgeBase[0] =
+            ((fx[2] - fx[1]) * (baseSy - fy[1]) -
+             (fy[2] - fy[1]) * (baseSx - fx[1])) * sign;
+        p.edgeBase[1] =
+            ((fx[0] - fx[2]) * (baseSy - fy[2]) -
+             (fy[0] - fy[2]) * (baseSx - fx[2])) * sign;
+        p.edgeBase[2] =
+            ((fx[1] - fx[0]) * (baseSy - fy[0]) -
+             (fy[1] - fy[0]) * (baseSx - fx[0])) * sign;
+    }
+    else
+    {
+        degenerate = true;
+        // G649: the serial arm reached here with a freshly DEFAULT-CONSTRUCTED `p` and set only the
+        // bbox, `delta` and this marker; every other member kept its default. The parallel arm's
+        // storage is recycled, so restore exactly that state rather than inherit the last batch's.
+        const int keepMinX = p.minX, keepMinY = p.minY, keepMaxY = p.maxY;
+        const int8_t keepDelta = p.delta;
+        p = G570Batch139Tri{};
+        p.minX = keepMinX;
+        p.minY = keepMinY;
+        p.maxY = keepMaxY;
+        p.delta = keepDelta;
+        p.maxX = -1; // generic drawTriangle drops the same degenerate primitive
+    }
+    return 0;
+}
+
 static bool g570Batch139PrepareBuild()
 {
     g_g570Batch139RejectReason = 1;
-    g_g570Batch139Tris.clear();
+    // ⭐ G649 (P2): `g_g570Batch139Tris` is NOT cleared here any more.
+    //
+    // `[G649:trispar]` measures **4,588–4,763 triangles per batch**, so this array is ~1.09 MB, and
+    // `std::vector::resize` VALUE-INITIALISES: clearing it here and resizing it in the parallel arm
+    // would write that megabyte of zeros SERIALLY on the pole thread before the parallel job wrote
+    // it again with data — the same order as the whole `^tris` lap, i.e. it would eat the lever.
+    // Leaving the previous batch's SIZE in place makes `resize(n)` grow-only, and `n` barely moves
+    // between batches on this route, so a steady-state batch pays nothing.
+    //
+    // ⚠️ Two consequences, both handled:
+    //   * every path that returns false below still clears it explicitly, and no consumer reads the
+    //     array without `g570PreparedBatch` (rasterizer_tilebin_capture.inc) being true, so an
+    //     early return leaves storage that nothing looks at;
+    //   * element storage is RECYCLED, so `g649SetupTri` may not assume a default-constructed `p`.
+    //     It resets `topLeftMask` and rebuilds the whole default state on the degenerate path.
+    // ⚠️⚠️ A FIRST ATTEMPT parked the buffer in a persistent scratch and swapped. It does not work:
+    // ~15 of every 16 dispatch windows reject at reason 2 BEFORE the loop, and each of those swapped
+    // and cleared, so after two consecutive rejects BOTH buffers were empty and the next successful
+    // batch paid the full value-init anyway.
     g_g570Batch139Spans.clear();
     g_g570Batch139GpuTris.clear();
     g_g570Batch139GpuSpans.clear();
@@ -1358,106 +1918,143 @@ static bool g570Batch139PrepareBuild()
 
     const bool gpuSpans = g570Batch139GpuOn();
     const bool tightGpuSpans = gpuSpans && g570Batch139TightGpuSpansOn();
+    // G648: defer ONLY when the GPU path both serves this batch and derives its own spans, so the
+    // uploaded table is not the thing being skipped. The G642 oracle needs the eager array to
+    // compare against, so it disables the deferral outright.
+    const bool deferSpans =
+        gpuSpans && g642DeriveActive() && g648LazySpanOn() && !g642VerifyOn();
+    g_g648SpansDeferred = deferSpans;
     // G638b sub-lap (no-op unless DC2_G638_PREP=1): `[G638:prep] g570prep` is 4.735 ms/f of
     // `dragon`'s static tail — 40% of the whole CPU-fallback dispatch window and the largest
     // single-threaded item on the GS pole. Split it into the per-triangle setup loop below and
     // g570Batch139BuildGpuPayload, because they need different levers.
     const auto g638TrisT0 = g_g638PrepCensusOn ? std::chrono::steady_clock::now()
                                                : std::chrono::steady_clock::time_point{};
+    const size_t g649N = g_g144List.size() - 1u;
+    // ⭐ G649 (P2): the parallel arm. Admitted only in the DEFERRED configuration — see the note
+    // above `g649SetupTri` for why `spanOffset` is the whole exactness question — and only when the
+    // pool actually has lanes and the batch is big enough to pay for one dispatch.
+    const bool g649Par = deferSpans && g649TrisParOn() && g_g144Threads > 1 && g649N >= 64u;
+    if (g649Par)
+    {
+        // Grow-only IN PLACE: `resize` value-initialises only the GROWTH (the array was not cleared
+        // at the top), and shrinking is O(1) for a trivially destructible element. In the steady
+        // state `n` barely moves, so a batch pays nothing here instead of writing 1.09 MB of zeros.
+        g_g570Batch139Tris.resize(g649N);
+        int lanes = g_g144Threads;
+        const int cap = GSRowPool::instance().laneCap();
+        if (lanes > cap)
+            lanes = cap;
+        // Over-decompose 4x the lane count and let every participant, the caller included, steal —
+        // G637 §5's law: a triangle's cost is not uniform, and a work estimator is both redundant
+        // and harmful beside a dynamic claimer.
+        int chunks = lanes * 4;
+        if (chunks > static_cast<int>(g649N))
+            chunks = static_cast<int>(g649N);
+        if (chunks < 1)
+            chunks = 1;
+        g_g649TrisBounds.resize(static_cast<size_t>(chunks) + 1u);
+        for (int c = 0; c <= chunks; ++c)
+            g_g649TrisBounds[static_cast<size_t>(c)] =
+                static_cast<int>(static_cast<int64_t>(g649N) * c / chunks);
+        g_g649TrisFail.store(~0ull, std::memory_order_relaxed);
+        const std::function<void(int, int)> g649Build = [&](int a, int b) {
+            for (int i = a; i <= b; ++i)
+            {
+                bool degenerate = false;
+                const int reason =
+                    g649SetupTri(g_g144List[static_cast<size_t>(i) + 1u], 0u,
+                                 g_g570Batch139Tris[static_cast<size_t>(i)], degenerate);
+                if (reason != 0)
+                {
+                    // Lowest index wins, so the reported reason is the serial loop's.
+                    const uint64_t packed =
+                        (static_cast<uint64_t>(static_cast<uint32_t>(i)) << 3) |
+                        static_cast<uint64_t>(static_cast<uint32_t>(reason));
+                    uint64_t cur = g_g649TrisFail.load(std::memory_order_relaxed);
+                    while (packed < cur &&
+                           !g_g649TrisFail.compare_exchange_weak(cur, packed,
+                                                                 std::memory_order_relaxed))
+                    {
+                    }
+                    return;
+                }
+            }
+        };
+        GSRowPool::instance().runCoop(g_g649TrisBounds.data(), chunks, lanes - 1, g649Build);
+        const uint64_t g649Fail = g_g649TrisFail.load(std::memory_order_relaxed);
+        if (g649Fail != ~0ull)
+        {
+            g_g570Batch139RejectReason = static_cast<int>(g649Fail & 7ull);
+            g_g570Batch139Tris.clear();
+            g_g570Batch139Spans.clear();
+            return false;
+        }
+        // Oracle: rebuild the SAME list serially, through the SAME helper, and compare field by
+        // field. A divergence can only come from the partition, since the arithmetic is shared.
+        if (g649TrisParVerifyOn())
+        {
+            std::vector<G570Batch139Tri> ref;
+            ref.reserve(g649N);
+            bool refOk = true;
+            for (size_t i = 1; i < g_g144List.size() && refOk; ++i)
+            {
+                G570Batch139Tri rp;
+                bool degenerate = false;
+                if (g649SetupTri(g_g144List[i], 0u, rp, degenerate) != 0)
+                    refOk = false;
+                else
+                    ref.push_back(rp);
+            }
+            bool eq = refOk && ref.size() == g_g570Batch139Tris.size();
+            size_t firstBad = ref.size();
+            for (size_t i = 0; eq && i < ref.size(); ++i)
+                if (!g649TriEq(ref[i], g_g570Batch139Tris[i]))
+                {
+                    eq = false;
+                    firstBad = i;
+                }
+            if (!eq && ++g_g649TrisBad <= 8ull)
+                std::fprintf(stderr,
+                             "[G649:trispar] MISMATCH refOk=%d n=%zu par=%zu firstBad=%zu\n",
+                             refOk ? 1 : 0, ref.size(), g_g570Batch139Tris.size(), firstBad);
+        }
+        if (g649TrisParStatOn())
+        {
+            ++g_g649TrisBatches;
+            g_g649TrisCount += g649N;
+            if ((g_g649TrisBatches % 600ull) == 0ull)
+                std::fprintf(stderr,
+                             "[G649:trispar] batches=%llu tris/batch=%.1f chunks=%d lanes=%d "
+                             "bad=%llu\n",
+                             static_cast<unsigned long long>(g_g649TrisBatches),
+                             static_cast<double>(g_g649TrisCount) /
+                                 static_cast<double>(g_g649TrisBatches),
+                             chunks, lanes,
+                             static_cast<unsigned long long>(g_g649TrisBad));
+        }
+    }
+    else
+    {
+    // G649: the top no longer clears, so the serial arm clears its own output before appending.
+    g_g570Batch139Tris.clear();
     g_g570Batch139Tris.reserve(g_g144List.size() - 1u);
     for (size_t i = 1; i < g_g144List.size(); ++i)
     {
         const G144Entry &e = g_g144List[i];
-        const uint8_t alphaMode = static_cast<uint8_t>(e.ctx.alpha & 0xffu);
-        const GSVertex &v0 = e.v[0], &v1 = e.v[1], &v2 = e.v[2];
-        const bool flatUnit = !e.prim.iip && v2.r == 1u && v2.g == 1u &&
-                              v2.b == 1u && v2.a == 0x40u;
-        if (!frameIs139(e) || e.prim.type != GS_PRIM_TRIFAN || e.prim.tme ||
-            !e.prim.abe || e.prim.fge || e.ctx.test != 0x5000aull ||
-            e.ctx.zbuf != 0x1010000d0ull ||
-            (alphaMode != 0x62u && alphaMode != 0x68u) ||
-            static_cast<uint8_t>((e.ctx.alpha >> 32u) & 0xffu) != 0x80u ||
-            !flatUnit || e.ctx.frame.fbmsk != 0u || e.ctx.fba != 0u || e.pabe)
-        {
-            g_g570Batch139RejectReason = 4;
-            g_g570Batch139Tris.clear();
-            g_g570Batch139Spans.clear();
-            return false;
-        }
-
-        const int ofx = e.ctx.xyoffset.ofx >> 4;
-        const int ofy = e.ctx.xyoffset.ofy >> 4;
-        const float x0 = v0.x - static_cast<float>(ofx);
-        const float y0 = v0.y - static_cast<float>(ofy);
-        const float x1 = v1.x - static_cast<float>(ofx);
-        const float y1 = v1.y - static_cast<float>(ofy);
-        const float x2 = v2.x - static_cast<float>(ofx);
-        const float y2 = v2.y - static_cast<float>(ofy);
-        const float denom = (y1 - y2) * (x0 - x2) + (x2 - x1) * (y0 - y2);
-
         G570Batch139Tri p;
-        p.ofx = ofx; p.ofy = ofy;
-        p.rawX[0] = v0.x; p.rawX[1] = v1.x; p.rawX[2] = v2.x;
-        p.rawY[0] = v0.y; p.rawY[1] = v1.y; p.rawY[2] = v2.y;
-        p.minX = std::max(static_cast<int>(e.ctx.scissor.x0),
-                          static_cast<int>(std::floor(std::min({x0, x1, x2}))));
-        p.maxX = std::min(static_cast<int>(e.ctx.scissor.x1),
-                          static_cast<int>(std::ceil(std::max({x0, x1, x2}))));
-        p.minY = std::max(static_cast<int>(e.ctx.scissor.y0),
-                          static_cast<int>(std::floor(std::min({y0, y1, y2}))));
-        p.maxY = std::min(static_cast<int>(e.ctx.scissor.y1),
-                          static_cast<int>(std::ceil(std::max({y0, y1, y2}))));
-        if (p.minX < 0 || p.maxX >= static_cast<int>(kG403DisplayZW) ||
-            p.minY < 0 || p.maxY >= static_cast<int>(kG403DisplayZH))
+        bool degenerate = false;
+        const int reason = g649SetupTri(
+            e, static_cast<uint32_t>(g_g570Batch139Spans.size()), p, degenerate);
+        if (reason != 0)
         {
-            g_g570Batch139RejectReason = 5;
+            g_g570Batch139RejectReason = reason;
             g_g570Batch139Tris.clear();
             g_g570Batch139Spans.clear();
             return false;
         }
-        p.delta = (alphaMode == 0x68u) ? 1 : -1;
-        if (std::fabs(denom) >= 0.001f)
+        if (!degenerate)
         {
-            p.fx[0] = static_cast<int64_t>(std::llround(x0 * 16.0f));
-            p.fx[1] = static_cast<int64_t>(std::llround(x1 * 16.0f));
-            p.fx[2] = static_cast<int64_t>(std::llround(x2 * 16.0f));
-            p.fy[0] = static_cast<int64_t>(std::llround(y0 * 16.0f));
-            p.fy[1] = static_cast<int64_t>(std::llround(y1 * 16.0f));
-            p.fy[2] = static_cast<int64_t>(std::llround(y2 * 16.0f));
-            p.sign = denom >= 0.0f ? 1 : -1;
-            const auto topLeft = [&](int a, int b) {
-                int64_t dx = p.fx[b] - p.fx[a];
-                int64_t dy = p.fy[b] - p.fy[a];
-                if (p.sign < 0) { dx = -dx; dy = -dy; }
-                return dy < 0 || (dy == 0 && dx > 0);
-            };
-            if (topLeft(1, 2)) p.topLeftMask |= 1u;
-            if (topLeft(2, 0)) p.topLeftMask |= 2u;
-            if (topLeft(0, 1)) p.topLeftMask |= 4u;
-            p.step[0] = -(p.fy[2] - p.fy[1]) * 16 * p.sign;
-            p.step[1] = -(p.fy[0] - p.fy[2]) * 16 * p.sign;
-            p.step[2] = -(p.fy[1] - p.fy[0]) * 16 * p.sign;
-            p.rowStep[0] = (p.fx[2] - p.fx[1]) * 16 * p.sign;
-            p.rowStep[1] = (p.fx[0] - p.fx[2]) * 16 * p.sign;
-            p.rowStep[2] = (p.fx[1] - p.fx[0]) * 16 * p.sign;
-            p.a0 = y1 - y2; p.b0 = x2 - x1;
-            p.a1 = y2 - y0; p.b1 = x0 - x2;
-            p.fx2 = x2; p.fy2 = y2;
-            p.winding = denom < 0.0f ? -1.0f : 1.0f;
-            p.invAbsDenom = 1.0f / std::fabs(denom);
-            p.z0 = v0.z; p.z1 = v1.z; p.z2 = v2.z;
-            p.spanOffset = static_cast<uint32_t>(g_g570Batch139Spans.size());
-            const int64_t baseSx = static_cast<int64_t>(p.minX) * 16;
-            const int64_t baseSy = static_cast<int64_t>(p.minY) * 16;
-            p.edgeBase[0] =
-                ((p.fx[2] - p.fx[1]) * (baseSy - p.fy[1]) -
-                 (p.fy[2] - p.fy[1]) * (baseSx - p.fx[1])) * p.sign;
-            p.edgeBase[1] =
-                ((p.fx[0] - p.fx[2]) * (baseSy - p.fy[2]) -
-                 (p.fy[0] - p.fy[2]) * (baseSx - p.fx[2])) * p.sign;
-            p.edgeBase[2] =
-                ((p.fx[1] - p.fx[0]) * (baseSy - p.fy[0]) -
-                 (p.fy[1] - p.fy[0]) * (baseSx - p.fx[0])) * p.sign;
             int64_t rowEdge[3] = {
                 p.edgeBase[0], p.edgeBase[1], p.edgeBase[2],
             };
@@ -1479,32 +2076,33 @@ static bool g570Batch139PrepareBuild()
                                                -p.step[edge], false);
                 }
             }
-            for (int y = p.minY; y <= p.maxY; ++y)
-            {
-                int xStart = p.minX, xEnd = p.maxX;
-                if (tightGpuSpans)
-                    g570Batch139ExactSpan(p, rowEdge, spanBounds, xStart, xEnd);
-                else if (!gpuSpans)
-                    g570Batch139ComputeSpan(p, y, xStart, xEnd);
-                g_g570Batch139Spans.push_back(
-                    static_cast<uint32_t>(xStart & 0xffff) |
-                    (static_cast<uint32_t>(xEnd & 0xffff) << 16u));
-                rowEdge[0] += rowStep[0];
-                rowEdge[1] += rowStep[1];
-                rowEdge[2] += rowStep[2];
-                if (tightGpuSpans)
+            // G648: in the deferred configuration every iteration of this loop would push the SAME
+            // constant `(minX, maxX)` that `p` already carries, and `rowEdge` / `spanBounds` are
+            // only read by the tight-span arm. Skip the whole thing; `g648SpanAt` reads `p`.
+            if (!deferSpans)
+                for (int y = p.minY; y <= p.maxY; ++y)
                 {
-                    spanBounds[0].advance();
-                    spanBounds[1].advance();
-                    spanBounds[2].advance();
+                    int xStart = p.minX, xEnd = p.maxX;
+                    if (tightGpuSpans)
+                        g570Batch139ExactSpan(p, rowEdge, spanBounds, xStart, xEnd);
+                    else if (!gpuSpans)
+                        g570Batch139ComputeSpan(p, y, xStart, xEnd);
+                    g_g570Batch139Spans.push_back(
+                        static_cast<uint32_t>(xStart & 0xffff) |
+                        (static_cast<uint32_t>(xEnd & 0xffff) << 16u));
+                    rowEdge[0] += rowStep[0];
+                    rowEdge[1] += rowStep[1];
+                    rowEdge[2] += rowStep[2];
+                    if (tightGpuSpans)
+                    {
+                        spanBounds[0].advance();
+                        spanBounds[1].advance();
+                        spanBounds[2].advance();
+                    }
                 }
-            }
-        }
-        else
-        {
-            p.maxX = -1; // generic drawTriangle drops the same degenerate primitive
         }
         g_g570Batch139Tris.push_back(p);
+    }
     }
     if (g_g638PrepCensusOn)
         g638PrepNote(kG638PhG570Tris, static_cast<uint64_t>(
@@ -1612,12 +2210,16 @@ static uint64_t g570Batch139ReplayRange(uint8_t *vram, size_t vramSize, int y0, 
         // Recreate the float setup on the lane thread, exactly where drawTriangle would.  The GS
         // worker and row-pool threads can carry different MXCSR state; persisting these values
         // across that boundary caused rare GEQUAL boundary differences.
-        const float lx0 = p.rawX[0] - static_cast<float>(p.ofx);
-        const float ly0 = p.rawY[0] - static_cast<float>(p.ofy);
-        const float lx1 = p.rawX[1] - static_cast<float>(p.ofx);
-        const float ly1 = p.rawY[1] - static_cast<float>(p.ofy);
-        const float lx2 = p.rawX[2] - static_cast<float>(p.ofx);
-        const float ly2 = p.rawY[2] - static_cast<float>(p.ofy);
+        // G649 (P7): the unscaled vertices come straight from the entry now — the setup loop no
+        // longer copies them into the triangle. Same subtraction, same operands, same order.
+        G649TriRaw raw;
+        g649TriRawAt(triIndex, raw);
+        const float lx0 = raw.lx[0];
+        const float ly0 = raw.ly[0];
+        const float lx1 = raw.lx[1];
+        const float ly1 = raw.ly[1];
+        const float lx2 = raw.lx[2];
+        const float ly2 = raw.ly[2];
         const float laneDenom = (ly1 - ly2) * (lx0 - lx2) +
                                 (lx2 - lx1) * (ly0 - ly2);
         const float laneA0 = ly1 - ly2, laneB0 = lx2 - lx1;
@@ -1632,18 +2234,15 @@ static uint64_t g570Batch139ReplayRange(uint8_t *vram, size_t vramSize, int y0, 
         const __m128 z0 = _mm_set1_ps(p.z0), z1 = _mm_set1_ps(p.z1), z2 = _mm_set1_ps(p.z2);
         for (int y = firstY; y <= lastY; ++y)
         {
-            const uint32_t packedSpan = g_g570Batch139Spans[
-                static_cast<size_t>(p.spanOffset) + static_cast<size_t>(y - p.minY)];
+            const uint32_t packedSpan = g648SpanAt(p, y); // G648
             const int xStart = static_cast<int16_t>(packedSpan & 0xffffu);
             const int xEnd = static_cast<int16_t>(packedSpan >> 16u);
-            const int64_t sx = static_cast<int64_t>(xStart) * 16;
-            const int64_t sy = static_cast<int64_t>(y) * 16;
-            int64_t edge0 = ((p.fx[2] - p.fx[1]) * (sy - p.fy[1]) -
-                             (p.fy[2] - p.fy[1]) * (sx - p.fx[1])) * p.sign;
-            int64_t edge1 = ((p.fx[0] - p.fx[2]) * (sy - p.fy[2]) -
-                             (p.fy[0] - p.fy[2]) * (sx - p.fx[2])) * p.sign;
-            int64_t edge2 = ((p.fx[1] - p.fx[0]) * (sy - p.fy[0]) -
-                             (p.fy[1] - p.fy[0]) * (sx - p.fx[0])) * p.sign;
+            // G649 (P7): the same three integers, from the header's affine form.
+            int64_t edgeStart[3];
+            g649EdgesAt(p, xStart, y, edgeStart);
+            int64_t edge0 = edgeStart[0];
+            int64_t edge1 = edgeStart[1];
+            int64_t edge2 = edgeStart[2];
             __m128 px = _mm_setr_ps(static_cast<float>(xStart),
                                     static_cast<float>(xStart + 1),
                                     static_cast<float>(xStart + 2),
@@ -1883,10 +2482,18 @@ static bool g570Batch139ReplayGpu(const std::vector<uint32_t> &color,
         g_g570Batch139GpuTileOffsets.empty() || g_g570Batch139GpuTileTris.empty())
         return false;
     const auto t0 = std::chrono::steady_clock::now();
+    // G641: `rect*` is the producer's own tile bbox when the window lever is armed, and the whole
+    // surface otherwise. `g641ShadowRect` returns false for anything it cannot describe, so every
+    // refusal falls straight back onto the legacy whole-surface submit.
+    int rx = 0, ry = 0, rw = static_cast<int>(kG403DisplayZW), rh = static_cast<int>(kG403DisplayZH);
+    g641ShadowRect(rx, ry, rw, rh);
     const bool ok = g570_backend_shadow139(
         color, g403DisplayZBuf(), g_g570Batch139GpuTris,
         g_g570Batch139GpuSpans, g_g570Batch139GpuTileOffsets,
-        g_g570Batch139GpuTileTris, out);
+        g_g570Batch139GpuTileTris, out, rx, ry, rw, rh,
+        // G642: the producer is authoritative about which span mode its payload encodes; the
+        // backend must never re-derive the predicate from env flags of its own.
+        g642DeriveActive() ? 1 : 0);
     const uint64_t us = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - t0).count());

@@ -34,7 +34,10 @@ namespace
 {
     bool g447EdgeOnImpl()
     {
-        static const bool on = (std::getenv("DC2_G447_EDGE") != nullptr);
+        // G640: DC2_G640_OVL rides inside the SAME scopes — it needs each edge's start/end, which
+        // only the G447 scope observes. Arming it therefore arms this census too, and both reports
+        // print. Neither is ever valid in a timing run.
+        static const bool on = (std::getenv("DC2_G447_EDGE") != nullptr) || g640OvlOn();
         return on;
     }
 
@@ -104,6 +107,7 @@ void g447NoteWait(int edge, unsigned long long ns)
 {
     if (edge < 0 || edge >= kG447Edges)
         return;
+    g640NoteEdge(edge, ns); // G640 (inert unless DC2_G640_OVL=1)
     g_g447Ns[edge] += static_cast<uint64_t>(ns);
     ++g_g447N[edge];
 }
@@ -115,6 +119,7 @@ void g447ReportBoundary(unsigned long long windowNsTotal)
 {
     if (!g447EdgeOnImpl())
         return;
+    g640ReportBoundary(); // G640 (inert unless DC2_G640_OVL=1); keeps its own 30-boundary counter
     if ((++g_g447Boundaries % 30ull) != 0ull)
         return;
     const double f = 30.0;

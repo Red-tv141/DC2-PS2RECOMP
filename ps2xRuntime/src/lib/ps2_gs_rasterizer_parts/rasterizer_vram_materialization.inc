@@ -1082,12 +1082,17 @@ static bool g305StatOn()  { static const bool v = envFlagEnabled("DC2_G305_STAT"
 // fail as a priced ceiling. Never default-on without the full route matrix.
 static bool g444AsyncOn() { static const bool v = envFlagEnabled("DC2_G444_ASYNC"); return v; }
 
+// G640: defined below in g640_async_pipeline.inc (which needs g_g305Pending / g493LateDrainOne and
+// therefore cannot be included above this point). A static function may be declared here and
+// defined later in the same TU.
+static bool g640AsyncOn();
+
 // Every drain stays armed for the whole paired run. This is deliberately selected-by-lever,
 // not selected-by-current-arm: a candidate packet may still be pending when the tick changes to
 // control, and that packet must be retired before any consumer or next submission proceeds.
 static bool g305DrainRequired()
 {
-    return g305AsyncOn() || g444AsyncOn() || g452AsyncSelected();
+    return g305AsyncOn() || g444AsyncOn() || g452AsyncSelected() || g640AsyncOn();
 }
 
 struct G305Pending
@@ -1105,6 +1110,11 @@ static std::atomic<uint64_t> g_g305Failed{0};       // backend render failures c
 // needs g_g305Pending / g_g305ForceSync / g_g305Drained above and must be visible at the flush's
 // submit point below.
 #include "g493_late_drain.inc"
+
+// G640: the asynchronous pipeline proper — the entry-storage recycling defect G305 introduced, the
+// configurable ring depth, and the drain-to-depth policy. MUST follow g493_late_drain.inc
+// (g640LateDrainToDepth calls g493LateDrainOne) and rasterizer_command_graph.inc (g_g260Pool).
+#include "g640_async_pipeline.inc"
 
 // Drain the in-flight async packet (if any) and resolve the delayed-failure contract. Cheap no-op
 // when nothing is pending; safe to call at every consumer edge. Runs only on the front-end thread.
@@ -1135,7 +1145,13 @@ static bool g305DrainOne()
                      (unsigned long long)nDrained,
                      (unsigned long long)g_g305Failed.load(std::memory_order_relaxed));
     if (ok)
+    {
+        // G640: the retained record's entry storage goes BACK to the executor's pool instead of
+        // being destroyed here. Exact — the list is already consumed; only its allocation survives.
+        g640ReturnPendingStorage(std::move(pending.list));
+        g640StatReport();
         return true;
+    }
     // Rare: the backend render/readback failed AFTER the optimistic front-end commit. Void the
     // optimistic snapshot and re-run the proven sequential drain (which itself re-attempts the GPU
     // synchronously and, on failure, runs the whole materialize-chain + CPU band replay) on the
@@ -1153,6 +1169,10 @@ static bool g305DrainOne()
     g_g305ForceSync = false;
     g_g144List.swap(savedList);
     g_g144LastGs = savedGs;
+    // G640: after the replay `savedList` holds the (now consumed) buffer the record carried; recycle
+    // that one, not `pending.list`, which the swaps above left empty.
+    g640ReturnPendingStorage(std::move(savedList));
+    g640StatReport();
     if (g305StatOn())
         std::fprintf(stderr, "[G305:async] backend FAILURE recovered via CPU replay (n=%llu)\n",
                      (unsigned long long)g_g305Failed.load(std::memory_order_relaxed));
@@ -5976,11 +5996,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // G444: `|| g444AsyncOn()` relaxes ONLY the G310 exclusion (and only when the probe is armed);
     // every other eligibility term is unchanged, so a non-armed run takes the identical decision.
     const bool g452Async = g452AsyncArm();
+    // G640 joins the arm disjunction and the G310 relaxation on exactly the same terms G444 uses —
+    // every other eligibility conjunct is unchanged, so a non-armed run takes the identical decision.
     const bool g305Async =
-        (g305AsyncOn() || g444AsyncOn() || g452Async) && !g_g305ForceSync && s_batch.skipReadback && !guestDepth &&
+        (g305AsyncOn() || g444AsyncOn() || g452Async || g640AsyncOn()) && !g_g305ForceSync && s_batch.skipReadback && !guestDepth &&
         !g275FuseReadback && !g262WaveDepth && !g286Transient && !g282Tight &&
         !(g255Rtt && g255VerifyThis) &&
-        (!g310On() || g444AsyncOn() || g452Async);
+        (!g310On() || g444AsyncOn() || g452Async || g640AsyncOn());
     // G324 premise only: this is the existing G305 pure-epilogue contract with G310 admitted as
     // the missing completion-ordered state family. No submission behavior changes here.
     const bool g324TxnEligible =
@@ -6057,8 +6079,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // is free by the next statement, GL order is unchanged (single FIFO worker), and every
     // consumer-side drain site is untouched. Failure is deferred, never replayed inline: s_batch is
     // live and the replay rebuilds it.
+    // G640: drain back to depth-1 rather than to empty, so `depth-1` packets stay in flight across
+    // this flush's own submit. At depth 1 this IS g493LateDrainPending() (drain everything).
     if (g305DrainRequired() && g493LateDrainActive())
-        g493LateDrainPending();
+        g640LateDrainToDepth();
     bool submitted;
     if (g305Async)
     {
@@ -6070,10 +6094,18 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             // the closure's post-success clear() is a no-op and the next flush accumulates fresh.
             G305Pending pending;
             pending.gs = gs;
+            // ⭐ G640: take the record's buffer from the executor's own pool BEFORE the swap, so
+            // g_g144List keeps a usable allocation and g_g260Pool does not receive a zero-capacity
+            // husk. Without this every async submit costs one entry-buffer free plus a from-scratch
+            // regrowth on the next batch (see g640_async_pipeline.inc, CAUSE 1).
+            g640TakePendingStorage(pending.list);
             pending.list.swap(g_g144List);
             g_g305Pending.push_back(std::move(pending));
             g_g305Submitted.fetch_add(1u, std::memory_order_relaxed);
+            g640StatReport();
         }
+        else
+            g640NoteRingFull();
     }
     else
     {
