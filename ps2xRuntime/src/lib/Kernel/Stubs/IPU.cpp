@@ -32,9 +32,10 @@ namespace ps2_stubs
 
         PS2Memory &mem = runtime->memory();
 
-        if (runtime->hasFunction(SETD4_CHCR_ENTRY))
+        if (auto setD4 = runtime->hasFunction(SETD4_CHCR_ENTRY)
+                             ? runtime->lookupFunction(SETD4_CHCR_ENTRY)
+                             : nullptr)
         {
-            auto setD4 = runtime->lookupFunction(SETD4_CHCR_ENTRY);
             ctx->r[4] = _mm_set_epi64x(0, 1);
             {
                 PS2Runtime::GuestExecutionScope guestExecution(runtime);

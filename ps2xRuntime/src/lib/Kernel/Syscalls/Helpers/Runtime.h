@@ -783,4 +783,3 @@ static void ensureBootModeTable(uint8_t *rdram)
 
     g_bootmode_initialized = true;
 }
-
