@@ -2111,7 +2111,20 @@ namespace ps2recomp
 
     bool PS2Recompiler::writeToFile(const std::string &path, const std::string &content)
     {
-        std::ofstream file(path);
+        // G652: regeneration is a content transform. Preserve timestamps for unchanged output so
+        // a two-function instrumentation change does not force every generated TU to rebuild.
+        {
+            std::ifstream existing(path, std::ios::binary);
+            if (existing)
+            {
+                std::string current((std::istreambuf_iterator<char>(existing)),
+                                    std::istreambuf_iterator<char>());
+                if (current == content)
+                    return true;
+            }
+        }
+
+        std::ofstream file(path, std::ios::binary | std::ios::trunc);
         if (!file)
         {
             std::cerr << "Failed to open file for writing: " << path << std::endl;

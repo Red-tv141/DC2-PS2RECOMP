@@ -1165,6 +1165,13 @@ namespace ps2recomp
             ss << "#endif\n";
         }
         ss << "void " << sanitizedName << "(uint8_t* rdram, R5900Context* ctx, PS2Runtime *runtime) {\n";
+        // G652 P2: isolate the two vblank-poll functions from useful EE work. The scope is
+        // re-created on every resumable invocation, so an unwind/re-entry (including host-thread
+        // migration) measures only the CPU chunk actually executed on that host thread.
+        if (function.start == 0x001412A0u || function.start == 0x00141310u)
+        {
+            ss << "    Ps2EeWaitScope __g652EeWaitScope;\n";
+        }
         ss << "#ifdef PS2_FUNCTION_LOG_TRACKER\n";
         ss << "    PS_LOG_ENTRY(\"" << sanitizedName << "\");\n";
         ss << "#endif\n";
