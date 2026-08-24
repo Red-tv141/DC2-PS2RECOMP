@@ -481,9 +481,10 @@ static void g59_frame_draw_tailcall_fix(uint8_t *rdram, R5900Context *ctx, PS2Ru
     uint32_t postSp = sp;
     uint32_t postRa = ra;
 
-    if (slot != 0u && slot != 0x001387F0u && runtime->hasFunction(slot))
+    auto targetFn = (slot != 0u && slot != 0x001387F0u)
+        ? (runtime->hasFunction(slot) ? runtime->lookupFunction(slot) : nullptr) : nullptr;
+    if (targetFn)
     {
-        auto targetFn = runtime->lookupFunction(slot);
         ctx->pc = slot;
         targetFn(rdram, ctx, runtime);
         called = true;

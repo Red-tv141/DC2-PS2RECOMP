@@ -1,6 +1,8 @@
 #include "ps2_runtime.h"
 #include "register_functions.h"
 #include "games_database.h"
+#include "lib/ps2_runtime_parts/dc2_logger.inc"
+#include "lib/ps2_runtime_parts/dc2_crash_reporter.inc"
 
 #ifdef _DEBUG
 #include "ps2_log.h"
@@ -15,36 +17,6 @@
 
 namespace
 {
-    void setupTerminateLogger() // to help on release build crashs
-    {
-        std::set_terminate([]()
-                           {
-                               std::cerr << "[terminate] unhandled exception" << std::endl;
-                               const std::exception_ptr ep = std::current_exception();
-                               if (ep)
-                               {
-                                   try
-                                   {
-                                       std::rethrow_exception(ep);
-                                   }
-                                   catch (const std::system_error &e)
-                                   {
-                                       std::cerr << "[terminate] std::system_error code=" << e.code().value()
-                                                 << " category=" << e.code().category().name()
-                                                 << " message=" << e.what() << std::endl;
-                                   }
-                                   catch (const std::exception &e)
-                                   {
-                                       std::cerr << "[terminate] std::exception: " << e.what() << std::endl;
-                                   }
-                                   catch (...)
-                                   {
-                                       std::cerr << "[terminate] non-std exception" << std::endl;
-                                   }
-                               }
-                               std::abort(); });
-    }
-
     std::string normalizeGameId(const std::string &folderName)
     {
         std::string result = folderName;
@@ -67,11 +39,9 @@ namespace
     {
         if (argc >= 2 && argv[1] && argv[1][0] != '\0')
         {
-            std::cout << "Using argv boot path" << std::endl;
             return std::filesystem::path(argv[1]);
         }
 #if defined(PS2X_DEFAULT_BOOT_ELF)
-        std::cout << "Using default boot file" << std::endl;
         const std::filesystem::path configuredPath = std::filesystem::path(PS2X_DEFAULT_BOOT_ELF);
 #if defined(PLATFORM_VITA)
         return configuredPath;
@@ -89,10 +59,14 @@ namespace
 
 int main(int argc, char *argv[])
 {
-    setupTerminateLogger();
+    dc2_log::init("logs");
+    dc2_log::setCurrentThreadName("MainThread");
+    dc2_crash::installCrashReporter();
 
     try
     {
+        dc2_crash::checkTestCrashTrigger();
+
         std::filesystem::path pathObj = getExecutablePath(argc, argv);
 
         std::string filePathStr = pathObj.string();
@@ -113,10 +87,35 @@ int main(int argc, char *argv[])
             windowTitle += elfName;
         }
 
+        dc2_log::StartupConfig startupCfg{};
+        startupCfg.gameTitle = gameName ? gameName : "Dark Cloud 2";
+        startupCfg.elfName = elfName.c_str();
+#if defined(_DEBUG)
+        startupCfg.buildType = "Debug";
+#else
+        startupCfg.buildType = "Release";
+#endif
+#if defined(_MSC_VER)
+        startupCfg.compiler = "MSVC (x64)";
+#elif defined(__clang__)
+        startupCfg.compiler = "Clang (x64)";
+#elif defined(__GNUC__)
+        startupCfg.compiler = "GCC (x64)";
+#endif
+        startupCfg.resolutionW = 640;
+        startupCfg.resolutionH = 448;
+        startupCfg.isFullscreen = false;
+        startupCfg.isVSync = true;
+        startupCfg.isMtvu = (std::getenv("DC2_G297_NO_MTVU") == nullptr);
+        startupCfg.isMtgs = (std::getenv("DC2_G150_NO_MTGS") == nullptr);
+        startupCfg.isProfiler = (std::getenv("DC2_PROFILE") != nullptr);
+        startupCfg.dataPath = filePathStr.c_str();
+        dc2_log::logStartupSummary(startupCfg);
+
         PS2Runtime runtime;
         if (!runtime.initialize(windowTitle.c_str()))
         {
-            std::cerr << "Failed to initialize PS2 runtime" << std::endl;
+            LOG_ERROR(Runtime, "Failed to initialize PS2 runtime");
             return 1;
         }
 
@@ -124,7 +123,7 @@ int main(int argc, char *argv[])
 
         if (!runtime.loadELF(filePathStr))
         {
-            std::cerr << "Failed to load ELF file: " << filePathStr << std::endl;
+            LOG_ERROR(Runtime, "Failed to load ELF file: %s", filePathStr.c_str());
             return 1;
         }
 
@@ -133,19 +132,23 @@ int main(int argc, char *argv[])
 #ifdef _DEBUG
         ps2_log::print_saved_location();
 #endif
+        dc2_log::flush();
+        dc2_log::shutdown();
         std::cout.flush();
         std::cerr.flush();
         std::_Exit(0);
     }
     catch (const std::exception &e)
     {
-        std::cerr << "[main] fatal exception: " << e.what() << std::endl;
+        LOG_FATAL(Runtime, "[main] fatal exception: %s", e.what());
     }
     catch (...)
     {
-        std::cerr << "[main] fatal exception: unknown" << std::endl;
+        LOG_FATAL(Runtime, "[main] fatal exception: unknown");
     }
 
+    dc2_log::flush();
+    dc2_log::shutdown();
     std::cout.flush();
     std::cerr.flush();
     std::_Exit(1);

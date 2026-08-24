@@ -108,6 +108,20 @@ static void g598_capture_on_script_frame(uint32_t n, PS2Runtime *runtime)
 
 static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
+    if (g652CriticalTraceOn)
+    {
+        // G653 P4: bracket the EE command-generation span. mgEndFrame is the only guest-side frame
+        // edge the runtime owns, so "EE end of frame N" is here, and "EE begin of frame N+1" is the
+        // instant after the aggregator rolls the frame index. Without this pair the trace showed
+        // when each consumer ran but never when its producer finished, so a consumer's handoff gap
+        // could not be split into scheduling delay versus waiting on EE (kinds 40/41/42).
+        static uint32_t s_g653CritFrame = 0u;
+        g652CriticalTrace(42u, static_cast<uint64_t>(s_g653CritFrame));
+        g652CriticalFrameEnd();
+        ++s_g653CritFrame;
+        g652CriticalTrace(40u, static_cast<uint64_t>(s_g653CritFrame));
+        g652CriticalTrace(41u, static_cast<uint64_t>(s_g653CritFrame));
+    }
     // PHASE F30: green clear behind env-var gate. Default OFF so real title pixels survive.
     // Set $env:DC2_FORCE_VISIBLE='1' to restore F29 fallback for regression checks.
     static const bool forceVisible = []() {
@@ -186,7 +200,10 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
     static double s_sumFrameMs = 0.0;
     static double s_sumEndFrameMs = 0.0;
     static uint64_t s_lastEeCpuNs = 0ull;
+    static uint32_t s_lastEeThreadId = 0u;
     static double s_sumEeCpuMs = 0.0;
+    static uint64_t s_lastEeWaitCpuNs = 0ull;
+    static double s_sumEeWaitCpuMs = 0.0;
     static uint32_t s_perfWindow = 0u;
     // G141: read the global GS-raster + VU1-run ns accumulators (defined in
     // ps2_gs_rasterizer.cpp / ps2_vu1.cpp, declared at file scope below) to build a
@@ -224,8 +241,22 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
             if (s_g182PerfOn)
             {
                 const uint64_t eeCpuNow = g182ThreadCpuNs();
-                s_sumEeCpuMs += (eeCpuNow - s_lastEeCpuNs) / 1.0e6;
-                s_lastEeCpuNs = eeCpuNow;
+                const uint32_t eeThreadId = g182ThreadId();
+                // GetCurrentThread() can refer to a freshly-created EE host thread across a game
+                // mode transition, so its cumulative CPU clock may legitimately move backwards.
+                // Rebase that sample instead of unsigned-underflowing into a multi-year interval.
+                if (eeCpuNow != 0ull)
+                {
+                    if (s_lastEeThreadId == eeThreadId && s_lastEeCpuNs != 0ull &&
+                        eeCpuNow >= s_lastEeCpuNs)
+                        s_sumEeCpuMs += (eeCpuNow - s_lastEeCpuNs) / 1.0e6;
+                    s_lastEeCpuNs = eeCpuNow;
+                    s_lastEeThreadId = eeThreadId;
+                }
+                const uint64_t eeWaitCpuNow = ps2EeWaitCpuNs();
+                if (eeWaitCpuNow >= s_lastEeWaitCpuNs)
+                    s_sumEeWaitCpuMs += (eeWaitCpuNow - s_lastEeWaitCpuNs) / 1.0e6;
+                s_lastEeWaitCpuNs = eeWaitCpuNow;
             }
             const uint64_t gsNow = g_g141GsRasterNs.load(std::memory_order_relaxed);
             const uint64_t vuNow = g_g141Vu1RunNs.load(std::memory_order_relaxed);
@@ -313,7 +344,11 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
         else
         {
             if (s_g182PerfOn)
+            {
                 s_lastEeCpuNs = g182ThreadCpuNs();
+                s_lastEeThreadId = g182ThreadId();
+                s_lastEeWaitCpuNs = ps2EeWaitCpuNs();
+            }
             s_lastGsNs = g_g141GsRasterNs.load(std::memory_order_relaxed);
             s_lastVu1Ns = g_g141Vu1RunNs.load(std::memory_order_relaxed);
             s_lastVif1Ns = g_g146Vif1Ns.load(std::memory_order_relaxed);
@@ -421,6 +456,12 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                          s_sumGifMs / w,
                          s_sumImageMs / w,
                          s_sumLocalMs / w);
+#if defined(PS2X_G654_DIAG)
+            // G654 P16/P17: the same four layers, EXCLUSIVE of nesting and split per host thread.
+            // The line above is inclusive and thread-summed, which is why its four buckets can
+            // total more than the pole they are being compared against.
+            g654LayerReport(n, s_perfWindow);
+#endif
             // G303: VU1-worker busy time per frame (delta since last window / window frames). Placed
             // alongside GSimage so the pole can be attributed by THREAD (EE / VU1 worker / GS worker),
             // not by a per-bucket table (thread_attribution_trap). Only meaningful when MTVU is on.
@@ -467,10 +508,13 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
             if (s_g182PerfOn)
             {
                 const double eeCpuMs = s_sumEeCpuMs / w;
+                const double eeWaitCpuMs = s_sumEeWaitCpuMs / w;
+                const double eeWorkCpuMs = std::max(0.0, eeCpuMs - eeWaitCpuMs);
                 std::fprintf(stderr,
-                             "[G182:ee] n=%u window=%u busyMs/f=%.2f cpuMs/f=%.2f onCPU=%.0f%%\n",
-                             n, s_perfWindow, avgFrameMs, eeCpuMs,
-                             100.0 * eeCpuMs / std::max(0.001, avgFrameMs));
+                             "[G182:ee] n=%u window=%u busyMs/f=%.2f cpuMs/f=%.2f waitCpuMs/f=%.2f workCpuMs/f=%.2f onCPU=%.0f%% workOnCPU=%.0f%%\n",
+                             n, s_perfWindow, avgFrameMs, eeCpuMs, eeWaitCpuMs, eeWorkCpuMs,
+                             100.0 * eeCpuMs / std::max(0.001, avgFrameMs),
+                             100.0 * eeWorkCpuMs / std::max(0.001, avgFrameMs));
             }
             // ⭐ G651 (ROADMAP P1 objective 2): the dispatch-family counting instrument, printed on
             // the same cadence so its calls/f can be divided into the sampler's percentage share.
@@ -550,6 +594,7 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
             s_sumFrameMs = 0.0;
             s_sumEndFrameMs = 0.0;
             s_sumEeCpuMs = 0.0;
+            s_sumEeWaitCpuMs = 0.0;
             s_sumGsMs = 0.0;
             s_sumVu1Ms = 0.0;
             s_sumVif1Ms = 0.0;

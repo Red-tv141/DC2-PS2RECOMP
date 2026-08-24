@@ -383,8 +383,11 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     runtime.registerFunction(0x001643C0u, f50_7_funcpoint_set_rotation_probe); // F50.7: keep map-script CFuncPoint setter tailcalls resumable
     runtime.registerFunction(0x001643E0u, f50_7_funcpoint_set_position_probe); // F50.7: keep map-script CFuncPoint setter tailcalls resumable
     runtime.registerFunction(0x00143720u, f50_7_mg_active_lighting_probe); // F50.7: keep mgActiveLighting tailcall resumable
-    runtime.registerFunction(0x00160B10u, f50_7_map_draw_probe); // F50.7: keep CMap::Draw tailcall resumable
-    runtime.registerFunction(0x00160B30u, f50_7_map_draw_direct_probe); // F50.7: keep CMap::DrawDirect tailcall resumable
+    // G652 correctness: leave CMap::Draw/DrawDirect on their generated JR-tailcall bodies. The
+    // old synchronous wrappers used a fake ra=0 sentinel. A non-back-edge guest yield escaped
+    // that C++ call at pc=0x137104, so the wrapper lost its continuation and later resumed
+    // DrawSub@0x1b4340 with the fake saved ra. The generated five-instruction bodies preserve the
+    // original guest RA and tail-dispatch through ctx->pc, so every yield remains resumable.
     runtime.registerFunction(0x0015E3D0u, g56_mapparts_draw_tap);   // G56 Draw__9CMapParts (part vt+0x34) chain tap
     runtime.registerFunction(0x00166A00u, g56_mapparts_predraw_tap);// G56 PreDraw__9CMapParts (part vt+0x40 gate) chain tap
     runtime.registerFunction(0x00166E40u, g56_mappiece_draw_tap);   // G56 Draw__9CMapPiece (piece vt+0x34, geometry emit) chain tap

@@ -52,7 +52,7 @@ static void g58_canary(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
 }
 
 static void g58_canary_map_draw(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-{ g58_canary(rdram, ctx, runtime, "Draw__4CMap@160b10", f50_7_map_draw_probe); }
+{ g58_canary(rdram, ctx, runtime, "Draw__4CMap@160b10", Draw__4CMapFv_0x160b10); }
 static void g58_canary_editmap_drawsub(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 { g58_canary(rdram, ctx, runtime, "DrawSub__8CEditMap@1b4130", DrawSub__8CEditMapFi_0x1b4130); }
 static void g58_canary_map_drawsub(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)

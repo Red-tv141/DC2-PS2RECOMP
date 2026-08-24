@@ -102,8 +102,17 @@ static uint32_t g95_call_mg_send_vu_prog(uint8_t *rdram, R5900Context *ctx, PS2R
     f50_set_reg(ctx, 4, out);
     f50_set_reg(ctx, 5, vuProg);
     f50_set_reg(ctx, 31, 0u);
-    mgSendVuProg__FPUii_0x145e80(rdram, ctx, runtime);
-    const uint32_t words = getRegU32(ctx, 2);
+    // G653 P1 (yield-safe override audit). This site genuinely NEEDS the callee's `$v0`, so it
+    // cannot be a tailcall — the `$ra = 0` sentinel has to stay. What must not stay is a SINGLE
+    // invocation: mgSendVuProg@0x145e80 spills `$ra` into its own frame (`sd ra,0x20(sp)`) and
+    // calls two subroutines, so a yield inside it would later reload the fake 0 and deliver a
+    // naked pc=0 to the dispatcher — the G652 `[dispatch:pc-zero]` mechanism.
+    //
+    // Drive the continuation instead: f50_run_guest_call re-dispatches `ctx->pc` until the guest
+    // actually returns through the sentinel, which is the resume-driving contract SKILL.md §3
+    // prohibition 14 requires whenever a sentinel is unavoidable. (This whole G95 replay body is
+    // default-OFF diagnostic scaffolding, but it is reachable, so it is held to the same rule.)
+    const uint32_t words = f50_run_guest_call(rdram, ctx, runtime, 0x00145E80u);
 
     ctx->r[4] = savedA0;
     ctx->r[5] = savedA1;

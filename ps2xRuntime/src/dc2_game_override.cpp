@@ -10,6 +10,14 @@
 #include "ps2_runtime.h"
 #include "lib/ps2_runtime_parts/dc2_logger.inc"
 #include "lib/ps2_runtime_parts/dc2_crash_reporter.inc"
+// ⭐ G651: the G650/G651 core scheduler is DEFINED here. It needs <windows.h>, which this TU
+// already has through dc2_crash_reporter.inc, and — unlike ps2_gif_arbiter.cpp, where G650 put it —
+// this TU carries no GS-worker hot loop. See the note at the removal site for the measurement that
+// motivated the move (GS own +0.545/+0.820 from layout alone).
+// MSBuild does not reliably rebuild a .cpp when only an included .inc changed (the G359 trap), so
+// this marker must be touched whenever g650_thread_affinity.inc is edited.
+// g650_thread_affinity.inc revision: 3 (G651 adaptive topology + moved out of the GS worker's TU)
+#include "lib/ps2_runtime_parts/g650_thread_affinity.inc"
 #include "ps2_frame_dump.h"
 #include <cstdio>
 #include <cstdlib>
@@ -46,9 +54,12 @@ static uint64_t g182ThreadCpuNs()
     const uint64_t u = ((uint64_t)ut.dwHighDateTime << 32) | ut.dwLowDateTime;
     return (k + u) * 100ull; // FILETIME is 100 ns units -> ns
 }
+static uint32_t g182ThreadId() { return static_cast<uint32_t>(GetCurrentThreadId()); }
 #else
 static uint64_t g182ThreadCpuNs() { return 0ull; }
+static uint32_t g182ThreadId() { return 0u; }
 #endif
+#include "lib/ps2_critical_trace_api.inc"
 
 // G503: the FOURTH derivative probe's arm selector (g419_ab_instrument.inc, the rasterizer TU) and
 // the EE-thread instance of the G446 host PC sampler (g446_gsworker_pcsample.inc, the gif-arbiter
@@ -60,6 +71,7 @@ extern void g503RegisterEeThread();
 // ps2_runtime_parts/runtime_init_and_signals.inc. Declared at GLOBAL scope, above the anonymous
 // namespace, so it binds to the external symbol (appendix-dc2-project.md §3's linkage trap).
 extern void g651DispatchReport(unsigned long long presents);
+extern uint64_t ps2EeWaitCpuNs();
 
 // G183: statistical PC-sampling profiler. G182 found EE is 90-99% on-CPU with 92-93% of
 // that time inside the single mgEndFrame call -- but mgEndFrame is translated GUEST code
@@ -146,6 +158,13 @@ static void g183SamplerThreadMain()
 extern void (*g_g7_poll_live_pad_hook)();
 extern void (*g_g55_title_draw_probe_hook)(uint8_t *rdram);
 extern bool (*g_f66_drive_dungeon_pad_hook)(uint32_t);
+
+#if defined(PS2X_G654_DIAG)
+// G654 P16/P17: the exclusive, thread-keyed layer reporter, defined in the cold TU
+// ps2_g654_layerdiag.cpp. Declared HERE at global scope, above the anonymous namespace, or it would
+// bind to an internal-linkage entity and fail to link (the G568/G604 linkage lesson).
+void g654LayerReport(unsigned int n, unsigned int window);
+#endif
 
 // G141: perf ns accumulators, defined in ps2_gs_rasterizer.cpp / ps2_vu1.cpp (external linkage).
 extern std::atomic<uint64_t> g_g141GsRasterNs;
@@ -277,6 +296,7 @@ extern void DrawEffect__4CMapFv_0x15e3f0(uint8_t* rdram, R5900Context* ctx, PS2R
 // the runner; this probe tells whether the title map's config script dispatches WATER_VERTEX at all.
 extern void cfgWATER_VERTEX__FP9SPI_STACKi_0x1648f0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 // G58: remaining links of the title geometry-queue chain (wrapped by the g58 $ra-canary).
+extern void Draw__4CMapFv_0x160b10(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void DrawSub__8CEditMapFi_0x1b4130(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void DrawSub__4CMapFi_0x15e250(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void DrawSub__9CMapPartsFi_0x166a70(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);

@@ -202,27 +202,33 @@ static void f50_7_funcpoint_setter_probe(uint8_t *rdram, R5900Context *ctx, PS2R
 
     f50_7_copy_vec4(rdram, self + storeOff, vec);
 
-    const auto savedRa = ctx->r[31];
     f50_set_reg(ctx, 4, frame);
     f50_set_reg(ctx, 5, vec);
-    f50_set_reg(ctx, 31, 0u);
 
-    PS2Runtime::RecompiledFunction targetFn = fallbackFn;
+    // G653 P1 (yield-safe override audit). The three guest setters this probe stands in for
+    // (SetScale@1643a0 / SetRotation@1643c0 / SetPosition@1643e0) all END in `jr $t9` after the
+    // vec4 store — a genuine TAILCALL, not a call. The pre-G653 body emulated it as a synchronous
+    // call under a fake `$ra = 0` sentinel plus an unconditional `ctx->pc = ra` afterwards, which
+    // is the exact contract that produced the G652 `dungeon1 n=181` `[dispatch:pc-zero]`: back-edge
+    // preemption suppression only covers back edges, and any OTHER guest yield (wait, syscall,
+    // explicit scheduler handoff) inside an arbitrary subclass override still escaped with the
+    // fake sentinel live, after which the post-call `ctx->pc = ra` destroyed the resume PC.
+    //
+    // Reproduce the original instruction instead: leave $ra as the REAL caller's return address,
+    // publish $t9 the way `lw $t9,0x28($t9)` does, and hand the target to the dispatcher. This is
+    // byte-for-byte the shape the recompiler emits for `jr $t9`, so a yield anywhere inside the
+    // target is now indistinguishable from a yield in ordinary guest code. No sentinel exists to
+    // expose, and no preemption suppression is needed (SKILL.md §3 prohibition 14).
     if (slot != 0u && runtime->hasFunction(slot))
-        targetFn = runtime->lookupFunction(slot);
-    // G212 (audit, G186 bug class): the vtable slot target is arbitrary guest code; if it
-    // contains a back-edge preemption checkpoint, the unconditional ctx->pc = ra below
-    // would swallow the yield (the mgCObject fallbacks are checkpoint-free, but a subclass
-    // override need not be). Suppress preemption for the emulated call, like G186.
-    static const bool s_g212NoPreemptFix = dc2_env_flag_enabled("DC2_G212_NO_PREEMPTFIX");
-    if (!s_g212NoPreemptFix)
-        g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
-    targetFn(rdram, ctx, runtime);
-    if (!s_g212NoPreemptFix)
-        g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
+    {
+        f50_set_reg(ctx, 25, slot);
+        ctx->pc = slot;
+        return;
+    }
 
-    ctx->r[31] = savedRa;
-    ctx->pc = ra;
+    // Unregistered slot: fall back to the mgCObject body by direct call, still WITHOUT a sentinel
+    // and WITHOUT any post-call pc/$ra mutation, so the callee's own tail owns the continuation.
+    fallbackFn(rdram, ctx, runtime);
 }
 
 static void f50_7_funcpoint_set_scale_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -267,85 +273,45 @@ static void f50_7_mg_active_lighting_probe(uint8_t *rdram, R5900Context *ctx, PS
 
     dc2_write_u32(rdram, gp - 0x77E0u, 1u);
 
-    const auto savedRa = ctx->r[31];
     f50_set_reg(ctx, 4, 0x00380EC0u);
     f50_set_reg(ctx, 5, lightNo);
     f50_set_reg(ctx, 6, active);
-    f50_set_reg(ctx, 31, 0u);
-    // G212 (audit hit, G186 bug class): ActiveLighting@0x139120 has back-edge preemption
-    // checkpoints; a yield here would be swallowed by the unconditional ctx->pc = ra below
-    // (half-executed lighting call, resume lost). Suppress preemption for the emulated
-    // call, exactly like the G186 fix for the Draw__4CMap override. Kill: DC2_G212_NO_PREEMPTFIX=1.
-    static const bool s_g212NoPreemptFix = dc2_env_flag_enabled("DC2_G212_NO_PREEMPTFIX");
-    if (!s_g212NoPreemptFix)
-        g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
-    ActiveLighting__13mgRENDER_INFOFii_0x139120(rdram, ctx, runtime);
-    if (!s_g212NoPreemptFix)
-        g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
 
-    ctx->r[31] = savedRa;
-    ctx->pc = ra;
-}
-
-static void f50_7_map_draw_tailfix_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime,
-                                         const char *tag, uint32_t directFlag)
-{
-    static uint32_t calls = 0u;
-    const uint32_t n = ++calls;
-    const uint32_t self = getRegU32(ctx, 4);
-    const uint32_t ra = getRegU32(ctx, 31);
-    const uint32_t vt = self ? dc2_read_u32(rdram, self + 0x0D00u) : 0u;
-    const uint32_t slot = vt ? dc2_read_u32(rdram, vt + 0x08u) : 0u;
-
-    if (f50_7_trace_selected_map_enabled() && f50_6_debug_menu_enabled() && n <= 128u)
+    // G653 P1 (yield-safe override audit). mgActiveLighting@0x143720 is five instructions and its
+    // last one is `j 0x00139120` — a TAILCALL. The pre-G653 body emulated it as a synchronous call
+    // behind a fake `$ra = 0` plus an unconditional `ctx->pc = ra`, which needed G212 back-edge
+    // preemption suppression to be even approximately safe and still left every NON-back-edge yield
+    // inside ActiveLighting able to escape with the sentinel live (SKILL.md §3 prohibition 14, and
+    // the mechanism behind the G652 `[dispatch:pc-zero]` incident).
+    //
+    // Delegate as the real jump instead: $ra keeps the caller's return address, so ActiveLighting
+    // returns straight past us and a yield inside it carries an ordinary resume PC. This also
+    // DELETES the suppression window — the lighting call is now preemptible exactly as on hardware.
+    if (runtime->hasFunction(0x00139120u))
     {
-        std::fprintf(stderr,
-                     "[F50.7:tailfix] tag=%s n=%u self=0x%x direct=%u ra=0x%x vt=0x%x slot=0x%x\n",
-                     tag, n, self, directFlag, ra, vt, slot);
-    }
-
-    if (slot == 0u || !runtime->hasFunction(slot))
-    {
-        ctx->pc = slot;
+        ctx->pc = 0x00139120u;
         return;
     }
-
-    const auto savedRa = ctx->r[31];
-    f50_set_reg(ctx, 4, self);
-    f50_set_reg(ctx, 5, directFlag);
-    f50_set_reg(ctx, 31, 0u);
-    // G186 FIX (root cause of Known Issue #3, the 0xe3dc70/0x1dd8260 "Function not
-    // found" level-load crashes): the ra=0 sentinel contract below is only safe if the
-    // emulated call runs to completion in ONE invocation. If the draw chain back-edge
-    // yields (shouldPreemptGuestExecution) mid-call, this probe's C++ frame unwinds and
-    // prematurely restores ra; the resumed chain later reloads the fake ra=0 saved in
-    // DrawSub's own guest frame, the naked pc=0 reaches the dispatcher, and pc-zero
-    // recovery re-enters a mid-function pc WITHOUT restoring $sp — the resumed code then
-    // runs ~0x500 deep into live frames, corrupting saved-$ra slots (the garbage values
-    // 0xe3dc70 / 0x1dd8260 / stack addresses seen as "missing functions"). Same hazard
-    // class G57 fixed for the title draw, same fix: suppress back-edge preemption for
-    // the duration of the emulated call. Kill-switch: DC2_G186_NO_PREEMPTFIX=1.
-    static const bool s_g186NoPreemptFix = (std::getenv("DC2_G186_NO_PREEMPTFIX") != nullptr);
-    if (!s_g186NoPreemptFix)
-        g_dc2PreemptSuppressDepth.fetch_add(1, std::memory_order_relaxed);
-    runtime->lookupFunction(slot)(rdram, ctx, runtime);
-    if (!s_g186NoPreemptFix)
-        g_dc2PreemptSuppressDepth.fetch_sub(1, std::memory_order_relaxed);
-
-    const uint32_t postPc = ctx->pc;
-    ctx->r[31] = savedRa;
-    ctx->pc = (postPc == 0u) ? ra : postPc;
+    ctx->pc = 0x00139120u;
+    ActiveLighting__13mgRENDER_INFOFii_0x139120(rdram, ctx, runtime);
 }
 
-static void f50_7_map_draw_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-{
-    f50_7_map_draw_tailfix_probe(rdram, ctx, runtime, "Draw@160b10", 0u);
-}
-
-static void f50_7_map_draw_direct_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
-{
-    f50_7_map_draw_tailfix_probe(rdram, ctx, runtime, "DrawDirect@160b30", 1u);
-}
+// ---------------------------------------------------------------------------
+// ⛔ REMOVED IN G653 P1 — DO NOT RESURRECT: `f50_7_map_draw_tailfix_probe` and its two wrappers
+// (`Draw__4CMap@0x160b10`, `DrawDirect__4CMap@0x160b30`).
+//
+// Both guest functions are three-instruction `lw $t9 / lw $t9 / jr $t9` TAILCALLS. The probe
+// emulated them as synchronous calls behind a fake `$ra = 0` sentinel. G186 patched the
+// back-edge half of the resulting hazard with preemption suppression, but suppression only
+// covers back edges: in G652 a NON-back-edge guest yield escaped the emulated call with the
+// sentinel still live and produced the deterministic `dungeon1 n=181` `[dispatch:pc-zero]`.
+// The registrations were dropped then, leaving these bodies unreferenced.
+//
+// The fix is structural, not a flag: 0x160b10 / 0x160b30 stay on their GENERATED `jr $t9`
+// bodies, which set `ctx->pc` and return so the dispatcher owns the continuation. Anything that
+// needs to observe those calls must do so without taking over the continuation — wrap the
+// TARGET, or read state at a separate registered site. See SKILL.md §3 prohibition 14.
+// ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
 // PHASE G56: trace the main-title map per-part/per-piece geometry submission.
