@@ -36,7 +36,7 @@ Each row: reference dump → exact input route → harness → re-check triggers
 | `debug_menu.{gs,png}` | Debug menu → Down×2 → Down → Confirm (`DrawSub__8CEditMapFi@0x001B4130`) | `tools/run_30s_diagnose.ps1`<br>`DC2_DEBUG_MENU=1` | Preemption unwind (`g_dc2PreemptSuppressDepth`), vtable draw chain (G396) |
 | `map_15.{gs,png}` | Down@57 → R1@114 → Right×5 @187/243/296/351/404 → Circle@444 → MAP 15, then a scripted **moving-camera cutscene** (~f=449–2129) | `tools/run_g536_map15.ps1`<br>gate `tools/g596_skybroken.py <tag>` (⛔ **not** `g536_detect.py` alone)<br>cross-arm: **`-SfDump`** + `tools/g598_pair.py` (§3.2b, `appendix-dc2-capture-and-gates.md`) | **GPU-resident RTT publication ownership** (`g261Materialize`, `genAtSkip`, G264 mirror), texture-in-RTT-window aliasing (G536), 0x139-residency sky defect (G598) |
 
-| *(no reference dump yet)* | **`route13-heavy-new`** — recorded by the user 2026-08-22. Sleeping-dragon tent cutscene: `Down ×5 → Circle → Right ×9 → Down ×5 → Circle` into the map, then ~180 Cross taps through a long dialogue; 4,417 scriptFrames, then a **STATIC tail** | `tools/g525_route.ps1 -Route dragon` | ⭐⭐⭐ **THE LARGEST GS POLE IN THE SET** (GS own 33.2–33.8 vs VU1 24.0–25.5, headroom **+9.2 ms/f**) and the only content-static steady state. ⛔ Replay NEITHER stick. ⛔ Do NOT bring a CPU-band-replay lever here — see §1.3p |
+| *(no reference dump yet)* | **`route13-heavy-new`** — recorded by the user 2026-08-22. Sleeping-dragon tent cutscene: `Down ×5 → Circle → Right ×9 → Down ×5 → Circle` into the map, then ~180 Cross taps through a long dialogue; 4,417 scriptFrames, then a **STATIC tail** | `tools/g525_route.ps1 -Route dragon` | ⭐⭐⭐ **THE LARGEST GS POLE IN THE SET** (shipped: GS own 29.7–30.4 vs VU1 23.4–23.9, headroom **≈+6.3 ms/f**) and the only content-static steady state. ⛔ Replay NEITHER stick. ⛔ Do NOT bring a CPU-band-replay lever **or an async/ring/command-graph lever** here, and ⚠️ **its arms self-terminate — check every arm's last `frame=`** — see §1.3p |
 
 | *(no reference dump yet)* | **`route11-s03-cutscene`** — recorded by the user 2026-08-16. Stage `map/s/s03`, the Ch.1 forest cutscene (Flotsam's clown boss + Linda + the train wreck): `Circle → Down×5 → Circle → Right×3 → Circle` into the map, then ~30 Cross taps through the dialogue; 4,919 scriptFrames | `tools/g525_route.ps1 -Route s03` | **CPU BAND REPLAY / GPU admission on the DISPLAY buffer.** The only surveyed route whose display batches fall back in bulk (1,062 batches / 18.6 s of replay wall), and the route G603's blend mode 6 was measured on. ⛔ Do NOT replay its left stick (constant keyboard neutral `0x68,0x68`). ⚠️ The live `record_err.txt` is 30 FPS-capped — `run_record.bat` sets no `DC2_PATCH_60FPS` |
 | `s05.{gs,png}` | **`route10-s05-bandage`** — recorded 2026-08-15; last Cross at scriptFrame 6863, after which the cutscene parks on *"Right. Thanks, Master Utan"*, which IS the reference frame | `tools/run_g477_perf.ps1 -PadInput <replay string from plans/g525-routes/route10-s05-bandage.replay.txt>`<br>capture **per PRESENT**: `DC2_FRAME_DUMP=1 DC2_FRAME_DUMP_EVERY=1 DC2_G600_TICK_SF_LO=6900`<br>gate `python tools/g601_band.py <tag>` (find: `g601_flicker.py`) | **ONE-FRAME / ALTERNATING defects** (Monica's hair band, ✅ FIXED by G601; rollback `DC2_G601_NO_EMPTYBIND=1` reproduces it). ⛔ Do NOT replay its left stick. ⛔ `-SfDump` at the default cadence cannot see this class — see §3.2c in `appendix-dc2-capture-and-gates.md` |
@@ -106,7 +106,8 @@ User recording 2026-08-22, preserved as `plans/g525-routes/route13-heavy-new.*`.
 
 | window | frame | GS own | VU1 | EE cpu | verdict |
 |---|---:|---:|---:|---:|---|
-| static tail (sf ≳ 4600, host tick ≳ 2071) | 34.4–35.8 | ⭐ **33.2–33.8** | 24.0–25.5 | 15.6–17.7 | **SOLE GS POLE, headroom +9.2** |
+| static tail, G638 (pre-G637/G639) | 34.4–35.8 | 33.2–33.8 | 24.0–25.5 | 15.6–17.7 | SOLE GS POLE, headroom +9.2 |
+| ⭐ static tail, SHIPPED (post-G637+G639) | **31.8–32.4** | ⭐ **29.7–30.4** | 23.4–23.9 | 14.5–15.1 | **SOLE GS POLE, headroom ≈+6.3** |
 
 ⭐ **Its tail is a STATIC screen** — after the last input the route parks on a dialogue frame. Nothing
 in the content depends on frame rate, so **a speed-changing candidate cannot move it**: this is the
@@ -121,12 +122,39 @@ shadow geometry is re-emitted with different coordinates every frame while the s
 `g570gpubatch` **5.263** + `g570prep` **4.735** vs `poolreplay` **1.611** ms/f — i.e. **~10 ms/f of
 the pole is the G570 0x139 shadow-compute preparation and band round trip**, and the replay every
 phase since G529 has been optimising is 1.6. `[G638:pool]` puts the whole `GSRowPool::run` barrier
-across all seven call sites at **1.84 ms/f**. The GS thread's real wait is the **GL backend future at
-≈9.9 ms/f** (`[G290:probe] gpuOk`, 46.9 synchronous submits/f @ 212 µs, `[G299:backend] q = 8–12 µs`
-so it is GL work, not handoff). ⛔ G637's payoff gate reads **NULL** here (blocks −0.197 / +0.026).
+across all seven call sites at **1.84 ms/f**. ⛔ G637's payoff gate reads **NULL** here
+(blocks −0.197 / +0.026).
+
+⛔⛔⛔ **CORRECTION (G640) — the "GL backend future at ≈9.9 ms/f" in the line above was WRONG.**
+`[G290:probe] gpuOk` brackets the whole successful `g178TryFlushGpu`, not a wait. The pole's real
+blocked half, from `[G447:edge]` on the static tail, is **10.1–10.7 ms/f across five edges**:
+
+| edge | ms/f | n/f | note |
+|---|---:|---:|---|
+| `backend-render` | 3.0 | 49 | ≈1.7 ms/f of GL work behind it |
+| `backend-readcolor` | 2.0 | 6 | blocking `glReadPixels` |
+| `backend-writecolor` | 0.17 | 7 | |
+| `backend-copy` | 0.00 | 1 | |
+| **`backend-other`** | **4.3** | 20 | **one 0x139 GPU compute at ≈4.2**, 19 tiny items at 0.33 total |
+
+and `[G332:gsw] backendMs/f = 8.7–9.3` is the GL worker's own serial GL WORK, so ⭐ **only ≈1.4 ms/f
+of the pole's blocked half is schedulable latency.** ⛔ **Do not bring an async/ring/command-graph
+lever here** — built and refuted in G640 (`DC2_G640_ASYNC`): `blocked` −0.8 but `cpu` +0.9, depth 4
+worse than depth 1 and worse than control. Recipe: `appendix-dc2-attribution-recipes.md` §1.3s.
+
+⚠️⚠️ **THIS ROUTE'S ARMS SELF-TERMINATE.** All four arms of G640's A B B A ended with
+`INFO: Window closed successfully` before their 140 s budget — A1 reached script frame 9153 but
+B1/B2/A2 reached 6097 / 5167 / 4503, collapsing the common window below the static tail's own start.
+Chaining four launches inside one PowerShell process made it worse; single launches reached the deep
+tail every time. **Check every arm's last `[G154:perf] frame=` and the tool's printed
+`common window:` before quoting any gate on `dragon`.**
 
 ⚠️ **8,044 GIF packets/frame** against lean MAP-0's 14 — this route stresses per-packet cost, not
-per-pixel cost. `DC2_G570_NO_GPU_139=1` costs **+2 ms/f**, so the GPU compute is paying for itself.
+per-pixel cost. ⚠️ But they become only **47 render batches/f at ≈1.7 ms/f of GL work**, so a
+draw-coalescing lever can reach 1.7 and no more; the packet count's cost is on the FRONT END
+(`[G147:gif] packet = 30.7 ms/f`). `DC2_G570_NO_GPU_139=1` costs **+2 ms/f**, so the GPU compute is
+paying for itself — its cost is the **blocking 1 MiB `glGetTexImage` readback (2.98 ms)**, not the
+shading (`[G571:gpuwork]`, `DC2_G571_SPLIT=1`).
 
 ### §1.3n ⭐⭐⭐ `dungeon1` — the GS gate route (added G613)
 

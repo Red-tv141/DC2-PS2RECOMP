@@ -143,6 +143,11 @@ unwind path and is NOT yield-safe by default.** Two real instances in one port (
    signatures, one cause).
 
 **Rules:**
+- Back-edge suppression covers only the `shouldPreemptGuestExecution()` checkpoints. It does
+  **not** suppress waits, blocking syscalls, or explicit scheduler handoffs. A measured DC2 case
+  returned from a guarded draw call at `pc=0x137104` with a deep guest stack, then later resumed a
+  parent holding fake `$ra=0`. For a native JR tailcall, the generated `ctx->pc = jumpTarget;
+  return;` body is the safest form because the dispatcher owns every continuation.
 - An override that delegates to a recompiled body must either (a) wrap the call in the
   runtime's preempt-suppression scope (`g_dc2PreemptSuppressDepth`-style ++/-- — the G57/G186
   fix pattern, cheap and proven), or (b) be resume-aware: loop re-dispatching `ctx->pc` until

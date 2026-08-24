@@ -437,3 +437,128 @@ is that bracket's own ±1 px margin on **3.95 covered px/row** slivers. Correcte
 **0.007 ms/f**.
 
 Full evidence: `plans/phase-G639-fix-log.md`.
+
+---
+
+### §1.3s ⭐⭐⭐ How to attribute the pole's BLOCKED half to the BACKEND (added G640) — do this before any async/ring/graph proposal
+
+§1.3h attributes the GS worker's blocked half to an EDGE. This recipe answers the next question:
+**how much of that blocked time is latency you can schedule away, and how much is backend WORK you
+cannot?** It costs two instruments and one run, and it closed a roadmap priority that had carried a
+wrong number for three phases.
+
+**Step 1 — the caller side, per edge.** `DC2_G447_EDGE=1` → `[G447:edge]`. Times every blocking edge
+on the GS worker only. `dragon` static tail, control:
+
+```
+render=3.35/49.0  rdcol=2.14/6.0  wrcol=0.29/7.0  copy=0.01/1.0  other=4.30/20.0
+vu1-collect=0.85/1886  arbiter-relock=0.07/1886  | blocked=10.80 cpu=17.92
+```
+
+**Step 2 — the worker side, per item type.** `DC2_G332_CENSUS=1` → `[G332:gsw] backendMs/f`. This is
+timed INSIDE the GL worker, so it is GL work with no handoff in it: **8.7–9.3 ms/f**.
+
+**Step 3 — subtract.** `10.1–10.8 − 8.7–9.3 ≈ 1.4 ms/f`. ⭐ **That difference is the ENTIRE amount a
+scheduling change can recover.** Everything else is work that must be deleted or moved off the
+thread. If the difference is under the route's noise, the async direction is closed before you write
+a line — which is what G640 measured, and G305/G444/G452/G493 had each measured half of without the
+subtraction.
+
+**Step 4 — the consumer-side bound.** `DC2_G640_OVL=1` → `[G640:ovl]`. Per edge: its own `wait`, the
+runnable CPU that follows before the worker blocks again at depth 1 and 4, and
+`hideK = Σ min(wait_i, gap_i(K))` per item. On `dragon`: `ceilK1=5.46 ceilK4=8.36`.
+⚠️ **Take the MINIMUM of step 4 and step 2.** Step 4 says the CPU exists; step 2 says the backend
+cannot absorb the deferred work. The truth is the smaller one.
+⚠️ `gap` can contain the edge's own CONSUMER (the readback's unpack, the compute's write-back), so
+`hide` is an upper bound except where the epilogue is provably pure bookkeeping.
+
+**Step 5 — split the backend's occupancy by item type**, because that is where the real lever is.
+`[G332:gsw]` + `[G453:other]` + `[G571:gpuwork]`. On `dragon`: **≈77% of the GL worker's serial busy
+is GPU→CPU readback** (a 2.98 ms blocking `glGetTexImage` of one 1 MiB compute result, plus 2.6–2.8
+ms/f of `glReadPixels`). That is a residency/authority phase, not a scheduling phase.
+
+### ⛔ Three traps this recipe exists to avoid
+
+- **`[G290:probe] gpuOk` is NOT a backend wait.** Its clock brackets the whole successful
+  `g178TryFlushGpu` — batch building, materialization, texture decode, the G310 freeze and the
+  colour-window publication. Reading it as the wait produced ROADMAP Priority 1's −9.0 ms/f target;
+  the real render-edge wait is 3.0. Same class as G638's `[G529:disp] wall`.
+- **`[G332:gsw]`'s `render` bucket is a CATCH-ALL.** Its classifier's last branch is `else`, so the
+  0x139 shadow compute lands there and `render = 5.9/48` is really 47 renders at ~36 µs plus one
+  4.2 ms compute. The tell: `[G453:other] total` matched `[G332] other` exactly, so bucket 3 was
+  fully enumerated and the compute had to be in the `else`.
+- **`DC2_G419_AB=norender` cannot price this route.** `[G492:inv]`: `fallback` 0.38/f candidate
+  against 14.44/f control, `other` 13.7 against 1.0 — a skipped render returns `true`, converting a
+  CPU-fallback batch into a "successful" GPU batch, and the corruption is stateful so the control
+  frames drift too. Use the behaviour-pure `[G640:ovl]` instead.
+
+---
+
+### §1.3t ⭐⭐⭐ How to price a READBACK (added G641) — do this before any residency/readback proposal
+
+§1.3s ends at "≈77% of the GL worker's serial busy is GPU→CPU readback". **That number was wrong,
+and this recipe is why.** It costs one flag and one run.
+
+**Step 1 — never price a readback off the lap that contains it.** A synchronous readback call blocks
+on *every* GPU operation queued ahead of it, so its wall time is `queued GPU work + the kernel that
+produced the data + the transfer`, fused. `[G571:gpuwork] read = 2.978 ms` was read as "a 2.98 ms
+blocking `glGetTexImage` of the 512×512 R32UI result" for three phases.
+
+**Step 2 — fence BOTH sides.** `DC2_G641_SHSPLIT=1` → `[G641:sh]`:
+
+```
+[G641:sh] n=240 pre=1.031 comp=1.572 xfer=0.627 MBps=1672     (dragon static tail, 8 windows)
+```
+
+| lap | ms/f | what it is |
+|---|---:|---|
+| `pre` | 1.02 | GL work already in flight — the frame's render draws. Not this item's cost at all. |
+| `comp` | 1.57 | the producing kernel's own execution |
+| `xfer` | **0.63** | the actual transfer, at 1.67–1.72 GB/s |
+
+⛔ **ONE fence is not enough.** After the dispatch only, it reads `drain = 2.44 / xfer = 0.61` and
+charges the compute for 1.02 ms of unrelated render backlog.
+
+**Step 3 — sanity-check the rate.** 1 MiB / 0.63 ms = 1.7 GB/s, matching `[G418:edge]`'s colour
+readback (852 KB / 0.499 ms). ⭐ **If a "readback" implies a bandwidth far below the machine's, it is
+not a transfer — it is a fence.** 1 MiB in 2.98 ms is 352 MB/s; that was the tell.
+
+**Step 4 — split the colour readbacks the same way** (`DC2_G495_RB=1`, which already brackets each
+with `glFinish`). `dragon`: 6 reads/frame, **drain 1.00 / xfer 1.49**.
+
+**Step 5 — the corrected backend split**, and what it means for the lever:
+
+| backend work | ms/f | share |
+|---|---:|---:|
+| GPU→CPU **transfer** | **2.12** | **24%** |
+| GPU **execution** the CPU blocks on | 3.59 | 40% |
+| CPU→GPU **upload** | 0.93 | 10% |
+| render batch issue · views | 2.03 | 23% |
+
+**Step 6 — before reaching for RESIDENCY, read the kernel's own text for an identity region.** The
+0x139 compute early-outs on `first == last` per 16×16 tile and then stores the value it loaded, so
+it is the identity outside its active tiles — and the CPU builds those tile bins *before* the
+submit. `[G641:nec]` (`DC2_G641_NEC=1`) turns that into the necessity classification:
+
+```
+[G641:nec] tiles=264.8/1024 tileFrac=0.259 bboxFrac=0.516 rowFrac=0.688 raggedFrac=0.304
+```
+
+⭐ **Bounding the bytes to the producer's claim needs NO authority change** — guest VRAM stays
+authoritative, so there is no writer enumeration, no coherence policy and no path selection, and
+none of the risk that made G629/G630 close negative. Report the four window shapes side by side: the
+CPU swizzle loops are per-row already so raggedness is free there, while a transfer must stay ONE
+contiguous rectangle.
+
+### ⛔ Two traps this recipe exists to avoid
+
+- **A redundancy census keyed on an exact `(surface, extent)` pair cannot see containment.**
+  `[G495:rb]` reports `redFbp = 0.0%` over 600 reads while `0x139` is read three times per frame at
+  rows `64..511`, `96..511`, `384..511` — the second is a strict SUBSET of the first, issued with
+  `ahead(items=1.0 draws=0 texKB=0)`. `448` and `416` are different keys and never meet.
+- **A lever's gate route is where its MECHANISM fires, not where the pole is largest.**
+  `[G570:gpu139]`: 0.298 shadow batches/script-frame on `dragon` against 0.0087 on `ridepod`. The
+  `ridepod` A B B A of a 0x139 lever reads NULL by construction (ceiling ≈0.02 ms/f against a ±0.5
+  block spread) — it is that lever's PIXEL gate, not its timing gate.
+
+Full evidence: `plans/phase-G641-fix-log.md`.
