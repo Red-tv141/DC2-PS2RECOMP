@@ -15,6 +15,27 @@
 
 #include "ps2_runtime.h"
 
+// G652 P2/P16: helpers used by generated code. Their bodies live in the runtime library so
+// generated translation units keep only the tiny hot-path wrappers here.
+void ps2EeWaitScopeEnter();
+void ps2EeWaitScopeExit();
+PS2Runtime::RecompiledFunction ps2TryRegisteredFunctionFast(PS2Runtime *runtime, uint32_t address);
+PS2Runtime::RecompiledFunction ps2LookupFunctionFast(PS2Runtime *runtime, uint32_t address);
+PS2Runtime::RecompiledFunction ps2TryRegisteredFunctionRuntimeFast(PS2Runtime *runtime, uint32_t address);
+PS2Runtime::RecompiledFunction ps2LookupFunctionRuntimeFast(PS2Runtime *runtime, uint32_t address);
+inline const bool g_ps2EeWorkStat = (std::getenv("DC2_G182_EE_STAT") != nullptr);
+
+class Ps2EeWaitScope
+{
+public:
+    Ps2EeWaitScope() : m_active(g_ps2EeWorkStat) { if (m_active) ps2EeWaitScopeEnter(); }
+    ~Ps2EeWaitScope() { if (m_active) ps2EeWaitScopeExit(); }
+    Ps2EeWaitScope(const Ps2EeWaitScope &) = delete;
+    Ps2EeWaitScope &operator=(const Ps2EeWaitScope &) = delete;
+private:
+    bool m_active;
+};
+
 static inline int32_t Ps2ExtractEpi32(__m128i v, int index)
 {
     switch (index & 3)

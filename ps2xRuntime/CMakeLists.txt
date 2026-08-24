@@ -8,6 +8,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(PS2X_ENABLE_RUNNER_UNITY_BUILD "Build ps2EntryRunner with CMake unity build" ON)
 set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 8 CACHE STRING "Unity build batch size for ps2EntryRunner")
 option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
+option(PS2X_G652_CRITICAL_TRACE "Compile the G652 cross-thread critical-path trace" OFF)
+option(PS2X_G653_POOLDIAG "Compile the G653 cooperative-dispatch census and spin prototype" OFF)
+# G654 P5: the G629-G636 persistent GPU-resident GS domain prototype. CLOSED NEGATIVE ON
+# PERFORMANCE and default-OFF at runtime, but 8.52% of ps2_gs_rasterizer.cpp's machine code - and
+# rule 12c says compiled-but-never-executed code in a hot TU is not free. OFF compiles the
+# constant-folding stubs in g654_stub_gpudomain.inc / g654_stub_g629.inc instead.
+option(PS2X_G654_GPUDOMAIN "Compile the G629-G636 persistent GS domain prototype" OFF)
+# G654 P16/P17: the exclusive, thread-keyed layer timer. `[G146:perf]`'s four buckets are inclusive,
+# nested (GIFsubmit sits INSIDE VIF1) and summed across threads, which is how `fight:rain` produced a
+# NEGATIVE 8.71 ms/f residue against its own pole. This build mode adds the non-overlapping,
+# per-thread companion. Diagnostic only - never in a timing arm.
+option(PS2X_G654_DIAG "Compile the G654 exclusive per-thread layer timer" OFF)
 
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
@@ -310,6 +322,9 @@ add_library(ps2_runtime STATIC
     src/lib/ps2_memory.cpp
     src/lib/ps2_pad.cpp
     src/lib/ps2_runtime.cpp
+    src/lib/ps2_runtime_cold.cpp
+    src/lib/ps2_gif_sequence_cold.cpp
+    src/lib/ps2_gif_arbiter_trace_cold.cpp
     src/lib/ps2_stubs.cpp
     src/lib/ps2_syscalls.cpp
     src/lib/ps2_vif1_interpreter.cpp
@@ -328,6 +343,52 @@ file(GLOB_RECURSE KERNEL_SRC_FILES CONFIGURE_DEPENDS
 target_sources(ps2_runtime PRIVATE
     ${KERNEL_SRC_FILES}
 )
+
+# G652 P15: the trace is a diagnostic build mode.  In the default build the shared API include
+# exposes constexpr-false inline stubs, so no global load or conditional remains in the VU, GS,
+# GL, or frame-end hot paths.  Limit the opt-in definition to the four participating TUs.
+# G653 P7/P29/P25: the cooperative-dispatch census and the spin-dispatch prototype are a DIAGNOSTIC
+# BUILD MODE, not runtime flags. An order-balanced A B B A measured the runtime-flagged version of
+# the very same code — default-OFF, behaviour identical — at +0.484 ms/f on `dragon` purely because
+# the BYTES were in ps2_gs_rasterizer.cpp (PS2_PROJECT_STATE.md rule 12b). A `const bool` guard
+# cannot buy that back; only excluding the code can.
+if(PS2X_G653_POOLDIAG)
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_g653_pool_census.cpp)
+    set_source_files_properties(
+        src/lib/ps2_gs_rasterizer.cpp
+        PROPERTIES COMPILE_DEFINITIONS "PS2X_G653_POOLDIAG=1"
+    )
+endif()
+
+if(PS2X_G654_GPUDOMAIN)
+    # APPEND, not set: PS2X_G653_POOLDIAG above already writes COMPILE_DEFINITIONS on this same
+    # source file, and a plain set_source_files_properties would silently drop it.
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp
+                 APPEND PROPERTY COMPILE_DEFINITIONS "PS2X_G654_GPUDOMAIN=1")
+endif()
+
+if(PS2X_G654_DIAG)
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_g654_layerdiag.cpp)
+    foreach(_g654src
+            src/lib/ps2_gs_gpu.cpp
+            src/lib/ps2_gs_rasterizer.cpp
+            src/lib/ps2_memory.cpp
+            src/lib/ps2_vif1_interpreter.cpp
+            src/dc2_game_override.cpp)
+        set_property(SOURCE ${_g654src} APPEND PROPERTY COMPILE_DEFINITIONS "PS2X_G654_DIAG=1")
+    endforeach()
+endif()
+
+if(PS2X_G652_CRITICAL_TRACE)
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_critical_trace.cpp)
+    set_source_files_properties(
+        src/lib/ps2_runtime.cpp
+        src/lib/ps2_gif_arbiter.cpp
+        src/lib/ps2_gs_gpu_raster.cpp
+        src/dc2_game_override.cpp
+        PROPERTIES COMPILE_DEFINITIONS "PS2X_G652_CRITICAL_TRACE=1"
+    )
+endif()
 
 file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
