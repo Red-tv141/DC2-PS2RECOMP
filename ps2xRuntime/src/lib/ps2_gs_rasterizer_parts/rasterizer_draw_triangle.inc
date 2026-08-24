@@ -813,7 +813,6 @@ void GSRasterizer::drawTriangle(GS *gs)
                     fx0, fy0, fx1, fy1, fx2, fy2, v0.q, v1.q, v2.q);
         }
     }
-
     static const bool s_g195FgTrace = envFlagEnabled("DC2_G195_FG_TRACE");
     if ((g268LiveEnvRead() ? envFlagEnabled("DC2_G195_FG_TRACE") : s_g195FgTrace) &&
         gs->m_vram &&

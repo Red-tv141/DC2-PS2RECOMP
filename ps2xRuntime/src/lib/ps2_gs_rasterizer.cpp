@@ -266,6 +266,10 @@ extern std::atomic<uint32_t> g_dc2ScriptFrame;
 // beyond relaxed: a target is admitted before any batch of it can be submitted.
 std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 
+// G654 P16: exclusive layer timer. Empty struct with an empty constructor in the default build -
+// no global load, no branch, no byte in this (the hottest) TU. Real only under -DPS2X_G654_DIAG=ON.
+#include <chrono>
+#include "ps2_g654_layer_api.inc"
 #include "ps2_gs_rasterizer_parts/rasterizer_headers_and_diagnostics.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_g214_cap_trace.inc"
@@ -327,7 +331,15 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // is ambiguous) and PRECEDE rasterizer_gpu_alias_page_view.inc (the g261Materialize publish order)
 // and rasterizer_vram_materialization.inc (the uploadFb seed). The predicates themselves live in
 // g636_authority_arbitration.inc, inside g630_gpu_domain.inc, because they use its page helpers.
+// G654 P5: the whole G629-G636 persistent-GS-domain prototype is a COMPILE-TIME build mode, not a
+// runtime flag. It is CLOSED NEGATIVE ON PERFORMANCE and default-OFF, and it is 121,285 bytes /
+// 8.52% of this TU's machine code - the very thing rule 12c (G653 P25) says cannot be bought back
+// with a `const bool`. Build with -DPS2X_G654_GPUDOMAIN=ON to restore it verbatim.
+#if defined(PS2X_G654_GPUDOMAIN)
 #include "ps2_gs_rasterizer_parts/g636_arb_flags.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g654_stub_gpudomain.inc"
+#endif
 
 #include "ps2_gs_rasterizer_parts/g345_closure.inc"
 
@@ -454,7 +466,9 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 #include "ps2_gs_rasterizer_parts/g623_producer_surface.inc"
 // G630 reuses G623's exact tap-window proof, so it follows that unit and precedes every
 // materialization/texture-consumer call site it extends.
+#if defined(PS2X_G654_GPUDOMAIN)   // G654 P5 - see the note at g636_arb_flags.inc above
 #include "ps2_gs_rasterizer_parts/g630_gpu_domain.inc"
+#endif
 
 #include "ps2_gs_rasterizer_parts/rasterizer_vram_materialization.inc"
 
@@ -521,7 +535,11 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // MUST precede rasterizer_tilebin_capture.inc, whose post-pool site is its only call site. It sits
 // BEFORE rasterizer_setup_and_perf_census.inc, which is a FRAGMENT OF drawPrimitive's BODY and
 // cannot contain a namespace.
+#if defined(PS2X_G654_GPUDOMAIN)   // G654 P5 - see the note at g636_arb_flags.inc above
 #include "ps2_gs_rasterizer_parts/g629_gpu_band_replay.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g654_stub_g629.inc"
+#endif
 
 #include "ps2_gs_rasterizer_parts/rasterizer_setup_and_perf_census.inc"
 
@@ -589,7 +607,9 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // helpers — all of which are defined AFTER that point. The entry points are forward-declared there
 // and defined here, in the same anonymous namespace and the same TU, exactly as
 // g529_replay_dispatch.inc already forward-declares the G570/G580 batch functions.
+#if defined(PS2X_G654_GPUDOMAIN)   // G654 P5 - see the note at g636_arb_flags.inc above
 #include "ps2_gs_rasterizer_parts/g629_gpu_kernel.inc"
+#endif
 
 // G614 revision: 1 — the SPRITE twin of G609's stage decomposition. `dungeon1` (G613) is 99.8%
 // sprites and 67.04% of its replay cycles are ONE PSMT8/bilinear `discov sprite` shape family, so

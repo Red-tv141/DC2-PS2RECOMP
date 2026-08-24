@@ -15,7 +15,7 @@
 // MSBuild does not reliably rebuild a .cpp when only an included .inc changed (G359 trap), so this
 // marker comment must be touched whenever g424_image_run_writers.inc is edited.
 // g424_image_run_writers.inc revision: 5 (G477 swizzle-row hoisted CT32/Z32/P4 run writers)
-// g477_fast_run_writers.inc revision: 7 (CT32 aligned-group stores + PSMT4 quad-gather)
+// g477_fast_run_writers.inc revision: 8 (partial-row PSMT4 complete 32-column groups)
 // g512_texdecode_row_readers.inc revision: 4 (G651 widened paletted group predicate 8/4/2 +
 //                                             P4HL/P4HH SSE2 word-group extraction + no-mask arm)
 

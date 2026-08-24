@@ -1,3 +1,4 @@
+// G652: cross-thread critical-path hooks + fast dispatch helpers (force rebuild v1).
 // G566: exact GPU-authoritative VU1 command producer and asynchronous packet-result handoff (v1).
 // G545: incremental CPU-authoritative VU1 worker -> persistent GPU shadow stream (v2 trace).
 // G478: runtime_mtvu_and_env.inc now arms the G446 PC sampler on the MTVU worker thread.
@@ -10,6 +11,7 @@
 // ps2_gif_arbiter.cpp, which already includes <windows.h> for the G446 PC sampler. Global scope on
 // purpose (the appendix's anon-namespace linkage trap).
 extern void g650PinThread(int role);
+#include "ps2_critical_trace_api.inc"
 #include "ps2_runtime_parts/runtime_mtvu_and_env.inc"
 #include "ps2_runtime_parts/runtime_host_display.inc"
 #include "ps2_runtime_parts/runtime_init_and_signals.inc"

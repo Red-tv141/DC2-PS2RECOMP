@@ -1,3 +1,5 @@
+#include <cstdint>
+
 int g473SimdMergeArm();
 // G508: A/B arm for the m_stateMutex lock-skip lever, read once per GIF packet in
 // GS::processGIFPacket. Defined at global scope in g419_ab_instrument.inc (rasterizer TU) - declared
@@ -9,8 +11,13 @@ int g508LockSkipArm();
 // g419_ab_instrument.inc (rasterizer TU) - declared HERE, above every anonymous namespace, for the
 // same reason g508LockSkipArm is (the appendix's anon-namespace trap).
 int g596CopyArm();
+// G652 P12: within-process arm for the exact 0x412 PACKED-tag clone.
+int g652Gif412Arm();
+// G652 P12: diagnostic implementation is cold; called only under DC2_G650_GIF_STAT.
+void g652GifSequenceNote(uint64_t tagHi, uint32_t nreg, uint32_t descriptors);
 // G508: force-recompile marker - .inc edits do not trigger MSBuild (G359). revision: 2
 // G596: force-recompile marker for the table-driven l2l copy. revision: 1
+// G652: packed-GIF descriptor-sequence census + 0x412 paired arm. revision: 2
 // G630: replay co-writes raw authority and linear FBO mirror. revision: 5
 // G522: `g144L2lLatePin` - the fail-safe replay of the local->local guest-VRAM publication that the
 // range barrier skipped when g289CanDeferLocalCopy promised an FBO->FBO blit. Declared with the
@@ -44,6 +51,9 @@ extern std::atomic<uint32_t> g_dc2ScriptFrame;
 // Must follow gpu_bridge_and_latch_helpers.inc (it uses that file's accessors and g123/g34 statics)
 // and precede gpu_gif_and_registers.inc + gpu_transfers_and_kick.inc, which call into it.
 // g602_gif_cold_outline.inc revision: 1  (G359 .inc rebuild marker — touch on every edit)
+// G654 P16/P17: exclusive, thread-keyed layer timer. In the default build G654LayerScope is an
+// empty struct with an empty constructor - no global load, no branch, no byte (rule 12c).
+#include "ps2_g654_layer_api.inc"
 #include "ps2_gs_gpu_parts/g440_latch_profile.inc"
 #include "ps2_gs_gpu_parts/gpu_bridge_and_latch_helpers.inc"
 #include "ps2_gs_gpu_parts/g602_gif_cold_outline.inc"

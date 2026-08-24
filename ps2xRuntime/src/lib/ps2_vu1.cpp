@@ -1,6 +1,7 @@
 ﻿// G520: `macscan` — g430ResolveAt (vu1_g421_fast_upper.inc) resolves the architectural MAC with a
 // branchless tree reduction instead of a serial branchy scan of the 8-slot history ring. Content
 // edit here forces MSBuild to consume the .inc (G359). revision: 28 (G612 native region backend)
+// G652: native-region LOI admission + flag-materialization census (force rebuild v1).
 #include "ps2_vu1_parts/vu1_helpers_and_tables.inc"
 #include "ps2_vu1_parts/vu1_g370_store_watch.inc"
 #include "ps2_g480_packet_pool.inc"

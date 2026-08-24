@@ -40,6 +40,8 @@ extern int g438SlowArm(int which);
 // G439 window-coalescing ceiling probe arm selector (same file, same contract as g438SlowArm).
 extern int g439CoalesceArm();
 
+#include "ps2_critical_trace_api.inc"
+
 // G297 MTVU bridges (defined in ps2_runtime.cpp). No-ops unless DC2_G297_MTVU=1.
 extern bool g297MtvuActive();
 extern bool g297HasPendingKicks();
@@ -52,6 +54,17 @@ extern bool g497WinBufActive();
 // G650 (ROADMAP P6): contention-aware core scheduler. Defined in
 // ps2_runtime_parts/g650_thread_affinity.inc (ps2_runtime.cpp TU) at GLOBAL scope on purpose.
 extern void g650PinThread(int role);
+
+// G652 P4: compile-time control permits an independent old-layout/new-layout binary gate.
+#ifndef DC2_G652_GIF_COLD
+#define DC2_G652_GIF_COLD 0
+#endif
+#if DC2_G652_GIF_COLD
+// The F512 packet decoder/formatter lives in a cold TU. The hot worker pays one cached load/branch
+// when disabled, and no longer carries the diagnostic body's text/layout budget.
+extern const bool g652GifTraceOn;
+void g652ScanGifPacketCold(const GifArbiterPacket &pkt, uint32_t drainIndex);
+#endif
 
 // G531: universal once-per-guest-frame A/B tick (defined in the rasterizer TU). This replaces
 // the route-specific colour-readback tick, which heavy routes can bypass entirely.
@@ -68,11 +81,17 @@ extern void g531FrameAbTick();
 // because it needs <windows.h> and that TU includes raylib.h + ThreadNaming.h, both of which
 // collide with it (`Rectangle`, `CloseWindow`, `ShowCursor`, `HMODULE`). This TU already has
 // <windows.h> for the G446 PC sampler. Every other TU declares `extern void g650PinThread(int);`.
-// MSBuild does not reliably rebuild a .cpp when only an included .inc changed (the G359 trap), so
-// this marker must be touched whenever g650_thread_affinity.inc is edited.
-// g650_thread_affinity.inc revision: 2 (G651 adaptive topology: EfficiencyClass ranking,
-//                                       CPU-set fallback, hard-affinity refusal below 5 cores)
-#include "ps2_runtime_parts/g650_thread_affinity.inc"
+//
+// ⛔⛔ G651 — THE SCHEDULER IS NO LONGER DEFINED HERE, AND THAT IS A MEASURED DECISION.
+// G650 put `g650_thread_affinity.inc` in this TU because it needs `<windows.h>` and
+// `ps2_runtime.cpp` cannot have it. G651's adaptive topology grew that file by ~150 lines of COLD
+// start-up code (`GetSystemCpuSetInformation`, the EfficiencyClass ranking sort), and this TU holds
+// `processGIFPacket` and the GS worker loop — `[G147:gif] packet` is 22.8–23.0 ms/f on `dragon`.
+// The G651 TOTAL gate read **GS own +0.545 (`dragon`) / +0.820 (`dungeon1`)** while the only GS-side
+// LEVER in the phase measured **−0.206** on its own arm, i.e. the loss is code LAYOUT, not
+// behaviour — 17d's inline-budget cliff at translation-unit scale.
+// The definition moved to `dc2_game_override.cpp`, which already has `<windows.h>` through
+// `dc2_crash_reporter.inc` and carries no GS-worker hot loop. This TU keeps the `extern` above.
 // G156: worker thread CPU-time (user+kernel) so we can compare it against wall-time and prove
 // whether the MTGS worker's ~130 ms/frame "busy" is real CPU work or scheduler/HT stall.
 static uint64_t g156ThreadCpuNs()
@@ -168,17 +187,20 @@ namespace
         return on;
     }
 
-    bool f50_12_trace_enabled()
-    {
-        static const bool enabled = f50_12_env_flag("DC2_TRACE_F50_12");
-        return enabled;
-    }
-
+    // Shared by the G341 census as well as the legacy F512 decoder, so this tiny primitive stays
+    // in the worker TU while the diagnostic parser/formatter moves cold.
     uint64_t f50_12_load64(const uint8_t *data)
     {
         uint64_t value = 0u;
         std::memcpy(&value, data, sizeof(value));
         return value;
+    }
+
+#if !DC2_G652_GIF_COLD // G652 P4 control: original hot-TU diagnostic body.
+    bool f50_12_trace_enabled()
+    {
+        static const bool enabled = f50_12_env_flag("DC2_TRACE_F50_12");
+        return enabled;
     }
 
     bool f50_12_is_paletted_psm(uint32_t psm)
@@ -516,6 +538,7 @@ namespace
             ++tagIndex;
         }
     }
+#endif
 }
 
 // ===== G150 MTGS (multi-threaded GS) — DEFAULT OFF (DC2_G150_MTGS=1) =====
@@ -903,6 +926,8 @@ namespace
             item.segEnds = std::move(segEnds);
             g317StampItem(item);
             m_items.push_back(std::move(item));
+            if (g652CriticalTraceOn)
+                g652CriticalTrace(20u, static_cast<uint64_t>(m_items.size()));
             m_cvWork.notify_one();
         }
 
@@ -1437,6 +1462,8 @@ namespace
                 }
 
                 g_g189WorkerStage.store(1, std::memory_order_relaxed);
+                if (g652CriticalTraceOn)
+                    g652CriticalTrace(21u, static_cast<uint64_t>(item.packets.size()));
                 static const bool s_g151cpu = (std::getenv("DC2_G151_STAT") != nullptr);
                 const size_t g151NPkt = item.packets.size();
                 const auto g151T0 = std::chrono::steady_clock::now();
@@ -1519,6 +1546,8 @@ namespace
                 g_g151WorkerCpuNs.fetch_add(g151Cpu1 - g151Cpu0, std::memory_order_relaxed);
                 g_g151WindowCount.fetch_add(1u, std::memory_order_relaxed);
                 g_g151PktCount.fetch_add(static_cast<uint64_t>(g151NPkt), std::memory_order_relaxed);
+                if (g652CriticalTraceOn)
+                    g652CriticalTrace(22u, static_cast<uint64_t>(g151NPkt));
 
                 // G447 edge 6: re-acquiring the arbiter mutex at the tail of a window. This runs
                 // ~1560x/frame against an EE thread that holds the same mutex to enqueue, so it is
@@ -2155,7 +2184,12 @@ void GifArbiter::drain()
                                                << " path3image=" << static_cast<uint32_t>(pkt.path3Image ? 1u : 0u)
                                                << std::endl);
             }
+#if DC2_G652_GIF_COLD
+            if (g652GifTraceOn)
+                g652ScanGifPacketCold(pkt, debugIndex);
+#else
             f50_12_scan_gif_packet(pkt, debugIndex);
+#endif
             g370ScanPacket(static_cast<int>(pkt.pathId), pkt.data.data(),
                            static_cast<uint32_t>(pkt.data.size()), nullptr);
             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));

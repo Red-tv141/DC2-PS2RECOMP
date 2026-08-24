@@ -1,3 +1,6 @@
+#include <cstdint>
+
+// G652: three-segment SSBO upload ring + finite persistent command-ring proof (force rebuild v1).
 // G630: persistent raw-VRAM stream with separately clocked GPU job classes (force rebuild v2).
 // G607: TRANSLATED VU1 kernel throughput CEILING bench (g607_tbench.inc + the generated
 // g607_translated_body.inc, v1). Prices the one term G606 left unmeasured.
@@ -8,6 +11,9 @@
 // G433: blocking colour-readback ceiling probe in lle_gpu_raster_backend.inc
 // (DC2_G433_NO_RB=1 skips only glReadPixels; DC2_G433_RBSTAT=1 times it). Content edit here
 // forces MSBuild to consume the .inc.
+#include "ps2_critical_trace_api.inc"
+// G652 P10: within-process arm for the three-segment SSBO upload ring.
+int g652SsboRingArm();
 // G546: CPU dead-history MAX/MIN + image-resident live VU code/RAM workspace (v31).
 // G545: batched live VU1 GPU shadow, persistent workspace + delayed checkpoints.
 // G565: clean rebuild of the resumed G545 exact semantic source.

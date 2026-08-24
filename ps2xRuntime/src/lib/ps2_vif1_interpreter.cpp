@@ -1,3 +1,6 @@
+#include <chrono>
+// G654 P16/P17: exclusive, thread-keyed layer timer (empty unless -DPS2X_G654_DIAG=ON).
+#include "ps2_g654_layer_api.inc"
 #include "ps2_vif1_interpreter_parts/vif1_probes_and_helpers.inc"
 // G371: EE-side mgRENDER_INFO census (DC2_G371_RI=1). Must precede the parser: the census is
 // called from processVIF1Data.

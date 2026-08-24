@@ -825,6 +825,10 @@ enum G419Lever
     // Read once per candidate ENTRY in the flush bind pre-pass on the GS worker, so it takes the
     // same thread-level block hold as G594/G595/G596/G622.
     kG623LeverProdSrc = 132,
+    // G652 P10/P12: command-side SSBO upload rotation and exact 0x412 PACKED tag clone. Both run
+    // on worker threads and therefore use the 16-frame hold.
+    kG652LeverSsboRing = 133,
+    kG652LeverGif412 = 134,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -957,6 +961,10 @@ static int g419AbLever()
             return static_cast<int>(kG622LeverTexVar);
         if (std::strcmp(value, "prodsrc") == 0)
             return static_cast<int>(kG623LeverProdSrc);
+        if (std::strcmp(value, "ssboring") == 0)
+            return static_cast<int>(kG652LeverSsboRing);
+        if (std::strcmp(value, "gif412") == 0)
+            return static_cast<int>(kG652LeverGif412);
         if (std::strcmp(value, "rbfmt") == 0)
             return static_cast<int>(kG491LeverRbFmt);
         if (std::strcmp(value, "rbspin") == 0)
@@ -1124,7 +1132,7 @@ static int g419AbLever()
                       "l2lskip|flagtail|flaghead|divlower|imgspec|hot0c70|hot0e00|hot30d8|"
                       "hot1be8|hot1c00|hot0900|hot1110|rtttri|bitalias|tri13b|tri13bfast|"
                       "solidsprite|drainmemo|zwin|g595line|g595note|g595both|g596copy|"
-                      "vu1null)\n",
+                       "vu1null|ssboring|gif412)\n",
                      value);
         return static_cast<int>(kG419LeverNone);
     }();
@@ -1189,6 +1197,8 @@ static const char *g419AbLeverName(int lever)
     case kG617LeverT4hh: return "t4hh";
     case kG622LeverTexVar: return "texvar";
     case kG623LeverProdSrc: return "prodsrc";
+    case kG652LeverSsboRing: return "ssboring";
+    case kG652LeverGif412: return "gif412";
     case kG491LeverRbFmt: return "rbfmt";
     case kG491LeverRbSpin: return "rbspin";
     case kG492LeverNoRender: return "norender";
@@ -1443,6 +1453,7 @@ static uint64_t g438ArmHoldFrames()
                  // G506's law again: G623's producer-surface arm is read once per candidate ENTRY
                  // in the flush bind pre-pass, on the GS worker, exactly like G622's.
                  sel == kG623LeverProdSrc ||
+                 sel == kG652LeverSsboRing || sel == kG652LeverGif412 ||
                  // G506's law again: G610's compiled-block arm is read once per run() on the VU1
                  // worker, exactly like G490's `blockrun`, so it takes the same block hold.
                  sel == kG610LeverVuJit ||
@@ -1526,6 +1537,38 @@ int g476PageBumpArm()
 int g477RunWriteArm()
 {
     if (g419AbLever() != static_cast<int>(kG477LeverRunWrite))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+// G652 P10/P12. These code-shape levers execute in other runtime translation units. Keep their
+// selectors global and memo attribution once per held tick, matching G477's cross-TU contract.
+int g652SsboRingArm()
+{
+    if (g419AbLever() != static_cast<int>(kG652LeverSsboRing))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
+int g652Gif412Arm()
+{
+    if (g419AbLever() != static_cast<int>(kG652LeverGif412))
         return -1;
     const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
     const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);

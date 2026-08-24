@@ -530,6 +530,87 @@ static void g638PrepEndBatch()
         g638PrepReport();
 }
 
+// ===== G653 P7 / P29: cooperative-dispatch diagnostics — COMPILE-TIME OPT-IN =====
+//
+// P7 needed a WORK / WAIT / BARRIER decomposition of `runCoop()`: `[G638:pool]` brackets only the
+// LEGACY `run()` path, so the promoted G637 cooperative dispatch had none, and "poolreplay is 69.8%
+// of the flush" could not distinguish rasterization from scheduling (rule 9: delete work, not
+// waiting). The census was built, it answered the question, and its numbers are in the G653 fix log.
+//
+// ⛔⛔ IT IS NOT IN THE DEFAULT BUILD, AND THIS IS THE MEASURED REASON.
+// The first G653 attempt kept the census hooks and a P29 spin-dispatch prototype as ordinary
+// runtime-flagged code in this file — every hook guarded by a `const bool`, the prototype
+// DEFAULT-OFF, behaviour byte-for-byte unchanged. An order-balanced A B B A between that binary and
+// the one before it, on `dragon`, 2,700 matched presents per arm and no drift:
+//
+//     block 1 +0.591 ms/f    block 2 +0.377 ms/f    POOLED +0.484 ms/f (GS own +0.443)
+//
+// Nothing behavioural changed. That 0.484 ms/f is PURE CODE LAYOUT — PS2_PROJECT_STATE.md rule 12b,
+// reproduced on a lever that does nothing. ⭐ And no env rollback can find it: every rollback
+// restores behaviour and none removes a byte. So the diagnostics leave the default build entirely.
+//
+// Build with -DPS2X_G653_POOLDIAG=ON to get `[G653:coop]` (DC2_G653_POOLCOOP=1) and the P29
+// spin-dispatch prototype (DC2_G653_POOLSPIN_US=<us>) back.
+#if defined(PS2X_G653_POOLDIAG)
+extern const bool g653PoolCoopOn;
+extern std::atomic<uint64_t> g_g653CoopCalls;
+extern std::atomic<uint64_t> g_g653CoopSerialCalls;
+extern std::atomic<uint64_t> g_g653CoopWallNs;
+extern std::atomic<uint64_t> g_g653CoopSetupNs;
+extern std::atomic<uint64_t> g_g653CoopCallerNs;
+extern std::atomic<uint64_t> g_g653CoopChunkNs;
+extern std::atomic<uint64_t> g_g653CoopBarrierNs;
+extern std::atomic<uint64_t> g_g653CoopWakeNs;
+extern std::atomic<uint64_t> g_g653CoopWakeSamples;
+extern std::atomic<uint64_t> g_g653CoopChunks;
+extern std::atomic<uint64_t> g_g653CoopCallerChunks;
+extern std::atomic<uint64_t> g_g653CoopSeats;
+extern std::atomic<uint64_t> g_g653CoopMaxChunkNs;
+void g653PoolCoopReport();
+
+static inline uint64_t g653NowNs()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+// ===== G653 P29: the spin budget for the cooperative dispatch's wake and join =====
+//
+// Namespace scope, never a function-local `static const` — MSVC compiles the latter into a
+// per-ACCESS `_Init_thread_header` epoch check, and this is read on every worker wake and every
+// join (G619's law; the same trap G649 fixed in `pushDispatchPc` and G651 in
+// `shouldPreemptGuestExecution`).
+//
+// ⛔ SPINNING IS NOT FREE ON THIS HOST. Six physical cores already carry EE + VU1 + GS + GL + seven
+// pool threads, and G419's `rbspin` arm measured +0.170 ms/f for spinning on a thread that was
+// going to block anyway. The budget is therefore BOUNDED and armed by measurement, not by
+// principle: it must show up as a frame win on an uncapped GS-poled route or it does not ship.
+#define G653_PAUSE() _mm_pause()
+
+// ⛔ DEFAULT OFF, and the arithmetic says why it has to earn its default. `dragon` runs ~12
+// dispatches per 27 ms frame, so the mean gap between dispatches is ~2.2 ms — two orders of
+// magnitude longer than any sane spin budget. Most spins will therefore burn their WHOLE budget
+// and then sleep anyway, at 7 workers x budget of core time per dispatch. The mechanism can only
+// win if the wake latency it deletes (17.5 us, P7) is worth more than the cores it steals from
+// EE / VU1 / GL on a 6-core host. That is a measurement, not a prediction — arm it with
+// DC2_G653_POOLSPIN_US=<us>; DC2_G653_NO_POOLSPIN=1 forces it off once/if it is ever promoted.
+static const uint32_t g_g653PoolSpinUs = [] () -> uint32_t {
+    if (std::getenv("DC2_G653_NO_POOLSPIN") != nullptr)
+        return 0u;
+    const char *v = std::getenv("DC2_G653_POOLSPIN_US");
+    if (!v || !*v)
+        return 0u;
+    const long n = std::strtol(v, nullptr, 10);
+    if (n <= 0)
+        return 0u;
+    return static_cast<uint32_t>(n > 1000 ? 1000 : n);
+}();
+
+#endif // PS2X_G653_POOLDIAG
+// In the DEFAULT build nothing above exists and every call site below is `#if`-excluded too, so the
+// emitted `ps2_gs_rasterizer.obj` is the pre-G653 one. That is the point: a `const bool` guard
+// leaves the BYTES in place, and the measurement above says the bytes are what cost 0.484 ms/f.
+
 class GSRowPool
 {
 public:
@@ -595,6 +676,11 @@ public:
             m_pending = narrow ? (lanes - 1)                        // lanes actually handed out
                                : static_cast<int>(m_threads.size()); // every worker reports
             ++m_gen;
+#if defined(PS2X_G653_POOLDIAG)
+            // G653 P29: publish the wake hint INSIDE the lock, after every field a woken worker
+            // reads. A spinner that observes it therefore observes all of them.
+            m_genA.store(m_gen, std::memory_order_release);
+#endif
         }
         m_cvWork.notify_all();
 
@@ -668,8 +754,16 @@ public:
                     job(bounds[i], bounds[i + 1] - 1);
             if (outCallerChunks)
                 *outCallerChunks = static_cast<uint32_t>(chunks);
+#if defined(PS2X_G653_POOLDIAG)
+            if (g653PoolCoopOn)
+                g_g653CoopSerialCalls.fetch_add(1ull, std::memory_order_relaxed);
+#endif
             return;
         }
+
+#if defined(PS2X_G653_POOLDIAG)
+        const uint64_t g653T0 = g653PoolCoopOn ? g653NowNs() : 0ull;
+#endif
 
         uint32_t gen;
         {
@@ -682,8 +776,26 @@ public:
             m_coopSeats.store(seats, std::memory_order_relaxed);
             gen = static_cast<uint32_t>(++m_gen);
             m_coopCursor.store(static_cast<uint64_t>(gen) << 32, std::memory_order_release);
+#if defined(PS2X_G653_POOLDIAG)
+            m_genA.store(m_gen, std::memory_order_release); // G653 P29 wake hint
+#endif
         }
+#if defined(PS2X_G653_POOLDIAG)
+        if (g653PoolCoopOn)
+            m_g653DispatchNs.store(g653T0, std::memory_order_release);
+        // G653 P29: `notify_all` with seven waiters is a kernel call and P7 measured the dispatcher
+        // paying 20.8 us for the publish-plus-notify pair. If at least `seats` workers are already
+        // spinning on the generation mirror they have ALREADY been told, so the syscall buys
+        // nothing. Any worker that is genuinely asleep is not counted, so this can only skip the
+        // notify when it is redundant — and a worker whose spin budget expires between the count
+        // and the skip still re-checks `m_gen` under the mutex before waiting, so it cannot miss
+        // the generation, only take the slow path to it.
+        if (g_g653PoolSpinUs == 0u || m_g653Spinning.load(std::memory_order_acquire) < seats)
+#endif
         m_cvWork.notify_all();
+#if defined(PS2X_G653_POOLDIAG)
+        const uint64_t g653TSetup = g653PoolCoopOn ? g653NowNs() : 0ull;
+#endif
 
         uint32_t mine = 0;
         for (;;)
@@ -696,12 +808,51 @@ public:
         }
         if (outCallerChunks)
             *outCallerChunks = mine;
+#if defined(PS2X_G653_POOLDIAG)
+        const uint64_t g653TClaims = g653PoolCoopOn ? g653NowNs() : 0ull;
 
+        // G653 P29: the JOIN half. P7 measured `barrier` at 33.2 us/dispatch, 21.0% of the wall -
+        // the caller parked at the fence after its own claims ran out. The chunks it is waiting on
+        // are already RUNNING (the cursor is exhausted before the caller ever gets here), so the
+        // remaining wait is bounded by ONE chunk's tail, not by a scheduling decision. Spinning
+        // that out avoids a condvar sleep/wake pair whose latency is the same ~17 us the worker
+        // wake costs, and whose length is comparable to what it is waiting for.
+        if (g_g653PoolSpinUs > 0u && m_coopRemaining.load(std::memory_order_acquire) != 0)
+        {
+            const uint64_t deadline = g653NowNs() + g_g653PoolSpinUs * 1000ull;
+            while (m_coopRemaining.load(std::memory_order_acquire) != 0)
+            {
+                if (g653NowNs() >= deadline)
+                    break;
+                G653_PAUSE();
+            }
+        }
+#endif
         if (m_coopRemaining.load(std::memory_order_acquire) != 0)
         {
             std::unique_lock<std::mutex> lk(m_mtx);
             m_cvDone.wait(lk, [&] { return m_coopRemaining.load(std::memory_order_acquire) == 0; });
         }
+#if defined(PS2X_G653_POOLDIAG)
+        if (g653PoolCoopOn)
+        {
+            const uint64_t g653TEnd = g653NowNs();
+            // `setup` is the mutex publish plus notify_all; `caller` is this thread's own claim
+            // loop (its real rasterization AND its claim CAS overhead); `barrier` is what it spent
+            // parked at the join once its own claims ran out. Those three partition `wall` for the
+            // CALLER. Worker work is recovered in the reporter from the summed chunk time.
+            g_g653CoopWallNs.fetch_add(g653TEnd - g653T0, std::memory_order_relaxed);
+            g_g653CoopSetupNs.fetch_add(g653TSetup - g653T0, std::memory_order_relaxed);
+            g_g653CoopCallerNs.fetch_add(g653TClaims - g653TSetup, std::memory_order_relaxed);
+            g_g653CoopBarrierNs.fetch_add(g653TEnd - g653TClaims, std::memory_order_relaxed);
+            g_g653CoopChunks.fetch_add(static_cast<uint64_t>(chunks), std::memory_order_relaxed);
+            g_g653CoopCallerChunks.fetch_add(mine, std::memory_order_relaxed);
+            g_g653CoopSeats.fetch_add(static_cast<uint64_t>(seats), std::memory_order_relaxed);
+            const uint64_t n = g_g653CoopCalls.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+            if ((n % 20000ull) == 0ull)
+                g653PoolCoopReport();
+        }
+#endif
         // Every claimed chunk has COMPLETED (that is what the countdown counts), so no worker is
         // inside the job body and the caller's `bounds`/`job` may now die with this frame.
     }
@@ -733,8 +884,26 @@ private:
     {
         const int a = bounds[idx];
         const int b = bounds[idx + 1] - 1;
+#if defined(PS2X_G653_POOLDIAG)
+        const uint64_t g653T = g653PoolCoopOn ? g653NowNs() : 0ull;
+#endif
         if (job && b >= a)
             (*job)(a, b);
+#if defined(PS2X_G653_POOLDIAG)
+        if (g653PoolCoopOn)
+        {
+            // Summed across EVERY participant, so this is aggregate work, not a timeline. The
+            // widest single chunk is tracked separately: an over-decomposed dispatch is only
+            // tail-safe while max(chunk) stays small against the wall.
+            const uint64_t dt = g653NowNs() - g653T;
+            g_g653CoopChunkNs.fetch_add(dt, std::memory_order_relaxed);
+            uint64_t hi = g_g653CoopMaxChunkNs.load(std::memory_order_relaxed);
+            while (dt > hi &&
+                   !g_g653CoopMaxChunkNs.compare_exchange_weak(hi, dt, std::memory_order_relaxed))
+            {
+            }
+        }
+#endif
         if (m_coopRemaining.fetch_sub(1, std::memory_order_acq_rel) == 1)
         {
             // Taken so the waiter cannot evaluate its predicate between our store and its wait.
@@ -758,6 +927,12 @@ private:
             std::lock_guard<std::mutex> lk(m_mtx);
             m_stop = true;
             ++m_gen;
+#if defined(PS2X_G653_POOLDIAG)
+            // G653 P29: mirror both, so a spinning worker leaves its spin immediately at shutdown
+            // instead of burning its whole budget first.
+            m_stopA.store(true, std::memory_order_release);
+            m_genA.store(m_gen, std::memory_order_release);
+#endif
         }
         m_cvWork.notify_all();
         for (auto &t : m_threads)
@@ -770,6 +945,44 @@ private:
         std::unique_lock<std::mutex> lk(m_mtx);
         for (;;)
         {
+            // ===== G653 P29: SPIN BEFORE SLEEPING =====
+            //
+            // P7 measured the cooperative dispatch's own overhead at 34% of its wall on `dragon`:
+            // setup 20.8 us/dispatch (the mutex publish plus `notify_all`) and barrier 33.2
+            // us/dispatch, with a worker WAKE LATENCY of 17.5 us. None of that is rasterization,
+            // and PS2_PROJECT_STATE.md rule 9 says only work reductions convert - but this IS the
+            // work of the dispatch itself, paid ~12 times a frame.
+            //
+            // `notify_all` on a condvar with seven waiters is a kernel call that wakes seven
+            // threads; the wake alone is the 17.5 us. A worker that is already SPINNING on the
+            // generation counter sees the new dispatch in tens of nanoseconds instead, and - the
+            // larger half - lets the dispatcher SKIP `notify_all` entirely when every seat it
+            // wants is already spinning.
+            //
+            // ⭐ EXACTNESS IS UNCHANGED AND UNCHANGEABLE HERE. This alters only WHEN a worker
+            // notices a generation, never which rows a chunk covers, which entries a chunk
+            // replays, or the order of writes inside it. `runCoop`'s contiguous / disjoint /
+            // in-order argument is untouched, and every claim still goes through the same
+            // generation-tagged CAS.
+            //
+            // Rollback: DC2_G653_NO_POOLSPIN=1. Budget: DC2_G653_POOLSPIN_US.
+#if defined(PS2X_G653_POOLDIAG)
+            if (g_g653PoolSpinUs > 0u && !m_stop && m_gen == seen)
+            {
+                lk.unlock();
+                m_g653Spinning.fetch_add(1, std::memory_order_acq_rel);
+                const uint64_t deadline = g653NowNs() + g_g653PoolSpinUs * 1000ull;
+                while (m_genA.load(std::memory_order_acquire) == seen &&
+                       !m_stopA.load(std::memory_order_acquire))
+                {
+                    if (g653NowNs() >= deadline)
+                        break;
+                    G653_PAUSE();
+                }
+                m_g653Spinning.fetch_sub(1, std::memory_order_acq_rel);
+                lk.lock();
+            }
+#endif
             m_cvWork.wait(lk, [&] { return m_stop || m_gen != seen; });
             if (m_stop)
                 return;
@@ -786,6 +999,21 @@ private:
                 const int *bounds = m_coopBounds;
                 const std::function<void(int, int)> *cjob = m_coopJob;
                 lk.unlock();
+#if defined(PS2X_G653_POOLDIAG)
+                if (g653PoolCoopOn)
+                {
+                    // G653 P7: WAKE LATENCY - dispatch instant to the moment a seated worker is
+                    // actually running. This is the part `barrier` cannot see: if wake dominates,
+                    // the condvar handoff (not the partition and not the kernel) owns the span.
+                    const uint64_t t0 = m_g653DispatchNs.load(std::memory_order_acquire);
+                    const uint64_t now = g653NowNs();
+                    if (t0 != 0ull && now > t0)
+                    {
+                        g_g653CoopWakeNs.fetch_add(now - t0, std::memory_order_relaxed);
+                        g_g653CoopWakeSamples.fetch_add(1ull, std::memory_order_relaxed);
+                    }
+                }
+#endif
                 for (;;)
                 {
                     const int idx = coopClaim(cgen, chunks);
@@ -842,6 +1070,17 @@ private:
     std::atomic<int> m_nextLane{0};
     uint64_t m_gen = 0;
     bool m_stop = false;
+#if defined(PS2X_G653_POOLDIAG)
+    // G653 P29: lock-free MIRRORS of the two words a sleeping worker waits on, so a spinning
+    // worker can observe a new dispatch without holding m_mtx. Both are written under m_mtx (or
+    // immediately after it, with release ordering) and only ever read by the spin loop, which then
+    // re-acquires m_mtx and re-reads the authoritative `m_gen` / `m_stop`. The mirrors are a
+    // WAKE HINT, never the source of truth — that is what keeps G420's
+    // "re-check m_gen under the mutex" guarantee intact.
+    std::atomic<uint64_t> m_genA{0};
+    std::atomic<bool> m_stopA{false};
+    std::atomic<int> m_g653Spinning{0};
+#endif
     // G637 cooperative dispatch state. All four scalars are written by the dispatcher under m_mtx
     // and read by a worker under m_mtx at its wake, so they need no atomicity of their own; the
     // cursor and the two counters are the lock-free part.
@@ -852,4 +1091,9 @@ private:
     std::atomic<uint64_t> m_coopCursor{0}; // generation<<32 | next chunk index
     std::atomic<int> m_coopRemaining{0};   // chunks not yet COMPLETED
     std::atomic<int> m_coopSeats{0};       // worker seats still available this generation
+#if defined(PS2X_G653_POOLDIAG)
+    // G653 P7/P29: dispatch timestamp for the wake-latency sample, plus the lock-free mirrors and
+    // spinner count. Absent from the default build (see the header on PS2X_G653_POOLDIAG).
+    std::atomic<uint64_t> m_g653DispatchNs{0};
+#endif
 };
