@@ -1,72 +1,85 @@
 # PS2 Recomp Project State — Dark Cloud 2
 
-> **GENERAL PROJECT INFORMATION ONLY** — operating rules, workspace/build facts, durable runtime architecture, and active environment flags. Specific phase investigation details, detailed benchmark tables, and superseded numbers belong in the appropriate fix logs and phase history.
+> **GENERAL PROJECT INFORMATION ONLY** — operating rules, workspace/build facts, durable runtime architecture, active session flags, and routing pointers. Specific phase investigation details belong in the matching fix logs; historical archives and solved issues belong in `plans/phase-history.md`.
 
 ---
 
 ## Where Everything Lives
 
-| Need | File |
+| Need | File / Location |
 |---|---|
 | **What to do NEXT** (short-term goals & active phase targets) | [plans/ROADMAP.MD](file:///d:/ps2r/dc2/plans/ROADMAP.MD) |
 | **Rules, paths, build, runtime architecture** | **this file** |
-| **How to drive a test** (graphics/audio routes & harness) | `skill/resources/appendix-dc2-test-routes.md` |
-| **How to attribute a measured cost** (layer / worker / blocked half / surface / sub-noise lever) | `skill/resources/appendix-dc2-attribution-recipes.md` |
-| **How to capture frames & gate a change on pixels** | `skill/resources/appendix-dc2-capture-and-gates.md` |
+| **Current optimization-phase evidence** | [plans/phase-G654-fix-log.md](file:///d:/ps2r/dc2/plans/phase-G654-fix-log.md) (24-priority sweep) |
+| **Previous shipped baseline evidence** | [plans/phase-G653-fix-log.md](file:///d:/ps2r/dc2/plans/phase-G653-fix-log.md) · [plans/phase-G652-fix-log.md](file:///d:/ps2r/dc2/plans/phase-G652-fix-log.md) · [plans/phase-G651-fix-log.md](file:///d:/ps2r/dc2/plans/phase-G651-fix-log.md) |
+| **Closed phase history archive, NO-GO table, superseded numbers** | [plans/phase-history.md](file:///d:/ps2r/dc2/plans/phase-history.md) — *grep it; Gemini-exclusive under Rule 49* |
 | **Full catalogue of `DC2_*` env flags** | [plans/env-flags.md](file:///d:/ps2r/dc2/plans/env-flags.md) |
+| **How to drive a test** (graphics/audio routes & harness) | `skill/resources/appendix-dc2-test-routes.md` |
+| **How to attribute a measured cost** (layer / worker / blocked half / surface) | `skill/resources/appendix-dc2-attribution-recipes.md` |
+| **How to capture frames & gate a change on pixels** | `skill/resources/appendix-dc2-capture-and-gates.md` |
 | **Performance profiler & telemetry architecture** | [PERFORMANCE_PROFILER_REPORT.md](file:///d:/ps2r/dc2/PERFORMANCE_PROFILER_REPORT.md) |
 | **Debug logging & crash reporting architecture** | [DEBUG_AND_CRASH_REPORTING.md](file:///d:/ps2r/dc2/DEBUG_AND_CRASH_REPORTING.md) |
 | **HD texture replacement & dumping architecture** | [TEXTURE_REPLACEMENT_REPORT.md](file:///d:/ps2r/dc2/TEXTURE_REPLACEMENT_REPORT.md) |
-| **Why one phase did what it did** | `plans/phase-<ID>-fix-log.md` |
-| **Closed phase history archive, NO-GO table, superseded numbers** | [plans/phase-history.md](file:///d:/ps2r/dc2/plans/phase-history.md) — *grep it; never read top-to-bottom* |
 | **Runtime architecture, ABIs, double/float math semantics** | `skill/resources/appendix-dc2-runtime-architecture.md` |
 | **Concrete paths, static export, harness wiring, PCSX2 A/B** | `skill/resources/appendix-dc2-project.md` |
 | **Already-diagnosed graphics defects** | `skill/resources/appendix-dc2-graphics-facts.md` |
-| **Project method & agent skill** | `skill/SKILL.md` and `skill/resources/` |
-| **Native-renderer design** | `plans/arc-native-renderer.md` · `plans/arc-total-closure.md` |
+| **Project method & agent skills** | `skill/SKILL.md` and `skill/resources/` |
 
 ---
 
-## Core Operating Rules
+## Core Operating Rules & Architectural Laws
 
-- **NO PER-SCREEN FIXES (hard rule).** Repair the root state/init/data path once, where the game itself sets it. Never patch a symptom by writing game state per-frame or per-draw scoped to one screen.
-- **Never clean the build.** `cmake --build <build_dir>` only; no clean targets, no build-dir deletion (full rebuild = 30+ hours).
-- **Never modify or create files in `runner/`**, and never modify standard `.h` headers (only `.inc` and `.cpp` files).
-- **Never run destructive git commands.** Preserve unrelated worktree changes.
-- **Build only inside an x64 `vcvars64` environment.**
-- **Every performance run must set `DC2_PATCH_60FPS=1`.** Otherwise 33.33 ms is only the 30 FPS cap.
-- **Three-Thread Pole Model**: $\text{frame} \approx \max(\text{VU1 busy}, \text{GS own}, \text{EE cpu})$, where $\text{GS own} = \text{gsWorkerMs/f} - \text{gsStallMs/f}$ and $\text{EE cpu} = \text{[G182:ee] cpuMs/f}$ (**not** `busyMs/f`). Re-derive the EE term per route (`skill/resources/23-renderer-qualification-and-pole-injection.md`).
-- **Derivative Injection Rule**: Census levels alone do not prove conversion. Always probe with `DC2_G431_GS_SLOW_US` / `DC2_G503_EE_SLOW_US` to measure injection sensitivity ($\Delta \text{frame} / \Delta \text{injected}$) before choosing a lever. A level pole (e.g. `dungeon1` GS 0.69 / EE 0.14) is a closure for single-thread levers.
-- **Delete Work, Not Waiting (G493/G622)**: Removing a synchronization wait on a secondary thread does not recover frame time unless the underlying work shrinks. **⭐ G637 EXCEPTION — a wait ON THE POLE ITSELF is work.** When the blocking thread is the pole and `gsStallMs/f = 0.00`, the wait is inside `GS own` and deleting it converts at the route's injection sensitivity. Always ask WHICH thread waits before applying this rule.
-- **A PC Sampler Cannot Name a Function in a Symbol-Less Module (G639)**: `[G446:eeprof]` read `getenv 2.07%` of the EE thread; `DC2_G446_ENVCENSUS=1` then printed **nothing** over a full 190 s run (< 27 hooked env reads/frame). The samples are in `ucrtbase.dll`, which ships no PDB, so `SymFromAddr` resolves to the nearest **exported** symbol. **Read such a row as "time in this MODULE" and get the function from a counter you own.** This refuted a roadmap candidate three phases old.
-- **Grep a Helper's DEFINITION, Not Its Calls (G639)**: `envFlagEnabled` is **five separate anonymous-namespace copies** (GS stub, GPU bridge, rasterizer, IOP, memory) plus `dc2_env_flag_enabled` in the override TU. A memo wrapping one cannot move the others' traffic.
-- **A Reference Arm Must Differ ONLY in the Thing Under Test (G639)**: G624's proposed `DC2_G261_NO_WAVE=1` reference sits **1.53** from both candidates, which differ from each other by **0.15** — it cannot adjudicate. Measure the reference's own divergence FIRST and require it to be smaller than the effect. Also **size a slow arm's budget from its own measured rate** — that arm is 3.4× slower and its first capture dumped **0 frames**.
-- **Read `common window:` and per-arm `pres` Before Quoting an A B B A (G639)**: one arm exiting early silently shrinks the gate (2,040 → 360 presents) rather than failing it.
-- **Identical Register COUNTS Are Not Identical Register VALUES (G638)**: `[G147:gif]`'s `tags` / `packedRegs` / `imageKB` were byte-identical across every window of `dragon`'s static tail, and a payload memo built on that premise measured **0 hits in 1,200 batches** — the geometry is re-emitted with different coordinates while the screen holds still. **Gate a caching/memo lever on a census of the VALUES it memoizes, never on the stability of their shape.**
-- **A GS Pole Is Not Automatically Rasterization (G638)**: on `dragon`, 44% of a 33.8 ms/f GS pole is one target's shadow-compute preparation and band round trip (`[G638:prep] g570gpubatch` 5.263 + `g570prep` 4.735 ms/f) while the CPU band replay every phase since G529 has optimised is **1.611**. Split the drain (`tools/g638_drain.py`) and the dispatch window (`DC2_G638_PREP=1`) before choosing a lever.
-- **Bracket the Barrier, Don't Infer It (G638)**: ⛔ `[G529:disp] wall` is **NOT** `GSRowPool::run` despite its header comment — `g529T` spans the whole `if (y1 >= y0)` body, a **7× overstatement** on `dragon` (9,957 vs 134 µs/dispatch). G637 §1's `rt = wall − lane0 = "GS-thread SLEEP"` inherits it. Quote `[G638:pool]` (`DC2_G638_POOL=1`), which brackets `run()` itself and splits all seven call sites by return address.
-- **Rank a Fork/Join Census by WAIT, Not WALL (G638)**: `wall` contains the caller's own band — real work no scheduling lever can delete. The recoverable term is `wall − lane`.
-- **Over-Decomposition Subsumes a Static Work Estimator (G637)**: For a fork/join over a partitionable range, cut it into more chunks than workers and let every participant — **including the caller** — claim dynamically. Do NOT also build a work-estimating partition: it is redundant (the scheduler balances) and harmful (its fences cluster where the work is dense, so more items straddle a boundary and repeat their per-item setup). Measured: +14% aggregate CPU for a `max` the scheduler did not need. (`skill/resources/26-cooperative-replay-scheduling.md`)
-- **A Fork/Join Dispatch Is Either Tail-Bound or Aggregate-Bound (G637)**: Split its wall into `sum` (aggregate participant time) and `max` (worst chunk) before choosing a lever. `max ≈ wall` ⇒ imbalance, fix the schedule. `sum/workers > max` ⇒ aggregate-bound, and no scheduling change can help — only deleting work can.
-- **Synthetic Address Space Isolation (G625)**: A synthetic "other processor" address space must NEVER be carved out of guest RAM (`kIopHeapBase`). Dedicated host backing stores (`g_g625IopShadow`) are mandatory (`skill/resources/21-synthetic-address-spaces-and-iop-heap.md`).
-- **Coordinate Transforms & Quantization (G624)**: Flipping a sampling coordinate inverts quantization/rounding tie-breaks. Evaluate rules in original space and map results back (`uUvFlipV`, `skill/resources/22-gs-uv-transforms-and-quantization.md`).
-- **PSMT8-in-CT32 Sub-Word Boundary Updates (G627)**: Sub-word writes cannot be reconstructed in guest VRAM, but are expressible directly on resident GPU FBOs using `glColorMask` + per-texel fragment lane discard (`DC2_G627_LANEMIR=1`).
-- **Dead Stage Elision & Proofs (G628)**: When state makes a stage dead (e.g. `ZTST=ALWAYS` + `ZMSK=1`), omit it entirely in lowered templates and pass null buffers. Admission must prove dead-stage conditions fail closed.
-- **A Resident GPU Authority Must Be a Superset of Every Writer (G636)**: Enumerate all memory writers first (including native GL FBO residency `m_fbos[fbp]` and CPU private depth mirror `g403DisplayZBuf()`). Missing any writer produces silent corruption across authority boundaries.
-- **A Second Authority with Unmergeable Conflicts Must Be Deleted (G636)**: When both authorities perform concurrent writes, detection alone does not solve the merge; the secondary authority must be retired and refused back to the primary.
-- **A Deterministic Pixel Window Is Deterministic AT FIXED FRAME RATE ONLY (G637)**: `ridepod`'s opening scores a 0.00 floor between two same-speed runs, but sprites that advance on **host presents** (the dialogue cursor, particles) land on different animation sub-phases when an arm's speed changes, and the ±2-key temporal minimum cannot collapse a sub-key offset. **A speed-changing candidate must be gated against a speed-perturbed same-binary control (`DC2_G431_GS_SLOW_US`)** — otherwise its own payoff convicts it. Every pre-G637 prototype was SLOWER than control, which is why this never surfaced.
-- **Exactness Oracles vs Mandatory Pixel Gates (G635)**: Exactness oracles test arithmetic on one path; they cannot see path selection, source staleness, or execution ordering. For any path-selection, source-authority, or residency change, **pixels against a same-binary control are the only admissible gate** (`tools/g635_bisect.py`, `tools/g635_look.py`, `ridepod` opening sf 768..1392 floor 0.00).
-- **Flag Exclusivity (G636)**: `DC2_FRAME_DUMP=1` (host tick) and `DC2_G598_DUMP_SF` (script clock) are **mutually exclusive**. Never arm both.
-- **Diagnostic Hygiene in Hot Loops**: Cache all environment flag reads at namespace scope. Function-local `static const bool` is an MSVC per-access TLS guard (`_Init_global_epoch`).
-- **Rollback Arm Fidelity**: A rollback arm must restore the original construct verbatim, not an older or alternative mechanism.
-- **Script Clock Keying**: Key transient and soak captures on script clock (`scriptFrame`, `[G154:perf] frame=`), never host-present tick `n`.
-- **Subsystem Wall Ceiling Check**: Total subsystem wall time is the hard ceiling on all optimizations within it.
-- **Unconditional A/B Sampling**: Sample A/B arms on paths that 100% of the target population executes, not inside conditional branches.
-- **Valid Gate Evaluation**: Treat `[G419:ab]` runs with $w < 10$ as unmeasured; never draw conclusions from early in-progress runs inside entry spikes.
-- **Renderer Promotion Requirements**: Paired within-process payoff (`DC2_G419_AB`), exactness oracle verification (`bad=0`), rollback flag registration, and direct normal-output review on the relevant graphics route.
-- **Harness Maintenance**: Add every new `DC2_*` flag to `tools/run_g477_perf.ps1`'s `$clear` array in the same edit that creates it.
-- **Fix Log Requirement**: Write `plans/phase-<ID>-fix-log.md` before ending each executable phase.
-- **Rule 49**: **ONLY GEMINI IS ALLOWED TO UPDATE `plans/phase-history.md`.** No other AI assistant or automated agent may modify or edit `plans/phase-history.md`.
+1. **NO PER-SCREEN FIXES (hard rule)**: Repair the root state/init/data path once, where the game itself sets it. Never patch a symptom by writing game state per-frame or per-draw scoped to one screen.
+2. **Never clean the build**: Incremental builds only (`cmake --build <build_dir> --config Release --target <target> -- /m:1`). Never use `--clean-first` or delete build directories (full rebuild = 30+ hours).
+3. **Untouchable code**: Never modify or create files in `runner/`, and never modify standard `.h` headers (use `.inc` and `.cpp` files to modularize logic).
+4. **Git safety**: Never run destructive git commands (`checkout`, `clean`, `reset`, `stash`, `pull`).
+5. **Toolchain environment**: Build only inside an x64 `vcvars64` environment.
+6. **Performance uncapping**: Every performance run must set `DC2_PATCH_60FPS=1` (otherwise 33.33 ms is only the 30 FPS cap).
+7. **Three-Thread Pole Model**: $\text{frame} \approx \max(\text{VU1 busy}, \text{GS own}, \text{EE cpu})$, where $\text{GS own} = \text{gsWorkerMs/f} - \text{gsStallMs/f}$ and $\text{EE cpu} = \text{[G182:ee] cpuMs/f}$ (**not** `busyMs/f`). Re-derive the EE term per route (`skill/resources/23-renderer-qualification-and-pole-injection.md`).
+7b. **⛔⛔ The Vsync-Spin Absorber (G651)**: on a route **AT** the emulated 60 FPS cap, `[G182:ee] cpuMs/f` is **NOT** a work metric and is **inadmissible as an EE gate** — the guest busy-polls the emulated vblank counter (`WaitVSync__Fii` + `mgGetVSyncCount` = **17.4% of `dungeon6`'s EE thread**, 7.3% of `s05`'s), and `cpuMs/f` is a `GetThreadTimes` delta that counts the spin. Freed EE work is converted into spin, so the metric does not move. Gate EE levers on an **uncapped** EE-heavy route (`dungeon1`), or push the capped route off the cap with `DC2_G503_EE_SLOW_US` first. *(This supersedes the older rule that `cpuMs/f` is the admissible substitute for `frame` on `s05`/`dungeon6`.)*
+7c. **Work-Only EE Counter (G652)**: `[G182:ee] workCpuMs/f` subtracts only generated vblank-wait scopes and is the admissible EE work metric on capped routes. Guest continuations can migrate between host threads, so cumulative `GetThreadTimes` baselines must be keyed by host thread ID and rebased on migration; never subtract clocks from two different threads.
+8. **Derivative Injection Rule**: Census levels alone do not prove conversion. Always probe with `DC2_G431_GS_SLOW_US` / `DC2_G503_EE_SLOW_US` to measure injection sensitivity ($\Delta \text{frame} / \Delta \text{injected}$) before choosing a lever.
+9. **Delete Work, Not Waiting (G493/G622)**: Removing a synchronization wait on a secondary thread does not recover frame time unless the underlying work shrinks. *(G637 exception: a wait on the pole itself when `gsStallMs/f = 0.00` is work).*
+10. **Single-FIFO Backend Law (G640)**: The amount recoverable by scheduling on a single FIFO GL backend is `blocked − backendBusy`, and nothing more. Async submission migrates waits to the next synchronous edge (`skill/resources/27-async-gs-gl-and-gpu-command-graph.md`).
+11. **Producer-Bounded Transfers (G641)**: Bound transfers to the producer's active bounding rect instead of transferring the entire VRAM, without changing memory authority (`skill/resources/32-gpu-ssbo-compute-and-shadow-chains.md`).
+12. **Grow-Only Streaming GPU Buffers (G643)**: SSBO/VBO buffers must be grow-only (round-up high-water capacity + `glBufferSubData`). Reallocating `glBufferData` on size change causes driver allocation stalls.
+12c. **⛔⛔ A `const bool` Guard Does Not Make Diagnostic Code Free (G653 §P25)**: rule 12b's strict
+form, measured on a change with **no behavioural difference at all**. ~60 lines of never-executed,
+`const bool`-guarded census/prototype code added to `ps2_gs_rasterizer.cpp` cost **+0.484 ms/f on
+`dragon` / GS own +0.443**, both order blocks agreeing (+0.591 / +0.377), 2,700 matched presents per
+arm, no drift. ⭐ **No env rollback can ever recover it** — every rollback restores behaviour and
+none removes a byte. **Rule**: a diagnostic that must live in a hot TU is a COMPILE-TIME build mode
+with its call sites `#if`-EXCLUDED (not merely predicated), and its reporter in a separate TU.
+Precedents: `PS2X_G652_CRITICAL_TRACE`, `PS2X_G653_POOLDIAG`. It is not an L1I capacity effect —
+nothing was near a cache budget; the mechanism is MSVC's placement of everything *else* in the TU.
+12b. **⛔⛔ Translation-Unit Layout Budget (G651)**: a TU has a code-layout budget the way a function has an inline budget. Adding ~150 lines of COLD start-up code to `ps2_gif_arbiter.cpp` (the TU holding `processGIFPacket` and the GS worker loop) cost **+0.567 / +0.934 ms/f of `GS own`** on `dragon`/`dungeon1`; moving the identical code to a TU with no hot loop recovered **1.13 / 1.06 ms/f**. ⭐ **Diagnostic**: a TOTAL gate that regresses on ONE THREAD while every lever's own arm is neutral-or-negative means LAYOUT — ⛔ no env rollback can find it, because every rollback restores behaviour and none removes a byte. Put new code in a TU that carries no hot loop.
+13. **Hot-Loop Invariant Hoisting (G645/G650)**: Select execution arms once outside hot loops. Never place rollback ternaries inside inner loops; execute single-form compiled paths (`skill/resources/29-vif1-gif-compiled-acceleration.md`).
+14. **Exactness Oracles vs Mandatory Pixel Gates (G635)**: Exactness oracles test arithmetic on one path; they cannot see path selection or source staleness. For any path selection or residency change, pixels against a same-binary control (`tools/g635_bisect.py` on `ridepod` opening) are mandatory.
+15. **Rule 49**: **ONLY GEMINI IS ALLOWED TO UPDATE `plans/phase-history.md`.** No other AI assistant or automated agent may modify or edit `plans/phase-history.md`.
+16. **⭐⭐⭐ Compile Closed Prototypes OUT, Not Just Off (G654 §P5)**: rule 12b/12c measured with the
+sign reversed. The G629–G636 persistent-GS-domain family is **closed negative on performance and
+default-OFF**, so every one of its entry points is a constant at run time — and it was still
+**121,285 bytes across 1,059 COMDATs = 8.52%** of `ps2_gs_rasterizer.cpp`'s machine code.
+`#if`-excluding it (`PS2X_G654_GPUDOMAIN`, default OFF) removed **134,807 bytes (−9.47%)** and bought
+**−1.082 ms/f on `dragon:tail`**, with **GS own −0.996, VU1 −0.792 and EE −0.355 — all three threads**,
+which is the signature of code placement rather than a subsystem lever. ⭐ **Method**: price a TU by
+family first with `tools/g654_tu_price.py <obj> --auto`, then exclude, then gate. Replace the family
+with constant-folding stubs that return exactly what the real code returns when disarmed, annotate
+each stub with the source line that establishes it, and keep the real code restorable by one CMake
+option so the two builds can be A/B'd and pixel-gated.
+17. **⛔⛔ `[G146:perf]`'s Four Layers Do Not Partition `GS own` (G654 §P17)**: `GIFsubmit` is
+**nested inside** `VIF1` (`processVIF1Data` opens a `G146PerfScope` and reaches `submitGifPacket`,
+which opens a second; `G146PerfScope` has no nesting guard), and all four accumulators are global
+atomics **summed across threads** while `GS own` is one thread's occupancy. `fight:rain` therefore
+shows a **negative 9.44 ms/f "residue"** against its own pole. Never subtract them from a pole; use
+`[G654:layer]` (`-DPS2X_G654_DIAG=ON`) for an exclusive, thread-keyed split.
+18. **Gate Through `tools/g654_gate.py` (G654 §P1–P3)**: an A B B A is not scored until three
+pre-checks pass — a **named scene window** resolved to script frames on the control arm (no whole-run
+averages, no capped scenes), **arm observability** (a mechanism counter, a log marker or a binary
+hash proving the arms can differ), and **host-drift rejection** (control/candidate drift ≤ 1.5 ms/f,
+no block-sign reversal, no monotone ramp, balanced present counts). Run the four arms with
+`tools/g654_abba.ps1`, which burns one discarded warm-up first — the session's first run of a route
+read 1.56 ms/f high.
 
 ---
 
@@ -74,11 +87,12 @@
 
 1. Load `skill/SKILL.md`, this file, `plans/ROADMAP.MD`, and `PS2Recomp/AGENTS.md`.
 2. Attribute the current resource pole before choosing a lever ($\text{frame} \approx \max(\text{VU1 busy}, \text{GS own}, \text{EE cpu})$).
-3. Keep one architectural variable per timing arm and repair parity failures in the same phase before promotion.
+3. Keep one architectural variable per timing arm and repair parity failures before promotion.
 4. Build Release targets incrementally (`/m:1`); never clean.
-5. Run the exact oracle, paired timing, and relevant graphics test routes.
-5b. ⛔⛔⛔ **MANDATORY PIXEL GATE for ANY change that alters WHICH path serves a draw** (a new view, a new admission, a residency/coherence change). The gate is: `tools/g635_bisect.py <ctlA> <ctlB> <arm>… --lo 768 --hi 1400` on `ridepod`'s deterministic opening with a second control `ctlB` as noise floor, plus `tools/g635_look.py <ctl> <arm> <worstKey>` visual PNG inspection.
-6. Update roadmap, env-flags, fix log, and phase history upon phase completion.
+5. Run the exact oracle, paired timing (`DC2_G419_AB`), and relevant graphics test routes.
+5b. **Mandatory Pixel Gate**: Run `tools/g635_bisect.py` and `tools/g635_look.py` on `ridepod` opening (`sf 768..1400`) for any change altering draw paths or data authority.
+5c. **Mandatory Regeneration Smoke**: After any recompiler/code-generation change, compare route arrival and progression against a saved pre-change runner before trusting timing. Runtime environment rollbacks cannot remove an emitted call-site shape.
+6. Update roadmap, env-flags, and the matching fix log upon phase completion. `plans/phase-history.md` remains Gemini-exclusive under Rule 49.
 
 ---
 
@@ -118,51 +132,41 @@ cmake --build D:\ps2r\dc2\build64 --config Release --target dc2_game -- /m:1
 
 ## Active Session-Critical Flags
 
-| Flag | Purpose |
-|---|---|
-| `DC2_DEBUG_MENU=1` + `DC2_PAD_INPUT=...` + `DC2_NO_XINPUT=1` | Route automation & deterministic pad input |
-| `DC2_PATCH_60FPS=1` | Mandatory performance uncapper (`0x00376C50 = 1`) |
-| `DC2_NO_PRESENT_SYNC=1` | Rollback for G616 RTSS presentation synchronization (restores free-running 60 Hz swaps) |
-| `DC2_LOG_LEVEL=<lvl>` | Global logging threshold (`TRACE`, `DEBUG`, `INFO` [default], `WARN`, `ERROR`, `FATAL`) |
-| `DC2_PROFILE=1` | Master toggle for unified performance profiler + telemetry |
-| `DC2_PROFILE_OVERLAY=1` | Real-time on-screen HUD profiler overlay (toggleable live via F3) |
-| `DC2_G419_AB=<lever>` | Randomized within-process A/B timing harness |
-| `DC2_G26X_NO_NATIVE=1` | Master rollback for native-renderer stack |
-| `DC2_G605_NO_TRI_SPAN=1` | Rollback for G605 exact accelerated replayed-triangle span kernel |
-| `DC2_G608_NO_TRI_FST=1` | Rollback for G608 `fst=1` sampler leaf of that kernel |
-| `DC2_G609_NO_TRI_SCAN=1` / `_NO_SAMP_INLINE=1` | Rollbacks for G609 outlined tight triangle scanline & inlined sampler |
-| `DC2_G610_NO_JIT=1` / `DC2_G612_NO_REGION=1` | Rollbacks for G610/G612 native VU1 JIT and REGION backends |
-| `DC2_G614_NO_SPRITE_FAST=1` | Rollback for G614 inlined replayed-sprite leaves & column slide |
-| `DC2_G615_NO_PRIVZ_SPAN=1` | Rollback for G615 private-Z display-sprite span admission |
-| `DC2_G617_NO_BLEND_FILL=1` / `_NO_T4HH=1` | Rollbacks for G617 untextured blended fill & PSMT4HH tap |
-| `DC2_G618_NO_NEGCACHE=1` / `_NO_FAST_T8MAP=1` | Rollbacks for G618 PSMT8 refusal ring & lowered map builder |
-| `DC2_G619_LIVE_ENVREAD=1` / `_NO_DEPTHSLOTS=1` | Rollbacks for G619 EE env-flag cache & guest execution depth slots |
-| `DC2_G620_NO_ZCLEARSKIP=1` / `_NO_PXPOOL=1` | Rollbacks for G620 private-Z dirty bit skip & decoded-texel pool |
-| `DC2_G620_LIVE_TEXREPL=1` / `_NO_FASTROW=1` | Rollbacks for G620 HD-replacement probe early-out & fast row reader |
-| `DC2_G621_NO_WRSPAN=1` / `_WRSPAN_VERIFY=1` | Rollback & oracle for G621 producer-scoped colour readback window |
-| `DC2_G622_NO_TEXVAR=1` / `_TEXVAR_VERIFY=1` | Rollback & oracle for G622 content-addressed texture variants |
-| `DC2_G623_NO_PRODSRC=1` / `_VERIFY=1` | Rollback & oracle for G623 producer-surface direct consumption (promoted by G624) |
-| `DC2_G624_NO_UVFLIP=1` / `_UVFLIP_STAT=1` | Rollback & census for G624 flip-aware G406/G407 UV rounding |
-| `DC2_G625_LEGACY_IOPHEAP=1` | Rollback for G625 host shadow IOP heap (restores EE RAM aliasing) |
-| `DC2_G626_LIVE_PIXFLAG=1` | Rollback for G626 per-pixel diagnostic predicate cache (measured NULL) |
-| `DC2_G627_NO_LANEMIR=1` / `_VERIFY=1` | Rollback & oracle for G627 PSMT8-in-CT32 local transfer lane mirror |
-| `DC2_G628_NO_TRI_UNTEX=1` / `_STAT=1` | Rollback & census for G628 untextured (`tme=0`) triangle span-kernel admission |
-| `DC2_G629_GPU=1` / `_NO_GPU=1` / `_VERIFY=1` | G629 exact GPU compute band replay (**default-OFF, measured +1.13 ms/f slower**). 100% bit-exact since G636 |
-| `DC2_G630_RESIDENT=1` / `_NO_RESIDENT=1` / `_STAT=1` | G630 persistent raw-VRAM GPU authority prototype (**default-OFF, measured +1.38 ms/f slower**). 100% bit-exact since G636 |
-| `DC2_G633_PLANS=1` / `_NO_PLANS=1` | G633 event-driven compiled residency & invalidation plans inside G630 prototype (**default-OFF**) |
-| `DC2_G634_RAWVIEW=1` / `_NO_RAWVIEW=1` | G634 raw-VRAM CT32/CT24 texture view addressed by TEX0 (**default-OFF**) |
-| `DC2_G634_RAWUP=1` / `_NO_RAWUP=1` | G634b format-agnostic Host→Local IMAGE ingestion (**default-OFF**) |
-| `DC2_G636_NO_ARBITRATE=1` / `_NO_BANDPATCH=1` / `_NO_FBSEED=1` / `_NO_MATPUB=1` / `_NO_UPSYNCFIX=1` | G636 rollbacks for authority-arbitration repairs inside prototype |
-| `DC2_G636_LINVIEW=1` / `_RESIDENT_Z=1` | ⛔⛔ Re-arms of the two RETIRED mechanisms (resident linear FBO mirror and persistent GPU depth mirror) |
-| `DC2_G637_NO_COOP=1` | 🛡️ Rollback for G637 cooperative over-decomposed work-stealing band replay — ⭐ **PROMOTED DEFAULT-ON by G638** (A B B A on `ridepod`, both order blocks agree: **−1.404 ms/f pooled, −5.95%**; GS own 21.08 → 19.74). `DC2_G637_COOP=1` remains accepted as the bring-up spelling |
-| `DC2_G637_OVER=<n>` / `_MINCHUNK=<n>` | G637 chunk sizing (defaults 4 chunks per lane, 2 rows minimum) |
-| `DC2_G637_BALANCE=1` / `_INDEX=1` | ⛔ G637's two REFUTED / measured-NULL slices, retained as their own probes |
-| `DC2_G637_BAL=1` / `_VERIFY=1` | G637 dispatch balance census (`[G637:bal]`) & partition oracle |
-| `DC2_G638_POOL=1` / `DC2_G638_PREP=1` | 📊 G638 censuses — the legacy `GSRowPool::run` barrier **by call site** (`[G638:pool]`, resolve with `tools/g638_pool.py`) and the CPU-fallback dispatch window **by phase** (`[G638:prep]`). Never valid in a timing run |
-| `DC2_G638_PAYCACHE=1` / `_NO_PAYCACHE=1` / `_VERIFY=1` / `_STAT=1` | ⛔ G638 0x139 shadow-payload memo — **REFUTED (0 hits in 1,200 batches)**, retained as its own probe plus `[G638:keydiff]` |
-| `DC2_G639_NO_PAYPAR=1` | 🛡️ Rollback for the ⭐ **G639 PARALLEL 0x139 GPU payload build (default-ON)** — oracle `bad=0` on 2,400 batches, A B B A on `dragon` **−2.882 ms/f (−8.24%)**. `_VERIFY=1` / `_STAT=1` are its oracle and census |
-| `DC2_G639_ENVMEMO=1` / `_NO_ENVMEMO=1` | ⛔ G639 `dc2_env_flag_enabled` memo — **measured NULL**, retained as its own probe |
-| `DC2_TEXTURE_REPLACEMENTS=1` / `_DUMP=1` | Enable HD texture replacement / dumping (`Mods/HD Texture`) |
+| Flag | Category | Purpose |
+|---|---|---|
+| `DC2_DEBUG_MENU=1` + `DC2_PAD_INPUT=...` + `DC2_NO_XINPUT=1` | Test Automation | Route automation & deterministic pad input replay |
+| `DC2_PATCH_60FPS=1` | Timing | Mandatory performance uncapper (`0x00376C50 = 1`) |
+| `DC2_NO_PRESENT_SYNC=1` | Timing | Rollback for G616 RTSS presentation synchronization |
+| `DC2_LOG_LEVEL=<lvl>` | Logging | Global logging threshold (`TRACE`, `DEBUG`, `INFO` [default], `WARN`, `ERROR`, `FATAL`) |
+| `DC2_PROFILE=1` / `DC2_PROFILE_OVERLAY=1` | Profiling | Master toggle for unified telemetry / Real-time HUD overlay (F3) |
+| `DC2_G419_AB=<lever>` | Benchmarking | Randomized within-process A/B timing harness |
+| `DC2_G637_NO_COOP=1` | Rollback | Rollback for G637 cooperative work-stealing band replay (default-ON) |
+| `DC2_G639_NO_PAYPAR=1` | Rollback | Rollback for G639 parallel 0x139 GPU payload build (default-ON) |
+| `DC2_G641_NO_WIN=1` | Rollback | Rollback for G641 producer-scoped 0x139 bounding window (default-ON) |
+| `DC2_G642_NO_DERIVESPAN=1` | Rollback | Rollback for G642 in-shader 0x139 span derivation (default-ON) |
+| `DC2_G643_NO_SSBO=1` | Rollback | Rollback for G643 SSBO data path for 0x139 kernel (default-ON) |
+| `DC2_G645_NO_EEPOOL=1` | Rollback | Rollback for G645 EE/VIF1 packet buffer pool (default-ON) |
+| `DC2_G646_NO_DISPATCH=1` | Rollback | Rollback for G646 direct-mapped guest dispatch table (default-ON) |
+| `DC2_G648_NO_LAZYSPAN=1` | Rollback | Rollback for G648 lazy CPU span array (default-ON) |
+| `DC2_G649_NO_TRISPAR=1` | Rollback | Rollback for G649 parallel 0x139 triangle setup loop (default-ON) |
+| `DC2_G649_NO_DISPATCHLEAN=1` | Rollback | Rollback for G649 dispatch diagnostic hoisting (default-ON) |
+| `DC2_G650_NO_FASTUNPACK=1` | Rollback | Rollback for G650 compiled VIF1 UNPACK kernels (default-ON) |
+| `DC2_G650_NO_ROWPAL=1` | Rollback | Rollback for G650 hoisted paletted row readers (default-ON) |
+| `DC2_G650_NO_SCHED=1` | Rollback | Rollback for G650 contention-aware core scheduler (default-ON) |
+| `DC2_G651_NO_ROWPAL2=1` | Rollback | Rollback for G651 widened paletted arms — P4HL/P4HH SSE2 word group + no-mask body (default-ON) |
+| `DC2_G651_NO_VUCLIP=1` | Rollback | Rollback for G651 in-region FCGET emission in G612 region bodies (default-ON) |
+| `DC2_G651_NO_TOPO=1` | Rollback | Rollback for G651 adaptive CPU topology → G650's static role→core map (default-ON) |
+| `DC2_G651_NO_DISPTRACE=1` | Rollback | Drops the per-dispatch diagnostic ring in `lookupFunction` (ring default-ON) |
+| `DC2_G651_ROWPAL_STAT=1` / `_DISP_STAT=1` | Census | `[G651:rowpal]` paletted arm split · `[G651:disp]` EE dispatch-family call counts |
+| `DC2_G182_EE_STAT=1` | Profiling | Extended G652 output includes migration-safe `waitCpuMs/f`, `workCpuMs/f`, and `workOnCPU`; use work, not raw CPU, on capped routes |
+| `DC2_G652_VU_LOI=1` / `_NO_VU_LOI=1` | Refuted prototype | Opt in to P3 LOI admission / force its legacy exit; default OFF after neutral-negative timing |
+| `DC2_G652_NO_VU_SHORTENTRY=1` / `_NO_VU_HAZSTORE=1` | Rollback | Independently restore the two promoted P13 VU tail/exit arms |
+| `DC2_G652_NO_RUNTIME_FASTDISPATCH=1` | Rollback | Disables promoted P6 runtime-only single-probe dispatch |
+| `DC2_G652_CRIT_TRACE=1` / `_RINGBENCH=1` | Diagnostic / experiment | P15 critical-path timeline and P17 persistent command-ring proof; both default-OFF and invalid in timing arms |
+| `PS2X_G654_GPUDOMAIN=ON` (CMake) | Build mode | Restores the G629–G636 persistent-GS-domain prototype. **Default OFF = compiled out** (G654 P5). Every `DC2_G629_*` / `DC2_G630_*` / `DC2_G632_*` / `DC2_G633_*` / `DC2_G634_*` / `DC2_G636_*` flag exists ONLY in this build |
+| `PS2X_G654_DIAG=ON` (CMake) + `DC2_G654_LAYER=1` | Build mode / census | `[G654:layer]` exclusive per-thread layer split, `[G654:submit]` the four-seam submit split, `[G654:bindmemo]` the per-entry bind-decision repeat census. Never valid in a timing arm |
+| `DC2_ACK_LAYOUT_GROWTH=<reason>` | Build guard | Acknowledges a hot-TU code/COMDAT growth in `tools/g652_layout_guard.ps1`; the reason belongs in the phase fix log beside the timing gate that justified it |
+| `DC2_TEXTURE_REPLACEMENTS=1` / `_DUMP=1` | Textures | Enable HD texture replacement / dumping (`Mods/HD Texture`) |
 
 *Full flag catalogue: [plans/env-flags.md](file:///d:/ps2r/dc2/plans/env-flags.md).*
 
@@ -171,7 +175,7 @@ cmake --build D:\ps2r\dc2\build64 --config Release --target dc2_game -- /m:1
 ## Durable Architecture Overview
 
 ### 1. The 5 GS Worker Layers (`processGIFPacket`)
-1. **Layer 1 — Batch Execution & CPU Band Replay**: Replays rasterization for display and discovered targets where GPU contracts fallback (accelerated via G605/G608/G609 triangle span kernels, G530/G614/G615/G617 sprite and fill kernels). **Dispatch (G637, `DC2_G637_COOP=1`, default-OFF)**: the row range is cut into ~4× more contiguous chunks than lanes and every participant — *including the GS thread itself* — claims chunks from one lock-free generation-tagged cursor until the batch is exhausted (`GSRowPool::runCoop`, `g637_coop_replay.inc`). Exact by the same argument as the legacy equal-band split: contiguous disjoint row ranges, whole entry list replayed in submission order clipped to each. The legacy `GSRowPool::run` barrier remains and is what `DC2_G637_NO_COOP=1` restores verbatim.
+1. **Layer 1 — Batch Execution & CPU Band Replay**: Replays rasterization for display and discovered targets where GPU contracts fallback (accelerated via G605/G608/G609 triangle span kernels, G530/G614/G615/G617 sprite and fill kernels). Dispatched via G637 cooperative work-stealing (`GSRowPool::runCoop`).
 2. **Layer 2 — `drawPrimitive` & Tile-Bin Capture**: Fixed front-end tile binning and winner search (`g310EnsureCurrent`).
 3. **Layer 3 — Register-Triggered TRXDIR Transfers**: Table-driven same-format local-to-local VRAM transfers (`g596copy`).
 4. **Layer 4 — GIF Tag Walk & Register Replay**: Vertex assembly and non-vertex register state machine with outlined prologues (`g602_gif_cold_outline.inc`).
@@ -185,33 +189,32 @@ cmake --build D:\ps2r\dc2\build64 --config Release --target dc2_game -- /m:1
 5. **Level 5 — Interpreter Pair Loop (`VU1Interpreter::run()`)**: Fallback generic interpreter loop for uncompiled / hazard pairs.
 
 ### 3. GPU Band Replay & Persistent GS Domain Prototype Status (G629–G636)
-- **Status: CLOSED NEGATIVE ON PERFORMANCE (DEFAULT-OFF).**
-- G636 resolved all visual defects across the prototype family (now 100% bit-exact `0.00/0.00/0.00` on 53 keys of `ridepod` opening sf 768..1392). However, end-to-end performance is +1.13 to +1.51 ms/f slower than control because refusing private depth leaves 57% of batches on CPU replay, so addressable wait savings (~1.2 ms/f) sit below added resident costs (~1.8 ms/f). Kept default-OFF. Full autopsy: `plans/phase-history.md` & `phase-G636-fix-log.md`.
+- **Status: CLOSED NEGATIVE ON PERFORMANCE — and since G654, COMPILED OUT.** `PS2X_G654_GPUDOMAIN`
+  (CMake option, default **OFF**) selects constant-folding stubs
+  (`ps2_gs_rasterizer_parts/g654_stub_gpudomain.inc`, `g654_stub_g629.inc`) instead of the family.
+  Removing its 134,807 bytes from the hottest TU bought **−1.082 ms/f on `dragon:tail`** (rule 16).
+  ⚠️ Every `DC2_G629_*`/`DC2_G630_*`/`DC2_G632_*`/`DC2_G633_*`/`DC2_G634_*`/`DC2_G636_*` env flag
+  exists ONLY in a `-DPS2X_G654_GPUDOMAIN=ON` build; a census that needs one must be run there.
+- G636 resolved all visual defects across the prototype family (100% bit-exact `0.00/0.00/0.00` on `ridepod` opening). However, end-to-end performance is +1.13 to +1.51 ms/f slower than control due to private depth fallback leaving 57% of batches on CPU. Kept default-OFF.
 
 ### 4. GPU-VU Architecture Status
-- **Closed Across All Shapes**: Scalar GPU-VU interpreter (G606), translated GPU-VU compute (G607), and program-point batching (G608) are all closed due to synchronization, kick-chain dispatch floor, and inter-kick RAW dependencies. All VU1 execution is retained on native CPU compilation backend.
+- **Status: CLOSED ACROSS ALL SHAPES.**
+- Scalar GPU-VU (G606), translated GPU-VU compute (G607), and program-point batching (G608) are closed due to synchronization, kick-chain dispatch floor, and inter-kick RAW dependencies. Retained on native CPU compilation backend.
 
 ### 5. Unified Performance Profiler & Telemetry (`dc2_profiler.inc`)
-- **Multi-Threaded Model**: Main Thread (serial wall-clock: Upload, Present, WaitFrame, Input, DrawHUD); Concurrent Worker Threads (cumulative CPU: `EE_CPU`, `VU1`, `GS`).
-- **Overhead**: Subsystem timing (`DC2_PROFILE=1`) < 0.1 ms/frame; function profiling (`DC2_PROFILE_FUNCTIONS=1`) ~0.40 ms/frame. Live overlay via F3 toggle. Guide: [`PERFORMANCE_PROFILER_REPORT.md`](file:///d:/ps2r/dc2/PERFORMANCE_PROFILER_REPORT.md).
+- Multi-Threaded Model: Main Thread (serial wall-clock: Upload, Present, WaitFrame, Input, DrawHUD); Concurrent Worker Threads (cumulative CPU: `EE_CPU`, `VU1`, `GS`). Guide: [`PERFORMANCE_PROFILER_REPORT.md`](file:///d:/ps2r/dc2/PERFORMANCE_PROFILER_REPORT.md).
 
 ### 6. Debug Logging & Crash Reporting (`dc2_logger.inc` & `dc2_crash_reporter.inc`)
-- **Structured Logging**: 6 log levels across 18 subsystem categories, dual sinks (ANSI console + rotating `logs/latest.log`), zero-allocation in-memory crash ring buffer.
-- **Crash Reporting**: Windows SEH filter, guest function symbol resolver (`DAC.csv`, 7,810 functions), register snapshots, MiniDump (`crashes/`). Guide: [`DEBUG_AND_CRASH_REPORTING.md`](file:///d:/ps2r/dc2/DEBUG_AND_CRASH_REPORTING.md).
+- Structured logging across 18 subsystem categories; Windows SEH crash filter, guest symbol resolver (`DAC.csv`, 7,810 symbols), register snapshots, MiniDump (`crashes/`). Guide: [`DEBUG_AND_CRASH_REPORTING.md`](file:///d:/ps2r/dc2/DEBUG_AND_CRASH_REPORTING.md).
 
 ### 7. HD Texture Replacement & Dumping Prototype (`ps2_texture_replacements.inc`)
-- **Status**: Supports 6,577 PNG pack (`Mods/HD Texture`), scanning at startup in ~37ms. Guide: [`TEXTURE_REPLACEMENT_REPORT.md`](file:///d:/ps2r/dc2/TEXTURE_REPLACEMENT_REPORT.md).
+- Supports 6,577 PNG pack (`Mods/HD Texture`), scanning at startup in ~37ms. Guide: [`TEXTURE_REPLACEMENT_REPORT.md`](file:///d:/ps2r/dc2/TEXTURE_REPLACEMENT_REPORT.md).
 
 ---
-
 ## Known Issues & Prototype Status
 
-- **Correctness Status**: ✅ **NO KNOWN OPEN CORRECTNESS DEFECT** across the shipped default path and prototype arms (all 3 defects eliminated and bit-exact since G636).
-- **Performance Targets & Active Qualification**:
-  - **Objectives**: 30 FPS floor (no gameplay frame over 33.33 ms); long-term 60 FPS (16.67 ms).
-  - ⭐⭐⭐ **Worst-Case GS Route (G638, re-taken G639)**: `dragon` static tail — after G637+G639 promotion frame **≈31.8–32.4 ms**, GS own **≈29.7–30.4**, VU1 ≈23.4–23.9, EE cpu ≈14.5–15.1. **Sole GS pole, headroom ≈+6.4 ms/f.** (Pre-promotion it was 34.4–35.8 / 33.2–33.8 / +9.2.) ⛔ Its pole is **not** rasterization: 44% is the G570 0x139 shadow-compute preparation + band round trip, and the whole CPU band replay is 1.6 ms/f. See `plans/phase-G638-fix-log.md` §2 and `appendix-dc2-test-routes.md` §1.3p.
-  - **Band-Replay Gate Route**: `ridepod` — post-G637 baseline frame **22.21 ms**, GS own **19.74**, VU1 17.65, EE cpu 14.13, headroom +2.1. ⭐ **Re-derived injection sensitivity (G638): GS 0.971 / VU1 −0.212** — still a **SOLE GS POLE**; VU1 has real slack even at 19 ms/f. ⛔ `dragon` **cannot** gate a band-replay lever — it is 1.6 ms/f there and G637's A B B A reads NULL (blocks −0.197 / +0.026). **Gate a lever where its MECHANISM dominates, not where the POLE is largest.**
-  - **Active EE Route**: `s05` (frame 16.5–17.2 ms, EE cpu **14.6–15.1 ms/f** — EE poled, −2.5 ms/f needed for 60 FPS gate).
+
+  - **Objectives**: 60 FPS floor (no gameplay frame over 16.67 ms); long-term 60 FPS.
 - **High-Resolution Prototype Issues**:
   - **FOV Stretch**: Setting `DC2_RESOLUTION_WIDTH` stretches 4:3 image rather than expanding FOV.
   - **Height Multiples**: `DC2_RESOLUTION_HEIGHT` requires integer multiples of 448 (e.g. 896).
