@@ -37,7 +37,10 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
                                            static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0)),
                                            ctx);
 
-        RecompiledFunction fn = lookupFunction(pc);
+        // G652 P6: the outer runtime dispatcher does not need to re-evaluate dormant
+        // lookup observers after the direct-table probe. The helper falls back verbatim
+        // whenever diagnostics/statistics/SP balancing are active.
+        RecompiledFunction fn = ps2LookupFunctionRuntimeFast(this, pc);
         const uint32_t dispatchedPc = pc;
         const uint32_t dispatchedRa = static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0));
 

@@ -807,6 +807,75 @@ static __declspec(noinline) void g649DispatchDiagnostics(uint32_t address, uint8
     }
 }
 
+// G652 P6/P16: direct-table single-probe helpers for runtime and generated dispatch. The fast
+// path is used only when every observer/trampoline is dormant. Otherwise the original public API
+// runs verbatim, retaining statistics, diagnostics, dispatch history, and SP-balance behavior.
+static const bool g_g652NoFastDispatch = (std::getenv("DC2_G652_NO_FASTDISPATCH") != nullptr);
+static const bool g_g652NoGeneratedFastDispatch =
+    g_g652NoFastDispatch || (std::getenv("DC2_G652_NO_GENERATED_FASTDISPATCH") != nullptr);
+static const bool g_g652NoRuntimeFastDispatch =
+    g_g652NoFastDispatch || (std::getenv("DC2_G652_NO_RUNTIME_FASTDISPATCH") != nullptr);
+
+static PS2Runtime::RecompiledFunction g652TryRegisteredFunctionFast(
+    PS2Runtime *runtime, uint32_t address, bool disabled)
+{
+    if (!runtime)
+        return nullptr;
+    if (disabled || !s_g646DispatchOn || s_g646StatOn || g_g649DispatchDiagOn ||
+        g_g651DispStat || g_g186SpBal)
+    {
+        if (!runtime->hasFunction(address))
+            return nullptr;
+        return runtime->lookupFunction(address);
+    }
+    const PS2Runtime::RecompiledFunction direct = g646Get(address);
+    if (!direct)
+    {
+        if (!runtime->hasFunction(address))
+            return nullptr;
+        return runtime->lookupFunction(address);
+    }
+    pushDispatchPc(address);
+    return direct;
+}
+
+static PS2Runtime::RecompiledFunction g652LookupFunctionFast(
+    PS2Runtime *runtime, uint32_t address, bool disabled)
+{
+    if (!runtime)
+        return nullptr;
+    if (!disabled && s_g646DispatchOn && !s_g646StatOn && !g_g649DispatchDiagOn &&
+        !g_g651DispStat && !g_g186SpBal)
+    {
+        if (const PS2Runtime::RecompiledFunction direct = g646Get(address))
+        {
+            pushDispatchPc(address);
+            return direct;
+        }
+    }
+    return runtime->lookupFunction(address);
+}
+
+PS2Runtime::RecompiledFunction ps2TryRegisteredFunctionFast(PS2Runtime *runtime, uint32_t address)
+{
+    return g652TryRegisteredFunctionFast(runtime, address, g_g652NoGeneratedFastDispatch);
+}
+
+PS2Runtime::RecompiledFunction ps2LookupFunctionFast(PS2Runtime *runtime, uint32_t address)
+{
+    return g652LookupFunctionFast(runtime, address, g_g652NoGeneratedFastDispatch);
+}
+
+PS2Runtime::RecompiledFunction ps2TryRegisteredFunctionRuntimeFast(PS2Runtime *runtime, uint32_t address)
+{
+    return g652TryRegisteredFunctionFast(runtime, address, g_g652NoRuntimeFastDispatch);
+}
+
+PS2Runtime::RecompiledFunction ps2LookupFunctionRuntimeFast(PS2Runtime *runtime, uint32_t address)
+{
+    return g652LookupFunctionFast(runtime, address, g_g652NoRuntimeFastDispatch);
+}
+
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);

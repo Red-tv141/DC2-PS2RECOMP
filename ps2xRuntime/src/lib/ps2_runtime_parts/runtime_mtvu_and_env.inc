@@ -513,6 +513,8 @@ public:
         {
             std::lock_guard<std::mutex> lk(m_mtx);
             m_work.push_back(item);
+            if (g652CriticalTraceOn)
+                g652CriticalTrace(10u, static_cast<uint64_t>(m_work.size()));
         }
         m_cvWork.notify_one();
         // G301 diagnostic: DC2_G301_SYNC_WORKER runs the kick on the worker but BLOCKS the EE until
@@ -816,6 +818,8 @@ private:
                 item = m_work.front();
                 m_work.pop_front();
             }
+            if (g652CriticalTraceOn)
+                g652CriticalTrace(11u, static_cast<uint64_t>(item->writes.size()));
             const auto g441T1 = s_g441Kick ? std::chrono::steady_clock::now()
                                            : std::chrono::steady_clock::time_point{};
             g_g297KickCapture = &item->packets; // redirect this kick's XGKICKs into item->packets
@@ -933,6 +937,8 @@ private:
                                    PS2_VU1_DATA_SIZE, *m_gs, m_mem, item->startPC, item->itop,
                                    item->budget);
             }
+            if (g652CriticalTraceOn)
+                g652CriticalTrace(12u, static_cast<uint64_t>(item->budget));
             // G438: when DC2_G419_AB=vu1slow is armed the spin runs on CANDIDATE frames only, so the
             // probe becomes a within-process paired measurement instead of a difference of two run
             // means (whose run-level spread is ~4.5 ms here — larger than the effect). The spin

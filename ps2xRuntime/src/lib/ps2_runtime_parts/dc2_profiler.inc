@@ -31,6 +31,10 @@
 #include <iomanip>
 #include <sstream>
 
+// G652 P2 counter is implemented in ps2_runtime_cold.cpp. The generated RAII scopes around
+// WaitVSync/mgGetVSyncCount feed it; the G182 reporter subtracts its delta from raw EE CPU.
+extern uint64_t ps2EeWaitCpuNs();
+
 #ifndef ENABLE_PROFILER
 #define ENABLE_PROFILER 1
 #endif

@@ -15,6 +15,10 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
     G146PerfScope g146Scope(g_g146Vif1Ns);
+    // G654 P17: the EXCLUSIVE, thread-keyed companion. `G146PerfScope` has no nesting guard, and
+    // submitGifPacket - which opens the GIFsubmit scope - is reached from inside this body, so
+    // every GIF submit driven by VIF1 is counted in BOTH buckets. Empty in the default build.
+    G654LayerScope g654Scope(kG654LayerVif1);
 
     if (!data || !m_gsVRAM || sizeBytes == 0u)
         return;

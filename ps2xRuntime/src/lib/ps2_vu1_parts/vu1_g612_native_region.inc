@@ -121,6 +121,9 @@ namespace
     // forward-declared here. Its definition (and the whole exactness argument) is beside
     // `g612VerifyOn`.
     bool g651VuClipOn();
+    bool g652VuLoiOn();
+    bool g652VuShortEntryOn();
+    bool g652VuHazStoreOn();
 
     constexpr uint32_t G612_MAX_BB = 48u;          // basic blocks per region
     constexpr uint32_t G612_MAX_PAIRS = 512u;      // emitted pairs per region
@@ -318,13 +321,43 @@ namespace
         return g421DescTableConst.e[p.upperKind].cls != 0u;
     }
 
+    // G652 P13: SQI's same-pair hazard means its VF source must observe the pre-upper value.
+    // The generic loop implements that by saving the old VF, executing upper, temporarily
+    // restoring old VF for lower, then overlaying the upper result. SQI never writes a VF, so the
+    // exact equivalent is much smaller: emit SQI first and upper second. The store and VI
+    // post-increment are invisible to every upper opcode, while the upper's FMAC history record
+    // is invisible to SQI. Keep this admission deliberately limited to the measured opcode.
+    bool g652RegionHazStorePairOk(uint32_t slot)
+    {
+        if (!g652VuHazStoreOn() || slot >= G612_SLOTS)
+            return false;
+        const G410CompiledUpper &p = s_g410Cache.uppers[slot];
+        if (p.pairFlags != 0u || p.lowerKind != G422_LK_SQI ||
+            (p.g425Flags & G426_PF_HAZ) == 0u)
+            return false;
+        if ((p.g425Flags & (G426_PF_PRESTALL | G427_PF_FLAGREAD | G428_PF_STATUSREAD)) != 0u)
+            return false;
+        if (p.upperKind == 0x6fu)
+            return true;
+        return g421DescTableConst.e[p.upperKind].cls != 0u;
+    }
+
     // A PLAIN region pair: block-eligible by the shipped sidecar AND inside the emitted op set.
     bool g612PlainEmittable(uint32_t slot)
     {
         if (slot >= G612_SLOTS)
             return false;
+        const G410CompiledUpper &p = s_g410Cache.uppers[slot];
+        // G652 P3: an I-bit pair executes the upper after loading the lower word into st.i; the
+        // lower word is not an instruction. E-bit remains an exit because it latches program end.
+        if (g652VuLoiOn() && p.pairFlags == G410_PAIR_I_BIT)
+        {
+            const G479FusedPair &fp = s_g410Cache.fused[slot];
+            return g612UpperEmittable(fp.pair.upperKind, (uint32_t)(fp.source >> 32));
+        }
         // precondition 1 — or, for FCGET only, the hand-checked equivalent above.
-        if (s_g410Cache.g490RunLen[slot] == 0u && !g651RegionClipPairOk(slot))
+        if (s_g410Cache.g490RunLen[slot] == 0u && !g651RegionClipPairOk(slot) &&
+            !g652RegionHazStorePairOk(slot))
             return false;
         const G479FusedPair &fp = s_g410Cache.fused[slot];
         return g612UpperEmittable(fp.pair.upperKind, (uint32_t)(fp.source >> 32)) &&
@@ -433,6 +466,117 @@ namespace
     {
         static const bool s_on = f50_12_vu_env_flag("DC2_G612_VERIFY");
         return s_on;
+    }
+    bool g652VuLoiOn()
+    {
+        // P3 prototype remains available for exactness/census work, but its independent
+        // warmed timing gate found no VU benefit. Keep the proven legacy exit as default.
+        static const bool s_on = f50_12_vu_env_flag("DC2_G652_VU_LOI") &&
+                                 !f50_12_vu_env_flag("DC2_G652_NO_VU_LOI");
+        return s_on;
+    }
+    bool g652VuShortEntryOn()
+    {
+        static const bool s_on = !f50_12_vu_env_flag("DC2_G652_NO_VU_SHORTENTRY");
+        return s_on;
+    }
+    bool g652VuHazStoreOn()
+    {
+        static const bool s_on = !f50_12_vu_env_flag("DC2_G652_NO_VU_HAZSTORE");
+        return s_on;
+    }
+    thread_local std::array<uint32_t, G612_SLOTS> s_g652ExitIAt{};
+    thread_local std::array<uint32_t, G612_SLOTS> s_g652ExitEAt{};
+    thread_local std::array<uint32_t, G612_SLOTS> s_g652FmandPendingAt{};
+    thread_local std::array<uint32_t, G612_SLOTS> s_g652FmandMaterialAt{};
+
+    // G652: `s_g612ExitAt` is intentionally a slot histogram, but VU micro-memory is
+    // self-modifying.  Labelling that accumulated count with the *latest* image in
+    // `s_g410Cache` produced plausible-looking lies when one slot hosted several programs.
+    // Keep an exact raw-instruction identity alongside the legacy location census.  This table
+    // exists only behind DC2_G612_STAT, so the larger key and open-addressed lookup do not touch
+    // the production path.
+    constexpr uint32_t G652_EXIT_ID_CAP = 16384u;
+    struct G652ExitIdentity
+    {
+        uint64_t source = 0u;
+        uint64_t count = 0u;
+        uint64_t iCount = 0u;
+        uint64_t eCount = 0u;
+        uint64_t fmandPending = 0u;
+        uint64_t fmandMaterial = 0u;
+        uint16_t slot = 0u;
+        uint8_t lowerKind = 0u;
+        uint8_t upperKind = 0u;
+        uint8_t pairFlags = 0u;
+        uint8_t g425Flags = 0u;
+        uint8_t tail = 0u;
+        uint8_t used = 0u;
+    };
+    thread_local std::array<G652ExitIdentity, G652_EXIT_ID_CAP> s_g652ExitIdentity{};
+    thread_local uint64_t s_g652ExitIdentityDropped = 0u;
+
+    void g652ExitIdentityNote(uint32_t slot, int fmandState)
+    {
+        const G410CompiledUpper &p = s_g410Cache.uppers[slot];
+        const uint64_t source = s_g410Cache.sources[slot];
+        const uint8_t tail = s_g410Cache.g500Tail[slot];
+        uint64_t hash = source ^ (static_cast<uint64_t>(slot) * 0x9e3779b97f4a7c15ull);
+        hash ^= static_cast<uint64_t>(tail) * 0xbf58476d1ce4e5b9ull;
+        hash ^= hash >> 30u;
+        hash *= 0xbf58476d1ce4e5b9ull;
+        hash ^= hash >> 27u;
+        hash *= 0x94d049bb133111ebull;
+        hash ^= hash >> 31u;
+        uint32_t at = static_cast<uint32_t>(hash) & (G652_EXIT_ID_CAP - 1u);
+        for (uint32_t probe = 0u; probe < G652_EXIT_ID_CAP; ++probe)
+        {
+            G652ExitIdentity &r = s_g652ExitIdentity[at];
+            if (r.used == 0u)
+            {
+                r.used = 1u;
+                r.source = source;
+                r.slot = static_cast<uint16_t>(slot);
+                r.lowerKind = p.lowerKind;
+                r.upperKind = p.upperKind;
+                r.pairFlags = p.pairFlags;
+                r.g425Flags = p.g425Flags;
+                r.tail = tail;
+            }
+            if (r.source == source && r.slot == slot && r.lowerKind == p.lowerKind &&
+                r.upperKind == p.upperKind && r.pairFlags == p.pairFlags &&
+                r.g425Flags == p.g425Flags && r.tail == tail)
+            {
+                ++r.count;
+                if ((p.pairFlags & G410_PAIR_I_BIT) != 0u)
+                    ++r.iCount;
+                if ((p.pairFlags & G410_PAIR_E_BIT) != 0u)
+                    ++r.eCount;
+                if (fmandState > 0)
+                    ++r.fmandPending;
+                else if (fmandState == 0)
+                    ++r.fmandMaterial;
+                return;
+            }
+            at = (at + 1u) & (G652_EXIT_ID_CAP - 1u);
+        }
+        ++s_g652ExitIdentityDropped;
+    }
+
+    bool g652MacHistoryPendingAt(const G430HistBlock &h, int64_t target)
+    {
+        int best = -1;
+        int64_t bestStamp = INT64_MIN;
+        for (int i = 0; i < G430_HIST; ++i)
+        {
+            const int64_t stamp = h.stamp[i];
+            if (stamp <= target && stamp > bestStamp)
+            {
+                bestStamp = stamp;
+                best = i;
+            }
+        }
+        return best >= 0 && h.kind[best] == G428_MK_PENDING;
     }
     // ============================================================================================
     // ⭐ G651 (ROADMAP Priority 3) — FCGET EMITTED INSIDE THE REGION BODY
@@ -809,9 +953,22 @@ namespace
         int why = 0;
         bool usesHist = false;
         bool used = false;
+        const bool loi = g652VuLoiOn() &&
+                         fp.pair.pairFlags == G410_PAIR_I_BIT;
+        const bool hazardStore = g652RegionHazStorePairOk(slot);
+        if (loi)
+            e.movStImm32(G610_RCX, G610_OFF_I, lower);  // visible to this pair's upper
+        // SQI must read the pre-upper VF. It cannot affect any upper input, so scheduling this
+        // lower first is the exact same-cycle overlay without save/restore traffic.
+        if (hazardStore && !g610EmitLower(e, lower, fp.pair.lowerKind, dataSize, &why))
+            return false;
         if (!g610EmitUpper(e, upper, fp.pair.upperKind, j, usesHist, used, &why))
             return false;
-        if (fp.pair.lowerKind == G422_LK_FCGET)
+        if (loi)
+        {
+            // The lower word is the immediate, so there is no lower instruction to emit.
+        }
+        else if (fp.pair.lowerKind == G422_LK_FCGET)
         {
             // ⭐ G651: `if (it != 0) st.vi[it] = (int32_t)(st.clip & 0xFFFu);`
             // Three instructions, and the transcription is the interpreter's own statement:
@@ -832,7 +989,7 @@ namespace
             }
             ++s_g651ClipEmitted;
         }
-        else if (!g610EmitLower(e, lower, fp.pair.lowerKind, dataSize, &why))
+        else if (!hazardStore && !g610EmitLower(e, lower, fp.pair.lowerKind, dataSize, &why))
             return false;
         g612EmitRepin(e, fp);
         return true;
@@ -1249,7 +1406,11 @@ namespace
         {
             if (s_g612.slot[i].fn != nullptr || s_g612Claim[i] != 0u)
                 continue;                              // already inside an earlier region
-            if (s_g410Cache.g490RunLen[i] < G612_MIN_ENTRY)
+            // G652 P13: dynamic JR/JALR exits commonly land on one plain pair followed by an
+            // already-supported IBEQ/IBNE tail. The old two-pair block threshold left those
+            // fragments permanently unbound. Let the CFG planner price all emittable starts;
+            // its existing `anyBranch` test rejects truly trivial one-pair regions before emit.
+            if (s_g410Cache.g490RunLen[i] < G612_MIN_ENTRY && !g652VuShortEntryOn())
                 continue;
             if (!g612PlainEmittable(i))
                 continue;
@@ -1380,12 +1541,58 @@ namespace
                     break;
                 }
         }
-        std::fprintf(stderr, "[G612:exit]");
+        std::fprintf(stderr, "[G612:exitslot]");
         for (int s = 0; s < 8; ++s)
             if (topVal[s] != 0u)
-                std::fprintf(stderr, " 0x%04x:%u(lk=%u,uk=0x%02x)", topIdx[s] * 8u, topVal[s],
-                             (unsigned)s_g410Cache.uppers[topIdx[s]].lowerKind,
-                             (unsigned)s_g410Cache.uppers[topIdx[s]].upperKind);
+                std::fprintf(stderr, " 0x%04x:%u(i=%u,e=%u)", topIdx[s] * 8u, topVal[s],
+                             s_g652ExitIAt[topIdx[s]], s_g652ExitEAt[topIdx[s]]);
+        std::fprintf(stderr, "\n");
+        std::fprintf(stderr, "[G652:fmand]");
+        for (int s = 0; s < 8; ++s)
+            if (topVal[s] != 0u &&
+                (s_g652FmandPendingAt[topIdx[s]] != 0u ||
+                 s_g652FmandMaterialAt[topIdx[s]] != 0u))
+                std::fprintf(stderr, " 0x%04x:pending=%u,material=%u", topIdx[s] * 8u,
+                             s_g652FmandPendingAt[topIdx[s]],
+                             s_g652FmandMaterialAt[topIdx[s]]);
+        std::fprintf(stderr, "\n");
+        uint32_t idTop[12] = {};
+        uint64_t idVal[12] = {};
+        for (uint32_t i = 0u; i < G652_EXIT_ID_CAP; ++i)
+        {
+            const uint64_t v = s_g652ExitIdentity[i].count;
+            if (v == 0u)
+                continue;
+            for (int s = 0; s < 12; ++s)
+                if (v > idVal[s])
+                {
+                    for (int t = 11; t > s; --t)
+                    {
+                        idVal[t] = idVal[t - 1];
+                        idTop[t] = idTop[t - 1];
+                    }
+                    idVal[s] = v;
+                    idTop[s] = i;
+                    break;
+                }
+        }
+        std::fprintf(stderr, "[G652:exitid] dropped=%llu",
+                     (unsigned long long)s_g652ExitIdentityDropped);
+        for (int s = 0; s < 12; ++s)
+            if (idVal[s] != 0u)
+            {
+                const G652ExitIdentity &r = s_g652ExitIdentity[idTop[s]];
+                std::fprintf(stderr,
+                             " 0x%04x/%016llx:%llu(lk=%u,uk=0x%02x,pf=0x%x,g425=0x%x,"
+                             "tail=%u,i=%llu,e=%llu,fp=%llu,fm=%llu)",
+                             (unsigned)r.slot * 8u, (unsigned long long)r.source,
+                             (unsigned long long)r.count, (unsigned)r.lowerKind,
+                             (unsigned)r.upperKind, (unsigned)r.pairFlags,
+                             (unsigned)r.g425Flags, (unsigned)r.tail,
+                             (unsigned long long)r.iCount, (unsigned long long)r.eCount,
+                             (unsigned long long)r.fmandPending,
+                             (unsigned long long)r.fmandMaterial);
+            }
         std::fprintf(stderr, "\n");
         // ⭐ G651: how many FCGET pairs the emitter actually placed inside region bodies. `on=0`
         // with a non-zero `[G612:exit] lk=37` row means the arm is disarmed, not that the lever

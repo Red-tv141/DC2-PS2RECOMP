@@ -197,6 +197,31 @@ bool g643SsboOn()
     return on;
 }
 
+bool g652RingBenchRequestedFwd()
+{
+    static const bool on = g158EnvFlag("DC2_G652_RINGBENCH");
+    return on;
+}
+
+// G652 P10: rotate each payload through three non-overlapping ranges. Retained as an opt-in
+// prototype: the paired dragon gate was +0.941 ms/f slower raw and +0.243 ms/f slower by held
+// blocks (t=1.97), so extra capacity/range binds cost more than any removed upload serialization.
+bool g652SsboRingOn()
+{
+    const int arm = g652SsboRingArm();
+    if (arm >= 0)
+        return arm != 0;
+    static const bool on = g158EnvFlag("DC2_G652_SSBORING") &&
+                           !g158EnvFlag("DC2_G652_NO_SSBORING");
+    return on;
+}
+
+bool g652SsboRingStatOn()
+{
+    static const bool on = g158EnvFlag("DC2_G652_SSBORING_STAT");
+    return on;
+}
+
 // G324 diagnostics mirror the front-end armed/census split. They time only the existing logical
 // composite and T8-view QueueItems; default runs pay cached-boolean branches only.
 bool g324BackendCensusOn()
@@ -662,7 +687,11 @@ typedef void(APIENTRY *PFN178GETINTERNALFORMATIV)(GLenum, GLenum, GLenum, GLsize
 typedef void(APIENTRY *PFN541DISPATCHCOMPUTE)(GLuint, GLuint, GLuint);
 // G643: the two entry points the SSBO data path for the 0x139 compute needs beyond GLFns.
 typedef void(APIENTRY *PFN643BINDBUFFERBASE)(GLenum, GLuint, GLuint);
+typedef void(APIENTRY *PFN643BINDBUFFERRANGE)(GLenum, GLuint, GLuint, GLsizeiptrLocal, GLsizeiptrLocal);
 typedef void(APIENTRY *PFN643BUFFERSUBDATA)(GLenum, GLsizeiptrLocal, GLsizeiptrLocal, const void *);
+typedef void(APIENTRY *PFN652BUFFERSTORAGE)(GLenum, GLsizeiptrLocal, const void *, GLbitfield);
+typedef void *(APIENTRY *PFN652MAPBUFFERRANGE)(GLenum, GLsizeiptrLocal, GLsizeiptrLocal, GLbitfield);
+typedef GLboolean(APIENTRY *PFN652UNMAPBUFFER)(GLenum);
 
 struct G178GLExt
 {
@@ -679,7 +708,11 @@ struct G178GLExt
     PFN178GETINTERNALFORMATIV glGetInternalformativ_ = nullptr;
     PFN541DISPATCHCOMPUTE glDispatchCompute_ = nullptr;
     PFN643BINDBUFFERBASE glBindBufferBase_ = nullptr;
+    PFN643BINDBUFFERRANGE glBindBufferRange_ = nullptr;
     PFN643BUFFERSUBDATA glBufferSubData_ = nullptr;
+    PFN652BUFFERSTORAGE glBufferStorage_ = nullptr;
+    PFN652MAPBUFFERRANGE glMapBufferRange_ = nullptr;
+    PFN652UNMAPBUFFER glUnmapBuffer_ = nullptr;
 };
 
 bool g178LoadGLExt(G178GLExt &e)
@@ -720,7 +753,15 @@ bool g178LoadGLExt(G178GLExt &e)
     if (g570Shadow139Requested())
     {
         (void)loadProc(e.glBindBufferBase_, "glBindBufferBase");
+        (void)loadProc(e.glBindBufferRange_, "glBindBufferRange");
         (void)loadProc(e.glBufferSubData_, "glBufferSubData");
+    }
+    if (g652RingBenchRequestedFwd())
+    {
+        (void)loadProc(e.glBufferStorage_, "glBufferStorage");
+        (void)loadProc(e.glMapBufferRange_, "glMapBufferRange");
+        (void)loadProc(e.glUnmapBuffer_, "glUnmapBuffer");
+        (void)loadProc(e.glBindBufferBase_, "glBindBufferBase");
     }
     return ok;
 }
@@ -768,6 +809,7 @@ constexpr GLenum GL641_PACK_SKIP_PIXELS = 0x0D04;
 // translated-kernel include.
 #include "g607_translated_body.inc"
 #include "g607_tbench.inc"
+#include "g652_command_ring_bench.inc"
 // GPU texture-cache residency cap (bytes of decoded RGBA8). Title uses a handful of ≤512²
 // textures (~1-4MB); the cap only matters on texture-heavy routes. LRU by last-used batch.
 constexpr size_t kG178TexCacheCapBytes = 256ull * 1024 * 1024;
@@ -2565,6 +2607,8 @@ private:
             (void)g606RunWideBench(m_f, m_e);
         if (g607TBenchRequested())
             (void)g607RunTBench(m_f, m_e);
+        if (g652RingBenchRequested())
+            (void)g652RunRingBench(m_f, m_e);
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         m_ready.store(true, std::memory_order_release);
@@ -2614,6 +2658,8 @@ private:
                 }
                 m_queue.pop_front();
             }
+            if (g652CriticalTraceOn)
+                g652CriticalTrace(31u, 1u);
             if (item.g545LiveBatch)
             {
                 if (m_g545Available && !m_g545Disabled.load(std::memory_order_acquire))
@@ -3305,6 +3351,8 @@ private:
             // from the future, so nothing about the value or its ordering changes.
             if (item.doneFlag != nullptr)
                 item.doneFlag->store(1u, std::memory_order_release);
+            if (g652CriticalTraceOn)
+                g652CriticalTrace(32u, ok ? 1u : 0u);
             item.promise->set_value(ok);
         }
 
@@ -4973,17 +5021,47 @@ void main()
     // allocator stealing CPU from them). `g570UploadWords` never had that cost because
     // `allocatedRows` is a high-water mark. Match it: allocate once at a rounded-up capacity and
     // then only ever `glBufferSubData` into it.
-    bool g643UploadSsbo(int slot, const std::vector<uint32_t> &words)
+    bool g643UploadSsbo(int slot, const std::vector<uint32_t> &words,
+                        GLsizeiptrLocal &bindOffset, GLsizeiptrLocal &bindBytes)
     {
         if (words.empty())
             return false;
         const GLsizeiptrLocal bytes =
             static_cast<GLsizeiptrLocal>(words.size() * sizeof(uint32_t));
+        bindOffset = 0;
+        bindBytes = bytes;
         m_f.glBindBuffer_(GL643_SHADER_STORAGE_BUFFER, m_g643Ssbo[slot]);
-        if (m_g643SsboBytes[slot] < bytes)
+        const bool ring = g652SsboRingOn() && m_e.glBindBufferRange_ != nullptr;
+        if (ring)
         {
-            // Round the capacity up to 256 KB so a slowly growing batch does not reallocate every
-            // frame on its way up.
+            // Round the segment to both a coarse allocation grain and the driver's required
+            // SSBO range alignment. Being larger than the alignment is not sufficient when an
+            // implementation reports a non-divisor of the coarse grain.
+            constexpr GLsizeiptrLocal kGrain = 256 * 1024;
+            constexpr GLenum kSsboOffsetAlignment = 0x90DFu;
+            GLint alignmentValue = 1;
+            glGetIntegerv(kSsboOffsetAlignment, &alignmentValue);
+            const GLsizeiptrLocal alignment =
+                static_cast<GLsizeiptrLocal>(std::max(1, alignmentValue));
+            const GLsizeiptrLocal coarse = ((bytes + kGrain - 1) / kGrain) * kGrain;
+            const GLsizeiptrLocal segment =
+                ((coarse + alignment - 1) / alignment) * alignment;
+            if (m_g643SsboSegmentBytes[slot] < segment)
+            {
+                const GLsizeiptrLocal cap = segment * 3;
+                m_f.glBufferData_(GL643_SHADER_STORAGE_BUFFER, cap, nullptr, GL643_DYNAMIC_DRAW);
+                if (glGetError() != GL_NO_ERROR)
+                    return false;
+                m_g643SsboSegmentBytes[slot] = segment;
+                m_g643SsboBytes[slot] = cap;
+                m_g643SsboNext[slot] = 0u;
+                ++m_g652SsboGrows;
+            }
+            bindOffset = m_g643SsboSegmentBytes[slot] * m_g643SsboNext[slot];
+            m_g643SsboNext[slot] = (m_g643SsboNext[slot] + 1u) % 3u;
+        }
+        else if (m_g643SsboBytes[slot] < bytes)
+        {
             constexpr GLsizeiptrLocal kGrain = 256 * 1024;
             const GLsizeiptrLocal cap = ((bytes + kGrain - 1) / kGrain) * kGrain;
             m_f.glBufferData_(GL643_SHADER_STORAGE_BUFFER, cap, nullptr, GL643_DYNAMIC_DRAW);
@@ -4991,8 +5069,23 @@ void main()
                 return false;
             m_g643SsboBytes[slot] = cap;
         }
-        m_e.glBufferSubData_(GL643_SHADER_STORAGE_BUFFER, 0, bytes, words.data());
-        return glGetError() == GL_NO_ERROR;
+        m_e.glBufferSubData_(GL643_SHADER_STORAGE_BUFFER, bindOffset, bytes, words.data());
+        const bool ok = glGetError() == GL_NO_ERROR;
+        if (ok && ring)
+        {
+            ++m_g652SsboUploads;
+            m_g652SsboUploadBytes += static_cast<uint64_t>(bytes);
+            if (g652SsboRingStatOn() && (m_g652SsboUploads % 4096u) == 0u)
+                std::fprintf(stderr,
+                             "[G652:ssboring] uploads=%llu MiB=%.2f grows=%llu capMiB=%.2f\n",
+                             static_cast<unsigned long long>(m_g652SsboUploads),
+                             static_cast<double>(m_g652SsboUploadBytes) / (1024.0 * 1024.0),
+                             static_cast<unsigned long long>(m_g652SsboGrows),
+                             static_cast<double>(m_g643SsboBytes[0] + m_g643SsboBytes[1] +
+                                                 m_g643SsboBytes[2] + m_g643SsboBytes[3]) /
+                                 (1024.0 * 1024.0));
+        }
+        return ok;
     }
 
     bool g570UploadWords(GLuint &tex, uint32_t &allocatedRows, uint32_t width,
@@ -5176,10 +5269,14 @@ void main()
         // images. `m_g643Dead` retires the SSBO arm for the process on the first refusal, so a
         // driver that cannot serve it degrades to the proven path instead of failing the batch.
         const bool ssbo = m_g643Prog != 0u && !m_g643Dead;
+        GLsizeiptrLocal g652BindOffset[4] = {0, 0, 0, 0};
+        GLsizeiptrLocal g652BindBytes[4] = {0, 0, 0, 0};
         if (ssbo)
         {
-            const bool ok = g643UploadSsbo(0, triWords) && g643UploadSsbo(1, spanWords) &&
-                            g643UploadSsbo(2, tileOffsets) && g643UploadSsbo(3, tileTris);
+            const bool ok = g643UploadSsbo(0, triWords, g652BindOffset[0], g652BindBytes[0]) &&
+                            g643UploadSsbo(1, spanWords, g652BindOffset[1], g652BindBytes[1]) &&
+                            g643UploadSsbo(2, tileOffsets, g652BindOffset[2], g652BindBytes[2]) &&
+                            g643UploadSsbo(3, tileTris, g652BindOffset[3], g652BindBytes[3]);
             if (g571On) g571TriUs = g571LapUs();
             if (!ok)
             {
@@ -5221,7 +5318,15 @@ void main()
         if (ssbo)
         {
             for (GLuint slot = 0; slot < 4u; ++slot)
-                m_e.glBindBufferBase_(GL643_SHADER_STORAGE_BUFFER, 2u + slot, m_g643Ssbo[slot]);
+            {
+                if (g652SsboRingOn() && m_e.glBindBufferRange_ != nullptr)
+                    m_e.glBindBufferRange_(GL643_SHADER_STORAGE_BUFFER, 2u + slot,
+                                           m_g643Ssbo[slot], g652BindOffset[slot],
+                                           g652BindBytes[slot]);
+                else
+                    m_e.glBindBufferBase_(GL643_SHADER_STORAGE_BUFFER, 2u + slot,
+                                          m_g643Ssbo[slot]);
+            }
         }
         else
         {
@@ -9735,6 +9840,9 @@ void main()
     GLint m_locG643DeriveSpan = -1;
     GLuint m_g643Ssbo[4] = {0u, 0u, 0u, 0u};                // tris / spans / tileOffsets / tileTris
     GLsizeiptrLocal m_g643SsboBytes[4] = {0, 0, 0, 0};
+    GLsizeiptrLocal m_g643SsboSegmentBytes[4] = {0, 0, 0, 0};
+    uint32_t m_g643SsboNext[4] = {0u, 0u, 0u, 0u};
+    uint64_t m_g652SsboUploads = 0u, m_g652SsboUploadBytes = 0u, m_g652SsboGrows = 0u;
     bool m_g643Dead = false;            // ...retired for the process after any upload refusal
     GLuint m_g641ReadFbo = 0;   // G641: scratch FBO for the sub-rect colour read
     bool m_g641RectDead = false; // ...retired for the process after any refusal

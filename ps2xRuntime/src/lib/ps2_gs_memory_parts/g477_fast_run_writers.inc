@@ -71,6 +71,16 @@ namespace
         return v;
     }
 
+    bool g652P4BulkOn()
+    {
+        // Prototype only. Live dragon census found every P4 segment was already a complete
+        // 128-pixel G477 row (3.56M bulk segments, zero scalar), leaving zero partial groups for
+        // this arm. Keep it reproducible without adding a default-path branch/code-layout risk.
+        static const bool v = std::getenv("DC2_G652_P4BULK") != nullptr &&
+                              std::getenv("DC2_G652_NO_P4BULK") == nullptr;
+        return v;
+    }
+
     struct G477RunStat
     {
         unsigned long long calls = 0ull;
@@ -80,6 +90,8 @@ namespace
     G477RunStat g_g477Stat[2]; // 0 = CT32/Z32, 1 = P4  (GS worker only; single writer thread)
     unsigned long long g_g477P4Quad = 0ull;   // P4 segments taking the 32-bit quad-gather path
     unsigned long long g_g477P4Scalar = 0ull; // P4 segments falling back to the byte RMW loop
+    unsigned long long g_g652P4Groups = 0ull; // 32-pixel groups handled by the G652 bulk arm
+    unsigned long long g_g652P4Pixels = 0ull;
 
     void g477NoteRun(unsigned slot, u32 count)
     {
@@ -89,12 +101,12 @@ namespace
         if (((g_g477Stat[0].calls + g_g477Stat[1].calls) % 500000ull) == 0ull)
             std::fprintf(stderr,
                          "[G477:census] ct32(calls=%llu px=%llu avg=%.1f) p4(calls=%llu px=%llu avg=%.1f)"
-                         " p4seg(quad=%llu scalar=%llu)\n",
+                         " p4seg(quad=%llu scalar=%llu) g652(groups=%llu px=%llu)\n",
                          g_g477Stat[0].calls, g_g477Stat[0].pixels,
                          g_g477Stat[0].calls ? (double)g_g477Stat[0].pixels / (double)g_g477Stat[0].calls : 0.0,
                          g_g477Stat[1].calls, g_g477Stat[1].pixels,
                          g_g477Stat[1].calls ? (double)g_g477Stat[1].pixels / (double)g_g477Stat[1].calls : 0.0,
-                         g_g477P4Quad, g_g477P4Scalar);
+                         g_g477P4Quad, g_g477P4Scalar, g_g652P4Groups, g_g652P4Pixels);
     }
 
     std::atomic<unsigned long long> g_g477Ok{0ull};
@@ -358,79 +370,7 @@ namespace
             if (lim > count - i)
                 lim = count - i;
 
-            // Quad-gather path: a whole 128-pixel page row whose table layout was verified above.
-            const bool quadPath = (idx == 0u && lim == kPageW && g477P4QuadOk(bp % 32u, y % kPageH));
-            if (censusOn)
-            {
-                if (quadPath) ++g_g477P4Quad; else ++g_g477P4Scalar;
-            }
-            if (quadPath)
-            {
-                // Only the eight anchors of each 32-column group seed a quad; iterate them
-                // directly rather than filtering all 128 columns.
-                for (u32 a = 0u; a < 32u; ++a)
-                {
-                    const u32 c = ((a & ~7u) * 4u) + (a & 7u); // group (a>>3) * 32 + (a & 7)
-
-                    const u32 bits = (pageBase + row[c]) * 4u;
-                    const u32 b = (bits / 8u) & kMask;
-                    const u32 sh = bits % 8u;
-                    // The four bytes must stay contiguous after masking, or this anchor falls back.
-                    if ((((pageBase + row[c] + 6u) * 4u) / 8u & kMask) != b + 3u)
-                    {
-                        for (u32 q = 0u; q < 4u; ++q)
-                        {
-                            const u32 j = c + q * 8u;
-                            const u32 n = nibble0 + i + j;
-                            const u32 v = (static_cast<u32>(src[n >> 1u]) >> ((n & 1u) * 4u)) & 0x0Fu;
-                            const u32 qb = (pageBase + row[j]) * 4u;
-                            const u32 qbyte = (qb / 8u) & kMask;
-                            const u32 qsh = qb % 8u;
-                            data[qbyte] = static_cast<u8>((data[qbyte] & ~(0x0Fu << qsh)) | (v << qsh));
-                            if constexpr (Verify)
-                            {
-                                const u32 refBits =
-                                    Traits::Address(PageTableP4, bp, bw, xi + j, y) * 4u;
-                                g477Note("p4q", bp, bw, xi + j, y, qbyte, (refBits / 8u) & kMask);
-                                g477Note("p4qsh", bp, bw, xi + j, y, qsh, refBits % 8u);
-                            }
-                        }
-                        continue;
-                    }
-
-                    const u32 n0 = nibble0 + i + c;
-                    const u32 half = (n0 & 1u) * 4u;
-                    const u8 *sp = src + (n0 >> 1u);
-                    const u32 ins = ((static_cast<u32>(sp[0]) >> half) & 0x0Fu) |
-                                    (((static_cast<u32>(sp[4]) >> half) & 0x0Fu) << 8u) |
-                                    (((static_cast<u32>(sp[8]) >> half) & 0x0Fu) << 16u) |
-                                    (((static_cast<u32>(sp[12]) >> half) & 0x0Fu) << 24u);
-
-                    u32 w;
-                    std::memcpy(&w, data + b, 4u);
-                    w = (w & ~(0x0F0F0F0Fu << sh)) | (ins << sh);
-                    std::memcpy(data + b, &w, 4u);
-
-                    if constexpr (Verify)
-                    {
-                        for (u32 q = 0u; q < 4u; ++q)
-                        {
-                            const u32 j = c + q * 8u;
-                            const u32 refBits = Traits::Address(PageTableP4, bp, bw, xi + j, y) * 4u;
-                            g477Note("p4q", bp, bw, xi + j, y, b + q, (refBits / 8u) & kMask);
-                            g477Note("p4qsh", bp, bw, xi + j, y, sh, refBits % 8u);
-                            const u32 n = nibble0 + i + j;
-                            g477Note("p4qsrc", bp, bw, xi + j, y,
-                                     static_cast<u32>(sp[q * 4u]) >> half & 0x0Fu,
-                                     (static_cast<u32>(src[n >> 1u]) >> ((n & 1u) * 4u)) & 0x0Fu);
-                        }
-                    }
-                }
-                i += lim;
-                continue;
-            }
-
-            for (u32 j = 0u; j < lim; ++j)
+            const auto writeScalar = [&](u32 j)
             {
                 const u32 n = nibble0 + i + j;
                 const u32 v = (static_cast<u32>(src[n >> 1u]) >> ((n & 1u) * 4u)) & 0x0Fu;
@@ -447,7 +387,88 @@ namespace
                     g477Note("p4", bp, bw, xi + j, y, b, (refBits / 8u) & kMask);
                     g477Note("p4sh", bp, bw, xi + j, y, sh, refBits % 8u);
                 }
+            };
+
+            // G652 P11: the table relation repeats every 32 columns. G477 used it only when the
+            // caller supplied an entire 128-pixel page row; apply the same verified four-nibble
+            // gather to every complete 32-pixel group inside a partial run.
+            const bool tableOk = g477P4QuadOk(bp % 32u, y % kPageH);
+            u32 firstGroup = (idx + 31u) & ~31u;
+            u32 groupEnd = (idx + lim) & ~31u;
+            const bool oldWholeRow = idx == 0u && lim == kPageW;
+            const bool bulkGroups = tableOk &&
+                (oldWholeRow || (g652P4BulkOn() && firstGroup < groupEnd));
+            if (censusOn)
+            {
+                if (bulkGroups) ++g_g477P4Quad; else ++g_g477P4Scalar;
             }
+            if (!bulkGroups)
+            {
+                for (u32 j = 0u; j < lim; ++j)
+                    writeScalar(j);
+                i += lim;
+                continue;
+            }
+
+            if (oldWholeRow)
+            {
+                firstGroup = 0u;
+                groupEnd = kPageW;
+            }
+            for (u32 j = 0u; idx + j < firstGroup; ++j)
+                writeScalar(j);
+
+            for (u32 group = firstGroup; group < groupEnd; group += 32u)
+            {
+                if (censusOn && g652P4BulkOn() && !oldWholeRow)
+                {
+                    ++g_g652P4Groups;
+                    g_g652P4Pixels += 32u;
+                }
+                for (u32 lane = 0u; lane < 8u; ++lane)
+                {
+                    const u32 c = group + lane;
+                    const u32 j0 = c - idx;
+                    const u32 bits = (pageBase + row[c]) * 4u;
+                    const u32 b = (bits / 8u) & kMask;
+                    const u32 sh = bits % 8u;
+                    if ((((pageBase + row[c] + 6u) * 4u) / 8u & kMask) != b + 3u)
+                    {
+                        for (u32 q = 0u; q < 4u; ++q)
+                            writeScalar(j0 + q * 8u);
+                        continue;
+                    }
+
+                    const u32 n0 = nibble0 + i + j0;
+                    const u32 half = (n0 & 1u) * 4u;
+                    const u8 *sp = src + (n0 >> 1u);
+                    const u32 ins = ((static_cast<u32>(sp[0]) >> half) & 0x0Fu) |
+                                    (((static_cast<u32>(sp[4]) >> half) & 0x0Fu) << 8u) |
+                                    (((static_cast<u32>(sp[8]) >> half) & 0x0Fu) << 16u) |
+                                    (((static_cast<u32>(sp[12]) >> half) & 0x0Fu) << 24u);
+                    u32 w;
+                    std::memcpy(&w, data + b, 4u);
+                    w = (w & ~(0x0F0F0F0Fu << sh)) | (ins << sh);
+                    std::memcpy(data + b, &w, 4u);
+
+                    if constexpr (Verify)
+                    {
+                        for (u32 q = 0u; q < 4u; ++q)
+                        {
+                            const u32 j = j0 + q * 8u;
+                            const u32 refBits = Traits::Address(PageTableP4, bp, bw, xi + j, y) * 4u;
+                            g477Note("p4q", bp, bw, xi + j, y, b + q, (refBits / 8u) & kMask);
+                            g477Note("p4qsh", bp, bw, xi + j, y, sh, refBits % 8u);
+                            const u32 n = nibble0 + i + j;
+                            g477Note("p4qsrc", bp, bw, xi + j, y,
+                                     static_cast<u32>(sp[q * 4u]) >> half & 0x0Fu,
+                                     (static_cast<u32>(src[n >> 1u]) >> ((n & 1u) * 4u)) & 0x0Fu);
+                        }
+                    }
+                }
+            }
+            for (u32 j = groupEnd - idx; j < lim; ++j)
+                writeScalar(j);
             i += lim;
         }
     }

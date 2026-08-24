@@ -3822,6 +3822,53 @@ namespace
     // resulting `st.pc` agrees — a region that ran the right number of pairs down the wrong path
     // cannot land on the right pc.
     // -------------------------------------------------------------------------------------------
+    // G652: authoritative one-pair oracle bridge for the two admissions that deliberately sit
+    // outside G490's block sidecar. It calls the shipped G421/G422 leaves and reproduces the
+    // generic loop's same-pair overlay literally; it does not consult the region CFG or emitter.
+    bool g652RefSpecialPair(VU1State &st, uint32_t idx, uint8_t *vuData, uint32_t dataSize,
+                            int64_t stamp, G430HistBlock *hb)
+    {
+        if (idx >= s_g410Cache.fused.size())
+            return false;
+        const G479FusedPair &fp = s_g410Cache.fused[idx];
+        const uint32_t lower = static_cast<uint32_t>(fp.source);
+        const uint32_t upper = static_cast<uint32_t>(fp.source >> 32u);
+        const bool loi = g652VuLoiOn() && fp.pair.pairFlags == G410_PAIR_I_BIT;
+        const bool hazardStore = g652RegionHazStorePairOk(idx);
+        if (!loi && !hazardStore)
+            return false;
+
+        __m128 oldV = _mm_setzero_ps();
+        __m128 newV = _mm_setzero_ps();
+        const int hazardDest = hazardStore ? static_cast<int>(fp.pair.upperVfDest) : -1;
+        if (hazardDest >= 0)
+            oldV = _mm_loadu_ps(st.vf[hazardDest]);
+        if (loi)
+            std::memcpy(&st.i, &lower, sizeof(lower));
+        if (fp.pair.upperKind != 0x6fu)
+            g421FastUpper<true, false>(st, upper, fp.pair.upperKind, true, false, true,
+                                       stamp, hb);
+        if (hazardDest >= 0)
+        {
+            newV = _mm_loadu_ps(st.vf[hazardDest]);
+            _mm_storeu_ps(st.vf[hazardDest], oldV);
+            g422FastLower(st, lower, fp.pair.lowerKind, vuData, dataSize);
+            const uint8_t mask = static_cast<uint8_t>((upper >> 21u) & 0xFu);
+            alignas(16) uint32_t newBits[4];
+            std::memcpy(newBits, &newV, sizeof(newBits));
+            for (unsigned lane = 0u; lane < 4u; ++lane)
+                if ((mask & (8u >> lane)) != 0u)
+                    std::memcpy(&st.vf[hazardDest][lane], &newBits[lane], sizeof(uint32_t));
+        }
+        if ((fp.pair.g425Flags & G425_PF_TOUCHES_ZERO) != 0u)
+        {
+            const __m128 vf0 = _mm_castsi128_ps(_mm_set_epi32(0x3f800000, 0, 0, 0));
+            _mm_storeu_ps(st.vf[0], vf0);
+            st.vi[0] = 0;
+        }
+        return true;
+    }
+
     uint32_t g612RefRun(VU1State &st, uint32_t startSlot, uint8_t *vuData, uint32_t dataSize,
                         int *qDelay, int *pDelay, int64_t stampBase, G430HistBlock *hb,
                         uint32_t wantPairs, uint32_t codeSize)
@@ -3887,7 +3934,25 @@ namespace
             }
             const uint32_t tailPairs = (tail == G531_FLAG_TAIL) ? 1u : tail;
             if (count == 0u && tail == 0u)
-                break;
+            {
+                const bool special =
+                    (g652VuLoiOn() &&
+                     s_g410Cache.uppers[idx].pairFlags == G410_PAIR_I_BIT) ||
+                    g652RegionHazStorePairOk(idx);
+                if (!special)
+                    break;
+                // The generic pair loop advances scalar pipelines before either issue slot.
+                if (*qDelay > 0 && --(*qDelay) == 0)
+                    st.q = s_vuQPending;
+                if (*pDelay > 0 && --(*pDelay) == 0)
+                    st.p = s_vuPPending;
+                if (!g652RefSpecialPair(st, idx, vuData, dataSize,
+                                        stampBase + static_cast<int64_t>(consumed), hb))
+                    break;
+                ++consumed;
+                pc = (pc + 8u >= codeSize) ? 0u : pc + 8u;
+                continue;
+            }
             g531ExecuteBlockTailFlag(st, idx, count, vuData, dataSize, qDelay, pDelay,
                                      stampBase + (int64_t)consumed, hb, tail);
             consumed += count + tailPairs;
@@ -4050,7 +4115,30 @@ namespace
                 s_g612MaxPairs = (uint64_t)n;
             const uint32_t ex = st.pc >> 3u;
             if (ex < s_g612ExitAt.size())
+            {
                 ++s_g612ExitAt[ex];
+                const uint8_t flags = s_g410Cache.uppers[ex].pairFlags;
+                if ((flags & G410_PAIR_I_BIT) != 0u)
+                    ++s_g652ExitIAt[ex];
+                if ((flags & G410_PAIR_E_BIT) != 0u)
+                    ++s_g652ExitEAt[ex];
+                int g652FmandState = -1;
+                if (s_g410Cache.uppers[ex].lowerKind == G422_LK_FMAND)
+                {
+                    const int64_t target = stampBase + (int64_t)n - 4;
+                    if (g652MacHistoryPendingAt(*hb, target))
+                    {
+                        ++s_g652FmandPendingAt[ex];
+                        g652FmandState = 1;
+                    }
+                    else
+                    {
+                        ++s_g652FmandMaterialAt[ex];
+                        g652FmandState = 0;
+                    }
+                }
+                g652ExitIdentityNote(ex, g652FmandState);
+            }
             if ((s_g612Runs & 0x3FFFFFull) == 0ull)
                 g612Report();
         }
