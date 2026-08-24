@@ -131,6 +131,10 @@ static bool g459TriScissorStatOn()
 
 void GSRasterizer::drawPrimitive(GS *gs)
 {
+    // G654 P16: nested INSIDE the GS front's GIF tag walk. Timing it here lets `[G654:layer]`
+    // report GIFwalk EXCLUSIVE of drawing, which is what splits `[G147:gif] parserOther` into
+    // "the walk itself" and "a nested layer counted twice". Empty struct outside -DPS2X_G654_DIAG.
+    G654LayerScope g654Scope(kG654LayerDrawPrim);
     // G526: books this call's whole span to whichever of the four exits it takes (rej/cull/
     // defer/inline). Inert unless DC2_G526_DRAW=1. Must be the FIRST thing in the function so the
     // four columns sum to `[G147:gif] draw` and the split can be checked against it.

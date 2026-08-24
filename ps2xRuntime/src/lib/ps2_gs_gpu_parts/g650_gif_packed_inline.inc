@@ -69,6 +69,16 @@ bool g650GifStatOn()
     return s_on;
 }
 
+bool g652Gif412On()
+{
+    const int arm = g652Gif412Arm();
+    if (arm >= 0)
+        return arm != 0;
+    static const bool s_on = std::getenv("DC2_G652_GIF412") != nullptr &&
+                             std::getenv("DC2_G652_NO_GIF412") == nullptr;
+    return s_on;
+}
+
 // Behaviour-pure census: how much of the PACKED descriptor stream the inline dispatch actually
 // covers, and what the residue is. Read only under DC2_G650_GIF_STAT.
 std::atomic<uint64_t> g_g650GifDesc{0ull};

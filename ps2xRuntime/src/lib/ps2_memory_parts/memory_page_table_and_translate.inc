@@ -404,6 +404,7 @@ static std::atomic<uint32_t> &g377SubmitOwner()
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
     G146PerfScope g146Scope(g_g146GifSubmitNs);
+    G654LayerScope g654Scope(kG654LayerGifSubmit); // G654 P17, empty in the default build
 
     if (!data || sizeBytes < 16)
         return;

@@ -4175,10 +4175,38 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // guest VRAM and the bind gates read page generations — so the arm is separate and the
         // reorder it implies is COUNTED (`[G632:conflict]`), never assumed away.
         G632EpochScope g632TexEpoch(g632TexEpochOn(), 2);
+#if defined(PS2X_G654_DIAG)
+        // ===== G654 P12: IS THE PER-ENTRY BIND DECISION REPEATED? ==============================
+        // `[G323:census]` prices this loop at 0.083-0.097 ms per flush and 70-71% of the whole
+        // `deps` span, over 324-362 ENTRIES per flush (41.0 M on `map15`, 68.6 M on `s03`). The
+        // roadmap's question is whether that repetition is REDUNDANT, and the only honest way to
+        // answer it is to count how often consecutive entries carry the same decision inputs and
+        // reach the same outcome. G510 measured adjacent GS state 92.80% identical, but a state
+        // count is not a decision count (`appendix-dc2-attribution-recipes.md` §1.3q: counts are
+        // not values), so this counts the DECISION, keyed on everything the loop below reads.
+        uint64_t g654PrevKey = ~0ull;
+        bool g654HavePrev = false;
+        size_t g654Repeat = 0u, g654Distinct = 0u;
+#endif
         for (size_t i = 0; i < g_g144List.size() && !s_g599NoBind; ++i)
         {
             const G178EntryState &st = s_states[i];
             const G144Entry &e = g_g144List[i];
+#if defined(PS2X_G654_DIAG)
+            {
+                const uint64_t g654Key =
+                    (static_cast<uint64_t>(fbp) << 40) ^
+                    (static_cast<uint64_t>(st.texKey) * 0x9e3779b97f4a7c15ull) ^
+                    (static_cast<uint64_t>(e.ctx.tex0.psm) << 8) ^
+                    (static_cast<uint64_t>(st.skip ? 1u : 0u) << 4) ^
+                    (static_cast<uint64_t>(e.prim.tme ? 1u : 0u) << 5) ^
+                    (static_cast<uint64_t>(st.residencyPlan) << 16);
+                if (g654HavePrev && g654Key == g654PrevKey) ++g654Repeat;
+                else ++g654Distinct;
+                g654PrevKey = g654Key;
+                g654HavePrev = true;
+            }
+#endif
             if (g289DirectDisplaySrc != 0u && i == 0u)
             {
                 s_g261FboSrc[i] = g289DirectDisplaySrc;
@@ -4771,6 +4799,41 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             if (!g261AnyBind)
                 s_g261FboSrc.clear();
         }
+#if defined(PS2X_G654_DIAG)
+        // G654 P12: cross-tab the key repetition against the OUTCOME. `none` is the population a
+        // memo could skip outright (no bind token, no view key, i.e. the loop body ran and changed
+        // nothing); `bind`/`view` populations would have to reproduce their side effect.
+        {
+            static uint64_t s_rep = 0u, s_dist = 0u, s_none = 0u, s_bind = 0u, s_view = 0u,
+                            s_flushes = 0u;
+            s_rep += g654Repeat;
+            s_dist += g654Distinct;
+            ++s_flushes;
+            for (size_t i = 0; i < g_g144List.size(); ++i)
+            {
+                const bool bound = !s_g261FboSrc.empty() && s_g261FboSrc[i] != 0u;
+                const bool viewed = !s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u;
+                if (bound) ++s_bind;
+                else if (viewed) ++s_view;
+                else ++s_none;
+            }
+            if ((s_flushes % 3000u) == 0u)
+            {
+                const double tot = static_cast<double>(s_rep + s_dist);
+                std::fprintf(stderr,
+                             "[G654:bindmemo] flushes=%llu entries=%llu repeatKey=%llu (%.1f%%) "
+                             "distinct=%llu outcome(none=%llu bind=%llu view=%llu)\n",
+                             static_cast<unsigned long long>(s_flushes),
+                             static_cast<unsigned long long>(s_rep + s_dist),
+                             static_cast<unsigned long long>(s_rep),
+                             tot > 0.0 ? 100.0 * static_cast<double>(s_rep) / tot : 0.0,
+                             static_cast<unsigned long long>(s_dist),
+                             static_cast<unsigned long long>(s_none),
+                             static_cast<unsigned long long>(s_bind),
+                             static_cast<unsigned long long>(s_view));
+            }
+        }
+#endif
     }
     // G633: a later pre-pass ownership event can invalidate a view admitted earlier in this pass.
     // Repair only those event-queued consumers now, after all coherence preparation and before any
@@ -5822,6 +5885,16 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
 
     const auto g298T5 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
+#if defined(PS2X_G654_DIAG)
+    // ===== G654 P11: SPLIT THE `submit` SPAN AT ITS FOUR REAL SEAMS ==========================
+    // `[G298:profile] submit` is 0.053 ms per accepted flush and the roadmap asks which of CPU
+    // command construction / backend enqueue / synchronization / actual submission owns it. The
+    // span is not one operation: it is the same-run ORACLE block, then pre-submit BOOKKEEPING
+    // (drain requirement, late drain, async eligibility), then the ENQUEUE itself, then post-submit
+    // accounting. Four unconditional clock reads per accepted flush - roughly 15-50 per frame -
+    // and only in this build mode (rule 12c: the call sites are #if-excluded, not predicated).
+    const auto g654S0 = std::chrono::steady_clock::now();
+#endif
     // G255 verification is intentionally color-only. Any batch that needs real guest depth has
     // already failed closed unless the separately opt-in G242 ownership model is active; do not
     // combine those two experiments in one oracle.
@@ -5967,6 +6040,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // hypothesis is that per-wave submit/sync latency dominates the pending-graph drain.
     // G314 needs only the submits executed inside one real upload edge.  Reuse these proven
     // category counters while that edge scope is active; no global probe or behavior arm turns on.
+#if defined(PS2X_G654_DIAG)
+    const auto g654S1 = std::chrono::steady_clock::now(); // end of the same-run oracle block
+#endif
     const bool g276Probe = g276ProbeOn() || g314EdgeActive();
     const auto g324SubmitT0 = g324IsArmed && g324Diag.hadProducer
         ? std::chrono::steady_clock::now()
@@ -6083,6 +6159,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // this flush's own submit. At depth 1 this IS g493LateDrainPending() (drain everything).
     if (g305DrainRequired() && g493LateDrainActive())
         g640LateDrainToDepth();
+#if defined(PS2X_G654_DIAG)
+    const auto g654S2 = std::chrono::steady_clock::now(); // end of pre-submit bookkeeping
+#endif
     bool submitted;
     if (g305Async)
     {
@@ -6118,6 +6197,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                                depthGlY, depthRows)
                    : g178_backend_submit(s_batch));
     }
+#if defined(PS2X_G654_DIAG)
+    const auto g654S3 = std::chrono::steady_clock::now(); // end of the backend enqueue itself
+#endif
     if (g324IsArmed && g324Diag.hadProducer)
         g324Diag.submitNs +=
             g324ElapsedNs(g324SubmitT0, std::chrono::steady_clock::now());
@@ -6155,6 +6237,40 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                       : std::chrono::steady_clock::time_point{};
     const auto g298T6 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
+#if defined(PS2X_G654_DIAG)
+    {
+        // G654 P11. Same denominator (nGpu) and same cumulative-mean convention as `[G298:profile]`,
+        // so the four sub-means SUM to `submit`.
+        static uint64_t s_oracleNs = 0u, s_prepNs = 0u, s_enqNs = 0u, s_postNs = 0u;
+        static uint64_t s_async = 0u, s_ok = 0u;
+        const auto g654Ns = [](auto a, auto b) {
+            return static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+        };
+        const auto g654S4 = std::chrono::steady_clock::now();
+        s_oracleNs += g654Ns(g654S0, g654S1);
+        s_prepNs += g654Ns(g654S1, g654S2);
+        s_enqNs += g654Ns(g654S2, g654S3);
+        s_postNs += g654Ns(g654S3, g654S4);
+        s_async += g305Async ? 1u : 0u;
+        s_ok += submitted ? 1u : 0u;
+        if ((nGpu % 300u) == 0u && nGpu != 0u)
+        {
+            const double d = 1.0e6 * static_cast<double>(nGpu);
+            std::fprintf(stderr,
+                         "[G654:submit] gpu=%llu ok=%llu async=%llu avgMs(oracle=%.4f prep=%.4f "
+                         "enqueue=%.4f post=%.4f) sum=%.4f\n",
+                         static_cast<unsigned long long>(nGpu),
+                         static_cast<unsigned long long>(s_ok),
+                         static_cast<unsigned long long>(s_async),
+                         static_cast<double>(s_oracleNs) / d,
+                         static_cast<double>(s_prepNs) / d,
+                         static_cast<double>(s_enqNs) / d,
+                         static_cast<double>(s_postNs) / d,
+                         static_cast<double>(s_oracleNs + s_prepNs + s_enqNs + s_postNs) / d);
+        }
+    }
+#endif
     if (!submitted)
     {
         // A G281 view kept its producer newer in the FBO. If the consumer batch cannot submit

@@ -1,5 +1,9 @@
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    // G654 P16: the GS-front tag walk, timed EXCLUSIVE of the image writer and the local->local
+    // transfer nested inside it, so `[G147:gif] parserOther` can be split into work that is really
+    // parsing and work that is a nested layer. Empty struct in the default build (rule 12c).
+    G654LayerScope g654Scope(kG654LayerGifWalk);
     G147CountedPerfScope g147GifScope(g_g147GsGifPacketNs, g_g147GsGifPacketCount);
     const bool g147On = g147PerfEnabled();
     uint64_t g147Tags = 0ull;
@@ -230,16 +234,34 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                             (inl ? g_g650GifInlined : g_g650GifCalled)
                                 .fetch_add(reps, std::memory_order_relaxed);
                         }
+                        g652GifSequenceNote(tagHi, nreg, nDesc);
                         g650GifReport();
                     }
-                    for (uint32_t loop = 0; loop < fullLoops; ++loop)
+                    // G652 P12 prototype: the dragon sequence census found exactly six tag
+                    // shapes, with ST/RGBAQ/XYZF2 (descriptor key 0x412) carrying 59.4% of all
+                    // descriptors. Clone that whole tag once so its inner walk has no descriptor
+                    // extraction, loop counter, or switch. Default-off until its independent gate.
+                    if (g652Gif412On() && nreg == 3u && (tagHi & 0x0FFFull) == 0x0412ull &&
+                        tailRegs == 0u)
                     {
-                        for (uint32_t r = 0; r < nreg; ++r, p += 16)
+                        for (uint32_t loop = 0; loop < fullLoops; ++loop, p += 48)
                         {
-                            const uint8_t g650d = G602_REGDESC(r);
-                            const uint64_t g650lo = loadLE64(p);
-                            const uint64_t g650hi = loadLE64(p + 8);
-                            G650_PK_DISPATCH(g650d, g650lo, g650hi);
+                            G650_PK_ST(loadLE64(p), loadLE64(p + 8));
+                            G650_PK_RGBAQ(loadLE64(p + 16), loadLE64(p + 24));
+                            G650_PK_XYZF2(loadLE64(p + 32), loadLE64(p + 40));
+                        }
+                    }
+                    else
+                    {
+                        for (uint32_t loop = 0; loop < fullLoops; ++loop)
+                        {
+                            for (uint32_t r = 0; r < nreg; ++r, p += 16)
+                            {
+                                const uint8_t g650d = G602_REGDESC(r);
+                                const uint64_t g650lo = loadLE64(p);
+                                const uint64_t g650hi = loadLE64(p + 8);
+                                G650_PK_DISPATCH(g650d, g650lo, g650hi);
+                            }
                         }
                     }
                     for (uint32_t r = 0; r < tailRegs; ++r, p += 16)

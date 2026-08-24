@@ -64,6 +64,7 @@ extern void g327NoteImageChunk(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
 void GS::performLocalToLocalTransfer()
 {
     G146PerfScope g146Scope(g_g146GsLocalNs);
+    G654LayerScope g654Scope(kG654LayerGsLocal); // G654 P17, empty in the default build
     // G219 transition sentinel (inert unless DC2_G219_SKYPX=1).
     {
         extern void g219Sentinel(const uint8_t *, uint32_t, const char *);
@@ -576,6 +577,7 @@ void GS::vertexKick(bool drawing)
 void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
 {
     G146PerfScope g146Scope(g_g146GsImageNs);
+    G654LayerScope g654Scope(kG654LayerGsImage); // G654 P17, empty in the default build
     // G219 transition sentinel (inert unless DC2_G219_SKYPX=1).
     {
         extern void g219Sentinel(const uint8_t *, uint32_t, const char *);
