@@ -463,57 +463,14 @@ static int g_intc_tail_order = 1000;
 static int g_dmac_head_order = 0;
 static int g_dmac_tail_order = 1000;
 
-std::string translatePs2Path(const char *ps2Path)
-{
-    if (!ps2Path || !*ps2Path)
-    {
-        return {};
-    }
-
-    std::string pathStr(ps2Path);
-    std::string lower = toLowerAscii(pathStr);
-
-    auto resolveWithBase = [&](const std::filesystem::path &base, const std::string &suffix) -> std::string
-    {
-        const std::string normalizedSuffix = normalizePs2PathSuffix(suffix);
-        std::filesystem::path resolved = base;
-        if (!normalizedSuffix.empty())
-        {
-            resolved /= std::filesystem::path(normalizedSuffix);
-        }
-        return resolved.lexically_normal().string();
-    };
-
-    if (lower.rfind("host0:", 0) == 0 || lower.rfind("host:", 0) == 0)
-    {
-        const std::size_t prefixLength = (lower.rfind("host0:", 0) == 0) ? 6 : 5;
-        return resolveWithBase(getConfiguredHostRoot(), pathStr.substr(prefixLength));
-    }
-
-    if (lower.rfind("cdrom0:", 0) == 0 || lower.rfind("cdrom:", 0) == 0)
-    {
-        const std::size_t prefixLength = (lower.rfind("cdrom0:", 0) == 0) ? 7 : 6;
-        return resolveWithBase(getConfiguredCdRoot(), pathStr.substr(prefixLength));
-    }
-
-    if (lower.rfind(kMc0Prefix, 0) == 0)
-    {
-        const std::size_t prefixLength = sizeof(kMc0Prefix) - 1;
-        return resolveWithBase(getConfiguredMcRoot(), pathStr.substr(prefixLength));
-    }
-
-    if (!pathStr.empty() && (pathStr.front() == '/' || pathStr.front() == '\\'))
-    {
-        return resolveWithBase(getConfiguredCdRoot(), pathStr);
-    }
-
-    if (pathStr.size() > 1 && pathStr[1] == ':')
-    {
-        return pathStr;
-    }
-
-    return resolveWithBase(getConfiguredCdRoot(), pathStr);
-}
+// ===== G657 P1: duplicate definition removed ================================================
+// `translatePs2Path` is also defined, byte-for-byte identically, as an `inline` function in
+// Kernel/Syscalls/Helpers/Runtime.h. The link discarded THIS copy
+//   ps2_runtime.lib(ps2_syscalls.obj) : warning LNK4006: "...translatePs2Path..." already
+//   defined in ps2_runtime.lib(System.cpp.obj); second definition ignored
+// so removing it is behaviour-neutral; the forward declaration in ps2_syscalls.cpp now binds
+// to the Kernel definition, which is what the linker already chose. Removed because the same
+// collision is fatal (LNK1179) under /GL /LTCG.
 
 static bool localtimeSafe(const std::time_t *t, std::tm *out)
 {

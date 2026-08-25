@@ -1,9 +1,3 @@
-// ===== G657 P1: 45 duplicate definitions removed ==========================
-// Each collided with an identical symbol in another TU and was ALREADY discarded
-// by the linker ("second definition ignored", LNK4006), so removal is
-// behaviour-neutral by construction. Removed because under /GL /LTCG the same
-// collision is fatal (LNK1179), which is what blocked the PGO pipeline (G652).
-// Regenerate with tools/g657_dup_audit.py.
 void syRtcInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     static int logCount = 0;
@@ -270,6 +264,16 @@ void pdGetPeripheral(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     setReturnS32(ctx, 0);
 }
 
+void Ps2SwapDBuff(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    static int logCount = 0;
+    if (logCount < 8)
+    {
+        std::cout << "ps2_stub Ps2SwapDBuff" << std::endl;
+        ++logCount;
+    }
+    setReturnS32(ctx, 0);
+}
 
 void InitReadKeyEx(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
@@ -421,6 +425,16 @@ void ADXT_SetNumRetry(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     setReturnS32(ctx, 0);
 }
 
+void cvFsSetDefDev(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    static int logCount = 0;
+    if (logCount < 8)
+    {
+        std::cout << "ps2_stub cvFsSetDefDev" << std::endl;
+        ++logCount;
+    }
+    setReturnS32(ctx, 0);
+}
 
 namespace
 {
@@ -431,45 +445,226 @@ namespace
     constexpr int32_t kCvMcIconCapacityBytes = 0x00004000;
 }
 
+void mcCallMessageTypeSe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
 
+void mcCheckReadStartConfigFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcCheckReadStartSaveFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcCheckWriteStartConfigFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcCheckWriteStartSaveFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcCreateConfigInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcCreateFileSelectWindow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcCreateIconInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcCreateSaveFileInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcDispFileName(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
 
+void mcDispFileNumber(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
 
+void mcDisplayFileSelectWindow(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
 
+void mcDisplaySelectFileInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
 
+void mcDisplaySelectFileInfoMesCount(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
 
+void mcDispWindowCurSol(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
 
+void mcDispWindowFoundtion(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
 
+void mceGetInfoApdx(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
 
+void mceIntrReadFixAlign(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
 
+void mceStorePwd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
 
+void mcGetConfigCapacitySize(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, kCvMcConfigCapacityBytes);
+}
 
+void mcGetFileSelectWindowCursol(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, g_cvMcFileCursor);
+}
 
+void mcGetFreeCapacitySize(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, kCvMcFreeCapacityBytes);
+}
 
+void mcGetIconCapacitySize(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, kCvMcIconCapacityBytes);
+}
 
+void mcGetIconFileCapacitySize(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, kCvMcIconCapacityBytes);
+}
 
+void mcGetPortSelectDirInfo(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
 
+void mcGetSaveFileCapacitySize(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, kCvMcSaveCapacityBytes);
+}
 
+void mcGetStringEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const uint32_t strAddr = getRegU32(ctx, 4);
+    const std::string value = readPs2CStringBounded(rdram, runtime, strAddr, 1024);
+    setReturnU32(ctx, strAddr + static_cast<uint32_t>(value.size()));
+}
 
+void mcMoveFileSelectWindowCursor(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    const int32_t delta = static_cast<int32_t>(getRegU32(ctx, 5));
+    g_cvMcFileCursor += delta;
+    g_cvMcFileCursor = std::clamp(g_cvMcFileCursor, -1, 15);
+    setReturnS32(ctx, 0);
+}
 
+void mcNewCreateConfigFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcNewCreateIcon(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcNewCreateSaveFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcReadIconData(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcReadStartConfigFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcReadStartSaveFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcSelectFileInfoInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    g_cvMcFileCursor = 0;
+    setReturnS32(ctx, 1);
+}
 
+void mcSelectSaveFileCheck(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcSetFileSelectWindowCursol(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    g_cvMcFileCursor = static_cast<int32_t>(getRegU32(ctx, 5));
+    g_cvMcFileCursor = std::clamp(g_cvMcFileCursor, -1, 15);
+    setReturnS32(ctx, 0);
+}
 
+void mcSetFileSelectWindowCursolInit(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    g_cvMcFileCursor = 0;
+    setReturnS32(ctx, 0);
+}
 
+void mcSetStringSaveFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
 
+void mcSetTyepWriteMode(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 0);
+}
 
+void mcWriteIconData(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcWriteStartConfigFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}
 
+void mcWriteStartSaveFile(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
+{
+    setReturnS32(ctx, 1);
+}

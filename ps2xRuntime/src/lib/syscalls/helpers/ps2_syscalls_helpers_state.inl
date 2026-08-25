@@ -1,5 +1,14 @@
-std::unordered_map<int, FILE *> g_fileDescriptors;
-int g_nextFd = 3; // Start after stdin, stdout, stderr
+// ===== G657 P1: these two were DUPLICATE DEFINITIONS the linker already discarded ==============
+// `Kernel/Syscalls/Helpers/State.h` defines both as C++17 `inline` variables, and the link reported
+//   ps2_runtime.lib(ps2_syscalls.obj) : warning LNK4006: "..." already defined in
+//   ps2_runtime.lib(System.cpp.obj) / (FileIO.cpp.obj); second definition ignored
+// so every user in this TU has ALWAYS been operating on the Kernel object. Declaring them `extern`
+// binds to that same object explicitly and is therefore behaviour-identical, while removing a
+// collision that is fatal (LNK1179) under /GL /LTCG.
+// ⛔ NOT `inline`: this file and `State.h` have DIVERGED (646 vs 575 lines), so defining them here
+// as well would be an ODR violation with two different definitions rather than a merge.
+extern std::unordered_map<int, FILE *> g_fileDescriptors;
+extern int g_nextFd;
 
 struct ThreadInfo
 {
@@ -215,7 +224,10 @@ static int g_nextAlarmId = 1;
 static std::mutex g_alarm_mutex;
 static std::condition_variable g_alarm_cv;
 static std::once_flag g_alarm_worker_once;
-std::atomic<int> g_activeThreads{0};
+// G657 P1: same discarded-duplicate case as g_fileDescriptors / g_nextFd above. The surviving
+// definition is `inline std::atomic<int> g_activeThreads{0};` in Kernel/Syscalls/Helpers/State.h,
+// reported against ps2_runtime.lib(Thread.obj).
+extern std::atomic<int> g_activeThreads;
 static std::mutex g_fd_mutex;
 
 static void registerHostThread(int tid, std::thread worker)

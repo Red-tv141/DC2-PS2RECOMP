@@ -270,9 +270,17 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // no global load, no branch, no byte in this (the hottest) TU. Real only under -DPS2X_G654_DIAG=ON.
 #include <chrono>
 #include "ps2_g654_layer_api.inc"
+// G656 P6/P9: the upload-edge and bind-loop lap timers. Empty structs unless PS2X_G656_DIAG.
+#include "ps2_g656_diag_api.inc"
+// G657 P3/P4/P7: the fallback-WALL and GPU-coverage census. Empty struct unless PS2X_G657_DIAG.
+#include "ps2_g657_diag_api.inc"
 #include "ps2_gs_rasterizer_parts/rasterizer_headers_and_diagnostics.inc"
 
+#if defined(PS2X_G655_LEGACY_DIAG)
 #include "ps2_gs_rasterizer_parts/rasterizer_g214_cap_trace.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g655_stub_g214.inc"
+#endif
 
     #include "ps2_gs_rasterizer_parts/rasterizer_clipping_and_tex_checks.inc"
 
@@ -299,8 +307,16 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 
 // G400/G401: raw surface sampling must be visible at command-graph execution time. G400's
 // draw-entry hook remains below; G401 calls the helper before the composite batch executes.
+#if defined(PS2X_G655_LEGACY_DIAG)
 #include "ps2_gs_rasterizer_parts/rasterizer_g400_stage_probe.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g655_stub_g400.inc"
+#endif
+#if defined(PS2X_G401_DIAG)
 #include "ps2_gs_rasterizer_parts/rasterizer_g401_composite_probe.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g655_stub_g401.inc"
+#endif
 
 #include "ps2_gs_rasterizer_parts/rasterizer_draw_prim_probe.inc"
 
@@ -314,12 +330,20 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // G526: per-primitive path attribution (DC2_G526_DRAW=1, default-off). Must precede
 // rasterizer_setup_and_perf_census.inc and rasterizer_tilebin_capture.inc, which hold the four
 // drawPrimitive exits it books against.
+#if defined(PS2X_G655_LEGACY_DIAG)
 #include "ps2_gs_rasterizer_parts/g526_draw_census.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g655_stub_g526.inc"
+#endif
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_command_graph.inc"
 
+#if defined(PS2X_G655_LEGACY_DIAG)
 #include "ps2_gs_rasterizer_parts/rasterizer_g336_runway.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g655_stub_g336.inc"
+#endif
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_rtt_census_and_waves.inc"
@@ -404,10 +428,18 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 
 // G342 arc#6 slice-1 premise-gate: per-consumer-shape TIME census of c5 tex-alias materialize.
 // Included before vram_materialization.inc so g342NoteTexAlias is visible at the trigger site.
+#if defined(PS2X_G342_DIAG)
 #include "ps2_gs_rasterizer_parts/g342_texalias_time_census.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g655_stub_g342.inc"
+#endif
 
 // G343: arc#4 slice-1 ג€” per-shape TIME census of the l2l consumer-floor edge (default-off)
+#if defined(PS2X_G343_DIAG)
 #include "ps2_gs_rasterizer_parts/g343_l2l_floor_census.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g655_stub_g343.inc"
+#endif
 
 // G418: colour-readback VRAM unpack (CPU-copy component of the 0x13b readback edge) ג€” the exact
 // table/paired/lane arm plus its profile and oracle. Included before vram_materialization.inc so
@@ -437,13 +469,24 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // rasterizer_gpu_alias_page_view.inc above, and must precede vram_materialization.inc, whose
 // texture loop carries all three call sites (source decision, registry hit, decode).
 #include "ps2_gs_rasterizer_parts/g600_sky_probe.inc"
+// G656 P17: the HD texture replacement & dumping subsystem is 96,500 bytes (8.19%) of this TU and
+// is OFF in every normal Release run. Compile it out (rule 16); `-DPS2X_G656_TEXREPL=ON` restores
+// the real implementation. See g656_stub_texrepl.inc for the exactness argument.
+#if defined(PS2X_G656_TEXREPL)
 #include "ps2_gs_rasterizer_parts/ps2_texture_replacements.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g656_stub_texrepl.inc"
+#endif
 
 // G620: why a texture RE-DECODES (default OFF). Same placement rule as g600_sky_probe.inc — the
 // three call sites (gen hit, hash hit, decode) all live in vram_materialization.inc's texture loop,
 // and it needs g599EnvU32/envFlagEnabled from above.
 #include "ps2_gs_rasterizer_parts/g620_decode_buffers.inc"
+#if defined(PS2X_G620_DIAG)
 #include "ps2_gs_rasterizer_parts/g620_texdecode_census.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g655_stub_g620.inc"
+#endif
 
 // G621: the PRODUCER-scoped colour readback window. Must follow g418_readback_unpack.inc (its
 // oracle re-runs g418UnpackColorRows) and precede vram_materialization.inc, which holds both call
@@ -526,7 +569,11 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // constraint as G528/G529: it sits BEFORE rasterizer_setup_and_perf_census.inc, which is a FRAGMENT
 // OF GSRasterizer::drawPrimitive's BODY and cannot contain a namespace. Content edit forces MSBuild
 // to consume it (G359).
+#if defined(PS2X_G654_DIAG)
 #include "ps2_gs_rasterizer_parts/g603_admission_census.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g655_stub_g603.inc"
+#endif
 
 // G629 revision: 1 — the GPU-RESIDENT BAND REPLAY admission census (default-off, DC2_G629_STAT=1).
 // Same placement constraints as G603/G529: it needs G144Entry + g528ClassifyFbp/kG528ClsName
@@ -550,7 +597,11 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // G369 cutscene gray-screen census (default-off: DC2_G369_CENSUS=1). Must sit AFTER the
 // anonymous namespace opened in rasterizer_headers_and_diagnostics.inc has closed, because it
 // declares the externally-linked g_dc2PresentTick from ps2_runtime.cpp.
+#if defined(PS2X_G655_LEGACY_DIAG)
 #include "ps2_gs_rasterizer_parts/rasterizer_g369_scene_census.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g655_stub_g369.inc"
+#endif
 
 #include "ps2_gs_rasterizer_parts/rasterizer_write_pixel.inc"
 
@@ -590,7 +641,11 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // Must precede rasterizer_draw_sprite.inc and rasterizer_draw_triangle.inc (both are FRAGMENTS of a
 // member function body and cannot open a namespace), and must follow g528_flush_publish.inc, whose
 // g528ClassifyFbp/kG528Cls* it uses. Default-off: DC2_G605_CYC=1.
+#if defined(PS2X_G605_CYC_DIAG)
 #include "ps2_gs_rasterizer_parts/g605_replay_leaf_census.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g655_stub_g605_cyc.inc"
+#endif
 
 // G609 revision: 1 — the TIGHT SCANLINE for the G605/G608-admitted replayed triangle. Same
 // lowering, given its own outlined `noinline` row loop so the admitted pixel stops walking the
@@ -598,6 +653,9 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // per-draw-constant branches) to reach it. Must follow g605_tri_span.inc (it calls both sampler
 // leaves, g605CommitWord and G605Blend) and g530_sprite_span.inc (G530RowAddr/g530GroupBase), and
 // must precede rasterizer_draw_triangle.inc, which is a FRAGMENT of the member function body.
+// G656 P20: the exact SSE2 bilinear quad-lerp the G609 sampler calls. Must precede
+// g609_tri_scan.inc (which is its only caller) and follow the env-flag helpers.
+#include "ps2_gs_rasterizer_parts/g656_bilinear_simd.inc"
 #include "ps2_gs_rasterizer_parts/g609_tri_scan.inc"
 
 // G629 revision: 1 — the GPU-resident batched replay's MARSHALLING side (default-off,
