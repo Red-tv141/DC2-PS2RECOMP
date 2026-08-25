@@ -20,6 +20,22 @@ option(PS2X_G654_GPUDOMAIN "Compile the G629-G636 persistent GS domain prototype
 # NEGATIVE 8.71 ms/f residue against its own pole. This build mode adds the non-overlapping,
 # per-thread companion. Diagnostic only - never in a timing arm.
 option(PS2X_G654_DIAG "Compile the G654 exclusive per-thread layer timer" OFF)
+# G655 P13-P16: large, default-off census families in the hottest renderer TU.  Keep each real
+# implementation available for evidence/reproduction, but compile a constant-foldable stub in a
+# normal build.  Runtime environment guards alone did not remove their machine-code footprint.
+option(PS2X_G620_DIAG "Compile the G620 texture-decode census" OFF)
+option(PS2X_G343_DIAG "Compile the G343 local-transfer census and closed prototype" OFF)
+option(PS2X_G342_DIAG "Compile the G342 texture-alias census and closed prototype" OFF)
+option(PS2X_G401_DIAG "Compile the G401 composite surface probe" OFF)
+option(PS2X_G605_CYC_DIAG "Compile the G605 replay-leaf cycle census" OFF)
+option(PS2X_G655_LEGACY_DIAG "Compile closed legacy G214/G336/G369/G400/G526/G595 diagnostics" OFF)
+option(PS2X_G419_DIAG "Compile the G419 within-process A/B parser and reporter" OFF)
+option(PS2X_G655_DEPTH_DIAG "Compile the G655 discovered-target depth-coherence trace" OFF)
+option(PS2X_G656_DIAG "Compile the G656 upload-edge and bind-loop lap timers" OFF)
+option(PS2X_G657_DIAG "Compile the G657 fallback-wall and GPU-coverage census" OFF)
+option(PS2X_G657_FOGSIMD "Compile the G657 exact SSE2 fog lerp (built, exact, NOT promoted)" OFF)
+option(PS2X_G656_TEXREPL "Compile the HD texture replacement and dumping subsystem" OFF)
+option(PS2X_G656_VERIFY "Compile the G255 same-run CPU verify oracle and G628 mask census" OFF)
 
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
@@ -379,15 +395,87 @@ if(PS2X_G654_DIAG)
     endforeach()
 endif()
 
+foreach(_g655diag G620 G343 G342)
+    if(PS2X_${_g655diag}_DIAG)
+        set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                     "PS2X_${_g655diag}_DIAG=1")
+    endif()
+endforeach()
+
+if(PS2X_G401_DIAG)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G401_DIAG=1")
+endif()
+
+if(PS2X_G605_CYC_DIAG)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G605_CYC_DIAG=1")
+endif()
+
+if(PS2X_G655_LEGACY_DIAG)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G655_LEGACY_DIAG=1")
+endif()
+
+if(PS2X_G419_DIAG)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G419_DIAG=1")
+endif()
+
+if(PS2X_G655_DEPTH_DIAG)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G655_DEPTH_DIAG=1")
+endif()
+
+# G656 P6/P9: the upload-edge stage split and the per-entry bind-loop split. Storage and reporters
+# live in a cold TU (rule 12b); the hot TU sees empty structs in the default build.
+if(PS2X_G656_DIAG)
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_g656_diag.cpp)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G656_DIAG=1")
+endif()
+
+# G657 P3/P4/P7: the fallback-WALL and GPU-coverage census. `[G583:rejcensus]` ranks the same
+# population by ENTRIES, and on `lavaboss` the two rankings disagree by 16x (see the header of
+# ps2_g657_diag_api.inc). Storage and reporter live in a cold TU (rule 12b).
+if(PS2X_G657_DIAG)
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_g657_diag.cpp)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G657_DIAG=1")
+endif()
+
+# G657 P2b: the exact SSE2 fog lerp. BUILT, PROVEN EXACT (bad=0 on 1.10 G per-pixel comparisons),
+# and NOT PROMOTED — at matched denominators it reads -0.89% cyc/inside on the dominant leaf, inside
+# the scalar arm's own cross-run drift. It is a compile-time mode rather than a runtime flag so the
+# default binary carries none of its bytes (rule 12c).
+if(PS2X_G657_FOGSIMD)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G657_FOGSIMD=1")
+endif()
+
+# G656 P17: the second hot-TU compile-isolation sweep. Each of these is default-OFF at RUN time in
+# a normal Release build, so its machine code is a pure code-layout tax on the hottest TU in the
+# build (rule 12c / rule 16). Turning the option ON restores the real implementation byte for byte.
+if(PS2X_G656_TEXREPL)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G656_TEXREPL=1")
+endif()
+
+if(PS2X_G656_VERIFY)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G656_VERIFY=1")
+endif()
+
 if(PS2X_G652_CRITICAL_TRACE)
     target_sources(ps2_runtime PRIVATE src/lib/ps2_critical_trace.cpp)
-    set_source_files_properties(
-        src/lib/ps2_runtime.cpp
-        src/lib/ps2_gif_arbiter.cpp
-        src/lib/ps2_gs_gpu_raster.cpp
-        src/dc2_game_override.cpp
-        PROPERTIES COMPILE_DEFINITIONS "PS2X_G652_CRITICAL_TRACE=1"
-    )
+    foreach(_g652src
+            src/lib/ps2_runtime.cpp
+            src/lib/ps2_gif_arbiter.cpp
+            src/lib/ps2_gs_gpu_raster.cpp
+            src/dc2_game_override.cpp)
+        set_property(SOURCE ${_g652src} APPEND PROPERTY COMPILE_DEFINITIONS
+                     "PS2X_G652_CRITICAL_TRACE=1")
+    endforeach()
 endif()
 
 file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
