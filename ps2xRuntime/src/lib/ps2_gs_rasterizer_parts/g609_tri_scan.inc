@@ -291,6 +291,26 @@ __declspec(noinline) static void g609DumpScanCensus()
                  (unsigned long long)g_g609UntexChecks.load(std::memory_order_relaxed),
                  (unsigned long long)g_g609UntexBad.load(std::memory_order_relaxed),
                  g609TriScanVerifyOn() ? "verify" : "live");
+    // G656 P20: the SSE2 bilinear arm's own selection proof and oracle result. `arm=` is the
+    // observability counter a gate needs (rule 18): it proves the two arms could differ.
+    std::fprintf(stderr, "[G656:lerp] arm=%s checks=%llu bad=%llu shadeChecks=%llu shadeBad=%llu "
+                         "modChecks=%llu modBad=%llu\n",
+                 g656VerifyLerpOn() ? "verify" : (g656SimdLerpOn() ? "simd" : "scalar"),
+                 (unsigned long long)g_g656LerpChecks.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g656LerpBad.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g656ShadeChecks.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g656ShadeBad.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g656ModChecks.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g656ModBad.load(std::memory_order_relaxed));
+#if defined(PS2X_G657_FOGSIMD)
+    // G657 P2b: same contract for the SSE2 fog arm. ⛔ `bad` alone is not a result — an oracle that
+    // never armed also reports zero (`g589_oracle_with_zero_checks`), so `checks` and the selected
+    // `arm=` are printed beside it and a gate must read all three.
+    std::fprintf(stderr, "[G657:fog] arm=%s checks=%llu bad=%llu\n",
+                 g657VerifyFogOn() ? "verify" : (g657SimdFogOn() ? "simd" : "scalar"),
+                 (unsigned long long)g_g657FogChecks.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g657FogBad.load(std::memory_order_relaxed));
+#endif
 }
 
 inline void g609NoteScanDraw()
@@ -352,6 +372,11 @@ struct G609TriScan
     // are mutually exclusive and the thread_local read is safe to lift).
     const G580SharedSample *sample = nullptr;
     const uint32_t *clut = nullptr;
+    // ⭐ G656 P20: the SSE2 bilinear quad-lerp arm and its shadow oracle. Both are per-DRAW
+    // constants, read once in `drawTriangle` and carried here, so the pixel loop sees a
+    // loop-invariant branch rather than an env read (rule 13).
+    bool simdLerp = true;
+    bool verifyLerp = false;
     // ⛔ CEILING PROBE ONLY (DC2_G609_CEIL). Renders garbage; never promoted, never a correctness
     // switch. It exists because `cyc/inside` prices the WHOLE admitted pixel and nothing inside it,
     // so the next lever cannot be ranked without a stage decomposition. The baseline arm is THE SAME
@@ -426,7 +451,8 @@ inline uint8_t g609Lerp8(uint8_t c00, uint8_t c10, uint8_t c01, uint8_t c11, flo
 template <bool FST>
 inline uint32_t g609SampleT8(const G580SharedSample &sample, const uint32_t *clut,
                              uint8_t *vram, G609Quad &quad, int ceil, uint32_t &quadMiss,
-                             float s, float t, float q, uint16_t u, uint16_t v)
+                             float s, float t, float q, uint16_t u, uint16_t v,
+                             bool simdLerp, bool verifyLerp)
 {
     float texUf, texVf;
     if constexpr (FST)
@@ -483,6 +509,11 @@ inline uint32_t g609SampleT8(const G580SharedSample &sample, const uint32_t *clu
     const uint32_t c01 = quad.c01, c11 = quad.c11;
     if (ceil == 6) // ⛔ ceiling: the four bilinear lerpChannel calls deleted
         return c00;
+    // ⭐⭐⭐ G656 P20: all four channels in one SSE2 vector. `simdLerp` is a per-DRAW constant
+    // hoisted into `G609TriScan` (rule 13), so this is a loop-invariant branch, never a per-pixel
+    // decision. Exactness argument and the oracle live in g656_bilinear_simd.inc.
+    if (simdLerp && !verifyLerp)
+        return g656LerpQuad4(c00, c10, c01, c11, fx, fy);
     const uint8_t r = g609Lerp8(static_cast<uint8_t>(c00), static_cast<uint8_t>(c10),
                                 static_cast<uint8_t>(c01), static_cast<uint8_t>(c11), fx, fy);
     const uint8_t g = g609Lerp8(static_cast<uint8_t>(c00 >> 8u), static_cast<uint8_t>(c10 >> 8u),
@@ -491,8 +522,26 @@ inline uint32_t g609SampleT8(const G580SharedSample &sample, const uint32_t *clu
                                 static_cast<uint8_t>(c01 >> 16u), static_cast<uint8_t>(c11 >> 16u), fx, fy);
     const uint8_t a = g609Lerp8(static_cast<uint8_t>(c00 >> 24u), static_cast<uint8_t>(c10 >> 24u),
                                 static_cast<uint8_t>(c01 >> 24u), static_cast<uint8_t>(c11 >> 24u), fx, fy);
-    return static_cast<uint32_t>(r) | (static_cast<uint32_t>(g) << 8u) |
-           (static_cast<uint32_t>(b) << 16u) | (static_cast<uint32_t>(a) << 24u);
+    const uint32_t scalarTexel = static_cast<uint32_t>(r) | (static_cast<uint32_t>(g) << 8u) |
+                                 (static_cast<uint32_t>(b) << 16u) | (static_cast<uint32_t>(a) << 24u);
+    if (verifyLerp)
+    {
+        // Ship the SCALAR value. A defect is counted, never rendered (rule 14 / G529's oracle
+        // shape: an oracle that ships the candidate cannot prove the candidate).
+        const uint32_t cand = g656LerpQuad4(c00, c10, c01, c11, fx, fy);
+        g_g656LerpChecks.fetch_add(1ull, std::memory_order_relaxed);
+        if (cand != scalarTexel)
+        {
+            const uint64_t bad = g_g656LerpBad.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+            if (bad <= 16ull)
+                std::fprintf(stderr,
+                             "[G656:lerp-BAD] n=%llu simd=%08x scalar=%08x "
+                             "c00=%08x c10=%08x c01=%08x c11=%08x fx=%.9g fy=%.9g\n",
+                             static_cast<unsigned long long>(bad), cand, scalarTexel,
+                             c00, c10, c01, c11, fx, fy);
+        }
+    }
+    return scalarTexel;
 }
 
 // Conservative upper bound on any byte offset the CT32 commit can reach on this row, over
@@ -589,10 +638,45 @@ static void g609TriScanRowT(const G609TriScan &S, int y, float py,
         }
 
         // --- the G605/G608 exact leaf: :2332..2426, verbatim ---
-        const uint8_t shadeR = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
-        const uint8_t shadeG = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
-        const uint8_t shadeB = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
-        const uint8_t shadeA = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+        // ⭐ G656 P20 slice 2: the four gouraud channels are the same 4-lane shape as the bilinear
+        // blend (exactness argument in g656_bilinear_simd.inc). `simdLerp` is the same per-DRAW
+        // arm, so the two slices roll back together.
+        uint8_t shadeR, shadeG, shadeB, shadeA;
+        if (S.simdLerp && !S.verifyLerp)
+        {
+            const uint32_t sh = g656ShadeQuad4(g656VertexRgba(v0), g656VertexRgba(v1),
+                                               g656VertexRgba(v2), w0, w1, w2);
+            shadeR = static_cast<uint8_t>(sh);
+            shadeG = static_cast<uint8_t>(sh >> 8u);
+            shadeB = static_cast<uint8_t>(sh >> 16u);
+            shadeA = static_cast<uint8_t>(sh >> 24u);
+        }
+        else
+        {
+            shadeR = clampU8(static_cast<int>(v0.r * w0 + v1.r * w1 + v2.r * w2));
+            shadeG = clampU8(static_cast<int>(v0.g * w0 + v1.g * w1 + v2.g * w2));
+            shadeB = clampU8(static_cast<int>(v0.b * w0 + v1.b * w1 + v2.b * w2));
+            shadeA = clampU8(static_cast<int>(v0.a * w0 + v1.a * w1 + v2.a * w2));
+            if (S.verifyLerp)
+            {
+                const uint32_t cand = g656ShadeQuad4(g656VertexRgba(v0), g656VertexRgba(v1),
+                                                     g656VertexRgba(v2), w0, w1, w2);
+                const uint32_t ref = static_cast<uint32_t>(shadeR) |
+                                     (static_cast<uint32_t>(shadeG) << 8u) |
+                                     (static_cast<uint32_t>(shadeB) << 16u) |
+                                     (static_cast<uint32_t>(shadeA) << 24u);
+                g_g656ShadeChecks.fetch_add(1ull, std::memory_order_relaxed);
+                if (cand != ref)
+                {
+                    const uint64_t bad =
+                        g_g656ShadeBad.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+                    if (bad <= 16ull)
+                        std::fprintf(stderr, "[G656:shade-BAD] n=%llu simd=%08x scalar=%08x "
+                                             "w=%.9g,%.9g,%.9g\n",
+                                     static_cast<unsigned long long>(bad), cand, ref, w0, w1, w2);
+                }
+            }
+        }
 
         uint8_t fr, fg, fb, fa;
         if constexpr (!TEXTURED)
@@ -617,7 +701,8 @@ static void g609TriScanRowT(const G609TriScan &S, int y, float py,
                 const uint16_t iv = static_cast<uint16_t>(v0.v * w0 + v1.v * w1 + v2.v * w2);
                 if constexpr (SAMPINL)
                     texel = g609SampleT8<true>(*S.sample, S.clut, S.vram, quad, S.ceil, quadMiss,
-                                               0.0f, 0.0f, 1.0f, iu, iv);
+                                               0.0f, 0.0f, 1.0f, iu, iv,
+                                               S.simdLerp, S.verifyLerp);
                 else
                     texel = g608SampleSharedT8Uv(S.vram, iu, iv);
             }
@@ -628,7 +713,8 @@ static void g609TriScanRowT(const G609TriScan &S, int y, float py,
                 const float iq = v0.q * w0 + v1.q * w1 + v2.q * w2;
                 if constexpr (SAMPINL)
                     texel = g609SampleT8<false>(*S.sample, S.clut, S.vram, quad, S.ceil, quadMiss,
-                                                is, it, iq, 0u, 0u);
+                                                is, it, iq, 0u, 0u,
+                                                S.simdLerp, S.verifyLerp);
                 else
                     texel = g580SampleSharedT8(S.vram, is, it, iq);
             }
@@ -646,10 +732,51 @@ static void g609TriScanRowT(const G609TriScan &S, int y, float py,
         {
             // combineTexture with tfx == 0 (MODULATE) and tcc == 1, both pinned by the admission.
             // rasterizer_row_pool.inc:84..87, statement for statement.
+            // ⭐ G656 P20 slice 2: the third 4-lane shape in this pixel. Exactness argument in
+            // g656_bilinear_simd.inc — the uint8 x uint8 product fits in 16 bits, so
+            // `_mm_mullo_epi16` is the exact product and `_mm_packus_epi16` is the exact clampU8.
+            if (S.simdLerp && !S.verifyLerp)
+            {
+                const uint32_t shadeWord = static_cast<uint32_t>(shadeR) |
+                                           (static_cast<uint32_t>(shadeG) << 8u) |
+                                           (static_cast<uint32_t>(shadeB) << 16u) |
+                                           (static_cast<uint32_t>(shadeA) << 24u);
+                const uint32_t out = g656ModulateQuad4(texel, shadeWord);
+                fr = static_cast<uint8_t>(out);
+                fg = static_cast<uint8_t>(out >> 8u);
+                fb = static_cast<uint8_t>(out >> 16u);
+                fa = static_cast<uint8_t>(out >> 24u);
+            }
+            else
+            {
             fr = static_cast<uint8_t>(clampU8((tr * shadeR) >> 7));
             fg = static_cast<uint8_t>(clampU8((tg * shadeG) >> 7));
             fb = static_cast<uint8_t>(clampU8((tb * shadeB) >> 7));
             fa = static_cast<uint8_t>(clampU8((ta * shadeA) >> 7));
+            if (S.verifyLerp)
+            {
+                const uint32_t shadeWord = static_cast<uint32_t>(shadeR) |
+                                           (static_cast<uint32_t>(shadeG) << 8u) |
+                                           (static_cast<uint32_t>(shadeB) << 16u) |
+                                           (static_cast<uint32_t>(shadeA) << 24u);
+                const uint32_t cand = g656ModulateQuad4(texel, shadeWord);
+                const uint32_t ref = static_cast<uint32_t>(fr) |
+                                     (static_cast<uint32_t>(fg) << 8u) |
+                                     (static_cast<uint32_t>(fb) << 16u) |
+                                     (static_cast<uint32_t>(fa) << 24u);
+                g_g656ModChecks.fetch_add(1ull, std::memory_order_relaxed);
+                if (cand != ref)
+                {
+                    const uint64_t bad =
+                        g_g656ModBad.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+                    if (bad <= 16ull)
+                        std::fprintf(stderr, "[G656:mod-BAD] n=%llu simd=%08x scalar=%08x "
+                                             "texel=%08x shade=%08x\n",
+                                     static_cast<unsigned long long>(bad), cand, ref,
+                                     texel, shadeWord);
+                }
+            }
+            }
         }
         else
         {

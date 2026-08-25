@@ -846,6 +846,7 @@ static bool g447HostCheckOn()
     return on;
 }
 
+#if defined(PS2X_G419_DIAG)
 static int g419AbLever()
 {
     static const int lever = [] {
@@ -1278,11 +1279,16 @@ static const char *g419AbLeverName(int lever)
     default: return "none";
     }
 }
+#else
+static constexpr int g419AbLever() { return static_cast<int>(kG419LeverNone); }
+static const char *g419AbLeverName(int) { return "none"; }
+#endif
 
 // DC2_G419_BALLAST=<repeats> — critical-path sensitivity probe. BOTH buckets run the control form;
 // the candidate bucket additionally repeats the site's work <repeats> times. The repeat must be
 // idempotent (it rewrites identical bytes), so the only thing measured is how much of a KNOWN added
 // cost at that exact site reaches the frame.
+#if defined(PS2X_G419_DIAG)
 static int g419AbBallast()
 {
     static const int n = [] {
@@ -1349,6 +1355,14 @@ static bool g419AbArmFor(int lever, bool defaultOn)
         return false;
     return arm != 0u;
 }
+
+#else
+static constexpr int g419AbBallast() { return 0; }
+static constexpr uint64_t g419AbWarmFrames() { return 0u; }
+static constexpr uint64_t g419AbWindow() { return 0u; }
+static constexpr bool g419AbLeverMatches(int) { return false; }
+static bool g419AbArmFor(int, bool defaultOn) { return defaultOn; }
+#endif
 
 static bool g452AsyncSelected()
 {
@@ -3757,6 +3771,7 @@ int g445KickAllArm()
 
 
 // How many extra idempotent repetitions this frame's site should perform (ballast mode only).
+#if defined(PS2X_G419_DIAG)
 static int g419AbBallastReps(int lever)
 {
     const int n = g419AbBallast();
@@ -3764,6 +3779,9 @@ static int g419AbBallastReps(int lever)
         return 0;
     return g_g419AbArm.load(std::memory_order_relaxed) != 0u ? n : 0;
 }
+#else
+static constexpr int g419AbBallastReps(int) { return 0; }
+#endif
 
 // Frames observed at the instrument's sample point. Counted unconditionally (one increment per
 // frame) so every G419 per-batch census can be normalised to a real per-frame figure. Guessing the
@@ -3778,6 +3796,7 @@ static void g419NoteFrameTick()
 
 // Once-per-guest-frame tick at g150_frame_barrier. Charges the elapsed interval to whichever arm a
 // consumer reported, then draws the next frame's arm.
+#if defined(PS2X_G419_DIAG)
 static void g419AbTick()
 {
     if (g419AbLever() == kG419LeverNone)
@@ -3994,6 +4013,9 @@ static void g419AbTick()
                      static_cast<unsigned long long>(s_blkFav), verdict);
     }
 }
+#else
+static void g419AbTick() {}
+#endif
 
 // ---------------------------------------------------------------------------------------------
 // Exact CT32 upload fast pack.

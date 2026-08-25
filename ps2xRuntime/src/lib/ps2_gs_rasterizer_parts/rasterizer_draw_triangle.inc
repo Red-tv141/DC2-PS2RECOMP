@@ -1743,6 +1743,9 @@ void GSRasterizer::drawTriangle(GS *gs)
                          : nullptr;
         g609S.ceil = g609CeilProbe();
         g609S.stat = g609TriScanStatOn();
+        // G656 P20: per-draw hoist of the SSE2 bilinear arm and its shadow oracle.
+        g609S.simdLerp = g656SimdLerpOn();
+        g609S.verifyLerp = g656VerifyLerpOn();
     }
     // Slice B is admitted only when both hoists are valid — fail closed onto the `noinline` call.
     // G628: `g605Texd` gates it as well, because the untextured instantiation has no sampler to

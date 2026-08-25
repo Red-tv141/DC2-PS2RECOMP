@@ -219,8 +219,27 @@
                 // batch is already rendered AND read back into VRAM — skip the CPU replay
                 // entirely. On ANY unsupported entry it returns false having changed nothing,
                 // and the proven CPU band replay below runs for the whole flush.
+#if defined(PS2X_G657_DIAG)
+                // G657 P4: the accepted-GPU half of the coverage metric. Paired with the fallback
+                // lap below, these two are the only two exits from this decision, so their batch /
+                // entry / wall totals partition the whole raster population by construction.
+                const bool g657On = g657WallOn();
+                const std::chrono::steady_clock::time_point g657T0 =
+                    g657On ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+                const size_t g657Entries = g_g144List.size();
+                const uint32_t g657Fbp = g_g144List.empty() ? 0u : g_g144List[0].ctx.frame.fbp;
+#endif
                 if (g178TryFlushGpu(self, g_g144LastGs, g_g144LastGs->m_vram, g_g144LastGs->m_vramSize))
                 {
+#if defined(PS2X_G657_DIAG)
+                    if (g657On)
+                        g657NoteGpuOk(g528ClassifyFbp(g657Fbp), g657Fbp,
+                                      static_cast<unsigned long long>(g657Entries),
+                                      static_cast<unsigned long long>(
+                                          std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                              std::chrono::steady_clock::now() - g657T0).count()));
+#endif
                     g401NoteCompositeEntries(g_g144LastGs->m_vram, g_g144List, "post-gpu");
                     g401NoteDisplayFlush(g_g144LastGs->m_vram, g_g144List, "post-gpu");
                     if (g290P)
@@ -240,6 +259,21 @@
                 // gated on g290P — the entry weight is the whole point and must not require the
                 // probe's per-flush clock pair to be armed.
                 g583NoteFallback(g_g144List);
+#if defined(PS2X_G657_DIAG)
+                // G657 P3: charge the WHOLE CPU-fallback tail - publication prologue, band replay,
+                // and the post-replay notes - to the reject family that sent the batch here. The
+                // destructor fires at the end of this closure, i.e. after the last write, so the
+                // reason and the wall it caused are one fact rather than two joined after the run.
+                // ⛔ CONSTRUCTED HERE, NOT LOWER DOWN, because `g603NoteFallbackAdmission` below
+                // CLOBBERS `g_g266ClassifySite` (its own comment says so, which is why G583 reads
+                // it first). Same ordering hazard, same fix. Rule 17 still applies to the run
+                // itself: DC2_G603_ADMIT doubles the classification work per fallback entry, so it
+                // changes the population and must never share a process with DC2_G657_REJWALL.
+                const G657WallLap g657Lap(g657On, static_cast<unsigned>(g_g266FlushRej & 0xF),
+                                          static_cast<unsigned>(g_g266ClassifySite & 0xF),
+                                          g528ClassifyFbp(g657Fbp), g657Fbp,
+                                          static_cast<unsigned long long>(g657Entries));
+#endif
                 // G603 (default-off, DC2_G603_ADMIT=1): the same choke point, asking the question
                 // G583's reason code cannot answer — WOULD the classifier admit these entries, and
                 // if not, is the first failing conjunct the last one? Must follow g583NoteFallback:

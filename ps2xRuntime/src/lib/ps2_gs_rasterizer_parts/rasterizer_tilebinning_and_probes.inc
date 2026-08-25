@@ -237,9 +237,59 @@ static inline uint8_t g364FogLerp(uint8_t c, uint32_t f, uint32_t fc)
     // Exact at both endpoints: f=255 -> c, f=0 -> fc.
     return static_cast<uint8_t>((static_cast<uint32_t>(c) * f + fc * (255u - f) + 127u) / 255u);
 }
+// ===== G657 P2b — BUILT, PROVEN EXACT, AND NOT PROMOTED (mechanism at the noise floor) =========
+//
+// The exact SSE2 lowering of the three lerps below lives in `g657_fog_simd.inc`. It is correct:
+// `[G657:fog] arm=verify checks=1,104,536,503 bad=0` on `lavaboss`. Its mechanism is not worth its
+// bytes: at matched denominators (n=896,458 / px=1,103,963,280 in both arms) the packed form reads
+// **323.2 vs 326.1 cyc/inside = -0.89%**, inside the scalar arm's own cross-run drift (+-0.85%).
+//
+// ⛔ RULE 12c: a lever that does not pay must not sit in this TU as runtime-flagged code — a
+// `const bool` guard does not make it free. It is therefore a COMPILE-TIME build mode
+// (`-DPS2X_G657_FOGSIMD=ON`) with its call site `#if`-EXCLUDED, so the default binary carries zero
+// bytes of it, exactly like PS2X_G654_GPUDOMAIN / PS2X_G656_TEXREPL.
+#if defined(PS2X_G657_FOGSIMD)
+#include "g657_fog_simd.inc"
+#endif
+
 static inline void g364ApplyFog(uint32_t f, uint8_t &r, uint8_t &g, uint8_t &b)
 {
     const uint32_t fc = g364FogColNow();
+#if defined(PS2X_G657_FOGSIMD)
+    // ⭐ The arm is selected ONCE, outside every hot loop, by a function-local static (rule 13:
+    // never a rollback ternary inside an inner loop). MSVC folds the magic-static guard to a single
+    // predictable load+test here, the same shape g656SimdLerpOn() already has in this TU.
+    static const bool s_simd = g657SimdFogOn();
+    static const bool s_verify = g657VerifyFogOn();
+    if (s_verify)
+    {
+        // Shadow oracle: run BOTH forms, compare, and SHIP THE SCALAR ONE, so an exactness defect
+        // is counted and reported but can never reach a pixel or a captured frame.
+        uint8_t sr = r, sg = g, sb = b;
+        sr = g364FogLerp(sr, f, fc & 0xFFu);
+        sg = g364FogLerp(sg, f, (fc >> 8) & 0xFFu);
+        sb = g364FogLerp(sb, f, (fc >> 16) & 0xFFu);
+        uint8_t vr = r, vg = g, vb = b;
+        g657FogQuad3(f, fc, vr, vg, vb);
+        g_g657FogChecks.fetch_add(1ull, std::memory_order_relaxed);
+        if (vr != sr || vg != sg || vb != sb)
+        {
+            const uint64_t bad = g_g657FogBad.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+            if (bad <= 16ull)
+                std::fprintf(stderr,
+                             "[G657:fog-BAD] n=%llu f=%u fc=%06x simd=(%u,%u,%u) scalar=(%u,%u,%u)\n",
+                             static_cast<unsigned long long>(bad), f, fc,
+                             vr, vg, vb, sr, sg, sb);
+        }
+        r = sr; g = sg; b = sb;
+        return;
+    }
+    if (s_simd)
+    {
+        g657FogQuad3(f, fc, r, g, b);
+        return;
+    }
+#endif // PS2X_G657_FOGSIMD
     r = g364FogLerp(r, f, fc & 0xFFu);
     g = g364FogLerp(g, f, (fc >> 8) & 0xFFu);
     b = g364FogLerp(b, f, (fc >> 16) & 0xFFu);
@@ -795,6 +845,41 @@ static std::atomic<uint64_t> g_g587VerifyChecks{0}, g_g587VerifyBad{0},
 static std::atomic<uint64_t> g_g584VerifyBadBig{0}, g_g584VerifyMaxDelta{0};
 static std::atomic<uint64_t> g_g584Verify139BadBig{0}, g_g584Verify139Pixels{0};
 
+#if defined(PS2X_G655_DEPTH_DIAG)
+// This include precedes the G178 generation implementation. Keep a diagnostic-only mirror of its
+// actual page walk, filled by g178BumpRectImpl after G471 has resolved the touched physical pages.
+struct G655DepthWriter
+{
+    uint64_t seq = 0u;
+    uint32_t source = 0u, bpBlocks = 0u, psm = 0u;
+    uint32_t x = 0u, y = 0u, w = 0u, h = 0u;
+};
+static std::array<G655DepthWriter, 512> g_g655DepthWriter{};
+static std::array<G655DepthWriter, 512> g_g655DepthPrevWriter{};
+static std::atomic<uint64_t> g_g655DepthGuestSeq{0u};
+
+static void g655TraceDepthBump(uint32_t basePage, uint32_t widthPages,
+                               uint32_t py0, uint32_t py1, uint32_t px0, uint32_t px1,
+                               bool exactAligned, uint32_t source, uint32_t bpBlocks,
+                               uint32_t psm, uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    const uint32_t slack = exactAligned ? 0u : 1u;
+    for (uint32_t py = py0; py <= py1; ++py)
+        for (uint32_t px = px0; px <= px1 + slack; ++px)
+        {
+            const uint32_t page = (basePage + py * widthPages + px) & 511u;
+            // ZBP 0xd0, FBW 8, 512 rows occupies 16 page rows x 8 pages.
+            if (page < 0x0d0u || page > 0x14fu)
+                continue;
+            const uint64_t seq = g_g655DepthGuestSeq.fetch_add(1u,
+                std::memory_order_relaxed) + 1u;
+            g_g655DepthPrevWriter[page] = g_g655DepthWriter[page];
+            g_g655DepthWriter[page] = G655DepthWriter{
+                seq, source, bpBlocks, psm, x, y, w, h};
+        }
+}
+#endif
+
 struct G255VerifyState
 {
     bool pending = false;
@@ -823,6 +908,9 @@ struct G255VerifyState
     int depthRowHi = -1;
     std::vector<uint32_t> depthBefore;
     std::vector<uint32_t> depthGpu;
+#if defined(PS2X_G655_DEPTH_DIAG)
+    uint64_t g655GuestZGen = 0u;
+#endif
     uint32_t g604SubDraws = 0; // G604: blend-mode-6 draws in this batch (arm-divergence counter)
     uint32_t g604FboSrcDraws = 0; // G604: draws sampling another target's FBO (residency skew)
     bool g604IsDiscov = false;    // G604: this batch is a G527-discovered transient target
@@ -999,6 +1087,9 @@ static void g255BeginVerify(uint8_t *vram, uint32_t vramSize, uint32_t fbp, uint
     s.depthRowHi = depthRowHi;
     if (s.g570Depth)
     {
+#if defined(PS2X_G655_DEPTH_DIAG)
+        s.g655GuestZGen = g_g655DepthGuestSeq.load(std::memory_order_relaxed);
+#endif
         const size_t depthCount =
             static_cast<size_t>(depthRowHi - depthRowLo + 1) * static_cast<size_t>(fbW);
         s.depthBefore.resize(depthCount);
@@ -1060,6 +1151,18 @@ static void g570StageDepthVerify()
         }
 }
 
+// ===== G656 P17: the same-run CPU verify oracle is a COMPILE-TIME build mode ==================
+// `g255CompareCpuVerify` is 10,603 bytes of the hottest TU in the build (a per-COMDAT rank of the
+// shipped G655 object put it 6th overall, ahead of every G609 span kernel). It runs only when one
+// of `g570Verify13dOn / g583Verify13bOn / g586Verify141On / g587Verify15dOn / g604VerifyDispOn /
+// g604VerifyDiscovOn` is armed, i.e. never in a normal Release run — so by rule 12c its bytes are
+// a pure code-layout tax there. `-DPS2X_G656_VERIFY=ON` restores it, and that build is what the
+// G656 depth work (P3/P28) and every future `DC2_G604_VERIFY_*` run must use.
+//
+// The stub is exact: with every arm disarmed the real body's first statement is the compound
+// `if (!(...) || !s.pending || !s.g570Depth) return;`, which is unconditionally taken, and the
+// function has no other effect and no return value.
+#if defined(PS2X_G656_VERIFY)
 static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
 {
     G255VerifyState &s = g_g255Verify;
@@ -1178,13 +1281,27 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
                 }
             }
         }
+    #if defined(PS2X_G655_DEPTH_DIAG)
+    int firstDepthX = -1, firstDepthY = -1;
+    uint32_t firstDepthCpu = 0u, firstDepthGpu = 0u;
+    #endif
     if (s.g570Depth)
         for (int y = s.depthRowLo; y <= s.depthRowHi; ++y)
             for (int x = 0; x < s.fbW; ++x)
             {
                 const size_t i = static_cast<size_t>(y - s.depthRowLo) * s.fbW + x;
-                if (g403DisplayZRead(x, y, s.fbp) != s.depthGpu[i])
+                const uint32_t cpuZ = g403DisplayZRead(x, y, s.fbp);
+                if (cpuZ != s.depthGpu[i])
+                {
+#if defined(PS2X_G655_DEPTH_DIAG)
+                    if (firstDepthX < 0)
+                    {
+                        firstDepthX = x; firstDepthY = y;
+                        firstDepthCpu = cpuZ; firstDepthGpu = s.depthGpu[i];
+                    }
+#endif
                     ++depthBad;
+                }
             }
     const int ti = g248TargetIndex(s.fbp);
     if (g570Verify139On() && s.fbp == 0x139u)
@@ -1340,6 +1457,37 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
         }
         if (bad != 0u || depthBad != 0u || n <= 8u || (n % 60u) == 0u)
         {
+#if defined(PS2X_G655_DEPTH_DIAG)
+            static const bool g655Trace = envFlagEnabled("DC2_G655_DEPTH_TRACE");
+            if (g655Trace && depthBad != 0u && firstDepthX >= 0)
+            {
+                const uint32_t off = GSPSMCT32::addrPSMCT32(
+                    0x0d0u << 5u, 8u, static_cast<uint32_t>(firstDepthX),
+                    static_cast<uint32_t>(firstDepthY));
+                const uint32_t page = (off >> 13u) & 511u;
+                const uint64_t genNow = g_g655DepthGuestSeq.load(std::memory_order_relaxed);
+                const G655DepthWriter writer = g_g655DepthWriter[page];
+                const G655DepthWriter prior = g_g655DepthPrevWriter[page];
+                std::fprintf(stderr,
+                             "[G655:depthtrace] batch=%llu fbp=%03x zbp=0d0 rows=%d..%d "
+                             "first=(%d,%d cpu=%08x gpu=%08x) zbad=%llu guestGen=%llu->%llu "
+                             "page=%03x pageGen=%llu writer(seq=%llu src=%u bp=%x psm=%x "
+                             "rect=%u,%u,%u,%u) prior(seq=%llu src=%u bp=%x psm=%x "
+                             "rect=%u,%u,%u,%u) privateMirror=1 boundary=gpu-restore-cpu up=%u\n",
+                             static_cast<unsigned long long>(n), s.fbp,
+                             s.depthRowLo, s.depthRowHi, firstDepthX, firstDepthY,
+                             firstDepthCpu, firstDepthGpu,
+                             static_cast<unsigned long long>(depthBad),
+                             static_cast<unsigned long long>(s.g655GuestZGen),
+                             static_cast<unsigned long long>(genNow), page,
+                             static_cast<unsigned long long>(writer.seq),
+                             static_cast<unsigned long long>(writer.seq), writer.source,
+                             writer.bpBlocks, writer.psm, writer.x, writer.y, writer.w, writer.h,
+                             static_cast<unsigned long long>(prior.seq), prior.source,
+                             prior.bpBlocks, prior.psm, prior.x, prior.y, prior.w, prior.h,
+                             s.g604Upload);
+            }
+#endif
             const uint64_t px = g_g604DscPixels.load(std::memory_order_relaxed);
             std::fprintf(stderr,
                          "[G604:verifydiscov] n=%llu fbp=0x%x pixels=%zu bad=%llu rgb=%llu "
@@ -1660,6 +1808,10 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
     s.pending = false;
     s.g570Depth = false;
 }
+#else
+// G656 P17 stub — see the note above the real body.
+static void g255CompareCpuVerify(uint8_t *, uint32_t) {}
+#endif
 
 // G253 (diagnostic only, default off): attribute G252's mid-frame drains without changing
 // capture, replay, or barrier behavior.  The compact transition matrix answers whether the

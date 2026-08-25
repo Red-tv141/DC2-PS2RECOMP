@@ -1356,7 +1356,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // largest single pass) so its per-flush PROLOGUE, its per-entry LOOP and its EPILOGUE are
     // separated too. Behaviour-pure; implies G298's timestamps. Armed by DC2_G523_FIT=1.
     static const bool s_g523Fit = envFlagEnabled("DC2_G523_FIT");
-    static const bool s_g298Profile = envFlagEnabled("DC2_G298_PROFILE") || s_g523Fit;
+#if defined(PS2X_G654_DIAG)
+    static const bool s_g655ClassSplit = envFlagEnabled("DC2_G655_CLASSSPLIT");
+#else
+    static constexpr bool s_g655ClassSplit = false;
+#endif
+    static const bool s_g298Profile =
+        envFlagEnabled("DC2_G298_PROFILE") || s_g523Fit || s_g655ClassSplit;
     // G323: split G298 T2->T3 dependency preparation into exclusive complete-operation families.
     // The empty arm takes the same cached scope timestamps but retains no counters, bounding timer
     // self-cost without changing renderer behavior or dependency ordering.
@@ -1684,6 +1690,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // admission, the G266 FBW residency reset, the s_states reserve). Below is the per-entry loop.
     const auto g523ClsA = s_g298Profile ? std::chrono::steady_clock::now()
                                         : std::chrono::steady_clock::time_point{};
+    uint64_t g655ClassIdentityNs = 0u, g655ClassClassifierNs = 0u,
+             g655ClassRangeNs = 0u;
     for (size_t g510i = 0; g510i < g_g144List.size(); ++g510i)
     {
         const G144Entry &e = g_g144List[g510i];
@@ -1716,6 +1724,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             return false; // mixed targets in one flush — shouldn't happen (block flush on fbp change)
         }
         G178EntryState st;
+        const auto g655ClassA = s_g655ClassSplit ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
         // G510: state-identity test against the immediately preceding entry. Each sub-struct is
         // compared whole because every one of them is written by a single struct assignment at
         // capture time (`e.ctx = ctx` etc), so their internal padding travels with their content.
@@ -1746,6 +1756,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                  e.townDepthScope == p.townDepthScope)
                     ? 1u : 0u;
         }
+        const auto g655ClassB = s_g655ClassSplit ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
+        if (s_g655ClassSplit)
+            g655ClassIdentityNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(g655ClassB - g655ClassA)
+                    .count());
         if (g510Same)
             ++g510Eligible;
         if (g510Memo && g510Same)
@@ -1770,6 +1786,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             }
             return false;
         }
+        const auto g655ClassC = s_g655ClassSplit ? std::chrono::steady_clock::now()
+                                                 : std::chrono::steady_clock::time_point{};
+        if (s_g655ClassSplit)
+            g655ClassClassifierNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(g655ClassC - g655ClassB)
+                    .count());
         // G282: G144 capture already computed conservative primitive rows with the same
         // floor/ceil/scissor rules as drawTriangle/drawSprite. Keep a parallel tight union for
         // the measured alias batch; the legacy scissor union stays intact until all entries pass.
@@ -1832,6 +1854,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 g282RowHi = std::max(g282RowHi, g282EntryHi);
             }
         }
+        if (s_g655ClassSplit)
+            g655ClassRangeNs += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - g655ClassC)
+                    .count());
     }
     // G523 lap B: the per-entry loop ends here. What follows (the G510/G511 census tails and the
     // G289 owner-view build) is per-flush EPILOGUE.
@@ -3878,6 +3905,18 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // "rejected on shape" and "the decision point never ran" must not share one bucket.
     bool g623PrePassRan = false;
     g630BeginTexturePass();
+#if defined(PS2X_G654_DIAG)
+    static const bool s_g654BindMemo = envFlagEnabled("DC2_G654_BINDMEMO");
+    uint64_t g654PrevKey = ~0ull;
+    bool g654HavePrev = false;
+    size_t g654Repeat = 0u, g654Distinct = 0u;
+    static std::vector<uint8_t> s_g654WeakRepeat, s_g654ExactRepeat;
+    if (s_g654BindMemo)
+    {
+        s_g654WeakRepeat.assign(g_g144List.size(), 0u);
+        s_g654ExactRepeat.assign(g_g144List.size(), 0u);
+    }
+#endif
     if ((g261WaveOn() && g261AnyDirty()) || g630HaveSurfaces() || g289DirectDisplaySrc != 0u ||
         g289OwnerViewReady)
     {
@@ -4175,6 +4214,14 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // guest VRAM and the bind gates read page generations — so the arm is separate and the
         // reorder it implies is COUNTED (`[G632:conflict]`), never assumed away.
         G632EpochScope g632TexEpoch(g632TexEpochOn(), 2);
+#if defined(PS2X_G656_DIAG)
+        // G656 P6: read the arm ONCE per flush, never per entry (rule 13 - hot-loop invariant
+        // hoisting). In the default build this whole declaration is compiled out.
+        const bool g656BindArmed = g656BindOn();
+#else
+        const bool g656BindArmed = false;
+        (void)g656BindArmed;
+#endif
 #if defined(PS2X_G654_DIAG)
         // ===== G654 P12: IS THE PER-ENTRY BIND DECISION REPEATED? ==============================
         // `[G323:census]` prices this loop at 0.083-0.097 ms per flush and 70-71% of the whole
@@ -4184,15 +4231,16 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // reach the same outcome. G510 measured adjacent GS state 92.80% identical, but a state
         // count is not a decision count (`appendix-dc2-attribution-recipes.md` §1.3q: counts are
         // not values), so this counts the DECISION, keyed on everything the loop below reads.
-        uint64_t g654PrevKey = ~0ull;
-        bool g654HavePrev = false;
-        size_t g654Repeat = 0u, g654Distinct = 0u;
 #endif
         for (size_t i = 0; i < g_g144List.size() && !s_g599NoBind; ++i)
         {
             const G178EntryState &st = s_states[i];
             const G144Entry &e = g_g144List[i];
+            // G656 P6: which of this loop's ~10 candidate-source gates owns the 70-71% of `deps`
+            // that [G323:census] prices as one number. Diagnostic build mode only (rule 12c).
+            G656BindLap g656Bind(g656BindArmed);
 #if defined(PS2X_G654_DIAG)
+            if (s_g654BindMemo)
             {
                 const uint64_t g654Key =
                     (static_cast<uint64_t>(fbp) << 40) ^
@@ -4201,8 +4249,14 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     (static_cast<uint64_t>(st.skip ? 1u : 0u) << 4) ^
                     (static_cast<uint64_t>(e.prim.tme ? 1u : 0u) << 5) ^
                     (static_cast<uint64_t>(st.residencyPlan) << 16);
-                if (g654HavePrev && g654Key == g654PrevKey) ++g654Repeat;
+                const bool g654WeakSame = g654HavePrev && g654Key == g654PrevKey;
+                if (g654WeakSame) ++g654Repeat;
                 else ++g654Distinct;
+                s_g654WeakRepeat[i] = g654WeakSame ? 1u : 0u;
+                if (i > 0u &&
+                    std::memcmp(&e, &g_g144List[i - 1u], sizeof(G144Entry)) == 0 &&
+                    std::memcmp(&st, &s_states[i - 1u], sizeof(G178EntryState)) == 0)
+                    s_g654ExactRepeat[i] = 1u;
                 g654PrevKey = g654Key;
                 g654HavePrev = true;
             }
@@ -4228,6 +4282,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 g261AnyBind = true;
                 continue;
             }
+            G656_BIND_LAP(kG656BindG289);
             const bool g310Shape =
                 (g310On() || g310StatOn()) && g310EntryShape(fbp, e, st);
             const bool g309Shape = g309On() && g309EntryShape(fbp, e, st);
@@ -4248,6 +4303,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 }
                 // A failed or invalidated logical snapshot takes the frozen legacy path below.
             }
+            G656_BIND_LAP(kG656BindG310);
             const bool g309Candidate =
                 !g310On() && g309Shape;
             if (g309Candidate)
@@ -4265,10 +4321,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 // frozen legacy materialize/decode path. Do not let the implied G280 stack turn
                 // a G309 failure into the older page-copy behavior.
             }
+            G656_BIND_LAP(kG656BindG309);
             if (st.texKey == 0 || st.skip || !e.prim.tme)
                 continue;
             if (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u)
                 continue; // G310 decoded this exact self-atlas snapshot before publication.
+            G656_BIND_LAP(kG656BindEarly);
 
             // G630: decode PSMT8 directly from persistent raw VRAM. FIFO order places the view
             // before the native draw that consumes this texture key, with no publication/wait.
@@ -4321,6 +4379,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 }
             }
 
+            G656_BIND_LAP(kG656BindT8);
             // G267 diagnostic: characterize the stable display TRISTRIP consumer with exact
             // bilinear taps and exact CT32 sampled pages. Behavior is intentionally unchanged:
             // the repaired prototype was neutral and was removed at phase close.
@@ -4398,6 +4457,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                      static_cast<unsigned>(st.wrapV));
                 }
             }
+            G656_BIND_LAP(kG656BindG267);
             // G280: fully handle the entry when the bind is provable AND every dirty-sibling
             // physical-page alias resolves with a GPU->GPU page-tile copy (the G267 family).
             // Success replaces the whole legacy per-target loop below for this entry — the
@@ -4414,6 +4474,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     continue;
                 }
             }
+            G656_BIND_LAP(kG656BindG280);
             // ===== G623: PRODUCER-SURFACE DIRECT CONSUMPTION =====
             // The read's base IS a transient producer surface's base and the sampled window is
             // provably still equal to that producer's FBO (version + alias + format + window +
@@ -4443,6 +4504,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     continue;
                 }
             }
+            G656_BIND_LAP(kG656BindProducer);
             // ===== G634: THE GPU-NATIVE TEXTURE READ =====
             // Every direct-FBO bind above declined. Before conceding a guest-VRAM authority
             // transition, decode the texture out of the persistent raw image with TEX0 addressing.
@@ -4460,6 +4522,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     continue;
                 }
             }
+            G656_BIND_LAP(kG656BindG634);
             // G630 fallback: a CPU decode is a proven CPU-visible boundary. If the exact direct
             // view gate declined, publish only the texture pages it is about to read.
             if (e.prim.tme)
@@ -4765,6 +4828,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 g323BindNs += elapsed > g323MaterializeNs
                     ? elapsed - g323MaterializeNs : 0u;
         }
+#if defined(PS2X_G656_DIAG)
+        if (g656BindArmed)
+            g656ReportBind();
+#endif
     }
     else
     {
@@ -4799,42 +4866,70 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             if (!g261AnyBind)
                 s_g261FboSrc.clear();
         }
+    }
 #if defined(PS2X_G654_DIAG)
-        // G654 P12: cross-tab the key repetition against the OUTCOME. `none` is the population a
-        // memo could skip outright (no bind token, no view key, i.e. the loop body ran and changed
-        // nothing); `bind`/`view` populations would have to reproduce their side effect.
+    // G654 P12: cross-tab the key repetition against the OUTCOME. Count only flushes where the
+    // bind-decision pre-pass actually ran; skipped pre-passes made no decision and are not `none`.
+    if (s_g654BindMemo && g654Distinct != 0u)
+    {
+        static uint64_t s_rep = 0u, s_dist = 0u, s_none = 0u, s_bind = 0u, s_view = 0u,
+                        s_weakStable = 0u, s_weakChanged = 0u,
+                        s_exactRepeat = 0u, s_exactStable = 0u, s_exactChanged = 0u,
+                        s_flushes = 0u;
+        s_rep += g654Repeat;
+        s_dist += g654Distinct;
+        ++s_flushes;
+        for (size_t i = 0; i < g_g144List.size(); ++i)
         {
-            static uint64_t s_rep = 0u, s_dist = 0u, s_none = 0u, s_bind = 0u, s_view = 0u,
-                            s_flushes = 0u;
-            s_rep += g654Repeat;
-            s_dist += g654Distinct;
-            ++s_flushes;
-            for (size_t i = 0; i < g_g144List.size(); ++i)
+            const bool bound = !s_g261FboSrc.empty() && s_g261FboSrc[i] != 0u;
+            const bool viewed = !s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u;
+            if (bound) ++s_bind;
+            else if (viewed) ++s_view;
+            else ++s_none;
+            if (i == 0u)
+                continue;
+            const uint32_t src = !s_g261FboSrc.empty() ? s_g261FboSrc[i] : 0u;
+            const uint32_t prevSrc = !s_g261FboSrc.empty() ? s_g261FboSrc[i - 1u] : 0u;
+            const uint64_t view = !s_g281ViewKey.empty() ? s_g281ViewKey[i] : 0u;
+            const uint64_t prevView = !s_g281ViewKey.empty() ? s_g281ViewKey[i - 1u] : 0u;
+            const int viewSrc = !s_g281ViewSrc.empty() ? s_g281ViewSrc[i] : -1;
+            const int prevViewSrc = !s_g281ViewSrc.empty() ? s_g281ViewSrc[i - 1u] : -1;
+            const bool sameOutcome = src == prevSrc && view == prevView && viewSrc == prevViewSrc;
+            if (s_g654WeakRepeat[i])
             {
-                const bool bound = !s_g261FboSrc.empty() && s_g261FboSrc[i] != 0u;
-                const bool viewed = !s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u;
-                if (bound) ++s_bind;
-                else if (viewed) ++s_view;
-                else ++s_none;
+                if (sameOutcome) ++s_weakStable;
+                else ++s_weakChanged;
             }
-            if ((s_flushes % 3000u) == 0u)
+            if (s_g654ExactRepeat[i])
             {
-                const double tot = static_cast<double>(s_rep + s_dist);
-                std::fprintf(stderr,
-                             "[G654:bindmemo] flushes=%llu entries=%llu repeatKey=%llu (%.1f%%) "
-                             "distinct=%llu outcome(none=%llu bind=%llu view=%llu)\n",
-                             static_cast<unsigned long long>(s_flushes),
-                             static_cast<unsigned long long>(s_rep + s_dist),
-                             static_cast<unsigned long long>(s_rep),
-                             tot > 0.0 ? 100.0 * static_cast<double>(s_rep) / tot : 0.0,
-                             static_cast<unsigned long long>(s_dist),
-                             static_cast<unsigned long long>(s_none),
-                             static_cast<unsigned long long>(s_bind),
-                             static_cast<unsigned long long>(s_view));
+                ++s_exactRepeat;
+                if (sameOutcome) ++s_exactStable;
+                else ++s_exactChanged;
             }
         }
-#endif
+        if ((s_flushes % 3000u) == 0u)
+        {
+            const double tot = static_cast<double>(s_rep + s_dist);
+            std::fprintf(stderr,
+                         "[G654:bindmemo] flushes=%llu entries=%llu repeatKey=%llu (%.1f%%) "
+                         "distinct=%llu outcome(none=%llu bind=%llu view=%llu) "
+                         "stable(weak=%llu changed=%llu exactN=%llu exact=%llu changed=%llu)\n",
+                         static_cast<unsigned long long>(s_flushes),
+                         static_cast<unsigned long long>(s_rep + s_dist),
+                         static_cast<unsigned long long>(s_rep),
+                         tot > 0.0 ? 100.0 * static_cast<double>(s_rep) / tot : 0.0,
+                         static_cast<unsigned long long>(s_dist),
+                         static_cast<unsigned long long>(s_none),
+                         static_cast<unsigned long long>(s_bind),
+                         static_cast<unsigned long long>(s_view),
+                         static_cast<unsigned long long>(s_weakStable),
+                         static_cast<unsigned long long>(s_weakChanged),
+                         static_cast<unsigned long long>(s_exactRepeat),
+                         static_cast<unsigned long long>(s_exactStable),
+                         static_cast<unsigned long long>(s_exactChanged));
+        }
     }
+#endif
     // G633: a later pre-pass ownership event can invalidate a view admitted earlier in this pass.
     // Repair only those event-queued consumers now, after all coherence preparation and before any
     // native draw consumes the resident token.
@@ -6238,38 +6333,15 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const auto g298T6 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
 #if defined(PS2X_G654_DIAG)
-    {
-        // G654 P11. Same denominator (nGpu) and same cumulative-mean convention as `[G298:profile]`,
-        // so the four sub-means SUM to `submit`.
-        static uint64_t s_oracleNs = 0u, s_prepNs = 0u, s_enqNs = 0u, s_postNs = 0u;
-        static uint64_t s_async = 0u, s_ok = 0u;
-        const auto g654Ns = [](auto a, auto b) {
-            return static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
-        };
-        const auto g654S4 = std::chrono::steady_clock::now();
-        s_oracleNs += g654Ns(g654S0, g654S1);
-        s_prepNs += g654Ns(g654S1, g654S2);
-        s_enqNs += g654Ns(g654S2, g654S3);
-        s_postNs += g654Ns(g654S3, g654S4);
-        s_async += g305Async ? 1u : 0u;
-        s_ok += submitted ? 1u : 0u;
-        if ((nGpu % 300u) == 0u && nGpu != 0u)
-        {
-            const double d = 1.0e6 * static_cast<double>(nGpu);
-            std::fprintf(stderr,
-                         "[G654:submit] gpu=%llu ok=%llu async=%llu avgMs(oracle=%.4f prep=%.4f "
-                         "enqueue=%.4f post=%.4f) sum=%.4f\n",
-                         static_cast<unsigned long long>(nGpu),
-                         static_cast<unsigned long long>(s_ok),
-                         static_cast<unsigned long long>(s_async),
-                         static_cast<double>(s_oracleNs) / d,
-                         static_cast<double>(s_prepNs) / d,
-                         static_cast<double>(s_enqNs) / d,
-                         static_cast<double>(s_postNs) / d,
-                         static_cast<double>(s_oracleNs + s_prepNs + s_enqNs + s_postNs) / d);
-        }
-    }
+    const auto g654Ns = [](auto a, auto b) {
+        return static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+    };
+    const auto g654S4 = std::chrono::steady_clock::now();
+    const uint64_t g654OracleNs = g654Ns(g654S0, g654S1);
+    const uint64_t g654PrepNs = g654Ns(g654S1, g654S2);
+    const uint64_t g654EnqNs = g654Ns(g654S2, g654S3);
+    const uint64_t g654PostNs = g654Ns(g654S3, g654S4);
 #endif
     if (!submitted)
     {
@@ -6852,6 +6924,35 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     }
 
     const uint64_t nGpu = g_g178GpuFlushes.fetch_add(1u, std::memory_order_relaxed) + 1u;
+#if defined(PS2X_G654_DIAG)
+    {
+        // G654 P11. Same denominator (nGpu) and same cumulative-mean convention as `[G298:profile]`,
+        // so the four sub-means SUM to `submit`.
+        static uint64_t s_oracleNs = 0u, s_prepNs = 0u, s_enqNs = 0u, s_postNs = 0u;
+        static uint64_t s_async = 0u, s_ok = 0u;
+        s_oracleNs += g654OracleNs;
+        s_prepNs += g654PrepNs;
+        s_enqNs += g654EnqNs;
+        s_postNs += g654PostNs;
+        s_async += g305Async ? 1u : 0u;
+        s_ok += submitted ? 1u : 0u;
+        if ((nGpu % 300u) == 0u)
+        {
+            const double d = 1.0e6 * static_cast<double>(nGpu);
+            std::fprintf(stderr,
+                         "[G654:submit] gpu=%llu ok=%llu async=%llu avgMs(oracle=%.4f prep=%.4f "
+                         "enqueue=%.4f post=%.4f) sum=%.4f\n",
+                         static_cast<unsigned long long>(nGpu),
+                         static_cast<unsigned long long>(s_ok),
+                         static_cast<unsigned long long>(s_async),
+                         static_cast<double>(s_oracleNs) / d,
+                         static_cast<double>(s_prepNs) / d,
+                         static_cast<double>(s_enqNs) / d,
+                         static_cast<double>(s_postNs) / d,
+                         static_cast<double>(s_oracleNs + s_prepNs + s_enqNs + s_postNs) / d);
+        }
+    }
+#endif
     if (s_g323Census)
     {
         static uint64_t s_depsNs = 0u, s_hygieneNs = 0u, s_logicalNs = 0u,
@@ -6973,6 +7074,34 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
         };
         s_classNs += ns(g298T0, g298T1);
+        if (s_g655ClassSplit)
+        {
+            static uint64_t s_g655ProNs = 0u, s_g655IdentityNs = 0u,
+                            s_g655ClassifierNs = 0u, s_g655RangeNs = 0u,
+                            s_g655EpilogueNs = 0u;
+            s_g655ProNs += ns(g298T0, g523ClsA);
+            s_g655IdentityNs += g655ClassIdentityNs;
+            s_g655ClassifierNs += g655ClassClassifierNs;
+            s_g655RangeNs += g655ClassRangeNs;
+            s_g655EpilogueNs += ns(g523ClsB, g298T1);
+            if ((nGpu % 300u) == 0u)
+            {
+                const double d = 1.0e6 * static_cast<double>(nGpu);
+                const uint64_t sum = s_g655ProNs + s_g655IdentityNs + s_g655ClassifierNs +
+                                     s_g655RangeNs + s_g655EpilogueNs;
+                std::fprintf(stderr,
+                             "[G655:classsplit] gpu=%llu avgMs(pro=%.4f identity=%.4f "
+                             "classifier=%.4f range=%.4f epi=%.4f) sum=%.4f class=%.4f\n",
+                             static_cast<unsigned long long>(nGpu),
+                             static_cast<double>(s_g655ProNs) / d,
+                             static_cast<double>(s_g655IdentityNs) / d,
+                             static_cast<double>(s_g655ClassifierNs) / d,
+                             static_cast<double>(s_g655RangeNs) / d,
+                             static_cast<double>(s_g655EpilogueNs) / d,
+                             static_cast<double>(sum) / d,
+                             static_cast<double>(s_classNs) / d);
+            }
+        }
         s_fbzNs += ns(g298T1, g298T2);
         // G576: split that same fbz span at its four seams. Same denominator (nGpu) and same
         // cumulative-mean convention as the parent tag, so the four sub-means SUM to `fbz`.

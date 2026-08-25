@@ -784,6 +784,10 @@ static void g628NoteMask(const G628MaskRow &r)
     ++g_g628MaskOverflow;
 }
 
+// G656 P17: the untextured-mask census dump is 4,667 bytes of the hottest TU and reachable only
+// from the millionth-call branch of a census that is itself default-OFF. Compile-time build mode
+// (rule 12c); `-DPS2X_G656_VERIFY=ON` restores it alongside the G255 oracle.
+#if defined(PS2X_G656_VERIFY)
 #if defined(_MSC_VER)
 __declspec(noinline)
 #endif
@@ -847,6 +851,11 @@ static void g628DumpMaskCensus()
     }
     std::fflush(stderr);
 }
+#else
+// G656 P17 stub — the census it dumps is default-OFF, so with the build mode off there is nothing
+// to print. Same signature, no body, no bytes.
+static void g628DumpMaskCensus() {}
+#endif
 
 #if defined(_MSC_VER)
 __declspec(noinline)

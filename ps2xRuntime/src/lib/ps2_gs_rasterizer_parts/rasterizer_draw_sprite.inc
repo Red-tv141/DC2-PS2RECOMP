@@ -2800,6 +2800,10 @@ void g144FlushPendingUploadRange(uint32_t dbp,
     // uploads record through with no synchronization. Unresolvable ranges fail closed.
     if (g260NrOn())
     {
+        // G656 P9: the exclusive stage split of this edge. `[G313:seg]` proves the whole edge is
+        // 95.9% of the `lavaboss` IMAGE layer, but an inclusive timer around a flush measures the
+        // work it DRAINS (G429's law), so the WORK/WAIT question is answered here, per stage.
+        G656UpLap g656Up(g656DiagOn());
         const G144BlockRange dst = g144RangeForRect(dbp, dpsm, dbw, dsax, dsay, rrw, rrh);
         const bool dstUnknown = (rrw != 0u && rrh != 0u && !dst.valid);
         const bool g289UploadOverwrite =
@@ -2829,6 +2833,7 @@ void g144FlushPendingUploadRange(uint32_t dbp,
         }
         if (!g289UploadOverwrite)
             g289MaterializeForRanges(G144BlockRange{}, dst, false, dstUnknown, 7);
+        G656_UP_LAP(kG656UpG289Mat);
         G314EdgeScope g314Edge;
         if (g260HasPending())
         {
@@ -2859,6 +2864,7 @@ void g144FlushPendingUploadRange(uint32_t dbp,
                 ++g_g260UploadSkips;
             }
         }
+        G656_UP_LAP(kG656UpExec);
         // G261: the caller writes `dst` into guest VRAM next — if it lands on (or the range is
         // unresolvable near) a GPU-resident RTT row, materialize first so the upload composes
         // over current bytes and the residency record cannot go stale-partial.
@@ -2889,12 +2895,15 @@ void g144FlushPendingUploadRange(uint32_t dbp,
             ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                   std::chrono::steady_clock::now() - g327T0).count())
             : 0u;
+        G656_UP_LAP(kG656UpG264);
         (void)g278FlushPendingDepthForRanges(
             7, G144BlockRange{}, dst, false, dstUnknown);
+        G656_UP_LAP(kG656UpG278Dep);
         if (g327CensusOn())
             g327T0 = std::chrono::steady_clock::now();
         g261MaterializeForRanges(G144BlockRange{}, dst, false, dstUnknown, kG261MatUpload,
                                  g264Mask, g630UploadPatch);
+        G656_UP_LAP(kG656UpG261Mat);
         const uint64_t g327MatNs = g327CensusOn()
             ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                   std::chrono::steady_clock::now() - g327T0).count())
@@ -2902,13 +2911,23 @@ void g144FlushPendingUploadRange(uint32_t dbp,
         g327RecordUpload(dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
                          g327OverlapMask, g264Mask, g327NoteNs, g327MatNs);
         (void)g278FlushPendingDepthForDisplayOwners(7);
+        G656_UP_LAP(kG656UpG278Disp);
         g272MaterializeForRanges(G144BlockRange{}, dst, false, dstUnknown, 7);
+        G656_UP_LAP(kG656UpG272Mat);
         g277CensusRangeEdge(7, G144BlockRange{}, dst, false, dstUnknown);
         // G276/G284: publish deferred display readbacks before this l2h upload edge — unless G284
         // proves the upload dst is disjoint from the pending display rows (then keep it coalesced).
         g276FlushPendingDisplayForRanges(7, G144BlockRange{}, dst, false, dstUnknown);
+        G656_UP_LAP(kG656UpG276Disp);
         g314FinishEdge(g314Edge, g264Mask, dbp, dbw, dpsm,
                        dsax, dsay, rrw, rrh);
+#if defined(PS2X_G656_DIAG)
+        if (g656DiagOn())
+        {
+            g656Up.lap(kG656UpTail);
+            g656ReportUpload();
+        }
+#endif
         return;
     }
     if (g_g144List.empty())

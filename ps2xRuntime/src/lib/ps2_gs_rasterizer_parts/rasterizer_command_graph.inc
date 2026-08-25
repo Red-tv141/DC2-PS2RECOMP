@@ -1969,6 +1969,10 @@ void g178BumpRectImpl(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
         g582NoteBump(g570Source, py1 - py0 + 1u,
                      px1 - px0 + 1u + (exactAligned ? 0u : 1u));
     g570TraceBump(pr, bpBlocks, bw64, psm, x, y, w, h, g570Source);
+#if defined(PS2X_G655_DEPTH_DIAG)
+    g655TraceDepthBump(basePage, widthPages, py0, py1, px0, px1, exactAligned,
+                       g570Source & 0xffu, bpBlocks, psm, x, y, w, h);
+#endif
     // G277-R mover probe: report every bump whose page walk (incl. the +1 slack) can touch the
     // 0x68 display chunk-12 pages 200..207 — pins the writer that trips publish-before-upload.
     {
