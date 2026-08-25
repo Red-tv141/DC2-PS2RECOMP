@@ -1,10 +1,4 @@
-﻿// ===== G657 P1: 11 duplicate definitions removed ==========================
-// Each collided with an identical symbol in another TU and was ALREADY discarded
-// by the linker ("second definition ignored", LNK4006), so removal is
-// behaviour-neutral by construction. Removed because under /GL /LTCG the same
-// collision is fatal (LNK1179), which is what blocked the PGO pipeline (G652).
-// Regenerate with tools/g657_dup_audit.py.
-#include "ps2_stubs.h"
+﻿#include "ps2_stubs.h"
 
 #include "ps2_runtime.h"
 
@@ -18,6 +12,21 @@ namespace ps2_stubs {
 
 // AUTO-STUB: memclr
 
+void memclr(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+
+    static bool logged = false;
+
+    if (!logged) {
+
+        std::cerr << "[AUTO-STUB] memclr called (returning 0)" << std::endl;
+
+        logged = true;
+
+    }
+
+    setReturnS32(ctx, 0);
+
+}
 
 
 
@@ -552,11 +561,41 @@ void DisableCache(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
 
 // AUTO-STUB: isceSifSetDma
 
+void isceSifSetDma(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+
+    static bool logged = false;
+
+    if (!logged) {
+
+        std::cerr << "[AUTO-STUB] isceSifSetDma called (returning 0)" << std::endl;
+
+        logged = true;
+
+    }
+
+    setReturnS32(ctx, 0);
+
+}
 
 
 
 // AUTO-STUB: isceSifSetDChain
 
+void isceSifSetDChain(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+
+    static bool logged = false;
+
+    if (!logged) {
+
+        std::cerr << "[AUTO-STUB] isceSifSetDChain called (returning 0)" << std::endl;
+
+        logged = true;
+
+    }
+
+    setReturnS32(ctx, 0);
+
+}
 
 
 
@@ -1102,6 +1141,21 @@ void sceLseek64(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
 
 // AUTO-STUB: sceDevctl
 
+void sceDevctl(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+
+    static bool logged = false;
+
+    if (!logged) {
+
+        std::cerr << "[AUTO-STUB] sceDevctl called (returning 0)" << std::endl;
+
+        logged = true;
+
+    }
+
+    setReturnS32(ctx, 0);
+
+}
 
 
 
@@ -1147,11 +1201,41 @@ void sceReadlink(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
 
 // AUTO-STUB: sceSifAllocSysMemory
 
+void sceSifAllocSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+
+    static bool logged = false;
+
+    if (!logged) {
+
+        std::cerr << "[AUTO-STUB] sceSifAllocSysMemory called (returning 0)" << std::endl;
+
+        logged = true;
+
+    }
+
+    setReturnS32(ctx, 0);
+
+}
 
 
 
 // AUTO-STUB: sceSifFreeSysMemory
 
+void sceSifFreeSysMemory(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+
+    static bool logged = false;
+
+    if (!logged) {
+
+        std::cerr << "[AUTO-STUB] sceSifFreeSysMemory called (returning 0)" << std::endl;
+
+        logged = true;
+
+    }
+
+    setReturnS32(ctx, 0);
+
+}
 
 
 
@@ -1457,6 +1541,21 @@ void _sceCd_scmd_prechk(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) 
 
 // AUTO-STUB: sceMcEnd
 
+void sceMcEnd(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+
+    static bool logged = false;
+
+    if (!logged) {
+
+        std::cerr << "[AUTO-STUB] sceMcEnd called (returning 0)" << std::endl;
+
+        logged = true;
+
+    }
+
+    setReturnS32(ctx, 0);
+
+}
 
 
 
@@ -1702,16 +1801,61 @@ void atoi(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
 
 // AUTO-STUB: malloc_extend_top
 
+void malloc_extend_top(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+
+    static bool logged = false;
+
+    if (!logged) {
+
+        std::cerr << "[AUTO-STUB] malloc_extend_top called (returning 0)" << std::endl;
+
+        logged = true;
+
+    }
+
+    setReturnS32(ctx, 0);
+
+}
 
 
 
 // AUTO-STUB: __malloc_lock
 
+void __malloc_lock(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+
+    static bool logged = false;
+
+    if (!logged) {
+
+        std::cerr << "[AUTO-STUB] __malloc_lock called (returning 0)" << std::endl;
+
+        logged = true;
+
+    }
+
+    setReturnS32(ctx, 0);
+
+}
 
 
 
 // AUTO-STUB: __malloc_unlock
 
+void __malloc_unlock(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+
+    static bool logged = false;
+
+    if (!logged) {
+
+        std::cerr << "[AUTO-STUB] __malloc_unlock called (returning 0)" << std::endl;
+
+        logged = true;
+
+    }
+
+    setReturnS32(ctx, 0);
+
+}
 
 
 
@@ -1997,6 +2141,21 @@ void _PAD_SET_AUTO_REPEAT__FP12RS_STACKDATAi(uint8_t *rdram, R5900Context *ctx, 
 
 // AUTO-STUB: __divdi3
 
+void __divdi3(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime) {
+
+    static bool logged = false;
+
+    if (!logged) {
+
+        std::cerr << "[AUTO-STUB] __divdi3 called (returning 0)" << std::endl;
+
+        logged = true;
+
+    }
+
+    setReturnS32(ctx, 0);
+
+}
 
 
 
