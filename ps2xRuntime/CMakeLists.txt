@@ -36,6 +36,10 @@ option(PS2X_G657_DIAG "Compile the G657 fallback-wall and GPU-coverage census" O
 option(PS2X_G657_FOGSIMD "Compile the G657 exact SSE2 fog lerp (built, exact, NOT promoted)" OFF)
 option(PS2X_G656_TEXREPL "Compile the HD texture replacement and dumping subsystem" OFF)
 option(PS2X_G656_VERIFY "Compile the G255 same-run CPU verify oracle and G628 mask census" OFF)
+# G658 P2-P4/P9: mode-6 stage oracle. This changes rendered values deliberately and exists only in
+# the diagnostic build used with the G656 same-run CPU/GPU verifier. Keep both hot TUs byte-free in
+# normal Release builds (rule 12c).
+option(PS2X_G658_DIAG "Compile the G658 mode-6 source/blend/coverage stage oracle" OFF)
 
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
@@ -464,6 +468,14 @@ endif()
 if(PS2X_G656_VERIFY)
     set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
                  "PS2X_G656_VERIFY=1")
+endif()
+
+if(PS2X_G658_DIAG)
+    foreach(_g658src
+            src/lib/ps2_gs_rasterizer.cpp
+            src/lib/ps2_gs_gpu_raster.cpp)
+        set_property(SOURCE ${_g658src} APPEND PROPERTY COMPILE_DEFINITIONS "PS2X_G658_DIAG=1")
+    endforeach()
 endif()
 
 if(PS2X_G652_CRITICAL_TRACE)
