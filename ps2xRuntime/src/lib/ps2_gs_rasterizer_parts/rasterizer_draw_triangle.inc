@@ -1159,6 +1159,16 @@ void GSRasterizer::drawTriangle(GS *gs)
     const float winding = (denom < 0.0f) ? -1.0f : 1.0f;
     const float invAbsDenom = 1.0f / std::fabs(denom);
     constexpr float kEdgeEpsilon = 1.0e-4f;
+#if defined(PS2X_G658_DIAG)
+    // G658 stage 4: make only the admitted mode-6 CPU draw use strict barycentric coverage. The
+    // GPU arm remains byte-for-byte normal, so the same-run oracle directly prices the CPU's
+    // deliberately conservative epsilon as the seed of the accumulated batch divergence.
+    const float g658EdgeEpsilon =
+        (g658Mode6StageCpu() == 4 && g658Mode6CpuActive(gs->m_prim.abe != 0u, ctx))
+            ? 0.0f : kEdgeEpsilon;
+#else
+    constexpr float g658EdgeEpsilon = kEdgeEpsilon;
+#endif
 
     // [G42] EXPERIMENT: backface cull for the costume model RTT (fbp=0x139). The head/cap
     // renders as a "hollow face" because the concave cap's back-facing interior triangles draw
@@ -1471,7 +1481,9 @@ void GSRasterizer::drawTriangle(GS *gs)
     // band replay restored. Fail-closed: any mismatch falls through to the untouched generic nest.
     // `g580Tri13b` wins where both would fire (it is the narrower, already-verified contract).
     const bool g605TriSubject =
-        g605TriSpanRequested() && t_g144InReplay && !g580Tri13b && gs->m_vram != nullptr &&
+        g605TriSpanRequested() && t_g144InReplay && !g580Tri13b &&
+        !g658Mode6CpuActive(gs->m_prim.abe != 0u, ctx) &&
+        gs->m_vram != nullptr &&
         (gs->m_prim.type == GS_PRIM_TRIANGLE || gs->m_prim.type == GS_PRIM_TRISTRIP);
     int g605Reject = kG605RejState;
     bool g605Tri = false;
@@ -1726,7 +1738,7 @@ void GSRasterizer::drawTriangle(GS *gs)
         g609S.fx2 = fx2; g609S.fy2 = fy2;
         g609S.winding = winding;
         g609S.invAbsDenom = invAbsDenom;
-        g609S.edgeEpsilon = kEdgeEpsilon;
+        g609S.edgeEpsilon = g658EdgeEpsilon;
         g609S.vram = gs->m_vram;
         g609S.vramSize = static_cast<uint32_t>(gs->m_vramSize);
         g609S.tex0 = &ctx.tex0;
@@ -2019,7 +2031,7 @@ void GSRasterizer::drawTriangle(GS *gs)
         int xStart = minX, xEnd = maxX;
         if (!s_g141NoXspan)
         {
-            const double eps = static_cast<double>(kEdgeEpsilon);
+            const double eps = static_cast<double>(g658EdgeEpsilon);
             const double basePx = static_cast<double>(minX) + 0.5;
             const double pyd = static_cast<double>(py);
             const double w0b = ((static_cast<double>(fy1 - fy2)) * (basePx - static_cast<double>(fx2)) +
@@ -2337,7 +2349,8 @@ void GSRasterizer::drawTriangle(GS *gs)
                     e2 < 0 || (e2 == 0 && !g408Tl[2]))
                     continue;
             }
-            else if (w0 < -kEdgeEpsilon || w1 < -kEdgeEpsilon || w2 < -kEdgeEpsilon)
+            else if (w0 < -g658EdgeEpsilon || w1 < -g658EdgeEpsilon ||
+                     w2 < -g658EdgeEpsilon)
             {
                 continue;
             }

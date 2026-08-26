@@ -866,6 +866,7 @@ void GSRasterizer::drawSprite(GS *gs)
         // into another) — the mirror image of the defect G615 found in `pro%`.
         const bool g530Admit =
             g530SpanOn() && !g530AnyProbe() && g530Quiet() &&
+            !g658Mode6CpuActive(gs->m_prim.abe != 0u, ctx) &&
             (g248FastSampleSprite || g617T4hhSprite) &&
             !s_g248Verify &&
             (ctx.frame.psm == GS_PSM_CT32 || ctx.frame.psm == GS_PSM_CT24) &&

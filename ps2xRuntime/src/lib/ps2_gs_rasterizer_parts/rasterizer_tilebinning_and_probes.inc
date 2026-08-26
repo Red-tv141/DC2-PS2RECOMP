@@ -1191,6 +1191,20 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
     const bool g604HaveBox = s.g604SubX1 >= s.g604SubX0 && s.g604SubY1 >= s.g604SubY0;
     uint64_t inBoxPx = 0, inBoxBig = 0, outBoxPx = 0, outBoxBig = 0;
     unsigned inBoxMaxD = 0;
+#if defined(PS2X_G658_DIAG)
+    // G658 P3/P4: stage 2 writes a distinctive constant from the mode-6 draw on both arms while
+    // bypassing blending. Comparing that sentinel and each final value against the saved pre-batch
+    // destination separates raster coverage/authority from arithmetic and later overwrite.
+    static const int g658VerifyStage = []() {
+        const char *value = std::getenv("DC2_G658_STAGE");
+        const int parsed = value ? std::atoi(value) : 0;
+        return parsed >= 0 && parsed <= 3 ? parsed : 0;
+    }();
+    uint64_t g658CpuOnly = 0, g658GpuOnly = 0, g658BothSentinel = 0;
+    uint64_t g658BothChangedDifferent = 0, g658LaterOrOther = 0;
+    uint64_t g658RttCpuOnly = 0, g658RttGpuOnly = 0;
+    uint64_t g658RttBothZDiff = 0, g658RttBothZSame = 0, g658RttOther = 0;
+#endif
     int firstBigX = -1, firstBigY = -1;
     uint32_t firstBigCpu = 0, firstBigGpu = 0;
     int firstX = -1, firstY = -1;
@@ -1212,6 +1226,40 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
             }
             if (cpu != s.gpu[i])
             {
+#if defined(PS2X_G658_DIAG)
+                if (g658VerifyStage == 2 && s.g604SubDraws != 0u && g604InBox)
+                {
+                    constexpr uint32_t kSentinelRgb = 0x003CA55Au;
+                    const uint32_t cpuRgb = cpu & 0x00FFFFFFu;
+                    const uint32_t gpuRgb = s.gpu[i] & 0x00FFFFFFu;
+                    const uint32_t dstRgb = s.before[i] & 0x00FFFFFFu;
+                    const bool cpuSentinel = cpuRgb == kSentinelRgb;
+                    const bool gpuSentinel = gpuRgb == kSentinelRgb;
+                    const bool cpuChanged = cpuRgb != dstRgb;
+                    const bool gpuChanged = gpuRgb != dstRgb;
+                    bool rgbBig = false;
+                    for (unsigned ch = 0; ch < 3u; ++ch)
+                    {
+                        const int c = static_cast<int>((cpuRgb >> (ch * 8u)) & 0xFFu);
+                        const int g = static_cast<int>((gpuRgb >> (ch * 8u)) & 0xFFu);
+                        if ((c > g ? c - g : g - c) > 1)
+                            rgbBig = true;
+                    }
+                    if (rgbBig)
+                    {
+                        if (cpuSentinel && !gpuSentinel && !gpuChanged)
+                            ++g658CpuOnly;
+                        else if (gpuSentinel && !cpuSentinel && !cpuChanged)
+                            ++g658GpuOnly;
+                        else if (cpuSentinel && gpuSentinel)
+                            ++g658BothSentinel; // defensive: cannot be RGB-big
+                        else if (cpuChanged && gpuChanged)
+                            ++g658BothChangedDifferent;
+                        else
+                            ++g658LaterOrOther;
+                    }
+                }
+#endif
                 if (bad == 0)
                 {
                     firstX = x; firstY = y; firstCpu = cpu; firstGpu = s.gpu[i];
@@ -1242,6 +1290,32 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
                     maxDeltaRgb = worstRgb;
                 if (worstRgb > 1u)
                 {
+#if defined(PS2X_G658_DIAG)
+                    if (s.g604IsDiscov)
+                    {
+                        const uint32_t cpuRgb = cpu & 0x00FFFFFFu;
+                        const uint32_t gpuRgb = s.gpu[i] & 0x00FFFFFFu;
+                        const uint32_t dstRgb = s.before[i] & 0x00FFFFFFu;
+                        const bool cpuChanged = cpuRgb != dstRgb;
+                        const bool gpuChanged = gpuRgb != dstRgb;
+                        if (cpuChanged && !gpuChanged)
+                            ++g658RttCpuOnly;
+                        else if (gpuChanged && !cpuChanged)
+                            ++g658RttGpuOnly;
+                        else if (cpuChanged && gpuChanged && s.g570Depth &&
+                                 y >= s.depthRowLo && y <= s.depthRowHi)
+                        {
+                            const size_t zi = static_cast<size_t>(y - s.depthRowLo) * s.fbW + x;
+                            const uint32_t cpuZ = g403DisplayZRead(x, y, s.fbp);
+                            if (zi < s.depthGpu.size() && cpuZ != s.depthGpu[zi])
+                                ++g658RttBothZDiff;
+                            else
+                                ++g658RttBothZSame;
+                        }
+                        else
+                            ++g658RttOther;
+                    }
+#endif
                     // The WORST pixel, not the first: scan order finds a 2-LSB pixel long before
                     // the one that carries the defect's magnitude.
                     if (worstRgb >= maxDeltaRgb)
@@ -1441,6 +1515,82 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
         g_g604DscZBad.fetch_add(depthBad, std::memory_order_relaxed);
         g_g604DscBadBig.fetch_add(badBig, std::memory_order_relaxed);
         g_g604DscBigRgb.fetch_add(badBigRgb, std::memory_order_relaxed);
+#if defined(PS2X_G658_DIAG)
+        struct G658RttRow
+        {
+            uint64_t batches = 0, entries = 0, pixels = 0, bigRgb = 0, zbad = 0;
+            uint64_t cpuOnly = 0, gpuOnly = 0, bothZDiff = 0, bothZSame = 0, other = 0;
+            uint64_t exactBatches = 0, exactEntries = 0;
+        };
+        static G658RttRow s_g658RttRows[512][16]{};
+        const unsigned family = ((s.prim & 7u) << 1u) | (s.tme & 1u);
+        G658RttRow &row = s_g658RttRows[s.fbp & 511u][family];
+        ++row.batches;
+        row.entries += s.entries;
+        row.pixels += s.gpu.size();
+        row.bigRgb += badBigRgb;
+        row.zbad += depthBad;
+        row.cpuOnly += g658RttCpuOnly;
+        row.gpuOnly += g658RttGpuOnly;
+        row.bothZDiff += g658RttBothZDiff;
+        row.bothZSame += g658RttBothZSame;
+        row.other += g658RttOther;
+        if (badBigRgb == 0u && depthBad == 0u)
+        {
+            ++row.exactBatches;
+            row.exactEntries += s.entries;
+        }
+        if (n <= 16u || (n % 128u) == 0u)
+            std::fprintf(stderr,
+                         "[G658:rttbatch] n=%llu fbp=%03x family=prim%u/tme%u entries=%zu "
+                         "bigRgb=%llu zbad=%llu cpuOnly=%llu gpuOnly=%llu bothZDiff=%llu "
+                         "bothZSame=%llu other=%llu exact=%u\n",
+                         static_cast<unsigned long long>(n), s.fbp, s.prim, s.tme, s.entries,
+                         static_cast<unsigned long long>(badBigRgb),
+                         static_cast<unsigned long long>(depthBad),
+                         static_cast<unsigned long long>(g658RttCpuOnly),
+                         static_cast<unsigned long long>(g658RttGpuOnly),
+                         static_cast<unsigned long long>(g658RttBothZDiff),
+                         static_cast<unsigned long long>(g658RttBothZSame),
+                         static_cast<unsigned long long>(g658RttOther),
+                         (badBigRgb == 0u && depthBad == 0u) ? 1u : 0u);
+        if ((n % 512u) == 0u)
+        {
+            struct Ranked { unsigned fbp, family; const G658RttRow *row; };
+            std::vector<Ranked> ranked;
+            for (unsigned fbp = 0; fbp < 512u; ++fbp)
+                for (unsigned fam = 0; fam < 16u; ++fam)
+                    if (s_g658RttRows[fbp][fam].batches != 0u)
+                        ranked.push_back(Ranked{fbp, fam, &s_g658RttRows[fbp][fam]});
+            std::sort(ranked.begin(), ranked.end(), [](const Ranked &a, const Ranked &b) {
+                return (a.row->bigRgb + a.row->zbad) > (b.row->bigRgb + b.row->zbad);
+            });
+            const size_t limit = std::min<size_t>(ranked.size(), 8u);
+            for (size_t rank = 0; rank < limit; ++rank)
+            {
+                const Ranked &rr = ranked[rank];
+                const G658RttRow &r = *rr.row;
+                std::fprintf(stderr,
+                             "[G658:rttrank] n=%llu rank=%zu fbp=%03x prim=%u tme=%u "
+                             "batches=%llu entries=%llu bigRgb=%llu zbad=%llu cpuOnly=%llu "
+                             "gpuOnly=%llu bothZDiff=%llu bothZSame=%llu other=%llu "
+                             "exactBatches=%llu exactEntries=%llu\n",
+                             static_cast<unsigned long long>(n), rank + 1u, rr.fbp,
+                             rr.family >> 1u, rr.family & 1u,
+                             static_cast<unsigned long long>(r.batches),
+                             static_cast<unsigned long long>(r.entries),
+                             static_cast<unsigned long long>(r.bigRgb),
+                             static_cast<unsigned long long>(r.zbad),
+                             static_cast<unsigned long long>(r.cpuOnly),
+                             static_cast<unsigned long long>(r.gpuOnly),
+                             static_cast<unsigned long long>(r.bothZDiff),
+                             static_cast<unsigned long long>(r.bothZSame),
+                             static_cast<unsigned long long>(r.other),
+                             static_cast<unsigned long long>(r.exactBatches),
+                             static_cast<unsigned long long>(r.exactEntries));
+            }
+        }
+#endif
         {
             uint64_t p = g_g604DscMaxDelta.load(std::memory_order_relaxed);
             while (maxDelta > p &&
@@ -1560,6 +1710,29 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
                                                                std::memory_order_relaxed))
             {
             }
+#if defined(PS2X_G658_DIAG)
+            if (g658VerifyStage == 2)
+            {
+                static std::atomic<uint64_t> s_cpuOnly{0}, s_gpuOnly{0}, s_bothSentinel{0};
+                static std::atomic<uint64_t> s_bothChanged{0}, s_laterOrOther{0}, s_subBatches{0};
+                s_cpuOnly.fetch_add(g658CpuOnly, std::memory_order_relaxed);
+                s_gpuOnly.fetch_add(g658GpuOnly, std::memory_order_relaxed);
+                s_bothSentinel.fetch_add(g658BothSentinel, std::memory_order_relaxed);
+                s_bothChanged.fetch_add(g658BothChangedDifferent, std::memory_order_relaxed);
+                s_laterOrOther.fetch_add(g658LaterOrOther, std::memory_order_relaxed);
+                const uint64_t batches = s_subBatches.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (batches <= 8u || (batches % 16u) == 0u)
+                    std::fprintf(stderr,
+                                 "[G658:class] stage=2 subBatches=%llu cpuOnly=%llu gpuOnly=%llu "
+                                 "bothSentinel=%llu bothChanged=%llu laterOrOther=%llu\n",
+                                 static_cast<unsigned long long>(batches),
+                                 static_cast<unsigned long long>(s_cpuOnly.load(std::memory_order_relaxed)),
+                                 static_cast<unsigned long long>(s_gpuOnly.load(std::memory_order_relaxed)),
+                                 static_cast<unsigned long long>(s_bothSentinel.load(std::memory_order_relaxed)),
+                                 static_cast<unsigned long long>(s_bothChanged.load(std::memory_order_relaxed)),
+                                 static_cast<unsigned long long>(s_laterOrOther.load(std::memory_order_relaxed)));
+            }
+#endif
         }
         else
         {

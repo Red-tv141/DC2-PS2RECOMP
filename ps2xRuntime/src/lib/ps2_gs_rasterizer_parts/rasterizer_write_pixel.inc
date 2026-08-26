@@ -1,5 +1,37 @@
 namespace
 {
+#if defined(PS2X_G658_DIAG)
+// G658 P2-P4/P9: CPU half of the mode-6 stage oracle. The GPU backend has an independent cached
+// reader of the same process-constant selector. 0=normal, 1=source-only, 2=constant-source
+// coverage, 3=constant-source through the normal mode-6 blend, 4=strict CPU coverage with the
+// normal source/blend, 5=exact sampler/combine plus CPU-style truncated vertex shade on GPU,
+// 6=CPU-style truncated vertex shade with the existing GL bilinear sampler, 7=mode-6 ordered
+// integer image-load/store blend prototype.
+// Diagnostic build only.
+static int g658Mode6StageCpu()
+{
+    static const int stage = []() {
+        const char *value = std::getenv("DC2_G658_STAGE");
+        const int parsed = value ? std::atoi(value) : 0;
+        return parsed >= 0 && parsed <= 7 ? parsed : 0;
+    }();
+    return stage;
+}
+
+static bool g658Mode6CpuActive(bool abe, const GSContext &ctx)
+{
+    if (g658Mode6StageCpu() == 0 || !abe)
+        return false;
+    const uint64_t alpha = ctx.alpha;
+    return (ctx.frame.fbp == 0u || ctx.frame.fbp == 0x68u) &&
+           (alpha & 3u) == 2u && ((alpha >> 2u) & 3u) == 0u &&
+           ((alpha >> 4u) & 3u) == 0u && ((alpha >> 6u) & 3u) == 1u;
+}
+#else
+static constexpr int g658Mode6StageCpu() { return 0; }
+static constexpr bool g658Mode6CpuActive(bool, const GSContext &) { return false; }
+#endif
+
 constexpr int kG407ScanX0 = 130;
 constexpr int kG407ScanX1 = 224;
 constexpr int kG407ScanY0 = 260;
@@ -677,7 +709,30 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
     const uint8_t srcB = b;
     const uint8_t srcA = a;
 
-    if (gs->m_prim.abe)
+#if defined(PS2X_G658_DIAG)
+    const int g658Stage = g658Mode6CpuActive(gs->m_prim.abe != 0u, ctx)
+        ? g658Mode6StageCpu() : 0;
+    if (g658Stage == 2 || g658Stage == 3)
+    {
+        // Exactly representable byte constants. Stage 2 isolates coverage; stage 3 retains the
+        // ordinary integer blend and therefore isolates destination/blend/writeback from sampling.
+        r = 0x5Au; g = 0xA5u; b = 0x3Cu; a = 0x40u;
+    }
+    if (g658Stage != 0)
+    {
+        static std::atomic<uint64_t> s_g658CpuPx{0};
+        const uint64_t n = s_g658CpuPx.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n == 1u || (n % 1000000u) == 0u)
+            std::fprintf(stderr, "[G658:cpu] stage=%d pixels=%llu\n", g658Stage,
+                         static_cast<unsigned long long>(n));
+    }
+#else
+    constexpr int g658Stage = g658Mode6StageCpu();
+#endif
+
+    // Stages 1/2 compare the pre-blend source/coverage surface. Stage 3 follows the exact legacy
+    // integer blend below with a shared constant source.
+    if (gs->m_prim.abe && g658Stage != 1 && g658Stage != 2)
     {
         uint32_t existing = 0u;
         if (bytesPerPixel == 2u)

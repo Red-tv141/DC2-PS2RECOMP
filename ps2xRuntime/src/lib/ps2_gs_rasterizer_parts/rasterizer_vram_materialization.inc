@@ -1646,7 +1646,15 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // fail-closed: any single entry that mixes target, width, format or primitive class returns
     // the whole batch to the proven band replay.
     const bool g604MeasuredShape =
-        g604DiscovTrn && fbw == 8u &&
+        g604DiscovTrn &&
+#if defined(PS2X_G658_DIAG)
+        // G658 P5-P7/P16: dungeon1's dominant discovered targets are narrow FBW=2 surfaces.
+        // Admit them only in the diagnostic build so the same-run oracle can rank and reject or
+        // validate the population; the shipped FBW=8 contract remains unchanged.
+        (fbw == 8u || fbw == 2u) &&
+#else
+        fbw == 8u &&
+#endif
         g_g144List[0].ctx.frame.psm == GS_PSM_CT32 &&
         std::all_of(g_g144List.begin(), g_g144List.end(), [fbp, fbw](const G144Entry &e) {
             return e.ctx.frame.fbp == fbp && e.ctx.frame.fbw == fbw &&
