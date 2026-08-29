@@ -922,6 +922,11 @@ struct G255VerifyState
 };
 
 static G255VerifyState g_g255Verify;
+
+// G659 P1/P3/P4/P5/P6/P7/P10: the rewrite-depth / ordered-destination census rides this oracle's
+// snapshot pair. Diagnostic build only; the default build compiles the file to nothing.
+#include "g659_m6_census.inc"
+
 static std::atomic<uint64_t> g_g255Attempts[kG248TargetCount]{};
 static std::atomic<uint64_t> g_g255Gpu[kG248TargetCount]{};
 static std::atomic<uint64_t> g_g255Checks[kG248TargetCount]{};
@@ -1072,6 +1077,9 @@ static void g255BeginVerify(uint8_t *vram, uint32_t vramSize, uint32_t fbp, uint
     const size_t count = static_cast<size_t>(rowHi - rowLo + 1) * static_cast<size_t>(fbW);
     s.before.resize(count);
     s.gpu.resize(count);
+#if defined(PS2X_G659_DIAG)
+    g659BeginBatch(count);
+#endif
     for (int y = rowLo; y <= rowHi; ++y)
         for (int x = 0; x < fbW; ++x)
         {
@@ -1224,6 +1232,29 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
             {
                 if (g604InBox) ++inBoxPx; else ++outBoxPx;
             }
+#if defined(PS2X_G659_DIAG)
+            if (g659CensusOn())
+            {
+                // Share the oracle's own `big` predicate so the census and the gate never end up
+                // with different denominators (G656 rule 5).
+                bool g659Big = false;
+                for (unsigned ch = 0; ch < 3u; ++ch)
+                {
+                    const int c = static_cast<int>((cpu >> (ch * 8u)) & 0xFFu);
+                    const int g = static_cast<int>((s.gpu[i] >> (ch * 8u)) & 0xFFu);
+                    if ((c > g ? c - g : g - c) > 1)
+                        g659Big = true;
+                }
+                g659ScorePixel(i, s.before[i], cpu, s.gpu[i], g659Big,
+                               s.g604SubDraws != 0u, g604InBox);
+                // P1: the untouched-pixel address probe. `cpu == before` there by construction, so
+                // any GPU difference is a batch-entry destination or addressing fact.
+                if (i < g_g659Px.size() && g_g659Px[i].depth == 0u &&
+                    (s.gpu[i] & 0x00FFFFFFu) != (s.before[i] & 0x00FFFFFFu) &&
+                    g_g659ShiftProbes < 200000u)
+                    g659ShiftProbe(s, x, y, s.gpu[i]);
+            }
+#endif
             if (cpu != s.gpu[i])
             {
 #if defined(PS2X_G658_DIAG)
@@ -1359,12 +1390,76 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
     int firstDepthX = -1, firstDepthY = -1;
     uint32_t firstDepthCpu = 0u, firstDepthGpu = 0u;
     #endif
+#if defined(PS2X_G666_DIAG)
+    // G666: the SAME comparison, bucketed by WHO WROTE THE PIXEL. `depthBad` below is denominated
+    // over the whole depth rect and is guarded by `s.g570Depth`, so it (a) cannot fire at all for a
+    // batch carrying no depth — which makes "the bounded-value class has zbad = 0" a tautology of
+    // the guard rather than evidence of exactness — and (b) is dominated by untouched pixels. That
+    // is Rule 20c, which G660 wrote for the COLOUR counter and then reproduced on this one when it
+    // ranked discovered-target families by raw `zbad` counts. These buckets re-denominate to the
+    // TOUCHED population using the `depthBefore` snapshot the oracle already captures.
+    unsigned long long g666ZRect = 0, g666ZCpu = 0, g666ZGpu = 0, g666ZTouched = 0,
+                       g666ZBadTouched = 0, g666ZBadUntouched = 0, g666ZMaxDelta = 0;
+    // G667: magnitude histogram of |cpuZ - gpuZ| plus the first large-delta exemplar. See the
+    // rationale beside kG666ZHistBuckets in ps2_g666_diag_api.inc — a rate and a max cannot tell a
+    // systematic +-1 rounding rule from a rare unbounded ordering failure, and those two have
+    // opposite consequences for this workload's GPU-native prospects.
+    unsigned long long g666ZHist[kG666ZHistBuckets] = {0, 0, 0, 0, 0, 0, 0};
+    int g666ZBigX = -1, g666ZBigY = -1;
+    uint32_t g666ZBigCpu = 0u, g666ZBigGpu = 0u;
+    const bool g666ZUsable =
+        s.g570Depth && g666ZRateOn() && s.depthBefore.size() == s.depthGpu.size();
+#endif
     if (s.g570Depth)
         for (int y = s.depthRowLo; y <= s.depthRowHi; ++y)
             for (int x = 0; x < s.fbW; ++x)
             {
                 const size_t i = static_cast<size_t>(y - s.depthRowLo) * s.fbW + x;
                 const uint32_t cpuZ = g403DisplayZRead(x, y, s.fbp);
+#if defined(PS2X_G666_DIAG)
+                if (g666ZUsable)
+                {
+                    const uint32_t before = s.depthBefore[i];
+                    const uint32_t gpuZ = s.depthGpu[i];
+                    // ⚠️ Rule 26, stated not hidden: "wrote" is `!= before`, so a write that
+                    // reproduces the previous Z exactly counts as untouched. Under ZTST that is the
+                    // CONSERVATIVE direction — it can only shrink the touched denominator, i.e.
+                    // only make the reported rate look worse, never better.
+                    const bool cpuW = cpuZ != before;
+                    const bool gpuW = gpuZ != before;
+                    ++g666ZRect;
+                    g666ZCpu += cpuW ? 1u : 0u;
+                    g666ZGpu += gpuW ? 1u : 0u;
+                    if (cpuZ != gpuZ)
+                    {
+                        const uint32_t d = cpuZ > gpuZ ? (cpuZ - gpuZ) : (gpuZ - cpuZ);
+                        if (d > g666ZMaxDelta) g666ZMaxDelta = d;
+                        if (cpuW || gpuW)
+                        {
+                            ++g666ZBadTouched;
+                            // Powers of 16, so seven buckets span the whole Z24 range.
+                            const int b = d < 2u        ? 0
+                                          : d < 16u     ? 1
+                                          : d < 256u    ? 2
+                                          : d < 4096u   ? 3
+                                          : d < 65536u  ? 4
+                                          : d < 1048576u ? 5
+                                                         : 6;
+                            ++g666ZHist[b];
+                            if (b >= 4 && g666ZBigX < 0)
+                            {
+                                g666ZBigX = x; g666ZBigY = y;
+                                g666ZBigCpu = cpuZ; g666ZBigGpu = gpuZ;
+                            }
+                        }
+                        // Neither arm wrote it and they still disagree: that is an AUTHORITY LEAK
+                        // (the two sides are not looking at the same surface), a different and more
+                        // serious finding than a value error. It must read 0.
+                        else              ++g666ZBadUntouched;
+                    }
+                    if (cpuW || gpuW) ++g666ZTouched;
+                }
+#endif
                 if (cpuZ != s.depthGpu[i])
                 {
 #if defined(PS2X_G655_DEPTH_DIAG)
@@ -1377,6 +1472,12 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
                     ++depthBad;
                 }
             }
+#if defined(PS2X_G666_DIAG)
+    if (g666ZUsable)
+        g666NoteZRate(s.fbp, s.prim, g666ZRect, g666ZCpu, g666ZGpu, g666ZTouched,
+                      g666ZBadTouched, g666ZBadUntouched, g666ZMaxDelta,
+                      g666ZHist, g666ZBigX, g666ZBigY, g666ZBigCpu, g666ZBigGpu);
+#endif
     const int ti = g248TargetIndex(s.fbp);
     if (g570Verify139On() && s.fbp == 0x139u)
     {
@@ -1978,6 +2079,15 @@ static void g255CompareCpuVerify(uint8_t *vram, uint32_t vramSize)
                          firstX, firstY, firstCpu, firstGpu,
                          (unsigned long long)g_g570VerifyBad.load(std::memory_order_relaxed));
     }
+#if defined(PS2X_G659_DIAG)
+    if (g659CensusOn())
+    {
+        static uint64_t s_g659Checks = 0;
+        ++s_g659Checks;
+        if ((s_g659Checks % 256u) == 0u)
+            g659Report(s_g659Checks);
+    }
+#endif
     s.pending = false;
     s.g570Depth = false;
 }

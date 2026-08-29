@@ -287,10 +287,44 @@ bool g570Transient13dTarget(uint32_t fbp)
 // G570: the large combat/jump 0x139 batch was still rejected as a physical color/Z alias even
 // though G403/G411 deliberately moved ZBP=0xd0 into a private mirror.  Bring up the narrow
 // private-depth admission independently; its same-run verifier implies the path.
+//
+// ⭐⭐ G660 PROMOTION (2026-08-27): DEFAULT-ON, rollback `DC2_G570_NO_PRIVATE_139=1`.
+//
+// G570 refused this and G604 reproduced the refusal, both on ONE number: `[G570:verify139]`'s
+// 0.208-0.25% "off by more than 1 LSB". That number has two defects, and G659 wrote the law for
+// each of them AFTER those phases ran:
+//
+//   * its DENOMINATOR is `s.gpu.size()` - the whole compare rect, every untouched pixel included
+//     (G659 measurement law 12: quote a candidate's rate beside the SHIPPED path's own rate, at
+//     the same write depth, never in the absolute); and
+//   * its NUMERATOR is `badBig`, ALL CHANNELS - so it counts the standing alpha convention that
+//     G604 documented in this very tree as "not the admission under test", but corrected only for
+//     the display oracle.
+//
+// Re-measured RGB-restricted and bucketed by ordinary write depth (`[G659:m6depth]`), against the
+// display admission this binary ALREADY performs, same route / binary / instrument / session:
+//
+//     lavaboss  d1  0.1169% vs  4.5951%   d2 1.0153% vs 15.5333%   d3 0.0727% vs 11.5851%
+//     dragon    d1  0.3758% vs  1.2275%   d2 3.7238% vs 44.0254%   d3 0.2859% vs 70.0123%
+//     s03       d1  0.2073% vs  6.6411%   d2 0.4175% vs  5.6042%   d3 0.3166% vs  3.4155%
+//
+// i.e. 3x-245x MORE exact than the shipped display path at every matched depth, with a max green
+// delta of 2-9 against the shipped path's 19-255. `[G660:rejterm]` additionally measures the reject
+// as 100.00% conservative (`gateOnly`, `correctnessRequired=0`, `zAliasLive=0`, `depthWriting=0`)
+// on 2,052 batches / 6.18 M entries across three routes.
+//
+// Pixel gate (`ridepod` opening, sf 768..1392, same binary, env-flag arms): p50 0.00 / p90 0.07 /
+// max 1.25 / maxTile 46.64 - DIGIT-FOR-DIGIT identical to the `DC2_G431_GS_SLOW_US=2` speed
+// control, i.e. indistinguishable from an unmodified renderer at a different speed. The lever fires
+// 3,840 times on that route, so the gate is not vacuous.
+//
+// Timing, order-balanced A/B/B/A, same binary: `lavaboss` whole-run **-2.11 ms/f (-8.2%)**,
+// `lavaboss:tail` **-3.05 (-11.6%)**, `lavaboss:spikes` -1.05, `dragon:tail` -1.13, all with control
+// drift 0.083-0.258 inside the 0.30 requirement.
+// ⛔ NOT uniform: `dragon`'s DIALOGUE window regresses +1.58 ms/f. See the G660 fix log.
 bool g570Private139On()
 {
     static const bool s_on =
-        (envFlagEnabled("DC2_G570_PRIVATE_139") || g570Verify139On()) &&
         !envFlagEnabled("DC2_G570_NO_PRIVATE_139") &&
         !envFlagDisabled("DC2_G570_PRIVATE_139");
     return s_on && g260NrOn();
@@ -394,14 +428,342 @@ static bool g587Transient15dStatOn()
 // ⛔ This is deliberately NOT `g248TargetIndex` widening. That is G569, DEMOTED for a
 // user-verified escaped-writer defect on every jump/dash. G569 granted RESIDENCY; this claims
 // none, which is exactly why it cannot reproduce that defect.
+// ===== G663 P5a: THE NARROW DISCOVERED-TARGET ADMISSION IS PROMOTED ==========================
+//
+// The three predicates below (TRANSIENT / NODEPTH / NARROW) are not three levers - they are one
+// admission expressed in three conjuncts: TRANSIENT selects the discovered-target population,
+// NODEPTH keeps only its bounded-value (no guest depth) half, and NARROW keeps only the FBW=2 half
+// of that. They were always gated together and they are promoted together, under ONE rollback.
+//
+// WHY IT SHIPS NOW, when G660 refused it and G662 could not resolve it:
+//   * POPULATION, reproduced this phase on its own binary ([G657:cover], dungeon1, same binary
+//     both arms): cpuBatches 13,341 -> 376, cpuMs 8,521.4 -> 776.6 (-90.9%), GPU-native WALL
+//     85.08% -> 98.61%.
+//   * TIMING - every arm whose control drift met the project's 0.30 ms/f bar is a same-signed
+//     negative: dungeon1:heavy -0.616 (drift 0.103, blocks -0.597/-0.636), dungeon1:run -0.132
+//     (0.134, -0.150/-0.115), lavaboss:spikes -0.192 (0.006, -0.134/-0.249). Mean -0.313 ms/f.
+//     `lavaboss` is the COLLATERAL control - little discovered-target population - and it does not
+//     pay a cost.
+//   * `ridepod:boss`, the window G662 refused the FULL arm on, rejects on REVERSING blocks in two
+//     independent attempts with both means slightly negative. G662's blocker there was a **+0.828
+//     same-signed REGRESSION** of the FBW=8 arm; the narrow arm's effect is below the order effect.
+//     That is "no regression", measured twice - not a win claimed from a rejected run.
+//   * PIXELS - `ridepod` opening, 53 keys, same binary, and G637's law applied because the arm is
+//     FASTER: at MATCHED SPEED `narrowSlow` is IDENTICAL to `ctlSlow` on every statistic
+//     (p50 0.00 / p90 0.07 / max 1.24 / maxTile 46.64, same worst key). The unmatched arm's max
+//     45.39 collapses to 1.24 (36.6x); p90 0.43 against a control floor of 5.50.
+//
+// ⚠️ G660 measured this same family at +0.00..+0.58 and refused it; G662 measured +0.742 on
+// `dungeon1:heavy` from CONTAMINATED arms. The baseline moved underneath both (G662 P4's hot-TU
+// removal), and G661 P12 established that this population's GPU marginal cost and its CPU replay
+// cost are COMPARABLE - which is exactly the condition under which a GS-side shift flips the sign.
+//
+// Rollback the whole admission: DC2_G663_NO_DISCOV=1. The individual arm spellings still work for
+// diagnosis, and an explicit `DC2_G604_DISCOV_TRANSIENT=0` still disables (envFlagDisabled).
+static bool g663DiscovPromoted()
+{
+    static const bool s_on = !envFlagEnabled("DC2_G663_NO_DISCOV");
+    return s_on;
+}
+
 bool g604DiscovTransientOn()
 {
     static const bool s_on =
-        (envFlagEnabled("DC2_G604_DISCOV_TRANSIENT") || g604VerifyDiscovOn()) &&
+        (envFlagEnabled("DC2_G604_DISCOV_TRANSIENT") || g604VerifyDiscovOn() ||
+         g663DiscovPromoted()) &&
         !envFlagEnabled("DC2_G604_NO_DISCOV_TRANSIENT") &&
         !envFlagDisabled("DC2_G604_DISCOV_TRANSIENT");
     return s_on && g260NrOn() && g262WideOn();
 }
+
+// ===== G660 P21: per-FAMILY discovered-target admission, as a PREDICATE not an address list =====
+//
+// `DC2_G604_DISCOV_TRANSIENT` is one global switch over the whole discovered-target population, and
+// G659's pixel gate refused it on ONE family's failure: with P19's colour repair active the
+// `ridepod` opening still scored p90 26.93 against a 0.35 speed envelope and lost the mech's floor
+// shadow. That is a verdict about one family's DEPTH/AUTHORITY, not about every discovered target.
+//
+// G660's four-route census (`[G658:rttrank]`, `DC2_G604_VERIFY_DISCOV=1`) separates the population
+// into exactly two classes, and the separator is not an address:
+//
+//   DEPTH/AUTHORITY class - large `zbad`, TWO-SIDED coverage divergence. `ridepod` 0x142 prim=6
+//     (zbad 9,026,765 = 83.6% of that route's whole zbad population, cpuOnly 1,102,116 - this IS
+//     the lost shadow), `ridepod` 0x141 prim=6, `s03` 0x15c (zbad 5,049,227, cpuOnly 63,795 /
+//     gpuOnly 72,416), 0x14d, 0x15f, 0x151, 0x14c, 0x162, 0x13e.
+//
+//   BOUNDED-VALUE class - `zbad = 0`, coverage divergence at or near zero. `ridepod` 0x141 prim=4
+//     (4,592 batches / 4,862,928 entries, zbad 0, cpuOnly 0, gpuOnly 0), `dungeon1` 0x14b / 0x141 /
+//     0x13f (zbad 0, 18 cpuOnly of 7.2 M divergent), `s03` 0x140 prim=6 tme=1.
+//
+// ⭐ THE TWO CLASSES ARE EXACTLY `guestDepth` vs `!guestDepth`. The census reports the whole
+// bounded-value class under `other`, which is the bucket the G658 classifier uses when no depth was
+// captured for the batch - i.e. those batches carry no guest depth at all, so they have no depth
+// mechanism to diverge and no authority to lose. So the split needs no address table and no new
+// contract: it is one extra conjunct on the depth arm of `g604ExactDiscov`, and it fails CLOSED
+// (a batch whose depth state cannot be established keeps the proven CPU band replay).
+//
+// ⭐ G663 P5a: PROMOTED (default-ON) as the second conjunct of the one admission. Rollback with
+// DC2_G663_NO_DISCOV=1, or this conjunct alone with DC2_G660_NO_DISCOV_NODEPTH=1 - which is a
+// CORRECTNESS-RELEVANT rollback, not a perf one: dropping it re-admits the DEPTH/AUTHORITY class
+// whose pixel failure (the Ridepod mech's lost floor shadow, p90 26.93) is why G659 refused the
+// undifferentiated arm in the first place.
+bool g660DiscovNoDepthOnly()
+{
+    static const bool s_on = (envFlagEnabled("DC2_G660_DISCOV_NODEPTH") ||
+                              g663DiscovPromoted()) &&
+                             !envFlagEnabled("DC2_G660_NO_DISCOV_NODEPTH");
+    return s_on;
+}
+
+// G660 P28: `dungeon1`'s dominant discovered targets are narrow FBW=2 surfaces, and the shipped
+// `g604MeasuredShape` contract requires FBW=8. G658 widened it inside `PS2X_G658_DIAG` only, so the
+// population has never been reachable from a shippable binary. This is the runtime arm of that
+// widening: default-OFF, so the shipped contract still reads FBW=8 exactly as before.
+bool g660DiscovFbw2On()
+{
+    static const bool s_on = envFlagEnabled("DC2_G660_DISCOV_FBW2") &&
+                             !envFlagEnabled("DC2_G660_NO_DISCOV_FBW2");
+    return s_on;
+}
+
+// ===== G662 P8: the SAME admission, restricted to NARROW targets — because the wide half is the
+// ===== one that loses, and the two are separable by a register field ==========================
+//
+// G662 put the full G660 arm (`DISCOV_TRANSIENT` + `NODEPTH` + `FBW2`) through order-balanced
+// A/B/B/A on three windows of two routes, and it does NOT have one sign:
+//
+//   dungeon1:heavy  -0.219 ms/f   blocks -0.123 / -0.315   ctl drift 0.075
+//   dungeon1:run    -0.389 ms/f   blocks -0.506 / -0.271   ctl drift 0.246
+//   ridepod:boss    +0.828 ms/f   blocks +0.945 / +0.710   ctl drift 0.219   <-- SLOWER
+//
+// Net +0.220 ms/f, so as one lever it fails its own cross-route gate. But the population is not
+// homogeneous, and the split is structural rather than per-address:
+//
+//   * `dungeon1`'s dominant discovered targets are NARROW FBW=2 surfaces (0x14b / 0x141 / 0x13f),
+//     which is exactly the population `DC2_G660_DISCOV_FBW2` exists to reach — G658 P5-P7/P16
+//     measured them, and they are the ones that convert here.
+//   * `ridepod`'s are FBW=8 3D targets (0x142 / 0x141), the family G660 P5/P19 named as owning
+//     83.6% of that route's `zbad`. `NODEPTH` already excludes the depth-WRITING part of it, so
+//     what regresses is the residual FBW=8 no-depth subset — 512-pixel-wide batches whose GPU
+//     marginal cost G661 P12 measured as comparable to their CPU replay, without dungeon1's
+//     narrow-surface advantage to pay for the extra FBO bind, upload and draw.
+//
+// So this admits ONLY the narrow half: `fbw == 2` exactly, never widening the shipped FBW=8
+// contract. Requires `DC2_G604_DISCOV_TRANSIENT` and `DC2_G660_DISCOV_NODEPTH` like the arm it
+// refines, and it is deliberately MUTUALLY EXCLUSIVE with `DC2_G660_DISCOV_FBW2` (which ADDS
+// FBW=2 to FBW=8): setting both would re-admit the population this exists to exclude, so this
+// predicate loses to it and the two can never be confused in a capture.
+//
+// ⭐ G663 P5a: PROMOTED (default-ON) as the third conjunct of the one admission. Rollback with
+// DC2_G663_NO_DISCOV=1, or this conjunct alone with DC2_G662_NO_DISCOV_NARROW=1 - which restores
+// the FBW=8 contract, i.e. exactly the half G662 measured REGRESSING `ridepod:boss` by +0.828.
+// Still mutually exclusive with DC2_G660_DISCOV_FBW2 (which ADDS FBW=2 to FBW=8): that flag wins,
+// so the two can never be confused in a capture.
+bool g662DiscovNarrowOn()
+{
+    static const bool s_on = (envFlagEnabled("DC2_G662_DISCOV_NARROW") ||
+                              g663DiscovPromoted()) &&
+                             !envFlagEnabled("DC2_G662_NO_DISCOV_NARROW") &&
+                             !g660DiscovFbw2On();
+    return s_on;
+}
+
+// ===== G666: the FBW=8 DEPTH-WRITING half — BUILT, PIXEL-GATED, REFUTED, REMOVED (Rule 31) ======
+//
+// ⛔⛔⛔ NO LEVER IS DEFINED HERE ON PURPOSE. G666 built `DC2_G666_DISCOV_WIDEZ` exactly as
+// described below, ran it through the `ridepod` opening pixel gate, and it FAILED:
+//
+//     arm            p50     p90     max   maxTile  worstKey
+//     ctlB (floor)  0.00    0.00   23.63    41.07      1368
+//     g666widez     0.64   29.66   40.08    73.99      1080
+//
+// `g635_look.py` key 1080: meanDiff 6.070, **386 of 3,264 tiles over 20** (the documented PASSING
+// temporal-phase signature is 7 tiles and meanDiff 0.113), and the contact sheet shows **the Ridepod
+// mech's FLOOR SHADOW MISSING** — verbatim the failure G659 reported at p90 26.93. The lever was
+// removed from the source under Rule 31 (a lever that fails its gate does not ship inert in the
+// hottest TU; it measured +512 bytes here). `PS2X_G666_DIAG`'s censuses are retained so the whole
+// measurement reproduces without rewriting the lever.
+//
+// ⭐ WHAT G666 ESTABLISHED THAT IS NOT THROWN AWAY:
+//   * `[G666:discovterm]` — on `combat`, **100.00%** of the 16,547,409 CPU-replayed
+//     discovered-target entries are blocked by exactly two POLICY conjuncts (`noDepthPolicy` +
+//     `width`) and **0.00%** by a foreign depth authority. `zbp=0xd0`, `zpsm=1`,
+//     `g411SharedGpuDepthOn()` and `g404SharedZScope()` hold on every one of them.
+//   * `[G666:zrate]` — `badUntouched = 0` on every row: there is **no authority leak**. CPU and GPU
+//     see the same surface; CPU/GPU coverage differs by 0.013%. The failure is a VALUE failure in a
+//     depth pipeline that is otherwise correctly owned.
+//   * So this class is NOT on the CPU for want of a GPU surface. It is on the CPU because the GPU's
+//     depth VALUES are wrong enough to flip an occlusion.
+//
+// ⭐⭐ WHY THE EXACTNESS RATE SAID "ADMIT" AND THE PIXEL GATE SAID "NO", AND WHICH ONE WAS RIGHT:
+//   divergence FREQUENCY  candidate 12.30%  vs shipped display SPRITE 12.24% / 12.37%  -> identical
+//   divergence MAGNITUDE  candidate maxDelta 3,790,057 vs shipped 1,036,982            -> 3.7x
+// A lost shadow is a depth-ORDERING failure, and ordering is decided by MAGNITUDE — a depth error is
+// invisible at any frequency until the delta crosses the gap between two surfaces, and then a single
+// pixel flips an occlusion. **For a DEPTH oracle the visibility-relevant statistic is the magnitude
+// distribution, not the rate** — the opposite emphasis from COLOUR, where Rule 20b's frequency
+// comparison is decisive. Do not re-rank this direction off a depth rate again.
+//
+// ⛔⛔⛔ G666'S RE-OPEN CONDITION WAS REFUTED BY G667 — DO NOT RE-DERIVE IT.
+// G666 wrote: "the CPU holds sprite Z flat from vertex 2 while the GPU emits it as an interpolated
+// varying; emit FLAT Z for SPRITE on the GPU path." It flagged that "consistent with, not proven
+// by, the evidence", and the caveat was load-bearing: **the GPU path already does exactly that.**
+//     rasterizer_vram_materialization.inc:4847   c00.z = c10.z = c11.z = c01.z = b.z;
+//     rasterizer_vram_materialization.inc:4698   const GSVertex &b = e.v[1];   // the KICK vertex
+// bit-identical in intent to the CPU's `float zf = v1.z` (rasterizer_draw_sprite.inc:125). All four
+// corners carry one Z, so `noperspective out float vZ` interpolates a CONSTANT. Corroborated by fog
+// being flattened the same way in the same block (G364, :4848), by the LINE path doing the same
+// (rasterizer_rtt_census_and_waves.inc:982), and by `g178PushVertex` being a pure `o.z = v.z` copy.
+// ⚠️ The G666 hypothesis was formed by diffing two SHADER fragments without reading the code that
+// FILLS the vertex buffer — a varying only interpolates what it is given, and that lives in another
+// file. The verifying read is one file away from the suggestive one.
+//
+// ⭐⭐⭐ G667 THEN RE-TESTED THE CLASS ANYWAY, AND EVERY PER-BATCH ORACLE EXONERATES IT
+// (`combat`, same run / binary / instrument / session, matched denominators):
+//     [G666:zhist]  99.740% of ALL 26,007,082 depth divergences in the process are +-1 LSB
+//     ge4k tail share   candidate 0.136%  vs shipped 0.027%-2.693%   (19x BETTER than shipped tri)
+//     CPU/GPU coverage  candidate 0.013%  vs shipped up to 5.6%      (~430x better)
+//     colour bigRgb     candidate 0.199%  vs shipped display 1.401%  (7x better)
+//     badUntouched      0 everywhere - no authority leak WITHIN a batch
+// Only `maxDelta` is outside (3,790,057 vs <=1,093,910), and that is 66 pixels >=1M process-wide.
+// ⇒ **The depth VALUES do not explain the pixel-gate failure.** See plans/phase-G667-fix-log.md.
+//
+// ⭐ WHERE THE DEFECT ACTUALLY IS (by elimination, strongly corroborated, NOT directly instrumented):
+// a per-batch oracle is structurally blind to a CROSS-BATCH effect, and this tree already documents
+// one on this exact mirror - G535, at rasterizer_vram_materialization.inc:2345-2356: CPU-rasterized
+// draws read/write the private mirror directly via g403DisplayZRead/g403DisplayZWrite while a GPU
+// owner is pending, giving "mixed CPU/GPU depth authority: environment geometry alternately wins and
+// loses the depth test". That IS a lost floor shadow. Note also that **0x13d is G569 slot 8**
+// (rasterizer_tilebinning_and_probes.inc:474), and G569 is DEFAULT-OFF for a user-verified jump/dash
+// graphical bug via the `[G261:invariant] escaped writer` storm - same family, same mechanism.
+//
+// ⇒ RE-OPEN ONLY WITH A CROSS-BATCH AUTHORITY INSTRUMENT: a census at the private-mirror consumer
+// edge proving that while a 0x13d GPU owner is pending, NO CPU-rasterized draw reads a stale mirror
+// - `[G261:invariant] escaped writer` at 0 and `[G592:pub]` showing every consumer covered, across
+// the `ridepod` opening window. That is the same precondition G569 needs to be re-armed, so the two
+// are ONE problem and should be ONE phase. ⛔ Do NOT re-open on a per-batch exactness argument:
+// six oracles already clear it. ⚠️ And the prize must still clear an order-balanced A/B/B/A, because
+// G662 measured the adjacent FBW=8 NO-DEPTH half at **+0.828 ms/f**.
+//
+// ------------------------------------------------------------------------------------------------
+// The design as built, kept because the re-open needs it verbatim:
+//
+// ⭐ WHY IT WAS *ADDITIVE* RATHER THAN A ROLLBACK.
+//
+// `[G666:discovterm]` on `combat` measured the whole residual discovered-target CPU-fallback
+// population of that route as ONE shape — `fbp=0x13d fbw=8 prim=SPRITE tme=0 guestZ=1 zwrite=1`,
+// 16,640 batches / 16,547,409 entries — and **100.00% of those entries are blocked by exactly two
+// conjuncts and nothing else**: `noDepthPolicy` (G660's blanket refusal of every depth-carrying
+// discovered target) and `width` (G662's `fbw == 2` refinement). **0.00% are blocked by a foreign
+// depth authority**: `zbp == 0xd0`, `zpsm == 1`, `g411SharedGpuDepthOn()` and `g404SharedZScope()`
+// hold on every one of them, so the surface the GPU would need already exists and is already the
+// G403/G411 private mirror. `[G604:discov-reject] admits=0` on that route: the G663-promoted
+// admission converts NOTHING there, because its `fbw == 2` refinement excludes the only discovered
+// target `combat` has.
+//
+// ⛔ THE TWO SHIPPED ROLLBACKS ARE NOT A SHIPPABLE FORM OF THIS. Setting
+// `DC2_G662_NO_DISCOV_NARROW=1` does not *add* FBW=8 — it REPLACES the `fbw == 2` test, and so
+// deletes the G663-promoted narrow admission that moved `dungeon1` to 98.24% and `map125` to 99.44%
+// GPU-native WALL. The rollback pair is a legitimate DIAGNOSTIC arm on a route with no FBW=2
+// population (`combat` has 188 such batches, 0.00% of entries) and a REGRESSION anywhere else.
+// Hence a separate additive predicate.
+//
+// ⭐ WHY IT IS CONDITIONED ON `guestDepth`. G662 P8 measured the FBW=8 half at **+0.828 ms/f on
+// `ridepod:boss`** and withdrew it — but `NODEPTH` was already active in that arm, so what it
+// measured was the FBW=8 **NO-DEPTH** subset: 512-pixel-wide batches whose GPU marginal cost G661
+// P12 found comparable to their CPU replay. Requiring `guestDepth` keeps that measured regression
+// OUT of this arm and admits only the population neither phase ever measured.
+//
+// EXACTNESS EVIDENCE ON ENTRY (`[G666:zrate]`, `combat`, same run / binary / instrument / session):
+//   candidate 0x13d prim=6 : 6.91% of WRITTEN depth pixels diverge (10,752 batches), maxDelta 3,790,057
+//   SHIPPED display 0x000/0x068 : **7.03% - 19.73%** of written depth pixels diverge, maxDelta <= 1,055,876
+//   badUntouched = 0 on EVERY row (no authority leak); CPU/GPU coverage differs by 0.0109%
+// i.e. the candidate's divergence FREQUENCY is inside the envelope of the path it would join
+// (Rule 20b), while its worst individual delta is 3.6x larger. The frequency comparison is why this
+// was built; the delta asymmetry is why the pixel gate, not the rate, is the arbiter.
+//
+// ⚠️ The inherited `zbad` cannot express any of the above: it is guarded by `s.g570Depth` (so it
+// reads 0 for the no-depth class by CONSTRUCTION, which is what made "the two classes are exactly
+// guestDepth vs !guestDepth" a tautology of the counter) and denominated over the whole depth rect,
+// which `[G666:zrate]` measured as **9.7x-10.1x** larger than the written population. See
+// ps2_g666_diag_api.inc.
+//
+// The predicate itself was:
+//
+//     bool g666DiscovWideZOn()
+//     { static const bool s_on = envFlagEnabled("DC2_G666_DISCOV_WIDEZ") &&
+//                                !envFlagEnabled("DC2_G666_NO_DISCOV_WIDEZ"); return s_on; }
+//
+// and it entered `g604ExactDiscov` as a second disjunctive clause, with `g666WideZShape` added to
+// the two `g282` row/depth-window accumulation guards in rasterizer_vram_materialization.inc:
+//
+//     (g666WideZShape && guestDepth && g282RowHi >= g282RowLo &&
+//      guestZbpPage == 0x0d0u && guestZpsm == 1u &&
+//      g282DepthHi >= g282DepthLo && g411SharedGpuDepthOn() &&
+//      g404SharedZScope(fbp, fbw, guestZbpPage, guestZpsm))
+//
+// ⛔ REMOVED under Rule 31 after the pixel gate failed (p90 29.66 vs a 0.00 floor). It is NOT kept
+// as an inert default-OFF arm: it measured **+512 bytes** in `ps2_gs_rasterizer.obj`, and G662 P4
+// priced 21,652 bytes of this TU at -0.448 ms/f while G653 P25 priced ~60 never-executed lines at
+// +0.484 ms/f. The census that produced every number above is retained behind
+// `-DPS2X_G666_DIAG=ON`, which costs the default build nothing.
+
+// ===== G663: HOIST THE DIRTY-TARGET SET OUT OF THE BIND PRE-PASS'S PER-ENTRY LOOP ============
+//
+// MEASURED PREMISE, not a hypothesis. `[G323:census]` prices the bind pre-pass at 2.838 ms/f on
+// `dragon:tail` and 3.754 ms/f on `s03:steady` - the largest convertible CPU term in the whole
+// `exec` partition (`[G298:profile] deps` is 34.1% / 39.8% of the flush there, and `bind` is
+// 65.5% / 75.9% of `deps`). `[G656:bindstage]` then places 60.84% / 56.29% of the loop in its
+// `tail` at ~1,344 cyc per entry that reaches it, and the tail's dominant term is
+//
+//     for (uint32_t t = 0; t < kG248TargetCount; ++t)     // 14 residency slots, PER ENTRY
+//         ...
+//         if (!g_g261Res[t].dirty) continue;              // rasterizer_vram_materialization.inc
+//
+// -- 18.3 M entries x 14 = 256 M iterations on one `dragon` run, the great majority of which exist
+// only to rediscover that a slot is clean. `dirty` is a FLUSH-scoped property, so the set can be
+// computed once per flush instead of once per entry.
+//
+// ⭐ WHY THIS IS EXACT BY CONSTRUCTION, with no key-sufficiency argument (the trap G661 §1.6b
+// rule 2 describes, and the reason the OTHER memoization shape was dropped - see below):
+//   1. Inside this loop `g_g261Res[t].dirty` can only ever be CLEARED (by `g261Materialize` and
+//      friends). The single site that SETS it is `g282CommitFanout`
+//      (rasterizer_t8_map_resolver.inc:2081), whose only caller is
+//      rasterizer_vram_materialization.inc:5223 - far below the pre-pass.
+//   2. So the precomputed index list is a SUPERSET of the slots the unhoisted loop would not skip.
+//   3. The body keeps its own `if (!r.dirty) continue;` unchanged, so a slot that goes clean
+//      mid-loop is still skipped exactly as before.
+//   4. Iteration ORDER is preserved (the list is built ascending), which matters because the body
+//      can `break` out of the target loop (the G338 resident-view path).
+//
+// ⛔ THE MEMOIZATION SHAPE THIS REPLACES IS REFUTED, not merely unchosen. `[G654:bindmemo]` on the
+// promoted binary: the byte-exact predecessor match (memcmp of `G144Entry` + `G178EntryState`, the
+// only form needing no argument about which inputs a key must cover) fires **254 times in
+// 41,332,773 entries on `dragon` (0.0006%)** and 170 times in 75,694,602 on `s03`. That lever has
+// no population. The weak decision key repeats 99.1-99.3% with the outcome changing exactly ONCE
+// in 40.95 M, which is suggestive - but it is a KEY, and this hoist gets the same work removed
+// without having to defend one.
+//
+// ⛔⛔ REVERTED, AND THE REASON IS THE RESULT. Built, gated on `s03:steady` (the GS-sole-poled
+// window where `bind` is largest), and MEASURED NULL: frame 23.121 -> 23.021 = -0.100 ms/f with
+// blocks +0.042 / -0.242 (mixed sign) against a 0.272 control drift, arms verified by ENVCHK and
+// observability proven by `[G663:bindscan]` (armedFlushes 180,224 of 180,224 with the flag, 0
+// without).
+//
+// ⭐ `[G663:tailsplit]` then explained it: with exactly ONE dirty slot the per-entry scan's 875
+// cyc are 13 cheap predicted-taken skips plus ONE REAL BODY, so deleting 92.86% of the ITERATIONS
+// deletes about 7% of the TIME. **An iteration count is not a cost** - the same family as Rule 19
+// (entries are not wall) and Rule 27 (a count whose denominator cannot separate the arms).
+//
+// The implementation is not kept as a default-OFF arm: a null lever that grows the hottest TU is
+// precisely the defect G663 P0 found inherited (+264 B / +2 functions of unpromoted
+// DC2_G662_DISCOV_NARROW against the recorded G662 floor). `[G663:bindscan]` / `[G663:tailsplit]`
+// remain under -DPS2X_G663_DIAG=ON so the measurement reproduces without rewriting the lever.
+//
+// RE-OPEN CONDITION: a lever aimed at the DIRTY TARGET'S BODY - the per-entry UV-extent
+// containment test, g144TextureRange / g144ClutRange, g291PagesCurrent - not at the scan around
+// it. Note that body's inputs include `e.v[k].u/v`, which is why `[G654:bindmemo]`'s exact
+// predecessor match fires only 254 times in 41,332,773 entries.
 
 bool g604DiscovTransientTarget(uint32_t fbp)
 {

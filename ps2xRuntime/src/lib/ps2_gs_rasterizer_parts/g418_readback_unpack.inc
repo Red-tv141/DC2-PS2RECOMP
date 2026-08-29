@@ -289,27 +289,96 @@ static void g418UnpackColorRows(uint8_t *vram, uint32_t vramSize,
     const G418Ct32Table &tbl = g418Ct32Table(fbBlock, fbw);
     const uint32_t pagesPerRow = (fbw != 0u) ? fbw : 1u;
     const uint32_t basePage = fbBlock >> 5u;
-    const auto fastRows = [&](int laneLo, int laneHi) {
-        for (int y = laneLo; y <= laneHi; ++y)
+    // G672: the arm is read ONCE per call here, never inside a row or group loop (G502/G645 law).
+    // `rowPair` additionally requires an 8-multiple width, which is what makes an aligned x group
+    // exist at all; every measured DC2 target is 512/128/64 wide.
+    const bool g672RowPair = g672RowPairOn() && (fbW & 7) == 0;
+    const bool g672Stat = g672StatOn();
+    const bool g672Verify = g672VerifyOn();
+    // `fastRows` is dispatched to several GSRowPool lanes concurrently, so the census counters must
+    // be atomic. They are touched ONLY behind the cached `g672Stat` bool, so the default path pays
+    // one predicted-not-taken compare per group, never an atomic (rule 12c).
+    std::atomic<uint64_t> g672PairGrp{0ull}, g672ScalarGrp{0ull}, g672OddRows{0ull};
+    // One row of the shipped table/paired form, verbatim.
+    const auto singleRow = [&](int y) {
+        const size_t srcRow = static_cast<size_t>(fbH - 1 - y) * fbW;
+        const uint32_t *rowOff = tbl.off[static_cast<uint32_t>(y) & 31u];
+        const uint32_t yBase =
+            (basePage + (static_cast<uint32_t>(y) >> 5u) * pagesPerRow) << 13u;
+        const uint32_t *srcPx = src.data() + srcRow;
+        for (int x = 0; x < fbW; x += 2)
         {
-            const size_t srcRow = static_cast<size_t>(fbH - 1 - y) * fbW;
-            const uint32_t *rowOff = tbl.off[static_cast<uint32_t>(y) & 31u];
-            const uint32_t yBase =
-                (basePage + (static_cast<uint32_t>(y) >> 5u) * pagesPerRow) << 13u;
-            const uint32_t *srcPx = src.data() + srcRow;
-            for (int x = 0; x < fbW; x += 2)
+            const uint32_t off = yBase +
+                                 (static_cast<uint32_t>(x >> 6) << 13u) +
+                                 rowOff[static_cast<uint32_t>(x) & 63u];
+            if (off + 8u <= vramSize)
+                std::memcpy(vram + off, srcPx + x, 8);
+            else if (off + 4u <= vramSize)
+                // The second pixel of the pair sits at off+4 and needs off+8 <= vramSize, which
+                // just failed, so the original loop would have dropped it too.
+                std::memcpy(vram + off, srcPx + x, 4);
+        }
+    };
+    // G672: rows y (EVEN) and y+1 in 8-pixel groups. `groupBase + 64 <= vramSize` implies all eight
+    // of the pairs' original `off + 8 <= vramSize` tests, so a group that passes writes exactly the
+    // bytes the scalar form would; a group that fails falls back to it for both rows.
+    const auto pairRows = [&](int y) {
+        const uint32_t *srcA = src.data() + static_cast<size_t>(fbH - 1 - y) * fbW;
+        const uint32_t *srcB = src.data() + static_cast<size_t>(fbH - 2 - y) * fbW;
+        const uint32_t *rowOffA = tbl.off[static_cast<uint32_t>(y) & 31u];
+        const uint32_t *rowOffB = tbl.off[static_cast<uint32_t>(y + 1) & 31u];
+        // y is even, so (y+1)>>5 == y>>5: both rows share this page base by construction.
+        const uint32_t yBase =
+            (basePage + (static_cast<uint32_t>(y) >> 5u) * pagesPerRow) << 13u;
+        for (int x = 0; x < fbW; x += 8)
+        {
+            const uint32_t groupBase = yBase +
+                                       (static_cast<uint32_t>(x >> 6) << 13u) +
+                                       rowOffA[static_cast<uint32_t>(x) & 63u];
+            if (groupBase + 64u <= vramSize)
             {
-                const uint32_t off = yBase +
-                                     (static_cast<uint32_t>(x >> 6) << 13u) +
-                                     rowOff[static_cast<uint32_t>(x) & 63u];
-                if (off + 8u <= vramSize)
-                    std::memcpy(vram + off, srcPx + x, 8);
-                else if (off + 4u <= vramSize)
-                    // The second pixel of the pair sits at off+4 and needs off+8 <= vramSize, which
-                    // just failed, so the original loop would have dropped it too.
-                    std::memcpy(vram + off, srcPx + x, 4);
+                g672StoreGroup(vram + groupBase, srcA + x, srcB + x);
+                if (g672Verify)
+                    g672VerifyGroup(vram, vramSize, srcA + x, srcB + x, fbBlock, pagesPerRow, x, y);
+                if (g672Stat)
+                    g672PairGrp.fetch_add(1ull, std::memory_order_relaxed);
+                continue;
+            }
+            if (g672Stat)
+                g672ScalarGrp.fetch_add(1ull, std::memory_order_relaxed);
+            for (int k = 0; k < 8; k += 2)
+            {
+                const uint32_t offA = yBase + (static_cast<uint32_t>((x + k) >> 6) << 13u) +
+                                      rowOffA[static_cast<uint32_t>(x + k) & 63u];
+                if (offA + 8u <= vramSize)
+                    std::memcpy(vram + offA, srcA + x + k, 8);
+                else if (offA + 4u <= vramSize)
+                    std::memcpy(vram + offA, srcA + x + k, 4);
+                const uint32_t offB = yBase + (static_cast<uint32_t>((x + k) >> 6) << 13u) +
+                                      rowOffB[static_cast<uint32_t>(x + k) & 63u];
+                if (offB + 8u <= vramSize)
+                    std::memcpy(vram + offB, srcB + x + k, 8);
+                else if (offB + 4u <= vramSize)
+                    std::memcpy(vram + offB, srcB + x + k, 4);
             }
         }
+    };
+    const auto fastRows = [&](int laneLo, int laneHi) {
+        int y = laneLo;
+        if (g672RowPair)
+        {
+            if ((y & 1) != 0 && y <= laneHi)
+            {
+                singleRow(y);
+                ++y;
+                if (g672Stat)
+                    g672OddRows.fetch_add(1ull, std::memory_order_relaxed);
+            }
+            for (; y + 1 <= laneHi; y += 2)
+                pairRows(y);
+        }
+        for (; y <= laneHi; ++y)
+            singleRow(y);
     };
     const int rows = rowHi - rowLo + 1;
     const int lanes = lanesOverride > 0
@@ -319,6 +388,14 @@ static void g418UnpackColorRows(uint8_t *vram, uint32_t vramSize,
         fastRows(rowLo, rowHi); // no dispatch at all — GSRowPool::run would still cost its setup
     else
         GSRowPool::instance().run(rowLo, rowHi, lanes, fastRows);
+    // G672 census, folded ONCE per call after every lane has joined. `lanesOverride > 0` is exactly
+    // G498's owner-publish dispatch (its two call sites pin one lane); G418's own publication site
+    // passes nothing. Behaviour-pure and default-off.
+    if (g672Stat)
+        g672Note(lanesOverride > 0 ? 2 : 0,
+                 g672PairGrp.load(std::memory_order_relaxed),
+                 g672ScalarGrp.load(std::memory_order_relaxed),
+                 g672OddRows.load(std::memory_order_relaxed));
 }
 
 // DC2_G418_PROFILE aggregate for the CPU-copy component, keyed by target.

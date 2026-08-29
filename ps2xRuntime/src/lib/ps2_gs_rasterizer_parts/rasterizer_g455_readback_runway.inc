@@ -149,6 +149,109 @@ static void g455ArmLocalEdge(const G144BlockRange &src, const G144BlockRange &ds
     }
 }
 
+#if defined(PS2X_G669_DIAG)
+// ===== G669: the EARLY-ISSUE arm at the sites that actually carry the readback cost =============
+//
+// WHY THIS EXISTS. G668 read `[G455:runway] = 0.000/0.000/0.000 ms` on all three sites and all
+// three routes and could not use it: that zero is a ZERO-SAMPLE ARTIFACT (Rule 38). `runwayNs`
+// accumulates only under `if (arm.early)` (see g455BeginRead below), and `early = true` had exactly
+// ONE producer — `g455ArmLocalEdge`, called from the local-COPY edge
+// (rasterizer_draw_sprite.inc:3165) — which credits only kG455Local139 and kG455Display and was
+// refused by `r.mirPending` on 98.1% of its opportunities (lavaboss 2,782/2,837; dungeon1 4,794;
+// dragon 2,560). kG455Resync139 had NO early-arm site at all, so its `early = 0` restated the code
+// rather than the run. The axis was unmeasured for the two sites that carry the cost:
+// `[G279:mat]` puts `resync` at 0.877 ms/f and the display publication owns the frame's largest
+// single read.
+//
+// ⭐ THE EARLIEST LEGAL ISSUE POINT IS NOT THE l2l EDGE. It is the instant a GPU batch's draws have
+// landed in the persistent FBO and that batch's own readback was DEFERRED — which is exactly where
+// the shipped code already calls g455NoteResidentWrite / g455NoteDisplayWrite to bump the write
+// clock. From that instant the FBO holds the final content for those rows until the next writer,
+// and the next writer bumps the SAME clock and invalidates the arm. So arming here is safe under
+// exactly the contract `g455BeginRead` already enforces — `writeSeq` equality plus row containment
+// (`arm.rowLo <= rowLo && arm.rowHi >= rowHi`) — and introduces no new invariant. A pending union
+// that GROWS re-arms with the wider window, because the growth itself passes through the write
+// clock first.
+//
+// THE MIRROR DEPENDENCY IS REAL, NOT AN ARTEFACT. `r.mirPending` means a G264 deferred VRAM→FBO
+// upload is outstanding, i.e. guest VRAM holds bytes the FBO has not received
+// (rasterizer_mat_support.inc:601), so a read issued before `g264FlushMirror` would return
+// pre-upload content — which is precisely why `g455ArmLocalEdge` refuses. It is COUNTED per site
+// here rather than assumed away. These two sites are reached after the flush entry's
+// `g264FlushMirrorsAtFlush()` (rasterizer_vram_materialization.inc:264), so the common path finds
+// the mirrors already drained; `mirrorBlocked` below reports whether that holds in practice.
+//
+// BEHAVIOUR-PURE: stores a timestamp and a row window, reads no GL state, issues no GL call and
+// changes no decision. `#if`-excluded (rule 12c) because both call sites are in
+// ps2_gs_rasterizer.cpp, the hottest TU.
+static uint64_t g_g669Armed[kG455SiteCount] = {};
+static uint64_t g_g669MirrorBlocked[kG455SiteCount] = {};
+static uint64_t g_g669Superseded[kG455SiteCount] = {};
+static uint64_t g_g669ShapeSkip[kG455SiteCount] = {};
+
+static void g669ArmEarly(int site, G455Arm &arm, uint64_t writeSeq, uint32_t fbp, uint32_t fbw,
+                         int fbW, int rowLo, int rowHi, bool mirrorPending)
+{
+    if (!g455RunwayOn() || site < 0 || site >= kG455SiteCount)
+        return;
+    if (fbW <= 0 || rowHi < rowLo || rowLo < 0 || rowHi >= 512)
+    {
+        ++g_g669ShapeSkip[site];
+        return;
+    }
+    if (mirrorPending)
+    {
+        // A read issued now would observe pre-upload FBO content. Do NOT arm; report it.
+        ++g_g669MirrorBlocked[site];
+        return;
+    }
+    if (arm.active)
+        ++g_g669Superseded[site];
+    arm.active = true;
+    arm.early = true;
+    arm.writeSeq = writeSeq;
+    arm.fbp = fbp;
+    arm.fbw = fbw;
+    arm.fbW = fbW;
+    arm.rowLo = rowLo;
+    arm.rowHi = rowHi;
+    arm.issued = std::chrono::steady_clock::now();
+    ++g_g669Armed[site];
+}
+
+// Called from the G261 wave tail, once this flush's rendered rows are unioned into the residency
+// record and G280 has dropped the overlays those rows invalidate. ⚠️ `s_g455ResArm` is SHARED by
+// kG455Local139 and kG455Resync139 (g455BeginRead picks the arm by site), so an arm placed here is
+// credited to whichever of the two actually consumes it — which is the honest attribution. The
+// `armed` counter below records where it was ISSUED.
+static void g669ArmResidentEarly(int ti)
+{
+    if (ti < 0 || ti >= static_cast<int>(kG248TargetCount) || kG261Fbp[ti] != 0x139u)
+        return;
+    const G261Res &r = g_g261Res[ti];
+    if (!r.dirty)
+        return;
+    if (!g_g280Ovl[ti].empty())
+    {
+        ++s_g455Stat[kG455Resync139].blockedOverlay;
+        return;
+    }
+    g669ArmEarly(kG455Resync139, s_g455ResArm, s_g455ResWriteSeq, kG261Fbp[ti], r.fbw, r.fbW,
+                 r.dirtyLo, r.dirtyHi, r.mirPending);
+}
+
+// Called from the G276 coalesce tail, once the pending display union has absorbed this batch. The
+// display FBO carries no G264 mirror (the mirror table is keyed on the G261 residency targets), so
+// there is no upload dependency to clear at this site.
+static void g669ArmDisplayEarly()
+{
+    if (!s_g276Pend.active)
+        return;
+    g669ArmEarly(kG455Display, s_g455DisplayArm, s_g455DisplayWriteSeq, s_g276Pend.fbp,
+                 s_g276Pend.fbw, s_g276Pend.fbW, s_g276Pend.rowLo, s_g276Pend.rowHi, false);
+}
+#endif // PS2X_G669_DIAG
+
 static G455Ticket g455BeginRead(int site, uint64_t writeSeq, uint32_t fbp, uint32_t fbw,
                                 int fbW, int rowLo, int rowHi)
 {
@@ -216,6 +319,21 @@ static void g455Report()
                      s.consumePx ? static_cast<double>(s.issuePx) / s.consumePx : 0.0);
     }
     std::fprintf(stderr, "\n");
+#if defined(PS2X_G669_DIAG)
+    // G669: the early-issue arm's OWN bookkeeping, printed on its own line so it can never be
+    // confused with the shipped G455 columns above. `armed` is where the arm was ISSUED;
+    // `valid`/`runway` above are credited where it was CONSUMED. Read `armed` FIRST — a zero there
+    // means the site never fired and every runway figure beside it is a zero-sample artifact
+    // (Rule 38, which is the whole reason this instrument exists).
+    std::fprintf(stderr, "[G669:early]");
+    for (int i = 0; i < kG455SiteCount; ++i)
+        std::fprintf(stderr, " %s(armed=%llu mirrorBlocked=%llu superseded=%llu shapeSkip=%llu)",
+                     names[i], static_cast<unsigned long long>(g_g669Armed[i]),
+                     static_cast<unsigned long long>(g_g669MirrorBlocked[i]),
+                     static_cast<unsigned long long>(g_g669Superseded[i]),
+                     static_cast<unsigned long long>(g_g669ShapeSkip[i]));
+    std::fprintf(stderr, "\n");
+#endif
 }
 
 static void g455EndRead(const G455Ticket &ticket)

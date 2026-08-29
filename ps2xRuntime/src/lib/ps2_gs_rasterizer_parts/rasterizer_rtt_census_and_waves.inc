@@ -35,6 +35,73 @@ static bool g265DisplayTarget(uint32_t fbp)
     return fbp == 0u || fbp == 0x68u;
 }
 
+// ===== G662 P2: the `colorzalias` population that dies one CLASSIFIER STAGE EARLIER ============
+//
+// G661 P4's 14-route wall census found the corpus's only top-three residual family that is NOT
+// `cpuonlyrtt cls=discov`: `map125` carries **7,934.3 ms (47.14% of that route's whole CPU-fallback
+// wall)** of `rej=classify site=blend cls=legacy fbp=0x139`, and `map125` is also the corpus's
+// WORST GPU-native WALL coverage (63.12%). G660 promoted the 0x139 admission via the
+// `g570Exact139` private-depth carve-out — but that carve-out is consulted at the colour/Z ALIAS
+// stage, and these entries never get there: they are rejected at `site=blend`, above.
+//
+// The reason is scope, not capability. Blend combos 5 (`(0-Cd)*As>>7 + Cd`) and 6
+// (`(0-Cs)*As>>7 + Cd`) are admitted only on `g265DisplayTarget`, which is literally
+// `fbp == 0 || fbp == 0x68`. The BACKEND has no such restriction: its blend dispatch
+// (lle_gpu_raster_backend.inc, the g496BlendOn call) is a per-draw decision on `d.blend` alone,
+// and combos 5/6 already run there every frame for the display buffers. The `d.blend & 3` packing
+// that genuinely cannot represent a 6 belongs to the g256Exact program, and `g256ExactRttOn()`
+// needs two env flags and is off on every default and every perf run.
+//
+// So this widens exactly one predicate, and only for the address whose exact contract G660 already
+// promoted and gated. It fails CLOSED: without `g570Private139On()` the carve-out that admits the
+// batch downstream is not armed either, so admitting it here would only trade a `blend` reject for
+// a `colorzalias` one.
+//
+// ⛔ NO `DC2_G419_AB` ARM, for the same reason as G603/G604: this is read by the CLASSIFIER, so it
+// changes WHICH authority produced the pixels and it changes the batching population (G657
+// measurement law 9). Measure it with alternating WHOLE RUNS on a scripted route.
+// ⭐ PROMOTED TO DEFAULT-ON (G662 P2). Rollback: DC2_G662_NO_BLEND139=1.
+//
+// All four gates passed, on `map125`, at matched denominators:
+//   WALL      cpuMs 16,649.0 -> 8,644.6 at gpuBatches=159,744 (-48.1%), and the
+//             `rej=classify site=blend cls=legacy fbp=139` row (46.17% of that route's fallback
+//             wall) VANISHES from `[G657:rejwall]` entirely.
+//   COVERAGE  GPU-native WALL 63.31% -> 77.87% (+14.56 points) on the corpus's WORST-covered route.
+//   EXACTNESS `[G570:verify139]` RGB 0.071% of the compare rect, cov 0.030%, and 65% of the raw
+//             `bad` is the standing GL-0..255 vs PS2-raw-0..128 ALPHA convention (first divergence
+//             is cpu=00000000 gpu=40000000 — RGB identical). The shipped display path this joins
+//             reads 1.2275%-70.0123% at matched write depth (G660 law 14).
+//   PIXELS    `g635_bisect` p50/p90/max 2.80/4.68/7.15 against a SAME-BINARY control floor of
+//             0.00/4.07/5.02; `g635_look` on both worst keys shows the identical signature — the
+//             route's own animated starfield particles — with 0/3264 tiles over 20 in BOTH, and
+//             the character's drop shadow (G659's failure signature) present and unchanged.
+//   TIMING    `map125:map` lifted off the 60 FPS cap with matched GS ballast in both arms:
+//             frame 17.367 -> 17.036 = -0.331 ms/f (-1.91%), blocks -0.135 / -0.527 (SAME sign),
+//             control drift 0.100; GS own -0.535.
+static bool g662Blend139On()
+{
+    static const bool s_on = !envFlagEnabled("DC2_G662_NO_BLEND139") &&
+                             !envFlagDisabled("DC2_G662_BLEND139");
+    return s_on;
+}
+
+// Every site that asks "may this target take the destination-dependent display blend combos?".
+// The `fbp == 0x139u` compare is FIRST so the default build pays exactly one extra integer test on
+// the hot classifier path and never touches either magic-static guard (rule 12b).
+static inline bool g662DestBlendTarget(uint32_t fbp)
+{
+    if (g265DisplayTarget(fbp))
+        return true;
+    if (fbp != 0x139u || !g662Blend139On() || !g570Private139On())
+        return false;
+#if defined(PS2X_G662_DIAG)
+    // G657 measurement law 10 / G659 P18: an arm that is never observed cannot produce a measured
+    // null. This ticks only on the entries the widening actually moved.
+    g662NoteLever(kG662LeverBlend139);
+#endif
+    return true;
+}
+
 static void g265NoteSeen(const G144Entry &e)
 {
     if (g265CensusOn() && g265DisplayTarget(e.ctx.frame.fbp))
@@ -215,10 +282,26 @@ static int g_g266ClassifySite = -1;      // kG262Rej* site of the latest classif
 // pixels and runs the g265 Z round-trip, so alternating it per frame would have the control frames
 // composite over the candidate's output (g569_no_ab_arm_for_an_authority_lever). Measure it with
 // alternating WHOLE RUNS on a scripted route, bucketed by window.
+// ⭐ PROMOTED TO DEFAULT-ON (G659). Rollback: DC2_G603_NO_SUBBLEND=1.
+//
+// Held default-OFF by G603/G604/G657/G658 on one number: the same-run oracle's in-footprint
+// `bigRgb` against a region control (59.09% vs 1.43% on `lavaboss`, a 41.3x ratio). G659's
+// rewrite-depth census showed that ratio is an OVERDRAW-DEPTH CONFOUND -- the mode-6 footprint is
+// the densest overdraw in the frame and the region control is about one write deep. Bucketed by how
+// many times the CPU replay actually committed each pixel:
+//   * pixels written ONLY by mode-6 draws diverge at 0.0000-2.60% with a max channel delta of 11
+//     (`lavaboss`: 0.0000% and max delta 1 at depths 4 and above);
+//   * the ordinary display draws this binary ALREADY admits diverge at 7.24-22.01% with a max
+//     channel delta of 255;
+//   * at MATCHED ordinary-overdraw depth, adding mode-6 writes does not raise the rate, and on
+//     `lavaboss` it lowers it at five of six depths.
+// Gates: `ridepod` opening pixel gate p50 0.00 / p90 0.00 / maxTile 39.00 -- identical to the
+// second control -- and a same-binary order-balanced A/B/B/A on `s03`'s drain spike reading
+// -9.415 / -8.170 ms/f against a control drift of 0.190. See plans/phase-G659-fix-log.md.
 static bool g603SubBlendOn()
 {
-    static const bool on = envFlagEnabled("DC2_G603_SUBBLEND") &&
-                           !envFlagEnabled("DC2_G603_NO_SUBBLEND");
+    static const bool on = !envFlagEnabled("DC2_G603_NO_SUBBLEND") &&
+                           !envFlagDisabled("DC2_G603_SUBBLEND");
     return on;
 }
 
@@ -577,10 +660,10 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
                  g262WideOn() && g583WaveEligibleTarget(ctx.frame.fbp))
             st.blend = 4; // (0-Cs)*(FIX=128)>>7 + Cd == Cd - Cs (G262 census shape, RTT waves only)
         else if (a == 2u && b == 1u && c == 0u && d == 1u &&
-                 g265DisplayZWaveOn() && g265DisplayTarget(ctx.frame.fbp))
+                 g265DisplayZWaveOn() && g662DestBlendTarget(ctx.frame.fbp))
             st.blend = 5; // G265 census: (0-Cd)*As>>7 + Cd == Cd*(1-As)
         else if (a == 2u && b == 0u && c == 0u && d == 1u && g603SubBlendOn() &&
-                 g265DisplayZWaveOn() && g265DisplayTarget(ctx.frame.fbp))
+                 g265DisplayZWaveOn() && g662DestBlendTarget(ctx.frame.fbp))
             st.blend = 6; // G603 census: (0-Cs)*As>>7 + Cd == Cd - Cs*As/128 (see the header above)
         else if (t_g603RelaxBlend)
         {
@@ -1313,6 +1396,13 @@ struct G261Res
 {
     bool dirty = false;
     int dirtyLo = 512, dirtyHi = -1; // GS rows the FBO has and VRAM lacks
+    // G662: the COLUMN union of the scissors of every wave that dirtied this target, i.e. the
+    // horizontal analogue of `dirtyLo/dirtyHi`. The publication readback is
+    // `g178_backend_read_color(k, r.fbW, ...)` — always the FULL target width — and P6 measured
+    // that readback at 80.05% of the whole `kG261MatLocal` cost, so this is where Rule 11
+    // (producer-bounded transfers) has an unexamined axis. Maintained and read only under
+    // PS2X_G662_DIAG for now: `[G662:colspan]` PRICES the ceiling before anything narrows.
+    int dirtyColLo = 1 << 24, dirtyColHi = -1;
     int covLo = 512, covHi = -1;     // GS rows DEFINED in the FBO (upload/readback/render union)
     uint32_t fbw = 0;
     int fbW = 0;

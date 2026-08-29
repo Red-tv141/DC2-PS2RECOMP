@@ -259,6 +259,20 @@
                 // gated on g290P — the entry weight is the whole point and must not require the
                 // probe's per-flush clock pair to be armed.
                 g583NoteFallback(g_g144List);
+#if defined(PS2X_G662_DIAG)
+                // G662 P10: THIS is the CPU band-replay choke point — g178TryFlushGpu has already
+                // returned false, so every entry in g_g144List is about to replay on the CPU, and
+                // each passes here exactly once. An entry that writes the G403/G411 private depth
+                // mirror is therefore precisely a CPU writer of it, which is the one fact that
+                // decides whether bounded GPU-exclusive depth ownership is available at all.
+                // ⛔ G661 asked the same question from inside g261PrepareCpuReplay, which is
+                // reached only after `if (!g261WaveOn() || !g261AnyDirty() || g_g144List.empty())
+                // return;` — so it saw entries only in flushes where a resident target was ALREADY
+                // dirty, and reached cpuEntriesSeen=1 on `combat` and `ridepod`. Its own fix-log
+                // named this site as the correction; this is it.
+                for (const G144Entry &g662e : g_g144List)
+                    g662NoteCpuReplayEntry(g662e.ctx.frame.fbp, g662e.ctx.zbuf);
+#endif
 #if defined(PS2X_G657_DIAG)
                 // G657 P3: charge the WHOLE CPU-fallback tail - publication prologue, band replay,
                 // and the post-replay notes - to the reject family that sent the batch here. The

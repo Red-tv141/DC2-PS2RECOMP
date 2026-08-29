@@ -730,6 +730,14 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
     constexpr int g658Stage = g658Mode6StageCpu();
 #endif
 
+#if defined(PS2X_G659_DIAG)
+    // G659 P3/P5: the mode-6 rewrite-depth census needs the exact PRE-CLAMP subtrahend this write
+    // applies, not the clamped result — a clamped write is non-linear and cannot be inverted, so
+    // it is counted separately rather than folded into the sum.
+    bool g659M6 = false;
+    int g659SubG = 0;
+    bool g659ClampG = false;
+#endif
     // Stages 1/2 compare the pre-blend source/coverage surface. Stage 3 follows the exact legacy
     // integer blend below with a shared constant source.
     if (gs->m_prim.abe && g658Stage != 1 && g658Stage != 2)
@@ -771,6 +779,17 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
             int cAlpha = (csel == 0) ? a : (csel == 1) ? da
                                                        : fix;
 
+#if defined(PS2X_G659_DIAG)
+            if (asel == 2u && bsel == 0u && csel == 0u && dsel == 1u)
+            {
+                const int rawG =
+                    ((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) +
+                    pickRGB(dsel, g, dg);
+                g659M6 = true;
+                g659SubG = static_cast<int>(dg) - rawG;
+                g659ClampG = rawG < 0 || rawG > 255;
+            }
+#endif
             r = clampU8(((pickRGB(asel, r, dr) - pickRGB(bsel, r, dr)) * cAlpha >> 7) + pickRGB(dsel, r, dr));
             g = clampU8(((pickRGB(asel, g, dg) - pickRGB(bsel, g, dg)) * cAlpha >> 7) + pickRGB(dsel, g, dg));
             b = clampU8(((pickRGB(asel, b, db) - pickRGB(bsel, b, db)) * cAlpha >> 7) + pickRGB(dsel, b, db));
@@ -978,6 +997,10 @@ void GSRasterizer::writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_
     f50_12_log_framebuffer_commit(ctx, x, y, off, bytesPerPixel, pixel,
                                   gs->m_prim.type, gs->m_prim.tme, gs->m_prim.abe,
                                   gs->m_prim.fst, gs->m_prim.ctxt);
+#if defined(PS2X_G659_DIAG)
+    // The commit point: every test this pixel could still have failed is behind us.
+    g659NoteCpuWrite(ctx.frame.fbp, x, y, g659M6, g659SubG, g659ClampG);
+#endif
     std::memcpy(gs->m_vram + off, &pixel, 4);
 }
 

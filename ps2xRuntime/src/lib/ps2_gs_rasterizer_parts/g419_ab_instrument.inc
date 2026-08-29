@@ -829,6 +829,11 @@ enum G419Lever
     // on worker threads and therefore use the 16-frame hold.
     kG652LeverSsboRing = 133,
     kG652LeverGif412 = 134,
+    // G672: the ROW-PAIR PSMCT32 swizzle kernel. Selects whether the three CT32 <-> host row
+    // converters (G418 readback publish, G498 owner publish, G419 upload pack) walk two GS rows at
+    // a time in 64-byte contiguous groups or keep the shipped one-row / paired 8-byte form. Read
+    // once per CALL on the GS worker, so it takes the same thread-level 16-frame block hold.
+    kG672LeverRowPair = 135,
 };
 
 // DC2_G419_AB=<lever> selects the ONE lever the instrument alternates. Exactly one at a time:
@@ -966,6 +971,8 @@ static int g419AbLever()
             return static_cast<int>(kG652LeverSsboRing);
         if (std::strcmp(value, "gif412") == 0)
             return static_cast<int>(kG652LeverGif412);
+        if (std::strcmp(value, "rowpair") == 0)
+            return static_cast<int>(kG672LeverRowPair);
         if (std::strcmp(value, "rbfmt") == 0)
             return static_cast<int>(kG491LeverRbFmt);
         if (std::strcmp(value, "rbspin") == 0)
@@ -1200,6 +1207,7 @@ static const char *g419AbLeverName(int lever)
     case kG623LeverProdSrc: return "prodsrc";
     case kG652LeverSsboRing: return "ssboring";
     case kG652LeverGif412: return "gif412";
+    case kG672LeverRowPair: return "rowpair";
     case kG491LeverRbFmt: return "rbfmt";
     case kG491LeverRbSpin: return "rbspin";
     case kG492LeverNoRender: return "norender";
@@ -1468,6 +1476,9 @@ static uint64_t g438ArmHoldFrames()
                  // in the flush bind pre-pass, on the GS worker, exactly like G622's.
                  sel == kG623LeverProdSrc ||
                  sel == kG652LeverSsboRing || sel == kG652LeverGif412 ||
+                 // G506's law again: G672's row-pair swizzle arm is read once per CALL in the
+                 // readback publish / owner publish / upload pack, all on the GS worker.
+                 sel == kG672LeverRowPair ||
                  // G506's law again: G610's compiled-block arm is read once per run() on the VU1
                  // worker, exactly like G490's `blockrun`, so it takes the same block hold.
                  sel == kG610LeverVuJit ||
@@ -3608,6 +3619,25 @@ int g498OwnPubArm()
     return arm != 0u ? 1 : 0;
 }
 
+// G672 row-pair swizzle arm. Read once per CALL (~10/frame across the three converters) on the GS
+// worker, same shape and same thread-level block hold as g498OwnPubArm above. Both arms write the
+// identical VRAM/host bytes and neither leaves state behind, so a candidate call can never
+// subsidise a control one.
+int g672RowPairArm()
+{
+    if (g419AbLever() != static_cast<int>(kG672LeverRowPair))
+        return -1;
+    const uint32_t arm = g_g419AbArm.load(std::memory_order_relaxed);
+    const uint64_t seq = s_g438TickSeq.load(std::memory_order_relaxed);
+    static thread_local uint64_t s_lastSeq = 0xFFFFFFFFFFFFFFFFull;
+    if (s_lastSeq != seq)
+    {
+        s_lastSeq = seq;
+        g_g419AbUsed.fetch_or(arm != 0u ? 2u : 1u, std::memory_order_relaxed);
+    }
+    return arm != 0u ? 1 : 0;
+}
+
 bool g438SlowLeverSelected(int which);
 int g438SlowArm(int which)
 {
@@ -4164,7 +4194,57 @@ static void g419PackFbRows(uint32_t *dst, size_t dstCount,
     const G419Ct32Page &tbl = g419Ct32Table(fbBlock, fbw);
     const uint32_t pagesPerRow = (fbw != 0u) ? fbw : 1u;
     const uint32_t basePage = fbBlock >> 5u;
-    for (int y = laneLo; y <= laneHi; ++y)
+    // ===== G672: the ROW-PAIR read, the exact mirror of g418UnpackColorRows's write =============
+    // Rows y (EVEN) and y+1 share page and blockId, so an 8-aligned x group occupies 64 CONTIGUOUS
+    // VRAM bytes holding a 64-bit interleave of the two rows. One `groupBase + 64 <= vramSize` test
+    // implies all eight of the scalar form's `off + 8 <= vramSize` tests; anything it refuses (and
+    // any row whose destination window is short) falls through to the untouched scalar loop below,
+    // including its zero-fill behaviour. The arm is read ONCE per call, never per group.
+    const bool g672RowPair = g672RowPairOn() && (fbW & 7) == 0;
+    const bool g672Stat = g672StatOn();
+    uint64_t g672PairGrp = 0ull, g672ScalarGrp = 0ull;
+    int yStart = laneLo;
+    if (g672RowPair)
+    {
+        for (int y = laneLo; y + 1 <= laneHi; y += 2)
+        {
+            if ((y & 1) != 0)
+                break; // an odd lane start takes the scalar loop for its first row
+            const size_t dstRowA = static_cast<size_t>(fbH - 1 - y) * fbW;
+            const size_t dstRowB = static_cast<size_t>(fbH - 2 - y) * fbW;
+            if (dstRowA + static_cast<size_t>(fbW) > dstCount ||
+                dstRowB + static_cast<size_t>(fbW) > dstCount)
+                break;
+            const uint32_t *rowOffA = tbl.off[static_cast<uint32_t>(y) & 31u];
+            const uint32_t yBase =
+                (basePage + (static_cast<uint32_t>(y) >> 5u) * pagesPerRow) << 13u;
+            uint32_t *dstA = dst + dstRowA;
+            uint32_t *dstB = dst + dstRowB;
+            bool wholeRowPaired = true;
+            for (int x = 0; x < fbW; x += 8)
+            {
+                const uint32_t groupBase = yBase +
+                                           (static_cast<uint32_t>(x >> 6) << 13u) +
+                                           rowOffA[static_cast<uint32_t>(x) & 63u];
+                if (groupBase + 64u > vramSize)
+                {
+                    wholeRowPaired = false;
+                    break;
+                }
+                g672LoadGroup(vram + groupBase, dstA + x, dstB + x);
+                if (g672Stat)
+                    ++g672PairGrp;
+            }
+            if (!wholeRowPaired)
+            {
+                if (g672Stat)
+                    ++g672ScalarGrp;
+                break; // hand this row pair and everything after it to the scalar loop
+            }
+            yStart = y + 2;
+        }
+    }
+    for (int y = yStart; y <= laneHi; ++y)
     {
         const size_t dstRow = static_cast<size_t>(fbH - 1 - y) * fbW;
         if (dstRow + static_cast<size_t>(fbW) > dstCount)
@@ -4196,6 +4276,8 @@ static void g419PackFbRows(uint32_t *dst, size_t dstCount,
             }
         }
     }
+    if (g672Stat)
+        g672Note(1, g672PairGrp, g672ScalarGrp, 0ull);
 }
 
 // DC2_G419_PROFILE aggregate for the isolated pack cost, keyed by target and staging geometry.
