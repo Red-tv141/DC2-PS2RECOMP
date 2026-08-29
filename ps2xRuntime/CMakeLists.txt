@@ -40,6 +40,75 @@ option(PS2X_G656_VERIFY "Compile the G255 same-run CPU verify oracle and G628 ma
 # the diagnostic build used with the G656 same-run CPU/GPU verifier. Keep both hot TUs byte-free in
 # normal Release builds (rule 12c).
 option(PS2X_G658_DIAG "Compile the G658 mode-6 source/blend/coverage stage oracle" OFF)
+# G659 P1/P3-P7/P10: the rewrite-depth / ordered-destination census. Pure instrumentation — it
+# changes no rendered value — but it costs a per-pixel counter in the CPU replay's commit point,
+# so it is a compile-time build mode with `#if`-excluded call sites (rule 12c).
+option(PS2X_G659_DIAG "Compile the G659 mode-6 rewrite-depth and destination census" OFF)
+# G660 P2/P3/P4: the `colorzalias` rejection-TERM census. Pure instrumentation — it changes no
+# rendered value and no admission — but its call site is inside g178TryFlushGpu in the hottest TU,
+# so it is a compile-time build mode with an `#if`-excluded call site (rule 12c).
+option(PS2X_G660_DIAG "Compile the G660 colorzalias rejection-term census" OFF)
+# G661 P9: the arm counter + reporter for the exact destination-floor blend repair. The LEVER is a
+# runtime flag in every build (it selects an execution arm, not a diagnostic); only its Law-10
+# counter proof is compile-time, because that counter's call site is in the per-draw GPU submit
+# loop of a hot TU and measured +279 code bytes / +1 COMDAT there (rule 12c).
+option(PS2X_G661_DIAG "Compile the G661 destination-floor blend arm counter" OFF)
+# G662: the phase's COMPLETE instrument set, declared in one place before the first diagnostic
+# build (skill/SKILL.md §1.6b rule 1 — G661 relinked three times because it added one census per
+# priority). Holds [G662:zauth] (the re-scoped private-depth-mirror writer histogram, at the real
+# CPU band-replay choke point instead of inside g261PrepareCpuReplay), [G662:matgran] (kG261MatLocal
+# publication granularity per flush edge) and [G662:lever] (arm counters). Every call site is in
+# ps2_gs_rasterizer.cpp, the hottest TU, so this is a compile-time build mode (rule 12c).
+option(PS2X_G662_DIAG "Compile the G662 depth-authority, materialization-granularity and lever censuses" OFF)
+# G663: the bind pre-pass scan census. [G656:bindstage] measured `tail` at 56-61% of the whole bind
+# loop (1344 cyc/entry on `dragon`), and the tail's dominant term is a PER-ENTRY scan of all 14
+# residency slots (kG248TargetCount). [G663:bindscan] counts the dirty-target population that scan
+# is looking for, so the hoist's ceiling is measured before its timing arm is believed. Call sites
+# are in ps2_gs_rasterizer.cpp, the hottest TU => compile-time build mode (rule 12c).
+option(PS2X_G663_DIAG "Compile the G663 bind-scan population census" OFF)
+# G666: the phase's COMPLETE instrument set, declared in one place before the first diagnostic build
+# (G661 retrospective rule 1 — G661 rebuilt its diagnostic binary three times because each new
+# priority suggested one more census, and every rebuild invalidates the captures already taken).
+# Two censuses, both with `#if`-excluded call sites in ps2_gs_rasterizer.cpp (rule 12c) and storage
+# in the cold TU ps2_g666_diag.cpp (rule 12b):
+#   [G666:discovterm] — which conjunct blocks each DISCOVERED-TARGET batch, separating a
+#       PERFORMANCE gate (width, G662's +0.828 ms/f withdrawal) from a POLICY gate (G660's blanket
+#       NODEPTH refusal) from a genuinely missing GPU depth authority (foreign ZBP/ZPSM/scope).
+#   [G666:zrate] — the depth divergence rate at a MATCHED WRITE DEPTH. The inherited `zbad` is
+#       guarded by `s.g570Depth` (so it cannot fire for the class it exonerates) and denominated
+#       over the whole depth rect; this re-denominates to the touched population.
+option(PS2X_G666_DIAG "Compile the G666 discovered-target term census and matched-depth Z oracle" OFF)
+# G669: the EARLY-ISSUE arm for the colour readback, at the two sites that actually carry its cost.
+# G668 read `[G455:runway] = 0.000 ms` everywhere and could not use it — `runwayNs` accumulates only
+# under `if (arm.early)`, and `early=true` had ONE producer (the local-COPY edge) which credits only
+# Local139/Display and was refused by a pending G264 upload mirror on 98.1% of its opportunities;
+# kG455Resync139 had no early-arm site at all. That zero is a Rule 38 zero-sample artifact, not a
+# measurement. This adds the arm where the FBO content actually becomes final — the G261 wave tail
+# and the G276 coalesce tail — so the runway can be measured with a non-zero valid population.
+# Behaviour-pure (a timestamp and a row window; no GL call, no decision changed). Both call sites are
+# in ps2_gs_rasterizer.cpp, the hottest TU, so they are `#if`-excluded (rule 12c); the storage is
+# four small arrays inside the existing G455 part rather than a new TU, because the arm struct they
+# write is file-local to that part.
+option(PS2X_G669_DIAG "Compile the G669 readback early-issue runway arm" OFF)
+# G664 P4: NO OPTION IS DEFINED HERE ON PURPOSE. The phase built `PS2X_G664_LEGACY_VU1ARMS` to
+# compile out the VU1 block A/B arms and measured it at -3,584 bytes against a 211,024-byte target
+# - a null, because `g490BlockBody` is also instantiated by the G610/G612 native FALLBACK paths and
+# not only by the arm selector. Reverted under Rule 31. The re-open condition and the instrument it
+# would need are written at the call site, over `g499BlkArmRun()` in
+# src/lib/ps2_vu1_parts/vu1_g490_block_run.inc.
+# G665: VU1 backend state MIGRATION (GPU -> CPU) plus its round-trip self-test. G566 is a one-way
+# door - it seeds CPU state into the GPU and never imports back - which is why a GPU failure is
+# fail-closed and why a per-workload backend selector was impossible. The import primitive is ~4.3 KB
+# in ps2_vu1.obj, the SECOND HOTTEST TU (layout-guard budget 0), and this phase landed no shipped
+# caller for it, so it is compile-time gated under Rule 31. Make it unconditional in the same edit
+# that lands a caller. Call site: src/lib/ps2_vu1_parts/vu1_g665_backend_migration.inc.
+option(PS2X_G665_DIAG "Compile the G665 VU1 backend state-migration primitives and oracle" OFF)
+# G665: the TRANSLATED GPU VU1 backend - whole-microprogram VU1 -> GLSL specialization of G543's
+# exact executor, plus its corpus bench graded by G543's own section oracle. Lives in
+# ps2_gs_gpu_raster.cpp, which is layout-guarded at budget 0 (Rule 12b), so it is fully
+# `#if`-excluded until it has a promoted caller. Call sites:
+# src/lib/ps2_gs_gpu_raster_parts/g665_vu_{translate,bench}.inc.
+option(PS2X_G665_GPUVU "Compile the G665 translated GPU VU1 backend and its corpus bench" OFF)
 
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
@@ -477,6 +546,85 @@ if(PS2X_G658_DIAG)
         set_property(SOURCE ${_g658src} APPEND PROPERTY COMPILE_DEFINITIONS "PS2X_G658_DIAG=1")
     endforeach()
 endif()
+
+if(PS2X_G659_DIAG)
+    foreach(_g659src
+            src/lib/ps2_gs_rasterizer.cpp
+            src/lib/ps2_gs_gpu_raster.cpp)
+        set_property(SOURCE ${_g659src} APPEND PROPERTY COMPILE_DEFINITIONS "PS2X_G659_DIAG=1")
+    endforeach()
+endif()
+
+# G660 P2/P3/P4: the colorzalias rejection-term census. Storage and reporter live in a cold TU
+# (rule 12b); only ps2_gs_rasterizer.cpp carries the `#if`-excluded call site.
+if(PS2X_G660_DIAG)
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_g660_diag.cpp)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G660_DIAG=1")
+endif()
+
+# G661 P9: the arm counter and reporter for the exact destination-floor blend repair. Its call site
+# is in the per-draw GPU submit loop in ps2_gs_gpu_raster.cpp, and the first build measured it at
+# +279 code bytes / +1 COMDAT in that hot object — the class G653 P25 priced at +0.484 ms/f for a
+# behaviourally inert addition. Compile-time build mode (rule 12c); the lever itself stays in every
+# build behind the runtime flag, because a runtime flag that selects an ARM is not a diagnostic.
+if(PS2X_G661_DIAG)
+    foreach(_g661src
+            src/lib/ps2_gs_gpu_raster.cpp
+            src/lib/ps2_gs_rasterizer.cpp)
+        set_property(SOURCE ${_g661src} APPEND PROPERTY COMPILE_DEFINITIONS "PS2X_G661_DIAG=1")
+    endforeach()
+endif()
+
+# G662: storage and reporters live in a cold TU (rule 12b); only ps2_gs_rasterizer.cpp carries the
+# `#if`-excluded call sites.
+if(PS2X_G662_DIAG)
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_g662_diag.cpp)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G662_DIAG=1")
+endif()
+
+# G663: same shape as G662 - storage and the reporter live in a cold TU (rule 12b), and only
+# ps2_gs_rasterizer.cpp carries the `#if`-excluded call sites.
+if(PS2X_G663_DIAG)
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_g663_diag.cpp)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G663_DIAG=1")
+endif()
+
+# G666: same shape as G660/G662/G663 — storage and both reporters live in a cold TU (rule 12b), and
+# only ps2_gs_rasterizer.cpp carries the `#if`-excluded call sites (rule 12c).
+if(PS2X_G666_DIAG)
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_g666_diag.cpp)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G666_DIAG=1")
+endif()
+
+# G669: no cold TU — the arm struct and the write clocks it reads are file-local statics inside
+# rasterizer_g455_readback_runway.inc, so only ps2_gs_rasterizer.cpp can write them (the same
+# constraint that kept PS2X_G665_DIAG out of a cold TU). Four uint64 arrays and two leaf functions.
+if(PS2X_G669_DIAG)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G669_DIAG=1")
+endif()
+
+# G665: the VU1 backend state-migration primitives. Unlike G662/G663 these CANNOT live in a cold TU:
+# the hidden VU1 pipeline they import is a set of `thread_local` statics in an anonymous namespace
+# inside ps2_vu1.cpp, so only that TU can write them. That is precisely why the option exists -
+# ps2_vu1.obj is layout-guarded at budget 0, so the code is excluded until it has a shipped caller.
+if(PS2X_G665_DIAG)
+    set_property(SOURCE src/lib/ps2_vu1.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G665_DIAG=1")
+endif()
+
+# G665 translated GPU VU1 backend. Separate from PS2X_G665_DIAG on purpose: that one gates the
+# CPU-side state-migration primitives in ps2_vu1.cpp, this one gates the GPU-side translator in the
+# raster TU. They are independently useful and independently priced.
+if(PS2X_G665_GPUVU)
+    set_property(SOURCE src/lib/ps2_gs_gpu_raster.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G665_GPUVU=1")
+endif()
+
 
 if(PS2X_G652_CRITICAL_TRACE)
     target_sources(ps2_runtime PRIVATE src/lib/ps2_critical_trace.cpp)
