@@ -1,3 +1,4 @@
+// G659: consume compile-time diagnostic revisions for the 33-priority closure phase (rev 1).
 // G630: large-view source attribution for the remaining residency break (force rebuild v9).
 // G612: this TU gains only the `vureg` A/B arm in g419_ab_instrument.inc (the native VU1 REGION
 // backend lives in the VU1 TU), so this content edit is what forces MSBuild to consume the .inc
@@ -180,6 +181,11 @@ int g456UvPredicateArm();
 // every part that reads it is inside an anonymous namespace, and the definition lives in
 // g419_ab_instrument.inc far below.
 int g498OwnPubArm();
+// G672: the row-pair PSMCT32 swizzle arm. Defined at GLOBAL scope in g419_ab_instrument.inc and
+// consumed by g672_rowpair_swizzle.inc / g418_readback_unpack.inc, both of which are included ~12
+// parts EARLIER and live inside the anonymous namespace — declaring it there would name a
+// different, never-defined symbol (the G568 linkage lesson, same rule as g498OwnPubArm above).
+int g672RowPairArm();
 // G589: the DRAIN TRANSACTION (GPU-VU command/authority redesign, slice 1). These five must be
 // declared at GLOBAL scope here, before any part is included: g589BeginDrain / g589EndDrain are
 // called from rasterizer_command_graph.inc (inside an anonymous namespace, and far earlier than
@@ -274,6 +280,22 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 #include "ps2_g656_diag_api.inc"
 // G657 P3/P4/P7: the fallback-WALL and GPU-coverage census. Empty struct unless PS2X_G657_DIAG.
 #include "ps2_g657_diag_api.inc"
+// G660 P2/P3/P4: the `colorzalias` rejection-TERM census. Empty inlines unless PS2X_G660_DIAG.
+#include "ps2_g660_diag_api.inc"
+// G662: the phase's frozen instrument set — [G662:zauth] (private depth-mirror writer histogram at
+// the REAL CPU band-replay choke point), [G662:matgran], [G662:lever]. Empty inlines unless
+// PS2X_G662_DIAG; storage and reporters live in the cold TU ps2_g662_diag.cpp.
+#include "ps2_g662_diag_api.inc"
+// G663: [G663:bindscan] - the dirty-residency-slot population the bind pre-pass's per-entry
+// 14-slot scan is looking for. Empty inlines unless PS2X_G663_DIAG; storage and the reporter live
+// in the cold TU ps2_g663_diag.cpp.
+#include "ps2_g663_diag_api.inc"
+// G666: [G666:discovterm] - which conjunct actually blocks each DISCOVERED-TARGET batch, separating
+// a PERFORMANCE gate (width) from a POLICY gate (the blanket NODEPTH refusal) from a genuinely
+// missing GPU depth authority (foreign ZBP/ZPSM/scope) - and [G666:zrate], the depth divergence
+// rate at a MATCHED WRITE DEPTH, which the inherited `zbad` counter cannot express. Empty inlines
+// unless PS2X_G666_DIAG; storage and reporters live in the cold TU ps2_g666_diag.cpp.
+#include "ps2_g666_diag_api.inc"
 #include "ps2_gs_rasterizer_parts/rasterizer_headers_and_diagnostics.inc"
 
 #if defined(PS2X_G655_LEGACY_DIAG)
@@ -374,7 +396,15 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // rasterizer_gpu_alias_page_view.inc, whose g261Materialize calls g590NoteMaterialize, and
 // rasterizer_vram_materialization.inc, which owns the colour/depth upload decisions and the pack
 // site the shadow oracle hooks. Content edit here forces MSBuild to consume the .inc files (G359).
+// G662 P4: every entry point of this family is gated on DC2_G590_CENSUS / _SHADOW / _ZWHY /
+// _ZVERIFY / _ZWIN, all OFF in every default and every performance run — so it is 9,430 code bytes
+// and 34 COMDATs of never-executed machine code sitting in the hottest object in the build
+// (rule 12b/12c). Compile-time build mode; `-DPS2X_G655_LEGACY_DIAG=ON` restores it verbatim.
+#if defined(PS2X_G655_LEGACY_DIAG)
 #include "ps2_gs_rasterizer_parts/g590_surface_authority.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g662_stub_g590.inc"
+#endif
 
 // G591 revision: 2 — WINDOW-SCOPED SURFACE AUTHORITY. Slice A (the G411 private depth mirror's
 // WRITE EPOCH) is PROMOTED DEFAULT-ON; slice B (window-scoped colour authority) is REFUTED by its
@@ -397,6 +427,12 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // predicate). CPU-rasterized draws consume that mirror through g403DisplayZRead/Write and no
 // publication edge covered them, which is the game-wide missing-environment defect. Content edit
 // here forces MSBuild to consume the .inc (G359). Diagnostic restore: DC2_G535_PRIVZ_DEFER=1.
+// G662: the alias/page-authority STATE half — G280 overlay records, G310 page-authority tables,
+// G326 plan caches, and the G536/G281/G282/G309 flags and counters. Split out of
+// rasterizer_gpu_alias_page_view.inc (5,116 lines) so the functions that use them are not preceded
+// by 1,000 lines of declarations. MUST be included IMMEDIATELY BEFORE its parent: one translation
+// unit, byte-identical preprocessor output (rule 12b).
+#include "ps2_gs_rasterizer_parts/rasterizer_alias_state.inc"
 #include "ps2_gs_rasterizer_parts/rasterizer_gpu_alias_page_view.inc"
 
 
@@ -444,6 +480,11 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // G418: colour-readback VRAM unpack (CPU-copy component of the 0x13b readback edge) ג€” the exact
 // table/paired/lane arm plus its profile and oracle. Included before vram_materialization.inc so
 // g418UnpackColorRows is visible at the publication site.
+// G672: the ROW-PAIR PSMCT32 swizzle kernel shared by all three CT32 <-> host row converters.
+// Must precede g418_readback_unpack.inc (which is its first consumer) and therefore also G498's
+// dispatch and G419's upload pack.
+#include "ps2_gs_rasterizer_parts/g672_rowpair_swizzle.inc"
+
 #include "ps2_gs_rasterizer_parts/g418_readback_unpack.inc"
 
 // G498: the two OWNER-PUBLISH colour unpacks G418 never reached (g345MaterializeSlot and
@@ -468,7 +509,14 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // G600: the MAP-15 backdrop probe (default OFF). Needs g599EnvU32/g_dc2ScriptFrame from
 // rasterizer_gpu_alias_page_view.inc above, and must precede vram_materialization.inc, whose
 // texture loop carries all three call sites (source decision, registry hit, decode).
+// G662 P4: same argument as g590 above — gated on DC2_G600_TEX / _TEXPAINT / _DIRECT, all OFF in
+// every default and every performance run. 6,897 code bytes / 24 COMDATs in the hot object.
+// `-DPS2X_G655_LEGACY_DIAG=ON` restores it.
+#if defined(PS2X_G655_LEGACY_DIAG)
 #include "ps2_gs_rasterizer_parts/g600_sky_probe.inc"
+#else
+#include "ps2_gs_rasterizer_parts/g662_stub_g600.inc"
+#endif
 // G656 P17: the HD texture replacement & dumping subsystem is 96,500 bytes (8.19%) of this TU and
 // is OFF in every normal Release run. Compile it out (rule 16); `-DPS2X_G656_TEXREPL=ON` restores
 // the real implementation. See g656_stub_texrepl.inc for the exactness argument.
@@ -513,6 +561,13 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 #include "ps2_gs_rasterizer_parts/g630_gpu_domain.inc"
 #endif
 
+// G662: the materialization SUPPORT half — G340 census, the G261 materialize entry points, G285
+// local-to-local consume, the G264/G326 upload-mirror planner, the G661/G662 probes, the CPU-replay
+// prologue, G582 dedup, the G305 async drain and G581 snapshot invalidation. Split out of
+// rasterizer_vram_materialization.inc (7,737 lines) whose remaining body is essentially the single
+// 6,280-line `g178TryFlushGpu`. MUST be included IMMEDIATELY BEFORE its parent: one translation
+// unit, byte-identical preprocessor output (rule 12b).
+#include "ps2_gs_rasterizer_parts/rasterizer_mat_support.inc"
 #include "ps2_gs_rasterizer_parts/rasterizer_vram_materialization.inc"
 
 // G627 revision: 1 — PSMT8-in-CT32 local-transfer destinations without the destination-triggered

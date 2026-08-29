@@ -119,6 +119,13 @@ extern void g650PinThread(int role);
 #include "ps2_gs_gpu_raster_parts/g496_gpu_ballast.inc"
 #include "ps2_gs_gpu_raster_parts/g496_gl_state_cache.inc"
 #include "ps2_gs_gpu_raster_parts/g621_readback_span_census.inc"
+// G662: the backend's pre-class half — env-flag predicates, the G643 0x139 kernel data path, the
+// G659 shade-rounding levers, the G661 P9 destination-blend arms and the shader helpers. Split out
+// of lle_gpu_raster_backend.inc (which was 10,426 lines / 551 KB) purely so the 9.4k-line
+// `class G178Backend` is not the only way to reach them. MUST be included IMMEDIATELY BEFORE its
+// parent and in this order: the two halves are one translation unit and the preprocessor output is
+// byte-identical to the unsplit file, which is what makes this safe in a hot TU (rule 12b).
+#include "ps2_gs_gpu_raster_parts/lle_gpu_raster_prelude.inc"
 #include "ps2_gs_gpu_raster_parts/lle_gpu_raster_backend.inc"
 #include "ps2_gs_gpu_raster_parts/gpu_raster_bridge_and_stubs.inc"
 // G425: readback-redundancy ceiling census added in lle_gpu_raster_backend.inc (force recompile v1).

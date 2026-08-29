@@ -41,6 +41,11 @@
 #include "ps2_vu1_parts/vu1_lower_opcodes.inc"
 #include "ps2_vu1_parts/vu1_dispatch_and_sync.inc"
 #include "ps2_vu1_parts/vu1_g541_pipeline_snapshot.inc"
+// G665: the INVERSE of the G541 snapshot plus the G566 state encoding - VU1 backend state IMPORT.
+// Must come AFTER vu1_g541_pipeline_snapshot.inc: its self-test calls the writer it inverts, and
+// exactness of that round trip is the whole point. Marshalling only; nothing calls it unless a
+// GPU->CPU migration actually happens, so the default path pays nothing (Rule 12c).
+#include "ps2_vu1_parts/vu1_g665_backend_migration.inc"
 // G360: item-slot UV-loss XGKICK probe added in vu1_dispatch_and_sync.inc (force recompile v2).
 // G541: stable hidden-pipeline snapshots + ordered XGKICK addresses for the VU1 GPU corpus (v1).
 // G370: VU1 store-watch probe added (force recompile).

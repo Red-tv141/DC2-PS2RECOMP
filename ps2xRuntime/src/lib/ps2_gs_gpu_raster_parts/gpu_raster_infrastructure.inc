@@ -132,7 +132,7 @@ inline int dc2GetNativePhysicalHeight(int logicalH)
 {
     if (!dc2IsNativeHighResActive() || logicalH <= 0)
         return logicalH;
-    if (logicalH == 415 || logicalH == 416 || logicalH == 448 || logicalH == 512)
+    if (logicalH == 415 || logicalH == 416 || logicalH == 448)
         return getDC2NativeRenderConfig().requestedHeight;
     return std::max(1, static_cast<int>(std::round(static_cast<float>(logicalH) * dc2GetNativeScaleY())));
 }

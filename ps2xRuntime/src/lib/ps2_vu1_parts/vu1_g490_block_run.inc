@@ -580,6 +580,73 @@ namespace
     //  27 = + G533 immutable-image specialization: exact-source static handler for one recurring
     //       nine-pair block plus its typed flag tail. 28 is its full-state/history oracle copy;
     //       29 is the isolated occupancy-census copy.
+// =================================================================================================
+// G664 §P4 — THE CLOSED PHASES' A/B ARMS ARE 33.41% OF THIS TRANSLATION UNIT'S `.text`.
+//
+// MEASUREMENT.  `tools/g657_comdat_rank.py ps2_vu1.obj --match g490BlockBody` reads **14 COMDATs,
+// 211,024 bytes, 33.41% of the TU's 631,663 `.text` bytes** — fourteen full copies of the block
+// body, one per template specialization.  `ps2_vu1.obj` is 630,896 code bytes / 1,281 functions,
+// the second-largest hot TU in the project after `ps2_gs_rasterizer.obj`.
+//
+// WHAT SELECTS THEM.  `g499BlkArmRun()` below.  Every arm above the final `return 34` is reachable
+// only by setting `DC2_G419_AB=<lever>` (the paired benchmarking flag) or a `DC2_G5xx_NO_*` /
+// `DC2_G5xx_VERIFY` env flag.  In a DEFAULT run `DC2_G419_AB` is unset, no rollback is set, so the
+// chain falls through to **34**, and `vu1_upper_opcodes.inc` then folds that to `g499BlkArm == 23`
+// via `g533StaticRun`.  Thirteen of the fourteen copies are unreachable in the shipped binary —
+// they are the A/B control arms of phases that CLOSED: G499, G500, G502, G504, G514, G515, G516,
+// G517, G531, G532, G533, G547–G551, G554, G555.
+//
+// WHY IT IS NOT FREE.  Rule 12b/12c and Rule 31.  A hot TU has a code-layout budget the same way a
+// function has an inline budget, and inert code in one is measured, not assumed:
+//     G653 P25   ~60 inert lines, zero behavioural difference      **+0.484 ms/f**
+//     G662 P4    21,652 bytes isolated out of the rasterizer TU    **−0.448 ms/f**
+//     G654       134,807 bytes deleted from the rasterizer TU      **−1.082 ms/f**
+// 211,024 bytes is 1.6x G654's deletion and 9.7x G662 P4's, in the VU1 TU, which has never been
+// attacked this way.  This file's own G490 note already states the law: "a copy nothing selects is
+// text nothing pays for".  The TU has since accumulated fourteen.
+//
+// WHAT THIS CHANGES.  Nothing, in a default run.  With `PS2X_G664_LEGACY_VU1ARMS` OFF the selector
+// is the compile-time constant 34, so every `g499BlkArm == N` (N != 23) folds to `false`, the arm
+// wrappers become unreferenced and `/OPT:REF` discards their specializations.  The shipped
+// dispatch is arm 23 either way — this deletes copies nothing selects, it does not choose
+// differently among them.
+//
+// ⛔ WHAT IT COSTS, AND HOW TO GET IT BACK.  In the default build the VU1 `DC2_G419_AB` levers and
+// the `DC2_G5xx_NO_*` / `DC2_G5xx_VERIFY` block-arm rollbacks stop resolving.  Rebuild with
+// `-DPS2X_G664_LEGACY_VU1ARMS=ON` to restore every arm exactly.  This is the same contract G662 P4
+// used for `-DPS2X_G655_LEGACY_DIAG=ON`, and it satisfies Rule 31: the census/rollback lives behind
+// a compile-time option with its re-open condition written at the call site.
+//
+// ⛔⛔ G664 BUILT THIS AND REVERTED IT — THE ATTRIBUTION WAS WRONG, AND THE MEASUREMENT SAYS SO.
+//
+// The lever: make this function the compile-time constant `34` under a default-OFF
+// `PS2X_G664_LEGACY_VU1ARMS`, so `g533StaticRun` folds true, `g499BlkArm` folds to 23, every other
+// `g499BlkArm == N` comparison dies, the arm wrappers go unreferenced and `/OPT:REF` discards their
+// specializations.  Built, linked, and measured **twice** (the second time additionally handing
+// MSVC `__assume(g499BlkArm == 0 || g499BlkArm == 23)`, whose premise is provable from the three
+// lines around `g499BlkArm`'s definition in `vu1_upper_opcodes.inc`):
+//
+//     dc2_runner.exe  110,645,248 -> 110,641,664   =  **-3,584 bytes**, both times.
+//
+// Against a 211,024-byte target that is a **null**, and the reason is visible in this very file:
+// `g490BlockBody<...>` is ALSO instantiated by direct calls from the G610 native-JIT and G612
+// native-region FALLBACK paths (lines ~4229/4245/4261 and ~5778/5793/5810/5838), which no arm
+// selector gates.  So the fourteen copies are NOT "thirteen dead A/B arms plus one shipped body" —
+// a substantial share is reachable from the SHIPPED native backends, i.e. from the levels that
+// carry 87.94% of all pairs.  The census was right about the SIZE and wrong about the OWNER.
+//
+// Reverted under Rule 31 (a null lever is reverted, not shipped default-OFF): the change removed
+// every VU1 `DC2_G419_AB` lever and `DC2_G5xx_NO_*` / `_VERIFY` block rollback from the default
+// build, which is a real cost to every future phase, in exchange for 3,584 bytes.
+//
+// ⚠️ RE-OPEN CONDITION.  The 211,024 bytes / 33.41% of this TU's `.text` is REAL and unattacked —
+// it is simply not addressable through the arm selector.  Re-open only with a census that first
+// partitions the fourteen specializations by CALL SITE (arm-selector vs G610/G612 fallback), and
+// attack only the subset with no fallback caller.  Instrument to build: a per-specialization entry
+// counter, since a `dumpbin` size ranking cannot see reachability.  Prior art for the payoff if it
+// exists: G654 (-1.082 ms/f for 134,807 bytes), G662 P4 (-0.448 ms/f for 21,652).
+// =================================================================================================
+
     int g499BlkArmRun()
     {
         static const int s_paired = [] {

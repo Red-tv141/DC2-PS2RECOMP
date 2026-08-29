@@ -152,7 +152,22 @@ void g657NoteGpuOk(unsigned cls, unsigned fbp, unsigned long long entries, unsig
         r.entries += entries;
         ++r.events;
     }
-    g_gpuOkN.fetch_add(1ull, std::memory_order_relaxed);
+    // ⛔ G661 P4 FIX — G657 measurement law 10, third form ("a census printing nothing because its
+    // reporter is nested inside another path"). The ONLY call site of g657ReportWall() used to be
+    // g657NoteFallbackWall's `n % 2048` tick, so a route that never accumulates 2,048 CPU-fallback
+    // batches prints NOTHING AT ALL — no [G657:cover], no [G657:rejwall] — even after 4,981 frames
+    // with the flag verifiably set. `map15` is exactly that route, and it is why G660's corpus
+    // census stalled at 7 of 14 with map15 recorded as "not measured".
+    //
+    // The bias this introduced is the dangerous part: the routes it silences are the ones with the
+    // LEAST CPU fallback, i.e. the best GPU coverage in the corpus. A coverage range quoted from
+    // the routes that DID report is therefore a range over the worse half by construction.
+    //
+    // Tick on the GPU-OK side too. The counters are cumulative and the reader takes the LAST line,
+    // so printing more often cannot change any measured value — only whether it is ever emitted.
+    const unsigned long long gn = g_gpuOkN.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+    if ((gn % 4096ull) == 0ull)
+        g657ReportWall();
 }
 
 void g657ReportWall()
