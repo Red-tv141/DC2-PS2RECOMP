@@ -707,6 +707,13 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
         // drains this one. PCRTC registers and field phase bypass the FIFO, so capture them now;
         // VRAM/context remain worker-owned and are consumed only at this marker's FIFO position.
         const bool g412CrossFrame = g412_cross_frame_enabled();
+        static const bool g677Enabled =
+            !dc2_env_flag_enabled("DC2_G677_NO_DEBUG_FRAME_BOUNDARY");
+        static const bool g677Trace =
+            dc2_env_flag_enabled("DC2_G677_DEBUG_BOUNDARY_TRACE");
+        const bool g677MenuFramePending = s_g677DebugMenuFramePending;
+        s_g677DebugMenuFramePending = false;
+        const bool g677LogicalFrame = g677Enabled && g677MenuFramePending;
         uint64_t g412Pmode = 0ull;
         uint64_t g412Smode2 = 0ull;
         uint64_t g412Dispfb1 = 0ull;
@@ -730,6 +737,7 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
 
         g150_frame_barrier([runtime, n,
                             g412CrossFrame,
+                            g677LogicalFrame,
                             g412Pmode,
                             g412Smode2,
                             g412Dispfb1,
@@ -761,7 +769,23 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - g440FlushT0).count()));
             g189_set_closure_stage(2, n);
-            if (g412CrossFrame)
+            if (g677LogicalFrame && g412CrossFrame)
+            {
+                g677_latch_logical_host_presentation_snapshot(&runtime->gs(),
+                                                               g412Pmode,
+                                                               g412Smode2,
+                                                               g412Dispfb1,
+                                                               g412Display1,
+                                                               g412Dispfb2,
+                                                               g412Display2,
+                                                               g412Bgcolor,
+                                                               g412VsyncTick);
+            }
+            else if (g677LogicalFrame)
+            {
+                g677_latch_logical_host_presentation_frame(&runtime->gs());
+            }
+            else if (g412CrossFrame)
             {
                 g412_latch_host_presentation_snapshot(&runtime->gs(),
                                                        g412Pmode,
@@ -782,6 +806,12 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
             // frame n has completed and no later latch can have started.
             g598_capture_on_script_frame(n, runtime);
         });
+        if (g677Trace && g677LogicalFrame && (n <= 8u || (n % 60u) == 0u))
+        {
+            std::fprintf(stderr,
+                         "[G677:debug-boundary] n=%u existing=mgEndFrame mtgs=%u crossFrame=%u\n",
+                         n, g150_mtgs_enabled() ? 1u : 0u, g412CrossFrame ? 1u : 0u);
+        }
         if (f29_should_log(n))
         {
             std::fprintf(stderr,

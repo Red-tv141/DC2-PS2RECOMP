@@ -508,7 +508,6 @@ static void f40_drive_pad(uint32_t frame, uint32_t loopNo)
 {
     static bool havePrevFrame = false;
     static uint32_t prevFrame = 0u;
-    static uint16_t deferredPress = 0u;
 
     // F64: correlate the input scriptFrame with the top-level LoopNo (program
     // state: title/menu/costume/cutscene) so route-B pad timing can be tuned to
@@ -571,17 +570,21 @@ static void f40_drive_pad(uint32_t frame, uint32_t loopNo)
         }
     }
 
-    // Keep Cross-window confirmations from being consumed by TitleModeKey.
-    if ((effectivePressed & 0x4000u) != 0u && loopNo == 1u)
-    {
-        deferredPress |= effectivePressed;
-        effectivePressed = 0u;
-    }
-    else if (deferredPress != 0u && loopNo != 1u)
-    {
-        effectivePressed |= deferredPress;
-        deferredPress = 0u;
-    }
+    // G678: the old "keep Cross-window confirmations from being consumed by TitleModeKey"
+    // deferral lived here:
+    //     if ((effectivePressed & 0x4000u) && loopNo == 1u) { defer; effectivePressed = 0; }
+    // It was written before G7 measured that the button word reaching the guest is
+    // BYTE-SWAPPED relative to the documented scePad layout, so 0x4000 in this path is
+    // D-PAD DOWN, not Cross (game space: Up 0x1000, Right 0x2000, Down 0x4000, Left 0x8000,
+    // Tri 0x0010, Circle 0x0020, Cross 0x0040, Square 0x0080). And `loopNo == 1` is the
+    // IN-GAME loop, not the title (measured: LoopNo 0 at boot/title, 1 from the moment the
+    // map loads and never again anything else) — so the branch could not protect
+    // TitleModeKey and instead swallowed EVERY scripted D-pad Down for the whole session,
+    // into a `deferredPress` latch whose flush condition (`loopNo != 1`) never came.
+    // Measured: 32 [F40:inject] lines for the pre-game presses and ZERO for a 38-press Down
+    // train at loopNo == 1. That is why scripted routes cannot move a menu cursor down.
+    // Removed outright (Rule 31: no inert code in a path that has to stay exact) — nothing
+    // can depend on it, because while it was armed it never delivered a press at all.
 
     if (effectivePressed != 0u)
     {
@@ -592,14 +595,18 @@ static void f40_drive_pad(uint32_t frame, uint32_t loopNo)
         // digital D-pad ג€” so a scripted "Up" with the stick centred (0x80) never
         // translated the player. Deflect the left stick to match any scripted
         // direction bit (kept ALONGSIDE the digital bit so menus that read D-pad
-        // still navigate; menus ignore the analog stick). scePad bits: Up 0x10,
-        // Right 0x20, Down 0x40, Left 0x80. Stick byte: centre 0x80, min 0x00,
-        // max 0xFF; up = -Y = 0x00, left = -X = 0x00 (raylib axisToByte convention).
+        // still navigate; menus ignore the analog stick). G678: these bits are in the
+        // GAME-SPACE (byte-swapped) layout this path actually carries — Up 0x1000,
+        // Right 0x2000, Down 0x4000, Left 0x8000. They used to be the documented scePad
+        // values (0x10/0x20/0x40/0x80), which in game space are Tri/Circle/Cross/Square:
+        // a scripted direction deflected NOTHING and a scripted Cross shoved the stick
+        // down. Stick byte: centre 0x80, min 0x00, max 0xFF; up = -Y = 0x00,
+        // left = -X = 0x00 (raylib axisToByte convention).
         uint8_t lx = 0x80u, ly = 0x80u;
-        if ((effectivePressed & 0x10u) != 0u) ly = 0x00u; // Up
-        if ((effectivePressed & 0x40u) != 0u) ly = 0xFFu; // Down
-        if ((effectivePressed & 0x80u) != 0u) lx = 0x00u; // Left
-        if ((effectivePressed & 0x20u) != 0u) lx = 0xFFu; // Right
+        if ((effectivePressed & 0x1000u) != 0u) ly = 0x00u; // Up
+        if ((effectivePressed & 0x4000u) != 0u) ly = 0xFFu; // Down
+        if ((effectivePressed & 0x8000u) != 0u) lx = 0x00u; // Left
+        if ((effectivePressed & 0x2000u) != 0u) lx = 0xFFu; // Right
         ps2_stubs::setPadOverrideState(static_cast<uint16_t>(~effectivePressed & 0xFFFFu),
                                        lx, ly, 0x80u, 0x80u);
         f40_log_inject(frame, effectivePressed, "mgEndFrameScaled");

@@ -133,6 +133,12 @@ static void f50_6_menu_init_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime 
     }
 }
 
+// G677 revision 3: MenuLoop and mgEndFrame are sequential siblings in the recompiled main loop.
+// Hand one source-authority token to the next EXISTING frame boundary. Publishing a second boundary
+// races that native latch and visibly alternates 512x415 debug frames with the stale 1024x830
+// gameplay FBO at S=2. One-shot consumption also prevents debug authority leaking into gameplay.
+static thread_local bool s_g677DebugMenuFramePending = false;
+
 static void f49_menu_loop_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
     static uint32_t calls = 0u;
@@ -157,6 +163,8 @@ static void f49_menu_loop_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *r
     }
     const auto t0 = std::chrono::steady_clock::now();
     MenuLoop__Fv_0x191c30(rdram, ctx, runtime);
+    if (f50_6_debug_menu_enabled())
+        s_g677DebugMenuFramePending = true;
     const auto t1 = std::chrono::steady_clock::now();
     if (f50_6_debug_menu_enabled() && (n <= 64u || getRegU32(ctx, 2) != 0u))
     {
