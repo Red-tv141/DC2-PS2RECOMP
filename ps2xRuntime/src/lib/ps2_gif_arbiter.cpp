@@ -1,6 +1,7 @@
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "ps2_log.h"
+#include "ps2_g674_hot_flag.inc"
 #include "ps2_gif_arbiter_parts/g370_nan_source_probe.inc"
 #include "ps2_g480_packet_pool.inc"
 

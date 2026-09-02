@@ -1,4 +1,5 @@
 #include <chrono>
+#include "ps2_g674_hot_flag.inc"
 // G654 P16/P17: exclusive, thread-keyed layer timer (empty unless -DPS2X_G654_DIAG=ON).
 #include "ps2_g654_layer_api.inc"
 #include "ps2_vif1_interpreter_parts/vif1_probes_and_helpers.inc"

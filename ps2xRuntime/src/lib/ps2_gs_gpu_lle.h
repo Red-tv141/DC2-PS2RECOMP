@@ -28,10 +28,13 @@ struct G178Vtx
     // G364: GS per-vertex FOG byte (F). Interpolated by the FS and blended towards G178Draw::fogCol
     // when the draw's fge flag is set. pad keeps the 4-byte attribute alignment explicit.
     uint8_t fog, pad0, pad1, pad2;
+#if defined(PS2X_G684_LEGACY_G560_RUNS)
     // G561: flat per-triangle draw state for ordered same-texture runs. Values are integer-packed
     // into floats below 2^24, hence lossless through the GL_FLOAT vertex attribute. The legacy
-    // shader ignores this private tail entirely.
+    // shader ignores this private tail entirely. G684 excludes it from normal builds: all three
+    // consumers are closed default-off experiments, and carrying it inflated every upload by 50%.
     float drawState0, drawState1, drawState2, drawState3;
+#endif
 };
 
 // One state-batched draw run over a contiguous vertex range (triangles, 3 verts each).
@@ -57,6 +60,27 @@ struct G178Draw
     // G406: per-sprite GS 12.4 UV rounding state. Zero flags disable the path.
     uint16_t uvOriginX = 0, uvOriginY = 0;
     uint8_t uvRoundU = 0, uvRoundV = 0;
+    // ⭐⭐⭐ G679: the EXACT-LATTICE PERIOD of each axis, in pixels. A sprite's texture coordinate is
+    // V(p) = v0 + (p - origin)·dt/dp, so it is an EXACT INTEGER precisely when (p - origin) is a
+    // multiple of |dp| / gcd(|dt|,|dp|) — that value. On those pixels the correct texel IS the
+    // boundary and `g406RoundAxis`'s down-nudge must not fire; the `pixel == origin` exception the
+    // rule already carried is just the p == origin case of this. 0 = "never exact" (a sprite whose
+    // v0 is not texel-aligned), 1 = every pixel (any 1:1 sprite). Packed into the round uniforms.
+    uint16_t uvPeriodU = 1, uvPeriodV = 1;
+    // ⭐ G675: 1 when this draw is a SCREEN-SPACE FST SPRITE — GS `PRIM_SPRITE` with TME and FST,
+    // i.e. an axis-aligned 1:1 texel→pixel blit whose UVs the front-end shifted by -0.5 texel per
+    // pixel so a 1x fragment centre lands on the CPU sampler's texel. The backend needs to know,
+    // for two reasons that only exist away from 1x / 4:3:
+    //   * at scale S the S sub-fragments of one logical pixel sit at logical x+0.25/x+0.75, so
+    //     that -0.5 shift puts one of them in the NEIGHBOURING atlas texel (measured: the two
+    //     sub-columns of the Items panel disagree by mean 17.68 / 63.5% of pixels). The sample
+    //     must be taken at the LOGICAL pixel centre — a 1:1 blit has no more source data, so
+    //     nearest magnification is the only faithful answer.
+    //   * under a widened field of view the 3D world is rendered wider, but screen-space 2D is
+    //     not projected at all, so it must be scaled about the screen centre to keep its shape.
+    // Zero for every triangle/strip/fan and for every non-FST sprite, so both effects are scoped
+    // to exactly the population that carries the 1x-calibrated UV shift.
+    uint8_t screenSprite = 0;
     uint16_t scX0 = 0, scY0 = 0, scX1 = 0, scY1 = 0; // GS scissor (inclusive, top-origin)
 };
 

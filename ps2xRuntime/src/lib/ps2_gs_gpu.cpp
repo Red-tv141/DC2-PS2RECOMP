@@ -1,4 +1,5 @@
 #include <cstdint>
+#include "ps2_g674_hot_flag.inc"
 
 int g473SimdMergeArm();
 // G508: A/B arm for the m_stateMutex lock-skip lever, read once per GIF packet in
@@ -15,9 +16,15 @@ int g596CopyArm();
 int g652Gif412Arm();
 // G652 P12: diagnostic implementation is cold; called only under DC2_G650_GIF_STAT.
 void g652GifSequenceNote(uint64_t tagHi, uint32_t nreg, uint32_t descriptors);
+// G687: mark the dominant ST/RGBAQ/XYZF2 tag as a fixed-state capture run. The parser still
+// executes the exact generic descriptor bodies; the rasterizer only fast-captures after one
+// ordinary draw has proved this tag's state is deferrable.
+bool g687BeginPackedCaptureRun();
+void g687EndPackedCaptureRun();
 // G508: force-recompile marker - .inc edits do not trigger MSBuild (G359). revision: 2
 // G596: force-recompile marker for the table-driven l2l copy. revision: 1
 // G652: packed-GIF descriptor-sequence census + 0x412 paired arm. revision: 2
+// G687: fixed-state 0x412 capture run. revision: 1
 // G630: replay co-writes raw authority and linear FBO mirror. revision: 5
 // G522: `g144L2lLatePin` - the fail-safe replay of the local->local guest-VRAM publication that the
 // range barrier skipped when g289CanDeferLocalCopy promised an FBO->FBO blit. Declared with the
@@ -26,6 +33,7 @@ void g652GifSequenceNote(uint64_t tagHi, uint32_t nreg, uint32_t descriptors);
 
 // G397: reserved A+D display-alias fix plus presentation diagnostics live in the parts below.
 // G412: force-recompile marker for immutable depth-two frame-boundary presentation snapshots.
+// G677: force-recompile marker for logical-VRAM source authority at MenuLoop boundaries. revision: 1
 // G399: DC2_G399_SURFDUMP raw render-target surface probe (diagnostic, default-off).
 // G414 diagnostic: force-recompile marker for default-off exact GS l2l self-copy retirement.
 // G434 probe: force-recompile marker for DC2_G434_NO_DRAW (front-thread draw deletion ceiling).

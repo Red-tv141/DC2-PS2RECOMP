@@ -1,4 +1,5 @@
 #include <chrono>
+#include "ps2_g674_hot_flag.inc"
 // G654 P16/P17: exclusive, thread-keyed layer timer. Empty struct unless
 // -DPS2X_G654_DIAG=ON (rule 12c: a diagnostic in a hot TU is a compile-time build mode).
 #include "ps2_g654_layer_api.inc"

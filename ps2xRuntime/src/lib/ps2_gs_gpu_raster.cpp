@@ -1,4 +1,5 @@
 #include <cstdint>
+#include "ps2_g674_hot_flag.inc"
 
 // G652: three-segment SSBO upload ring + finite persistent command-ring proof (force rebuild v1).
 // G630: persistent raw-VRAM stream with separately clocked GPU job classes (force rebuild v2).

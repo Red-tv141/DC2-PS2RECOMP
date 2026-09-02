@@ -1,3 +1,5 @@
+#include "ps2_g674_hot_flag.inc"
+// G687: force-recompile marker for the fixed-state 0x412 capture run. revision: 1
 // G659: consume compile-time diagnostic revisions for the 33-priority closure phase (rev 1).
 // G630: large-view source attribution for the remaining residency break (force rebuild v9).
 // G612: this TU gains only the `vureg` A/B arm in g419_ab_instrument.inc (the native VU1 REGION
@@ -290,6 +292,7 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // 14-slot scan is looking for. Empty inlines unless PS2X_G663_DIAG; storage and the reporter live
 // in the cold TU ps2_g663_diag.cpp.
 #include "ps2_g663_diag_api.inc"
+#include "ps2_g680_diag_api.inc"
 // G666: [G666:discovterm] - which conjunct actually blocks each DISCOVERED-TARGET batch, separating
 // a PERFORMANCE gate (width) from a POLICY gate (the blanket NODEPTH refusal) from a genuinely
 // missing GPU depth authority (foreign ZBP/ZPSM/scope) - and [G666:zrate], the depth divergence
@@ -307,6 +310,7 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
     #include "ps2_gs_rasterizer_parts/rasterizer_clipping_and_tex_checks.inc"
 
     #include "ps2_gs_rasterizer_parts/rasterizer_row_pool.inc"
+    #include "ps2_gs_rasterizer_parts/g684_async_prep.inc"
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_tilebinning_and_probes.inc"
@@ -643,10 +647,24 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 #include "ps2_gs_rasterizer_parts/g654_stub_g629.inc"
 #endif
 
+// G687's tag markers are called by the GIF TU. This TLS bit lets the overwhelmingly common
+// inactive drawPrimitive path reject the helper with one load/branch and no function call.
+static thread_local bool g_g687PackedCaptureRunActive = false;
+__declspec(noinline) static bool g687TryFastCapture(
+    GSRasterizer *self, GS *gs, const GSContext &ctx, const GSPrimReg &prim,
+    const GSTexaReg &texa, const GSTexClutReg &texclut, bool pabe,
+    const GSVertex *vertices, uint8_t *vram);
+static void g687PrimePackedCapture(
+    GSRasterizer *self, GS *gs, uint8_t *vram, const GSContext &ctx,
+    const GSPrimReg &prim, const GSTexaReg &texa, const GSTexClutReg &texclut,
+    bool pabe, bool g286Transient, bool g573Tri13b);
+
 #include "ps2_gs_rasterizer_parts/rasterizer_setup_and_perf_census.inc"
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_tilebin_capture.inc"
+
+#include "ps2_gs_rasterizer_parts/g687_packed_capture_run.inc"
 
 
 // G369 cutscene gray-screen census (default-off: DC2_G369_CENSUS=1). Must sit AFTER the
