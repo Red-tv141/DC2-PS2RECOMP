@@ -206,10 +206,23 @@ bool g280_backend_copy_color_rects(uint32_t srcFbp, uint32_t dstFbp,
     return G178Backend::instance().copyColor(srcFbp, dstFbp, rects6);
 }
 
+// G675: the rect-aware form. `rect*` is the PCRTC read rectangle in LOGICAL GS coordinates
+// (DISPFB DBX/DBY + DISPLAY DW/DH); the backend multiplies it by the native scale. A zero
+// width/height means "whole surface".
+bool g675_backend_read_display_rect(uint32_t fbp, uint32_t fallbackFbp,
+                                    int32_t rectX, int32_t rectY, int32_t rectW, int32_t rectH,
+                                    uint32_t &outW, uint32_t &outH,
+                                    std::vector<uint8_t> &outRgba)
+{
+    return G178Backend::instance().readDisplayFbo(fbp, fallbackFbp, rectX, rectY, rectW, rectH,
+                                                  outW, outH, outRgba);
+}
+
 bool g178_backend_read_display_fbo(uint32_t fbp, uint32_t fallbackFbp, uint32_t &outW, uint32_t &outH,
                                    std::vector<uint8_t> &outRgba)
 {
-    return G178Backend::instance().readDisplayFbo(fbp, fallbackFbp, outW, outH, outRgba);
+    // Rect-less legacy entry point (declared in ps2_gs_gpu_lle.h): whole display surface.
+    return g675_backend_read_display_rect(fbp, fallbackFbp, 0, 0, 0, 0, outW, outH, outRgba);
 }
 
 bool g289_backend_copy_display_to_work(uint32_t srcFbp, uint32_t dstFbp)

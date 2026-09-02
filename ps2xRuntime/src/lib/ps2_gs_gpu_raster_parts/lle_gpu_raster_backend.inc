@@ -1220,7 +1220,9 @@ void main()
     }
 
     // Native High-Res Presentation Read: read active display FBO directly at its native physical resolution.
-    bool readDisplayFbo(uint32_t fbp, uint32_t fallbackFbp, uint32_t &outW, uint32_t &outH,
+    bool readDisplayFbo(uint32_t fbp, uint32_t fallbackFbp,
+                        int32_t rectX, int32_t rectY, int32_t rectW, int32_t rectH,
+                        uint32_t &outW, uint32_t &outH,
                         std::vector<uint8_t> &out)
     {
         if (!m_ready.load(std::memory_order_acquire))
@@ -1234,6 +1236,10 @@ void main()
             item.isDisplayFboRead = true;
             item.colorFbp = fbp;
             item.displayReadFallbackFbp = fallbackFbp;
+            item.displayRectX = rectX;
+            item.displayRectY = rectY;
+            item.displayRectW = rectW;
+            item.displayRectH = rectH;
             item.displayOutW = &outW;
             item.displayOutH = &outH;
             item.displayOutRgba = &out;
@@ -1648,6 +1654,13 @@ private:
         // Native High-Res Presentation Read job
         bool isDisplayFboRead = false;
         uint32_t displayReadFallbackFbp = 0u;
+        // G675: the PCRTC read rectangle in LOGICAL GS coordinates (DISPFB DBX/DBY + DISPLAY
+        // DW/DH), top-origin, exactly the rect the 1x VRAM path copies. 0 width/height means
+        // "whole surface" and keeps the legacy behaviour for any caller that has no rect.
+        int32_t displayRectX = 0;
+        int32_t displayRectY = 0;
+        int32_t displayRectW = 0;
+        int32_t displayRectH = 0;
         uint32_t *displayOutW = nullptr;
         uint32_t *displayOutH = nullptr;
         std::vector<uint8_t> *displayOutRgba = nullptr;
@@ -2300,6 +2313,8 @@ private:
                                             item.colorRows, *item.colorWrite);
                 else if (item.isDisplayFboRead)
                     ok = readDisplayFboOnWorker(item.colorFbp, item.displayReadFallbackFbp,
+                                                item.displayRectX, item.displayRectY,
+                                                item.displayRectW, item.displayRectH,
                                                 *item.displayOutW, *item.displayOutH,
                                                 *item.displayOutRgba);
                 else if (item.depthReadback != nullptr && !item.renderThenReadDepth)
@@ -2593,6 +2608,16 @@ private:
             glDeleteTextures(1, &m_g566OutputTex);
         if (m_g627Prog != 0)
             m_f.glDeleteProgram_(m_g627Prog);
+        if (m_g675ResolveProg != 0)
+            m_f.glDeleteProgram_(m_g675ResolveProg);
+        if (m_g675UpProg != 0)
+            m_f.glDeleteProgram_(m_g675UpProg);
+        if (m_g675UpTex != 0)
+            glDeleteTextures(1, &m_g675UpTex);
+        if (m_g675ResolveFbo != 0)
+            m_f.glDeleteFramebuffers_(1, &m_g675ResolveFbo);
+        if (m_g675ResolveTex != 0)
+            glDeleteTextures(1, &m_g675ResolveTex);
         if (m_g627ValTex != 0)
             glDeleteTextures(1, &m_g627ValTex);
         if (m_g627MaskTex != 0)
@@ -4670,6 +4695,14 @@ void main()
             "layout(location=2) in vec4 aColor;\n"
             "layout(location=3) in vec4 aFog;\n"
             "uniform vec2 uFbSize;\n"
+            // ⭐ G675, the screen-space-sprite pair (one uniform, both stages declare it):
+            //   .x = UV snap  — the render scale S on a screen-space sprite, else 0 (see the FS)
+            //   .y = X scale  — fovScaleX on a screen-space sprite under a widened field of view,
+            //                   else 1.0. 3D geometry is widened by the guest's own projection
+            //                   (ps2_widescreen.inc); screen-space 2D is not projected at all, so
+            //                   it must be scaled here, about the logical screen centre, or it
+            //                   stretches with the frame.
+            "uniform vec2 uSprite;\n"
             "noperspective out vec3 vSTQ;\n"
             "noperspective out vec4 vColor;\n"
             "noperspective out float vZ;\n"
@@ -4679,7 +4712,9 @@ void main()
             "    vColor = aColor;\n"
             "    vFog = aFog.x;\n"
             "    vZ = aPos.z;\n"
-            "    float ndcX = aPos.x / uFbSize.x * 2.0 - 1.0;\n"
+            "    float cx = uFbSize.x * 0.5;\n"
+            "    float px = (aPos.x - cx) * uSprite.y + cx;\n"
+            "    float ndcX = px / uFbSize.x * 2.0 - 1.0;\n"
             "    float ndcY = 1.0 - aPos.y / uFbSize.y * 2.0;\n"
             "    gl_Position = vec4(ndcX, ndcY, 0.0, 1.0);\n"
             "}\n";
@@ -4737,6 +4772,10 @@ void main()
             "uniform int uWrapV;\n"
             "uniform vec2 uFbSize;\n"
             "uniform vec2 uFbScale;\n"
+            // ⭐ G675 (same uniform the vertex stage declares): .x is the render scale S on a
+            // SCREEN-SPACE SPRITE draw and 0 otherwise; .y is the vertex-stage X scale. See
+            // g675SnapUv() below for what .x repairs.
+            "uniform vec2 uSprite;\n"
             "uniform int uUvOriginX;\n"
             "uniform int uUvOriginY;\n"
             "uniform int uUvRoundU;\n"
@@ -4744,6 +4783,56 @@ void main()
             // G624: nonzero when this draw samples a producer FBO through `srcFbp`, whose GL row
             // h-1-v holds GS row v (the front end flipped T with `tq = 1 - tq`). See g406RoundUv.
             "uniform int uUvFlipV;\n"
+            // ⭐⭐ G675: RE-EVALUATE A SCREEN-SPACE SPRITE'S TEXTURE COORDINATE AT THE **LOGICAL**
+            // PIXEL CENTRE.
+            //
+            // The front end shifts an FST sprite's UVs by -0.5 texel per pixel so that at 1x a
+            // fragment centre lands exactly on the CPU sampler's texel — which, as G362 already
+            // documented, puts every sample of an axis-aligned 2D sprite EXACTLY on a texel
+            // boundary. At render scale S the S sub-fragments of one logical pixel sit at logical
+            // x+0.25 / x+0.75 (S=2), so that same shift throws one of them across the boundary and
+            // into the NEIGHBOURING ATLAS TILE: the Items panel grew a full orange lattice at every
+            // cell seam and a black notch beside every icon, at S>1 only.
+            //
+            // Measured before the fix, on the pure-2D item grid: S=2's own sub-pixel phases
+            // disagreed with EACH OTHER by mean 17.68 / 63.5% of pixels (x+0 vs x+1) — and for a
+            // 1:1 point blit they must be identical, because there IS no more source data. The
+            // faithful high-resolution answer is nearest magnification: every sub-fragment of a
+            // logical pixel samples the texel that logical pixel sampled at 1x.
+            //
+            // uv is affine for an FST sprite (iq == 1), so shifting along the screen-space
+            // derivatives to the logical pixel centre is exact, not an approximation. The branch
+            // is on a uniform, so the derivatives stay well-defined; identity at S == 1.
+            // ⛔ The grid it snaps to is the sprite's ORIGINAL, PRE-X-SCALE logical pixel grid, not
+            // the on-screen one. Under a widened field of view the vertex stage scales screen-space
+            // sprites about the centre by a NON-INTEGER factor (0.75 for 16:9, 0.60 for 21:9), so
+            // the blit stops being 1:1 and snapping to the on-screen grid lets a fragment sample
+            // across a source texel boundary again — the lattice came straight back at 16:9 when
+            // this was written the naive way. Undoing the X scale first restores "one source texel
+            // per ORIGINAL logical pixel", which is the invariant the -0.5 shift was built around.
+            "vec2 g675SnapUv(vec2 uv){\n"
+            "    if (uSprite.x <= 0.0) return uv;\n"
+            "    float s = uSprite.x;\n"          // render scale S
+            "    float k = uSprite.y;\n"          // vertex-stage X scale (1.0 unless widened)
+            "    float cx = uFbSize.x * 0.5;\n"
+            "    float ox = (gl_FragCoord.x / s - cx) / k + cx;\n"  // pre-scale logical x
+            "    float oy = gl_FragCoord.y / s;\n"
+            "    float tgtX = ((floor(ox) + 0.5 - cx) * k + cx) * s;\n"
+            "    float tgtY = (floor(oy) + 0.5) * s;\n"
+            // ⛔ BOUND THE CORRECTION TO HALF A PRE-SCALE PIXEL. One pre-scale logical pixel is
+            // s*k fragments wide (s tall), so a fragment's own pixel centre is always within
+            // ±0.5*s*k of it. At a sprite EDGE the scaled span is fractional, floor() can name the
+            // NEIGHBOURING pixel, and the unclamped shift then extrapolates the UV past the
+            // sprite's own texel span into the adjacent atlas tile — a faint seam at every cell
+            // boundary. Clamping is exact where the snap is legitimate and disarms it precisely
+            // where it would extrapolate. (An earlier attempt rounded the sprite's scaled EDGES to
+            // integers in the vertex stage instead; it measured WORSE on the pre-scale grouping
+            // oracle — 0.316 vs 0.097 — and risked 1px gaps between adjacent HUD pieces.)
+            "    float mx = 0.5 * s * k;\n"
+            "    float my = 0.5 * s;\n"
+            "    return uv + dFdx(uv) * clamp(tgtX - gl_FragCoord.x, -mx, mx)\n"
+            "              + dFdy(uv) * clamp(tgtY - gl_FragCoord.y, -my, my);\n"
+            "}\n"
             "int wrapCoord(int p, int n, int mode){\n"
             "    if (mode != 0) return clamp(p, 0, n - 1);\n"
             "    int r = p % n; return r < 0 ? r + n : r;\n"
@@ -4796,15 +4885,28 @@ void main()
             "    p.y = wrapCoord(p.y, n.y, uWrapV);\n"
             "    return clamp(ivec4(floor(texelFetch(uTex, p, 0) * 255.0 + 0.5)), 0, 255);\n"
             "}\n"
-            "float g406RoundAxis(float value, int pixel, int origin, int flags){\n"
+            // ⭐⭐⭐ G679: `flagsIn` carries the 4 G406 flag bits in [3:0] and the axis' EXACT-LATTICE
+            // PERIOD in [19:8] (G178Draw::uvPeriodU/V). A pixel whose exact texture coordinate is an
+            // integer must take the boundary — the down-nudge would name the PREVIOUS texel. The
+            // rule already had the `pixel == origin` case of this hard-coded; the period generalises
+            // it to every exact pixel, and `period == 1` (any 1:1 sprite) means all of them.
+            "float g406RoundAxis(float value, int pixel, int origin, int flagsIn){\n"
+            "    int flags = flagsIn & 15;\n"
+            "    int period = (flagsIn >> 8) & 4095;\n"
+            // ⛔ G680: the period-1 question is decided ONCE, in `g679ExactPeriod` (the front end is
+            // the only producer of this field), so that `DC2_G680_NO_UNIT_PERIOD=1` is a TRUE
+            // control on both rasterizers. Duplicating the `> 1` test here would harden the GPU
+            // path against its own rollback flag and make the arms differ in more than the lever.
+            "    bool exact = (pixel == origin) ||\n"
+            "                 (period != 0 && ((pixel - origin) % period) == 0);\n"
             "    bool legacy = (flags & 4) != 0;\n"
             "    bool halfBoundary = legacy || uLinear != 0;\n"
             "    float boundary = halfBoundary ? floor(value * 2.0 + 0.5) * 0.5\n"
             "                                  : floor(value + 0.5);\n"
             "    float threshold = legacy ? 0.25 : (1.0 / 64.0);\n"
             "    if (abs(value - boundary) > threshold) return value;\n"
-            "    bool down = ((flags & 2) != 0) && pixel != origin;\n"
-            "    bool up = ((flags & 1) != 0) || (((flags & 2) != 0) && pixel == origin);\n"
+            "    bool down = ((flags & 2) != 0) && !exact;\n"
+            "    bool up = ((flags & 1) != 0) || (((flags & 2) != 0) && exact);\n"
             "    float downNudge = legacy ? 0.25 : (1.0 / 16.0);\n"
             "    float upNudge = legacy ? 0.25 : 0.0;\n"
             "    return down ? boundary - downNudge : (up ? boundary + upNudge : value);\n"
@@ -4997,7 +5099,7 @@ void main()
             "        float g659ShadeBias = ((uMode & 65536) != 0) ? 0.0 : 0.5;\n"
             "        ivec4 vc = clamp(ivec4(floor(vColor * 255.0 + g659ShadeBias)), 0, 255);\n"
 #endif
-            "        vec2 uv = vSTQ.xy / max(vSTQ.z, 1e-8);\n"
+            "        vec2 uv = g675SnapUv(vSTQ.xy / max(vSTQ.z, 1e-8));\n"
             "        ivec4 tc = sampleExact(g406RoundUv(uv * vec2(textureSize(uTex, 0))));\n"
             "        if ((uMode & 1024) != 0) tc.a = 128;\n"
             "        ivec4 ec = combineExact(vc, tc);\n"
@@ -5034,7 +5136,7 @@ void main()
             "    int alphaByte = 0;\n"
             "    if (alphaTest) alphaByte = int(floor(vColor.a * 255.0 + 0.5));\n"
             "    if ((uMode & 1) != 0) {\n"
-            "        vec2 uv = vSTQ.xy / max(vSTQ.z, 1e-8);\n"
+            "        vec2 uv = g675SnapUv(vSTQ.xy / max(vSTQ.z, 1e-8));\n"
             "        vec4 t;\n"
             "        if ((uMode & 2048) != 0) t = g309Linear(uv);\n"
             "        else if ((uMode & 4096) != 0)\n"
@@ -5126,6 +5228,14 @@ void main()
         m_f.glUseProgram_(m_prog);
         m_locFbSize = m_f.glGetUniformLocation_(m_prog, "uFbSize");
         m_locFbScale = m_f.glGetUniformLocation_(m_prog, "uFbScale");
+        // ⭐ G675: one vec2 shared by both stages — (uvSnap, vertexXScale). It MUST be seeded
+        // here: a GL uniform defaults to 0, and a zero .y would collapse every vertex onto the
+        // screen centre. (0, 1) is the identity pair.
+        m_locG675Sprite = m_f.glGetUniformLocation_(m_prog, "uSprite");
+        if (m_locG675Sprite >= 0)
+            m_e.glUniform2f_(m_locG675Sprite, 0.0f, 1.0f);
+        m_g675SnapCur = 0.0f;
+        m_g675XScaleCur = 1.0f;
         m_locMode = m_f.glGetUniformLocation_(m_prog, "uMode");
         m_locFogCol = m_f.glGetUniformLocation_(m_prog, "uFogCol"); // G364
         m_locLinear = m_f.glGetUniformLocation_(m_prog, "uLinear");
@@ -5155,6 +5265,7 @@ void main()
         m_f.glUniform1i_(m_f.glGetUniformLocation_(m_prog, "uG309Base"),
                          static_cast<GLint>(kG309BaseUnit));
 
+#if defined(PS2X_G684_LEGACY_G560_RUNS)
         if (g560MultiDrawRequested() || g561TextureRunsRequested() ||
             g570UntexturedRunsRequested())
         {
@@ -5204,9 +5315,13 @@ void main()
                                 "#define uMode (vG560State.x & 65535)\n"
                                 "#define uFogCol vG560State.y\n"
                                 "#define uUvOriginX (vG560State.z & 65535)\n"
-                                "#define uUvRoundU ((vG560State.z >> 16) & 15)\n"
+                                // G679: flags in [19:16], exact-lattice period in [31:20]; the
+                                // shader wants flags in [3:0] and period in [19:8].
+                                "#define uUvRoundU (((vG560State.z >> 16) & 15) | "
+                                "(((vG560State.z >> 20) & 4095) << 8))\n"
                                 "#define uUvOriginY (vG560State.w & 65535)\n"
-                                "#define uUvRoundV ((vG560State.w >> 16) & 15)\n"
+                                "#define uUvRoundV (((vG560State.w >> 16) & 15) | "
+                                "(((vG560State.w >> 20) & 4095) << 8))\n"
                                 // G624: this build has no per-primitive slot left for the flip
                                 // flag, so it keeps the pre-G624 (unflipped) rounding. That is
                                 // only correct for draws that do not bind a producer FBO, which
@@ -5319,6 +5434,7 @@ void main()
                          g561TextureRunsRequested() ? "same-texture" :
                          (g570UntexturedRunsRequested() ? "untextured" : "blend-only"));
         }
+#endif
         return true;
     }
 
@@ -5580,8 +5696,7 @@ void main()
         m_f.glUniform1i_(m_locG338Aem, aem != 0 ? 1 : 0);
         if (m_locG338FbScale >= 0)
             m_e.glUniform2f_(m_locG338FbScale,
-                             dc2IsNativeHighResActive() ? dc2GetNativeScaleX() : 1.0f,
-                             dc2IsNativeHighResActive() ? dc2GetNativeScaleY() : 1.0f);
+                             dc2GetNativeScaleX(), dc2GetNativeScaleY());
         glDrawArrays(GL_TRIANGLES, 0, 3);
         g496PassBallast(); // G496 GPU derivative probe, `pass` site (idempotent re-issue)
         if (g494GetError(kG494Ct24Err) != GL_NO_ERROR)
@@ -5880,8 +5995,13 @@ void main()
         m_f.glBindVertexArray_(m_vao);
         m_f.glGenBuffers_(1, &m_vbo);
         m_f.glBindBuffer_(GL158_ARRAY_BUFFER, m_vbo);
+#if defined(PS2X_G684_LEGACY_G560_RUNS)
         static_assert(sizeof(G178Vtx) == 48,
                       "G178Vtx must be tightly packed (6 floats + RGBA/fog + G561 state)");
+#else
+        static_assert(sizeof(G178Vtx) == 32,
+                      "G178Vtx must be tightly packed (6 floats + RGBA/fog)");
+#endif
         m_f.glVertexAttribPointer_(0, 3, GL_FLOAT, GL_FALSE, sizeof(G178Vtx),
                                    reinterpret_cast<const void *>(0));
         m_f.glVertexAttribPointer_(1, 3, GL_FLOAT, GL_FALSE, sizeof(G178Vtx),
@@ -5891,13 +6011,17 @@ void main()
         // G364: per-vertex fog byte (normalized; .x carries F, .yzw are the struct padding).
         m_f.glVertexAttribPointer_(3, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(G178Vtx),
                                    reinterpret_cast<const void *>(28));
+#if defined(PS2X_G684_LEGACY_G560_RUNS)
         m_f.glVertexAttribPointer_(4, 4, GL_FLOAT, GL_FALSE, sizeof(G178Vtx),
                                    reinterpret_cast<const void *>(32));
+#endif
         m_f.glEnableVertexAttribArray_(0);
         m_f.glEnableVertexAttribArray_(1);
         m_f.glEnableVertexAttribArray_(2);
         m_f.glEnableVertexAttribArray_(3);
+#if defined(PS2X_G684_LEGACY_G560_RUNS)
         m_f.glEnableVertexAttribArray_(4);
+#endif
         return true;
     }
 
@@ -6223,10 +6347,13 @@ void main()
                         n, fbp, reuse ? "REUSE" : "RECREATE", e.w, e.h, e.fbo, w, h);
             }
         }
-        const bool isMainTarget = (fbp == 0x000u || fbp == 0x068u || fbp == 0x139u);
-        const bool allowScale = !dc2NativeMainOnlyOn() || isMainTarget;
-        const int physW = allowScale ? dc2GetNativePhysicalWidth(w) : w;
-        const int physH = allowScale ? dc2GetNativePhysicalHeight(h) : h;
+        // G675: EVERY colour target scales, without exception. The old `DC2_NATIVE_MAIN_ONLY`
+        // arm left non-main FBOs at 1x while the shader still applied the global uFbScale to
+        // them, so a resident-view fetch on any such surface read the wrong texel — it could
+        // only ever be a bisect crutch, never a correct configuration, and it is removed under
+        // Rule 31 (no inert/incorrect arms in a hot TU).
+        const int physW = dc2GetNativePhysicalWidth(w);
+        const int physH = dc2GetNativePhysicalHeight(h);
         if (e.fbo != 0 && e.w == w && e.h == h && e.physW == physW && e.physH == physH)
             return e;
         // G415: recycle the parked geometry for this key instead of deleting and reallocating a
@@ -6406,23 +6533,31 @@ void main()
         {
             if (it->second.physW != w || it->second.physH != h)
             {
-                const float sy = static_cast<float>(it->second.physH) / static_cast<float>(h);
-                const int physGlY = static_cast<int>(std::round(glY * sy));
-                const int physRows = std::max(1, static_cast<int>(std::round(rows * sy)));
-                const int physW = it->second.physW;
-                std::vector<uint32_t> physPx(static_cast<size_t>(physW) * physRows);
-                g433DoReadPixels(m_f, physGlY, physW, physRows, physPx.data());
-                for (int r = 0; r < rows; ++r)
+                // G675: physical == logical * S exactly, so the row/column windows are exact
+                // integer products and every logical pixel is one SxS physical block. The tap is
+                // the block CENTRE (offset S/2, which is 0 at S=1 — the 1x path is unchanged).
+                // The GPU resolve produces exactly this tap in a logical-sized target, so the
+                // readback moves S^2 fewer bytes; the CPU loop below is its exact fallback.
+                if (resolveColorToLogical(it->second.colorTex, w, h))
                 {
-                    int pr = (r * physRows) / rows;
-                    if (pr >= physRows) pr = physRows - 1;
-                    const uint32_t *srcRow = physPx.data() + static_cast<size_t>(pr) * physW;
-                    uint32_t *dstRow = out.data() + static_cast<size_t>(r) * w;
-                    for (int x = 0; x < w; ++x)
+                    g433DoReadPixels(m_f, glY, w, rows, out.data());
+                    m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, it->second.fbo);
+                }
+                else
+                {
+                    const int s = dc2GetNativeScale();
+                    const int c = dc2NativeSubPixelCentre();
+                    const int physGlY = glY * s;
+                    const int physRows = rows * s;
+                    const int physW = it->second.physW;
+                    std::vector<uint32_t> physPx(static_cast<size_t>(physW) * physRows);
+                    g433DoReadPixels(m_f, physGlY, physW, physRows, physPx.data());
+                    for (int r = 0; r < rows; ++r)
                     {
-                        int px = (x * physW) / w;
-                        if (px >= physW) px = physW - 1;
-                        dstRow[x] = srcRow[px];
+                        const uint32_t *srcRow = physPx.data() + static_cast<size_t>(r * s + c) * physW;
+                        uint32_t *dstRow = out.data() + static_cast<size_t>(r) * w;
+                        for (int x = 0; x < w; ++x)
+                            dstRow[x] = srcRow[x * s + c];
                     }
                 }
             }
@@ -6477,8 +6612,17 @@ void main()
             it->second.h != texH)
             return false;
         glBindTexture(GL_TEXTURE_2D, it->second.colorTex);
+        // G675: same GPU replicate as the uploadFb path, restricted to this row window. The FBO
+        // must be bound for the draw; the CPU expansion below is the exact fallback.
         if (it->second.physW != it->second.w || it->second.physH != it->second.h)
         {
+            m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, it->second.fbo);
+            if (upscaleLogicalToPhysical(in.data(), w, rows, glX, glY))
+                return g494GetError(kG494WColErr) == GL_NO_ERROR;
+        }
+        if (it->second.physW != it->second.w || it->second.physH != it->second.h)
+        {
+            glBindTexture(GL_TEXTURE_2D, it->second.colorTex);
             const float sx = static_cast<float>(it->second.physW) / static_cast<float>(it->second.w);
             const float sy = static_cast<float>(it->second.physH) / static_cast<float>(it->second.h);
             const int physGlX = static_cast<int>(std::round(glX * sx));
@@ -6508,6 +6652,274 @@ void main()
                             in.data());
         }
         return g494GetError(kG494WColErr) == GL_NO_ERROR;
+    }
+
+    // ===== G675: the physical -> logical colour RESOLVE ==========================================
+    //
+    // At scale S a target's colour attachment holds S^2 physical pixels per logical pixel, but
+    // guest VRAM only ever consumes ONE of them — the centre tap of the SxS block. Reading the
+    // whole physical surface back and decimating on the CPU therefore moves S^2 times the bytes it
+    // needs across the PCIe bus and then throws 1 - 1/S^2 of them away: at S=3 that is 9.4 MB per
+    // readback against the 1.05 MB the caller actually keeps, seven times a frame.
+    //
+    // ⭐ The resolve is EXACT, not an approximation, and that is the whole point: the shader
+    // performs the IDENTICAL tap (`texelFetch(src, p*S + C)`) the CPU loop performed, so the bytes
+    // handed to guest VRAM are bit-for-bit what the CPU path produced. It is a pure transport
+    // change. It also runs on the GPU, which G671 measured at ~95% idle.
+    //
+    // The destination is one grow-only logical-sized RGBA8 FBO — never routed through ensureFbo(),
+    // because ensureFbo() applies the scale by construction and this target must stay at 1x.
+    bool setupG675ResolveProgram()
+    {
+        if (m_g675ResolveProg != 0u)
+            return true;
+        if (m_g675ResolveFailed)
+            return false;
+        static const char *kVS =
+            "#version 330 core\n"
+            "void main(){\n"
+            "    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+            "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+            "}\n";
+        static const char *kFS =
+            "#version 330 core\n"
+            "out vec4 o;\n"
+            "uniform sampler2D uSrc;\n"
+            "uniform int uScale;\n"
+            "uniform int uCentre;\n"
+            "void main(){\n"
+            "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+            "    o = texelFetch(uSrc, p * uScale + ivec2(uCentre), 0);\n"
+            "}\n";
+        GLuint vs = 0u, fs = 0u;
+        std::string log;
+        if (!g158CompileShader(m_f, GL158_VERTEX_SHADER, kVS, vs, log))
+        {
+            std::fprintf(stderr, "[G675:resolve] FAIL: VS compile: %s\n", log.c_str());
+            m_g675ResolveFailed = true;
+            return false;
+        }
+        if (!g158CompileShader(m_f, GL158_FRAGMENT_SHADER, kFS, fs, log))
+        {
+            std::fprintf(stderr, "[G675:resolve] FAIL: FS compile: %s\n", log.c_str());
+            m_f.glDeleteShader_(vs);
+            m_g675ResolveFailed = true;
+            return false;
+        }
+        GLuint prog = m_f.glCreateProgram_();
+        m_f.glAttachShader_(prog, vs);
+        m_f.glAttachShader_(prog, fs);
+        m_f.glLinkProgram_(prog);
+        m_f.glDeleteShader_(vs);
+        m_f.glDeleteShader_(fs);
+        GLint ok = 0;
+        m_f.glGetProgramiv_(prog, GL158_LINK_STATUS, &ok);
+        if (!ok)
+        {
+            m_f.glDeleteProgram_(prog);
+            std::fprintf(stderr, "[G675:resolve] FAIL: link\n");
+            m_g675ResolveFailed = true;
+            return false;
+        }
+        m_g675ResolveProg = prog;
+        m_f.glUseProgram_(m_g675ResolveProg);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g675ResolveProg, "uSrc"), 0);
+        m_locG675ResolveScale = m_f.glGetUniformLocation_(m_g675ResolveProg, "uScale");
+        m_locG675ResolveCentre = m_f.glGetUniformLocation_(m_g675ResolveProg, "uCentre");
+        std::fprintf(stderr, "[G675:resolve] PASS: physical->logical colour resolve ready\n");
+        return true;
+    }
+
+    // Renders `srcTex` (physical, logW*S x logH*S) into the logical-sized resolve FBO and LEAVES
+    // that FBO bound, so the caller's glReadPixels(x, glY, w, rows) reads logical pixels directly.
+    // Returns false if anything is unavailable — every caller falls back to the CPU path, so this
+    // can never change a result, only where the decimation happens.
+    bool resolveColorToLogical(GLuint srcTex, int logW, int logH)
+    {
+        const int s = dc2GetNativeScale();
+        if (s <= 1 || srcTex == 0u || logW <= 0 || logH <= 0)
+            return false;
+        if (g675NoResolveOn())
+            return false;
+        if (!setupG675ResolveProgram())
+            return false;
+        if (m_g675ResolveFbo == 0u)
+        {
+            m_f.glGenFramebuffers_(1, &m_g675ResolveFbo);
+            if (m_g675ResolveFbo == 0u)
+                return false;
+        }
+        if (m_g675ResolveTex == 0u || m_g675ResolveW != logW || m_g675ResolveH != logH)
+        {
+            if (m_g675ResolveTex == 0u)
+                glGenTextures(1, &m_g675ResolveTex);
+            if (m_g675ResolveTex == 0u)
+                return false;
+            glBindTexture(GL_TEXTURE_2D, m_g675ResolveTex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, logW, logH, 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, nullptr);
+            m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g675ResolveFbo);
+            m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0,
+                                        GL_TEXTURE_2D, m_g675ResolveTex, 0);
+            if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) != GL158_FRAMEBUFFER_COMPLETE)
+            {
+                std::fprintf(stderr, "[G675:resolve] FAIL: FBO incomplete at %dx%d\n", logW, logH);
+                m_g675ResolveW = 0;
+                m_g675ResolveH = 0;
+                m_g675ResolveFailed = true;
+                return false;
+            }
+            m_g675ResolveW = logW;
+            m_g675ResolveH = logH;
+        }
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g675ResolveFbo);
+        glViewport(0, 0, logW, logH);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_BLEND);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        m_f.glUseProgram_(m_g675ResolveProg);
+        m_f.glUniform1i_(m_locG675ResolveScale, s);
+        m_f.glUniform1i_(m_locG675ResolveCentre, dc2NativeSubPixelCentre());
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, srcTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        m_f.glBindVertexArray_(m_vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        return true;
+    }
+
+    // ===== G675: the logical -> physical colour UPSCALE (the resolve's mirror) ===================
+    //
+    // Measured on `MAP-0` at S=3 with `[G415:stage]`: the framebuffer upload (`up`) is **15.6 ms/f**
+    // of a 65 ms frame — by far the largest scale-dependent term, and larger than the readback the
+    // resolve above addresses. The CPU path expanded a 512x512 logical image into a 1536x1536 host
+    // buffer with a nested replicate loop and then pushed 9.4 MB through glTexSubImage2D, nine
+    // times the bytes the guest actually supplied.
+    //
+    // ⭐ EXACT, again by construction: the CPU loop's source index was `(py * logH) / physH` i.e.
+    // `py / S` with integer division (and the same in x). `ivec2(gl_FragCoord.xy)` truncates to the
+    // fragment's integer coordinate, so `(coord - origin) / uScale` is the IDENTICAL index. Only
+    // the transport changes — 1x the bytes, and the replication happens on a GPU G671 measured at
+    // ~95% idle instead of on the pole thread.
+    bool setupG675UpscaleProgram()
+    {
+        if (m_g675UpProg != 0u)
+            return true;
+        if (m_g675UpFailed)
+            return false;
+        static const char *kVS =
+            "#version 330 core\n"
+            "void main(){\n"
+            "    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+            "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+            "}\n";
+        static const char *kFS =
+            "#version 330 core\n"
+            "out vec4 o;\n"
+            "uniform sampler2D uSrc;\n"
+            "uniform int uScale;\n"
+            "uniform int uOriginX;\n"
+            "uniform int uOriginY;\n"
+            "void main(){\n"
+            "    ivec2 p = (ivec2(gl_FragCoord.xy) - ivec2(uOriginX, uOriginY)) / uScale;\n"
+            "    o = texelFetch(uSrc, p, 0);\n"
+            "}\n";
+        GLuint vs = 0u, fs = 0u;
+        std::string log;
+        if (!g158CompileShader(m_f, GL158_VERTEX_SHADER, kVS, vs, log))
+        {
+            std::fprintf(stderr, "[G675:upscale] FAIL: VS compile: %s\n", log.c_str());
+            m_g675UpFailed = true;
+            return false;
+        }
+        if (!g158CompileShader(m_f, GL158_FRAGMENT_SHADER, kFS, fs, log))
+        {
+            std::fprintf(stderr, "[G675:upscale] FAIL: FS compile: %s\n", log.c_str());
+            m_f.glDeleteShader_(vs);
+            m_g675UpFailed = true;
+            return false;
+        }
+        const GLuint prog = m_f.glCreateProgram_();
+        m_f.glAttachShader_(prog, vs);
+        m_f.glAttachShader_(prog, fs);
+        m_f.glLinkProgram_(prog);
+        m_f.glDeleteShader_(vs);
+        m_f.glDeleteShader_(fs);
+        GLint linked = 0;
+        m_f.glGetProgramiv_(prog, GL158_LINK_STATUS, &linked);
+        if (!linked)
+        {
+            m_f.glDeleteProgram_(prog);
+            std::fprintf(stderr, "[G675:upscale] FAIL: link\n");
+            m_g675UpFailed = true;
+            return false;
+        }
+        m_g675UpProg = prog;
+        m_f.glUseProgram_(m_g675UpProg);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g675UpProg, "uSrc"), 0);
+        m_locG675UpScale = m_f.glGetUniformLocation_(m_g675UpProg, "uScale");
+        m_locG675UpOrigin = m_f.glGetUniformLocation_(m_g675UpProg, "uOriginX");
+        m_locG675UpOriginY = m_f.glGetUniformLocation_(m_g675UpProg, "uOriginY");
+        std::fprintf(stderr, "[G675:upscale] PASS: logical->physical colour upscale ready\n");
+        return true;
+    }
+
+    // Replicates `src` (logical, srcW x srcRows) into the already-bound physical FBO at logical
+    // GL-space offset (logX, logY). Returns false when unavailable; every caller keeps its CPU
+    // path, so this can only change transport, never a pixel.
+    bool upscaleLogicalToPhysical(const uint32_t *src, int srcW, int srcRows,
+                                  int logX, int logY)
+    {
+        const int s = dc2GetNativeScale();
+        if (s <= 1 || src == nullptr || srcW <= 0 || srcRows <= 0)
+            return false;
+        if (g675NoResolveOn())
+            return false;
+        if (!setupG675UpscaleProgram())
+            return false;
+        if (m_g675UpTex == 0u)
+        {
+            glGenTextures(1, &m_g675UpTex);
+            if (m_g675UpTex == 0u)
+                return false;
+            m_g675UpW = 0;
+            m_g675UpH = 0;
+        }
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, m_g675UpTex);
+        if (m_g675UpW != srcW || m_g675UpH != srcRows)
+        {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, srcW, srcRows, 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, src);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            m_g675UpW = srcW;
+            m_g675UpH = srcRows;
+        }
+        else
+        {
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, srcW, srcRows, GL_RGBA, GL_UNSIGNED_BYTE, src);
+        }
+        glViewport(logX * s, logY * s, srcW * s, srcRows * s);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_BLEND);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        m_f.glUseProgram_(m_g675UpProg);
+        m_f.glUniform1i_(m_locG675UpScale, s);
+        m_f.glUniform1i_(m_locG675UpOrigin, logX * s);
+        m_f.glUniform1i_(m_locG675UpOriginY, logY * s);
+        m_f.glBindVertexArray_(m_vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        return true;
     }
 
     // ===== G627: per-byte-lane masked patch of a resident CT32 target FBO =====
@@ -6683,7 +7095,9 @@ void main()
     }
 
     // Native High-Res Presentation Read: read active display FBO directly at its native physical resolution.
-    bool readDisplayFboOnWorker(uint32_t fbp, uint32_t fallbackFbp, uint32_t &outW, uint32_t &outH,
+    bool readDisplayFboOnWorker(uint32_t fbp, uint32_t fallbackFbp,
+                                int32_t rectX, int32_t rectY, int32_t rectW, int32_t rectH,
+                                uint32_t &outW, uint32_t &outH,
                                 std::vector<uint8_t> &outRgba)
     {
         dc2RenderEventCounter().store(0u, std::memory_order_relaxed);
@@ -6704,43 +7118,60 @@ void main()
             return false;
 
         const FboEntry &fbo = it->second;
-        const int srcW = fbo.physW > 0 ? fbo.physW : fbo.w;
-        const int srcH = fbo.physH > 0 ? fbo.physH : fbo.h;
-        if (srcW <= 0 || srcH <= 0)
+        const int logW = fbo.w > 0 ? fbo.w : 0;
+        const int logH = fbo.h > 0 ? fbo.h : 0;
+        const int srcW = fbo.physW > 0 ? fbo.physW : logW;
+        const int srcH = fbo.physH > 0 ? fbo.physH : logH;
+        if (srcW <= 0 || srcH <= 0 || logW <= 0 || logH <= 0)
             return false;
 
-        const int dispW = dc2IsNativeHighResActive()
-                              ? dc2GetNativePhysicalDisplayWidth() : srcW;
-        const int dispH = dc2IsNativeHighResActive()
-                              ? std::min(srcH, dc2GetNativePhysicalDisplayHeight()) : srcH;
+        // ⭐⭐ G675: PCRTC/DISPLAY CONVERSION IS NOT A RESOLUTION STAGE, AND IT IS NOT A CROP-FREE
+        // STAGE EITHER.
+        //
+        // What this publishes is the PCRTC READ RECTANGLE — DISPFB's DBX/DBY origin and DISPLAY's
+        // DW/DH extent — taken to physical density, i.e. EXACTLY the logical rect the 1x VRAM
+        // path copies (512 x 415 on DC2), times S. Two bugs are fixed at once:
+        //   * it used to resample to `dc2GetNativePhysicalDisplayWidth()` (a 640-derived number)
+        //     while the display SURFACE is 512 logical wide — so the presentation stage, not the
+        //     raster, decided the delivered width, at the wrong ratio;
+        //   * it used to publish the WHOLE surface (512 x 512 logical), so the ~97 rows below the
+        //     display rectangle — scratch, not display — were presented and then squashed into
+        //     the 4:3 output, which is a vertical offset/stretch present at no other resolution.
+        // Any fit into the host window happens later, in the presentation blit, where it belongs.
+        const int s = dc2GetNativeScale();
+        int cropX = 0, cropY = 0, cropW = logW, cropH = logH;
+        if (rectW > 0 && rectH > 0)
+        {
+            cropX = std::max(0, std::min(rectX, logW - 1));
+            cropY = std::max(0, std::min(rectY, logH - 1));
+            cropW = std::max(1, std::min(rectW, logW - cropX));
+            cropH = std::max(1, std::min(rectH, logH - cropY));
+        }
 
-        outW = static_cast<uint32_t>(dispW);
-        outH = static_cast<uint32_t>(dispH);
-        outRgba.resize(static_cast<size_t>(dispW) * dispH * 4u);
+        // GS is top-origin, GL is bottom-origin. Logical GS row r occupies physical GL rows
+        // [physH - S*(r+1), physH - S*r), so the rect's GL base row is physH - S*(cropY + cropH).
+        const int physX = cropX * s;
+        const int physW = cropW * s;
+        const int physRows = cropH * s;
+        const int physGlY = srcH - s * (cropY + cropH);
+        if (physX < 0 || physGlY < 0 || physX + physW > srcW || physGlY + physRows > srcH)
+            return false;
+
+        outW = static_cast<uint32_t>(physW);
+        outH = static_cast<uint32_t>(physRows);
+        outRgba.resize(static_cast<size_t>(physW) * physRows * 4u);
 
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, fbo.fbo);
         glDisable(GL_SCISSOR_TEST);
-        std::vector<uint32_t> glPixels(static_cast<size_t>(srcW) * srcH);
-        glReadPixels(0, 0, srcW, srcH, GL_RGBA, GL_UNSIGNED_BYTE, glPixels.data());
+        std::vector<uint32_t> glPixels(static_cast<size_t>(physW) * physRows);
+        glReadPixels(physX, physGlY, physW, physRows, GL_RGBA, GL_UNSIGNED_BYTE, glPixels.data());
 
         // GL is bottom-origin, convert to top-origin presentation scanlines
-        for (int y = 0; y < dispH; ++y)
+        for (int y = 0; y < physRows; ++y)
         {
-            const int glY = srcH - 1 - (dc2IsNativeHighResActive() ? y : (y * srcH) / dispH);
-            const uint32_t *srcRow = glPixels.data() + static_cast<size_t>(glY) * srcW;
-            uint32_t *dstRow = reinterpret_cast<uint32_t *>(outRgba.data() + static_cast<size_t>(y) * dispW * 4u);
-            if (dispW == srcW)
-            {
-                std::memcpy(dstRow, srcRow, static_cast<size_t>(dispW) * 4u);
-            }
-            else
-            {
-                for (int x = 0; x < dispW; ++x)
-                {
-                    const int srcX = (x * srcW) / dispW;
-                    dstRow[x] = srcRow[srcX];
-                }
-            }
+            const uint32_t *srcRow = glPixels.data() + static_cast<size_t>(physRows - 1 - y) * physW;
+            uint32_t *dstRow = reinterpret_cast<uint32_t *>(outRgba.data() + static_cast<size_t>(y) * physW * 4u);
+            std::memcpy(dstRow, srcRow, static_cast<size_t>(physW) * 4u);
         }
         return true;
     }
@@ -6774,8 +7205,10 @@ void main()
                 sx > src.w - w || sy > src.h - h || dx > dst.w - w || dy > dst.h - h)
                 return false;
         }
+        // G675: gated behind DC2_NATIVE_RES_DIAG. It was unconditional, so a shipped run paid a
+        // static-counter load and branch on every local-to-local copy for a trace nobody reads.
         static uint32_t s_l2lDiagPrints = 0u;
-        if (s_l2lDiagPrints++ < 2u)
+        if (dc2NativeResDiagOn() && s_l2lDiagPrints++ < 2u)
         {
             std::fprintf(stderr, "\n========== [DC2 RESOLUTION DIAGNOSTIC (FRAMEBUFFER COPY)] ==========\n");
             std::fprintf(stderr, "Logical source target      = 0x%03x (w=%d, h=%d)\n", srcFbp, src.w, src.h);
@@ -6981,8 +7414,7 @@ void main()
         glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
         m_f.glUseProgram_(m_g309Prog);
         if (m_locG309FbScale >= 0)
-            m_e.glUniform2f_(m_locG309FbScale, dc2IsNativeHighResActive() ? dc2GetNativeScaleX() : 1.0f,
-                                               dc2IsNativeHighResActive() ? dc2GetNativeScaleY() : 1.0f);
+            m_e.glUniform2f_(m_locG309FbScale, dc2GetNativeScaleX(), dc2GetNativeScaleY());
         m_f.glBindVertexArray_(m_vao);
         for (uint32_t t = 0u; t < kG309SourceCount; ++t)
         {
@@ -7001,20 +7433,19 @@ void main()
             glBindTexture(GL_TEXTURE_2D, out.colorTex);
             if (out.physW > 0 && (out.physW != 512 || out.physH != 512))
             {
+                // G675: exact SxS block decimation, centre tap — same rule as every other
+                // physical->logical publication path.
+                const int s = dc2GetNativeScale();
+                const int c = dc2NativeSubPixelCentre();
                 std::vector<uint32_t> physPx(static_cast<size_t>(out.physW) * out.physH);
                 glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, physPx.data());
                 for (int y = 0; y < 512; ++y)
                 {
-                    int py = (y * out.physH) / 512;
-                    if (py >= out.physH) py = out.physH - 1;
-                    const uint32_t *srcRow = physPx.data() + static_cast<size_t>(py) * out.physW;
+                    const uint32_t *srcRow =
+                        physPx.data() + static_cast<size_t>(y * s + c) * out.physW;
                     uint32_t *dstRow = readback->data() + static_cast<size_t>(y) * 512;
                     for (int x = 0; x < 512; ++x)
-                    {
-                        int px = (x * out.physW) / 512;
-                        if (px >= out.physW) px = out.physW - 1;
-                        dstRow[x] = srcRow[px];
-                    }
+                        dstRow[x] = srcRow[x * s + c];
                 }
             }
             else
@@ -7200,8 +7631,7 @@ void main()
         m_f.glUseProgram_(m_g281Prog);
         if (m_locG281FbScale >= 0)
             m_e.glUniform2f_(m_locG281FbScale,
-                             dc2IsNativeHighResActive() ? dc2GetNativeScaleX() : 1.0f,
-                             dc2IsNativeHighResActive() ? dc2GetNativeScaleY() : 1.0f);
+                             dc2GetNativeScaleX(), dc2GetNativeScaleY());
         m_f.glBindVertexArray_(m_vao);
         m_f.glActiveTexture_(GL158_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, src.colorTex);
@@ -7285,24 +7715,23 @@ void main()
         }
         if (it->second.physW != w || it->second.physH != h)
         {
-            const float sy = static_cast<float>(it->second.physH) / static_cast<float>(h);
-            const int physDepthY = static_cast<int>(std::round(depthY * sy));
-            const int physDepthRows = std::max(1, static_cast<int>(std::round(depthRows * sy)));
+            // G675: exact SxS block decimation, centre tap (see readColorOnWorker). Depth uses
+            // the SAME representative sub-pixel as colour, so a logical pixel's colour and its Z
+            // always come from the same physical fragment — mixing taps here would publish a
+            // colour/Z pair that never existed at any point on the surface.
+            const int s = dc2GetNativeScale();
+            const int c = dc2NativeSubPixelCentre();
+            const int physDepthY = depthY * s;
+            const int physDepthRows = depthRows * s;
             const int physW = it->second.physW;
             std::vector<float> physDepth(static_cast<size_t>(physW) * physDepthRows);
             glReadPixels(0, physDepthY, physW, physDepthRows, GL_DEPTH_COMPONENT, GL_FLOAT, physDepth.data());
             for (int r = 0; r < depthRows; ++r)
             {
-                int pr = (r * physDepthRows) / depthRows;
-                if (pr >= physDepthRows) pr = physDepthRows - 1;
-                const float *srcRow = physDepth.data() + static_cast<size_t>(pr) * physW;
+                const float *srcRow = physDepth.data() + static_cast<size_t>(r * s + c) * physW;
                 float *dstRow = out.data() + static_cast<size_t>(r) * w;
                 for (int x = 0; x < w; ++x)
-                {
-                    int px = (x * physW) / w;
-                    if (px >= physW) px = physW - 1;
-                    dstRow[x] = srcRow[px];
-                }
+                    dstRow[x] = srcRow[x * s + c];
             }
         }
         else
@@ -7739,8 +8168,15 @@ void main()
         glViewport(0, 0, viewportW, viewportH);
         g415Note(); // 2: FBO ensure/bind
 
+        // ⭐ G675: the logical->physical trace for this batch (target sizes, scissor mapping, the
+        // first triangle's GS -> logical -> NDC -> host-raster-pixel chain). Gated behind
+        // DC2_NATIVE_RES_DIAG: it used to run its two `static uint32_t` counters and the
+        // `is3dWorldBatch` classification on EVERY batch of every shipped run (Rule 12c), and it
+        // is the instrument that proves the mapping, so it must not perturb what it measures.
         static uint32_t s_3dScenePrints = 0u;
         static uint32_t s_dispScenePrints = 0u;
+        if (dc2NativeResDiagOn())
+        {
         const bool is3dWorldBatch = (b.fbp == 0x139u || (b.verts.size() > 50u && !b.draws.empty() && (b.draws[0].depthFunc & 0x0Fu) != 0));
         const bool isDispBatch = (b.fbp == 0x068u || b.fbp == 0x000u);
         if ((is3dWorldBatch && s_3dScenePrints++ < 2u) || (isDispBatch && s_dispScenePrints++ < 2u))
@@ -7811,15 +8247,31 @@ void main()
                              di, dr.vtxCount, static_cast<unsigned long long>(dr.texKey), dr.srcFbp, dr.blend,
                              dr.depthFunc & 0x0Fu, dr.depthWrite, dr.scX0, dr.scY0, dr.scX1, dr.scY1, minX, minY, maxX, maxY);
             }
+            std::fprintf(stderr, "Native render scale S       = %d (phys/log = %d/%d = %.4f x, %d/%d = %.4f y)\n",
+                         dc2GetNativeScale(),
+                         viewportW, b.fbW, static_cast<double>(viewportW) / static_cast<double>(b.fbW),
+                         viewportH, b.fbH, static_cast<double>(viewportH) / static_cast<double>(b.fbH));
             std::fprintf(stderr, "=======================================================================\n\n");
             std::fflush(stderr);
+        }
         }
 
         const int g417UploadRowsThis = b.uploadFb ? b.fbH : 0;
         if (b.uploadFb && dc2ShouldExecuteRenderEvent("uploadFb", b.fbp, 0, 0, 0, 0, static_cast<float>(b.fbW), static_cast<float>(b.fbH), 0, 0, 0, 0, 0))
         {
             glBindTexture(GL_TEXTURE_2D, fbo.colorTex);
-            if (fbo.physW != b.fbW || fbo.physH != b.fbH)
+            // ⭐ G675: at scale, replicate on the GPU instead of expanding to S^2 on the CPU and
+            // pushing S^2 bytes. `[G415:stage]` measured the CPU form at 15.6 ms/f on MAP-0 at
+            // S=3, the largest scale-dependent term in the whole backend. Exact — same integer
+            // source index. The CPU expansion below stays as the fallback.
+            if ((fbo.physW != b.fbW || fbo.physH != b.fbH) &&
+                upscaleLogicalToPhysical(b.fbPixels.data(), b.fbW, b.fbH, 0, 0))
+            {
+                // The FBO is already bound; the upscale left the viewport at the full physical
+                // target, which is what the draw loop below wants anyway.
+                glViewport(0, 0, viewportW, viewportH);
+            }
+            else if (fbo.physW != b.fbW || fbo.physH != b.fbH)
             {
                 std::vector<uint32_t> scaledUpload(static_cast<size_t>(fbo.physW) * fbo.physH);
                 for (int py = 0; py < fbo.physH; ++py)
@@ -7966,6 +8418,7 @@ void main()
         const bool g256Exact = g256ExactRttOn() && m_progExact != 0u &&
             (b.fbp == 0x139u || b.fbp == 0x13cu || b.fbp == 0x143u ||
              b.fbp == 0x146u || b.fbp == 0x155u) && !guestDepth;
+#if defined(PS2X_G684_LEGACY_G560_RUNS)
         const bool g561TextureRuns = g561TextureRunsRequested() && m_g560Available && !g256Exact;
         const bool g570UntexturedRuns =
             g570UntexturedRunsRequested() && m_g560Available && !g256Exact;
@@ -8031,10 +8484,13 @@ void main()
             {
                 const uint32_t state0 = packMode(d) | (static_cast<uint32_t>(d.blend & 7u) << 16u);
                 const uint32_t state1 = d.fogCol & 0x00FFFFFFu;
+                // G679: bits [31:20] carry the axis' exact-lattice period; they were unused.
                 const uint32_t state2 = static_cast<uint32_t>(d.uvOriginX) |
-                                        (static_cast<uint32_t>(d.uvRoundU & 15u) << 16u);
+                                        (static_cast<uint32_t>(d.uvRoundU & 15u) << 16u) |
+                                        (static_cast<uint32_t>(d.uvPeriodU & 4095u) << 20u);
                 const uint32_t state3 = static_cast<uint32_t>(d.uvOriginY) |
-                                        (static_cast<uint32_t>(d.uvRoundV & 15u) << 16u);
+                                        (static_cast<uint32_t>(d.uvRoundV & 15u) << 16u) |
+                                        (static_cast<uint32_t>(d.uvPeriodV & 4095u) << 20u);
                 for (int v = 0; v < d.vtxCount; ++v)
                 {
                     G178Vtx &out = b.verts[static_cast<size_t>(d.firstVtx + v)];
@@ -8045,6 +8501,11 @@ void main()
                 }
             }
         }
+#else
+        constexpr bool g561TextureRuns = false;
+        constexpr bool g570UntexturedRuns = false;
+        constexpr bool g560MultiDraw = false;
+#endif
 
         m_f.glUseProgram_(g560MultiDraw ? m_progG560 : m_prog);
         m_f.glBindVertexArray_(m_vao);
@@ -8065,8 +8526,10 @@ void main()
         const GLint locUvRoundV = g560MultiDraw ? m_locG560UvRoundV : m_locUvRoundV;
         m_e.glUniform2f_(locFbSize, static_cast<GLfloat>(b.fbW), static_cast<GLfloat>(b.fbH));
         if (locFbScale >= 0)
-            m_e.glUniform2f_(locFbScale, dc2IsNativeHighResActive() ? dc2GetNativeScaleX() : 1.0f,
-                                         dc2IsNativeHighResActive() ? dc2GetNativeScaleY() : 1.0f);
+            // G675: scaleX == scaleY == S, and S == 1 when high-res is off, so the old
+            // `active ? scale : 1.0f` ternaries were a branch that could only ever pick the same
+            // value the accessor already returns.
+            m_e.glUniform2f_(locFbScale, dc2GetNativeScaleX(), dc2GetNativeScaleY());
         m_f.glActiveTexture_(GL158_TEXTURE0);
         glEnable(GL_SCISSOR_TEST);
         const bool g257RealDiagnostic = g256Exact && g257ImageStoreTestOn() &&
@@ -8413,6 +8876,40 @@ void main()
                 }
                 continue;
             }
+            // ⭐ G675: the screen-space-sprite pair. Both are the identity on every other draw and
+            // in every default 1x / native-aspect run, so this is two cached float compares.
+            // ⛔ Scoped to the legacy (shipped) program for the same reason G661 P9 below is: the
+            // G560 multi-draw build carries per-primitive state through gl_DrawID and does not
+            // declare these uniforms. G560 is default-OFF (`DC2_G560_MULTI_DRAW` opt-in).
+            if (!g560MultiDraw && m_locG675Sprite >= 0)
+            {
+                const bool g675Sprite = (d.screenSprite != 0u);
+                const float g675XScale = g675Sprite ? dc2GetSpriteScaleX() : 1.0f;
+                // ⛔⛔ THE SNAP IS ONLY VALID WHEN THE SPRITE IS MAGNIFIED OR 1:1 (S*k >= 1).
+                //
+                // Its premise is "several fragments share one source texel, so make them agree".
+                // Under MINIFICATION (S*k < 1) the opposite holds — there are fewer fragments than
+                // source texels — and quantising the coordinate to the pre-scale pixel grid then
+                // DISCARDS the texel the fragment should have read. On a paletted (PSMT8) pattern
+                // the substitute texel is an unrelated CLUT entry, i.e. an arbitrary colour.
+                // MEASURED: dungeon1's ground caustics are a 5x5 grid of 128x128 PSMT8 tiles at
+                // tbp=0x2f20 covering (-96,-96)..(384,384). At S=1 + 16:9 (S*k = 0.75) they turned
+                // into rainbow blocks; the position scaling was innocent — an arm with the scale on
+                // and the FOV off still showed it, and an arm with the scale off did not
+                // (neighbour-chroma-jump 3.83 reference / 6.48 scale-only / 3.83 FOV-only).
+                // At S=2 + 16:9, S*k = 1.5 >= 1 and the snap is both needed and correct.
+                const float g675S = static_cast<float>(dc2GetNativeScale());
+                const bool g675NeedSnap =
+                    g675Sprite && (g675S * g675XScale >= 1.0f) &&
+                    (dc2GetNativeScale() > 1 || g675XScale != 1.0f);
+                const float g675Snap = g675NeedSnap ? g675S : 0.0f;
+                if (m_g675SnapCur != g675Snap || m_g675XScaleCur != g675XScale)
+                {
+                    m_e.glUniform2f_(m_locG675Sprite, g675Snap, g675XScale);
+                    m_g675SnapCur = g675Snap;
+                    m_g675XScaleCur = g675XScale;
+                }
+            }
             // G661 P9: does THIS draw take the exact destination-floor blend path? Scoped to the
             // legacy (shipped) program: the G560 dual-source build masks uMode to 16 bits and
             // supplies its own per-primitive factors, so bit 20 would be invisible there and its
@@ -8561,14 +9058,8 @@ void main()
                     // G496b: the BIND is cached; the four sampler params are NOT. An FboEntry
                     // colour texture is re-parameterised by the T8, CT24, composite-source and
                     // spare-swap paths, so a per-object record here could go stale.
-                    if (realSrcFbp == 0x139u)
-                    {
-                        static uint32_t s_dc2_139_sample_count = 0u;
-                        if (s_dc2_139_sample_count < 16u)
-                            std::fprintf(stderr, "[DC2_139_SAMPLE] n=%u batchFbp=0x%03x draw=%zu srcFbo=%u srcTex=%u blend=%u verts=%d\n",
-                                         s_dc2_139_sample_count, b.fbp, drawIndex, src.fbo, src.colorTex, d.blend, d.vtxCount);
-                        ++s_dc2_139_sample_count;
-                    }
+                    // G675: removed an ungated `[DC2_139_SAMPLE]` trace that ran a static counter
+                    // and a branch on EVERY producer-surface draw in the hot loop (Rule 12c).
                     g496BindTex(src.colorTex, g496GlCache);
                     const GLint filter = d.bilinear ? GL_LINEAR : GL_NEAREST;
                     const bool ownerSource = g289SourceIsOwner(d.srcFbp);
@@ -8769,10 +9260,15 @@ void main()
                               static_cast<int>(d.uvOriginX), g496GlCache);
                 g496Uniform1i(g496Uni, kG496UOriginY, locUvOriginY,
                               static_cast<int>(d.uvOriginY), g496GlCache);
+                // G679: flags in [3:0], exact-lattice period in [19:8]. Packed into the existing
+                // uniform rather than adding one, so the state-call census and its elision cache
+                // are untouched.
                 g496Uniform1i(g496Uni, kG496URoundU, locUvRoundU,
-                              static_cast<int>(d.uvRoundU), g496GlCache);
+                              static_cast<int>(d.uvRoundU) |
+                                  (static_cast<int>(d.uvPeriodU & 4095u) << 8), g496GlCache);
                 g496Uniform1i(g496Uni, kG496URoundV, locUvRoundV,
-                              static_cast<int>(d.uvRoundV), g496GlCache);
+                              static_cast<int>(d.uvRoundV) |
+                                  (static_cast<int>(d.uvPeriodV & 4095u) << 8), g496GlCache);
             }
             float minX = 1e6f, minY = 1e6f, maxX = -1e6f, maxY = -1e6f;
             for (int vi = 0; vi < d.vtxCount; ++vi)
@@ -8783,18 +9279,18 @@ void main()
                 maxX = std::max(maxX, vx.x);
                 maxY = std::max(maxY, vx.y);
             }
-            if (dc2IsNativeHighResActive() && b.fbp == 0x139u && d.blend == 0u && (d.depthFunc & 0x0Fu) == 0u && d.texKey == 0u && d.srcFbp == 0u)
-            {
-                static uint32_t s_dc2_139_clear_count = 0u;
-                if (s_dc2_139_clear_count < 16u)
-                    std::fprintf(stderr, "[DC2_139_CLEAR] n=%u draw=%d verts=%d bounds=(%.0f,%.0f..%.0f,%.0f) physW=%d physH=%d\n",
-                                 s_dc2_139_clear_count, drawIndex, d.vtxCount, minX, minY, maxX, maxY, fbo.physW, fbo.physH);
-                ++s_dc2_139_clear_count;
-                glDisable(GL_SCISSOR_TEST);
-                glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
-                glClear(GL_COLOR_BUFFER_BIT);
-                glEnable(GL_SCISSOR_TEST);
-            }
+            // ⛔⛔ G675 REMOVED — THIS WAS THE HIGH-RES-ONLY CORRUPTION.
+            //
+            // A `dc2IsNativeHighResActive() && fbp == 0x139 && blend==0 && ztst==0 && !tex &&
+            // !srcFbp` draw used to take a SCISSOR-DISABLED, FULL-TARGET
+            // `glClear(GL_COLOR_BUFFER_BIT)` here — and then fall through and issue the draw as
+            // well. It fired ONLY above 1x, mid-batch, on the 3D world target, so every draw
+            // already emitted into that target in this batch was wiped: black rectangles and
+            // missing geometry that exist at no other resolution. There is nothing for it to fix
+            // either — an untextured full-target quad rasterizes over the whole physical viewport
+            // by construction, because the vertex shader maps LOGICAL coordinates onto a
+            // PHYSICAL viewport. The clear was a symptom patch for the scale mismatches this
+            // phase removed at the source (PS2_PROJECT_STATE.md rule 1: no per-screen fixes).
             const bool execDraw = dc2ShouldExecuteRenderEvent("draw", b.fbp, d.texKey, d.srcFbp, minX, minY, maxX, maxY, d.vtxCount, d.blend, d.depthFunc & 0x0Fu, d.depthWrite, mode);
             if (execDraw)
             {
@@ -9013,25 +9509,44 @@ void main()
             }
             if (fbo.physW > 0 && (fbo.physW != b.fbW || fbo.physH != b.fbH))
             {
-                const float sy = static_cast<float>(fbo.physH) / static_cast<float>(b.fbH);
-                if (narrow)
+                // G675: exact SxS block decimation, centre tap (identical rule to
+                // readColorOnWorker / readDepthOnWorker — one representative sub-pixel per
+                // logical pixel, chosen the same way everywhere so no two publication paths
+                // disagree about what a logical pixel's value is). The GPU resolve computes that
+                // same tap into a logical-sized target first, so the readback carries S^2 fewer
+                // bytes; the CPU loops below are its exact fallback.
+                const int s = dc2GetNativeScale();
+                const int c = dc2NativeSubPixelCentre();
+                const bool g675Resolved = resolveColorToLogical(fbo.colorTex, b.fbW, b.fbH);
+                if (g675Resolved)
                 {
-                    const int physY = static_cast<int>(std::round(narrowY * sy));
-                    const int physRows = std::max(1, static_cast<int>(std::round(narrowRows * sy)));
+                    if (narrow)
+                    {
+                        glReadPixels(0, narrowY, b.fbW, narrowRows, GL_RGBA, GL_UNSIGNED_BYTE,
+                                     b.readback.data() + static_cast<size_t>(narrowY) * b.fbW);
+                        g415ReadRows = narrowRows;
+                    }
+                    else
+                    {
+                        glReadPixels(0, 0, b.fbW, b.fbH, GL_RGBA, GL_UNSIGNED_BYTE,
+                                     b.readback.data());
+                        g415ReadRows = b.fbH;
+                    }
+                    m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, fbo.fbo);
+                }
+                else if (narrow)
+                {
+                    const int physY = narrowY * s;
+                    const int physRows = narrowRows * s;
                     std::vector<uint32_t> physPx(static_cast<size_t>(fbo.physW) * physRows);
                     glReadPixels(0, physY, fbo.physW, physRows, GL_RGBA, GL_UNSIGNED_BYTE, physPx.data());
                     for (int r = 0; r < narrowRows; ++r)
                     {
-                        int pr = (r * physRows) / narrowRows;
-                        if (pr >= physRows) pr = physRows - 1;
-                        const uint32_t *srcRow = physPx.data() + static_cast<size_t>(pr) * fbo.physW;
+                        const uint32_t *srcRow =
+                            physPx.data() + static_cast<size_t>(r * s + c) * fbo.physW;
                         uint32_t *dstRow = b.readback.data() + static_cast<size_t>(narrowY + r) * b.fbW;
                         for (int x = 0; x < b.fbW; ++x)
-                        {
-                            int px = (x * fbo.physW) / b.fbW;
-                            if (px >= fbo.physW) px = fbo.physW - 1;
-                            dstRow[x] = srcRow[px];
-                        }
+                            dstRow[x] = srcRow[x * s + c];
                     }
                     g415ReadRows = narrowRows;
                 }
@@ -9041,16 +9556,11 @@ void main()
                     glReadPixels(0, 0, fbo.physW, fbo.physH, GL_RGBA, GL_UNSIGNED_BYTE, physPx.data());
                     for (int r = 0; r < b.fbH; ++r)
                     {
-                        int pr = (r * fbo.physH) / b.fbH;
-                        if (pr >= fbo.physH) pr = fbo.physH - 1;
-                        const uint32_t *srcRow = physPx.data() + static_cast<size_t>(pr) * fbo.physW;
+                        const uint32_t *srcRow =
+                            physPx.data() + static_cast<size_t>(r * s + c) * fbo.physW;
                         uint32_t *dstRow = b.readback.data() + static_cast<size_t>(r) * b.fbW;
                         for (int x = 0; x < b.fbW; ++x)
-                        {
-                            int px = (x * fbo.physW) / b.fbW;
-                            if (px >= fbo.physW) px = fbo.physW - 1;
-                            dstRow[x] = srcRow[px];
-                        }
+                            dstRow[x] = srcRow[x * s + c];
                     }
                     g415ReadRows = b.fbH;
                 }
@@ -9329,8 +9839,25 @@ void main()
     GLint m_locG627Origin = -1, m_locG627Scale = -1, m_locG627Lane = -1;
     int m_g627TexW = -1, m_g627TexH = -1;
     bool m_g627ProgFailed = false;
+    // G675: the physical->logical colour RESOLVE. One grow-only logical-sized FBO plus a shader
+    // that performs EXACTLY the centre tap the CPU decimation performs, so glReadPixels moves
+    // S^2 fewer bytes across the bus for a bit-identical result. See resolveColorToLogical().
+    GLuint m_g675ResolveProg = 0, m_g675ResolveFbo = 0, m_g675ResolveTex = 0;
+    GLint m_locG675ResolveScale = -1, m_locG675ResolveCentre = -1;
+    int m_g675ResolveW = 0, m_g675ResolveH = 0;
+    bool m_g675ResolveFailed = false;
+    // G675: the logical->physical colour UPSCALE (the resolve's mirror). One grow-only staging
+    // texture at LOGICAL size plus a replicating shader. See upscaleLogicalToPhysical().
+    GLuint m_g675UpProg = 0, m_g675UpTex = 0;
+    GLint m_locG675UpScale = -1, m_locG675UpOrigin = -1, m_locG675UpOriginY = -1;
+    int m_g675UpW = 0, m_g675UpH = 0;
+    bool m_g675UpFailed = false;
     GLuint m_g309MapTex = 0, m_g309BaseTex = 0;
     GLint m_locFbSize = -1, m_locFbScale = -1, m_locMode = -1, m_locLinear = -1, m_locFogCol = -1;
+    // G675: the screen-space-sprite pair — logical-pixel-centre UV snap (FS) and the widescreen
+    // centre X scale (VS). Both are 1.0/off on every draw that is not a screen-space sprite.
+    GLint m_locG675Sprite = -1;
+    float m_g675SnapCur = 0.0f, m_g675XScaleCur = 1.0f;
     GLint m_locWrapU = -1, m_locWrapV = -1;
     GLint m_locG560FbSize = -1, m_locG560FbScale = -1, m_locG560Mode = -1, m_locG560Linear = -1;
     GLint m_locG560FogCol = -1, m_locG560WrapU = -1, m_locG560WrapV = -1;

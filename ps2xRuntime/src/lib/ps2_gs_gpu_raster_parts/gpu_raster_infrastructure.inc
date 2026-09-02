@@ -46,140 +46,18 @@ bool g158EnvFlag(const char *name)
            std::strcmp(value, "OFF") != 0;
 }
 
-struct DC2NativeRenderConfig
+// G675: the logical<->physical resolution mapping now has ONE definition for all four
+// TUs that need it. See that file for the integer-scale law it enforces.
+#include "../ps2_native_res.inc"
+
+// G675: rollback for the GPU-side physical->logical colour resolve. The resolve performs the
+// IDENTICAL centre tap the CPU decimation performs, so setting this changes only WHERE the
+// decimation runs and how many bytes cross the bus — never a pixel. Default ON above 1x; inert
+// at S=1, where there is nothing to resolve.
+inline bool g675NoResolveOn()
 {
-    bool isConfigured = false;
-    bool isNativeHighRes = false;
-    bool isFullscreen = false;
-    int requestedWidth = 0;
-    int requestedHeight = 0;
-    float scaleX = 1.0f;
-    float scaleY = 1.0f;
-};
-
-inline DC2NativeRenderConfig &getDC2NativeRenderConfig()
-{
-    static DC2NativeRenderConfig s_config = []()
-    {
-        DC2NativeRenderConfig cfg{};
-        const char *wEnv = std::getenv("DC2_RESOLUTION_WIDTH");
-        const char *hEnv = std::getenv("DC2_RESOLUTION_HEIGHT");
-        const char *fsEnv = std::getenv("DC2_FULLSCREEN");
-
-        int w = 0, h = 0;
-        if (wEnv && wEnv[0] != '\0')
-            w = std::atoi(wEnv);
-        if (hEnv && hEnv[0] != '\0')
-            h = std::atoi(hEnv);
-
-        cfg.isFullscreen = (fsEnv && fsEnv[0] != '\0' && std::strcmp(fsEnv, "0") != 0);
-
-        if (w > 0 && h > 0 && (w != 512 || h != 448) && (w != 640 || h != 448))
-        {
-            cfg.requestedWidth = w;
-            cfg.requestedHeight = h;
-            cfg.scaleX = static_cast<float>(w) / 640.0f;
-            cfg.scaleY = static_cast<float>(h) / 448.0f;
-            cfg.isNativeHighRes = true;
-        }
-        else if (w > 0 && h > 0)
-        {
-            cfg.requestedWidth = w;
-            cfg.requestedHeight = h;
-            cfg.scaleX = 1.0f;
-            cfg.scaleY = 1.0f;
-            cfg.isNativeHighRes = false;
-        }
-        else
-        {
-            cfg.requestedWidth = 640;
-            cfg.requestedHeight = 448;
-            cfg.scaleX = 1.0f;
-            cfg.scaleY = 1.0f;
-            cfg.isNativeHighRes = false;
-        }
-        cfg.isConfigured = true;
-        return cfg;
-    }();
-    return s_config;
-}
-
-inline bool dc2IsNativeHighResActive()
-{
-    return getDC2NativeRenderConfig().isNativeHighRes;
-}
-
-inline float dc2GetNativeScaleX()
-{
-    return getDC2NativeRenderConfig().scaleX;
-}
-
-inline float dc2GetNativeScaleY()
-{
-    return getDC2NativeRenderConfig().scaleY;
-}
-
-inline int dc2GetNativePhysicalWidth(int logicalW)
-{
-    if (!dc2IsNativeHighResActive() || logicalW <= 0)
-        return logicalW;
-    if (logicalW == 512 || logicalW == 640)
-        return getDC2NativeRenderConfig().requestedWidth;
-    return std::max(1, static_cast<int>(std::round(static_cast<float>(logicalW) * dc2GetNativeScaleX())));
-}
-
-inline int dc2GetNativePhysicalHeight(int logicalH)
-{
-    if (!dc2IsNativeHighResActive() || logicalH <= 0)
-        return logicalH;
-    if (logicalH == 415 || logicalH == 416 || logicalH == 448)
-        return getDC2NativeRenderConfig().requestedHeight;
-    return std::max(1, static_cast<int>(std::round(static_cast<float>(logicalH) * dc2GetNativeScaleY())));
-}
-
-inline int dc2GetNativePhysicalDisplayWidth()
-{
-    if (!dc2IsNativeHighResActive())
-        return 640;
-    return getDC2NativeRenderConfig().requestedWidth;
-}
-
-inline int dc2GetNativePhysicalDisplayHeight()
-{
-    if (!dc2IsNativeHighResActive())
-        return 448;
-    return getDC2NativeRenderConfig().requestedHeight;
-}
-
-inline int dc2GetNativePhysicalDisplayStorageHeight()
-{
-    if (!dc2IsNativeHighResActive())
-        return 448;
-    return getDC2NativeRenderConfig().requestedHeight;
-}
-
-inline bool dc2NativeResDiagOn()
-{
-    static const bool s_diag = (std::getenv("DC2_NATIVE_RES_DIAG") != nullptr);
-    return s_diag;
-}
-
-inline bool dc2NativeMainOnlyOn()
-{
-    static const bool s_mainOnly = (std::getenv("DC2_NATIVE_MAIN_ONLY") != nullptr);
-    return s_mainOnly;
-}
-
-inline bool dc2NativeDisableRttOn()
-{
-    static const bool s_noRtt = (std::getenv("DC2_NATIVE_DISABLE_RTT") != nullptr);
-    return s_noRtt;
-}
-
-inline bool dc2NativeDisableFbCopyScaleOn()
-{
-    static const bool s_noFbCopy = (std::getenv("DC2_NATIVE_DISABLE_FB_COPY_SCALE") != nullptr);
-    return s_noFbCopy;
+    static const bool s_off = (std::getenv("DC2_G675_NO_RESOLVE") != nullptr);
+    return s_off;
 }
 
 inline int dc2DrawLimit()

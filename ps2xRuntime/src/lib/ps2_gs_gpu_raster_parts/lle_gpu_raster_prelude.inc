@@ -715,12 +715,16 @@ static constexpr int g658Mode6StageGpu() { return 0; }
 // ordered glDrawArrays call.  Flat G178Vtx draw state and a dual-source fragment output supply the
 // per-primitive shader inputs and source/destination factors.  Default-off until the route and
 // exact-output gates are complete; DC2_G560_NO_MULTI_DRAW is the one-flag rollback.
+#if defined(PS2X_G684_LEGACY_G560_RUNS)
 static bool g560MultiDrawRequested()
 {
     static const bool on = g158EnvFlag("DC2_G560_MULTI_DRAW") &&
                            !g158EnvFlag("DC2_G560_NO_MULTI_DRAW");
     return on;
 }
+#else
+static constexpr bool g560MultiDrawRequested() { return false; }
+#endif
 
 // G624: rollback for the flip-aware G406/G407 V rounding on `srcFbp`-bound draws. Namespace scope,
 // not a function-local `static const bool` — G619 measured that form as a per-access TLS guard on
@@ -773,23 +777,31 @@ static const bool s_g661SrcQuant = g158EnvFlag("DC2_G661_SRC_QUANT") &&
 static std::atomic<uint32_t> g_g661FloorDraws{0};
 #endif
 
+#if defined(PS2X_G684_LEGACY_G560_RUNS)
 static bool g561TextureRunsRequested()
 {
     static const bool on = g158EnvFlag("DC2_G561_TEXTURE_RUNS") &&
                            !g158EnvFlag("DC2_G561_NO_TEXTURE_RUNS");
     return on;
 }
+#else
+static constexpr bool g561TextureRunsRequested() { return false; }
+#endif
 
 // G570: the G560 shader already carries every per-primitive state field needed by an
 // untextured draw. Sampler/UV state is dead when both adjacent draws have no texture source,
 // so it must not split an otherwise ordered run. Keep this narrowly opt-in while the combat
 // spike and full-frame gates are evaluated.
+#if defined(PS2X_G684_LEGACY_G560_RUNS)
 static bool g570UntexturedRunsRequested()
 {
     static const bool on = g158EnvFlag("DC2_G570_UNTEXTURED_RUNS") &&
                            !g158EnvFlag("DC2_G570_NO_UNTEXTURED_RUNS");
     return on;
 }
+#else
+static constexpr bool g570UntexturedRunsRequested() { return false; }
+#endif
 static uint32_t g349FboKey(uint32_t fbp, int w)
 {
     return (g349DecolOn() && fbp == 0x139u && w != 512) ? kG349Narrow139 : fbp;

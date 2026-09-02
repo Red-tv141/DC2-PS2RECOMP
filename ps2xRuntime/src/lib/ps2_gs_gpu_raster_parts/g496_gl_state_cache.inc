@@ -62,17 +62,14 @@
 //   DC2_G496_GLSTAT=1      census: issued vs elided, per call class
 // ==============================================================================================
 
-static bool g496GlCacheDefaultOn()
+static const bool s_g674G496GlCacheDefaultOn =
+    (std::getenv("DC2_G496_NO_GLCACHE") == nullptr);
+static const bool s_g674G496GlStatOn = (std::getenv("DC2_G496_GLSTAT") != nullptr);
+static DC2_G674_HOT_FLAG_INLINE bool g496GlCacheDefaultOn()
 {
-    static const bool on = (std::getenv("DC2_G496_NO_GLCACHE") == nullptr);
-    return on;
+    return s_g674G496GlCacheDefaultOn;
 }
-
-static bool g496GlStatOn()
-{
-    static const bool on = (std::getenv("DC2_G496_GLSTAT") != nullptr);
-    return on;
-}
+static DC2_G674_HOT_FLAG_INLINE bool g496GlStatOn() { return s_g674G496GlStatOn; }
 
 // Call classes for the census.
 enum G496GlCls
