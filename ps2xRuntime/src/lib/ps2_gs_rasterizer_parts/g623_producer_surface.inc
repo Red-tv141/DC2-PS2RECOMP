@@ -101,6 +101,7 @@ static bool g623ProdSrcOn()
     return on;
 }
 
+#if defined(PS2X_G684_HOT_DIAG)
 static bool g623CensusOn()
 {
     static const bool on = envFlagEnabled("DC2_G623_PC");
@@ -121,6 +122,11 @@ static bool g623Paired()
     }();
     return paired;
 }
+#else
+static constexpr bool g623CensusOn() { return false; }
+static constexpr bool g623VerifyOn() { return false; }
+static constexpr bool g623Paired() { return false; }
+#endif
 
 // ENV-LEVEL selection, arm-INDEPENDENT. The registry STAMP and the whole census run under this, so
 // both paired buckets maintain identical state and only the BIND differs (G520 §7b).

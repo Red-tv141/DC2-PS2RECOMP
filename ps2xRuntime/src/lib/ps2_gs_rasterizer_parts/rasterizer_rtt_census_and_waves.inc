@@ -168,11 +168,15 @@ static void g265Report()
                  (unsigned long long)g_g265ZReadbacks.load(std::memory_order_relaxed));
 }
 
+#if defined(PS2X_G684_HOT_DIAG)
 static bool g262CensusOn()
 {
     static const bool s_on = envFlagEnabled("DC2_G262_CENSUS");
     return s_on;
 }
+#else
+static constexpr bool g262CensusOn() { return false; }
+#endif
 
 static void g262Report()
 {
@@ -526,13 +530,13 @@ static inline bool g583WaveEligibleTarget(uint32_t fbp)
 static uint64_t g_g583Trn13bZAdmits = 0ull;
 static void g583NoteTrn13bZAdmission()
 {
-    ++g_g583Trn13bZAdmits;
+    const uint64_t n = ++g_g583Trn13bZAdmits;
     static const bool s_stat = envFlagEnabled("DC2_G583_STAT");
     if (!s_stat)
         return;
-    if (g_g583Trn13bZAdmits <= 8ull || (g_g583Trn13bZAdmits % 65536ull) == 0ull)
+    if (n <= 8ull || (n % 65536ull) == 0ull)
         std::fprintf(stderr, "[G583:trn13bz] admits=%llu\n",
-                     static_cast<unsigned long long>(g_g583Trn13bZAdmits));
+                     static_cast<unsigned long long>(n));
 }
 
 static void g262NoteSeen(const G144Entry &e)
@@ -901,8 +905,10 @@ void g178PushVertex(std::vector<G178Vtx> &out, const GSVertex &v, int ofx, int o
     // G364: F rides the GEOMETRIC vertex (a real GS interpolator, independent of IIP). Sprite
     // callers pre-copy the flat second-vertex F onto their corner vertices, mirroring `z`.
     o.fog = v.fog; o.pad0 = 0; o.pad1 = 0; o.pad2 = 0;
+#if defined(PS2X_G684_LEGACY_G560_RUNS)
     o.drawState0 = 0.0f; o.drawState1 = 0.0f;
     o.drawState2 = 0.0f; o.drawState3 = 0.0f;
+#endif
     if (!tme)
     {
         o.sq = 0.0f; o.tq = 0.0f; o.iq = 1.0f;

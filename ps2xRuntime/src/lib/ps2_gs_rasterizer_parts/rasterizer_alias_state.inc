@@ -995,11 +995,15 @@ static std::atomic<uint64_t> g_g279MatNs[8] = {}, g_g279MatReadNs[8] = {},
 static std::atomic<uint64_t> g_g279DisplayNs[9] = {}, g_g279DisplayReadNs[9] = {},
     g_g279DisplayN[9] = {};
 
+#if defined(PS2X_G684_HOT_DIAG)
 static bool g279ProfileOn()
 {
     static const bool s_on = envFlagEnabled("DC2_G279_PROFILE");
     return s_on;
 }
+#else
+static constexpr bool g279ProfileOn() { return false; }
+#endif
 
 static bool g261StatOn()
 {

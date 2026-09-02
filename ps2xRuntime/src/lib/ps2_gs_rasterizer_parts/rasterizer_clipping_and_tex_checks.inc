@@ -7,7 +7,83 @@ struct G406UvRoundInfo
     int originY = 0;
     uint8_t flagsU = 0;
     uint8_t flagsV = 0;
+    // G679: pixels per exact-integer texture coordinate on each axis (see G178Draw::uvPeriodU).
+    uint16_t periodU = 1;
+    uint16_t periodV = 1;
 };
+
+// ⭐⭐⭐ G679: on which pixels is this axis' texture coordinate an EXACT INTEGER?
+//
+// `T(p) = t0 + (p - p0)·dt/dp` with t0/dt/dp all in 12.4. If t0 is not texel-aligned the
+// coordinate is never an integer (return 0 = never). Otherwise T(p) is an integer exactly when
+// (p - p0)·dt ≡ 0 (mod dp), i.e. when (p - p0) is a multiple of |dp| / gcd(|dt|,|dp|).
+//
+// This is the information `g406RoundAxis` is missing. Its boundary test is a FLOAT epsilon of
+// 1/64, which is ~400x the interpolation noise it was meant to absorb, so in practice it fires on
+// coordinates that are exactly integral — where the correct texel IS the boundary and the
+// down-nudge (boundary - 1/16) selects the PREVIOUS texel instead.
+bool g679UvPeriodEnabled()
+{
+    static const bool enabled = std::getenv("DC2_G679_NO_UV_PERIOD") == nullptr;
+    return enabled;
+}
+
+uint16_t g679ExactPeriod(int pos0, int pos1, int tex0, int tex1)
+{
+    // Rollback: period 0 means "never exact", so the rule falls back to its own
+    // `pixel == origin` exception — the pre-G679 behaviour, bit for bit.
+    if (!g679UvPeriodEnabled())
+        return 0u;
+    const int64_t dp = static_cast<int64_t>(pos1) - pos0;
+    const int64_t dt = static_cast<int64_t>(tex1) - tex0;
+    if (dp == 0)
+        return 1u;
+    // ⛔ DO NOT test `pos0` and `tex0` for 16-alignment INDIVIDUALLY. The screen-space 1:1 strips
+    // this menu is built from sit at FRACTIONAL positions with `uv == position` — e.g.
+    // (245.88,65.88)-(277.88,313.50) — so NEITHER endpoint is texel-aligned while the coordinate is
+    // an exact integer at EVERY pixel. What decides exactness is the whole affine map evaluated at
+    // the origin pixel the shader actually uses.
+    //
+    // In 1/16 units, T16(p) = (numer + (p - origin)*16*dt) / dp, so pixel p is exact when that is a
+    // multiple of 16, i.e. when (numer + (p - origin)*16*dt) == 0 (mod 16*|dp|).
+    const int origin = pos0 >> 4;
+    const int64_t M = 16 * (dp < 0 ? -dp : dp);
+    const int64_t numer = static_cast<int64_t>(tex0) * dp + (16LL * origin - pos0) * dt;
+    if (M == 0 || (numer % M) != 0)
+        return 0u;              // the origin pixel is not itself on a texel: never provably exact
+    const int64_t step = (((16 * dt) % M) + M) % M;
+    if (step == 0)
+    {
+        // ⭐⭐⭐ G680: `step == 0` means an INTEGER number of texels per pixel (1:1, 2:1, 3:1 …).
+        // Every pixel is then exact — and a predicate that is TRUE FOR EVERY INPUT is not a
+        // predicate. G679 returned 1 here ("exact everywhere"), which made `g679AxisExactAt`
+        // unconditionally true and so converted G406's ROUND_DOWN into ROUND_UP on every pixel of
+        // every 1:1 blit, silently deleting the down-bias that G406/G407 promoted and that PCSX2's
+        // accurate-UV rule implements.
+        //
+        // MEASURED (`gs4` HUD, `tools/run_g680_hud.ps1`): the three-orb bar is one such blit —
+        // xy=(48,26)-(197,73) uv=(236,0)-(385,47), dt/dp = 1 exactly. Its last column (x=196) has
+        // the exact coordinate u = 384.0; ROUND_DOWN selects texel 383 (hardware's answer, plain
+        // background in the native `ref/dumps/hud.png`) while the G679 flip selected texel 384 —
+        // the first column of the NEIGHBOURING atlas cell, whose outline painted a 1x6 black run at
+        // logical (196, 48..53). Same-binary `DC2_G679_NO_UV_PERIOD=1` and the pre-G679 binary both
+        // read 2 thin-dark px/frame there against 9 with the flip.
+        //
+        // The exactness exception is only INFORMATIVE on a strict sub-lattice (period >= 2), which
+        // is precisely the class G679 was built for: a sprite magnified by a NON-INTEGER ratio
+        // (32 texels over 40 px => period 5) is exact on every 5th row and nowhere else. So fall
+        // back to G406's own `pixel == origin` case, which `period == 0` already expresses at both
+        // consumers (the CPU `g679AxisExactAt` and the GLSL `g406RoundAxis`).
+        // Rollback: DC2_G680_NO_UNIT_PERIOD=1 restores G679's "exact everywhere".
+        static const bool s_unitPeriodExact =
+            std::getenv("DC2_G680_NO_UNIT_PERIOD") != nullptr;
+        return s_unitPeriodExact ? 1u : 0u;
+    }
+    const int64_t period = M / std::gcd(step, M);
+    // ⛔ G680: `period == 1` can only arrive here as a degenerate gcd; it carries the same
+    // no-information meaning as the `step == 0` branch above and must not arm the exception.
+    return static_cast<uint16_t>((period > 1 && period < 4096) ? period : 0);
+}
 
 enum : uint8_t
 {
@@ -222,6 +298,8 @@ G406UvRoundInfo g406SpriteUvRoundInfo(const GSVertex &v0, const GSVertex &v1,
     }
     out.flagsU |= G407_ACCURATE_UV_ACTIVE;
     out.flagsV |= G407_ACCURATE_UV_ACTIVE;
+    out.periodU = g679ExactPeriod(x0, x1, u0, u1);
+    out.periodV = g679ExactPeriod(y0, y1, v0f, v1f);
     return out;
 }
 
@@ -232,8 +310,28 @@ bool g407SpriteSubpixelPhaseEnabled()
     return enabled;
 }
 
+// G679: `period` = G406UvRoundInfo::periodU/V for this axis. A pixel whose exact coordinate is an
+// integer must take the boundary, never the down-nudge — see g679ExactPeriod. `pixel == origin`
+// stays exact for every period, which is bit-for-bit the exception this rule already carried.
+// ⛔ G680: `period <= 1` is NOT "exact everywhere" for this purpose. It means an integer
+// texels-per-pixel map, where the exception would be true for every pixel and therefore
+// discriminates nothing — see the long note in g679ExactPeriod, which now returns 0 for that class
+// so this predicate collapses to G406's own origin case.
+inline bool g679AxisExactAt(int pixel, int origin, uint16_t period)
+{
+    if (pixel == origin)
+        return true;
+    // ⛔ G680: the period-1 question is decided ONCE, in `g679ExactPeriod`, so its rollback flag is
+    // a true control on BOTH rasterizers (the GLSL twin of this predicate keeps `period != 0` for
+    // the same reason). `period == 0` here means "not provably exact away from the origin".
+    if (period == 0u)
+        return false;
+    const int k = pixel - origin;
+    return (k % static_cast<int>(period)) == 0;
+}
+
 uint16_t g406RoundUvFixed(float value, int pixel, int origin, uint8_t flags,
-                         bool linear)
+                         bool linear, uint16_t period)
 {
     const int fixed = clampInt(
         linear ? static_cast<int>(std::floor(value * 16.0f))
@@ -250,9 +348,10 @@ uint16_t g406RoundUvFixed(float value, int pixel, int origin, uint8_t flags,
     if (std::fabs(value - boundary) > threshold)
         return static_cast<uint16_t>(fixed);
 
-    const bool roundDown = (flags & G406_ROUND_DOWN) != 0u && pixel != origin;
+    const bool exact = g679AxisExactAt(pixel, origin, period);
+    const bool roundDown = (flags & G406_ROUND_DOWN) != 0u && !exact;
     const bool roundUp = (flags & G406_ROUND_UP) != 0u ||
-                         ((flags & G406_ROUND_DOWN) != 0u && pixel == origin);
+                         ((flags & G406_ROUND_DOWN) != 0u && exact);
     const int boundaryFixed = static_cast<int>(std::lround(boundary * 16.0f));
     // The local exact sampler quantizes to 12.4 before selecting a point texel.
     // One 12.4 unit is the smallest representable nudge to either side.

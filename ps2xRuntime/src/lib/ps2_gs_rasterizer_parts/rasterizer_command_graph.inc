@@ -2941,8 +2941,12 @@ void g178DecodeWhole(GSRasterizer *self, GS *gs, uint8_t *vram, const GSContext 
         return std::max(1, std::min(16, std::atoi(value)));
     }();
     const int pixels = texW * texH;
+    // ⛔⛔ G684 P5: `GSRowPool` has ONE generation and ONE cursor. When this decode is itself a
+    // chunk of the fused preparation dispatch, raising a second dispatch here would overwrite that
+    // one's bounds/job pointer and corrupt both. The outer dispatch already supplies the
+    // parallelism — over a strictly larger pool of independent work — so stand the row split down.
     const int lanes =
-        s_g298ParTexDecode && texH >= 8 && pixels >= 4096
+        s_g298ParTexDecode && !t_g684InPoolChunk && texH >= 8 && pixels >= 4096
             ? s_g298TexDecodeLanes
             : 1;
 
@@ -3074,3 +3078,4 @@ struct G178EntryState
 // coupling this anonymous-namespace state type to the later include unit's namespace boundary.
 using G633AttachTextureHook = void (*)(const G144Entry &e, G178EntryState &st);
 static G633AttachTextureHook g_g633AttachTextureHook = nullptr;
+

@@ -108,9 +108,14 @@ static bool g310On()
     // The logical surface replaces the default five-target publication path. It deliberately
     // does not combine with the older overlay/fan-out experiment, whose copied FBO pages have a
     // separate ownership model. A user forcing both gets the older arm and G310 stays inert.
-    // In native high-res mode, G310 is bypassed to preserve exact high-res FBO sampling.
-    if (dc2IsNativeHighResActive())
-        return false;
+    // ⭐ G675: the unconditional `if (dc2IsNativeHighResActive()) return false;` bypass is gone.
+    // It made >1x take a DIFFERENT publication path from the 1x reference — the exact divergence
+    // this port cannot afford, since 1x is the correctness oracle. It is also unnecessary now:
+    // all three G310 backend entry points (seed -> writeColor, copy -> copyColor, composite ->
+    // buildLogicalComposite) map logical rects to physical through the entry's own physW/physH,
+    // and under G675's law that ratio is the same integer S for every target. Rollback if a
+    // route ever disagrees: DC2_G310_NO_LOGICAL=1 (which disables it at 1x too, so the two arms
+    // stay comparable).
     return g310Requested() && g261WaveOn() && !g280AliasOn();
 }
 
@@ -120,6 +125,7 @@ static bool g310VerifyOn()
     return s_on && g310On();
 }
 
+#if defined(PS2X_G684_HOT_DIAG)
 static bool g310StatOn()
 {
     static const bool s_on =
@@ -128,6 +134,9 @@ static bool g310StatOn()
         envFlagEnabled("DC2_G310_VERIFY");
     return s_on;
 }
+#else
+static bool g310StatOn() { return false; }
+#endif
 
 static bool g310AliasRetireOn()
 {

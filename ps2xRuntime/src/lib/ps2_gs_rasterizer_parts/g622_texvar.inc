@@ -63,6 +63,7 @@ static bool g622TexVarOn()
     return on;
 }
 
+#if defined(PS2X_G684_HOT_DIAG)
 static bool g622TexVarStatOn()
 {
     static const bool on = envFlagEnabled("DC2_G622_TEXVAR_STAT");
@@ -78,6 +79,10 @@ static bool g622TexVarVerifyOn()
     static const bool on = envFlagEnabled("DC2_G622_TEXVAR_VERIFY");
     return on;
 }
+#else
+static constexpr bool g622TexVarStatOn() { return false; }
+static constexpr bool g622TexVarVerifyOn() { return false; }
+#endif
 
 // Paired arm. GS-worker thread-level (the flush texture pass), hold 16 — registered in
 // g419_ab_instrument.inc's block-hold predicate in this same edit (G506's law).

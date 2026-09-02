@@ -933,7 +933,8 @@ void GSRasterizer::drawSprite(GS *gs)
                 const float tx = (static_cast<float>(px) - g530SampleX0 + s_uvBias) / spriteW;
                 const float tu = u0f + (u1f - u0f) * tx;
                 const uint16_t su16 = g406Round.active
-                    ? g406RoundUvFixed(tu, px, g406Round.originX, g406Round.flagsU, g248Linear)
+                    ? g406RoundUvFixed(tu, px, g406Round.originX, g406Round.flagsU, g248Linear,
+                                       g406Round.periodU)
                     : static_cast<uint16_t>(
                           clampInt(static_cast<int>(std::lround(tu * 16.0f)), 0, 0xFFFF));
                 g530U.sampleU[static_cast<size_t>(i)] = su16;
@@ -1176,7 +1177,8 @@ void GSRasterizer::drawSprite(GS *gs)
                 const float ty = (static_cast<float>(y) - g530SampleY0 + s_uvBias) / spriteH;
                 const float tv = v0f + (v1f - v0f) * ty;
                 const uint16_t sv16 = g406Round.active
-                    ? g406RoundUvFixed(tv, y, g406Round.originY, g406Round.flagsV, g248Linear)
+                    ? g406RoundUvFixed(tv, y, g406Round.originY, g406Round.flagsV, g248Linear,
+                                       g406Round.periodV)
                     : static_cast<uint16_t>(
                           clampInt(static_cast<int>(std::lround(tv * 16.0f)), 0, 0xFFFF));
                 const float vf = static_cast<float>(sv16) / 16.0f;
@@ -1616,12 +1618,12 @@ void GSRasterizer::drawSprite(GS *gs)
                     const float g530TexVf = g530NoUv ? (v0f) : texVf;
                     uint16_t sampleU = g406Round.active
                         ? g406RoundUvFixed(g530TexUf, x, g406Round.originX,
-                                          g406Round.flagsU, g248Linear)
+                                          g406Round.flagsU, g248Linear, g406Round.periodU)
                         : static_cast<uint16_t>(clampInt(
                               static_cast<int>(std::lround(g530TexUf * 16.0f)), 0, 0xFFFF));
                     uint16_t sampleV = g406Round.active
                         ? g406RoundUvFixed(g530TexVf, y, g406Round.originY,
-                                          g406Round.flagsV, g248Linear)
+                                          g406Round.flagsV, g248Linear, g406Round.periodV)
                         : static_cast<uint16_t>(clampInt(
                               static_cast<int>(std::lround(g530TexVf * 16.0f)), 0, 0xFFFF));
                     g258SampleU = sampleU;

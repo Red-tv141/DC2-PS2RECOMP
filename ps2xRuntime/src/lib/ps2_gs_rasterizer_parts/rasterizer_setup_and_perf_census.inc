@@ -131,6 +131,12 @@ static bool g459TriScissorStatOn()
 
 void GSRasterizer::drawPrimitive(GS *gs)
 {
+    // G687: one normal deferred triangle primes a fixed-state ST/RGBAQ/XYZF2 tag. Later strip
+    // triangles take the compact capture path. Every diagnostic mode makes begin() decline.
+    if (g_g687PackedCaptureRunActive &&
+        g687TryFastCapture(this, gs, gs->activeContext(), gs->m_prim, gs->m_texa,
+                           gs->m_texclut, gs->m_pabe, gs->m_vtxQueue, gs->m_vram))
+        return;
     // G654 P16: nested INSIDE the GS front's GIF tag walk. Timing it here lets `[G654:layer]`
     // report GIFwalk EXCLUSIVE of drawing, which is what splits `[G147:gif] parserOther` into
     // "the walk itself" and "a nested layer counted twice". Empty struct outside -DPS2X_G654_DIAG.

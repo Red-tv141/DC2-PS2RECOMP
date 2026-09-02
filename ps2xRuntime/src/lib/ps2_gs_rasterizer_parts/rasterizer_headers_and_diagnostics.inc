@@ -179,78 +179,11 @@ bool g310_backend_build_logical_composite(
     const std::vector<uint32_t> &pageMap,
     const std::vector<uint32_t> &basePixels);
 
-struct DC2NativeRenderConfig
-{
-    bool isConfigured = false;
-    bool isNativeHighRes = false;
-    bool isFullscreen = false;
-    int requestedWidth = 0;
-    int requestedHeight = 0;
-    float scaleX = 1.0f;
-    float scaleY = 1.0f;
-};
-
-inline DC2NativeRenderConfig &getDC2NativeRenderConfig()
-{
-    static DC2NativeRenderConfig s_config = []()
-    {
-        DC2NativeRenderConfig cfg{};
-        const char *wEnv = std::getenv("DC2_RESOLUTION_WIDTH");
-        const char *hEnv = std::getenv("DC2_RESOLUTION_HEIGHT");
-        const char *fsEnv = std::getenv("DC2_FULLSCREEN");
-
-        int w = 0, h = 0;
-        if (wEnv && wEnv[0] != '\0')
-            w = std::atoi(wEnv);
-        if (hEnv && hEnv[0] != '\0')
-            h = std::atoi(hEnv);
-
-        cfg.isFullscreen = (fsEnv && fsEnv[0] != '\0' && std::strcmp(fsEnv, "0") != 0);
-
-        if (w > 0 && h > 0 && (w != 512 || h != 448) && (w != 640 || h != 448))
-        {
-            cfg.requestedWidth = w;
-            cfg.requestedHeight = h;
-            cfg.scaleX = static_cast<float>(w) / 640.0f;
-            cfg.scaleY = static_cast<float>(h) / 448.0f;
-            cfg.isNativeHighRes = true;
-        }
-        else if (w > 0 && h > 0)
-        {
-            cfg.requestedWidth = w;
-            cfg.requestedHeight = h;
-            cfg.scaleX = 1.0f;
-            cfg.scaleY = 1.0f;
-            cfg.isNativeHighRes = false;
-        }
-        else
-        {
-            cfg.requestedWidth = 640;
-            cfg.requestedHeight = 448;
-            cfg.scaleX = 1.0f;
-            cfg.scaleY = 1.0f;
-            cfg.isNativeHighRes = false;
-        }
-        cfg.isConfigured = true;
-        return cfg;
-    }();
-    return s_config;
-}
-
-inline bool dc2IsNativeHighResActive()
-{
-    return getDC2NativeRenderConfig().isNativeHighRes;
-}
-
-inline float dc2GetNativeScaleX()
-{
-    return getDC2NativeRenderConfig().scaleX;
-}
-
-inline float dc2GetNativeScaleY()
-{
-    return getDC2NativeRenderConfig().scaleY;
-}
+// G675: the logical<->physical resolution mapping now has ONE definition for all four
+// TUs that need it. See that file for the integer-scale law it enforces.
+#include "../ps2_native_res.inc"
+// G676: the curated 2D do-not-scale list (content-hash keyed).
+#include "../ps2_g676_noscale.inc"
 
 // G141: measure-first perf scope (skill 17-performance-optimization.md), env-gated
 // (DC2_PERF=1), aggregate-only print. Self-contained per-TU; drawPrimitive runs on the
@@ -513,11 +446,8 @@ namespace
     // must not call getenv() per invocation (Windows CRT getenv = env lock + linear scan —
     // and the banded replay lanes serialize on that lock). Hot sites read once by default;
     // DC2_G268_LIVE_ENVREAD=1 restores the historical per-call read (same-binary A/B control).
-    bool g268LiveEnvRead()
-    {
-        static const bool live = envFlagEnabled("DC2_G268_LIVE_ENVREAD");
-        return live;
-    }
+    const bool s_g674G268LiveEnvRead = envFlagEnabled("DC2_G268_LIVE_ENVREAD");
+    DC2_G674_HOT_FLAG_INLINE bool g268LiveEnvRead() { return s_g674G268LiveEnvRead; }
 
     // G268: cached DC2_G242_STAT (was a per-call getenv on depth-sync/alias paths).
     bool g242StatEnabled()

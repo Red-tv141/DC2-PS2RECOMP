@@ -1449,6 +1449,10 @@
                 g521NoteEntry(bad);
             }
 #endif
+            // G687: only a fully successful ordinary capture may prime the remainder of a fixed
+            // 0x412 tag. Outside such a TRISTRIP run this is a no-op.
+            g687PrimePackedCapture(this, gs, gs->m_vram, ctx, gs->m_prim, gs->m_texa,
+                                   gs->m_texclut, gs->m_pabe, g286Transient, g573Tri13b);
             if (g_g156Stat)
                 g_g156CaptureNs.fetch_add(
                     (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(

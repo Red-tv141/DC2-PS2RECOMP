@@ -883,11 +883,15 @@ static bool g598T8AnyOn()
     return s_on && g261WaveOn();
 }
 
+#if defined(PS2X_G684_HOT_DIAG)
 static bool g598T8WhyOn()
 {
     static const bool s_on = envFlagEnabled("DC2_G598_T8WHY");
     return s_on;
 }
+#else
+static constexpr bool g598T8WhyOn() { return false; }
+#endif
 
 static std::atomic<uint64_t> g_g598T8Seen{0}, g_g598T8Src{0}, g_g598T8Admit{0},
     g_g598T8RejShape{0}, g_g598T8RejNoSrc{0}, g_g598T8RejClut{0}, g_g598T8RejMap{0},

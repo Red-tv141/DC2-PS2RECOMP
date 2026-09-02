@@ -22,7 +22,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     }
     g_g266FlushRej = kG266FrNone;
     G310BatchFreeze g310Freeze;
-    g_g178Flushes.fetch_add(1u, std::memory_order_relaxed);
+    g684DiagAdd(g_g178Flushes, 1u);
     // Resolve the exact 0x14a alias suffix before the generic owner-conflict audit: this batch
     // itself is the proven destructive prefix writer.
     const uint32_t g289DirectDisplaySrc = g289DirectDisplayToken();
@@ -104,6 +104,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g288PublishDisplayForGpuBatch();
     // G273 diagnostic: split the proven GPU flush into front-end preparation, synchronous backend
     // submit, and post-submit VRAM/depth publication. Quiet unless DC2_G273_PROFILE=1.
+ #if defined(PS2X_G684_HOT_DIAG)
     static const bool s_g273Profile = envFlagEnabled("DC2_G273_PROFILE");
     // G298 diagnosis: split G273's large front-end "pre" bucket at architecture boundaries.
     // Aggregate-only, cached, and behavior-inert unless explicitly requested.
@@ -122,11 +123,16 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // largest single pass) so its per-flush PROLOGUE, its per-entry LOOP and its EPILOGUE are
     // separated too. Behaviour-pure; implies G298's timestamps. Armed by DC2_G523_FIT=1.
     static const bool s_g523Fit = envFlagEnabled("DC2_G523_FIT");
+ #else
+    static constexpr bool s_g273Profile = false;
+    static constexpr bool s_g523Fit = false;
+ #endif
 #if defined(PS2X_G654_DIAG)
     static const bool s_g655ClassSplit = envFlagEnabled("DC2_G655_CLASSSPLIT");
 #else
     static constexpr bool s_g655ClassSplit = false;
 #endif
+ #if defined(PS2X_G684_HOT_DIAG)
     static const bool s_g298Profile =
         envFlagEnabled("DC2_G298_PROFILE") || s_g523Fit || s_g655ClassSplit;
     // G323: split G298 T2->T3 dependency preparation into exclusive complete-operation families.
@@ -134,6 +140,15 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // self-cost without changing renderer behavior or dependency ordering.
     static const bool s_g323Census = envFlagEnabled("DC2_G323_CENSUS");
     static const bool s_g323Empty = !s_g323Census && envFlagEnabled("DC2_G323_EMPTY");
+ #elif defined(PS2X_G654_DIAG)
+    static const bool s_g298Profile = s_g655ClassSplit;
+    static constexpr bool s_g323Census = false;
+    static constexpr bool s_g323Empty = false;
+ #else
+    static constexpr bool s_g298Profile = false;
+    static constexpr bool s_g323Census = false;
+    static constexpr bool s_g323Empty = false;
+ #endif
     const bool g323Armed = s_g323Census || s_g323Empty;
     const auto g273T0 = s_g273Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
@@ -143,7 +158,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // DC2_G589_CENSUS=1 this also samples the atlas input key so [G589:drain] can report the
     // amortization HEADROOM (share of non-first batches whose key is unchanged) with no behaviour
     // change. Inert on every other configuration.
+ #if defined(PS2X_G684_HOT_DIAG)
     g589NoteBatch();
+ #endif
 
     const uint32_t fbp = g_g144List[0].ctx.frame.fbp;
     const bool g286Transient = g286TransientTarget(fbp);
@@ -305,7 +322,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     if (fbW <= 0 || fbW > 1024)
     {
         g_g266FlushRej = kG266FrFbW;
-        g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+        g684DiagAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -508,7 +525,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                  e.ctx.tex0.tbp0, e.ctx.tex0.psm,
                                  static_cast<size_t>(&e - g_g144List.data()), g_g144List.size());
             }
-            g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+            g684DiagAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false; // mixed targets in one flush — shouldn't happen (block flush on fbp change)
         }
@@ -565,7 +582,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             g583NoteRejectEntry(e);
             if (g261Wave)
                 g_g261RttClassifyRej.fetch_add(1u, std::memory_order_relaxed);
-            g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+            g684DiagAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             if (g510Census)
             {
@@ -599,8 +616,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 // One GL attachment cannot represent two guest Z targets in one all-or-nothing
                 // flush. Preserve exact ordering by sending the whole list to the CPU replay.
                 g_g266FlushRej = kG266FrMixedZ;
-                g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
-                g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+                g684DiagAdd(g_g178Fallbacks, 1u);
+                g684DiagAdd(g_g178RejectState, 1u);
                 g581InvalidateCpuFallbackSnapshots();
                 return false;
             }
@@ -861,7 +878,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                          g282DepthLo, g282DepthHi, guestDepth ? 1u : 0u,
                          guestDepthWrites ? 1u : 0u);
         g_g266FlushRej = kG266FrCpuOnlyRtt;
-        g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+        g684DiagAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -934,7 +951,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                          g586BadFbp, g586BadFbw, g586BadPsm, g586BadPrim, g586BadTme);
         }
         g_g266FlushRej = kG266FrCpuOnlyRtt;
-        g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+        g684DiagAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -968,7 +985,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                          g282DepthLo, g282DepthHi, guestDepth ? 1u : 0u,
                          guestDepthWrites ? 1u : 0u);
         g_g266FlushRej = kG266FrCpuOnlyRtt;
-        g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+        g684DiagAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -1076,7 +1093,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         }
 #endif
         g_g266FlushRej = kG266FrCpuOnlyRtt;
-        g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+        g684DiagAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -1114,7 +1131,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g_g266FlushRej = kG266FrRttDepth;
         if (g261Wave)
             g_g261RttDepthRej.fetch_add(1u, std::memory_order_relaxed);
-        g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+        g684DiagAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -1327,8 +1344,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             }
 #endif
             g_g266FlushRej = kG266FrColorZAlias;
-            g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
-            g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+            g684DiagAdd(g_g178Fallbacks, 1u);
+            g684DiagAdd(g_g178RejectState, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false;
         }
@@ -1430,7 +1447,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 if (!g278FlushPendSlot(p, 0))
                 {
                     g_g266FlushRej = kG266FrZReadback;
-                    g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+                    g684DiagAdd(g_g178Fallbacks, 1u);
                     g581InvalidateCpuFallbackSnapshots();
                     return false;
                 }
@@ -1481,7 +1498,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         if (!g278FlushPendSlot(s_g278PendTab[s], 0))
                         {
                             g_g266FlushRej = kG266FrZReadback;
-                            g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+                            g684DiagAdd(g_g178Fallbacks, 1u);
                             g581InvalidateCpuFallbackSnapshots();
                             return false;
                         }
@@ -1499,7 +1516,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                   static_cast<uint32_t>(rowHi - rowLo + 1)))
     {
         g_g266FlushRej = kG266FrDepthSetup;
-        g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+        g684DiagAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -1634,6 +1651,16 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         if (r.dirty)
         {
             const uint64_t g261WinNow = g261WindowGenNow(r, fbp);
+            // ⛔⛔ G688 MEASURED, REFUTED, REVERTED (Rule 31). An absorber was built here to convert
+            // an escaped writer into a G264 mirror patch and KEEP residency — PCSX2's
+            // `InvalidateVideoMem` -> `Target::m_dirty` -> `Target::Update()` shape, which this tree
+            // already has in `G261Res::mirBits`. `[G688:escape]` on `combat` at
+            // `DC2_G569_RTTWIDE_MASK=0x01`: **calls=6144 absorbed=0, refused conflict=6144** — i.e.
+            // **100% of `0x13d` escapes land on pages whose rows the FBO is ALSO dirty over.** The
+            // guest and the GPU produce pixels for the SAME rows, so no merge exists without the
+            // write order and the absorber could never fire. The defect is therefore not "handle the
+            // escape" but a MISSING MATERIALIZE HOOK on the write path that reaches these rows.
+            // See `plans/phase-G688-fix-log.md` §10 before attempting this again.
             if (r.genAtSkip != g261WinNow)
             {
                 const uint64_t n = g_g261Invariants.fetch_add(1u, std::memory_order_relaxed) + 1u;
@@ -1764,6 +1791,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // it forever. This probe forces the refresh. Knowingly incorrect (it can overwrite FBO-only
     // rows with stale VRAM); it exists to price the staleness, not to ship.
     //   DC2_G599_FORCEUP=<fbp hex>   e.g. 139, or ffffffff for every target
+#if defined(PS2X_G684_HOT_DIAG)
     {
         static const uint32_t s_forceUp = []() -> uint32_t {
             const char *e = std::getenv("DC2_G599_FORCEUP");
@@ -1784,6 +1812,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                              g261ForceNoUpload ? 1 : 0);
         }
     }
+#endif
     if (s_batch.uploadFb && g345StatOn() && g345FamilyFbp(fbp))
         g345NoteFamUploadFbp(fbp, static_cast<uint64_t>(rowHi - rowLo + 1));
     // G590: classify this colour-authority decision for EVERY target (not just the 14 residency
@@ -1969,7 +1998,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (s_batch.uploadFb)
     {
-        g_g178FbUploads.fetch_add(1u, std::memory_order_relaxed);
+        g684DiagAdd(g_g178FbUploads, 1u);
         // G417 diagnostic-only CPU split. Keep the allocation/zero, metadata/setup, and joined
         // CT32 row pack separate so the backend GL edge is not blamed for front-end preparation.
         static const bool s_g417Profile = envFlagEnabled("DC2_G417_PROFILE");
@@ -2259,7 +2288,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     }
     else
     {
-        g_g178FbUploadSkips.fetch_add(1u, std::memory_order_relaxed);
+        g684DiagAdd(g_g178FbUploadSkips, 1u);
         // G420: the zero-fill elision needs a live buffer to elide against, and clear() drops
         // size() to 0 so the next uploadFb would value-initialise the whole thing again. Nothing
         // outside uploadFb reads fbPixels (every backend use is gated on b.uploadFb, and
@@ -2315,7 +2344,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         if (guestZpsm != 0x1u || depthRowHi < depthRowLo)
         {
             g_g266FlushRej = kG266FrDepthSetup;
-            g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+            g684DiagAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false;
         }
@@ -2718,7 +2747,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                       0u, 0u, static_cast<uint32_t>(fbW), kFbH, depthKey))
         {
             g_g266FlushRej = kG266FrDepthSetup;
-            g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+            g684DiagAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false;
         }
@@ -2739,7 +2768,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             state.dirtyLo = kFbH;
             state.dirtyHi = -1;
             g_g266FlushRej = kG266FrDepthSetup;
-            g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+            g684DiagAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false;
         }
@@ -2797,7 +2826,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     g622ResetFlush();
     // G623: the per-flush "which entry WOULD have bound" table. ORACLE ONLY — a no-op unless
     // DC2_G623_VERIFY is set, so the shipped path never allocates it.
+#if defined(PS2X_G684_HOT_DIAG)
     g623ResetFlush(g_g144List.size());
+#endif
     bool g261AnyBind = false;
     // G623: did the bind pre-pass's entry loop run for THIS flush? G598's lesson one level up —
     // "rejected on shape" and "the decision point never ran" must not share one bucket.
@@ -2918,6 +2949,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     // set survived the flush boundary: same viewKey, no producer write to that
                     // target since the last build, and byte-identical map+CLUT. Ceiling first —
                     // do not build the cache until this says the redundancy is real.
+#if defined(PS2X_G684_HOT_DIAG)
                     {
                         static const bool s_g431T8Census = envFlagEnabled("DC2_G431_T8CENSUS");
                         if (s_g431T8Census)
@@ -2972,6 +3004,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                              s_seen.size());
                         }
                     }
+#endif
                     const auto g324BackendT0 = g_g324ActiveDiag != nullptr
                         ? std::chrono::steady_clock::now()
                         : std::chrono::steady_clock::time_point{};
@@ -3101,7 +3134,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // in this flush goes through the ordinary VRAM decode. It keeps the GPU render (unlike
         // DC2_G400_NO_RESIDENT_139, which also halves the frame rate); it is the FBO-SOURCE half of
         // residency, isolated.
+#if defined(PS2X_G684_HOT_DIAG)
         static const bool s_g599NoBind = envFlagEnabled("DC2_G599_NOBIND");
+#else
+        constexpr bool s_g599NoBind = false;
+#endif
         if (s_g599NoBind)
             g261MaterializeAllDirty(kG261MatTexAlias);
         g623PrePassRan = !s_g599NoBind;
@@ -3677,7 +3714,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                             }
                             g_g338BuildFail.fetch_add(1u, std::memory_order_relaxed);
                         }
-                        g_g261FboRejects.fetch_add(1u, std::memory_order_relaxed);
+                        g684DiagAdd(g_g261FboRejects, 1u);
                         g266NoteTexBindMat(fbp, t, e, st);
                         // G342 (default-off): time THIS tex-alias materialize and attribute it to
                         // the consumer's shape. rows must be read BEFORE materialize clears dirty.
@@ -3906,6 +3943,20 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // Textures: decode + upload anything not resident or invalidated by page-gen changes.
     static std::unordered_set<uint64_t> s_batchKeys;
     s_batchKeys.clear();
+#if !defined(PS2X_G684_HOT_DIAG)
+    struct G684DecodeJob
+    {
+        size_t entryIndex = 0u;
+        uint64_t genSum = 0u;
+        uint64_t contentHash = 0u;
+        uint64_t residentKey = 0u;
+        uint8_t hashVariant = 0u;
+        G178TexUpload upload;
+    };
+    static std::vector<G684DecodeJob> s_g684DecodeJobs;
+    s_g684DecodeJobs.clear();
+    uint64_t g684DecodePixels = 0u;
+#endif
     // G511: this pass walks every graph entry (~9,900/frame) and asks s_batchKeys whether the
     // entry's effective texture key was already collected in THIS flush. G510 measured 94.4% of
     // entries carrying byte-identical state to their predecessor, and the texture key is a function
@@ -3920,10 +3971,17 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // established — after an insert, or after a count() that returned nonzero (never on the
     // short-circuited st.skip arm, where count() was not evaluated) — and it is cleared on the one
     // path that ERASES a key from the set (the G281 view-build failure below).
+#if defined(PS2X_G684_HOT_DIAG)
     const bool g511Run = g511TexRunActive();
     const bool g511Probe = g511TexProbeActive();
     const bool g511Census = g511CensusOn();
     const bool g511Split = g511TexSplitOn();
+#else
+    constexpr bool g511Run = false;
+    constexpr bool g511Probe = false;
+    constexpr bool g511Census = false;
+    constexpr bool g511Split = false;
+#endif
     // G620: read the census arm ONCE per flush and pass it down, exactly like the G511 arms above.
     const bool g620Dec = g620TexDecOn();
     uint64_t g511Present = 0u;
@@ -4077,9 +4135,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // G623: the population the bind pre-pass never SAW — a read whose base is a produced
         // surface's base on a flush whose pre-pass did not run at all. Counted separately from
         // every shape rejection so the two can never be confused.
+#if defined(PS2X_G684_HOT_DIAG)
         g623NoteUnconsidered(g_g144List[i], st,
                              g623PrePassRan ||
                                  (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u));
+#endif
         if (g511Census)
             ++g511Entries;
         if (g261HaveFboSrc && s_g261FboSrc[i] != 0u)
@@ -4223,8 +4283,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                  guestZbpPage, depthRowLo, depthRowHi, st.texW, st.texH,
                                  texAliasesZ ? 1u : 0u, clutAliasesZ ? 1u : 0u);
                 g_g266FlushRej = kG266FrTexAliasZ;
-                g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
-                g_g178RejectTex.fetch_add(1u, std::memory_order_relaxed);
+                g684DiagAdd(g_g178Fallbacks, 1u);
+                g684DiagAdd(g_g178RejectTex, 1u);
                 g581InvalidateCpuFallbackSnapshots();
                 return false;
             }
@@ -4236,7 +4296,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                                    0u, 0u, 64u, 32u)))
         {
             g_g266FlushRej = kG266FrTexAliasZ;
-            g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+            g684DiagAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false;
         }
@@ -4270,7 +4330,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         if (!g401ForceDecode && !g600TexPaintOn() && it != g_g178TexReg.end() && backendHas &&
             it->second.genSum == genNow)
         {
-            g_g178TexHits.fetch_add(1u, std::memory_order_relaxed);
+            g684DiagAdd(g_g178TexHits, 1u);
             g600NoteTexHit(e, st.texW, st.texH, st.texKey, "gen");
             g620NoteTexHit(g620Dec, st.texKey, false);
             g622NoteFlushKey(st.texKey, regKey); // G622: draws must reference the resident key
@@ -4308,6 +4368,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // disagreement the other way is only a wasted decode. Both are counted separately, and
         // the whole block is confined to the GS worker thread, which is the only thread that ever
         // walks this pass (g_g178TexReg itself is an unsynchronised std::unordered_map).
+#if defined(PS2X_G684_HOT_DIAG)
         if (g513VerifyOn())
         {
             static std::unordered_map<uint64_t, uint64_t> s_g513PrevRef;
@@ -4347,6 +4408,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             s_g513PrevRef[st.texKey] = refNow;
             s_g513PrevFast[st.texKey] = fastNow;
         }
+#endif
         // G513: the stamp must have been written by the SAME byte loop that just produced
         // `hashNow`. Without this the paired A/B's arm switch would compare a reference digest
         // against an 8-lane one — always a MISS, and on a collision a stale texture.
@@ -4355,7 +4417,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             it->second.contentHash == hashNow)
         {
             it->second.genSum = genNow;
-            g_g178TexHashHits.fetch_add(1u, std::memory_order_relaxed);
+            g684DiagAdd(g_g178TexHashHits, 1u);
             g600NoteTexHit(e, st.texW, st.texH, st.texKey, "hash");
             g620NoteTexHit(g620Dec, st.texKey, true);
             g622NoteFlushKey(st.texKey, regKey); // G622: draws must reference the resident key
@@ -4377,24 +4439,27 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         bool g622Hit = false;
         if (g622Mint)
         {
-            g_g622Probes.fetch_add(1u, std::memory_order_relaxed);
+            g684DiagAdd(g_g622Probes, 1u);
             if (g622Key != st.texKey)
-                g_g622Mints.fetch_add(1u, std::memory_order_relaxed);
+                g684DiagAdd(g_g622Mints, 1u);
             g622Hit = g178_backend_has_tex(g622Key);
         }
         // Under the oracle a hit is RECORDED BUT NOT TAKEN: the decode below runs anyway and its
         // texels are compared against the digest stored when this variant was uploaded. A verify
         // run therefore always ships the pre-G622 bytes.
+#if defined(PS2X_G684_HOT_DIAG)
         const bool g622Verify = g622TexVarVerifyOn();
+#else
+        constexpr bool g622Verify = false;
+#endif
         if (g622Hit && !g622Verify)
         {
             // The resident image under `g622Key` was decoded from a source with this same content
             // hash under this same hash body, and the decode is a pure function of (descriptor,
             // source bytes, CLUT) — the descriptor is in `st.texKey` and the bytes are in `hashNow`.
-            g_g622Hits.fetch_add(1u, std::memory_order_relaxed);
-            g_g622HitPx.fetch_add(static_cast<uint64_t>(st.texW) *
-                                      static_cast<uint64_t>(st.texH),
-                                  std::memory_order_relaxed);
+            g684DiagAdd(g_g622Hits, 1u);
+            g684DiagAdd(g_g622HitPx, static_cast<uint64_t>(st.texW) *
+                                         static_cast<uint64_t>(st.texH));
             g_g178TexReg[st.texKey] =
                 G178TexReg{genNow, hashNow, st.texW, st.texH, g622HashVar, g622Key};
             g622NoteFlushKey(st.texKey, g622Key);
@@ -4406,6 +4471,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g620NoteTexDecode(g620Dec, st.texKey, it != g_g178TexReg.end(), backendHas, hashNow,
                           st.texW, st.texH, ctx.tex0.tbp0, ctx.tex0.cbp,
                           static_cast<uint32_t>(ctx.tex0.psm), ctx.tex0.tbw);
+#if defined(PS2X_G684_HOT_DIAG)
         const auto g511DecT0 = g511Split ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
         const auto g620DecT0 = g620Dec ? std::chrono::steady_clock::now()
@@ -4436,7 +4502,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // on the raw decode, above the HD-replacement hook, so what it compares is exactly the
         // texels the shipped path derives from guest VRAM. `g623TryBind` returned 0 under the
         // oracle, so this decode is the one the shipped path would have run either way.
+#if defined(PS2X_G684_HOT_DIAG)
         g623VerifyDecode(i, st, up.px);
+#endif
         // HD Texture Replacement & Dumping
         // G620: `init()` early-returns on `m_initialized`, but only AFTER taking its mutex, and it
         // was called on every decode. This pass runs on the GS worker only, so a plain file-static
@@ -4457,6 +4525,17 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // G600 (default OFF, except DC2_G600_TEXFILL which is a knowingly-incorrect ceiling probe):
         // dump / mark the texels that are about to be uploaded.
         g600DumpDecoded(e, st.texW, st.texH, st.texKey, up.px);
+        // G676: record whether THIS texture is on the curated 2D do-not-scale list. Done here,
+        // once per unique decode, so the per-draw test downstream is a map probe. Both calls are a
+        // single bool load when no list file exists.
+        dc2_noscale::noteDecodedTexture(st.texKey, up.px.data(), st.texW, st.texH);
+        dc2_noscale::noteDecodedKeyDump(up.px.data(), st.texW, st.texH);
+        // Only STATIC textures are dumpable material for the list: an FBO/RTT-sourced decode is a
+        // readback of the live scene (3,073 of them on a 60 s route, nearly all 256x256 near-copies
+        // of the game view), which can never be a HUD image and would drown the browse.
+        if (!((g261HaveFboSrc && !s_g261FboSrc.empty() && s_g261FboSrc[i] != 0u) ||
+              (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u)))
+            dc2_noscale::dumpDecodedTexture(up.px.data(), st.texW, st.texH);
         if (g620Dec)
             g620NoteStage(true, 2u,
                           static_cast<uint64_t>(
@@ -4527,14 +4606,111 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g_g178TexReg[st.texKey] =
             G178TexReg{genNow, hashNow, st.texW, st.texH,
                        static_cast<uint8_t>(g513Fast ? 1u : 0u), g622Key};
-        g_g178TexDecodes.fetch_add(1u, std::memory_order_relaxed);
+        g684DiagAdd(g_g178TexDecodes, 1u);
         g622NoteFlushKey(st.texKey, g622Key);
         g622TexVarReport();
+#else
+        G684DecodeJob job;
+        job.entryIndex = i;
+        job.genSum = genNow;
+        job.contentHash = hashNow;
+        job.residentKey = g622Key;
+        job.hashVariant = g622HashVar;
+        job.upload.key = g622Key;
+        job.upload.w = st.texW;
+        job.upload.h = st.texH;
+        job.upload.px =
+            g620AcquirePx(static_cast<size_t>(st.texW) * static_cast<size_t>(st.texH));
+        g684DecodePixels += static_cast<uint64_t>(st.texW) * static_cast<uint64_t>(st.texH);
+        // Publish the draw-key decision now. The image bytes themselves are joined before submit.
+        g622NoteFlushKey(st.texKey, g622Key);
+        s_g684DecodeJobs.push_back(std::move(job));
+#endif
     }
+#if !defined(PS2X_G684_HOT_DIAG)
+    // Decode inputs are immutable after the dependency pass, so one job is a pure transform from
+    // frozen guest VRAM into its own private RGBA vector. P5 hands each job to the SAME cooperative
+    // dispatch that builds the vertex stream (see the chunk vector below), so a decode and a vertex
+    // range are interchangeable units of work to any lane.
+    const auto g684DecodeOne = [&](size_t jobIndex) {
+        G684DecodeJob &job = s_g684DecodeJobs[jobIndex];
+        const G144Entry &e = g_g144List[job.entryIndex];
+        const G178EntryState &st = s_states[job.entryIndex];
+        g178DecodeWhole(self, gs, vram, e.ctx, e.texa, e.texclut,
+                        st.texW, st.texH, job.upload.px.data());
+        g620PoisonCheck(job.upload.px,
+                        static_cast<size_t>(st.texW) * static_cast<size_t>(st.texH));
+    };
+    const auto g684DecodeWorkBody = [&] {
+        for (size_t j = 0; j < s_g684DecodeJobs.size(); ++j)
+            g684DecodeOne(j);
+    };
+
+    const auto g684FinishDecodes = [&] {
+        if (s_g684DecodeJobs.empty())
+            return;
+        // All feature hooks and registry mutations remain on the GS owner. Only the pure pixel
+        // transform moved threads, so replacement/list state needs no new synchronization.
+        {
+            static bool s_g620ReplInit = false;
+            if (!s_g620ReplInit)
+            {
+                dc2_tex::TextureReplacementManager::instance().init();
+                s_g620ReplInit = true;
+            }
+        }
+        for (G684DecodeJob &job : s_g684DecodeJobs)
+        {
+            const size_t i = job.entryIndex;
+            const G144Entry &e = g_g144List[i];
+            const G178EntryState &st = s_states[i];
+            const GSContext &ctx = e.ctx;
+            G178TexUpload &up = job.upload;
+            dc2_tex::TextureReplacementManager::instance().tryReplaceTexture(
+                vram, vramSize, ctx, e.texa, e.texclut,
+                (g261HaveFboSrc && !s_g261FboSrc.empty() && s_g261FboSrc[i] != 0u),
+                (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u),
+                up.w, up.h, up.px);
+            g600DumpDecoded(e, st.texW, st.texH, st.texKey, up.px);
+            dc2_noscale::noteDecodedTexture(st.texKey, up.px.data(), st.texW, st.texH);
+            dc2_noscale::noteDecodedKeyDump(up.px.data(), st.texW, st.texH);
+            if (!((g261HaveFboSrc && !s_g261FboSrc.empty() && s_g261FboSrc[i] != 0u) ||
+                  (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u)))
+                dc2_noscale::dumpDecodedTexture(up.px.data(), st.texW, st.texH);
+
+            s_batch.texUploads.push_back(std::move(up));
+            g_g178TexReg[st.texKey] =
+                G178TexReg{job.genSum, job.contentHash, st.texW, st.texH,
+                           job.hashVariant, job.residentKey};
+            g684DiagAdd(g_g178TexDecodes, 1u);
+            g622TexVarReport();
+        }
+    };
+
+    static const bool s_g684AsyncPrep =
+        !envFlagEnabled("DC2_G684_NO_ASYNC_PREP") &&
+        !envFlagDisabled("DC2_G684_ASYNC_PREP");
+    // The noscale classifier reads the decoded pixels from inside this pass, so its jobs must be
+    // complete before the walk continues; that population stays fully serial and in place.
+    const bool g684ClassificationNeedsPixels =
+        !s_g684DecodeJobs.empty() && dc2_noscale::needsDecodedClassification();
+    // `g684Async` now means "these decodes are deferred to the fused dispatch below", not "a lane
+    // owns them". Everything after the dispatch is unchanged: g684FinishDecodes still runs the
+    // registry mutations and the replacement/dump hooks on the GS owner, in job order.
+    const bool g684Async = s_g684AsyncPrep && !g684ClassificationNeedsPixels &&
+                           !s_g684DecodeJobs.empty() && g684DecodePixels >= 16384u;
+    if (!g684Async)
+    {
+        g684DecodeWorkBody();
+        g684FinishDecodes();
+    }
+#endif
     // G620: one report per DC2_G620_TEXDEC_EVERY flushes, outside the per-entry walk.
     g620TexDecReport(g620Dec);
     g620RowVerifyReport();
+#if defined(PS2X_G684_HOT_DIAG)
     g623Report();
+#endif
     // G511: one relaxed add per counter per FLUSH (33.4/frame), never per entry — a per-entry
     // counter would inflate the very loop it prices (G502).
     if (g511Probe)
@@ -4638,7 +4814,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                       : std::chrono::steady_clock::time_point{};
     // Vertices + state-batched draw runs (submission order preserved — no sorting; blending
     // depends on order).
-    for (size_t i = 0; i < g_g144List.size(); ++i)
+    const bool g684MergeDrawRuns = !g256ExactRttOn();
+    const auto g684BuildVertexRange =
+        [&](size_t begin, size_t end, std::vector<G178Vtx> &g684Verts,
+            std::vector<G178Draw> &g684Draws, size_t &g684FirstEntry) {
+    for (size_t i = begin; i < end; ++i)
     {
         const G178EntryState &st = s_states[i];
         if (st.skip)
@@ -4646,8 +4826,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         const G144Entry &e = g_g144List[i];
         const int ofx = e.ctx.xyoffset.ofx >> 4;
         const int ofy = e.ctx.xyoffset.ofy >> 4;
-        const int first = static_cast<int>(s_batch.verts.size());
+        const int first = static_cast<int>(g684Verts.size());
         G406UvRoundInfo g406Round;
+        // G675: does this entry carry the 1x-calibrated -0.5-texel sprite UV shift? Set only in
+        // the GS_PRIM_SPRITE + TME + FST branch below, i.e. exactly the screen-space 1:1 blits.
+        bool g675ScreenSprite = false;
         // G261 FBO-bound entry: normalize FST UVs against the PRODUCER target's full fbW x 512
         // space instead of the declared texture dims; the V axis is flipped after the push
         // (GS row y lives at GL row 511-y in the persistent FBO).
@@ -4687,7 +4870,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         }
         if (g270LineType(static_cast<uint32_t>(e.prim.type)))
         {
-            g270AppendLinePixels(s_batch.verts, e);
+            g270AppendLinePixels(g684Verts, e);
         }
         else if (e.prim.type == GS_PRIM_SPRITE)
         {
@@ -4699,6 +4882,140 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             GSVertex q0 = e.v[0], q1 = e.v[1];
             g406Round = g406SpriteUvRoundInfo(
                 a, b, ofx, ofy, !st.bilinear, e.prim.tme != 0u, e.prim.fst != 0u);
+            // G675: the screen-space 1:1 blit population. TME+FST is what makes the -0.5 texel
+            // shift below apply, and that shift is what breaks at S>1.
+            g675ScreenSprite = (e.prim.tme != 0u && e.prim.fst != 0u);
+            // ⛔⛔ G675: A SPRITE THAT SAMPLES A RENDER TARGET MUST KEEP ITS SCREEN POSITION.
+            // Its UVs ENCODE a screen location — the effect is defined by the correspondence
+            // between where the quad lands and where it reads. Moving the geometry (the widescreen
+            // X scale) while the UVs stay put samples the wrong part of the target.
+            // MEASURED, dungeon1 sf2400 ground band, neighbour-chroma-jump:
+            //   4:3 reference 3.83 · 16:9 FOV+2D 8.02 · 16:9 FOV-only 3.83 · 16:9 2D-only 6.48.
+            // i.e. the FOV widening is clean and the SPRITE SCALE was the whole defect — the
+            // dungeon floor's shine/reflection pass is exactly this shape and turned into rainbow
+            // blocks. Clearing the bit also disarms the UV snap, which is correct: a target-sampling
+            // sprite is not a 1:1 atlas blit.
+            if (g675ScreenSprite && g261HaveFboSrc && s_g261FboSrc[i] != 0u)
+                g675ScreenSprite = false;
+            // ⭐ G676: the curated do-not-scale list wins over every heuristic below. Keyed by the
+            // decoded texture's content hash (recorded at decode time), so a listed image keeps its
+            // exact GS position and size no matter where the game parks it in VRAM.
+            if (g675ScreenSprite && dc2_noscale::texKeyIsListed(st.texKey))
+                g675ScreenSprite = false;
+            // `DC2_2D_SCALE=list`: nothing scales unless the allow-list names it. The safe way to
+            // curate — a scene nobody has looked at yet cannot be broken by a heuristic.
+            if (g675ScreenSprite && dc2_noscale::allowListMode() &&
+                !dc2_noscale::texKeyIsAllowed(st.texKey))
+                g675ScreenSprite = false;
+            // G675 census (DC2_G675_SPRITE_CENSUS=1, diagnostic only): every sprite this
+            // classification admits, keyed by target + geometry class, so the population being
+            // scaled is a MEASUREMENT rather than a reading of the source. Deduped by key.
+            if (g675ScreenSprite)
+            {
+#if defined(PS2X_G684_HOT_DIAG)
+                static const bool s_census = (std::getenv("DC2_G675_SPRITE_CENSUS") != nullptr);
+                if (s_census)
+                {
+                    const int x0 = static_cast<int>(a.x) - ofx, x1 = static_cast<int>(b.x) - ofx;
+                    const int y0 = static_cast<int>(a.y) - ofy, y1 = static_cast<int>(b.y) - ofy;
+                    const int w = (x1 > x0 ? x1 - x0 : x0 - x1);
+                    const int h = (y1 > y0 ? y1 - y0 : y0 - y1);
+                    char key[192];
+                    std::snprintf(key, sizeof(key),
+                                  "fbp=0x%03x tbp=0x%04x tbw=%u psm=0x%02x wh=%dx%d "
+                                  "z=%u zw=%u blend=%u pos=(%d,%d)",
+                                  fbp, e.ctx.tex0.tbp0, (unsigned)e.ctx.tex0.tbw,
+                                  (unsigned)e.ctx.tex0.psm, w, h,
+                                  (unsigned)(st.depthFunc & 0x0Fu), (unsigned)st.depthWrite,
+                                  (unsigned)st.blend, x0 / 32 * 32, y0 / 32 * 32);
+                    static std::mutex m; static std::unordered_set<std::string> seen;
+                    std::lock_guard<std::mutex> lk(m);
+                    if (seen.size() < 200u && seen.insert(key).second)
+                        std::fprintf(stderr, "[G675:sprite] %s\n", key);
+                }
+#endif
+            }
+            // G675, DC2_2D_SCALE=fullwidth: a screen-space quad that already spans (nearly) the
+            // whole logical width is a FULL-SCREEN element — a fade, a letterbox bar, an FMV frame
+            // — not a HUD widget. Scaling it about the centre would shrink it off the sides and
+            // leave the 3D scene showing, so this mode leaves it unscaled. Measured on the sprite's
+            // own footprint, which is exactly the information the classification needs; the 90%
+            // threshold keeps a near-full-width panel with a small margin in the same class.
+            // Clearing the bit also disarms the UV snap for it, which is correct: an unscaled
+            // sprite at S>1 is still a 1:1 blit only if it was one before, and a full-screen quad
+            // is stretched by construction.
+            if (g675ScreenSprite && dc2FullWidth2dOn() && dc2GetSpriteScaleX() != 1.0f)
+            {
+                // a.x / b.x are already PIXELS here (the branch below does
+                // `static_cast<int>(a.x) - ofx`), and the GS scissor is inclusive pixels.
+                const float dx = b.x - a.x;
+                const float spanX = (dx < 0.0f) ? -dx : dx;
+                if (spanX >= 0.90f * static_cast<float>(st.scX1 - st.scX0 + 1))
+                    g675ScreenSprite = false;
+            }
+            // ⭐⭐⭐ G680: THE GS SPRITE COVERAGE RULE IS `ceil`, AND IT IS A PROPERTY OF EVERY
+            // SPRITE, NOT OF THE RTT CLASSES.
+            //
+            // `drawSprite` (the CPU rasterizer) has applied the G365 ceil rule to EVERY sprite class
+            // since G368 (`s_g367Sel` defaults to 7 = all): a sprite covers pixel P iff
+            // `ceil(p0) <= P < ceil(p1)`, and the texture coordinate at P is the raw affine map
+            // `t0 + (P - p0)·dt/dp` evaluated at P's INTEGER coordinate. The GPU half of that rule
+            // lived only inside the RTT/transient branch below, so every ordinary sprite was handed
+            // to GL with its RAW, possibly FRACTIONAL rect and let GL pick coverage by the
+            // pixel-CENTRE rule instead — `floor(p0 + 0.5) <= P < floor(p1 + 0.5)`.
+            //
+            // The two rules agree exactly whenever the edge is on an integer, which is why this
+            // survived every gate: virtually all of DC2's 2D sits on integers. They disagree by one
+            // row/column whenever an edge carries a 12.4 fraction below 0.5 — and the Item menu's
+            // fish icons are the one population in the game that ANIMATES BY A SUB-PIXEL VERTICAL
+            // BOB (measured: y0 = 253.1250 / 252.3125 / 251.5625 … at a fixed 32x40 size). On those
+            // phases GL rasterized one row ABOVE the row hardware draws, and the constant
+            // `-0.5 texel/pixel` FST shift then evaluated the texture coordinate BELOW the sprite's
+            // own UV rectangle (v = 735.9 for a cell that starts at v = 736.0). A NEAREST sampler
+            // reads that as the atlas row above the icon cell — a slice of a NEIGHBOURING icon,
+            // whose black outline is the reported "black dash floating above the fish".
+            //
+            // Snapping the quad to the ceil grid fixes coverage; the UV anchor is then repaired for
+            // free by G407's subpixel-phase shift below, which already derives the shift from
+            // `(snapped corner - raw corner - 0.5)·step` and is algebraically exact for ANY snapped
+            // rect (the two endpoint shifts also rescale the ramp so the effective step stays the
+            // RAW `dt/dp`). ⛔ Deliberately NOT the RTT branch's `max(1, span)` expansion: G367
+            // measured that combination as the cause of the MAP-160 page-row tear, and the CPU rule
+            // drops a collapsed sprite instead. A ceil-snapped degenerate quad rasterizes nothing in
+            // GL, which is the same answer.
+            //
+            // IDENTITY BY CONSTRUCTION on an integer rect: `ceil(n) == n`, so the corners are
+            // unchanged and the phase shift below reduces to exactly `-0.5·step`.
+            // Rollback: DC2_G680_NO_SPRITE_CEIL=1.
+            static const bool s_g680SpriteCeil = !envFlagEnabled("DC2_G680_NO_SPRITE_CEIL");
+            bool g680Snapped = false;
+            if (s_g680SpriteCeil &&
+                !(g255Rtt || g286Transient || g570Exact13d || g586Exact141 || g587Exact15d))
+            {
+                const float fx0 = std::ceil(a.x - static_cast<float>(ofx));
+                const float fy0 = std::ceil(a.y - static_cast<float>(ofy));
+                const float fx1 = std::ceil(b.x - static_cast<float>(ofx));
+                const float fy1 = std::ceil(b.y - static_cast<float>(ofy));
+                g680Snapped = (fx0 != a.x - static_cast<float>(ofx)) ||
+                              (fy0 != a.y - static_cast<float>(ofy)) ||
+                              (fx1 != b.x - static_cast<float>(ofx)) ||
+                              (fy1 != b.y - static_cast<float>(ofy));
+                q0.x = fx0 + static_cast<float>(ofx);
+                q0.y = fy0 + static_cast<float>(ofy);
+                q1.x = fx1 + static_cast<float>(ofx);
+                q1.y = fy1 + static_cast<float>(ofy);
+            }
+#if defined(PS2X_G680_DIAG)
+            g680NoteSpriteSnap(g680Snapped ? 1 : 0, e.prim.tme ? 1 : 0, e.prim.fst ? 1 : 0);
+            if (e.prim.tme && e.prim.fst)
+                g680NoteSpriteOracle(
+                    static_cast<int>(std::lround((a.x - static_cast<float>(ofx)) * 16.0f)),
+                    static_cast<int>(std::lround((a.y - static_cast<float>(ofy)) * 16.0f)),
+                    static_cast<int>(std::lround((b.x - static_cast<float>(ofx)) * 16.0f)),
+                    static_cast<int>(std::lround((b.y - static_cast<float>(ofy)) * 16.0f)),
+                    static_cast<int>(a.u), static_cast<int>(a.v),
+                    static_cast<int>(b.u), static_cast<int>(b.v));
+#endif
             if (g255Rtt || g286Transient || g570Exact13d || g586Exact141 || g587Exact15d)
             {
                 // drawSprite first truncates screen positions, sorts the bounds, and expands a
@@ -4750,6 +5067,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 // G366 (diagnostic, default-off): every RTT/transient sprite whose ceil-rect
                 // differs from the legacy trunc-rect — i.e. exactly the draws G365's GPU-side
                 // change moves. Deduped by the rect pair so the log stays short.
+ #if defined(PS2X_G684_HOT_DIAG)
                 {
                     static const bool s_g366 = (std::getenv("DC2_G366_RECT") != nullptr);
                     if (s_g366)
@@ -4776,6 +5094,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         }
                     }
                 }
+ #endif
                 q0.x = static_cast<float>(sx0 + ofx);
                 q0.y = static_cast<float>(sy0 + ofy);
                 q1.x = static_cast<float>(sx0 + std::max(1, sx1 - sx0) + ofx);
@@ -4797,8 +5116,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             {
                 const float dxp = q1.x - q0.x; // positions are already pixel-unit floats (kick /16)
                 const float dyp = q1.y - q0.y;
+                // G680: a ceil-snapped rect MUST take the phase-correct shift — the constant
+                // `-0.5·step` form is only equivalent when the quad's corner IS the raw vertex.
+                // (`g680Snapped` is false on an integer rect, so the selector is unchanged for
+                // every sprite the snap does not move.)
                 const bool g407SubpixelPhase =
-                    g406Round.active && g407SpriteSubpixelPhaseEnabled();
+                    (g406Round.active && g407SpriteSubpixelPhaseEnabled()) || g680Snapped;
                 const float rawX0 = a.x - static_cast<float>(ofx);
                 const float rawY0 = a.y - static_cast<float>(ofy);
                 const float rawX1 = b.x - static_cast<float>(ofx);
@@ -4838,6 +5161,41 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         16.0f / dyp;
                 }
             }
+#if defined(PS2X_G680_DIAG)
+            // G680 (diagnostic build only, rule 12c): the exact affine map of every scaled FST
+            // sprite — 12.4 screen rect, 12.4 UV rect, the front end's -0.5-texel shift, and the
+            // G406/G407/G679 rounding state that travels with it. The reporter lives in the cold
+            // TU ps2_g680_diag.cpp; this is one `#if`-excluded out-of-line call.
+            if (e.prim.tme && e.prim.fst)
+            {
+                const int dxr = static_cast<int>(std::lround((b.x - a.x) * 16.0f));
+                const int dyr = static_cast<int>(std::lround((b.y - a.y) * 16.0f));
+                const int dur = static_cast<int>(b.u) - static_cast<int>(a.u);
+                const int dvr = static_cast<int>(b.v) - static_cast<int>(a.v);
+                if ((dxr != dur || dyr != dvr) && dxr != 0 && dyr != 0)
+                {
+                    g680NoteIconSprite(
+                        static_cast<unsigned>(e.ctx.tex0.tbp0), static_cast<unsigned>(e.ctx.tex0.tbw),
+                        static_cast<unsigned>(e.ctx.tex0.psm), st.texW, st.texH, pushTexW, pushTexH,
+                        static_cast<int>(std::lround((a.x - static_cast<float>(ofx)) * 16.0f)),
+                        static_cast<int>(std::lround((a.y - static_cast<float>(ofy)) * 16.0f)),
+                        static_cast<int>(std::lround((b.x - static_cast<float>(ofx)) * 16.0f)),
+                        static_cast<int>(std::lround((b.y - static_cast<float>(ofy)) * 16.0f)),
+                        static_cast<int>(a.u), static_cast<int>(a.v),
+                        static_cast<int>(b.u), static_cast<int>(b.v),
+                        static_cast<int>(std::lround((q0.x - static_cast<float>(ofx)) * 16.0f)),
+                        static_cast<int>(std::lround((q0.y - static_cast<float>(ofy)) * 16.0f)),
+                        static_cast<int>(std::lround((q1.x - static_cast<float>(ofx)) * 16.0f)),
+                        static_cast<int>(std::lround((q1.y - static_cast<float>(ofy)) * 16.0f)),
+                        uvShiftU0, uvShiftU1, uvShiftV0, uvShiftV1,
+                        static_cast<unsigned>(g406Round.flagsU), static_cast<unsigned>(g406Round.flagsV),
+                        g406Round.originX, g406Round.originY,
+                        static_cast<unsigned>(g406Round.periodU), static_cast<unsigned>(g406Round.periodV),
+                        g675ScreenSprite ? 1 : 0,
+                        static_cast<unsigned>(st.wrapU), static_cast<unsigned>(st.wrapV), 0);
+                }
+            }
+#endif
             // Two triangles covering the rect; UVs pair with the ORIGINAL corners (axis-aligned).
             GSVertex c00 = q0, c11 = q1, c10 = q0, c01 = q0;
             c10.x = q1.x; c10.u = q1.u; // (x1, y0)
@@ -4847,12 +5205,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             c00.z = c10.z = c11.z = c01.z = b.z;
             c00.fog = c10.fog = c11.fog = c01.fog = b.fog; // G364: sprite F is flat (2nd vertex)
             const bool tme = e.prim.tme, fst = e.prim.fst;
-            g178PushVertex(s_batch.verts, c00, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU0, uvShiftV0);
-            g178PushVertex(s_batch.verts, c10, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU1, uvShiftV0);
-            g178PushVertex(s_batch.verts, c11, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU1, uvShiftV1);
-            g178PushVertex(s_batch.verts, c00, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU0, uvShiftV0);
-            g178PushVertex(s_batch.verts, c11, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU1, uvShiftV1);
-            g178PushVertex(s_batch.verts, c01, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU0, uvShiftV1);
+            g178PushVertex(g684Verts, c00, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU0, uvShiftV0);
+            g178PushVertex(g684Verts, c10, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU1, uvShiftV0);
+            g178PushVertex(g684Verts, c11, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU1, uvShiftV1);
+            g178PushVertex(g684Verts, c00, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU0, uvShiftV0);
+            g178PushVertex(g684Verts, c11, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU1, uvShiftV1);
+            g178PushVertex(g684Verts, c01, ofx, ofy, b, tme, fst, pushTexW, pushTexH, uvShiftU0, uvShiftV1);
         }
         else
         {
@@ -4875,18 +5233,20 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     p.x += s_g570Gpu139Shift;
                     p.y += s_g570Gpu139Shift;
                 }
-                g178PushVertex(s_batch.verts, p, ofx, ofy, iip ? e.v[k] : e.v[2],
+                g178PushVertex(g684Verts, p, ofx, ofy, iip ? e.v[k] : e.v[2],
                                tme, fst, pushTexW, pushTexH, 0.0f, 0.0f);
             }
         }
-        const int count = static_cast<int>(s_batch.verts.size()) - first;
+        const int count = static_cast<int>(g684Verts.size()) - first;
+        if (g684FirstEntry == static_cast<size_t>(-1))
+            g684FirstEntry = i;
         if (g261Bound)
         {
             // GS texel row v ↔ FBO GL row 511-v: flip the normalized T coordinate. Linear in
             // screen space, so a per-vertex flip is exact under noperspective interpolation.
             for (int k = first; k < first + count; ++k)
-                s_batch.verts[static_cast<size_t>(k)].tq =
-                    1.0f - s_batch.verts[static_cast<size_t>(k)].tq;
+                g684Verts[static_cast<size_t>(k)].tq =
+                    1.0f - g684Verts[static_cast<size_t>(k)].tq;
             // G624: ⛔ THIS FLIP IS EXACT FOR THE COORDINATE AND WRONG FOR THE ROUNDING STATE that
             // travels beside it. `g406Round` is expressed in GS V; the backend now undoes the flip
             // before applying it (`uUvFlipV`). Count the population so "no other srcFbp consumer
@@ -4894,21 +5254,28 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             g624NoteBound(g406Round.flagsU, g406Round.flagsV,
                           g623SurfaceFbW(s_g261FboSrc[i]) > 0);
         }
-        if (!g256ExactRttOn() && !s_batch.draws.empty() &&
+        if (g684MergeDrawRuns && !g684Draws.empty() &&
             g178StateEqual(s_states[i], s_states[i - 1]) &&
             (!g261HaveFboSrc || s_g261FboSrc[i] == s_g261FboSrc[i - 1]) &&
-            s_batch.draws.back().texKey == (g261Bound ? 0u : drawTexKey) &&
-            s_batch.draws.back().uvOriginX == g406Round.originX &&
-            s_batch.draws.back().uvOriginY == g406Round.originY &&
-            s_batch.draws.back().uvRoundU == g406Round.flagsU &&
-            s_batch.draws.back().uvRoundV == g406Round.flagsV &&
-            s_batch.draws.back().firstVtx + s_batch.draws.back().vtxCount == first)
+            g684Draws.back().texKey == (g261Bound ? 0u : drawTexKey) &&
+            g684Draws.back().uvOriginX == g406Round.originX &&
+            g684Draws.back().uvOriginY == g406Round.originY &&
+            g684Draws.back().uvRoundU == g406Round.flagsU &&
+            g684Draws.back().uvRoundV == g406Round.flagsV &&
+            // G679: the exact-lattice period is per-sprite state the shader reads, so two sprites
+            // that disagree on it can no more merge than two that disagree on origin or flags.
+            g684Draws.back().uvPeriodU == g406Round.periodU &&
+            g684Draws.back().uvPeriodV == g406Round.periodV &&
+            // G675: a screen-space sprite and a triangle take different sampling and different
+            // vertex X, so they must never merge into one draw record.
+            g684Draws.back().screenSprite == (g675ScreenSprite ? 1u : 0u) &&
+            g684Draws.back().firstVtx + g684Draws.back().vtxCount == first)
         {
-            s_batch.draws.back().vtxCount += count;
+            g684Draws.back().vtxCount += count;
         }
         else
         {
-            G178Draw d;
+            G178Draw d{};
             d.firstVtx = first;
             d.vtxCount = count;
             d.texKey = g261Bound ? 0u : drawTexKey;
@@ -4927,10 +5294,225 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             d.uvOriginY = static_cast<uint16_t>(g406Round.originY);
             d.uvRoundU = g406Round.flagsU;
             d.uvRoundV = g406Round.flagsV;
+            d.uvPeriodU = g406Round.periodU; // G679
+            d.uvPeriodV = g406Round.periodV; // G679
+            d.screenSprite = g675ScreenSprite ? 1u : 0u; // G675
             d.scX0 = st.scX0; d.scY0 = st.scY0; d.scX1 = st.scX1; d.scY1 = st.scY1;
-            s_batch.draws.push_back(d);
+            g684Draws.push_back(d);
         }
     }
+    };
+
+    size_t g684HeadFirstEntry = static_cast<size_t>(-1);
+#if !defined(PS2X_G684_HOT_DIAG)
+    // The accepted stream is strictly ordered, but translating each entry is independent once
+    // dependency binding and texture-key selection have frozen.  Cut the entry range into K ordered
+    // chunks, let the EXISTING GSRowPool claim them cooperatively (over-decomposed, work-stealing,
+    // caller participating), then concatenate the chunks in index order and repair the K-1 draw-run
+    // boundaries.  Small flushes stay scalar: a dispatch costs more than their vertex arithmetic.
+    //
+    // ⭐ G684 P4: the pool is the one already built for CPU band replay (G637).  G671 measured it at
+    // 0.15 ms/f / ~1% occupancy on `dungeon1`, i.e. eleven affinitised, already-warm lanes sitting
+    // idle inside the very stage that is the pole.  Reusing it beats the two bespoke lanes P3 used:
+    // no extra threads, no extra affinity policy, and `runCoop`'s dynamic claiming means the join
+    // waits for the worst CHUNK instead of the worst half.
+    static const bool s_g684ParallelVerts =
+        !envFlagEnabled("DC2_G684_NO_PAR_VERTS") &&
+        !envFlagDisabled("DC2_G684_PAR_VERTS");
+    static const unsigned s_g684PrepCpuCount = std::thread::hardware_concurrency();
+    static const bool s_g684ParallelVertsCpu = s_g684PrepCpuCount >= 4u;
+    constexpr size_t kG684ParallelVertsMinEntries = 192u;
+    // Entries per chunk and the worker seat budget. Both are read once and cached; they exist so a
+    // sweep can move the two scheduling constants without a relink, not as per-flush policy.
+    static const size_t s_g684VertChunkEntries = [] {
+        const char *v = std::getenv("DC2_G684_VERT_CHUNK");
+        const long long k = (v != nullptr) ? std::atoll(v) : 0LL;
+        return (k >= 16LL && k <= 4096LL) ? static_cast<size_t>(k) : size_t(64);
+    }();
+    static const int s_g684VertSeats = [] {
+        const char *v = std::getenv("DC2_G684_VERT_SEATS");
+        const long long k = (v != nullptr) ? std::atoll(v) : 0LL;
+        return (k >= 1LL && k <= 15LL) ? static_cast<int>(k) : 5;
+    }();
+
+    int g684VertChunks = 0;
+    if (s_g684ParallelVerts && s_g684ParallelVertsCpu &&
+        g_g144List.size() >= kG684ParallelVertsMinEntries)
+    {
+        const size_t want = g_g144List.size() / s_g684VertChunkEntries;
+        g684VertChunks = static_cast<int>(std::min<size_t>(want, size_t(32)));
+        if (g684VertChunks < 1)
+            g684VertChunks = 1;
+    }
+    // P5: the deferred decode jobs join the same dispatch as chunks of width one, placed at the
+    // LOW indices so the shared cursor hands them out first — they are the long poles of this
+    // stage and claiming them last would leave one lane finishing a whole texture after every
+    // vertex range is already done.
+    const int g684DecodeChunks =
+        g684Async ? static_cast<int>(s_g684DecodeJobs.size()) : 0;
+    const int g684TotalChunks = g684DecodeChunks + g684VertChunks;
+    const bool g684CoopPrep = g684TotalChunks >= 2 && s_g684ParallelVertsCpu &&
+                              GSRowPool::instance().laneCap() > 1;
+    const bool g684ParallelVerts = g684CoopPrep && g684VertChunks >= 1;
+
+    const auto g684AppendVertexChunk = [&](G684VertexChunk &chunk) {
+        const int tailBase = static_cast<int>(s_batch.verts.size());
+        const size_t tailFirst = chunk.firstEntry;
+        const bool mergeBoundary =
+            g684MergeDrawRuns && !s_batch.draws.empty() && !chunk.draws.empty() &&
+            tailFirst > 0u && tailFirst < s_states.size() &&
+            g178StateEqual(s_states[tailFirst], s_states[tailFirst - 1u]) &&
+            (!g261HaveFboSrc ||
+             s_g261FboSrc[tailFirst] == s_g261FboSrc[tailFirst - 1u]) &&
+            g684DrawStateEqual(s_batch.draws.back(), chunk.draws.front()) &&
+            s_batch.draws.back().firstVtx + s_batch.draws.back().vtxCount == tailBase &&
+            chunk.draws.front().firstVtx == 0;
+
+        s_batch.verts.reserve(s_batch.verts.size() + chunk.verts.size());
+        s_batch.verts.insert(s_batch.verts.end(), chunk.verts.begin(), chunk.verts.end());
+        s_batch.draws.reserve(s_batch.draws.size() + chunk.draws.size());
+        size_t firstTailDraw = 0u;
+        if (mergeBoundary)
+        {
+            s_batch.draws.back().vtxCount += chunk.draws.front().vtxCount;
+            firstTailDraw = 1u;
+        }
+        for (size_t j = firstTailDraw; j < chunk.draws.size(); ++j)
+        {
+            G178Draw d = chunk.draws[j];
+            d.firstVtx += tailBase;
+            s_batch.draws.push_back(d);
+        }
+    };
+
+    if (g684CoopPrep)
+    {
+        // Persistent chunk storage: the vectors retain their capacity across flushes, so a steady
+        // scene allocates nothing here after the first few frames.
+        static std::vector<G684VertexChunk> s_g684VertexChunks;
+        static std::vector<int> s_g684PrepBounds;
+        if (static_cast<int>(s_g684VertexChunks.size()) < g684VertChunks)
+            s_g684VertexChunks.resize(static_cast<size_t>(g684VertChunks));
+        s_g684PrepBounds.resize(static_cast<size_t>(g684TotalChunks) + 1u);
+        // Chunks [0, D) are decode jobs, one virtual index each. Chunks [D, D+V) are ordered entry
+        // ranges shifted up by D, so one strictly increasing fence describes both kinds.
+        for (int c = 0; c <= g684DecodeChunks; ++c)
+            s_g684PrepBounds[static_cast<size_t>(c)] = c;
+        const size_t g684N = g_g144List.size();
+        for (int c = 1; c <= g684VertChunks; ++c)
+            s_g684PrepBounds[static_cast<size_t>(g684DecodeChunks + c)] =
+                g684DecodeChunks + static_cast<int>((g684N * static_cast<size_t>(c)) /
+                                                    static_cast<size_t>(g684VertChunks));
+        for (int c = 0; c < g684VertChunks; ++c)
+            s_g684VertexChunks[static_cast<size_t>(c)].reset();
+
+        // `runCoop` hands each participant an INCLUSIVE index pair taken from the same fence array,
+        // so the chunk is recovered from its own lower bound — no shared cursor is read here and
+        // two participants can never select the same chunk.
+        const int *g684BoundsData = s_g684PrepBounds.data();
+        const int g684DecodeBase = g684DecodeChunks;
+        const std::function<void(int, int)> g684ChunkJob = [&](int lo, int hi) {
+            // ⛔ The decoder carries its own promoted row split; a nested dispatch would overwrite
+            // this one's bounds and cursor. Stand it down for the whole chunk body.
+            G684PoolChunkScope g684NoNested;
+            if (lo < g684DecodeBase)
+            {
+                g684DecodeOne(static_cast<size_t>(lo));
+                return;
+            }
+            const int c = static_cast<int>(
+                std::lower_bound(g684BoundsData + g684DecodeBase,
+                                 g684BoundsData + g684TotalChunks, lo) -
+                (g684BoundsData + g684DecodeBase));
+            G684VertexChunk &chunk = s_g684VertexChunks[static_cast<size_t>(c)];
+            g684BuildVertexRange(static_cast<size_t>(lo - g684DecodeBase),
+                                 static_cast<size_t>(hi - g684DecodeBase) + 1u,
+                                 chunk.verts, chunk.draws, chunk.firstEntry);
+        };
+        int g684Seats = s_g684VertSeats;
+        if (g684Seats > g684TotalChunks - 1)
+            g684Seats = g684TotalChunks - 1;
+        if (g684Seats < 1)
+            g684Seats = 1;
+        GSRowPool::instance().runCoop(g684BoundsData, g684TotalChunks, g684Seats, g684ChunkJob);
+
+        if (g684VertChunks >= 1)
+        {
+            for (int c = 0; c < g684VertChunks; ++c)
+                g684AppendVertexChunk(s_g684VertexChunks[static_cast<size_t>(c)]);
+            g684HeadFirstEntry = s_g684VertexChunks[0].firstEntry;
+        }
+        else
+        {
+            // Decode-only dispatch (a flush below the vertex-chunking floor that still owed
+            // transforms). The stream is short; translate it on the owner.
+            g684BuildVertexRange(0u, g_g144List.size(), s_batch.verts, s_batch.draws,
+                                 g684HeadFirstEntry);
+        }
+    }
+    else
+    {
+        // No dispatch was raised, so any deferred decode still owes its transform. Run it here,
+        // before the vertex build, exactly as the fully serial arm does.
+        if (g684Async)
+            g684DecodeWorkBody();
+        g684BuildVertexRange(0u, g_g144List.size(), s_batch.verts, s_batch.draws,
+                             g684HeadFirstEntry);
+    }
+
+    // Same-run exactness oracle for development gates.  It rebuilds the original scalar stream
+    // and compares every translated byte/state field; never enable it in a timing run.
+    static const bool s_g684VerifyParallelVerts =
+        envFlagEnabled("DC2_G684_VERIFY_PAR_VERTS");
+    if (s_g684VerifyParallelVerts && g684ParallelVerts)
+    {
+        static G684VertexChunk s_g684VertexReference;
+        s_g684VertexReference.reset();
+        g684BuildVertexRange(0u, g_g144List.size(),
+                             s_g684VertexReference.verts, s_g684VertexReference.draws,
+                             s_g684VertexReference.firstEntry);
+        bool same = s_g684VertexReference.verts.size() == s_batch.verts.size() &&
+                    s_g684VertexReference.draws.size() == s_batch.draws.size();
+        if (same && !s_batch.verts.empty())
+            same = std::memcmp(s_g684VertexReference.verts.data(), s_batch.verts.data(),
+                               s_batch.verts.size() * sizeof(G178Vtx)) == 0;
+        for (size_t i = 0u; same && i < s_batch.draws.size(); ++i)
+        {
+            const G178Draw &a = s_g684VertexReference.draws[i];
+            const G178Draw &b = s_batch.draws[i];
+            same = a.firstVtx == b.firstVtx && a.vtxCount == b.vtxCount &&
+                   g684DrawStateEqual(a, b);
+        }
+        static uint64_t s_g684VerifyFlushes = 0u;
+        ++s_g684VerifyFlushes;
+        if (!same)
+        {
+            std::fprintf(stderr,
+                         "[G684:parverts-verify] MISMATCH flush=%llu entries=%zu "
+                         "ref=%zu/%zu parallel=%zu/%zu chunks=%u\n",
+                         static_cast<unsigned long long>(s_g684VerifyFlushes),
+                         g_g144List.size(), s_g684VertexReference.verts.size(),
+                         s_g684VertexReference.draws.size(), s_batch.verts.size(),
+                         s_batch.draws.size(), static_cast<unsigned>(g684VertChunks));
+            std::abort();
+        }
+        if (s_g684VerifyFlushes == 1u || (s_g684VerifyFlushes % 2000u) == 0u)
+            std::fprintf(stderr,
+                         "[G684:parverts-verify] exact=%llu entries=%zu chunks=%u\n",
+                         static_cast<unsigned long long>(s_g684VerifyFlushes),
+                         g_g144List.size(), static_cast<unsigned>(g684VertChunks));
+    }
+#else
+    g684BuildVertexRange(0u, g_g144List.size(), s_batch.verts, s_batch.draws,
+                         g684HeadFirstEntry);
+#endif
+
+#if !defined(PS2X_G684_HOT_DIAG)
+    // `runCoop` returns only when every claimed chunk has COMPLETED, so the decode outputs are
+    // published by the time control reaches here — that join IS the publication fence.
+    if (g684Async)
+        g684FinishDecodes();
+#endif
 
     const auto g298T5 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
@@ -5114,7 +5696,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     if (g310Freeze.active && !g310FrozenUsable())
     {
         g_g266FlushRej = kG266FrSubmit;
-        g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+        g684DiagAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -5314,7 +5896,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 }
         }
         g_g266FlushRej = kG266FrSubmit;
-        g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+        g684DiagAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -5330,7 +5912,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         {
             g282DropResidencyAfterFanoutFailure();
             g_g266FlushRej = kG266FrSubmit;
-            g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+            g684DiagAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false;
         }
@@ -5366,7 +5948,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             std::fprintf(stderr, "[G262:depth] Z readback FAIL fbp=0x%x rows=%d..%d\n",
                          fbp, depthRowLo, depthRowHi);
             g_g266FlushRej = kG266FrZReadback;
-            g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+            g684DiagAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false;
         }
@@ -5475,7 +6057,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 if (!g278FlushPendingDepth(0))
                 {
                     g_g266FlushRej = kG266FrZReadback;
-                    g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+                    g684DiagAdd(g_g178Fallbacks, 1u);
                     g581InvalidateCpuFallbackSnapshots();
                     return false;
                 }
@@ -5513,7 +6095,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 if (!g278FlushPendSlot(s_g278PendTab[0], 0))
                 {
                     g_g266FlushRej = kG266FrZReadback;
-                    g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+                    g684DiagAdd(g_g178Fallbacks, 1u);
                     g581InvalidateCpuFallbackSnapshots();
                     return false;
                 }
@@ -5537,7 +6119,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     if (!g278FlushPendSlot(p, 0))
                     {
                         g_g266FlushRej = kG266FrZReadback;
-                        g_g178Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+                        g684DiagAdd(g_g178Fallbacks, 1u);
                         g581InvalidateCpuFallbackSnapshots();
                         return false;
                     }
@@ -5927,7 +6509,14 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g_g276Deferred.fetch_add(1u, std::memory_order_relaxed);
     }
 
+#if defined(PS2X_G684_HOT_DIAG)
     const uint64_t nGpu = g_g178GpuFlushes.fetch_add(1u, std::memory_order_relaxed) + 1u;
+#else
+    // Accepted flushes are owned by one GS thread. Keep the local report denominator without a
+    // locked cross-core RMW in the production graph.
+    static uint64_t s_g684GpuFlushes = 0u;
+    const uint64_t nGpu = ++s_g684GpuFlushes;
+#endif
 #if defined(PS2X_G654_DIAG)
     {
         // G654 P11. Same denominator (nGpu) and same cumulative-mean convention as `[G298:profile]`,
@@ -6297,7 +6886,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                          static_cast<double>(s_verts) / nGpu,
                          static_cast<double>(s_draws) / nGpu);
     }
+#if defined(PS2X_G684_HOT_DIAG)
     static const bool s_stat = (std::getenv("DC2_G178_STAT") != nullptr);
+#else
+    constexpr bool s_stat = false;
+#endif
     if (s_stat && (nGpu % 300u) == 0u)
         std::fprintf(stderr,
             "[G178:stat] flushes=%llu gpu=%llu fallback=%llu texDecodes=%llu texHits=%llu "

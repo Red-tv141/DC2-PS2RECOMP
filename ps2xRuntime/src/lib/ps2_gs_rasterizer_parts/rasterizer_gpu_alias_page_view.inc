@@ -575,11 +575,15 @@ static uint64_t g261WindowGenNow(const G261Res &r, uint32_t fbp)
 // and swallows the T8 cloud texture at 0x2720 plus several streaming-texture pages.
 // Counters only; no behaviour change.
 static std::atomic<uint64_t> g_g536MatTotal{0}, g_g536MatMoved{0};
+#if defined(PS2X_G684_HOT_DIAG)
 static bool g536MatChkOn()
 {
     static const bool on = envFlagEnabled("DC2_G536_MATCHK");
     return on;
 }
+#else
+static constexpr bool g536MatChkOn() { return false; }
+#endif
 // ===== G536 FIX (default-ON, kill DC2_G536_NO_PAGEOWN=1): page-ownership-aware publication =====
 // The residency claims a full-width row window, so on MAP-15 target 0x139 (fbw=8, cov=0..447)
 // its claim spans ~blocks 0x2720..0x3520 and swallows the T8 cloud texture at 0x2720 plus several
@@ -761,7 +765,7 @@ static void g536RestoreGuestOwnedPages(const std::vector<G536PageSave> &saved, u
             std::memcpy(vram + off, s.bytes.data(), 8192);
     }
     if (!saved.empty())
-        g_g536PagesKept.fetch_add(saved.size(), std::memory_order_relaxed);
+        g684DiagAdd(g_g536PagesKept, saved.size());
 }
 
 static void g536NoteMaterialize(const G261Res &r, uint32_t fbp, int cause)
@@ -1086,11 +1090,15 @@ static bool g454SkipReadbackAt(int siteLever)
 }
 
 // Behaviour-pure timing of this publication loop only (DC2_G432_CENSUS=1).
+#if defined(PS2X_G684_HOT_DIAG)
 static bool g432MatCensusOn()
 {
     static const bool on = envFlagEnabled("DC2_G432_CENSUS");
     return on;
 }
+#else
+static constexpr bool g432MatCensusOn() { return false; }
+#endif
 static uint64_t g_g432MatUnpackNs = 0, g_g432MatUnpackN = 0, g_g432MatUnpackPx = 0;
 
 // ===== G599: THE WRITE — what does a publication actually CHANGE in guest VRAM? (DEFAULT OFF) ====
@@ -1115,11 +1123,15 @@ static uint64_t g_g432MatUnpackNs = 0, g_g432MatUnpackN = 0, g_g432MatUnpackPx =
 //
 // Behaviour-pure: every byte compared and every counter touched is inside `if (g599)`. The page
 // walk is g536CollectGuestOwnedPages' walk verbatim, so the two describe the same page set.
+#if defined(PS2X_G684_HOT_DIAG)
 static bool g599PubOn()
 {
     static const bool on = envFlagEnabled("DC2_G599_PUB");
     return on;
 }
+#else
+static constexpr bool g599PubOn() { return false; }
+#endif
 static uint32_t g599EnvU32(const char *name, uint32_t dflt)
 {
     const char *e = std::getenv(name);
@@ -1156,11 +1168,15 @@ static bool g601RejOn()
     static const bool on = envFlagEnabled("DC2_G601_REJ");
     return on;
 }
+#if defined(PS2X_G684_HOT_DIAG)
 static bool g601MatOn()
 {
     static const bool on = envFlagEnabled("DC2_G601_MAT");
     return on;
 }
+#else
+static constexpr bool g601MatOn() { return false; }
+#endif
 static uint32_t g601Fbp()
 {
     static const uint32_t v = []() -> uint32_t {
@@ -1188,6 +1204,7 @@ static bool g601Window()
 //                                (p = page - fbp), so the write can be bisected page by page
 //   DC2_G599_NOPUB_FBW=<n>       restrict it to publications at that FBW (0x139 publishes at both
 //                                8 and 2; G568's law says never treat the two as one population)
+#if defined(PS2X_G684_HOT_DIAG)
 static uint32_t g599NoPubFbp()
 {
     static const uint32_t v = []() -> uint32_t {
@@ -1203,6 +1220,10 @@ static bool g599NoPubFor(uint32_t fbp, uint32_t fbw)
     static const uint32_t only = g599EnvU32("DC2_G599_NOPUB_FBW", 0u);
     return only == 0u || only == fbw;
 }
+#else
+static constexpr uint32_t g599NoPubFbp() { return 0xFFFFFFFFu; }
+static constexpr bool g599NoPubFor(uint32_t, uint32_t) { return false; }
+#endif
 static std::atomic<uint64_t> g_g599NoPubHits{0}, g_g599NoPubPages{0};
 
 struct G599PubBucket
@@ -1539,9 +1560,9 @@ static void g261Materialize(int ti, int cause)
             g536CollectGuestOwnedPages(r, fbp, r.dirtyLo, r.dirtyHi, vram, g_g261VramSize,
                                        s_g536Saved);
             t_g597InMatPrePub = false; // G597: the guard has read the anchor
-            g_g536PubTotal.fetch_add(1u, std::memory_order_relaxed);
+            g684DiagAdd(g_g536PubTotal, 1u);
             if (!s_g536Saved.empty())
-                g_g536PubGuarded.fetch_add(1u, std::memory_order_relaxed);
+                g684DiagAdd(g_g536PubGuarded, 1u);
             // G599 (default OFF): snapshot the target's own pages so the publication's ACTUAL
             // byte effect can be measured, not inferred. Straddles the guard's restore so what it
             // reports is the net effect on guest VRAM, which is what a consumer reads.
@@ -1657,7 +1678,7 @@ static void g261Materialize(int ti, int cause)
                      "[G261:materialize-fail] fbp=0x%x rows=%d..%d fbW=%d cause=%d — residency "
                      "dropped, VRAM stays authoritative\n",
                      fbp, r.dirtyLo, r.dirtyHi, r.fbW, cause);
-        g_g261Mat[kG261MatFail].fetch_add(1u, std::memory_order_relaxed);
+        g684DiagAdd(g_g261Mat[kG261MatFail], 1u);
         // FBO↔VRAM equality is unknown now — force a fresh upload. Reset in place (callers may
         // hold live references into g_g178FbSnap; erase would invalidate them). G351: both
         // surface snapshots (the split routes 0x139 across two FBO keys).
@@ -1678,7 +1699,7 @@ static void g261Materialize(int ti, int cause)
     r.dirtyHi = -1;
     g261UpdateWindow(ti); // window shrinks to cov rows; gen baseline re-anchored past our bump
     g310NoteTargetClean(ok);
-    g_g261MatByTarget[ti & 7].fetch_add(1u, std::memory_order_relaxed);
+    g684DiagAdd(g_g261MatByTarget[ti & 7], 1u);
     if (g279Profile)
     {
         g_g279MatNs[cause & 7].fetch_add(
@@ -1688,9 +1709,11 @@ static void g261Materialize(int ti, int cause)
         g_g279MatRows[cause & 7].fetch_add(
             static_cast<uint64_t>(std::max(rows, 0)), std::memory_order_relaxed);
     }
+#if defined(PS2X_G684_HOT_DIAG)
     const uint64_t n = g_g261Mat[cause & 7].fetch_add(1u, std::memory_order_relaxed) + 1u;
     if ((n % 512u) == 0u)
         g261Report();
+#endif
 }
 
 // ---- G276: within-drain display-color readback coalescing -------------------------------------

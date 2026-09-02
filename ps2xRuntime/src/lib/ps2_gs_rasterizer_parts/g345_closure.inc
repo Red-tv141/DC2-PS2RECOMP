@@ -18,12 +18,16 @@ static bool g345ClosureOn()
                              !envFlagEnabled("DC2_G345_NO_CLOSURE");
     return s_on;
 }
+#if defined(PS2X_G684_HOT_DIAG)
 static bool g345StatOn()
 {
     static const bool s_stat = envFlagEnabled("DC2_G345_STAT");
     static const bool s_g289 = envFlagEnabled("DC2_G289_STAT");
     return s_stat || (g345ClosureOn() && s_g289);
 }
+#else
+static constexpr bool g345StatOn() { return false; }
+#endif
 // Strip-family fbps (MAP-0 G342/G343 census output — census-derived, per-route, not authority).
 static bool g345FamilyFbp(uint32_t fbp)
 {
