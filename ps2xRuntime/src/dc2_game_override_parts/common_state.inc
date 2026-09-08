@@ -355,6 +355,57 @@ static void g154_observe_frame(uint8_t *rdram,
                          static_cast<double>(frameCount - s_lastG144FrameCount) / w,
                          static_cast<unsigned>(s_watches.size()));
 
+#if defined(PS2X_G654_DIAG)
+            // ⛔ G700: `[G654:layer]` — the instrument Rule 24 names as THE way to name the pole
+            // ("Name the pole with the exclusive, thread-keyed timer before ranking any lever") —
+            // was DEAD. `g654LayerReport` was defined in ps2_g654_layerdiag.cpp, declared at global
+            // scope in dc2_game_override.cpp, and called from nowhere: `grep -rn g654LayerReport`
+            // returned exactly one hit, its own definition. Every `G654LayerScope` in the tree was
+            // accumulating into rows nothing ever printed, so a diagnostic build armed with
+            // DC2_G654_LAYER=1 emitted `[G654:submit]` and silence where the layer split should be.
+            // Call it on the same window and denominator as `[G154:perf]` so the two are directly
+            // comparable arm to arm.
+            g654LayerReport(n, s_windowFrames);
+#endif
+
+            // ⛔ G704 — Rule 69 again, in the SAME shape, one phase later. `g701_backend_report()`
+            // is defined in the backend, has a real body that prints `[G701:async] armed=… submits=…
+            // fallbacks=…`, is declared at global scope in rasterizer_rtt_census_and_waves.inc —
+            // and `grep -rn g701_backend_report` finds no CALL. So a G701 gate could never show
+            // that its arm was exercised, which is precisely the non-negotiable ("assert the lever
+            // is COMPILED, ARMED and EXERCISED before reading any arm"). This matters because
+            // G701's refutation priced a DRAFT that copied an 850 KB depth buffer per flush; the
+            // shipped body now refuses depth batches outright and has never been re-measured.
+            //
+            // NOT #if-excluded (G700 §3.4's lesson): an admission counter that only exists in the
+            // diagnostic build cannot be read on the SHIP binary the promotion gate has to run on.
+            // One cached-bool test per perf window, at the cold frame boundary.
+            {
+                static const bool s_g701Stat = (std::getenv("DC2_G701_STAT") != nullptr);
+                if (s_g701Stat)
+                    g701_backend_report();
+            }
+
+            // G705: the fused-transport arm proof, on the same window and denominator, under the
+            // same rule as G701's — the report has to be readable on the SHIP binary, so it is not
+            // #if-excluded. `foreign` MUST be 0: a non-zero count means some thread other than the
+            // GS front end reached a blocking submit and had it declined into the CPU path.
+            {
+                static const bool s_g705Stat = (std::getenv("DC2_G705_STAT") != nullptr);
+                if (s_g705Stat)
+                    g705_backend_report();
+            }
+
+            // G704: unlike the old G261-internal call sites, this call is keyed directly to the
+            // diagnostic whose two summaries it prints.  One cached test per 60-frame perf window;
+            // the shipping path has no GS-hot-path branch and the reporter remains silent by
+            // default.  This is also the exercise proof for DC2_G704_VERIFY_PAGES.
+            {
+                static const bool s_g291Stat = (std::getenv("DC2_G291_STAT") != nullptr);
+                if (s_g291Stat)
+                    g704_page_memo_report();
+            }
+
             // G434: per-window workload invariant for the drawPrimitive deletion probe. Same
             // window and denominator as [G154:perf], so kicks/f is directly comparable arm to arm.
             {

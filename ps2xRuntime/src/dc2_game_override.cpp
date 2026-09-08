@@ -166,6 +166,18 @@ extern bool (*g_f66_drive_dungeon_pad_hook)(uint32_t);
 void g654LayerReport(unsigned int n, unsigned int window);
 #endif
 
+// G704: `[G701:async]`'s reporter, defined in the GL backend TU. Declared HERE at global scope for
+// the same linkage reason as g654LayerReport above — and called from the `[G154:perf]` window in
+// dc2_game_override_parts/common_state.inc, which is the call site Rule 69 says must exist before
+// any G701 arm can be read. NOT behind PS2X_G654_DIAG: the promotion gate runs on the SHIP binary.
+void g701_backend_report();
+void g705_backend_report();
+
+// G704: cumulative G291/page-memo reporter from the GS rasterizer TU.  This must be reachable
+// from DC2_G291_STAT alone; otherwise the inline [G291:skip] stream makes a dead summary reporter
+// look healthy and the page-memo oracle cannot prove that any memo hit was verified.
+void g704_page_memo_report();
+
 // G141: perf ns accumulators, defined in ps2_gs_rasterizer.cpp / ps2_vu1.cpp (external linkage).
 extern std::atomic<uint64_t> g_g141GsRasterNs;
 extern std::atomic<uint64_t> g_g141Vu1RunNs;
@@ -466,6 +478,16 @@ extern void g412_latch_host_presentation_snapshot(GS *gs,
                                                   uint64_t display2,
                                                   uint64_t bgcolor,
                                                   uint64_t vsyncTick);
+extern void g677_latch_logical_host_presentation_frame(GS *gs);
+extern void g677_latch_logical_host_presentation_snapshot(GS *gs,
+                                                          uint64_t pmode,
+                                                          uint64_t smode2,
+                                                          uint64_t dispfb1,
+                                                          uint64_t display1,
+                                                          uint64_t dispfb2,
+                                                          uint64_t display2,
+                                                          uint64_t bgcolor,
+                                                          uint64_t vsyncTick);
 
 // G303: VU1-worker (MTVU) busy-time attribution — snapshotted per perf window in the G146 block
 // to place the VU1 worker on the same footing as GSimage/EE for pole attribution.
@@ -513,6 +535,9 @@ std::atomic<uint32_t> g_dc2G217DirectPacketWrite{0u};
 // G385); BGM now shares the G391 mixer bus so it takes the reverb send, and the
 // reverb itself is the documented SPU preset network.
 // Kill: DC2_G392_LEGACY_SE_MIX=1, DC2_G392_NO_BGM_BUS=1.
+// G677 revision 3: forced-debug MenuLoop hands logical-VRAM authority to the next existing
+// mgEndFrame boundary; no duplicate boundary, no stale native-FBO alternation
+// (DC2_G677_NO_DEBUG_FRAME_BOUNDARY=1).
 void dc2G385PlaySfx(PS2AudioBackend *audioBackend, uint32_t soundSlot,
                     uint8_t program, uint8_t key, uint8_t velocity,
                     uint8_t channelVolume, uint8_t voiceId, uint8_t channelPan);
