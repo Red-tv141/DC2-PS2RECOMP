@@ -10,6 +10,12 @@ set(PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE 8 CACHE STRING "Unity build batch size fo
 option(PS2X_ENABLE_SCCACHE "Use sccache as compiler launcher when available" ON)
 option(PS2X_G652_CRITICAL_TRACE "Compile the G652 cross-thread critical-path trace" OFF)
 option(PS2X_G653_POOLDIAG "Compile the G653 cooperative-dispatch census and spin prototype" OFF)
+# G712: the CPU-contention ceiling probe for the parallel/pipelined GS front-end. It has NO call
+# site — the synthetic load starts from ps2_g712_pipeline.cpp's own static initialiser and is inert
+# unless DC2_G712_LOAD is set — so arming it cannot perturb any hot TU (rule 12b, after G710
+# measured +0.362 ms/f from compile-time-DEAD text in ps2_gs_rasterizer.cpp). The TU is added only
+# under this option, so a shipping link carries none of its bytes.
+option(PS2X_G712_DIAG "Compile the G712 CPU-contention ceiling probe" OFF)
 # G654 P5: the G629-G636 persistent GPU-resident GS domain prototype. CLOSED NEGATIVE ON
 # PERFORMANCE and default-OFF at runtime, but 8.52% of ps2_gs_rasterizer.cpp's machine code - and
 # rule 12c says compiled-but-never-executed code in a hot TU is not free. OFF compiles the
@@ -66,6 +72,13 @@ option(PS2X_G662_DIAG "Compile the G662 depth-authority, materialization-granula
 # is looking for, so the hoist's ceiling is measured before its timing arm is believed. Call sites
 # are in ps2_gs_rasterizer.cpp, the hottest TU => compile-time build mode (rule 12c).
 option(PS2X_G663_DIAG "Compile the G663 bind-scan population census" OFF)
+# G680: the item-menu ICON SPRITE geometry census. The fish icons' black dashes are painted by the
+# icon draws themselves (proved by elimination), and the artwork / CLUT / filter / requested sizes
+# are all exonerated — so the open question is the AFFINE MAP: the 12.4 screen rect, the 12.4 UV
+# rect, the -0.5-texel FST shift and the G406/G407/G679 rounding state that decide which texel row
+# each fragment reads. Call site is in ps2_gs_rasterizer.cpp, the hottest TU => compile-time build
+# mode (rule 12c); storage and the reporter live in the cold TU ps2_g680_diag.cpp (rule 12b).
+option(PS2X_G680_DIAG "Compile the G680 icon-sprite affine-map census" OFF)
 # G666: the phase's COMPLETE instrument set, declared in one place before the first diagnostic build
 # (G661 retrospective rule 1 — G661 rebuilt its diagnostic binary three times because each new
 # priority suggested one more census, and every rebuild invalidates the captures already taken).
@@ -109,6 +122,23 @@ option(PS2X_G665_DIAG "Compile the G665 VU1 backend state-migration primitives a
 # `#if`-excluded until it has a promoted caller. Call sites:
 # src/lib/ps2_gs_gpu_raster_parts/g665_vu_{translate,bench}.inc.
 option(PS2X_G665_GPUVU "Compile the G665 translated GPU VU1 backend and its corpus bench" OFF)
+# G684: G560/G561/G570 were closed, default-off ordered-run experiments, but their four-float
+# per-primitive state tail remained in every G178Vtx. That made the shipped vertex stream 48 B
+# instead of 32 B and paid four dead stores plus 16 dead upload bytes per vertex. Normal builds
+# compile the compact layout. This switch restores the old feature and layout only for historical
+# reproduction; both rasterizer TUs must receive it because they share the private G178Vtx ABI.
+option(PS2X_G684_LEGACY_G560_RUNS "Compile retired G560/G561/G570 ordered-run experiments" OFF)
+# G684 P2: old runtime-selected profilers/oracles still put branches and large cold successors in
+# g178TryFlushGpu even when every environment switch is absent. Normal builds compile those
+# observer-only paths out of the accepted graph. Turn this on only when reproducing their evidence.
+option(PS2X_G684_HOT_DIAG "Compile legacy runtime-selected diagnostics in the accepted GS graph" OFF)
+option(PS2X_G704_UPCENSUS "G704: compare host->local IMAGE uploads against the bytes already in VRAM (probe only)" OFF)
+# G710's ship-config flush stage decomposition was UNWIRED by G711 (Rule 31 / Rule 71: a knob with
+# no use site comes out). Its `#else` stubs were all `constexpr` and every use folded, but the
+# source text still perturbed ps2_gs_rasterizer.cpp's layout, and a cross-binary A/B/B/A priced that
+# at +0.42...+0.65 ms/f of GS own. To re-wire, restore this option, the scoped COMPILE_DEFINITIONS
+# block below, the #include in ps2_gs_rasterizer.cpp and the call sites listed in
+# plans/phase-G711-fix-log.md §8.
 
 if(PS2X_ENABLE_SCCACHE)
     find_program(PS2X_SCCACHE_PROGRAM sccache)
@@ -399,6 +429,16 @@ endfunction()
 add_library(ps2_runtime STATIC
     src/lib/game_overrides.cpp
     src/lib/ps2_gif_arbiter.cpp
+    # G712: the prep-ahead task pool. Threads, queue and env parsing live here, OUT of
+    # ps2_gs_rasterizer.cpp, because that TU has a code-layout budget (rule 12b: G651 measured
+    # +0.567/+0.934 ms/f from ~150 lines of cold start-up code in a hot TU, G710 +0.362 ms/f from
+    # 6 KB of compile-time-DEAD text). The hot TU keeps only the record, the job body and the
+    # help-or-wait consumer.
+    src/lib/ps2_g712_pipeline.cpp
+    # G713: the parse/exec GS pipeline. Same rule-12b split as G712 — the ring, the exec thread,
+    # the env parsing and the census live here, OUT of ps2_gs_rasterizer.cpp and ps2_gs_gpu.cpp.
+    # Those two hot TUs keep only declarations, the four producer sites and the two executors.
+    src/lib/ps2_g713_pipeline.cpp
     src/lib/ps2_audio.cpp
     src/lib/ps2_audio_vag.cpp
     src/lib/ps2_gs_gpu.cpp
@@ -447,6 +487,13 @@ if(PS2X_G653_POOLDIAG)
         src/lib/ps2_gs_rasterizer.cpp
         PROPERTIES COMPILE_DEFINITIONS "PS2X_G653_POOLDIAG=1"
     )
+endif()
+
+if(PS2X_G712_DIAG)
+    # Own TU, own compile definition, no other source file touched.
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_g712_loadprobe.cpp)
+    set_property(SOURCE src/lib/ps2_g712_loadprobe.cpp
+                 APPEND PROPERTY COMPILE_DEFINITIONS "PS2X_G712_DIAG=1")
 endif()
 
 if(PS2X_G654_GPUDOMAIN)
@@ -584,6 +631,13 @@ if(PS2X_G662_DIAG)
                  "PS2X_G662_DIAG=1")
 endif()
 
+# G680: same shape — reporter in a cold TU (rule 12b), `#if`-excluded call site in the hot TU.
+if(PS2X_G680_DIAG)
+    target_sources(ps2_runtime PRIVATE src/lib/ps2_g680_diag.cpp)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G680_DIAG=1")
+endif()
+
 # G663: same shape as G662 - storage and the reporter live in a cold TU (rule 12b), and only
 # ps2_gs_rasterizer.cpp carries the `#if`-excluded call sites.
 if(PS2X_G663_DIAG)
@@ -625,6 +679,28 @@ if(PS2X_G665_GPUVU)
                  "PS2X_G665_GPUVU=1")
 endif()
 
+if(PS2X_G684_LEGACY_G560_RUNS)
+    foreach(_g684src
+            src/lib/ps2_gs_rasterizer.cpp
+            src/lib/ps2_gs_gpu_raster.cpp)
+        set_property(SOURCE ${_g684src} APPEND PROPERTY COMPILE_DEFINITIONS
+                     "PS2X_G684_LEGACY_G560_RUNS=1")
+    endforeach()
+endif()
+
+if(PS2X_G684_HOT_DIAG)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G684_HOT_DIAG=1")
+endif()
+
+# G704: the upload-redundancy census. Scoped to ps2_gs_memory.cpp ALONE — it adds a full
+# destination read inside the run writers, which move ~7 GB/s, so it must never reach a timing
+# binary (rule 12c). Behaviour-pure: it only compares and counts.
+if(PS2X_G704_UPCENSUS)
+    set_property(SOURCE src/lib/ps2_gs_memory.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G704_UPCENSUS=1")
+endif()
+
 
 if(PS2X_G652_CRITICAL_TRACE)
     target_sources(ps2_runtime PRIVATE src/lib/ps2_critical_trace.cpp)
@@ -638,41 +714,59 @@ if(PS2X_G652_CRITICAL_TRACE)
     endforeach()
 endif()
 
-file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
-    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
-)
+# ===== ps2EntryRunner: the UPSTREAM PS2Recomp demo entry point (default OFF here) ============
+# This is NOT the Dark Cloud 2 deliverable — that is `dc2_runner`, defined in the top-level
+# D:/ps2r/dc2/CMakeLists.txt against `recomp/` and `dc2_game`.
+#
+# ⚠️ The glob below sweeps `src/runner/*.cpp`, and in this tree that directory also received a
+# STALE 2025-07-05 codegen dump of ~7,800 recompiled DC2 functions plus its own 4.7 MB
+# `register_functions.cpp` — an older generation of what `D:/ps2r/dc2/recomp/` now holds
+# (15 MB, and the one `dc2_runner` actually compiles). The target has never been built in this
+# tree, and building it would compile ~7,800 superseded translation units. Closure moved that
+# dump to `archive/stale-runner-codegen-2025-07-05/` and defaulted this target OFF, so a plain
+# `cmake --build . --config Release` builds only what ships.
+#
+# Turn it ON only when working on upstream PS2Recomp itself, and supply a
+# `src/runner/register_functions.cpp` that matches the guest you are targeting.
+option(PS2X_BUILD_ENTRY_RUNNER "Build the upstream PS2Recomp demo entry runner" OFF)
 
-set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
-set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
-
-if(EXISTS "${RUNNER_MAIN_CPP}")
-    list(APPEND RUNNER_SRC_FILES "${RUNNER_MAIN_CPP}")
-elseif(EXISTS "${ROOT_MAIN_CPP}")
-    list(APPEND RUNNER_SRC_FILES "${ROOT_MAIN_CPP}")
-endif()
-
-# dc2_game_override.cpp is compiled once in ps2_runtime (WHOLEARCHIVE keeps its
-# AutoRegister side effects); do not also compile it here or the registrations run twice.
-
-add_executable(ps2EntryRunner
-    ${RUNNER_SRC_FILES}
-)
-
-if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
-    set_target_properties(ps2EntryRunner PROPERTIES
-        UNITY_BUILD ON
-        UNITY_BUILD_BATCH_SIZE "${PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE}"
+if(PS2X_BUILD_ENTRY_RUNNER)
+    file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
     )
-endif()
 
-if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
-    target_compile_definitions(ps2EntryRunner PRIVATE
-        PS2X_DEFAULT_BOOT_ELF="${PS2X_DEFAULT_BOOT_ELF_DEFINE}"
+    set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
+    set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
+
+    if(EXISTS "${RUNNER_MAIN_CPP}")
+        list(APPEND RUNNER_SRC_FILES "${RUNNER_MAIN_CPP}")
+    elseif(EXISTS "${ROOT_MAIN_CPP}")
+        list(APPEND RUNNER_SRC_FILES "${ROOT_MAIN_CPP}")
+    endif()
+
+    # dc2_game_override.cpp is compiled once in ps2_runtime (WHOLEARCHIVE keeps its
+    # AutoRegister side effects); do not also compile it here or the registrations run twice.
+
+    add_executable(ps2EntryRunner
+        ${RUNNER_SRC_FILES}
     )
-endif()
 
-if(MSVC)
-    target_compile_options(ps2EntryRunner PRIVATE /FS /MP)
+    if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
+        set_target_properties(ps2EntryRunner PROPERTIES
+            UNITY_BUILD ON
+            UNITY_BUILD_BATCH_SIZE "${PS2X_RUNNER_UNITY_BUILD_BATCH_SIZE}"
+        )
+    endif()
+
+    if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
+        target_compile_definitions(ps2EntryRunner PRIVATE
+            PS2X_DEFAULT_BOOT_ELF="${PS2X_DEFAULT_BOOT_ELF_DEFINE}"
+        )
+    endif()
+
+    if(MSVC)
+        target_compile_options(ps2EntryRunner PRIVATE /FS /MP)
+    endif()
 endif()
 
 target_include_directories(ps2_runtime PUBLIC
@@ -681,46 +775,51 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend ffmpeg)
-target_link_libraries(ps2EntryRunner
-    PRIVATE
-    ps2_runtime
-)
-
-# G375: stage the FFmpeg runtime DLLs beside the executable.
-ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
-
-if(PS2X_IS_VITA)
-    set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1")
-
-    if(PS2X_VITA_CREATE_PACKAGE)
-        vita_create_self(eboot.bin ps2EntryRunner UNSAFE)
-        vita_create_vpk(ps2EntryRunner.vpk ${PS2X_VITA_TITLEID} eboot.bin
-            VERSION ${PS2X_VITA_VERSION}
-            NAME ${PS2X_VITA_APP_NAME}
-        )
-    endif()
-endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
     EnableFastReleaseMode(ps2_runtime)
-    EnableFastReleaseMode(ps2EntryRunner)
-
-    if(MSVC AND WIN32)
-        target_link_options(ps2EntryRunner PRIVATE
-            $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/SUBSYSTEM:WINDOWS>
-            $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/ENTRY:mainCRTStartup>
-        )
-    elseif(MINGW AND WIN32)
-        target_link_options(ps2EntryRunner PRIVATE
-            $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-mwindows>
-        )
-    endif()
- 
 endif()
 
-# Work around WinAPI vs raylib symbol clash for CloseWindow on x64
-if(MSVC)
-    target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE" "/WHOLEARCHIVE:ps2_runtime")
+if(PS2X_BUILD_ENTRY_RUNNER)
+    target_link_libraries(ps2EntryRunner
+        PRIVATE
+        ps2_runtime
+    )
+
+    # G375: stage the FFmpeg runtime DLLs beside the executable.
+    ps2x_stage_ffmpeg_runtime_dlls(ps2EntryRunner)
+
+    if(PS2X_IS_VITA)
+        set(VITA_MKSFOEX_FLAGS "${VITA_MKSFOEX_FLAGS} -d PARENTAL_LEVEL=1")
+
+        if(PS2X_VITA_CREATE_PACKAGE)
+            vita_create_self(eboot.bin ps2EntryRunner UNSAFE)
+            vita_create_vpk(ps2EntryRunner.vpk ${PS2X_VITA_TITLEID} eboot.bin
+                VERSION ${PS2X_VITA_VERSION}
+                NAME ${PS2X_VITA_APP_NAME}
+            )
+        endif()
+    endif()
+
+    if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo")
+        EnableFastReleaseMode(ps2EntryRunner)
+
+        if(MSVC AND WIN32)
+            target_link_options(ps2EntryRunner PRIVATE
+                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/SUBSYSTEM:WINDOWS>
+                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/ENTRY:mainCRTStartup>
+            )
+        elseif(MINGW AND WIN32)
+            target_link_options(ps2EntryRunner PRIVATE
+                $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-mwindows>
+            )
+        endif()
+    endif()
+
+    # Work around WinAPI vs raylib symbol clash for CloseWindow on x64
+    if(MSVC)
+        target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE" "/WHOLEARCHIVE:ps2_runtime")
+    endif()
 endif()
 
 install(TARGETS ps2_runtime
