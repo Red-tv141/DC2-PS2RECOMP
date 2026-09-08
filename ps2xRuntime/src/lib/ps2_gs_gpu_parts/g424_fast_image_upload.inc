@@ -62,6 +62,12 @@ namespace GSMem
                      const uint8_t *src, uint32_t count);
     void WriteRunP4(uint8_t *data, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y,
                     const uint8_t *src, uint32_t nibble0, uint32_t count);
+    void WriteBlockRectCT32(uint8_t *data, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y,
+                            const uint8_t *src, uint32_t srcPitch,
+                            uint32_t blocksWide, uint32_t blocksHigh);
+    void WriteBlockRectZ32(uint8_t *data, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y,
+                           const uint8_t *src, uint32_t srcPitch,
+                           uint32_t blocksWide, uint32_t blocksHigh);
 }
 
 namespace
@@ -85,6 +91,57 @@ namespace
     {
         static const bool v = envFlagEnabled("DC2_G424_STAT");
         return v;
+    }
+
+    // G706 promotes the complete-block stage present in PCSX2's IMAGE uploader. The existing row
+    // path remains the exact edge/split-packet fallback. Default ON; the kill switch makes an
+    // immediate same-binary control arm available.
+    bool g706BlockImageOn()
+    {
+        static const bool v = !envFlagEnabled("DC2_G706_NO_BLOCK_IMAGE");
+        return v;
+    }
+
+    bool g706BlockStatOn()
+    {
+        static const bool v = envFlagEnabled("DC2_G706_BLOCK_STAT");
+        return v;
+    }
+
+    struct G706BlockStat
+    {
+        uint64_t calls = 0u;
+        uint64_t blocks = 0u;
+        uint64_t blockBytes = 0u;
+        uint64_t rowBytes = 0u;
+    };
+    G706BlockStat g_g706BlockStat;
+
+    inline void g706NoteBlock(uint32_t blocks, uint32_t bytes)
+    {
+        if (!g706BlockStatOn())
+            return;
+        ++g_g706BlockStat.calls;
+        g_g706BlockStat.blocks += blocks;
+        g_g706BlockStat.blockBytes += bytes;
+        if (g_g706BlockStat.calls <= 2u || (g_g706BlockStat.calls % 4096u) == 0u)
+        {
+            const uint64_t total = g_g706BlockStat.blockBytes + g_g706BlockStat.rowBytes;
+            std::fprintf(stderr,
+                         "[G706:block] calls=%llu blocks=%llu blockMB=%.2f rowMB=%.2f share=%.2f%%\n",
+                         static_cast<unsigned long long>(g_g706BlockStat.calls),
+                         static_cast<unsigned long long>(g_g706BlockStat.blocks),
+                         static_cast<double>(g_g706BlockStat.blockBytes) / (1024.0 * 1024.0),
+                         static_cast<double>(g_g706BlockStat.rowBytes) / (1024.0 * 1024.0),
+                         total ? 100.0 * static_cast<double>(g_g706BlockStat.blockBytes) /
+                                     static_cast<double>(total) : 0.0);
+        }
+    }
+
+    inline void g706NoteRow(uint32_t bytes)
+    {
+        if (g706BlockStatOn())
+            g_g706BlockStat.rowBytes += bytes;
     }
 
     uint32_t g424VerifyEvery()
@@ -230,8 +287,43 @@ namespace
         }
 
         uint32_t offset = 0u;
+        const bool g706BlockFormat = dpsm == GS_PSM_CT32 || dpsm == GS_PSM_Z32;
+        const bool g706BlockGeometry = g706BlockFormat && g706BlockImageOn() &&
+                                       c.rrw >= 8u && (c.rrw & 7u) == 0u &&
+                                       (c.dsax & 7u) == 0u;
         while (offset < c.sizeBytes && *c.hwY < c.rrh)
         {
+            // Complete 8-row stripes are contiguous in the transfer stream whenever the cursor is
+            // at x=0. Consume as many as this IMAGE packet contains; partial rows/tiles naturally
+            // fall through to the old resumable row writer below.
+            if (g706BlockGeometry && *c.hwX == 0u &&
+                ((c.dsay + *c.hwY) & 7u) == 0u && c.rrh - *c.hwY >= 8u)
+            {
+                const uint32_t stripeBytes = c.rrw * 8u * 4u;
+                const uint32_t stripesByData = (c.sizeBytes - offset) / stripeBytes;
+                const uint32_t stripesByHeight = (c.rrh - *c.hwY) / 8u;
+                const uint32_t stripes = (stripesByData < stripesByHeight)
+                                             ? stripesByData : stripesByHeight;
+                if (stripes != 0u)
+                {
+                    const uint32_t blocksWide = c.rrw / 8u;
+                    const uint32_t blocks = blocksWide * stripes;
+                    const uint32_t bytes = stripeBytes * stripes;
+                    if (dpsm == GS_PSM_CT32)
+                        GSMem::WriteBlockRectCT32(c.vram, c.dbp, c.dbw, c.dsax,
+                                                  c.dsay + *c.hwY, c.data + offset,
+                                                  c.rrw * 4u, blocksWide, stripes);
+                    else
+                        GSMem::WriteBlockRectZ32(c.vram, c.dbp, c.dbw, c.dsax,
+                                                 c.dsay + *c.hwY, c.data + offset,
+                                                 c.rrw * 4u, blocksWide, stripes);
+                    offset += bytes;
+                    *c.hwY += stripes * 8u;
+                    g706NoteBlock(blocks, bytes);
+                    continue;
+                }
+            }
+
             const uint32_t pixelsLeft = c.rrw - *c.hwX;
             const uint32_t bytesAvail = c.sizeBytes - offset;
             uint32_t bytesLeft = pixelsLeft * bytesPerPixel;
@@ -270,6 +362,8 @@ namespace
                 default:
                     break;
                 }
+                if (g706BlockFormat)
+                    g706NoteRow(bytesLeft);
             }
 
             // The legacy loop advanced the cursor by `pixelsCopied` and consumed `bytesLeft` even

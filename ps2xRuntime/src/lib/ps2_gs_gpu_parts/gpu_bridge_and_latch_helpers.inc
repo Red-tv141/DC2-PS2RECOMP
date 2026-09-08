@@ -87,142 +87,17 @@ void g446NoteEnvRead(const char *name);
 // Native High-Res presentation bridge
 bool g178_backend_read_display_fbo(uint32_t fbp, uint32_t fallbackFbp, uint32_t &outW, uint32_t &outH,
                                    std::vector<uint8_t> &outRgba);
+// G675: the same read, restricted to the PCRTC read rectangle in LOGICAL GS coordinates
+// (DISPFB DBX/DBY origin + DISPLAY DW/DH extent). Defined in
+// ps2_gs_gpu_raster_parts/gpu_raster_bridge_and_stubs.inc.
+bool g675_backend_read_display_rect(uint32_t fbp, uint32_t fallbackFbp,
+                                    int32_t rectX, int32_t rectY, int32_t rectW, int32_t rectH,
+                                    uint32_t &outW, uint32_t &outH,
+                                    std::vector<uint8_t> &outRgba);
 
-struct DC2NativeRenderConfig
-{
-    bool isConfigured = false;
-    bool isNativeHighRes = false;
-    bool isFullscreen = false;
-    int requestedWidth = 0;
-    int requestedHeight = 0;
-    float scaleX = 1.0f;
-    float scaleY = 1.0f;
-};
-
-inline DC2NativeRenderConfig &getDC2NativeRenderConfig()
-{
-    static DC2NativeRenderConfig s_config = []()
-    {
-        DC2NativeRenderConfig cfg{};
-        const char *wEnv = std::getenv("DC2_RESOLUTION_WIDTH");
-        const char *hEnv = std::getenv("DC2_RESOLUTION_HEIGHT");
-        const char *fsEnv = std::getenv("DC2_FULLSCREEN");
-
-        int w = 0, h = 0;
-        if (wEnv && wEnv[0] != '\0')
-            w = std::atoi(wEnv);
-        if (hEnv && hEnv[0] != '\0')
-            h = std::atoi(hEnv);
-
-        cfg.isFullscreen = (fsEnv && fsEnv[0] != '\0' && std::strcmp(fsEnv, "0") != 0);
-
-        if (w > 0 && h > 0 && (w != 512 || h != 448) && (w != 640 || h != 448))
-        {
-            cfg.requestedWidth = w;
-            cfg.requestedHeight = h;
-            cfg.scaleX = static_cast<float>(w) / 640.0f;
-            cfg.scaleY = static_cast<float>(h) / 448.0f;
-            cfg.isNativeHighRes = true;
-        }
-        else if (w > 0 && h > 0)
-        {
-            cfg.requestedWidth = w;
-            cfg.requestedHeight = h;
-            cfg.scaleX = 1.0f;
-            cfg.scaleY = 1.0f;
-            cfg.isNativeHighRes = false;
-        }
-        else
-        {
-            cfg.requestedWidth = 640;
-            cfg.requestedHeight = 448;
-            cfg.scaleX = 1.0f;
-            cfg.scaleY = 1.0f;
-            cfg.isNativeHighRes = false;
-        }
-        cfg.isConfigured = true;
-        return cfg;
-    }();
-    return s_config;
-}
-
-inline bool dc2IsNativeHighResActive()
-{
-    return getDC2NativeRenderConfig().isNativeHighRes;
-}
-
-inline float dc2GetNativeScaleX()
-{
-    return getDC2NativeRenderConfig().scaleX;
-}
-
-inline float dc2GetNativeScaleY()
-{
-    return getDC2NativeRenderConfig().scaleY;
-}
-
-inline int dc2GetNativePhysicalWidth(int logicalW)
-{
-    if (!dc2IsNativeHighResActive() || logicalW <= 0)
-        return logicalW;
-    if (logicalW == 512 || logicalW == 640)
-        return getDC2NativeRenderConfig().requestedWidth;
-    return std::max(1, static_cast<int>(std::round(static_cast<float>(logicalW) * dc2GetNativeScaleX())));
-}
-
-inline int dc2GetNativePhysicalHeight(int logicalH)
-{
-    if (!dc2IsNativeHighResActive() || logicalH <= 0)
-        return logicalH;
-    if (logicalH == 415 || logicalH == 416 || logicalH == 448 || logicalH == 512)
-        return getDC2NativeRenderConfig().requestedHeight;
-    return std::max(1, static_cast<int>(std::round(static_cast<float>(logicalH) * dc2GetNativeScaleY())));
-}
-
-inline int dc2GetNativePhysicalDisplayWidth()
-{
-    if (!dc2IsNativeHighResActive())
-        return 640;
-    return getDC2NativeRenderConfig().requestedWidth;
-}
-
-inline int dc2GetNativePhysicalDisplayHeight()
-{
-    if (!dc2IsNativeHighResActive())
-        return 448;
-    return getDC2NativeRenderConfig().requestedHeight;
-}
-
-inline int dc2GetNativePhysicalDisplayStorageHeight()
-{
-    if (!dc2IsNativeHighResActive())
-        return 448;
-    return getDC2NativeRenderConfig().requestedHeight;
-}
-
-inline bool dc2NativeResDiagOn()
-{
-    static const bool s_diag = (std::getenv("DC2_NATIVE_RES_DIAG") != nullptr);
-    return s_diag;
-}
-
-inline bool dc2NativeMainOnlyOn()
-{
-    static const bool s_mainOnly = (std::getenv("DC2_NATIVE_MAIN_ONLY") != nullptr);
-    return s_mainOnly;
-}
-
-inline bool dc2NativeDisableRttOn()
-{
-    static const bool s_noRtt = (std::getenv("DC2_NATIVE_DISABLE_RTT") != nullptr);
-    return s_noRtt;
-}
-
-inline bool dc2NativeDisableFbCopyScaleOn()
-{
-    static const bool s_noFbCopy = (std::getenv("DC2_NATIVE_DISABLE_FB_COPY_SCALE") != nullptr);
-    return s_noFbCopy;
-}
+// G675: the logical<->physical resolution mapping now has ONE definition for all four
+// TUs that need it. See that file for the integer-scale law it enforces.
+#include "../ps2_native_res.inc"
 
 inline int dc2DrawLimit()
 {
@@ -235,25 +110,14 @@ inline int dc2DrawLimit()
 
 namespace
 {
-    bool g146PerfEnabled()
-    {
-        static const bool s_on = (std::getenv("DC2_PERF") != nullptr) ||
-                                 (std::getenv("DC2_G146_PERF") != nullptr) ||
-                                 (std::getenv("DC2_G147_PERF") != nullptr);
-        return s_on;
-    }
-
-    bool g147PerfEnabled()
-    {
-        static const bool s_on = (std::getenv("DC2_G147_PERF") != nullptr);
-        return s_on;
-    }
-
-    bool g171PerfEnabled()
-    {
-        static const bool s_on = (std::getenv("DC2_G171_STAT") != nullptr);
-        return s_on;
-    }
+    const bool s_g674G146PerfEnabled = (std::getenv("DC2_PERF") != nullptr) ||
+                                       (std::getenv("DC2_G146_PERF") != nullptr) ||
+                                       (std::getenv("DC2_G147_PERF") != nullptr);
+    const bool s_g674G147PerfEnabled = (std::getenv("DC2_G147_PERF") != nullptr);
+    const bool s_g674G171PerfEnabled = (std::getenv("DC2_G171_STAT") != nullptr);
+    DC2_G674_HOT_FLAG_INLINE bool g146PerfEnabled() { return s_g674G146PerfEnabled; }
+    DC2_G674_HOT_FLAG_INLINE bool g147PerfEnabled() { return s_g674G147PerfEnabled; }
+    DC2_G674_HOT_FLAG_INLINE bool g171PerfEnabled() { return s_g674G171PerfEnabled; }
 
     // G593 CEILING PROBE (DC2_G593_NOREG=1, DEFAULT-OFF, knowingly INCORRECT OUTPUT).
     //
@@ -272,11 +136,8 @@ namespace
     // downstream can react to the missing state, so (NO_DRAW) - (NO_DRAW + NOREG) is exactly
     // the register-replay CPU. Alone it also changes which textures decode and which batches
     // classify, and would over-count.
-    bool g593NoRegOn()
-    {
-        static const bool s_on = (std::getenv("DC2_G593_NOREG") != nullptr);
-        return s_on;
-    }
+    const bool s_g674G593NoRegOn = (std::getenv("DC2_G593_NOREG") != nullptr);
+    DC2_G674_HOT_FLAG_INLINE bool g593NoRegOn() { return s_g674G593NoRegOn; }
 
     struct G146PerfScope
     {
@@ -563,11 +424,8 @@ namespace
     // XYZF2 at 5.0us/call vs 25ns for RGBAQ (whose handler has no getenv) — ~2.4us/vertex of
     // pure environment lookup in vertexKick, ~66ms/frame. Hot sites now read once;
     // DC2_G268_LIVE_ENVREAD=1 restores the historical per-call read (same-binary A/B control).
-    bool g268LiveEnvRead()
-    {
-        static const bool live = envFlagEnabled("DC2_G268_LIVE_ENVREAD");
-        return live;
-    }
+    const bool s_g674G268LiveEnvRead = envFlagEnabled("DC2_G268_LIVE_ENVREAD");
+    DC2_G674_HOT_FLAG_INLINE bool g268LiveEnvRead() { return s_g674G268LiveEnvRead; }
 
     bool phaseDiagnosticsEnabled()
     {

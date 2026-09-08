@@ -101,6 +101,15 @@ namespace
         bool t8Valid = false;
         bool ct32Valid = false;
     };
+    // ⛔⛔ G691 REVERTED (Rule 31). A run-coalesced body was built here for the matched-sub-page-
+    // phase population and measured INERT: `[G691:runs] calls=2048 runCalls=0 rejPhase=2043` — a
+    // local-to-local copy essentially never shares phase between source and destination. It is
+    // refuted at the CEILING anyway, which is the argument that matters: `[G596:copy]` prices this
+    // whole body at **13.9 ms CUMULATIVE over a 70 s run (~0.005 ms/f)** at 1.35 ns/texel, so no hit
+    // rate could pay. The 3.05 ms/f `[G654:layer] GSlocal` that motivated it is NOT this copy — the
+    // layer brackets `performLocalToLocalTransfer`, which calls `g144FlushPendingLocalTransferRange`
+    // and is therefore a DRAIN POINT charged the deferred graph it executes (G429's law, the same
+    // trap G689 §7.2 hit with `GSimage`). See plans/phase-G690-fix-log.md §7.
 
     const G596Table &g596Tables()
     {

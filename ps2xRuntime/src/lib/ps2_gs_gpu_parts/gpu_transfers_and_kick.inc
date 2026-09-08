@@ -21,6 +21,20 @@ extern void g144L2lLatePin();
 // that surface's publication off the dependency pin; a no-op otherwise.
 extern void g627ApplyPendingL2lPatch(uint8_t *vram, uint32_t vramSize);
 extern void g627DiscardPendingL2lPatch();
+// G714: execute a same-format local->local transfer against the GPU-resident raw GS VRAM image.
+// Returns true only when the whole operation — source ingest, copy and destination publication —
+// ran on the GPU, in which case guest VRAM is deliberately untouched and the caller must NOT run
+// the CPU body, the depth barrier, or the VRAM write notification.
+extern bool g714TryExecuteL2l(uint8_t *vram, uint32_t vramSize,
+                              uint32_t sbp, uint8_t sbw, uint8_t spsm,
+                              uint32_t ssax, uint32_t ssay,
+                              uint32_t dbp, uint8_t dbw, uint8_t dpsm,
+                              uint32_t dsax, uint32_t dsay,
+                              uint32_t rrw, uint32_t rrh, bool revX, bool revY);
+// Census only (DC2_G714_STAT=1): the escaping transfer's pixel count. The REFUSAL CLASS is
+// recorded at the barrier, not here — by this point the barrier has already published, so a second
+// evaluation of the predicate would read a state that no longer explains the decision.
+extern void g714NoteEscape(uint32_t rrw, uint32_t rrh);
 extern void g144FlushPendingLocalTransferRange(uint32_t sbp,
                                                uint8_t sbw,
                                                uint8_t spsm,
@@ -173,6 +187,25 @@ void GS::performLocalToLocalTransfer()
         return;
     }
 
+    // ⛔⛔⛔ G713 LOCAL->LOCAL CEILING PROBE (DC2_G713_L2L_CEIL=1, default OFF, KNOWINGLY WRONG
+    // OUTPUT — never promote). Skips the range barrier, the source materialisation
+    // (g242PrepareVramReadRect, which IS the kG261MatLocal readback) and the CPU copy, while still
+    // bumping the destination's write generations so both arms do identical publication
+    // bookkeeping and the workload stays invariant. This prices the WHOLE local->local direction
+    // — copy plus the readback it forces — which is what a widened g289 admission would have to
+    // remove to be worth anything. See g713_pipe_gs.inc for why both terms must be priced together.
+    if (g713L2lCeilOn())
+    {
+        extern void g178NoteVramWriteRectTagged(uint8_t *, uint32_t, uint32_t, uint32_t,
+                                                uint32_t, uint32_t, uint32_t, uint32_t, uint32_t);
+        g149BumpVramGen();
+        g178NoteVramWriteRectTagged(m_vram, dbp, dbw, dpsm, dsax, dsay, rrw, rrh, 8u);
+        g627DiscardPendingL2lPatch();
+        if (g713L2lStatOn())
+            g713NoteL2l(false, sbp, spsm, dbp, dpsm, rrw, rrh);
+        return;
+    }
+
     if (g145DirtyUpload)
     {
         if (g432L2lArmed)
@@ -187,6 +220,28 @@ void GS::performLocalToLocalTransfer()
                                                dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
         }
     }
+
+    // ⭐⭐⭐ G714: THE GPU-RESIDENT RAW-VRAM PATH, AND WHY IT SITS EXACTLY HERE.
+    // Everything below this point exists to make the CPU pixel body able to READ guest VRAM:
+    // g242PrepareVramReadRect publishes aliased GPU depth, g144L2lLatePin replays the colour
+    // publication, g178NoteVramWriteRectTagged declares that VRAM changed. An admitted G714
+    // transfer does none of those things — it moves GS bytes inside the GPU's raw VRAM image and
+    // pushes the result straight into the destination target's FBO. Guest VRAM is left stale, and
+    // that debt is already carried by the residency record (the rows were dirty by admission), so
+    // the whole publication the edge used to pay simply does not happen.
+    // Placing the attempt ABOVE g242PrepareVramReadRect is the phase's central invariant (§4): a
+    // "GPU copy" that first materialises its source has missed the point.
+    if (g714TryExecuteL2l(m_vram, m_vramSize, sbp, sbw, spsm, ssax, ssay,
+                          dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
+                          traversal.reverseX, traversal.reverseY))
+    {
+        g149BumpVramGen();            // logical content moved: drop the de-swizzle texture cache
+        g627DiscardPendingL2lPatch(); // no CPU copy ran, so there are no VRAM bytes to reconcile
+        if (g713L2lStatOn())
+            g713NoteL2l(true, sbp, spsm, dbp, dpsm, rrw, rrh);
+        return;
+    }
+    g714NoteEscape(rrw, rrh);
 
     // G242: the range/full G144 barrier above must run first so every deferred draw
     // that can feed this copy has reached its GPU depth surface before we read VRAM.
@@ -214,6 +269,10 @@ void GS::performLocalToLocalTransfer()
                                           sbp, sbw, spsm, ssax, ssay,
                                           dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
     }
+
+    // G713: the escape census, at the one point where the GPU/CPU decision is already made.
+    if (g713L2lStatOn())
+        g713NoteL2l(g289GpuCopy, sbp, spsm, dbp, dpsm, rrw, rrh);
 
     // G522: the blit was not taken, so the CPU copy below WILL read guest VRAM. Replay the
     // publication the range barrier skipped. No-op on every other path.
@@ -701,6 +760,14 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
         g178NoteVramWriteRectTagged(m_vram, m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
                                     m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh,
                                     9u); // G582 source 9: host->local IMAGE upload
+        // G709 §3: snapshot this transfer's pages BEFORE the write loop runs. Default OFF
+        // (DC2_G709_IMGCENSUS=1); the paired `after` call is at the end of the writer.
+        extern void g709NoteImageWritePages(const uint8_t *, uint32_t, uint32_t, uint32_t,
+                                            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                            bool);
+        g709NoteImageWritePages(m_vram, m_vramSize, m_bitbltbuf.dbp, m_bitbltbuf.dbw,
+                                m_bitbltbuf.dpsm, m_trxpos.dsax, m_trxpos.dsay,
+                                m_trxreg.rrw, m_trxreg.rrh, false);
     }
     if (s_g313Census)
     {
@@ -1325,6 +1392,18 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
     }
 
     } // G424: end of the legacy per-pixel writer tree
+
+    // G709 §3: the paired `after` half of the page-identity census. Default OFF
+    // (DC2_G709_IMGCENSUS=1). Placed after EVERY writer arm, including the G424 fast path, so the
+    // fraction it reports is the fraction for the transfer as actually executed.
+    {
+        extern void g709NoteImageWritePages(const uint8_t *, uint32_t, uint32_t, uint32_t,
+                                            uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                                            bool);
+        g709NoteImageWritePages(m_vram, m_vramSize, m_bitbltbuf.dbp, m_bitbltbuf.dbw,
+                                m_bitbltbuf.dpsm, m_trxpos.dsax, m_trxpos.dsay,
+                                m_trxreg.rrw, m_trxreg.rrh, true);
+    }
 
     if (s_g424VerPending)
         g424VerifyCompare(m_vram, m_vramSize, m_hwregX, m_hwregY,

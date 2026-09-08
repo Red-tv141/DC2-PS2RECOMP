@@ -563,11 +563,8 @@ namespace
 
     thread_local G425Prof s_g425;
 
-    bool g425ProfileOn()
-    {
-        static const bool s_on = f50_12_vu_env_flag("DC2_G425_PROFILE");
-        return s_on;
-    }
+    const bool s_g674G425ProfileOn = f50_12_vu_env_flag("DC2_G425_PROFILE");
+    DC2_G674_HOT_FLAG_INLINE bool g425ProfileOn() { return s_g674G425ProfileOn; }
 
     uint64_t g425ReportEvery()
     {

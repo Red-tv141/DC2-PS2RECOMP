@@ -613,8 +613,11 @@ static bool UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
         return v && *v && *v != '0';
     }();
     static uint64_t s_g176LastUploadedGen = std::numeric_limits<uint64_t>::max();
-    static uint32_t s_g176LastOutWidth = FB_WIDTH;
-    static uint32_t s_g176LastOutHeight = DEFAULT_DISPLAY_HEIGHT;
+    // G675: seed the skip-path size with the PHYSICAL display geometry (identical to
+    // FB_WIDTH x DEFAULT_DISPLAY_HEIGHT at S=1), so a skipped tick before the first upload
+    // reports the same size a real upload would.
+    static uint32_t s_g176LastOutWidth = static_cast<uint32_t>(dc2GetNativePhysicalDisplayWidth());
+    static uint32_t s_g176LastOutHeight = static_cast<uint32_t>(dc2GetNativePhysicalDisplayHeight());
     static uint64_t s_g176Skips = 0ull;
     static uint64_t s_g176Uploads = 0ull;
     // Read the generation BEFORE the copy: if a latch lands in between, we copy the newer
@@ -715,8 +718,12 @@ static bool UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
-    const uint32_t texW = static_cast<uint32_t>(tex.width > 0 ? tex.width : (dc2IsNativeHighResActive() ? dc2GetNativePhysicalDisplayWidth() : FB_WIDTH));
-    const uint32_t texH = static_cast<uint32_t>(tex.height > 0 ? tex.height : (dc2IsNativeHighResActive() ? dc2GetNativePhysicalDisplayHeight() : DEFAULT_DISPLAY_HEIGHT));
+    // G675: one expression, identity at S=1 (640x448). The presentation texture is always the
+    // PS2 display geometry at physical density; the resample below only ever reconciles a
+    // display SURFACE whose logical width differs from 640 (DC2's is 512), exactly as it did
+    // at 1x — it is not, and must not become, the thing that produces the resolution increase.
+    const uint32_t texW = static_cast<uint32_t>(tex.width > 0 ? tex.width : dc2GetNativePhysicalDisplayWidth());
+    const uint32_t texH = static_cast<uint32_t>(tex.height > 0 ? tex.height : dc2GetNativePhysicalDisplayHeight());
     const size_t uploadSize = static_cast<size_t>(texW) * texH * 4u;
     std::vector<uint8_t> uploadBuffer(uploadSize, 0u);
     if (!scratch.empty() && width != 0u && height != 0u)

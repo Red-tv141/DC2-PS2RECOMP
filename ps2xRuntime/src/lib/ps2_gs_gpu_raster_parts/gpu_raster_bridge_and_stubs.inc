@@ -1,6 +1,20 @@
 bool g178_backend_ready()
 {
-    return g178EnvEnabled() && G178Backend::instance().ready();
+    if (!g178EnvEnabled())
+        return false;
+    G178Backend &backend = G178Backend::instance();
+    // G705: this function has exactly one call site — the top of g178TryFlushGpu — so the thread
+    // that reaches it first IS the GS front end, with or without MTGS. In fused mode that thread
+    // adopts the GL context here, once. After adoption `fusedNeedsAdopt()` is one relaxed load.
+    if (backend.fusedNeedsAdopt())
+        backend.adoptFusedContext();
+    return backend.ready();
+}
+
+// G705: fused-transport arm report, printed from the [G154:perf] window under DC2_G705_STAT=1.
+void g705_backend_report()
+{
+    G178Backend::instance().g705Report();
 }
 
 bool g178_backend_submit(G178Batch &batch)
@@ -54,6 +68,23 @@ bool g634_backend_prepare_raw_view(const std::shared_ptr<G634RawViewPacket> &pac
 bool g634_backend_submit_raw_upload(const std::shared_ptr<G634RawUploadPacket> &packet)
 {
     return G178Backend::instance().prepareG634RawUpload(packet);
+}
+
+// G714: one resolved same-format local->local transfer, executed against raw GS VRAM on the GPU.
+bool g714_backend_submit_l2l(const std::shared_ptr<G714L2lPacket> &packet)
+{
+    return G178Backend::instance().prepareG714L2l(packet);
+}
+
+// G715 VRAMDST: the same submit, but the caller needs `packet->dstOut` filled before it continues.
+bool g714_backend_submit_l2l_sync(const std::shared_ptr<G714L2lPacket> &packet)
+{
+    return G178Backend::instance().prepareG714L2lSync(packet);
+}
+
+bool g714_backend_available()
+{
+    return G178Backend::instance().g714Available();
 }
 
 bool g630_backend_poll(bool wait, std::vector<uint8_t> &results)
@@ -110,6 +141,26 @@ bool g566_backend_authority_submit(
     std::vector<uint8_t> &&command, const std::shared_ptr<G566VuAuthorityResult> &result)
 {
     return G178Backend::instance().submitG566Authority(std::move(command), result);
+}
+
+// G701: fire-and-forget submission of a readback-free batch. Returns false when the caller must
+// take the blocking path. See the G701 block in lle_gpu_raster_backend.inc for why FIFO ordering
+// on the single worker thread makes the wait unnecessary rather than merely optional.
+bool g701_backend_submit_nowait(G178Batch &batch, uint64_t depthKey,
+                                const std::vector<float> *depthUpload, int depthY, int depthRows)
+{
+    return G178Backend::instance().submitNoWait(batch, depthKey, depthUpload, depthY, depthRows);
+}
+
+// Latched failure from any earlier fire-and-forget submit; consumed and cleared.
+bool g701_backend_take_failure()
+{
+    return G178Backend::instance().g701TakeFailure();
+}
+
+void g701_backend_report()
+{
+    G178Backend::instance().g701Report();
 }
 
 // G305: one-slot move-owned async submit / drain (default-off). See G178Backend::submitAsync.

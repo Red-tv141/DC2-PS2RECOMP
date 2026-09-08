@@ -158,6 +158,47 @@ bool g629BackendRequested()
     return on;
 }
 
+// G714: the batched raw-VRAM local->local executor. Independent of G629/G630's prototype arming —
+// it reuses their raw-image REPRESENTATION but none of their replay or residency machinery, and
+// the 121 KB G654-P5 compile-time domain stays excluded.
+bool g714BackendRequested()
+{
+    static const bool on = (g158EnvFlag("DC2_G714_GPUL2L") && !g158EnvFlag("DC2_G714_NO_GPUL2L")) ||
+                          (g158EnvFlag("DC2_G716_AUTHORITY") && !g158EnvFlag("DC2_G716_NO_AUTHORITY"));
+    return on;
+}
+
+bool g714StatBackendOn()
+{
+    static const bool on = g158EnvFlag("DC2_G714_STAT");
+    return on;
+}
+
+// G715: escalate the pre-ingest visibility barrier to a full pipeline drain. Diagnostic only — it
+// answers "is this still a VISIBILITY problem?" without leaving the question to a choice of barrier
+// bits. If a glFinish is correct where GL_ALL_BARRIER_BITS is not, the fault is ordering, not logic.
+bool g715SyncInOn()
+{
+    static const bool on = g158EnvFlag("DC2_G715_SYNCIN");
+    return on;
+}
+
+// G715: the FBO<->raw round-trip oracle. Two full raw readbacks and one extra ingest dispatch per
+// written band, so it is a diagnostic and never a timing or shipping arm.
+bool g715RoundTripVfyOn()
+{
+    static const bool on = g158EnvFlag("DC2_G715_RTVFY");
+    return on;
+}
+
+// G715: drop the raw->FBO publication leg (see runG714OnWorker). Diagnostic — the transfer's bytes
+// deliberately reach nothing, so this arm prices what the FBO write is actually contributing.
+bool g715NoOutOn()
+{
+    static const bool on = g158EnvFlag("DC2_G715_NOOUT");
+    return on;
+}
+
 // G571: diagnostic-only exclusive split for the G570 synchronous compute job.  This remains
 // default-off because the extra clocks and stderr traffic perturb the motion window it measures.
 bool g571ShadowSplitOn()
@@ -455,17 +496,43 @@ bool g447WaitFuture(std::future<bool> &fut, std::atomic<uint32_t> &done)
     }
 }
 
+// G705: fused GS/GL thread. Declares g705FuseGlOn()/g_g705Pump, which SyncWait::wait() consults.
+#include "g705_fused_gl_thread.inc"
+
 struct SyncWait
 {
+    // G705: 0 = not run, 1 = ran and FAILED, 2 = ran and SUCCEEDED. The threaded transport only
+    // ever tests this against zero (g447WaitFuture spins on it and then takes the result from the
+    // future), so widening it is invisible there; the fused transport takes the RESULT from it and
+    // needs no promise at all.
     std::atomic<uint32_t> done{0u};
     std::shared_ptr<std::promise<bool>> promise;
     std::future<bool> future;
 
-    SyncWait() : promise(std::make_shared<std::promise<bool>>()),
-                 future(promise->get_future()) {}
+    SyncWait()
+    {
+        // ⭐ G705: the promise exists to carry a value ACROSS A THREAD. Fused mode has no second
+        // thread, so allocating one costs a heap block, a shared-state control block, two mutex
+        // acquisitions and a condition-variable notify per submit — about 67 submits a frame — to
+        // move a bool between two statements on the same stack.
+        if (g_g705Pump == nullptr)
+        {
+            promise = std::make_shared<std::promise<bool>>();
+            future = promise->get_future();
+        }
+    }
 
     bool wait()
     {
+        // G705: in fused mode there is no worker thread to satisfy this promise. The owner runs
+        // the queue inline here; a foreign thread has its item cancelled and reports a decline.
+        // Null (and therefore free) in every non-fused configuration.
+        if (g_g705Pump != nullptr)
+        {
+            if (!g_g705Pump(&done))
+                return false;
+            return done.load(std::memory_order_acquire) == 2u;
+        }
         return g447WaitFuture(future, done);
     }
 };
@@ -909,7 +976,7 @@ bool g178LoadGLExt(G178GLExt &e)
              g543SemanticReplayRequested() || g544ChainReplayRequested() ||
              g545LiveShadowRequested() || g566VuAuthorityRequested() ||
              g606WideBenchRequested() || g607TBenchRequestedFwd() ||
-             g570Shadow139Requested() || g629BackendRequested())
+             g570Shadow139Requested() || g629BackendRequested() || g714BackendRequested())
     {
         // Optional prototype: missing compute support must not disable the proven graphics backend.
         (void)loadProc(e.glBindImageTexture_, "glBindImageTexture");
@@ -919,7 +986,7 @@ bool g178LoadGLExt(G178GLExt &e)
         g543SemanticReplayRequested() || g544ChainReplayRequested() ||
         g545LiveShadowRequested() || g566VuAuthorityRequested() ||
         g606WideBenchRequested() || g607TBenchRequestedFwd() || g570Shadow139Requested() ||
-        g629BackendRequested())
+        g629BackendRequested() || g714BackendRequested())
         (void)loadProc(e.glDispatchCompute_, "glDispatchCompute");
     // G643: optional, like the compute pointers above — a driver without them keeps the proven
     // image2D data path for the 0x139 kernel instead of disabling anything.

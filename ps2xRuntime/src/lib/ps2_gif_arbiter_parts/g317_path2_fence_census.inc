@@ -17,10 +17,10 @@ enum G317VifFenceReason : uint32_t
 
 namespace
 {
-    bool g317FenceCensusOn()
+    const bool s_g674G317FenceCensusOn = f50_12_env_flag("DC2_G317_FENCE_CENSUS");
+    DC2_G674_HOT_FLAG_INLINE bool g317FenceCensusOn()
     {
-        static const bool s_on = f50_12_env_flag("DC2_G317_FENCE_CENSUS");
-        return s_on;
+        return s_g674G317FenceCensusOn;
     }
 
     std::atomic<uint64_t> g_g317VifFenceEpoch{0u};

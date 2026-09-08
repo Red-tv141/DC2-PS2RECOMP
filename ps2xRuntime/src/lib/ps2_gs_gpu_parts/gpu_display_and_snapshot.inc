@@ -350,6 +350,25 @@ namespace
     };
 
     thread_local G412PresentationOverride s_g412PresentationOverride{};
+
+    // G677: MenuLoop renders through the guest's logical VRAM path, not the native raster
+    // backend. Its ordered boundary must therefore bypass any resident native FBO left by the
+    // preceding gameplay frame. This is source authority, not a resolution-specific menu hack.
+    thread_local bool s_g677LogicalPresentationAuthority = false;
+
+    struct G677LogicalPresentationScope
+    {
+        bool previous = false;
+        G677LogicalPresentationScope()
+            : previous(s_g677LogicalPresentationAuthority)
+        {
+            s_g677LogicalPresentationAuthority = true;
+        }
+        ~G677LogicalPresentationScope()
+        {
+            s_g677LogicalPresentationAuthority = previous;
+        }
+    };
 }
 
 uint64_t g412_capture_vsync_tick()
@@ -389,6 +408,40 @@ void g412_latch_host_presentation_snapshot(GS *gs,
     } restore{previous};
     (void)restore;
     gs->latchHostPresentationFrame();
+}
+
+void g677_latch_logical_host_presentation_frame(GS *gs)
+{
+    if (!gs)
+        return;
+    G677LogicalPresentationScope logicalAuthority;
+    (void)logicalAuthority;
+    gs->latchHostPresentationFrame();
+}
+
+void g677_latch_logical_host_presentation_snapshot(GS *gs,
+                                                    uint64_t pmode,
+                                                    uint64_t smode2,
+                                                    uint64_t dispfb1,
+                                                    uint64_t display1,
+                                                    uint64_t dispfb2,
+                                                    uint64_t display2,
+                                                    uint64_t bgcolor,
+                                                    uint64_t vsyncTick)
+{
+    if (!gs)
+        return;
+    G677LogicalPresentationScope logicalAuthority;
+    (void)logicalAuthority;
+    g412_latch_host_presentation_snapshot(gs,
+                                          pmode,
+                                          smode2,
+                                          dispfb1,
+                                          display1,
+                                          dispfb2,
+                                          display2,
+                                          bgcolor,
+                                          vsyncTick);
 }
 
 // ===== G599: WHOLE-VRAM PAGE MAP AT THE PRESENTATION LATCH (default OFF) =====
@@ -1036,13 +1089,25 @@ void GS::latchHostPresentationFrame()
         return;
     }
 
-    if (dc2IsNativeHighResActive())
+    if (!s_g677LogicalPresentationAuthority && dc2IsNativeHighResActive())
     {
         uint32_t nativeW = 0u, nativeH = 0u;
         std::vector<uint8_t> nativeRgba;
         const uint32_t targetFbp = validCrt1 ? displayFrame1.fbp : (validCrt2 ? displayFrame2.fbp : 0u);
         const uint32_t fallbackFbp = (validCrt1 && validCrt2) ? displayFrame2.fbp : (m_preferredDisplaySourceFrame.fbp ? m_preferredDisplaySourceFrame.fbp : 0x139u);
-        if (g178_backend_read_display_fbo(targetFbp, fallbackFbp, nativeW, nativeH, nativeRgba) &&
+        // ⭐ G675: hand the backend the PCRTC READ RECTANGLE the 1x VRAM path uses — the DISPFB
+        // read origin and the DISPLAY DW/DH extent of whichever circuit is valid — so the
+        // high-res read publishes the SAME logical region, only at S x density. Without it the
+        // backend published the whole 512x512 render surface and the ~97 rows below the display
+        // rectangle were squashed into the presented image.
+        const GSDisplayReadOrigin &nativeOrigin = validCrt1 ? displayOrigin1 : displayOrigin2;
+        const int32_t nativeRectW = static_cast<int32_t>(validCrt1 ? width1 : width2);
+        const int32_t nativeRectH = static_cast<int32_t>(validCrt1 ? height1 : height2);
+        if (g675_backend_read_display_rect(targetFbp, fallbackFbp,
+                                           static_cast<int32_t>(nativeOrigin.x),
+                                           static_cast<int32_t>(nativeOrigin.y),
+                                           nativeRectW, nativeRectH,
+                                           nativeW, nativeH, nativeRgba) &&
             !nativeRgba.empty() && nativeW > 0 && nativeH > 0)
         {
             normalizePresentationAlpha(nativeRgba, nativeW, nativeH);

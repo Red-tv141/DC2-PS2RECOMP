@@ -343,16 +343,10 @@ namespace
     const char *const kG610RfName[G610_RF_COUNT] = {"upperCls", "upperOp", "minmaxDest",
                                                     "lowerKind", "dataSize", "arena", "encode"};
 
-    bool g610StatOn()
-    {
-        static const bool s_on = f50_12_vu_env_flag("DC2_G610_STAT");
-        return s_on;
-    }
-    bool g610VerifyOn()
-    {
-        static const bool s_on = f50_12_vu_env_flag("DC2_G610_VERIFY");
-        return s_on;
-    }
+    const bool s_g674G610StatOn = f50_12_vu_env_flag("DC2_G610_STAT");
+    const bool s_g674G610VerifyOn = f50_12_vu_env_flag("DC2_G610_VERIFY");
+    DC2_G674_HOT_FLAG_INLINE bool g610StatOn() { return s_g674G610StatOn; }
+    DC2_G674_HOT_FLAG_INLINE bool g610VerifyOn() { return s_g674G610VerifyOn; }
     // Is `DC2_G419_AB=vujit` the selected lever? Sampled once, the same way `g490BlockRequested`
     // does it, because it must be known BEFORE the arm register exists.
     bool g610Paired()
@@ -1139,6 +1133,13 @@ namespace
             histReg = G610_X4;
         }
         usesHist = true;
+        // ⭐ G711 measured this push at 0.525 ns/pair = 1.518 ms/f of VU1 busy on `dragon` (7.6% of
+        // it) with an order-balanced BALLAST ladder — the largest single term in the compiled pair's
+        // memory traffic, three times the operand and ACC round-trips combined. Most of it is DEAD:
+        // G612 makes every flag consumer a REGION EXIT, so no pair inside a region can read the
+        // history and only the last <=8 FMAC pushes before an exit are live. It is not elided
+        // because the prize does not CONVERT — VU1 exceeds every other pole on exactly one of the 23
+        // canonical windows, and that window is at the 60 FPS cap (plans/phase-G711-fix-log.md §12).
         // `H.vec[s]` has a 16-byte stride and x86 SIB scales only to 8, so the byte offset is built
         // in two steps: RAX = s*8, then an index scaled by 2. RAX is free here — the stamp value is
         // computed on the next line, after the store. (The oracle caught the scale-1 first version

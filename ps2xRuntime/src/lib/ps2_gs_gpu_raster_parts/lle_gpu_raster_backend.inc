@@ -37,6 +37,45 @@ public:
                          static_cast<unsigned long>(GetLastError()));
             return;
         }
+        // G705: fused mode spawns NO backend thread. Create and share the context here, on the
+        // main thread, but make it current nowhere; the GS front-end thread adopts it at its first
+        // g178_backend_ready(). wglCreateContext/wglShareLists do not require either context to be
+        // current, and the main context is released around them exactly as in the threaded path.
+        if (g705FuseGlOn())
+        {
+            m_rc = wglCreateContext(s_g158MainDC);
+            if (m_rc == nullptr || !wglShareLists(s_g158MainRC, m_rc))
+            {
+                std::fprintf(stderr,
+                             "[G705:fuse] FAIL: context create/share, GetLastError=%lu -- "
+                             "falling back to the threaded backend\n",
+                             static_cast<unsigned long>(GetLastError()));
+                if (m_rc != nullptr)
+                    wglDeleteContext(m_rc);
+                m_rc = nullptr;
+            }
+            else
+            {
+                m_started = true;
+                m_fused = true;
+                g_g705Pump = &g705PumpThunk;
+                std::fprintf(stderr,
+                             "[G705:fuse] armed -- GL runs on the GS front-end thread, no backend "
+                             "thread, no per-batch round trip\n");
+            }
+            if (!wglMakeCurrent(s_g158MainDC, s_g158MainRC))
+            {
+                std::fprintf(stderr,
+                             "[G178:backend] FAIL: could not restore main context, GetLastError=%lu\n",
+                             static_cast<unsigned long>(GetLastError()));
+            }
+            if (m_fused)
+                return;
+            // Share failed: fall through and start the threaded backend as usual. It re-releases
+            // the main context itself, so restore/release is balanced either way.
+            if (!wglMakeCurrent(nullptr, nullptr))
+                return;
+        }
         m_started = true;
         m_thread = std::thread([this] { worker(); });
         {
@@ -51,6 +90,108 @@ public:
     }
 
     bool ready() const { return m_ready.load(std::memory_order_acquire); }
+
+    // G705: true only in fused mode, and only until the context has been adopted. One relaxed load
+    // on the g178TryFlushGpu entry path once adoption has happened.
+    bool fusedNeedsAdopt() const
+    {
+        return m_fused && !m_ready.load(std::memory_order_relaxed) &&
+               !m_failed.load(std::memory_order_relaxed);
+    }
+
+    // G705: make the shared context current on the CALLING thread and build every GL object on it.
+    // Called from g178_backend_ready(), whose single call site is the top of g178TryFlushGpu -- so
+    // the adopting thread is by construction the thread that runs the GS front end, with or
+    // without MTGS.
+    void adoptFusedContext()
+    {
+        std::lock_guard<std::mutex> lk(m_adoptMtx);
+        if (!fusedNeedsAdopt())
+            return;
+        if (!wglMakeCurrent(s_g158MainDC, m_rc))
+        {
+            std::fprintf(stderr, "[G705:fuse] FAIL: make-current on GS thread, GetLastError=%lu\n",
+                         static_cast<unsigned long>(GetLastError()));
+            m_failed = true;
+            return;
+        }
+        if (!setupGlObjectsOnThisThread())
+        {
+            std::fprintf(stderr, "[G705:fuse] FAIL: GL object setup on GS thread\n");
+            wglMakeCurrent(nullptr, nullptr);
+            m_failed = true;
+            return;
+        }
+        m_ownerTid.store(GetCurrentThreadId(), std::memory_order_release);
+        m_ready.store(true, std::memory_order_release);
+        std::fprintf(stderr,
+                     "[G705:fuse] PASS: GL context adopted by thread %lu (GS front end); backend "
+                     "items now execute inline\n",
+                     static_cast<unsigned long>(GetCurrentThreadId()));
+    }
+
+    static bool g705PumpThunk(std::atomic<uint32_t> *doneFlag)
+    {
+        return instance().g705Pump(doneFlag);
+    }
+
+    // G705: the whole transport, in fused mode. The owner drains the queue INLINE, in FIFO order,
+    // so the caller's own item is complete before this returns and its SyncWait never blocks. A
+    // foreign thread cannot execute GL and there is no worker to do it for it, so instead of
+    // deadlocking it withdraws ITS OWN item (identified by the doneFlag, unique per SyncWait) and
+    // answers false -- the same "backend declined" answer every caller already handles by taking
+    // the exact CPU path.
+    bool g705Pump(std::atomic<uint32_t> *doneFlag)
+    {
+        if (!m_fused)
+            return true;
+        if (GetCurrentThreadId() != m_ownerTid.load(std::memory_order_acquire))
+        {
+            g_g705Foreign.fetch_add(1u, std::memory_order_relaxed);
+            if (doneFlag == nullptr)
+                return false; // no identifiable item to withdraw (owner-drain call shape)
+            // Withdraw this caller's own item so nothing dangles, then answer "declined". The
+            // caller's SyncWait returns false without touching its promise (there is none in fused
+            // mode), which is the same answer the backend gives whenever it refuses a batch.
+            std::unique_lock<std::mutex> lk(m_mtx);
+            for (auto it = m_queue.begin(); it != m_queue.end(); ++it)
+            {
+                if (it->doneFlag == doneFlag)
+                {
+                    m_queue.erase(it);
+                    break;
+                }
+            }
+            return false;
+        }
+        uint64_t ran = 0u;
+        for (;;)
+        {
+            QueueItem item;
+            if (!popQueueItem(item, /*blocking=*/false))
+                break;
+            runQueueItem(item);
+            ++ran;
+        }
+        g_g705Pumps.fetch_add(1u, std::memory_order_relaxed);
+        g_g705Items.fetch_add(ran, std::memory_order_relaxed);
+        return true;
+    }
+
+    // G705: read from the [G154:perf] window under DC2_G705_STAT=1. Not #if-excluded, so the arm
+    // can be proven to have fired on the SHIP binary a promotion gate runs on (Rule 69/71).
+    void g705Report()
+    {
+        if (!g705StatOn())
+            return;
+        std::fprintf(stderr,
+                     "[G705:fuse] armed=%u ownerTid=%lu pumps=%llu items=%llu foreign=%llu\n",
+                     m_fused ? 1u : 0u,
+                     static_cast<unsigned long>(m_ownerTid.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(g_g705Pumps.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(g_g705Items.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(g_g705Foreign.load(std::memory_order_relaxed)));
+    }
 
     // G541: enqueue-only transport. The VU1 worker never waits and the GL worker never reads its
     // persistent image back. Logical kicks coalesce into the one still-queued command; once the GL
@@ -903,6 +1044,10 @@ void main()
     bool pollG630(bool wait, std::vector<uint8_t> &results)
     {
         results.clear();
+        // G705: same insurance as drainAsync -- these futures belong to enqueue-only G630 replay
+        // packets (default-off) and only a pump can satisfy them in fused mode.
+        if (m_fused && !m_g630Futures.empty())
+            (void)g705Pump(nullptr);
         while (!m_g630Futures.empty())
         {
             std::future<bool> &f = m_g630Futures.front();
@@ -946,6 +1091,158 @@ void main()
     bool submit(G178Batch &batch)
     {
         return submitImpl(&batch, 0u, nullptr, 0, 0, nullptr);
+    }
+
+    // ===== G701 =====================================================================
+    static bool g701On()
+    {
+        static const bool on = g158EnvFlag("DC2_G701") && !g158EnvFlag("DC2_G701_NO_ASYNC");
+        return on;
+    }
+
+    static uint32_t g701MaxInFlight()
+    {
+        static const uint32_t n = [] {
+            const char *v = std::getenv("DC2_G701_DEPTH");
+            long long k = (v != nullptr) ? std::atoll(v) : 0LL;
+            if (k <= 0LL)
+                k = 6LL;
+            if (k > 16LL)
+                k = 16LL;
+            return static_cast<uint32_t>(k);
+        }();
+        return n;
+    }
+
+    // Enqueue a readback-free batch and return WITHOUT waiting. `false` means the caller must use
+    // the blocking path (not armed, not ready, ring full, or the batch is not eligible).
+    bool submitNoWait(G178Batch &batch, uint64_t depthKey,
+                      const std::vector<float> *depthUpload, int depthY, int depthRows)
+    {
+        if (!g701On() || !batch.skipReadback || !m_ready.load(std::memory_order_acquire))
+            return false;
+        // ⛔ MEASURED DEFECT IN THE FIRST DRAFT. A depth batch's `depthUpload` is the caller's
+        // reused `s_depthUpload` static, so a deferred worker cannot borrow it — the first draft
+        // COPIED it into the slot. That buffer is `fbW * depthRows` floats: 512 x 416 = 850 KB,
+        // copied on every depth flush. The `dragon` A/B/B/A read +3.3 ms/f with both order blocks
+        // positive, and G700 §2.4 then refused depth batches outright, attributing the loss to the
+        // copy.
+        //
+        // ⛔⛔⛔ G704: THE COPY WAS NOT THE CAUSE, AND THE WHOLE MECHANISM IS REFUTED A FOURTH
+        // TIME. With the copy gone, this colour-only path admits 58.8% of eligible flushes
+        // (`[G701:async] submits=113,757 fallbacks=79,844`) and measures **+2.873 ms/f (+10.83%)
+        // on `dragon`, GS own +2.641**, with VU1 −0.215 / EE −0.244 / kicks +0.8 — i.e. the entire
+        // regression lands on the one thread the lever touches, while the workload is invariant.
+        //
+        // ⭐ THE MECHANISM, which is why no implementation of this idea can pay. The blocking wait
+        // is not idle time being wasted: it is what YIELDS THE CORE to the GL worker. This host
+        // runs EE + VU1 + GS front + GL worker + an 11-lane row pool + audio on 6 physical cores,
+        // so removing a wait does not create parallelism — it creates contention, which is
+        // G493's "the GS front thread and the GL worker do not compose on this host" and G690's
+        // "+1.2 ms/f of pole CPU" measured a third and fourth way. G447 already promoted a
+        // SPIN-THEN-BLOCK on this exact edge (−1.5 ms/f); the handoff is tuned, and going fully
+        // asynchronous destroys that tuning.
+        //
+        // A depth extension (swapping `s_depthUpload`'s storage into the slot rather than copying
+        // it — exact, and written) was built and REVERTED on this evidence: admitting more batches
+        // to a path that regresses per batch can only regress further.
+        if (depthUpload != nullptr || depthRows > 0 || depthKey != 0u)
+        {
+            m_g701Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+            return false;
+        }
+        if (m_g701InFlight.load(std::memory_order_relaxed) >= g701MaxInFlight())
+        {
+            m_g701Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+            return false; // the blocking submit below drains the FIFO for us
+        }
+        // A published colour window belongs to a readback, which this batch does not have.
+        g_g415PendWindow.valid = false;
+        G701Slot *slot = nullptr;
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            if (!m_g701Free.empty())
+            {
+                slot = m_g701Free.front();
+                m_g701Free.pop_front();
+            }
+            else if (m_g701Slots.size() < g701MaxInFlight() + 2u)
+            {
+                m_g701Slots.emplace_back();
+                slot = &m_g701Slots.back();
+            }
+            else
+            {
+                m_g701Fallbacks.fetch_add(1u, std::memory_order_relaxed);
+                return false;
+            }
+            // Exchange storage: the slot takes the caller's vectors, the caller takes the slot's
+            // recycled ones. No allocation on either side once the ring is warm.
+            std::swap(slot->batch.fbPixels, batch.fbPixels);
+            std::swap(slot->batch.texUploads, batch.texUploads);
+            std::swap(slot->batch.verts, batch.verts);
+            std::swap(slot->batch.draws, batch.draws);
+            slot->batch.readback.clear();
+            // ⛔ The caller's `s_batch` is a STATIC reused across flushes. It now holds the slot's
+            // recycled storage, whose contents belong to an older batch; leaving them would make
+            // the caller's post-submit epilogue read a previous flush's draws — and, worse, would
+            // leave a previous flush's `readback` at full size, firing the VRAM publication block
+            // for a batch that read nothing back. Keep the capacity, drop the contents.
+            batch.fbPixels.clear();
+            batch.texUploads.clear();
+            batch.verts.clear();
+            batch.draws.clear();
+            batch.readback.clear();
+            slot->batch.fbp = batch.fbp;
+            slot->batch.fboKey = batch.fboKey;
+            slot->batch.fbW = batch.fbW;
+            slot->batch.fbH = batch.fbH;
+            slot->batch.clearDepth = batch.clearDepth;
+            slot->batch.uploadFb = batch.uploadFb;
+            slot->batch.g716SeedPages = batch.g716SeedPages;
+            slot->batch.g716SeedFbw = batch.g716SeedFbw;
+            slot->batch.g716SeedLo = batch.g716SeedLo;
+            slot->batch.g716SeedHi = batch.g716SeedHi;
+            slot->batch.g716SeedExpected = batch.g716SeedExpected;
+            slot->batch.g716SeedEarlyPages = batch.g716SeedEarlyPages;
+            slot->batch.skipReadback = true;
+            slot->batch.rttRawAlpha = batch.rttRawAlpha;
+            slot->busy = true;
+            QueueItem item;
+            item.batch = &slot->batch;
+            item.g701Slot = slot;
+            (void)depthY;
+            if (g299ProfileOn())
+                item.g299Enqueue = std::chrono::steady_clock::now();
+            m_queue.push_back(std::move(item));
+        }
+        m_g701InFlight.fetch_add(1u, std::memory_order_relaxed);
+        m_g701Submits.fetch_add(1u, std::memory_order_relaxed);
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
+        m_cvWork.notify_one();
+        return true;
+    }
+
+    // Latched failure from any fire-and-forget submit. Consumed (and cleared) by the front-end at
+    // its next synchronisation point, which then drops its residency claims.
+    bool g701TakeFailure()
+    {
+        return m_g701Failed.exchange(false, std::memory_order_acq_rel);
+    }
+
+    void g701Report()
+    {
+        const uint64_t s = m_g701Submits.load(std::memory_order_relaxed);
+        const uint64_t f = m_g701Fallbacks.load(std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "[G701:async] armed=%u depth=%u submits=%llu fallbacks=%llu (%.1f%%) "
+                     "inFlight=%u slots=%zu\n",
+                     g701On() ? 1u : 0u, g701MaxInFlight(),
+                     (unsigned long long)s, (unsigned long long)f,
+                     (s + f) ? 100.0 * (double)f / (double)(s + f) : 0.0,
+                     m_g701InFlight.load(std::memory_order_relaxed), m_g701Slots.size());
     }
 
     // G305: non-blocking submit of a skip-readback color batch (no guest depth, no readback out).
@@ -1031,6 +1328,11 @@ void main()
     {
         if (m_asyncSlots.empty())
             return false;
+        // G705: an async slot carries no doneFlag and no SyncWait, so its future is satisfied only
+        // by the queue actually running. In fused mode nothing runs it but this thread. (G305/G444/
+        // G452/G640 are all default-off, so this is insurance, not a hot path.)
+        if (m_fused)
+            (void)g705Pump(nullptr);
         AsyncSlot &slot = m_asyncSlots.front();
         try { ok = slot.future.get(); }
         catch (...) { ok = false; }
@@ -1635,12 +1937,18 @@ private:
         std::shared_ptr<G630T8Packet> g630T8;
         std::shared_ptr<G634RawViewPacket> g634Raw;
         std::shared_ptr<G634RawUploadPacket> g634Up;
+        // G714: one resolved same-format local->local transfer, executed entirely GPU-side.
+        std::shared_ptr<G714L2lPacket> g714L2l;
         std::vector<uint32_t> *g630ReadVram = nullptr;
         std::vector<uint32_t> *g630ReadDepth = nullptr;
         // G631: row band of the persistent raw-VRAM image to read back (row p == guest page p).
         // rowCount 0 keeps the legacy whole-image glGetTexImage.
         uint32_t g630ReadRowLo = 0u, g630ReadRowCount = 0u;
         std::shared_ptr<std::promise<bool>> promise;
+        // G701: when non-null this item owns a fire-and-forget slot. The worker returns it to the
+        // free list on completion and latches any failure; nothing waits on it, so `promise` is
+        // null and must not be dereferenced.
+        void *g701Slot = nullptr;
         // G447: optional caller-owned completion flag, stored (release) by the worker IMMEDIATELY
         // BEFORE promise->set_value so a spinning caller can never observe completion earlier than
         // the promise is satisfied — the caller's stack frame therefore always outlives this store.
@@ -1687,11 +1995,38 @@ private:
         GLuint fbo = 0, colorTex = 0, depthRb = 0;
         int w = 0, h = 0;
         int physW = 0, physH = 0;
-        // G415: one parked geometry per key. A target written at two widths (DC2's fbp=0x139 at
-        // fbw=8 and fbw=2) otherwise destroys and reallocates both attachments on every flip.
-        GLuint spareFbo = 0, spareColorTex = 0, spareDepthRb = 0;
-        int spareW = 0, spareH = 0;
-        int sparePhysW = 0, sparePhysH = 0;
+        // ⭐⭐⭐ G706: N PARKED GEOMETRIES PER KEY. G415 built ONE, against an assumed population:
+        // its own comment said *"a target written at TWO widths (DC2's fbp=0x139 at fbw=8 and
+        // fbw=2)"*. `[G349:fbolife]` on `dragon` measured the real cycle and it is THREE:
+        //
+        //   RECREATE fbp=0x139 (512x512)->(64x512)
+        //   RECREATE fbp=0x139 (64x512)->(128x512)
+        //   RECREATE fbp=0x139 (128x512)->(512x512)
+        //   139: re=27,816 rec=6,394        <- 18.7% of every 0x139 bind REBUILDS the FBO
+        //
+        // A one-deep spare holds only the immediately previous geometry, so on a 3-cycle it is
+        // wrong every single time: request 512 while the spare holds 128, park 512, request 64
+        // while the spare holds 512, and so on. The parked geometry is never the one asked for, so
+        // the recycle path measured as if it were not there. `[G415:stage]` prices the resulting
+        // churn at **fbo=0.180 ms on 6,001 batches** — 1.81 rebuilds per frame, **0.33 ms/f** of
+        // glGenTextures/glTexImage2D/glDeleteTextures, plus the 502-row VRAM re-upload each rebuild
+        // forces (`up=0.069 upRows=502.0` on the same population).
+        //
+        // ⭐ EXACT. Per acquisition the semantics are UNCHANGED: the caller receives a surface of
+        // the requested geometry, re-attached and CLEARED to colour 0 / depth 0, exactly as both
+        // the swap path and the fresh-create path already produce. Nothing defined today becomes
+        // undefined and nothing undefined becomes defined; only the number of geometries that may
+        // be parked instead of destroyed changes. Rollback `DC2_G415_NO_FBO_RECYCLE=1` still
+        // disables the whole mechanism, and `DC2_G706_FBO_SPARES=<1..8>` sets the depth (1
+        // reproduces G415's behaviour exactly).
+        struct Geom
+        {
+            GLuint fbo = 0, colorTex = 0, depthRb = 0;
+            int w = 0, h = 0;
+            int physW = 0, physH = 0;
+        };
+        static constexpr int kG706MaxSpares = 8;
+        Geom spares[kG706MaxSpares];
     };
     struct DepthEntry
     {
@@ -1715,14 +2050,38 @@ private:
             m_cvReady.notify_all();
             return;
         }
-        if (!g158LoadGL(m_f) || !g178LoadGLExt(m_e))
+        if (!setupGlObjectsOnThisThread())
         {
-            std::fprintf(stderr, "[G178:backend] FAIL: could not resolve GL entry points\n");
             wglMakeCurrent(nullptr, nullptr);
             wglDeleteContext(rc);
             m_failed = true;
             m_cvReady.notify_all();
             return;
+        }
+        m_ready.store(true, std::memory_order_release);
+        m_cvReady.notify_all();
+        std::fprintf(stderr, "[G178:backend] PASS: persistent LLE GPU raster thread ready\n");
+        workerLoop();
+
+        if (m_g545Available && !g566VuAuthorityRequested())
+            reportG545Status(true);
+        m_ready.store(false, std::memory_order_release);
+        destroyGlObjectsOnThisThread();
+        wglMakeCurrent(nullptr, nullptr);
+        wglDeleteContext(rc);
+    }
+
+    // G705: everything the GL context owner must build after making the context current, extracted
+    // from worker() so the fused GS thread can run the identical sequence on itself. Failure
+    // reporting is unchanged; the CALLER owns context teardown, because the two owners tear down
+    // differently (the worker deletes an HGLRC it created locally, the fused owner one that
+    // startEager() created on the main thread).
+    bool setupGlObjectsOnThisThread()
+    {
+        if (!g158LoadGL(m_f) || !g178LoadGLExt(m_e))
+        {
+            std::fprintf(stderr, "[G178:backend] FAIL: could not resolve GL entry points\n");
+            return false;
         }
         if (!setupProgram() ||
             ((g256ExactRttOn() || g658Mode6StageGpu() == 7) && !setupExactProgram()) ||
@@ -1732,11 +2091,7 @@ private:
             !setupBuffers() ||
             (g257ImageStoreTestOn() && !runG257ImageStoreDiagnostic()))
         {
-            wglMakeCurrent(nullptr, nullptr);
-            wglDeleteContext(rc);
-            m_failed = true;
-            m_cvReady.notify_all();
-            return;
+            return false;
         }
         if (g541NullComputeRequested())
         {
@@ -1749,6 +2104,13 @@ private:
             m_g629Available = setupG629();
             std::fprintf(stderr, "[G629:gpu] exact band-replay compute %s\n",
                          m_g629Available ? "READY" : "UNAVAILABLE; CPU path unchanged");
+        }
+        if (g714BackendRequested())
+        {
+            const bool ok = setupG714Programs();
+            m_g714Avail.store(ok, std::memory_order_release);
+            std::fprintf(stderr, "[G714:gpu] raw-VRAM local->local compute %s\n",
+                         ok ? "READY" : "UNAVAILABLE; CPU path unchanged");
         }
         if (g570Shadow139Requested())
         {
@@ -1787,53 +2149,186 @@ private:
 #endif
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-        m_ready.store(true, std::memory_order_release);
-        m_cvReady.notify_all();
-        std::fprintf(stderr, "[G178:backend] PASS: persistent LLE GPU raster thread ready\n");
+        return true;
+    }
 
+    // G705: the loop is now pop + run, so the RUN half can also be driven inline by the fused
+    // GS-thread pump (g705Pump). The body of both halves is unchanged.
+    void workerLoop()
+    {
         for (;;)
         {
             QueueItem item;
+            if (!popQueueItem(item, /*blocking=*/true))
+                break;
+            runQueueItem(item);
+        }
+    }
+
+    // G705: the GL teardown half of worker(), extracted verbatim. Runs on whichever thread owns
+    // the context; the caller releases and deletes the HGLRC itself.
+    void destroyGlObjectsOnThisThread()
+    {
+        for (auto &kv : m_fbos)
+            destroyFbo(kv.second);
+        m_fbos.clear();
+        for (auto &kv : m_depths)
+            if (kv.second.tex != 0)
+                glDeleteTextures(1, &kv.second.tex);
+        m_depths.clear();
+        for (auto &kv : m_texCache)
+            if (kv.second.id != 0)
+                glDeleteTextures(1, &kv.second.id);
+        m_texCache.clear();
+        m_texBytes = 0;
+        {
+            std::lock_guard<std::mutex> lk(m_residentMtx);
+            m_resident.clear();
+        }
+        if (m_vbo != 0)
+            m_f.glDeleteBuffers_(1, &m_vbo);
+        if (m_vao != 0)
+            m_f.glDeleteVertexArrays_(1, &m_vao);
+        if (m_prog != 0)
+            m_f.glDeleteProgram_(m_prog);
+        if (m_progG560 != 0)
+            m_f.glDeleteProgram_(m_progG560);
+        if (m_progExact != 0)
+            m_f.glDeleteProgram_(m_progExact);
+        if (m_g541NullProg != 0)
+            m_f.glDeleteProgram_(m_g541NullProg);
+        if (m_g541StateTex != 0)
+            glDeleteTextures(1, &m_g541StateTex);
+        if (m_g629Prog != 0)
+            m_f.glDeleteProgram_(m_g629Prog);
+        if (m_g630ViewProg != 0)
+            m_f.glDeleteProgram_(m_g630ViewProg);
+        if (m_g630UploadProg != 0)
+            m_f.glDeleteProgram_(m_g630UploadProg);
+        if (m_g630T8Prog != 0)
+            m_f.glDeleteProgram_(m_g630T8Prog);
+        const GLuint g629Textures[] = {
+            m_g629ColorTex, m_g629DepthTex, m_g629RecTex, m_g629TexDataTex,
+            m_g629TexDescTex, m_g629TileOffTex, m_g629TileRefTex, m_g630UploadTex,
+            m_g630ViewMapTex, m_g630T8MapTex, m_g630T8ClutTex
+        };
+        for (GLuint tex : g629Textures)
+            if (tex != 0u)
+                glDeleteTextures(1, &tex);
+        if (m_g570Prog != 0)
+            m_f.glDeleteProgram_(m_g570Prog);
+        if (m_g643Prog != 0)
+            m_f.glDeleteProgram_(m_g643Prog);
+        if (m_g643Ssbo[0] != 0u && m_f.glDeleteBuffers_ != nullptr)
+            m_f.glDeleteBuffers_(4, m_g643Ssbo);
+        const GLuint g570Textures[] = {
+            m_g570ColorTex, m_g570DepthTex, m_g570TriTex,
+            m_g570SpanTex, m_g570TileOffsetTex, m_g570TileTriTex
+        };
+        for (GLuint tex : g570Textures)
+            if (tex != 0u)
+                glDeleteTextures(1, &tex);
+        if (m_g545Prog != 0)
+            m_f.glDeleteProgram_(m_g545Prog);
+        if (m_g545CommandTex != 0)
+            glDeleteTextures(1, &m_g545CommandTex);
+        if (m_g545PayloadTex != 0)
+            glDeleteTextures(1, &m_g545PayloadTex);
+        if (m_g545WorkspaceTex != 0)
+            glDeleteTextures(1, &m_g545WorkspaceTex);
+        if (m_g566OutputTex != 0)
+            glDeleteTextures(1, &m_g566OutputTex);
+        if (m_g627Prog != 0)
+            m_f.glDeleteProgram_(m_g627Prog);
+        if (m_g675ResolveProg != 0)
+            m_f.glDeleteProgram_(m_g675ResolveProg);
+        if (m_g675UpProg != 0)
+            m_f.glDeleteProgram_(m_g675UpProg);
+        if (m_g675UpTex != 0)
+            glDeleteTextures(1, &m_g675UpTex);
+        if (m_g675ResolveFbo != 0)
+            m_f.glDeleteFramebuffers_(1, &m_g675ResolveFbo);
+        if (m_g675ResolveTex != 0)
+            glDeleteTextures(1, &m_g675ResolveTex);
+        if (m_g627ValTex != 0)
+            glDeleteTextures(1, &m_g627ValTex);
+        if (m_g627MaskTex != 0)
+            glDeleteTextures(1, &m_g627MaskTex);
+        if (m_g281Prog != 0)
+            m_f.glDeleteProgram_(m_g281Prog);
+        if (m_g281MapTex != 0)
+            glDeleteTextures(1, &m_g281MapTex);
+        if (m_g281ClutTex != 0)
+            glDeleteTextures(1, &m_g281ClutTex);
+        if (m_g281Fbo != 0)
+            m_f.glDeleteFramebuffers_(1, &m_g281Fbo);
+        if (m_g309Prog != 0)
+            m_f.glDeleteProgram_(m_g309Prog);
+        if (m_g309MapTex != 0)
+            glDeleteTextures(1, &m_g309MapTex);
+        if (m_g309BaseTex != 0)
+            glDeleteTextures(1, &m_g309BaseTex);
+    }
+
+    // G705: the pop half of the worker loop, extracted verbatim so the fused inline pump can
+    // share it. `blocking` true is the worker thread's own condition-variable wait; `blocking`
+    // false returns immediately on an empty queue, which is what the inline pump needs (it
+    // drains what is queued and no more). Returns false only when there is nothing to run --
+    // for the blocking caller the cv predicate guarantees `m_stop || !empty`, so an empty queue
+    // there means m_stop, exactly the condition the original `break` tested.
+    bool popQueueItem(QueueItem &item, bool blocking)
+    {
+            // G447 (second half of the round trip, DC2_G419_AB=wspin / DC2_G447_WSPIN_US): the
+            // caller-side spin removes the GS worker's wake, but the SUBMIT direction has the
+            // same latency — this thread is asleep when the item is queued and the kernel must
+            // schedule it back on. Spin on a submit sequence counter for a bounded budget before
+            // falling into the condition variable. Purely a hint: the cv predicate below is
+            // still the authority, so the queue discipline and ordering are unchanged.
+            // G471 tested both a cheaper and a more backed-off poll here too (the two spins read
+            // the same shared QPC page, so they were armed together); see g447WaitFuture above.
+            if (blocking && g447WorkerSpinActive())
             {
-                // G447 (second half of the round trip, DC2_G419_AB=wspin / DC2_G447_WSPIN_US): the
-                // caller-side spin removes the GS worker's wake, but the SUBMIT direction has the
-                // same latency — this thread is asleep when the item is queued and the kernel must
-                // schedule it back on. Spin on a submit sequence counter for a bounded budget before
-                // falling into the condition variable. Purely a hint: the cv predicate below is
-                // still the authority, so the queue discipline and ordering are unchanged.
-                // G471 tested both a cheaper and a more backed-off poll here too (the two spins read
-                // the same shared QPC page, so they were armed together); see g447WaitFuture above.
-                if (g447WorkerSpinActive())
+                const uint64_t seen = m_submitSeq.load(std::memory_order_acquire);
+                const auto until = std::chrono::steady_clock::now() +
+                                   std::chrono::microseconds(g447WorkerSpinBudgetUs());
+                while (m_submitSeq.load(std::memory_order_acquire) == seen)
                 {
-                    const uint64_t seen = m_submitSeq.load(std::memory_order_acquire);
-                    const auto until = std::chrono::steady_clock::now() +
-                                       std::chrono::microseconds(g447WorkerSpinBudgetUs());
-                    while (m_submitSeq.load(std::memory_order_acquire) == seen)
-                    {
-                        if (std::chrono::steady_clock::now() >= until)
-                            break;
-                        YieldProcessor();
-                    }
+                    if (std::chrono::steady_clock::now() >= until)
+                        break;
+                    YieldProcessor();
                 }
-                std::unique_lock<std::mutex> lk(m_mtx);
-                m_cvWork.wait(lk, [&] { return m_stop || !m_queue.empty(); });
-                if (m_stop && m_queue.empty())
-                    break;
-                item = std::move(m_queue.front());
-                if (item.g541NullBatch)
-                {
-                    const std::shared_ptr<G541NullBatch> queued = m_g541QueuedBatch.lock();
-                    if (queued.get() == item.g541NullBatch.get())
-                        m_g541QueuedBatch.reset();
-                }
-                if (item.g545LiveBatch)
-                {
-                    const std::shared_ptr<G545LiveBatch> queued = m_g545QueuedBatch.lock();
-                    if (queued.get() == item.g545LiveBatch.get())
-                        m_g545QueuedBatch.reset();
-                }
-                m_queue.pop_front();
             }
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (blocking)
+                m_cvWork.wait(lk, [&] { return m_stop || !m_queue.empty(); });
+            if (m_queue.empty())
+                return false;
+            item = std::move(m_queue.front());
+            if (item.g541NullBatch)
+            {
+                const std::shared_ptr<G541NullBatch> queued = m_g541QueuedBatch.lock();
+                if (queued.get() == item.g541NullBatch.get())
+                    m_g541QueuedBatch.reset();
+            }
+            if (item.g545LiveBatch)
+            {
+                const std::shared_ptr<G545LiveBatch> queued = m_g545QueuedBatch.lock();
+                if (queued.get() == item.g545LiveBatch.get())
+                    m_g545QueuedBatch.reset();
+            }
+            m_queue.pop_front();
+            return true;
+    }
+
+    // G705: the RUN half of the worker loop, extracted verbatim. The body is wrapped in
+    // `do { ... } while (false)` so every `continue` that belonged to the outer `for (;;)` keeps
+    // its exact meaning (leave this item, take the next) without a single edit inside it -- and
+    // every `continue` that belongs to a NESTED loop still binds to that loop. The three
+    // outer-scope continues are the G545 batch, the G541 batch and the G701 slot return.
+    void runQueueItem(QueueItem &item)
+    {
+        do
+        {
             if (g652CriticalTraceOn)
                 g652CriticalTrace(31u, 1u);
             if (item.g545LiveBatch)
@@ -2167,6 +2662,8 @@ private:
                     g495Cls = kG495ClsG630T8;
                 else if (item.g634Up != nullptr)
                     g495Cls = kG495ClsG630Upload;
+                else if (item.g714L2l != nullptr)
+                    g495Cls = kG495ClsG630Upload; // G714: raw-VRAM class, same GPU timeline bucket
                 else if (item.g630ReadVram != nullptr || item.g630ReadDepth != nullptr)
                     g495Cls = kG495ClsG630Read;
                 else if (item.g570TriWords != nullptr)
@@ -2241,6 +2738,8 @@ private:
                     ok = runG634RawViewOnWorker(*item.g634Raw);
                 else if (item.g634Up != nullptr)
                     ok = runG634RawUploadOnWorker(*item.g634Up);
+                else if (item.g714L2l != nullptr)
+                    ok = runG714OnWorker(*item.g714L2l);
                 else if (item.g630ReadVram != nullptr)
                     ok = readG630ImageOnWorker(false, *item.g630ReadVram,
                                                item.g630ReadRowLo, item.g630ReadRowCount);
@@ -2527,117 +3026,31 @@ private:
             // G447: publish completion to a spinning caller BEFORE satisfying the promise (see the
             // lifetime argument on QueueItem::doneFlag). Exact: the caller still takes its result
             // from the future, so nothing about the value or its ordering changes.
+            // G705: the value moved from 1 to 1|2 so the fused caller can read the RESULT here
+            // instead of through a promise. Every threaded consumer tests this against zero only.
             if (item.doneFlag != nullptr)
-                item.doneFlag->store(1u, std::memory_order_release);
+                item.doneFlag->store(ok ? 2u : 1u, std::memory_order_release);
             if (g652CriticalTraceOn)
                 g652CriticalTrace(32u, ok ? 1u : 0u);
-            item.promise->set_value(ok);
-        }
-
-        if (m_g545Available && !g566VuAuthorityRequested())
-            reportG545Status(true);
-        m_ready.store(false, std::memory_order_release);
-        for (auto &kv : m_fbos)
-            destroyFbo(kv.second);
-        m_fbos.clear();
-        for (auto &kv : m_depths)
-            if (kv.second.tex != 0)
-                glDeleteTextures(1, &kv.second.tex);
-        m_depths.clear();
-        for (auto &kv : m_texCache)
-            if (kv.second.id != 0)
-                glDeleteTextures(1, &kv.second.id);
-        m_texCache.clear();
-        m_texBytes = 0;
-        {
-            std::lock_guard<std::mutex> lk(m_residentMtx);
-            m_resident.clear();
-        }
-        if (m_vbo != 0)
-            m_f.glDeleteBuffers_(1, &m_vbo);
-        if (m_vao != 0)
-            m_f.glDeleteVertexArrays_(1, &m_vao);
-        if (m_prog != 0)
-            m_f.glDeleteProgram_(m_prog);
-        if (m_progG560 != 0)
-            m_f.glDeleteProgram_(m_progG560);
-        if (m_progExact != 0)
-            m_f.glDeleteProgram_(m_progExact);
-        if (m_g541NullProg != 0)
-            m_f.glDeleteProgram_(m_g541NullProg);
-        if (m_g541StateTex != 0)
-            glDeleteTextures(1, &m_g541StateTex);
-        if (m_g629Prog != 0)
-            m_f.glDeleteProgram_(m_g629Prog);
-        if (m_g630ViewProg != 0)
-            m_f.glDeleteProgram_(m_g630ViewProg);
-        if (m_g630UploadProg != 0)
-            m_f.glDeleteProgram_(m_g630UploadProg);
-        if (m_g630T8Prog != 0)
-            m_f.glDeleteProgram_(m_g630T8Prog);
-        const GLuint g629Textures[] = {
-            m_g629ColorTex, m_g629DepthTex, m_g629RecTex, m_g629TexDataTex,
-            m_g629TexDescTex, m_g629TileOffTex, m_g629TileRefTex, m_g630UploadTex,
-            m_g630ViewMapTex, m_g630T8MapTex, m_g630T8ClutTex
-        };
-        for (GLuint tex : g629Textures)
-            if (tex != 0u)
-                glDeleteTextures(1, &tex);
-        if (m_g570Prog != 0)
-            m_f.glDeleteProgram_(m_g570Prog);
-        if (m_g643Prog != 0)
-            m_f.glDeleteProgram_(m_g643Prog);
-        if (m_g643Ssbo[0] != 0u && m_f.glDeleteBuffers_ != nullptr)
-            m_f.glDeleteBuffers_(4, m_g643Ssbo);
-        const GLuint g570Textures[] = {
-            m_g570ColorTex, m_g570DepthTex, m_g570TriTex,
-            m_g570SpanTex, m_g570TileOffsetTex, m_g570TileTriTex
-        };
-        for (GLuint tex : g570Textures)
-            if (tex != 0u)
-                glDeleteTextures(1, &tex);
-        if (m_g545Prog != 0)
-            m_f.glDeleteProgram_(m_g545Prog);
-        if (m_g545CommandTex != 0)
-            glDeleteTextures(1, &m_g545CommandTex);
-        if (m_g545PayloadTex != 0)
-            glDeleteTextures(1, &m_g545PayloadTex);
-        if (m_g545WorkspaceTex != 0)
-            glDeleteTextures(1, &m_g545WorkspaceTex);
-        if (m_g566OutputTex != 0)
-            glDeleteTextures(1, &m_g566OutputTex);
-        if (m_g627Prog != 0)
-            m_f.glDeleteProgram_(m_g627Prog);
-        if (m_g675ResolveProg != 0)
-            m_f.glDeleteProgram_(m_g675ResolveProg);
-        if (m_g675UpProg != 0)
-            m_f.glDeleteProgram_(m_g675UpProg);
-        if (m_g675UpTex != 0)
-            glDeleteTextures(1, &m_g675UpTex);
-        if (m_g675ResolveFbo != 0)
-            m_f.glDeleteFramebuffers_(1, &m_g675ResolveFbo);
-        if (m_g675ResolveTex != 0)
-            glDeleteTextures(1, &m_g675ResolveTex);
-        if (m_g627ValTex != 0)
-            glDeleteTextures(1, &m_g627ValTex);
-        if (m_g627MaskTex != 0)
-            glDeleteTextures(1, &m_g627MaskTex);
-        if (m_g281Prog != 0)
-            m_f.glDeleteProgram_(m_g281Prog);
-        if (m_g281MapTex != 0)
-            glDeleteTextures(1, &m_g281MapTex);
-        if (m_g281ClutTex != 0)
-            glDeleteTextures(1, &m_g281ClutTex);
-        if (m_g281Fbo != 0)
-            m_f.glDeleteFramebuffers_(1, &m_g281Fbo);
-        if (m_g309Prog != 0)
-            m_f.glDeleteProgram_(m_g309Prog);
-        if (m_g309MapTex != 0)
-            glDeleteTextures(1, &m_g309MapTex);
-        if (m_g309BaseTex != 0)
-            glDeleteTextures(1, &m_g309BaseTex);
-        wglMakeCurrent(nullptr, nullptr);
-        wglDeleteContext(rc);
+            // G701: a fire-and-forget item has no waiter. Latch any failure for the front-end's
+            // next synchronisation point and hand the slot back to the free list.
+            if (item.g701Slot != nullptr)
+            {
+                G701Slot *slot = static_cast<G701Slot *>(item.g701Slot);
+                if (!ok)
+                    m_g701Failed.store(true, std::memory_order_release);
+                {
+                    std::unique_lock<std::mutex> lk(m_mtx);
+                    slot->busy = false;
+                    m_g701Free.push_back(slot);
+                }
+                m_g701InFlight.fetch_sub(1u, std::memory_order_relaxed);
+                continue;
+            }
+            // G705: null in fused mode -- the caller reads `ok` from doneFlag above.
+            if (item.promise)
+                item.promise->set_value(ok);
+        } while (false);
     }
 
     bool setupG545LiveShadow()
@@ -3709,6 +4122,21 @@ void main()
                              GL178_TEXTURE_FETCH_BARRIER_BIT);
         if (glGetError() != GL_NO_ERROR)
             return false;
+        if (!p.expected.empty())
+        {
+            m_e.glMemoryBarrier_(0xFFFFFFFFu);
+            std::vector<uint32_t> actual(p.expected.size());
+            glBindTexture(GL_TEXTURE_2D, out.id);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, actual.data());
+            uint64_t bad = 0;
+            for (size_t i = 0; i < actual.size(); ++i) bad += actual[i] != p.expected[i];
+            static uint64_t checks = 0, totalBad = 0;
+            ++checks; totalBad += bad;
+            if (bad || checks <= 4 || checks % 128 == 0)
+                std::fprintf(stderr, "[G716:t8-vfy] checks=%llu bad=%llu thisBad=%llu tbp=%x tbw=%u dims=%dx%d\n",
+                    (unsigned long long)checks, (unsigned long long)totalBad, (unsigned long long)bad,
+                    p.tbp, p.tbw, p.width, p.height);
+        }
         {
             std::lock_guard<std::mutex> lk(m_residentMtx);
             m_resident.insert(p.texKey);
@@ -6259,19 +6687,50 @@ void main()
         e.h = 0;
     }
 
+    // ⛔ G706: STAYS DEFAULT 1 — PRICED AND NOT WORTH IT, exactly like G594's fast walk.
+    //
+    // Depth 1 reproduces G415's shipped behaviour byte for byte (search slot 0, destroy slot 0,
+    // park into slot 0); depth 4 covers the measured 3-width 0x139 cycle and converts 895 of 907
+    // FBO allocations per 190 s arm into revives. The MECHANISM works completely. The PRIZE does
+    // not exist: the gate's own counters put the rate at **907 creates over 8,220 rendered frames
+    // = 0.110 per frame**, so at `[G415:stage]`'s 0.180 ms per create the ceiling is **0.020 ms/f**
+    // — twenty times below the Rule 16 drift gate, and the A/B/B/A that tried to read it came back
+    // drift 0.428 with mixed-sign blocks (−0.188 / +0.564), i.e. inadmissible AND unresolvable.
+    //
+    // ⚠️ The 0.33 ms/f that motivated building this was a rate error of my own: `[G415:stage]`'s
+    // per-batch `fbo` mark was multiplied by a batches-per-frame figure derived from a DIFFERENT
+    // run's window count. Rule 72 forbids exactly that, in the reverse direction.
+    //
+    // The finding it came from stands and is the durable part (Rule 77): G415's cache parks ONE
+    // geometry because its comment assumed a two-width population, the real cycle is three, and it
+    // has therefore been shipping default-ON at a **0% hit rate** (`fboRevive=0` over 907
+    // allocations) with its own counter reporting it. Set `DC2_G706_FBO_SPARES=4` to arm it.
+    static int g706FboSpareDepth()
+    {
+        static const int n = [] {
+            const char *v = std::getenv("DC2_G706_FBO_SPARES");
+            const int parsed = (v != nullptr) ? std::atoi(v) : 1;
+            return parsed < 1 ? 1 : (parsed > FboEntry::kG706MaxSpares
+                                         ? FboEntry::kG706MaxSpares : parsed);
+        }();
+        return n;
+    }
+
+    void destroySpareGeom(FboEntry::Geom &g)
+    {
+        if (g.fbo != 0)
+            m_f.glDeleteFramebuffers_(1, &g.fbo);
+        if (g.colorTex != 0)
+            glDeleteTextures(1, &g.colorTex);
+        if (g.depthRb != 0)
+            m_e.glDeleteRenderbuffers_(1, &g.depthRb);
+        g = FboEntry::Geom{};
+    }
+
     void destroySpareFbo(FboEntry &e)
     {
-        if (e.spareFbo != 0)
-            m_f.glDeleteFramebuffers_(1, &e.spareFbo);
-        if (e.spareColorTex != 0)
-            glDeleteTextures(1, &e.spareColorTex);
-        if (e.spareDepthRb != 0)
-            m_e.glDeleteRenderbuffers_(1, &e.spareDepthRb);
-        e.spareFbo = 0;
-        e.spareColorTex = 0;
-        e.spareDepthRb = 0;
-        e.spareW = 0;
-        e.spareH = 0;
+        for (int si = 0; si < FboEntry::kG706MaxSpares; ++si)
+            destroySpareGeom(e.spares[si]);
     }
 
     void destroyFbo(FboEntry &e)
@@ -6364,16 +6823,31 @@ void main()
         // takes the original create path.
         if (g415FboRecycleOn())
         {
-            if (e.spareFbo != 0 && e.spareColorTex != 0 && e.spareDepthRb != 0 &&
-                e.spareW == w && e.spareH == h && e.sparePhysW == physW && e.sparePhysH == physH)
+            // G706: search every parked geometry, not only the most recent one. On the measured
+            // 3-width 0x139 cycle the wanted geometry is never the most recent, which is why the
+            // one-deep form measured as if it were absent.
+            const int g706Depth = g706FboSpareDepth();
+            int g706Hit = -1;
+            for (int si = 0; si < g706Depth; ++si)
             {
-                std::swap(e.fbo, e.spareFbo);
-                std::swap(e.colorTex, e.spareColorTex);
-                std::swap(e.depthRb, e.spareDepthRb);
-                std::swap(e.w, e.spareW);
-                std::swap(e.h, e.spareH);
-                std::swap(e.physW, e.sparePhysW);
-                std::swap(e.physH, e.sparePhysH);
+                const FboEntry::Geom &s = e.spares[si];
+                if (s.fbo != 0 && s.colorTex != 0 && s.depthRb != 0 &&
+                    s.w == w && s.h == h && s.physW == physW && s.physH == physH)
+                {
+                    g706Hit = si;
+                    break;
+                }
+            }
+            if (g706Hit >= 0)
+            {
+                FboEntry::Geom &sp = e.spares[g706Hit];
+                std::swap(e.fbo, sp.fbo);
+                std::swap(e.colorTex, sp.colorTex);
+                std::swap(e.depthRb, sp.depthRb);
+                std::swap(e.w, sp.w);
+                std::swap(e.h, sp.h);
+                std::swap(e.physW, sp.physW);
+                std::swap(e.physH, sp.physH);
                 glBindTexture(GL_TEXTURE_2D, e.colorTex);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
@@ -6404,14 +6878,30 @@ void main()
             }
             else if (e.fbo != 0)
             {
-                destroySpareFbo(e);
-                e.spareFbo = e.fbo;
-                e.spareColorTex = e.colorTex;
-                e.spareDepthRb = e.depthRb;
-                e.spareW = e.w;
-                e.spareH = e.h;
-                e.sparePhysW = e.physW;
-                e.sparePhysH = e.physH;
+                // G706: park the live geometry in the first FREE slot instead of destroying
+                // whatever was parked before it. Only when every slot is occupied does one get
+                // destroyed, and then it is the LAST slot — the least recently promoted, since a
+                // hit above swaps its finder's slot with the live geometry and therefore keeps the
+                // active rotation in the low slots. With depth 1 this is byte-for-byte G415's
+                // behaviour (destroy slot 0, park into slot 0).
+                int g706Slot = -1;
+                for (int si = 0; si < g706Depth; ++si)
+                    if (e.spares[si].fbo == 0)
+                    {
+                        g706Slot = si;
+                        break;
+                    }
+                if (g706Slot < 0)
+                {
+                    g706Slot = g706Depth - 1;
+                    destroySpareGeom(e.spares[g706Slot]);
+                }
+                // Anything parked beyond the current depth (a shrunk DC2_G706_FBO_SPARES) is
+                // storage nothing can ever find again — release it rather than leak it.
+                for (int si = g706Depth; si < FboEntry::kG706MaxSpares; ++si)
+                    destroySpareGeom(e.spares[si]);
+                e.spares[g706Slot] = FboEntry::Geom{e.fbo, e.colorTex, e.depthRb,
+                                                   e.w, e.h, e.physW, e.physH};
                 e.fbo = 0;
                 e.colorTex = 0;
                 e.depthRb = 0;
@@ -8313,6 +8803,30 @@ void main()
                                 GL_RGBA, GL_UNSIGNED_BYTE, b.fbPixels.data());
             }
         }
+        if (!g716SeedOnWorker(b)) return false;
+        if (!b.g716SeedExpected.empty())
+        {
+            std::vector<uint32_t> actual(b.g716SeedExpected.size());
+            GLint savedTexture = 0;
+            glGetIntegerv(GL_TEXTURE_BINDING_2D, &savedTexture);
+            glBindTexture(GL_TEXTURE_2D, fbo.colorTex);
+            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, actual.data());
+            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(savedTexture));
+            uint64_t wrong = 0;
+            size_t first = 0;
+            for (size_t i = 0; i < actual.size(); ++i)
+                if (actual[i] != b.g716SeedExpected[i]) { if (!wrong) first = i; ++wrong; }
+            static uint64_t checks = 0, bad = 0;
+            ++checks; bad += wrong != 0;
+            if (checks <= 4 || (wrong && bad <= 16) || checks % 128 == 0)
+                std::fprintf(stderr, "[G716:seed-vfy] checks=%llu bad=%llu thisBad=%llu fbp=%x key=%x w=%d rows=%d..%d early=%zu late=%zu first=%zu gsxy=%zu,%zu got=%08x want=%08x guest=%08x\n",
+                    (unsigned long long)checks, (unsigned long long)bad, (unsigned long long)wrong,
+                    b.fbp, b.fboKey, b.fbW, b.g716SeedLo, b.g716SeedHi,
+                    b.g716SeedEarlyPages.size(), b.g716SeedPages.size(), first,
+                    first % b.fbW, b.fbH - 1 - first / b.fbW,
+                    actual[first], b.g716SeedExpected[first], b.fbPixels[first]);
+        }
+        g716TraceSurface(b, fbo.colorTex, 0);
         g415Note(); // 3: framebuffer upload
 
         // G242: the real guest Z target owns one persistent texture keyed by ZBP/ZBW/ZPSM, not by
@@ -9435,6 +9949,7 @@ void main()
                 }
             }
         }
+        g716TraceSurface(b, fbo.colorTex, 1);
         g415Note(); // 6: draw loop (+ exact-path epilogue)
         // G418 early kick: this batch leaves its GL work queued and never fences, so without a kick
         // the frame's one readback batch pays the whole backlog as drain. glFlush only guarantees
@@ -9890,6 +10405,13 @@ void main()
     unsigned m_g257PreErrorCount = 0, m_g257PostErrorCount = 0;
 
     std::thread m_thread;
+    // G705: fused mode -- no backend thread. `m_rc` is created and shared on the main thread by
+    // startEager() and made current by the GS front-end thread in adoptFusedContext(); after that
+    // `m_ownerTid` is the only thread allowed to execute a QueueItem.
+    bool m_fused = false;
+    HGLRC m_rc = nullptr;
+    std::atomic<uint32_t> m_ownerTid{0u};
+    std::mutex m_adoptMtx;
     std::mutex m_mtx;
     std::condition_variable m_cvWork;
     // G447: monotone submit counter — a lock-free hint the worker spins on before sleeping.
@@ -9911,6 +10433,46 @@ void main()
     std::deque<AsyncSlot> m_asyncSlots;
     // G640: a FREE LIST, not one slot — a depth-N ring needs N+1 buffer sets in circulation.
     std::deque<G178Batch> m_asyncRecycle;
+
+    // ===== G701: FIRE-AND-FORGET SUBMISSION FOR READBACK-FREE BATCHES ==========================
+    //
+    // THE DEFECT. `submitImpl` ends in `wait.wait()` UNCONDITIONALLY. A batch with
+    // `skipReadback = true` produces nothing the caller reads — the result stays in the FBO — and
+    // yet the pole thread still blocks on a promise satisfied by the GL worker. That is a full
+    // cross-thread round trip, 33.4 times a frame (`[G523:fit]` flushes/frame), buying a boolean.
+    //
+    // WHY THE ORDERING STILL HOLDS. Every backend operation — render, readColor, writeColor,
+    // copyRects, the T8/CT24 view builds, the display read — is enqueued on `m_queue` and consumed
+    // by ONE worker thread in FIFO order. A later readback is therefore already sequenced behind
+    // every earlier render without any front-end wait. The wait was never establishing order; it
+    // was establishing *completion*, which only a readback consumer actually needs.
+    //
+    // WHY THIS IS NOT G305/G640. Those built a ring of MOVE-OWNED batches with a promise and a
+    // future per packet, and drained it at every flush — G684 Rule 61 measured the drain as
+    // `elig=0` over 200,704 flushes and G690 charged the ring +1.2 ms/f of pole-thread CPU for
+    // <=0.34 ms of backend saving. This is the opposite shape: no promise, no future, no per-flush
+    // drain, and the caller's vector storage is exchanged with a recycled set so no allocation
+    // happens on either side. The only thing that crosses is a pointer into stable deque storage.
+    //
+    // FAILURE. A fire-and-forget submit cannot report a backend failure to the caller that issued
+    // it. The failure is latched instead, and the next operation that DOES synchronise reports it,
+    // at which point the front-end drops its residency claims and re-establishes from guest VRAM.
+    // The backend fails only when it is not ready — which is knowable synchronously — or on a GL
+    // exception, which has never been observed on a shipping path.
+    //
+    // Levers: DC2_G701=1 arms it; DC2_G701_NO_ASYNC=1 rolls it back; DC2_G701_DEPTH=<n> bounds the
+    // in-flight count (default 6, clamped 1..16).
+    struct G701Slot
+    {
+        G178Batch batch;
+        std::vector<float> depthUpload; // copied: the caller's buffer is a reused static
+        bool busy = false;
+    };
+    std::deque<G701Slot> m_g701Slots;   // stable storage; QueueItem::batch points into it
+    std::deque<G701Slot *> m_g701Free;  // slots the worker has released
+    std::atomic<uint32_t> m_g701InFlight{0u};
+    std::atomic<bool> m_g701Failed{false};
+    std::atomic<uint64_t> m_g701Submits{0u}, m_g701Fallbacks{0u};
 
     std::mutex m_residentMtx;
     std::unordered_set<uint64_t> m_resident;
@@ -9941,6 +10503,10 @@ void main()
     // G420 narrow-readback mechanism probe: inert destination-side write target (worker thread
     // only, allocated only when DC2_G419_AB=narrowtouch is armed).
     std::vector<uint32_t> m_g420TouchScratch;
+
+// G714: the batched GPU-resident raw-VRAM local->local executor. Its members close with an
+// explicit `private:`, so nothing below this include changes access.
+#include "g714_raw_l2l_members.inc"
 };
 } // namespace
 

@@ -45,17 +45,10 @@
 
 namespace
 {
-    bool g477FastRunOn()
-    {
-        static const bool v = (std::getenv("DC2_G477_NO_FAST_RUN") == nullptr);
-        return v;
-    }
-
-    bool g477VerifyOn()
-    {
-        static const bool v = (std::getenv("DC2_G477_VERIFY") != nullptr);
-        return v;
-    }
+    const bool s_g674G477FastRunOn = (std::getenv("DC2_G477_NO_FAST_RUN") == nullptr);
+    const bool s_g674G477VerifyOn = (std::getenv("DC2_G477_VERIFY") != nullptr);
+    DC2_G674_HOT_FLAG_INLINE bool g477FastRunOn() { return s_g674G477FastRunOn; }
+    DC2_G674_HOT_FLAG_INLINE bool g477VerifyOn() { return s_g674G477VerifyOn; }
 
     // Paired within-process gate. -1 = not selected, so the writer takes its own default/rollback.
     inline bool g477UseFast()
@@ -65,11 +58,8 @@ namespace
     }
 
     // ---- DC2_G477_CENSUS: price the site's CALL RATE before believing any profile row (G476) ----
-    bool g477CensusOn()
-    {
-        static const bool v = (std::getenv("DC2_G477_CENSUS") != nullptr);
-        return v;
-    }
+    const bool s_g674G477CensusOn = (std::getenv("DC2_G477_CENSUS") != nullptr);
+    DC2_G674_HOT_FLAG_INLINE bool g477CensusOn() { return s_g674G477CensusOn; }
 
     bool g652P4BulkOn()
     {

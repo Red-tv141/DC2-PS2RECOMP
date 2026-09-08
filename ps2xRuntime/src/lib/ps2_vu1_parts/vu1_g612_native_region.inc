@@ -457,16 +457,10 @@ namespace
     // separates them (G603's law: name the blocker).
     thread_local std::array<uint32_t, G612_SLOTS> s_g612ExitAt{};
 
-    bool g612StatOn()
-    {
-        static const bool s_on = f50_12_vu_env_flag("DC2_G612_STAT");
-        return s_on;
-    }
-    bool g612VerifyOn()
-    {
-        static const bool s_on = f50_12_vu_env_flag("DC2_G612_VERIFY");
-        return s_on;
-    }
+    const bool s_g674G612StatOn = f50_12_vu_env_flag("DC2_G612_STAT");
+    const bool s_g674G612VerifyOn = f50_12_vu_env_flag("DC2_G612_VERIFY");
+    DC2_G674_HOT_FLAG_INLINE bool g612StatOn() { return s_g674G612StatOn; }
+    DC2_G674_HOT_FLAG_INLINE bool g612VerifyOn() { return s_g674G612VerifyOn; }
     bool g652VuLoiOn()
     {
         // P3 prototype remains available for exactness/census work, but its independent

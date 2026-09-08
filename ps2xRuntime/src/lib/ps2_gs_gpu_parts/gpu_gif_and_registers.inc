@@ -32,6 +32,64 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
     G508StateLock lock(m_stateMutex, g508Arm != 0);
     if (!data || sizeBytes < 16 || !m_vram)
         return;
+    // ⭐ G713: install the pipeline's GS-side executors, once. They must be defined HERE, inside a
+    // GS member, because every member they touch is private and ps2_gs_gpu.h is frozen (see
+    // g713_pipe_gs.inc's header). A captureless lambda declared in a member's scope has that
+    // access AND converts to a plain function pointer, which is what the ring stores. Cost on the
+    // default path: one plain static-bool branch per packet (~4,400/frame).
+    {
+        static bool s_g713Reg = false;
+        if (!s_g713Reg)
+        {
+            s_g713Reg = true;
+            g_g713RealGs = this;
+            G713GsHooks g713H;
+            g713H.xfer = +[](const G713XferSnap *s) {
+                GS *g = g_g713ExecGs;
+                if (g == nullptr)
+                {
+                    if (g_g713RealGs == nullptr)
+                        return;
+                    g = new GS();
+                    g->m_vram = g_g713RealGs->m_vram;
+                    g->m_vramSize = g_g713RealGs->m_vramSize;
+                    g->m_privRegs = g_g713RealGs->m_privRegs;
+                    g_g713ExecGs = g;
+                }
+                g->writeRegister(GS_REG_BITBLTBUF, s->bitbltbuf);
+                g->writeRegister(GS_REG_TRXPOS, s->trxpos);
+                g->writeRegister(GS_REG_TRXREG, s->trxreg);
+                // Runs performLocalToLocalTransfer when dir==2; a host->local TRXDIR only resets
+                // the transfer cursor.
+                g->writeRegister(GS_REG_TRXDIR, s->trxdir);
+                if (g_g713RealGs)
+                    g_g713RealGs->m_lastDisplayBaseBytes = g->m_lastDisplayBaseBytes;
+            };
+            g713H.image = +[](const G713XferSnap *s, const uint8_t *data, uint32_t bytes) {
+                GS *g = g_g713ExecGs;
+                if (g == nullptr)
+                {
+                    if (g_g713RealGs == nullptr)
+                        return;
+                    g = new GS();
+                    g->m_vram = g_g713RealGs->m_vram;
+                    g->m_vramSize = g_g713RealGs->m_vramSize;
+                    g->m_privRegs = g_g713RealGs->m_privRegs;
+                    g_g713ExecGs = g;
+                }
+                if (s->resetProgress)
+                {
+                    g->writeRegister(GS_REG_BITBLTBUF, s->bitbltbuf);
+                    g->writeRegister(GS_REG_TRXPOS, s->trxpos);
+                    g->writeRegister(GS_REG_TRXREG, s->trxreg);
+                    g->writeRegister(GS_REG_TRXDIR, s->trxdir);
+                }
+                g->processImageData(data, bytes);
+            };
+            g713SetGsHooks(g713H);
+            g_g713L2hThunk = +[](void *p) { static_cast<GS *>(p)->performLocalToHostToBuffer(); };
+        }
+    }
 
     PS2_IF_AGRESSIVE_LOGS({
         const uint32_t packetIndex = s_debugGifPacketCount.fetch_add(1, std::memory_order_relaxed);
@@ -62,6 +120,13 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         {
             m_hwregX = 0;
             m_hwregY = 0;
+            // ⭐ G713: the scratch GS carries the transfer CURSOR across IMAGE nodes, so every
+            // point at which the real GS zeroes it must be mirrored — otherwise the cursor runs
+            // past `rrh` after the first transfer and every later chunk writes nothing (measured:
+            // GSimage collapsed to 0.2 ms/f, 20 ns per 10,188 calls). Re-arming `resetProgress`
+            // makes the next IMAGE node re-apply the four transfer registers, which is exactly
+            // what this reset means.
+            g_g713SnapReset = true;
         }
     }
 
@@ -106,7 +171,12 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                 std::fprintf(stderr, "[G12:cont] dbp=0x%x consume=%u remain=%u\n",
                              db, imageBytes, s_pendingImageBytes - imageBytes);
         }
-        processImageData(data, imageBytes);
+        if (g713PipeArmed() && g713PipeImageOn() && !g713OnExecThread()) // G713: post to exec
+            g713PostImageFromGs(m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
+                                m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh,
+                                data, imageBytes);
+        else
+            processImageData(data, imageBytes);
         g147ImageBytesLocal += imageBytes;
         s_pendingImageBytes -= imageBytes;
         offset = imageBytes;
@@ -154,6 +224,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         {
             m_hwregX = 0;
             m_hwregY = 0;
+            g_g713SnapReset = true; // G713: mirror the cursor reset onto the scratch GS (see above)
             const bool g171On = g171PerfEnabled();
             // ===== G593 ceiling probe (DC2_G593_NOREG=1, default-off, knowingly WRONG output) =====
             // The arm selects a DUPLICATED cold loop rather than adding a branch to the hot one.
@@ -274,6 +345,12 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                 }
                 else
                 {
+                    // G687: 0x412 is ST/RGBAQ/XYZF2, so no GS state register can change during
+                    // this tag. Keep the proven generic descriptor loop byte-for-byte and only
+                    // bracket strips long enough to contain a useful post-prime draw.
+                    const bool g687Run =
+                        fullLoops >= 4u && nreg == 3u && tailRegs == 0u &&
+                        (tagHi & 0x0FFFull) == 0x0412ull && g687BeginPackedCaptureRun();
                     for (uint32_t loop = 0; loop < fullLoops; ++loop)
                     {
                         for (uint32_t r = 0; r < nreg; ++r, p += 16)
@@ -281,6 +358,8 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                     }
                     for (uint32_t r = 0; r < tailRegs; ++r, p += 16)
                         writeRegisterPacked(G602_REGDESC(r), loadLE64(p), loadLE64(p + 8));
+                    if (g687Run)
+                        g687EndPackedCaptureRun();
                 }
                 offset += nDesc * 16u;
                 g147PackedRegs += nDesc;
@@ -441,7 +520,12 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
                         std::fprintf(stderr, "[G66:up] dbp=0x%x dpsm=0x%x n=%llu nz=%llu\n",
                             s_up[i].dbp, s_up[i].dpsm, (unsigned long long)s_up[i].n, (unsigned long long)s_up[i].nz);
             }
-            processImageData(data + offset, imageBytes);
+            if (g713PipeArmed() && g713PipeImageOn() && !g713OnExecThread()) // G713: post to exec
+                g713PostImageFromGs(m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
+                                    m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh,
+                                    data + offset, imageBytes);
+            else
+                processImageData(data + offset, imageBytes);
             g147ImageBytesLocal += imageBytes;
             offset += imageBytes;
             if (imageBytes < expectedImageBytes)
@@ -830,6 +914,7 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_BITBLTBUF:
     {
+        g_g713RawBitbltbuf = value; // G713: raw latch for exec replay (parse thread only)
         const uint32_t prevDbp = m_bitbltbuf.dbp;
         const uint8_t prevDbw = m_bitbltbuf.dbw;
         const uint8_t prevDpsm = m_bitbltbuf.dpsm;
@@ -852,12 +937,14 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_trxpos.dsax = static_cast<uint16_t>((value >> 32) & 0x7FF);
         m_trxpos.dsay = static_cast<uint16_t>((value >> 48) & 0x7FF);
         m_trxpos.dir = static_cast<uint8_t>((value >> 59) & 0x3);
+        g_g713RawTrxpos = value; // G713: raw latch for exec replay (parse thread only)
         break;
     }
     case GS_REG_TRXREG:
     {
         m_trxreg.rrw = static_cast<uint16_t>(value & 0xFFF);
         m_trxreg.rrh = static_cast<uint16_t>((value >> 32) & 0xFFF);
+        g_g713RawTrxreg = value; // G713: raw latch for exec replay (parse thread only)
         // G602: [F37:trxreg] moved out of line.
         if (G602_GATE_RG_QUALITY)
             g602ColdRegTrxreg(m_trxreg);
@@ -872,6 +959,36 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         if (G602_GATE_RG_QUALITY)
             g602ColdRegTrxdir(m_trxdir, m_bitbltbuf, m_trxreg);
 
+        // ⭐ G713 PIPELINE. This register is where a GIF stream stops being a parse and becomes a
+        // VRAM mutation, so it is the exact seam. The four transfer registers are snapshotted RAW
+        // and replayed by exec through this same function on its scratch GS, so there is no second
+        // decoder. Local->local is posted (async); local->host takes the blocking bypass because
+        // its result is a CPU-visible buffer the EE reads back through THIS object.
+        if (g713PipeArmed() && g713PipeImageOn() && !g713OnExecThread())
+        {
+            g_g713Snap.bitbltbuf = g_g713RawBitbltbuf;
+            g_g713Snap.trxpos = g_g713RawTrxpos;
+            g_g713Snap.trxreg = g_g713RawTrxreg;
+            g_g713Snap.trxdir = value;
+            g_g713Snap.resetProgress = 1u;
+            g_g713SnapReset = true;
+            if (m_trxdir == 2 && m_vram)
+            {
+                if (g713RasterCloseForLocalCopy(m_bitbltbuf.sbp, m_bitbltbuf.sbw, m_bitbltbuf.spsm,
+                                                m_trxpos.ssax, m_trxpos.ssay,
+                                                m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
+                                                m_trxpos.dsax, m_trxpos.dsay,
+                                                m_trxreg.rrw, m_trxreg.rrh))
+                    g713RasterFlushOpen();
+                g713PostXfer(g_g713Snap);
+                g_g713SnapReset = false; // the TRXDIR is consumed by the node just posted
+            }
+            else if (m_trxdir == 1 && m_vram)
+            {
+                g713CallOnExec(g_g713L2hThunk, this); // CPU-visible result: blocking bypass
+            }
+            break;
+        }
         // G432: split the addr=0x53 A+D bucket by the transfer it actually dispatches. The dir=1
         // gather charges itself from inside performLocalToHostToBuffer (prep vs pixel loop).
         if (m_trxdir == 2 && m_vram)
@@ -906,7 +1023,12 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         // it removes the only stack ARRAY in this function, which is what made MSVC give a
         // 55.8k-calls/frame function a /GS security cookie plus a `__security_check_cookie` call on
         // every return.
-        processImageData(reinterpret_cast<const uint8_t *>(&value), 8);
+        if (g713PipeArmed() && g713PipeImageOn() && !g713OnExecThread()) // G713: post to exec
+            g713PostImageFromGs(m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
+                                m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh,
+                                reinterpret_cast<const uint8_t *>(&value), 8);
+        else
+            processImageData(reinterpret_cast<const uint8_t *>(&value), 8);
         break;
     }
     case GS_REG_PABE:

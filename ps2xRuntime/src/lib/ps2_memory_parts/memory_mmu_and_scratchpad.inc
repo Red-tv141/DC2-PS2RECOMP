@@ -89,11 +89,8 @@ namespace
     // G268: env vars are process-constant in every DC2 harness; the VIF1 chain-tag walker
     // called getenv() per tag/candidate check (G217/G227 sites, up to 16384 tags per chain).
     // Read once by default; DC2_G268_LIVE_ENVREAD=1 restores the per-call read (A/B control).
-    bool g268LiveEnvRead()
-    {
-        static const bool live = envFlagEnabled("DC2_G268_LIVE_ENVREAD");
-        return live;
-    }
+    const bool s_g674G268LiveEnvRead = envFlagEnabled("DC2_G268_LIVE_ENVREAD");
+    DC2_G674_HOT_FLAG_INLINE bool g268LiveEnvRead() { return s_g674G268LiveEnvRead; }
 
     bool g217TagVuEnabled()
     {
@@ -107,23 +104,17 @@ namespace
         return g268LiveEnvRead() ? envFlagEnabled("DC2_TRACE_G227") : cached;
     }
 
-    bool f50_12_trace_enabled()
+    const bool s_g674F5012TraceEnabled = envFlagEnabled("DC2_TRACE_F50_12");
+    DC2_G674_HOT_FLAG_INLINE bool f50_12_trace_enabled()
     {
-        static const bool enabled = envFlagEnabled("DC2_TRACE_F50_12");
-        return enabled;
+        return s_g674F5012TraceEnabled;
     }
 
-    bool vu1_trace_enabled()
-    {
-        static const bool enabled = envFlagEnabled("DC2_TRACE_VU1");
-        return enabled;
-    }
+    const bool s_g674Vu1TraceEnabled = envFlagEnabled("DC2_TRACE_VU1");
+    DC2_G674_HOT_FLAG_INLINE bool vu1_trace_enabled() { return s_g674Vu1TraceEnabled; }
 
-    bool g136_trace_enabled()
-    {
-        static const bool enabled = envFlagEnabled("DC2_G136_TRACE");
-        return enabled;
-    }
+    const bool s_g674G136TraceEnabled = envFlagEnabled("DC2_G136_TRACE");
+    DC2_G674_HOT_FLAG_INLINE bool g136_trace_enabled() { return s_g674G136TraceEnabled; }
 
     uint32_t g136_env_u32(const char *name, uint32_t fallback)
     {

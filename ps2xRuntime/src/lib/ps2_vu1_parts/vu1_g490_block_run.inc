@@ -521,11 +521,8 @@ namespace
 #if DC2_G506_QPSEG
     // G506 oracle, caller side. Memoised like every other arm accessor (G500 §4: an uncached
     // getenv on a path reached ~158 k times per frame is 8 ms/f).
-    bool g506VerifyOn()
-    {
-        static const bool s_on = f50_12_vu_env_flag("DC2_G506_VERIFY");
-        return s_on;
-    }
+    const bool s_g674G506VerifyOn = f50_12_vu_env_flag("DC2_G506_VERIFY");
+    DC2_G674_HOT_FLAG_INLINE bool g506VerifyOn() { return s_g674G506VerifyOn; }
 
     // The premise, checked directly: inside a block both scalar-pipe counters can only COUNT DOWN,
     // so after `used` pairs each must hold `max(entry - used, 0)`. Reports both arms, so a

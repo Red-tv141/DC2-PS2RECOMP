@@ -452,8 +452,13 @@ void PS2Runtime::run()
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
     // A blank image to use as a framebuffer
-    const int frameInitW = dc2IsNativeHighResActive() ? dc2GetNativePhysicalDisplayWidth() : FB_WIDTH;
-    const int frameInitH = dc2IsNativeHighResActive() ? dc2GetNativePhysicalDisplayStorageHeight() : DEFAULT_DISPLAY_HEIGHT;
+    // G675: the presentation texture is the PS2 display geometry at PHYSICAL density —
+    // 640*S x 448*S. At S=1 those are exactly FB_WIDTH x DEFAULT_DISPLAY_HEIGHT, so the branch
+    // that used to pick between them is gone: one expression, identity at 1x. It is deliberately
+    // NOT the host window size — the window is sized by DC2_RESOLUTION_WIDTH/HEIGHT and the blit
+    // below aspect-fits this already-high-resolution image into it.
+    const int frameInitW = dc2GetNativePhysicalDisplayWidth();
+    const int frameInitH = dc2GetNativePhysicalDisplayStorageHeight();
     Image blank = GenImageColor(frameInitW, frameInitH, BLANK);
     Texture2D frameTex = LoadTextureFromImage(blank);
     UnloadImage(blank);
@@ -509,7 +514,10 @@ void PS2Runtime::run()
         }();
         static const bool s_g167StarveMain = (std::getenv("DC2_G167_STARVE_MAIN") != nullptr);
         uint32_t presentWidth = static_cast<uint32_t>(frameInitW);
-        uint32_t presentHeight = static_cast<uint32_t>(dc2IsNativeHighResActive() ? getDC2NativeRenderConfig().requestedHeight : DEFAULT_DISPLAY_HEIGHT);
+        // G675: the seed value must be the PRESENTATION TEXTURE's height, not the host window's.
+        // It used to seed with `requestedHeight` (a window property) whenever high-res was on,
+        // which is a different quantity the moment the window is not 4:3.
+        uint32_t presentHeight = static_cast<uint32_t>(frameInitH);
         g_g189PresentStage.store(1, std::memory_order_relaxed);
         bool newFrame = false;
         if (!s_g167StarveMain)
@@ -641,11 +649,44 @@ void PS2Runtime::run()
         g_g189PresentStage.store(3, std::memory_order_relaxed);
         if (!s_g167StarveMain)
         {
-        const float srcWidth = static_cast<float>(frameTex.width > 0 ? frameTex.width : (dc2IsNativeHighResActive() ? dc2GetNativePhysicalDisplayWidth() : FB_WIDTH));
-        const float srcHeight = static_cast<float>(frameTex.height > 0 ? frameTex.height : (dc2IsNativeHighResActive() ? dc2GetNativePhysicalDisplayHeight() : DEFAULT_DISPLAY_HEIGHT));
+        const float srcWidth = static_cast<float>(frameTex.width > 0 ? frameTex.width : dc2GetNativePhysicalDisplayWidth());
+        const float srcHeight = static_cast<float>(frameTex.height > 0 ? frameTex.height : dc2GetNativePhysicalDisplayHeight());
         const float screenWidth = static_cast<float>(GetScreenWidth());
         const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float gameAspect = (srcHeight > 0.0f) ? (srcWidth / srcHeight) : (static_cast<float>(FB_WIDTH) / static_cast<float>(DEFAULT_DISPLAY_HEIGHT));
+        // G675: when a display aspect is requested, the guest's own projection was widened to
+        // render that much more of the world (Kernel/Stubs/VU.cpp), so the finished frame must be
+        // PRESENTED at that aspect for the extra content to have correct proportions. This is the
+        // only thing the presentation stage does about it — it does not stretch a 4:3 render, it
+        // shows a frame that was already rendered wide. With no override the expression is
+        // unchanged, so the default build presents exactly as before.
+        const float nativeAspect = (srcHeight > 0.0f)
+                                       ? (srcWidth / srcHeight)
+                                       : (static_cast<float>(FB_WIDTH) / static_cast<float>(DEFAULT_DISPLAY_HEIGHT));
+        // ⭐ G675: an FMV is pre-rendered video — there is no projection to widen and no geometry to
+        // reveal, so a wider aspect can only STRETCH it. While a movie is on screen the frame is
+        // presented at 4:3 and pillarboxed inside the window, whatever `DC2_ASPECT` says.
+        // Opt out with DC2_FMV_KEEP_ASPECT=0.
+        const bool g675Fmv = dc2FmvActiveTick() && dc2FmvForce43On();
+        {
+            // One line per transition, so "did the movie path engage?" is answerable from a log
+            // instead of from a frame dump (dumps capture the guest framebuffer, which never shows
+            // the pillarbox — that lives in the presentation blit).
+            static int s_lastFmv = 0; // 0, not -1: no "movie ended" line at boot
+            const int nowFmv = g675Fmv ? 1 : 0;
+            if (nowFmv != s_lastFmv)
+            {
+                s_lastFmv = nowFmv;
+                std::fprintf(stderr, "[G675:fmv] movie %s -> presenting at %.4f\n",
+                             nowFmv ? "STARTED" : "ended",
+                             static_cast<double>(nowFmv ? kDc2FmvAspect
+                                                        : (dc2AspectOverrideActive()
+                                                               ? dc2GetDisplayAspect()
+                                                               : nativeAspect)));
+            }
+        }
+        const float gameAspect = g675Fmv
+                                     ? kDc2FmvAspect
+                                     : (dc2AspectOverrideActive() ? dc2GetDisplayAspect() : nativeAspect);
         const float windowAspect = (screenHeight > 0.0f) ? (screenWidth / screenHeight) : gameAspect;
         float dstWidth = 0.0f, dstHeight = 0.0f;
         if (windowAspect >= gameAspect)

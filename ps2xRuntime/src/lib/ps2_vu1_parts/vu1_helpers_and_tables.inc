@@ -168,11 +168,8 @@ namespace
     // per instruction word and commits to m_state.q at 0; WAITQ commits immediately. Single-
     // threaded VU1 (guest thread) -> thread_local is sufficient and persists Q across MSCALs like
     // the HW register. Kill-switch DC2_VU1_NO_QLATENCY restores the immediate model.
-    bool g87_q_latency_enabled()
-    {
-        static const bool v = (std::getenv("DC2_VU1_NO_QLATENCY") == nullptr);
-        return v;
-    }
+    const bool s_g674QlatencyEnabled = (std::getenv("DC2_VU1_NO_QLATENCY") == nullptr);
+    DC2_G674_HOT_FLAG_INLINE bool g87_q_latency_enabled() { return s_g674QlatencyEnabled; }
     thread_local float s_vuQPending = 0.0f;
     thread_local int   s_vuQDelay   = 0;
     // G239: VU1 P-register/EFU pipeline. EFU results are not architecturally visible until
@@ -182,11 +179,8 @@ namespace
     // lighting loop deliberately issues ERSQRT at the unit's throughput boundary, then executes
     // MFP one pair later. This pipeline is required for the architectural P value to match VU1;
     // DC2_VU1_NO_PPIPE restores the old immediate-result model for focused A/B verification.
-    bool g239_p_pipeline_enabled()
-    {
-        static const bool v = (std::getenv("DC2_VU1_NO_PPIPE") == nullptr);
-        return v;
-    }
+    const bool s_g674PpipelineEnabled = (std::getenv("DC2_VU1_NO_PPIPE") == nullptr);
+    DC2_G674_HOT_FLAG_INLINE bool g239_p_pipeline_enabled() { return s_g674PpipelineEnabled; }
     thread_local float s_vuPPending = 0.0f;
     thread_local int   s_vuPDelay   = 0;
 
@@ -221,10 +215,11 @@ namespace
     // pending Q first, then MULq consumes it. The old sequential upper-then-lower interpreter
     // multiplied by the stale Q and could turn a normalized lighting basis into ~FLT_MAX.
     // Kill switch retained solely for the matched route A/B.
-    bool g239_scalar_prestall_enabled()
+    const bool s_g674ScalarPrestallEnabled =
+        (std::getenv("DC2_VU1_NO_SCALAR_PRESTALL") == nullptr);
+    DC2_G674_HOT_FLAG_INLINE bool g239_scalar_prestall_enabled()
     {
-        static const bool v = (std::getenv("DC2_VU1_NO_SCALAR_PRESTALL") == nullptr);
-        return v;
+        return s_g674ScalarPrestallEnabled;
     }
     // G200: real VU1's FDIV unit stalls a second DIV/SQRT/RSQRT issued while a result is still
     // in flight -- the machine waits until the FIRST result latches into Q, then starts the new
@@ -237,11 +232,8 @@ namespace
     // vertices pass the ADC draw gate that real HW's map_0.gs freeze shows 100%-skipped (the
     // G195/G196 foreground water-sheet). Fix: commit the in-flight pending Q before arming the
     // new producer. Kill switch DC2_VU1_NO_QSTALL restores the drop-pending model.
-    bool g200_qstall_enabled()
-    {
-        static const bool v = (std::getenv("DC2_VU1_NO_QSTALL") == nullptr);
-        return v;
-    }
+    const bool s_g674QstallEnabled = (std::getenv("DC2_VU1_NO_QSTALL") == nullptr);
+    DC2_G674_HOT_FLAG_INLINE bool g200_qstall_enabled() { return s_g674QstallEnabled; }
     // G138: VU1 MAC/STATUS flag pipeline (default ON, kill DC2_VU1_NO_MACPIPE). Real VU1 FMAC
     // results — and therefore the MAC flags FMEQ/FMAND/FMOR and the STATUS bits FSAND/FSEQ/FSOR
     // read — become visible ~4 instruction pairs AFTER the FMAC issues, not immediately. The
@@ -257,11 +249,8 @@ namespace
     // instruction pair; flag-consuming lower ops read the snapshot from DEPTH pairs ago. The
     // architectural m_state.mac/status stay immediate (they are the newest pipeline entry).
     // Same class of fix as the G87 Q-register latency. Depth tunable DC2_VU1_MACPIPE_DEPTH.
-    bool g138_macpipe_enabled()
-    {
-        static const bool v = (std::getenv("DC2_VU1_NO_MACPIPE") == nullptr);
-        return v;
-    }
+    const bool s_g674MacpipeEnabled = (std::getenv("DC2_VU1_NO_MACPIPE") == nullptr);
+    DC2_G674_HOT_FLAG_INLINE bool g138_macpipe_enabled() { return s_g674MacpipeEnabled; }
     int g138_macpipe_depth()
     {
         static const int d = []() -> int {
@@ -437,17 +426,14 @@ namespace
         return s_seq;
     }
 
-    bool f50_12_vu_trace_enabled()
+    const bool s_g674F5012VuTraceEnabled = f50_12_vu_env_flag("DC2_TRACE_F50_12");
+    DC2_G674_HOT_FLAG_INLINE bool f50_12_vu_trace_enabled()
     {
-        static const bool enabled = f50_12_vu_env_flag("DC2_TRACE_F50_12");
-        return enabled;
+        return s_g674F5012VuTraceEnabled;
     }
 
-    bool g136_trace_enabled()
-    {
-        static const bool enabled = f50_12_vu_env_flag("DC2_G136_TRACE");
-        return enabled;
-    }
+    const bool s_g674G136TraceEnabled = f50_12_vu_env_flag("DC2_G136_TRACE");
+    DC2_G674_HOT_FLAG_INLINE bool g136_trace_enabled() { return s_g674G136TraceEnabled; }
 
     bool g136_trace_all_enabled()
     {
@@ -1039,23 +1025,14 @@ namespace
     }
 
     // ---- F51.7 VU1 transform diagnostics (env: DC2_TRACE_VU1) ----
-    bool vu1_trace_enabled()
-    {
-        static const bool enabled = f50_12_vu_env_flag("DC2_TRACE_VU1");
-        return enabled;
-    }
+    const bool s_g674Vu1TraceEnabled = f50_12_vu_env_flag("DC2_TRACE_VU1");
+    DC2_G674_HOT_FLAG_INLINE bool vu1_trace_enabled() { return s_g674Vu1TraceEnabled; }
 
-    bool g31_vu_trace_enabled()
-    {
-        static const bool enabled = f50_12_vu_env_flag("DC2_TRACE_G31");
-        return enabled;
-    }
+    const bool s_g674G31VuTraceEnabled = f50_12_vu_env_flag("DC2_TRACE_G31");
+    DC2_G674_HOT_FLAG_INLINE bool g31_vu_trace_enabled() { return s_g674G31VuTraceEnabled; }
 
-    bool g32_vu_trace_enabled()
-    {
-        static const bool enabled = f50_12_vu_env_flag("DC2_TRACE_G32");
-        return enabled;
-    }
+    const bool s_g674G32VuTraceEnabled = f50_12_vu_env_flag("DC2_TRACE_G32");
+    DC2_G674_HOT_FLAG_INLINE bool g32_vu_trace_enabled() { return s_g674G32VuTraceEnabled; }
 
     std::atomic<uint32_t> s_vu1ExecCount{0};
     std::atomic<uint32_t> s_vu1KickDumpCount{0};

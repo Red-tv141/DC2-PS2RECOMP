@@ -129,28 +129,25 @@ namespace
                std::strcmp(value, "OFF") != 0;
     }
 
-    bool phaseDiagnosticsEnabled()
+    const bool s_g674PhaseDiagnosticsEnabled = envFlagEnabled("DC2_PHASE_TRACE");
+    DC2_G674_HOT_FLAG_INLINE bool phaseDiagnosticsEnabled()
     {
-        static const bool enabled = envFlagEnabled("DC2_PHASE_TRACE");
-        return enabled;
+        return s_g674PhaseDiagnosticsEnabled;
     }
 
-    bool f50_12_trace_enabled()
+    const bool s_g674F5012TraceEnabled = envFlagEnabled("DC2_TRACE_F50_12");
+    DC2_G674_HOT_FLAG_INLINE bool f50_12_trace_enabled()
     {
-        static const bool enabled = envFlagEnabled("DC2_TRACE_F50_12");
-        return enabled;
+        return s_g674F5012TraceEnabled;
     }
 
-    bool vu1_trace_enabled()
-    {
-        static const bool enabled = envFlagEnabled("DC2_TRACE_VU1");
-        return enabled;
-    }
+    const bool s_g674Vu1TraceEnabled = envFlagEnabled("DC2_TRACE_VU1");
+    DC2_G674_HOT_FLAG_INLINE bool vu1_trace_enabled() { return s_g674Vu1TraceEnabled; }
 
-    bool g95_defer_gif_enabled()
+    const bool s_g674G95DeferGifEnabled = envFlagEnabled("DC2_G95_DEFER_GIF");
+    DC2_G674_HOT_FLAG_INLINE bool g95_defer_gif_enabled()
     {
-        static const bool enabled = envFlagEnabled("DC2_G95_DEFER_GIF");
-        return enabled;
+        return s_g674G95DeferGifEnabled;
     }
 
     bool g95_trace_enabled()
@@ -159,11 +156,8 @@ namespace
         return enabled;
     }
 
-    bool g136_trace_enabled()
-    {
-        static const bool enabled = envFlagEnabled("DC2_G136_TRACE");
-        return enabled;
-    }
+    const bool s_g674G136TraceEnabled = envFlagEnabled("DC2_G136_TRACE");
+    DC2_G674_HOT_FLAG_INLINE bool g136_trace_enabled() { return s_g674G136TraceEnabled; }
 
     uint32_t g136_env_u32(const char *name, uint32_t fallback)
     {
@@ -301,11 +295,8 @@ namespace
     // G268: env vars are process-constant in every DC2 harness; these two ran getenv() (plus
     // strcmp chains) per VIF1 packet parse / per VU1 kick. Parsed once by default;
     // DC2_G268_LIVE_ENVREAD=1 restores the historical per-call read (A/B control).
-    bool g268LiveEnvRead()
-    {
-        static const bool live = envFlagEnabled("DC2_G268_LIVE_ENVREAD");
-        return live;
-    }
+    const bool s_g674G268LiveEnvRead = envFlagEnabled("DC2_G268_LIVE_ENVREAD");
+    DC2_G674_HOT_FLAG_INLINE bool g268LiveEnvRead() { return s_g674G268LiveEnvRead; }
 
     G22Vu1KickMode g22_vu1_kick_mode_uncached()
     {
