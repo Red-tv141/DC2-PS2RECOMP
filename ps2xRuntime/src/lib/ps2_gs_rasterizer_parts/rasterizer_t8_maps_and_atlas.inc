@@ -296,6 +296,7 @@ static bool g280DirtyTargetOwnsPage(int ti, uint32_t pageBlock,
     if (static_cast<int>(col + 1u) * 64 > r.fbW || y0 >= 512 ||
         y0 + 31 < r.dirtyLo || y0 > r.dirtyHi)
         return false;
+    if (!g716HasRows(r, y0, y0 + 31)) return false;
     const G144BlockRange page{pageBlock, pageBlock + 31u, true};
     if (!g144RangeOverlaps(page, r.range))
         return false;

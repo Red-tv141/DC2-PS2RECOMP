@@ -21,6 +21,16 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         return false;
     }
     g_g266FlushRej = kG266FrNone;
+    // ⭐ G701: consume any latched failure from an earlier fire-and-forget submit. The batch that
+    // issued it could not be told, so this is where the runtime learns the FBO contents are
+    // unknown: every residency claim is dropped WITHOUT publishing (publishing would write
+    // garbage over guest VRAM) and the snapshot cache is invalidated, so the next batch to each
+    // surface re-establishes it from VRAM. Costs one relaxed atomic exchange per flush.
+    if (g701_backend_take_failure())
+    {
+        g700DropAllClaims();
+        g581InvalidateCpuFallbackSnapshots();
+    }
     G310BatchFreeze g310Freeze;
     g684DiagAdd(g_g178Flushes, 1u);
     // Resolve the exact 0x14a alias suffix before the generic owner-conflict audit: this batch
@@ -102,6 +112,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // G289's one exact display-grab sprite consumes that same owner directly from its FBO.
     if (g289DirectDisplaySrc == 0u)
         g288PublishDisplayForGpuBatch();
+    // ⭐ G700 consumer edge: this batch is about to decode textures and CLUTs out of guest VRAM.
+    // Publish any persistent surface still holding those bytes on the GPU. Two compares when
+    // nothing is owed, which is the steady state once a surface's consumers have run.
+    g700PrepareForBatch(g_g144List);
     // G273 diagnostic: split the proven GPU flush into front-end preparation, synchronous backend
     // submit, and post-submit VRAM/depth publication. Quiet unless DC2_G273_PROFILE=1.
  #if defined(PS2X_G684_HOT_DIAG)
@@ -162,6 +176,15 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     g589NoteBatch();
  #endif
 
+    // ⛔ G710's ceiling probe, state-run census, ballast arms and stage-decomposition laps were
+    // REMOVED FROM THIS FLUSH under Rule 31 by G711. They were `#if`-excluded and their `#else`
+    // stubs were all `constexpr`, so every use folded — but the source text still perturbed this
+    // TU's layout, and G711 PRICED that: a cross-binary A/B/B/A of the two links (identical source
+    // but for the stubs, same G708 profile) measured the stub link **+0.42…+0.65 ms/f of GS own**,
+    // larger than most levers this project has shipped. Rule 12b is not a style rule.
+    // The instrument itself is retained, unwired, at
+    // `ps2_gs_rasterizer_parts/g710_flush_ceiling.inc`; its findings are in
+    // plans/phase-G710-fix-log.md and its removal gate in plans/phase-G711-fix-log.md §8.
     const uint32_t fbp = g_g144List[0].ctx.frame.fbp;
     const bool g286Transient = g286TransientTarget(fbp);
     const bool g570Transient13d = g570Transient13dTarget(fbp);
@@ -169,7 +192,23 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const bool g587Transient15d = g587Transient15dTarget(fbp);
     // G604: the same non-persistent contract, selected by PROPERTY (see rasterizer_command_graph).
     const bool g604DiscovTrn = g604DiscovTransientTarget(fbp);
-    if (g286Transient)
+    // ⭐⭐⭐ G700: is this target a candidate for PERSISTENT residency? The four transient
+    // contracts above (`g286`/`g570`/`g586`/`g587`) and the two display buffers keep their own
+    // proven paths; everything else is a discovered target that today either pays a full
+    // VRAM->FBO->VRAM round trip on every flush or is rasterized on the CPU. Those are exactly
+    // the surfaces the persistent model exists for. Candidacy is by property; admission (below,
+    // beside `g604ExactDiscov`) additionally needs the batch shape and a free slot.
+    // The four hardcoded transient contracts are candidates too, behind their own arm: they are
+    // the population that actually pays `pro0trn` (see g700TransientTakeoverOn).
+    const bool g700TrnTakeover =
+        g700On() && g700TransientTakeoverOn() &&
+        (g286Transient || g570Transient13d || g586Transient141 || g587Transient15d);
+    const bool g700Cand = g700On() && fbp != 0u && fbp != 0x68u &&
+                          ((g527DiscoveredTarget(fbp) && g248TargetIndex(fbp) < 0 &&
+                            !g286Transient && !g570Transient13d && !g586Transient141 &&
+                            !g587Transient15d) ||
+                           g700TrnTakeover);
+    if (g286Transient && !g700TrnTakeover)
     {
         g_g286GpuAttempts.fetch_add(1u, std::memory_order_relaxed);
         if (g289CensusOn())
@@ -227,34 +266,41 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         if (!s_g524NoTrnMat)
             g261PrepareCpuReplay();
     }
-    if (g570Transient13d)
+    if (g570Transient13d && !g700TrnTakeover)
     {
         // 0x13d overlaps 0x139 physically. Publish every resident sibling before framebuffer
         // upload, then keep this target transient so the reverse edge can never find it dirty.
         g_g570TransientAttempts.fetch_add(1u, std::memory_order_relaxed);
         g261PrepareCpuReplay();
     }
-    if (g586Transient141)
+    if (g586Transient141 && !g700TrnTakeover)
     {
         // 0x141 is another physical sibling of the resident 0x139 family.  Publish every sibling
         // before upload, then keep both colour and Z under the non-persistent per-flush contract.
         g_g586TransientAttempts.fetch_add(1u, std::memory_order_relaxed);
         g261PrepareCpuReplay();
     }
-    if (g587Transient15d)
+    if (g587Transient15d && !g700TrnTakeover)
     {
         // 0x15d is tested under the same command-local ownership contract, but its gate and
         // oracle are independent from the rejected 0x141 experiment.
         g_g587TransientAttempts.fetch_add(1u, std::memory_order_relaxed);
         g261PrepareCpuReplay();
     }
-    if (g604DiscovTrn)
+    if (g604DiscovTrn && !g700Cand)
     {
         // G604: a DISCOVERED target's address is not known in advance, so it must be assumed to
         // be a physical sibling of the resident family exactly like 0x13d/0x141/0x15d — publish
         // every resident sibling into guest VRAM before any framebuffer upload or texture decode
         // can observe stale bytes. This is the same consumer edge G570/G586/G587 take, and it is
         // the reason the contract is safe to select by property rather than by address.
+        //
+        // ⭐ G700: a PERSISTENT surface does not take this edge. The publication exists so a
+        // VRAM->FBO upload can read fresh bytes; a persistent surface that owns its pages does not
+        // upload at all, so there is nothing for stale VRAM to poison. When it DOES need an
+        // upload (`g700NeedUpload` below), the ranged publication runs there instead — scoped to
+        // the pages actually read rather than to every resident sibling. `[G523:fit]` books this
+        // one call as `pro0trn` = 0.0323 ms per flush x 33.4 flushes = 1.08 ms/f.
         g261PrepareCpuReplay();
     }
     // G523 prologue lap P0: transient-target admission (and its g261PrepareCpuReplay).
@@ -311,7 +357,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // for 0x0/0x68, applied to an arbitrary address. The value this lever buys is the 8-lane
     // band-parallel CPU replay below, not the GPU. Route it there explicitly.
     if (g527DiscoveredTarget(fbp) && !g570Transient13d && !g586Transient141 &&
-        !g587Transient15d && !g604DiscovTrn)
+        !g587Transient15d && !g604DiscovTrn && !g700Cand)
     {
         g_g266FlushRej = kG266FrCpuOnlyRtt;
         return false;
@@ -319,6 +365,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const uint32_t fbw = g_g144List[0].ctx.frame.fbw;
     const int fbW = static_cast<int>(fbw) * 64;
     constexpr int kFbH = 512;
+    // ⭐⭐⭐ G700: acquire the persistent surface for this target. The slot survives every flush,
+    // every target switch and every frame; a switch back to it is an FBO bind, not a reconstruction
+    // of guest-VRAM authority. -1 keeps whatever path this target had before.
+    const int g700Slot = g700Cand ? g700Acquire(fbp, fbw, g_g144List[0].ctx.frame.psm) : -1;
     if (fbW <= 0 || fbW > 1024)
     {
         g_g266FlushRej = kG266FrFbW;
@@ -371,6 +421,25 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     static std::vector<G178EntryState> s_states;
     s_states.clear();
     s_states.reserve(g_g144List.size());
+    // ⭐⭐⭐ G712 PREP-AHEAD CONSUMER. This batch's `class` pass may already be finished on a
+    // worker thread — it was posted when g260CloseOpenBatch made the batch immutable, and on
+    // `lavaboss` a batch waits behind ~2 others before it drains. `g712PrepConsume` is HELP-OR-WAIT:
+    // if nobody started the job it runs it right here, which is byte-for-byte the loop below.
+    // It answers true only for a record whose (buffer, count, fbp, fbw) identify THIS batch and
+    // whose verdict is clean; every other answer leaves the shipped loop to run untouched.
+    // ⛔ Stood down whenever a per-entry census that counts what classification SEES is armed
+    // (G510/G511) so those numbers stay the shipped population (Rule 63).
+    bool g712Have = false;      // a clean record for THIS batch exists
+    bool g712Prepared = false;  // ... and we are adopting it (false under the VERIFY oracle)
+    bool g712Shape = false;
+    G712Prep *g712P = g_g712CurPrep;
+    if (g712P != nullptr && !g510CensusOn() && !g511ClsProbeActive() &&
+        g712PrepConsume(g712P, g_g144List.data(), g_g144List.size(), fbp, fbw))
+    {
+        g712Have = true;
+        g712Shape = g712P->shapeUniformCt32Prim;
+        g712Prepared = !g712VerifyOn(); // VERIFY runs the shipped loop anyway and compares
+    }
     int rowLo = kFbH, rowHi = -1;
 #if defined(PS2X_G662_DIAG)
     // G662 [G662:colspan]: reset the per-flush column union. thread_local because the flush-owner
@@ -414,21 +483,27 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const bool g586MeasuredShape =
         g586Transient141 && fbp == 0x141u && (fbw == 2u || fbw == 8u) &&
         g_g144List[0].ctx.frame.psm == GS_PSM_CT32 &&
+        // G712: the prepared pass already walked the list and answered exactly this predicate
+        // (`shapeUniformCt32Prim` = every entry on the batch's own fbp+fbw, CT32, sprite/tri/strip),
+        // and a prepared record only exists when no entry mixed target or width. Same value, no
+        // second walk. Falls back to the original scan whenever no record was consumed.
+        (g712Prepared ? g712Shape :
         std::all_of(g_g144List.begin(), g_g144List.end(), [fbw](const G144Entry &e) {
             return e.ctx.frame.fbp == 0x141u && e.ctx.frame.fbw == fbw &&
                    e.ctx.frame.psm == GS_PSM_CT32 &&
                    (e.prim.type == GS_PRIM_SPRITE || e.prim.type == GS_PRIM_TRIANGLE ||
                     e.prim.type == GS_PRIM_TRISTRIP);
-        });
+        }));
     const bool g587MeasuredShape =
         g587Transient15d && fbp == 0x15du && fbw == 8u &&
         g_g144List[0].ctx.frame.psm == GS_PSM_CT32 &&
+        (g712Prepared ? g712Shape : // G712: same predicate, already answered (see G586 above)
         std::all_of(g_g144List.begin(), g_g144List.end(), [](const G144Entry &e) {
             return e.ctx.frame.fbp == 0x15du && e.ctx.frame.fbw == 8u &&
                    e.ctx.frame.psm == GS_PSM_CT32 &&
                    (e.prim.type == GS_PRIM_SPRITE || e.prim.type == GS_PRIM_TRIANGLE ||
                     e.prim.type == GS_PRIM_TRISTRIP);
-        });
+        }));
     // G604: G587's shape contract with the address turned into `this batch's own target`.
     // `[G603:admit]` measured this contract holding on 100% of the batches of every discovered
     // target it saw (shapeOk == batches for 0x15c/0x151/0x14d/0x15f/0x14c/0x162/0x13e/0x149),
@@ -454,12 +529,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                               : (fbw == 8u || (fbw == 2u && g660DiscovFbw2On()))) &&
 #endif
         g_g144List[0].ctx.frame.psm == GS_PSM_CT32 &&
+        (g712Prepared ? g712Shape : // G712: same predicate, already answered (see G586 above)
         std::all_of(g_g144List.begin(), g_g144List.end(), [fbp, fbw](const G144Entry &e) {
             return e.ctx.frame.fbp == fbp && e.ctx.frame.fbw == fbw &&
                    e.ctx.frame.psm == GS_PSM_CT32 &&
                    (e.prim.type == GS_PRIM_SPRITE || e.prim.type == GS_PRIM_TRIANGLE ||
                     e.prim.type == GS_PRIM_TRISTRIP);
-        });
+        }));
     const bool g570Private139Candidate =
         g570Private139On() && fbp == 0x139u && fbw == 8u &&
         g_g144List[0].ctx.frame.psm == GS_PSM_CT32;
@@ -498,7 +574,36 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                         : std::chrono::steady_clock::time_point{};
     uint64_t g655ClassIdentityNs = 0u, g655ClassClassifierNs = 0u,
              g655ClassRangeNs = 0u;
-    for (size_t g510i = 0; g510i < g_g144List.size(); ++g510i)
+    // ⭐ G712: adopt the prepared pass. `s_states` is SWAPPED, not copied — the record goes back to
+    // the free list carrying the old `s_states` buffer, so neither side ever reallocates in steady
+    // state. The eleven reductions are the identical arithmetic over the identical entries; the
+    // g282 tight unions were accumulated unconditionally by the worker (it cannot know the flush's
+    // candidate flags) and are read here only under the same guard the loop used.
+    // The loop below is then entered with `g510i == size()` and does nothing.
+    if (g712Prepared)
+    {
+        s_states.swap(g712P->states);
+        rowLo = g712P->rowLo;
+        rowHi = g712P->rowHi;
+        depthRowLo = g712P->depthRowLo;
+        depthRowHi = g712P->depthRowHi;
+        g621WrLo = g712P->wrLo;
+        g621WrHi = g712P->wrHi;
+        g621WrUsable = g712P->wrUsable;
+        guestDepth = g712P->guestDepth;
+        guestDepthWrites = g712P->guestDepthWrites;
+        guestZbpPage = g712P->guestZbpPage;
+        guestZpsm = g712P->guestZpsm;
+        if (g282Candidate || g290Candidate || g570Candidate || g586MeasuredShape ||
+            g587MeasuredShape || g604MeasuredShape || g570Private139Candidate)
+        {
+            g282RowLo = g712P->tightRowLo;
+            g282RowHi = g712P->tightRowHi;
+            g282DepthLo = g712P->tightDepthLo;
+            g282DepthHi = g712P->tightDepthHi;
+        }
+    }
+    for (size_t g510i = g712Prepared ? g_g144List.size() : 0u; g510i < g_g144List.size(); ++g510i)
     {
         const G144Entry &e = g_g144List[g510i];
         if (e.ctx.frame.fbp != fbp || e.ctx.frame.fbw != fbw)
@@ -536,7 +641,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // compared whole because every one of them is written by a single struct assignment at
         // capture time (`e.ctx = ctx` etc), so their internal padding travels with their content.
         const bool g510Same =
-            (g510Memo || g510Census) && g510i > 0u &&
+            ((g510Memo || g510Census) && g510i > 0u &&
             std::memcmp(&e.ctx, &g_g144List[g510i - 1u].ctx, sizeof(GSContext)) == 0 &&
             std::memcmp(&e.prim, &g_g144List[g510i - 1u].prim, sizeof(GSPrimReg)) == 0 &&
             std::memcmp(&e.texa, &g_g144List[g510i - 1u].texa, sizeof(GSTexaReg)) == 0 &&
@@ -544,7 +649,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             e.pabe == g_g144List[g510i - 1u].pabe &&
             e.fogcol == g_g144List[g510i - 1u].fogcol &&
             e.titleRockScope == g_g144List[g510i - 1u].titleRockScope &&
-            e.townDepthScope == g_g144List[g510i - 1u].townDepthScope;
+            e.townDepthScope == g_g144List[g510i - 1u].townDepthScope);
         // G511: the extra comparison sits on the SAME operands as the real one, so it measures the
         // marginal cost of the identity test itself (the second run is cache-warm exactly as a
         // hypothetical replacement test would be). It cannot change behaviour — the result only
@@ -673,6 +778,83 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     std::chrono::steady_clock::now() - g655ClassC)
                     .count());
     }
+    // ⭐ G712 VERIFY ORACLE (DC2_G712_VERIFY=1, never a timing arm). The loop above ran the shipped
+    // classification; compare every byte of it, and all eleven reductions, against what the worker
+    // produced for the same batch. A single mismatch falsifies the purity argument in
+    // g712_prep_body.inc's header, which is the only thing this mechanism rests on.
+    if (g712Have && !g712Prepared)
+    {
+        const bool shapeRef =
+            !g_g144List.empty() &&
+            std::all_of(g_g144List.begin(), g_g144List.end(), [fbp, fbw](const G144Entry &e) {
+                return e.ctx.frame.fbp == fbp && e.ctx.frame.fbw == fbw &&
+                       e.ctx.frame.psm == GS_PSM_CT32 &&
+                       (e.prim.type == GS_PRIM_SPRITE || e.prim.type == GS_PRIM_TRIANGLE ||
+                        e.prim.type == GS_PRIM_TRISTRIP);
+            });
+        bool bad = g712P->states.size() != s_states.size() ||
+                   g712P->rowLo != rowLo || g712P->rowHi != rowHi ||
+                   g712P->depthRowLo != depthRowLo || g712P->depthRowHi != depthRowHi ||
+                   g712P->wrLo != g621WrLo || g712P->wrHi != g621WrHi ||
+                   g712P->wrUsable != g621WrUsable ||
+                   g712P->guestDepth != guestDepth ||
+                   g712P->guestDepthWrites != guestDepthWrites ||
+                   g712P->guestZbpPage != guestZbpPage || g712P->guestZpsm != guestZpsm ||
+                   g712P->shapeUniformCt32Prim != shapeRef;
+        uint32_t g712DiffMask = 0u;
+        size_t g712FirstDiff = static_cast<size_t>(-1);
+        if (g712P->states.size() == s_states.size())
+            for (size_t i = 0; i < s_states.size(); ++i)
+            {
+                // ⛔ FIELD-WISE, never memcmp — G178EntryState carries interior padding that both
+                // paths leave indeterminate, and the first version of this oracle reported a
+                // mismatch on 92% of flushes purely because of it while all eleven reductions
+                // agreed to the digit. See g712_prep_body.inc's note at g712StateDiff.
+                const uint32_t m = g712StateDiff(g712P->states[i], s_states[i]);
+                if (m != 0u && g712FirstDiff == static_cast<size_t>(-1))
+                    g712FirstDiff = i;
+                g712DiffMask |= m;
+            }
+        bad = bad || g712DiffMask != 0u;
+        if (!bad && (g282Candidate || g290Candidate || g570Candidate || g586MeasuredShape ||
+                     g587MeasuredShape || g604MeasuredShape || g570Private139Candidate))
+            bad = g712P->tightRowLo != g282RowLo || g712P->tightRowHi != g282RowHi ||
+                  g712P->tightDepthLo != g282DepthLo || g712P->tightDepthHi != g282DepthHi;
+        if (bad)
+        {
+            ++g_g712Mismatch;
+            // Rate-limited: 83k lines of stderr is not evidence, and it perturbs the run it is
+            // supposed to describe. `[G712:prep] mismatch=` carries the true total.
+            if (g_g712Mismatch <= 32u || (g_g712Mismatch % 4096u) == 0u)
+            {
+            char g712Fields[256];
+            g712Fields[0] = '\0';
+            for (uint32_t b = 0; b < 24u; ++b)
+                if (g712DiffMask & (1u << b))
+                {
+                    std::strncat(g712Fields, kG712FieldName[b],
+                                 sizeof(g712Fields) - std::strlen(g712Fields) - 2u);
+                    std::strncat(g712Fields, ",",
+                                 sizeof(g712Fields) - std::strlen(g712Fields) - 1u);
+                }
+            std::fprintf(stderr,
+                         "[G712:verify] MISMATCH fbp=0x%03x fbw=%u entries=%zu prepStates=%zu "
+                         "rows=%d..%d/%d..%d depth=%d..%d/%d..%d wr=%d..%d/%d..%d(%u/%u) "
+                         "gz=%u/%u zbp=%u/%u shape=%u/%u diffMask=0x%06x firstDiff=%zd [%s]\n",
+                         fbp, fbw, g_g144List.size(), g712P->states.size(),
+                         rowLo, rowHi, g712P->rowLo, g712P->rowHi,
+                         depthRowLo, depthRowHi, g712P->depthRowLo, g712P->depthRowHi,
+                         g621WrLo, g621WrHi, g712P->wrLo, g712P->wrHi,
+                         g621WrUsable ? 1u : 0u, g712P->wrUsable ? 1u : 0u,
+                         guestDepth ? 1u : 0u, g712P->guestDepth ? 1u : 0u,
+                         guestZbpPage, g712P->guestZbpPage,
+                         shapeRef ? 1u : 0u, g712P->shapeUniformCt32Prim ? 1u : 0u,
+                         g712DiffMask, static_cast<ptrdiff_t>(g712FirstDiff), g712Fields);
+            std::fflush(stderr);
+            }
+        }
+    }
+    g712PrepReport();
     // G523 lap B: the per-entry loop ends here. What follows (the G510/G511 census tails and the
     // G289 owner-view build) is per-flush EPILOGUE.
     const auto g523ClsB = s_g298Profile ? std::chrono::steady_clock::now()
@@ -1020,7 +1202,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g_g604RawAlphaFbpBits[(fbp >> 6) & 7u].fetch_or(1ull << (fbp & 63u),
                                                         std::memory_order_relaxed);
     }
-    if (g604DiscovTrn && !g604ExactDiscov)
+    // ⭐ G700: this return fires BEFORE the G700 admission below, so a discovered target that G604's
+    // FBW/depth contract refuses never reaches the persistent model at all — which is why the first
+    // armed run reported `acquires=4 renders=1174` with every render on 0x13b and none on the
+    // discovered targets the lever exists for. G700 has its own shape gate and its own fail-closed
+    // return a few lines down; let a candidate through to it.
+    if (g604DiscovTrn && !g604ExactDiscov && !g700Cand)
     {
         const uint64_t n =
             g_g604DiscovRejectShape.fetch_add(1u, std::memory_order_relaxed) + 1u;
@@ -1092,6 +1279,98 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                  static_cast<unsigned long long>(g_g144List.size()));
         }
 #endif
+        g_g266FlushRej = kG266FrCpuOnlyRtt;
+        g684DiagAdd(g_g178Fallbacks, 1u);
+        g581InvalidateCpuFallbackSnapshots();
+        return false;
+    }
+
+    // ⭐⭐⭐ G700 ADMISSION. The transient contract above admits a discovered target only at
+    // FBW=8 (or FBW=2 behind a flag) and only when it carries no guest depth outside the one
+    // shared private Z mirror — and then charges it a VRAM upload, a render and a full readback
+    // on every single flush. The persistent model has neither restriction to justify:
+    //
+    //   * WIDTH. The FBW gate exists because the transient contract's upload/readback pair was
+    //     only ever measured at those widths. A persistent surface performs neither in the steady
+    //     state, so width is just the page-column count of its ownership map.
+    //   * DEPTH. `!guestDepth` exists because guest Z has to stay authoritative and only a
+    //     readback keeps it so. A surface that OWNS its depth pages keeps Z on the GPU across
+    //     flushes; the same ownership token answers "who holds the newer Z". Gated on
+    //     `g700DepthOn()` so the depth half can be rolled back on its own.
+    //
+    // Fail-closed on exactly the property the shape gate above tests: any entry that mixes
+    // target, width, format or primitive class returns the whole batch to the proven band replay.
+    // The shape contract is TARGET UNIFORMITY and nothing else. G604's copy additionally required
+    // every primitive to be SPRITE/TRIANGLE/TRISTRIP, but that is defensive narrowing rather than
+    // a contract: `g178ClassifyEntry` runs over every entry a few hundred lines below and refuses
+    // any primitive the GPU path cannot render, so a prim-class test here only removes batches the
+    // classifier would have accepted. `[G657:rejwall]` books `cpuonlyrtt` on the single discovered
+    // target 0x15b at 438.6 ms = 30.5% of `dragon`'s whole CPU-fallback wall over 876 batches of
+    // ~240 entries; nothing in that population is about which primitive it draws.
+    const uint32_t g700Psm = g_g144List[0].ctx.frame.psm;
+    const bool g700ShapeOk =
+        g700Slot >= 0 && rowHi >= rowLo &&
+        (g700Psm == GS_PSM_CT32 || g700Psm == GS_PSM_CT24) &&
+        std::all_of(g_g144List.begin(), g_g144List.end(),
+                    [fbp, fbw, g700Psm](const G144Entry &e) {
+                        return e.ctx.frame.fbp == fbp && e.ctx.frame.fbw == fbw &&
+                               e.ctx.frame.psm == g700Psm;
+                    });
+    const bool g700Exact =
+        g700ShapeOk &&
+        (!guestDepth ||
+         // The depth class: either this build's persistent-depth arm carries it, or it falls back
+         // to the same private-mirror contract the transient path requires.
+         (g700DepthOn() && depthRowHi >= depthRowLo) ||
+         (guestZbpPage == 0x0d0u && guestZpsm == 1u && depthRowHi >= depthRowLo &&
+          g411SharedGpuDepthOn() && g404SharedZScope(fbp, fbw, guestZbpPage, guestZpsm)));
+    // Rule 12c compliance: this is inside the ALREADY-COMPUTED `g700Cand` branch (a flush that is
+    // not a candidate never evaluates it), the arming test is a cached `static const bool`, and
+    // the printing lives at the cold frame boundary. What remains in the hot path when unarmed is
+    // one predictable not-taken branch — the same shape as the `g_g633GuestWriteHook != nullptr`
+    // test the shipped bump walker already carries. The `#if` form was tried first and made the
+    // census unavailable in exactly the SHIP build the promotion gate has to run on, which is
+    // worse: a lever whose admission cannot be read on the binary being gated is ungateable.
+    if (g700Cand && g700StatOn())
+    {
+        // Which conjunct blocked this candidate? Without this the census reports `renders=0` and
+        // cannot distinguish "the population is empty" from "the shape gate refuses all of it"
+        // (G657 measurement law 10). Weighted by entries, because an entry is what the CPU band
+        // replay actually pays for.
+        static std::atomic<uint64_t> s_n{0}, s_noSlot{0}, s_rows{0}, s_psm{0}, s_mixed{0},
+            s_depth{0}, s_ok{0}, s_entries{0};
+        const uint64_t n = s_n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        s_entries.fetch_add(g_g144List.size(), std::memory_order_relaxed);
+        if (g700Slot < 0) s_noSlot.fetch_add(1u, std::memory_order_relaxed);
+        else if (rowHi < rowLo) s_rows.fetch_add(1u, std::memory_order_relaxed);
+        else if (g700Psm != GS_PSM_CT32 && g700Psm != GS_PSM_CT24)
+            s_psm.fetch_add(1u, std::memory_order_relaxed);
+        else if (!g700ShapeOk) s_mixed.fetch_add(1u, std::memory_order_relaxed);
+        else if (!g700Exact) s_depth.fetch_add(1u, std::memory_order_relaxed);
+        else s_ok.fetch_add(1u, std::memory_order_relaxed);
+        if (n <= 8u || (n % 4096u) == 0u)
+            std::fprintf(stderr,
+                         "[G700:admit] n=%llu entries=%llu ok=%llu | noSlot=%llu rows=%llu "
+                         "psm=%llu mixed=%llu depth=%llu | fbp=0x%x fbw=%u psm=%u "
+                         "rows=%d..%d guestZ=%u zbp=0x%x zpsm=%u\n",
+                         (unsigned long long)n,
+                         (unsigned long long)s_entries.load(std::memory_order_relaxed),
+                         (unsigned long long)s_ok.load(std::memory_order_relaxed),
+                         (unsigned long long)s_noSlot.load(std::memory_order_relaxed),
+                         (unsigned long long)s_rows.load(std::memory_order_relaxed),
+                         (unsigned long long)s_psm.load(std::memory_order_relaxed),
+                         (unsigned long long)s_mixed.load(std::memory_order_relaxed),
+                         (unsigned long long)s_depth.load(std::memory_order_relaxed),
+                         fbp, fbw, g_g144List[0].ctx.frame.psm, rowLo, rowHi,
+                         guestDepth ? 1u : 0u, guestZbpPage, guestZpsm);
+    }
+    if (g700Cand && !g700Exact)
+    {
+        // Shape drift on a candidate: publish anything the surface still owes so guest VRAM is
+        // whole for the CPU band replay that is about to run, then take the proven path.
+        if (g700Slot >= 0)
+            (void)g700Materialize(g700Slot, g_g700Surf[g700Slot].dirtyLo,
+                                  g_g700Surf[g700Slot].dirtyHi, 7 /* kG261MatFail */);
         g_g266FlushRej = kG266FrCpuOnlyRtt;
         g684DiagAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
@@ -1539,6 +1818,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                             g_g144List[0].prim.type == GS_PRIM_SPRITE;
     static G178Batch s_batch; // reused across flushes (keeps vector capacity)
     s_batch.fbp = fbp;
+    s_batch.g716SeedExpected.clear();
+    s_batch.g716SeedEarlyPages.clear();
     s_batch.fboKey = g351RouteB ? kG351Sprite139 : 0u;
     s_batch.fbW = fbW;
     s_batch.fbH = kFbH;
@@ -1576,9 +1857,15 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g276FlushPendingDisplay(0);
     // G261: waves leave the result in the FBO (no readPixels, no swizzle-writeback); the raw-
     // alpha RTT store rides the batch flag so the backend does not depend on the G255 env var.
-    s_batch.skipReadback = g261Wave || g272Wave || g276Coalesce;
+    // ⭐⭐⭐ G700: a persistent surface NEVER reads back at the flush. The rendered rows stay in
+    // the FBO and the surface records the publication debt; guest VRAM is materialised only when
+    // a real consumer edge (a VRAM transfer overlapping the debt, or the frame boundary) asks for
+    // those bytes. This is the whole point of the model — the readback is 4.0-4.5 ms/f of the
+    // frame (G682) and the flush's synchronous wait on it is what makes a target switch cost
+    // 0.184 ms here against PCSX2's ~0.02 ms.
+    s_batch.skipReadback = g261Wave || g272Wave || g276Coalesce || g700Exact;
     s_batch.rttRawAlpha = g255Rtt || g286Transient || g570Exact13d || g586Exact141 ||
-                          g587Exact15d || g604ExactDiscov;
+                          g587Exact15d || g604ExactDiscov || g700Exact;
 
     // Depth-clear on target change: mirror g106TitleZClearIfNeeded's fbp-transition semantics and
     // keep the CPU private-Z state machine in sync for any CPU-fallback flush in between.
@@ -1609,6 +1896,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // Publish the raw image for this target's rect HERE, before `fbGenNow` and before the upload
     // decision, so every generation this batch reasons about describes settled memory.
     // `g630MaterializeForRanges` costs 8 word-ANDs when nothing under the rect is authoritative.
+    if (s_g716CpuSeed && g716AnyRaw() && fbW > 0)
+        g716MaterializeForRanges(g144RangeForRect(fbBlock, GS_PSM_CT32, fbw, 0, 0, fbW, 512),
+                                 {}, false, false, kG261MatUpload);
     if (!s_g636NoFbSeed && g630DomainOn() && g630AnyDirty() && fbW > 0)
     {
         const G144BlockRange g636Fb =
@@ -1745,6 +2035,28 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const bool g591CGenSame = snap.valid && snap.genSum == fbGenNow;
     const bool g591CRowsIn = snap.valid && rowLo >= snap.rowLo && rowHi <= snap.rowHi;
     s_batch.uploadFb = !g591CForced && !(g591CGenSame && g591CRowsIn);
+    // ⭐⭐⭐ G700: the same question, answered in O(pages-in-window) from an explicit ownership
+    // token instead of a whole-surface generation SUM compared against a snapshot recorded under
+    // different row coverage. The surface owns a page iff it rendered it and no guest write has
+    // landed on it since; if every page of this window is owned, the FBO IS the newer copy and
+    // there is nothing to upload. When some page is not owned the upload runs in full — exact for
+    // the disowned pages, redundant for the owned ones, never wrong.
+    if (g700Exact)
+    {
+        const bool g700Up = g700NeedUpload(g700Slot, rowLo, rowHi);
+        if (!g700Up)
+            g_g700UploadSkips.fetch_add(1u, std::memory_order_relaxed);
+        else
+            // An upload READS guest VRAM for these pages, so anything another resident surface
+            // still owes over them must be published first — the same consumer edge the transient
+            // contract took unconditionally in its prologue, now scoped to the pages actually read.
+            g261MaterializeForRanges(
+                g144RangeForRect(fbBlock, GS_PSM_CT32, fbw, 0u, static_cast<uint32_t>(rowLo),
+                                 static_cast<uint32_t>(fbW),
+                                 static_cast<uint32_t>(rowHi - rowLo + 1)),
+                G144BlockRange{}, false, true, 2 /* kG261MatUpload */);
+        s_batch.uploadFb = g700Up;
+    }
     // ===== G591 slice B: WINDOW-SCOPED COLOUR AUTHORITY =====
     // `snap.genSum` above is a WHOLE-TARGET generation sum over all kFbH rows while the upload it
     // gates writes only rows upLoEff..upHi, so a write to ANY page of the surface forces an upload
@@ -2013,6 +2325,33 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // so uploading those rows from VRAM is pure churn — only rows the clear does not cover
         // need real VRAM bytes. Coverage invariant unchanged: rows 0..415 are valid post-clear.
         const int upLoEff = g290Seeded ? std::max(upLo, 416) : upLo;
+        s_batch.g716SeedLo = upLoEff;
+        s_batch.g716SeedHi = upHi;
+        // ⭐ Capture the raw-page set HERE, beside the pack, not at the old site ~4000 lines below.
+        // The overlay exists to repair exactly those seed texels whose packed bytes are stale, and
+        // that set is "pages raw AT PACK TIME". Collecting it later loses any page published
+        // between the two points: its bytes were packed stale, its raw claim is then gone, so it
+        // drops out of the mask and nothing repairs it. Whether that happens depends on flush
+        // timing, which is why the armed arm was not reproducible run to run.
+        // A page that becomes raw AFTER the pack needs no repair (guest was current when packed),
+        // and overlaying it is still content-correct, so pack-time capture is right in both
+        // directions. A publication does not erase raw, only the claim, so the mask stays valid.
+        if (s_g716SeedAtPack) g716PrepareSeed(s_batch, fbw);
+        if (s_g716Verify && g716AnyRaw() && upHi >= upLoEff)
+        {
+            const auto seedRange = g144RangeForRect(fbBlock, GS_PSM_CT32,
+                fbw, 0, upLoEff, fbW, upHi - upLoEff + 1);
+            static uint64_t seedOracleSerial = 0;
+            if (g716RangeHasRaw(seedRange) && (++seedOracleSerial <= 4 || seedOracleSerial % 64 == 0))
+            {
+                const auto shadow = g716ShadowMemory(seedRange);
+                s_batch.g716SeedExpected.assign(size_t(fbW) * kFbH, 0u);
+                g419PackFbRows(s_batch.g716SeedExpected.data(), s_batch.g716SeedExpected.size(),
+                    shadow.data(), shadow.size(), fbBlock, fbw, fbW, kFbH, upLoEff, upHi, true);
+                for (uint32_t pg = seedRange.first >> 5u; pg <= std::min(511u, seedRange.last >> 5u); ++pg)
+                    if (g_g716Raw[pg]) s_batch.g716SeedEarlyPages.push_back(pg);
+            }
+        }
         // G298 promotion (default on): CT32 maps each logical pixel to one independent 32-bit
         // staging element. Split disjoint guest-row ranges across the existing joined row pool;
         // VRAM is read-only here and the pool joins before backend submission, snapshot
@@ -2312,6 +2651,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     G242DepthState *depthState = nullptr;
     bool g262WaveDepth = false;
     bool g411PrivateDepth = false;
+    bool g700ZResident = false; // G700: this surface keeps its depth on the GPU across the flush
     bool g278PendingSameKey = false;
     bool g278OwnerEligible = false;
     // G535: restores the pre-G535 unconditional deferral of the G411 private-mirror depth owner.
@@ -2353,6 +2693,24 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g411PrivateDepth =
             g262WaveDepth && g411SharedGpuDepthOn() &&
             g404SharedZScope(fbp, fbw, guestZbpPage, guestZpsm);
+        // ⭐⭐⭐ G700 DEPTH RESIDENCY. G262's wave contract is: upload guest Z into the depth
+        // texture, render, read the Z back out into guest VRAM — per wave, per flush. That round
+        // trip is the ONLY reason the depth-carrying discovered targets are refused the GPU
+        // (`g660DiscovNoDepthOnly`), because guest Z has to stay authoritative and only a readback
+        // keeps it so. `[G666:discovterm]` measured the consequence on `combat`: 16,547,409 CPU
+        // entries — 100.00% of the residual discovered-target workload — blocked by that policy
+        // and by the width gate, with ZERO entries blocked because the GPU lacks a surface.
+        //
+        // A surface that OWNS its depth pages does not need the round trip. `g700DepthAcquire`
+        // answers "does this surface still hold these Z pages, unwritten by the guest since it
+        // claimed them" with the same per-page ownership token the colour half uses; when it does,
+        // the depth attachment simply stays resident across the flush. Fails closed: a key change,
+        // a row window outside the resident span, or any page the guest touched returns false and
+        // the proven upload/readback wave runs exactly as before.
+        g700ZResident =
+            g700Exact && g700DepthOn() && g262WaveDepth &&
+            g700DepthAcquire(g700Slot, guestZbpPage, guestZpsm, depthKey,
+                             depthRowLo, depthRowHi);
         if (g262WaveDepth)
         {
             const G144BlockRange depthWrite = g144RangeForRect(
@@ -2467,6 +2825,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 }
                 else if (g274ZResidentOn() && !fullInit && unchanged && !g282Tight &&
                          !g290Seeded)
+                    g274SkipUpload = true;
+                // ⭐ G700: the surface owns these Z pages and the guest has not written them since
+                // it claimed them, so the depth texture already holds the newer copy. Uploading
+                // guest Z over it would replace live GPU depth with a stale mirror.
+                if (g700ZResident)
                     g274SkipUpload = true;
                 // ===== G590 slice 1: WINDOW-SCOPED DEPTH AUTHORITY =====
                 // `unchanged` above is a WHOLE-TARGET 512-row generation sum, but the upload it
@@ -2819,6 +3182,42 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     static std::vector<uint64_t> s_g281ViewKey;
     static std::vector<int8_t> s_g281ViewSrc;
     static std::unordered_set<uint64_t> s_g310BuiltViews;
+    // ⭐⭐⭐ G704: the bind tail's `g291PagesCurrent` verdict, memoized per target for one flush.
+    //
+    // MEASURED, not assumed. `[G291:skip]` on `dragon` reaches **n=15,380,480 against mats=5,466**
+    // — a 2,814:1 ratio. Every one of those 15.4 M calls walks the target's coverage bitmap
+    // (`for p in pages overlapping the read: for y in 32 rows: test r.g291Cov[y][word]`, up to
+    // 4,096 `uint64` loads for a 512-row fbw=8 target) and concludes "already current, nothing to
+    // materialize". `[G656:bindstage]` books the tail those calls sit in at **69.90% of the whole
+    // bind loop at 4,604 cycles per entry that reaches it**, and `[G323:census]` puts `bind` at
+    // 0.042 ms/flush = **2.10 ms/f**, the largest addressable leaf in the frame once `submit` is
+    // closed on mechanism.
+    //
+    // ⭐ EXACT WITHIN A FLUSH, by who-writes-the-inputs. The verdict reads `r.g291Cov`,
+    // `r.g291CovFbw`, `r.fbw`, `r.fbW` and the query range. Inside this pre-pass:
+    //   * `g291Cov` is written at exactly three sites — the wave-render clear
+    //     (rasterizer_vram_materialization.inc, post-submit), the upload-note `|=`
+    //     (rasterizer_mat_support.inc) and the mirror reset (rasterizer_gpu_alias_page_view.inc).
+    //     None of the three is reachable from this loop.
+    //   * `g291CovFbw` is zeroed by width flips and the T8 atlas paths, all above or below it.
+    //   * the ONE mutation this loop CAN cause is `g261Materialize`, which is on the other side of
+    //     this very branch and clears `r.dirty` — after which `if (!r.dirty) continue;` skips the
+    //     target for every later entry. The memo is dropped there anyway (belt and braces).
+    // So for a target that stays dirty, consecutive entries asking the same range get the same
+    // answer by construction. Keyed on the full range pair, so a different texture re-computes.
+    //
+    // Oracle: `DC2_G704_VERIFY_PAGES=1` runs the real predicate on every HIT and compares.
+    // Rollback: `DC2_G704_NO_PAGEMEMO=1`.
+    struct G704PagesMemo
+    {
+        uint32_t texFirst = 0u, texLast = 0u, clutFirst = 0u, clutLast = 0u;
+        bool clutValid = false;
+        bool result = false;
+        bool valid = false;
+    };
+    static G704PagesMemo s_g704PagesMemo[kG248TargetCount];
+    for (uint32_t g704i = 0; g704i < kG248TargetCount; ++g704i)
+        s_g704PagesMemo[g704i].valid = false;
     // G622: the per-FLUSH source-key -> uploaded-key map. Cleared UNCONDITIONALLY here, above the
     // G261 bind block, because the texture pass that fills it and the draw pass that reads it both
     // run below this point on every flush that reaches them — keying a draw off a previous flush's
@@ -2834,6 +3233,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // "rejected on shape" and "the decision point never ran" must not share one bucket.
     bool g623PrePassRan = false;
     g630BeginTexturePass();
+    g_g716Built.clear();
+    // G716 reader test (default off): every consumer below this point runs in the same flush, so
+    // this is the one place that dominates all of them.
+    g716MirrorRawToGuest();
 #if defined(PS2X_G654_DIAG)
     static const bool s_g654BindMemo = envFlagEnabled("DC2_G654_BINDMEMO");
     uint64_t g654PrevKey = ~0ull;
@@ -2846,13 +3249,20 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         s_g654ExactRepeat.assign(g_g144List.size(), 0u);
     }
 #endif
-    if ((g261WaveOn() && g261AnyDirty()) || g630HaveSurfaces() || g289DirectDisplaySrc != 0u ||
+    // G710 ceiling probe (`deps`): deny the whole bind pre-pass. The `else` arm below already
+    // handles "the pre-pass did not run for this flush" exactly (G623's own path), so this is
+    // structurally supported — it only denies every FBO source, which is corrupting, not unsafe.
+    if ((g261WaveOn() && g261AnyDirty()) || g716AnyRaw() || g630HaveSurfaces() || g289DirectDisplaySrc != 0u ||
         g289OwnerViewReady)
     {
         s_g261FboSrc.assign(g_g144List.size(), 0u);
         s_g281ViewKey.assign(g_g144List.size(), 0u);
         s_g281ViewSrc.assign(g_g144List.size(), -1);
         s_g310BuiltViews.clear();
+        if (g716AnyRaw())
+            for (size_t i = 0; i < g_g144List.size(); ++i)
+                if (const uint64_t key = g716TryTexture(g_g144List[i], s_states[i]))
+                { s_g281ViewKey[i] = key; s_g281ViewSrc[i] = -2; }
         // G280: re-sync stale/orphaned alias-overlay tiles from VRAM before any bind decision
         // this flush makes (including legacy-path binds) can sample them.
         if (g280AliasOn())
@@ -2889,8 +3299,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 const G144Entry &e = g_g144List[i];
                 const G178EntryState &st = s_states[i];
                 const bool triType =
+                    !s_g281ViewKey[i] && (
                     e.prim.type == GS_PRIM_TRIANGLE ||
-                    e.prim.type == GS_PRIM_TRISTRIP;
+                    e.prim.type == GS_PRIM_TRISTRIP);
                 // G598: the shipped admission is the 0x139-destination / four-base whitelist below.
                 // With DC2_G598_T8ANY=1 the SOURCE is resolved from the texture base instead, which
                 // is what admits the MAP-15 sky (`fbp=0x13b` sampling `tbp=0x2720`, 0x139's own
@@ -3058,11 +3469,49 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // force legacy texture-alias publication and clear dirty ownership before the dominant
         // strip entry is reached; waiting until that entry therefore loses the residency state
         // G309/G310 must consume. G310 freezes this one-texture snapshot until submission ends.
+        // ⭐⭐⭐ G704: THE ATLAS SNAPSHOT SCAN IS A WHOLE-LIST WALK GUARDED BY A FLUSH CONSTANT.
+        //
+        // `[G323:census]` books this block as `logical` and prices it at **0.081 ms/flush = 61% of
+        // `deps`**, the largest leaf in the largest fixed pass. It is NOT the composite: over the
+        // same run `[G594:g310]` counts **4,096 composites against 152,100 flushes** (one per 37),
+        // and `[G453:other] composite=0.024 ms/f`. What costs is the SCAN — up to `g_g144List`
+        // entries (259 per flush here) of `g310EntryShape`, which is ~10 field comparisons plus a
+        // nested `g309EntryShape`, run until one matches or the list ends.
+        //
+        // ⭐ EXACT BY CONTAINMENT. Every path through `g310EntryShape` requires
+        // `g265DisplayTarget(batchFbp)` — `g309EntryShape` opens with it, the `g310StatOn()`
+        // logging block tests it, and the final `return` opens with it. And
+        // `g265DisplayTarget(fbp)` is `fbp == 0 || fbp == 0x68`: a function of the FLUSH's own
+        // target, constant for every entry in the list. So on a flush whose target is not a
+        // display buffer, the loop is provably a no-op — it cannot match, cannot log, and cannot
+        // reach `g310PrepareLogical`. Skipping it changes nothing but the time.
+        //
+        // On `dragon` the flushes are dominated by 0x139 / 0x159 / 0x13b, so most of this scan is
+        // spent proving that a non-display flush has no display-shaped entry. Same defect class as
+        // the bind-gate hoist above, one level out: the cheapest and most selective term was tested
+        // LAST, and per entry instead of once.
+        //
+        // Rollback: DC2_G704_NO_ATLASGATE=1.
+        // ⚠️ The gate wraps the LOOP, not the `if (g310On())` block. The block is the head of an
+        // `else if (g310StatOn())` chain that runs a DIFFERENT scan; gating the block would let a
+        // g310-on flush fall through into the stat branch and change behaviour.
+        static const bool s_g704NoAtlasGate = envFlagEnabled("DC2_G704_NO_ATLASGATE");
+        const bool g704AtlasScan = s_g704NoAtlasGate || g265DisplayTarget(fbp);
+        // ⛔ G707 BUILT, GATED, REVERTED (Rule 31). `tbp0 == kG707AtlasTbp` is a conjunct of
+        // BOTH sides of `g310EntryShape`'s disjunction, so testing it first is exact by
+        // containment and retires an entry in one 32-bit compare. It was built, proven exact
+        // (`[G594:g310] calls/f` 9.680 control vs 9.826 candidate — no decision changed) and
+        // gated: **GS own -0.010 ms/f, blocks -0.259 / +0.517 MIXED, control drift 0.375
+        // (inadmissible)**. A NULL.
+        // ⚠️ The estimate that justified it (`logical` 1.48 ms/f minus a 0.075 ms/f composite ⇒ a
+        // ~1.4 ms/f scan) came from `[G323:census]` on a HOT_DIAG binary. Rule 12b says extra code
+        // in this TU regresses the whole TU, so a leaf priced on the diag build cannot be
+        // converted into a ship-binary prize. See plans/phase-G707-fix-log.md.
         if (g310On())
         {
             const auto g323ScopeT0 = g323Armed ? std::chrono::steady_clock::now()
                                                : std::chrono::steady_clock::time_point{};
-            for (size_t i = 0; i < g_g144List.size(); ++i)
+            for (size_t i = 0; g704AtlasScan && i < g_g144List.size(); ++i)
                 if (g310EntryShape(fbp, g_g144List[i], s_states[i]))
                 {
                     (void)g310PrepareLogical(g310Ready);
@@ -3106,7 +3555,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         {
             const auto g323ScopeT0 = g323Armed ? std::chrono::steady_clock::now()
                                                : std::chrono::steady_clock::time_point{};
-            for (size_t i = 0; i < g_g144List.size(); ++i)
+            // G704: same containment as the atlas scan above — `g309EntryShape` opens with
+            // `g265DisplayTarget(batchFbp)`, which is constant across the list.
+            for (size_t i = 0; g704AtlasScan && i < g_g144List.size(); ++i)
                 if (g309EntryShape(fbp, g_g144List[i], s_states[i]))
                 {
                     (void)g309PrepareComposite(g309Ready);
@@ -3200,10 +3651,18 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             if (g_g261Res[t].dirty)
                 ++g663DirtyN;
 #endif
+        // G704: both this loop's arms are read ONCE per flush (rule 13). `g704BindGateOn` selects
+        // the hoisted `skip || !tme` early-out below; `g704TexRangeOn` selects the per-entry
+        // texture/CLUT range hoist inside the per-target scan.
+        static const bool s_g704NoBindGate = envFlagEnabled("DC2_G704_NO_BINDGATE");
+        static const bool s_g704NoTexRange = envFlagEnabled("DC2_G704_NO_TEXRANGE");
+        const bool g704BindGateOn = !s_g704NoBindGate;
+        const bool g704TexRangeOn = !s_g704NoTexRange;
         for (size_t i = 0; i < g_g144List.size() && !s_g599NoBind; ++i)
         {
             const G178EntryState &st = s_states[i];
             const G144Entry &e = g_g144List[i];
+            if (s_g716Authority && s_g281ViewKey[i] != 0) continue;
             // G656 P6: which of this loop's ~10 candidate-source gates owns the 70-71% of `deps`
             // that [G323:census] prices as one number. Diagnostic build mode only (rule 12c).
             G656BindLap g656Bind(g656BindArmed);
@@ -3251,9 +3710,48 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 continue;
             }
             G656_BIND_LAP(kG656BindG289);
+            // ⭐ G704: THE CHEAPEST AND MOST SELECTIVE GATE RAN FOURTH.
+            //
+            // `[G656:bindstage]` on `dragon`, one run: 6,200,501 entries enter this loop, and the
+            // `early` gate (`texKey == 0 || skip || !tme`, still below) retires **4,268,811 of
+            // 4,781,747 = 89.3%** of the ones that reach it — after `g310` (81.6 cyc/entry over
+            // 6,199,430) and `g309` (68.4 cyc over 4,781,747) have already been paid. That is
+            // ~150 cycles of shape evaluation spent on entries that were never candidates.
+            //
+            // ⭐ EXACT BY CONSTRUCTION — the hoisted conjuncts are ALREADY conjuncts of both
+            // shapes it skips. `g309EntryShape` opens `g265DisplayTarget(batchFbp) && !st.skip &&
+            // e.prim.tme && ...`; `g310EntryShape` returns `g309EntryShape(...) || (... && !st.skip
+            // && e.prim.tme && ...)`. So `st.skip || !e.prim.tme` implies BOTH are false, which
+            // implies `g310Shape`, `g309Shape`, `g310Candidate` and `g309Candidate` are all false
+            // and every block between here and the `early` gate is skipped anyway. The only
+            // other statement in that span is the `g_g310Candidates` counter, which is guarded by
+            // `g310Shape`.
+            //
+            // ⚠️ It must go BELOW the two G289 blocks above, which bind untextured entries too and
+            // therefore do NOT imply `tme`. `st.texKey == 0` deliberately stays in the original
+            // gate: nothing here proves it implies `!g310Shape` (the shape tests `st.texW`/`texH`,
+            // not the key), so hoisting it would be a key-sufficiency argument rather than a
+            // containment one — the trap G661 §1.6b rule 2 names.
+            //
+            // Rollback: DC2_G704_NO_BINDGATE=1 (the arm is read ONCE per flush, above the loop —
+            // rule 12c/13: a function-local `static const bool` inside this body would add an
+            // `_Init_thread_epoch` TLS compare per entry, which is the cost this lever removes).
+            if (g704BindGateOn && (st.skip || !e.prim.tme))
+                continue;
+            // ⭐⭐ G704: the SAME containment as the atlas-snapshot scan above, applied in the loop
+            // that runs 3.46 M times per run instead of 152 k. `[G656:bindstage]` books these two
+            // shape tests as `g310` 13.01% + `g309` 4.54% = **17.5% of the whole bind loop**, at
+            // 81.6 and 68.4 cyc per entry entered — and BOTH are unreachable-false on a flush whose
+            // target is not a display buffer, because every path through `g310EntryShape` and
+            // `g309EntryShape` opens with `g265DisplayTarget(batchFbp)` (`fbp == 0 || fbp == 0x68`),
+            // which is constant for the whole list.
+            //
+            // Exact: with `g704AtlasScan` false both shapes are false anyway, so `g310Candidate`,
+            // `g309Candidate` and the `g_g310Candidates` census all take the identical branch they
+            // already took. Shares the one flush-scoped arm read, and its rollback.
             const bool g310Shape =
-                (g310On() || g310StatOn()) && g310EntryShape(fbp, e, st);
-            const bool g309Shape = g309On() && g309EntryShape(fbp, e, st);
+                g704AtlasScan && (g310On() || g310StatOn()) && g310EntryShape(fbp, e, st);
+            const bool g309Shape = g704AtlasScan && g309On() && g309EntryShape(fbp, e, st);
             if ((g310On() || g310StatOn()) && g310Shape)
                 g_g310Candidates.fetch_add(1u, std::memory_order_relaxed);
             const bool g310Candidate = g310On() && g310Shape;
@@ -3295,6 +3793,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             if (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u)
                 continue; // G310 decoded this exact self-atlas snapshot before publication.
             G656_BIND_LAP(kG656BindEarly);
+
+            if (const uint64_t rawKey = g716TryTexture(e, st))
+            {
+                s_g281ViewKey[i] = rawKey;
+                s_g281ViewSrc[i] = -2;
+                continue;
+            }
 
             // G630: decode PSMT8 directly from persistent raw VRAM. FIFO order places the view
             // before the native draw that consumes this texture key, with no publication/wait.
@@ -3348,6 +3853,21 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             }
 
             G656_BIND_LAP(kG656BindT8);
+            // ⭐⭐⭐ G700 DIRECT RTT CONSUMPTION. This entry samples a texture; if those bytes are
+            // a live G700 surface's own pixels, bind that surface's FBO colour texture instead of
+            // publishing it into guest VRAM and decoding it back out. `[G332:gsw]` books the GL
+            // worker at 26.15 ms/f over 71 jobs/f on `dragon` against 16.7 render flushes — the
+            // other ~54 jobs a frame are exactly these materialisation round trips.
+            // Geometric identity only (same base, same width, same in-FBO layout, rows the FBO
+            // holds); anything else falls through to the ordinary decode.
+            if (const uint32_t g700Src = g700DirectSampleSrc(e, fbp))
+            {
+                s_g261FboSrc[i] = g700Src;
+                g261AnyBind = true;
+                g_g261FboBinds.fetch_add(1u, std::memory_order_relaxed);
+                g_g700DirectBinds.fetch_add(1u, std::memory_order_relaxed);
+                continue;
+            }
             // G267 diagnostic: characterize the stable display TRISTRIP consumer with exact
             // bilinear taps and exact CT32 sampled pages. Behavior is intentionally unchanged:
             // the repaired prototype was neutral and was removed at phase close.
@@ -3506,6 +4026,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     ? g633TexturePlanConst(st.residencyPlan) : nullptr;
                 const G144BlockRange g630Tex = g633Plan != nullptr
                     ? g633Plan->texRange : g144TextureRange(e);
+                g716MaterializeForRanges(g630Tex, g144ClutRange(e), !g630Tex.valid, false,
+                                         kG261MatTexAlias);
                 // G632 census: WHY both direct-view gates declined, as one per-draw bitmask
                 // (G628's law). `auth=1` marks the draws that are real `tex` breaks — the ones
                 // whose texture pages are actually GPU-authoritative right now.
@@ -3530,6 +4052,20 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             ++g663ScanEntries;
             const unsigned long long g663T1 = __rdtsc();
 #endif
+            // ⭐ G704: the texture and CLUT page ranges are a function of `e` ALONE, and the loop
+            // below recomputes both inside its per-target `else` branch — i.e. once for every
+            // (entry x dirty target) pair. `[G663:bindscan]` measured 2 dirty slots on 50.1% of
+            // `dragon` flushes and 1 on 95.9% of `s03` flushes, so this is 1-2 redundant
+            // recomputations per entry that reaches the tail (508,220 of them on one dragon run),
+            // and G663's own re-open condition names `g144TextureRange` / `g144ClutRange` as two
+            // of the three residual terms in exactly this body.
+            //
+            // Exact by construction: same function, same argument, no `t` in either signature.
+            // Rollback DC2_G704_NO_TEXRANGE=1 forces the recompute on every use, which restores
+            // the original call sequence literally rather than merely its result.
+            G144BlockRange g704TexRange{};
+            G144BlockRange g704ClutRange{};
+            bool g704RangesReady = false;
             for (uint32_t t = 0; t < kG248TargetCount; ++t)
             {
                 G261Res &r = g_g261Res[t];
@@ -3634,10 +4170,17 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 {
                     // Any other overlap of this texture/CLUT with the resident target's pages
                     // needs real VRAM bytes — materialize before the decode loop reads them.
-                    const G144BlockRange tex = g144TextureRange(e);
-                    const G144BlockRange clut = g144IsPalettedPsm(e.ctx.tex0.psm)
-                                                    ? g144ClutRange(e)
-                                                    : G144BlockRange{};
+                    // G704: computed once per ENTRY (see the declaration above the target loop).
+                    if (!g704RangesReady || !g704TexRangeOn)
+                    {
+                        g704TexRange = g144TextureRange(e);
+                        g704ClutRange = g144IsPalettedPsm(e.ctx.tex0.psm)
+                                            ? g144ClutRange(e)
+                                            : G144BlockRange{};
+                        g704RangesReady = true;
+                    }
+                    const G144BlockRange &tex = g704TexRange;
+                    const G144BlockRange &clut = g704ClutRange;
                     if (!tex.valid || !r.range.valid ||
                         g144RangeOverlaps(r.range, tex) ||
                         (clut.valid && g144RangeOverlaps(r.range, clut)))
@@ -3648,23 +4191,101 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         // the read touches — the materialize round-trip would be the identity
                         // there. CLUT reads use paletted PSMs whose range test is the same
                         // block interval. Fails closed on any partial page.
-                        if (g291AtlasOn() && tex.valid && r.range.valid &&
-                            g291PagesCurrent(r, kG261Fbp[t], tex) &&
-                            (!clut.valid || g291PagesCurrent(r, kG261Fbp[t], clut)))
+                        // G704: the coverage verdict, memoized per target for this flush. The
+                        // arms are cached statics read once per call (never per page).
+                        bool g704Pages = false;
                         {
-                            const uint64_t n = g_g291TexSkips.fetch_add(
-                                                   1u, std::memory_order_relaxed) + 1u;
-                            if (g291StatOn() && (n <= 8u || (n % 4096u) == 0u))
-                                std::fprintf(stderr,
-                                             "[G291:skip] n=%llu t=%03x tex=0x%x..0x%x "
-                                             "mats=%llu\n",
-                                             (unsigned long long)n, kG261Fbp[t],
-                                             tex.first, tex.last,
-                                             (unsigned long long)g_g291TexMats.load(
-                                                 std::memory_order_relaxed));
+                            static const bool s_g704NoPageMemo =
+                                envFlagEnabled("DC2_G704_NO_PAGEMEMO");
+                            static const bool s_g704VerifyPages =
+                                envFlagEnabled("DC2_G704_VERIFY_PAGES");
+                            static const bool s_g704Stats =
+                                g291StatOn() || s_g704VerifyPages;
+                            const bool g704Pre =
+                                g291AtlasOn() && tex.valid && r.range.valid;
+                            if (!g704Pre)
+                            {
+                                g704Pages = false;
+                            }
+                            else
+                            {
+                                G704PagesMemo &m = s_g704PagesMemo[t];
+                                const bool hit =
+                                    !s_g704NoPageMemo && m.valid &&
+                                    m.texFirst == tex.first && m.texLast == tex.last &&
+                                    m.clutValid == clut.valid &&
+                                    m.clutFirst == clut.first && m.clutLast == clut.last;
+                                if (hit && !s_g704VerifyPages)
+                                {
+                                    g704Pages = m.result;
+                                    if (s_g704Stats)
+                                        g_g704PageMemoHits.fetch_add(
+                                            1u, std::memory_order_relaxed);
+                                }
+                                else
+                                {
+                                    const bool real =
+                                        g291PagesCurrent(r, kG261Fbp[t], tex) &&
+                                        (!clut.valid ||
+                                         g291PagesCurrent(r, kG261Fbp[t], clut));
+                                    if (hit)
+                                    {
+                                        // Same-run oracle: the memo said `m.result`, the real
+                                        // predicate says `real`. A disagreement means an input
+                                        // moved inside the loop and the memo is unsound.
+                                        if (s_g704Stats)
+                                            g_g704PageMemoHits.fetch_add(
+                                                1u, std::memory_order_relaxed);
+                                        if (real != m.result)
+                                        {
+                                            const uint64_t bad =
+                                                g_g704PageMemoBad.fetch_add(
+                                                    1u, std::memory_order_relaxed) + 1u;
+                                            if (bad <= 16u)
+                                                std::fprintf(
+                                                    stderr,
+                                                    "[G704:pagememo-BAD] n=%llu t=%03x "
+                                                    "tex=0x%x..0x%x memo=%d real=%d\n",
+                                                    (unsigned long long)bad, kG261Fbp[t],
+                                                    tex.first, tex.last,
+                                                    m.result ? 1 : 0, real ? 1 : 0);
+                                        }
+                                    }
+                                    else
+                                    {
+                                        if (s_g704Stats)
+                                            g_g704PageMemoMiss.fetch_add(
+                                                1u, std::memory_order_relaxed);
+                                    }
+                                    g704Pages = real;
+                                    m.texFirst = tex.first;
+                                    m.texLast = tex.last;
+                                    m.clutFirst = clut.first;
+                                    m.clutLast = clut.last;
+                                    m.clutValid = clut.valid;
+                                    m.result = real;
+                                    m.valid = true;
+                                }
+                            }
+                        }
+                        if (g704Pages)
+                        {
+                            if (g291StatOn())
+                            {
+                                const uint64_t n = g_g291TexSkips.fetch_add(
+                                                       1u, std::memory_order_relaxed) + 1u;
+                                if (n <= 8u || (n % 4096u) == 0u)
+                                    std::fprintf(stderr,
+                                                 "[G291:skip] n=%llu t=%03x tex=0x%x..0x%x "
+                                                 "mats=%llu\n",
+                                                 (unsigned long long)n, kG261Fbp[t],
+                                                 tex.first, tex.last,
+                                                 (unsigned long long)g_g291TexMats.load(
+                                                     std::memory_order_relaxed));
+                            }
                             continue;
                         }
-                        if (g291AtlasOn())
+                        if (g291AtlasOn() && g291StatOn())
                             g_g291TexMats.fetch_add(1u, std::memory_order_relaxed);
                         // G262 diagnosis: WHY did the direct-bind test fail for a real consumer?
                         static std::atomic<uint32_t> s_g262BindRejLog{0};
@@ -3731,6 +4352,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         // same page have been reordered. Count it, and count the overlapping
                         // subset — `overlapping=0` is the evidence the deferral is unobservable.
                         g632NoteG261InEpoch(r.range);
+                        // G704: the ONE mutation this loop can cause. `g261Materialize` clears
+                        // `r.dirty` (so later entries skip this target at the top) AND clears the
+                        // wave-render coverage rows, so drop the memo here rather than rely on the
+                        // dirty flag alone — belt and braces, one store on a path that already
+                        // does a full publication.
+                        s_g704PagesMemo[t].valid = false;
                         g261Materialize(static_cast<int>(t), kG261MatTexAlias);
                         if (g342On)
                             g342NoteTexAlias(
@@ -4272,7 +4899,45 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             // therefore too strong for that pair. See g568_bitalias_admission.inc.
             const bool g568Disjoint = g568TexAliasIsBitDisjoint(
                 texAliasesZ, clutAliasesZ, ctx.tex0.psm, guestZpsm);
-            if ((texAliasesZ || clutAliasesZ) && !g568Disjoint)
+            // ⭐⭐⭐ G702 — A TEXTURE THAT ALIASES THE LIVE Z WINDOW IS A DEPENDENCY, NOT A
+            // DISQUALIFICATION.
+            //
+            // `[G657:rejwall]` on `dragon`, 150 s: `texaliasz` on the two DISPLAY buffers is
+            // 456.6 + 442.9 = **899.5 ms of a 1,439.3 ms CPU-fallback wall = 62.5%** — the single
+            // largest CPU band-replay cause in the whole census, over 594 events x ~234 entries.
+            // `[G657:cover]` puts that whole fallback population at **36.5% of the GS wall**.
+            //
+            // WHY THE GATE EXISTS. Colour and depth are separate GL resources, so the GS's
+            // physical page aliasing — a texture whose GS pages ARE the Z buffer's GS pages — is
+            // not reproduced on the GPU. The flush decodes the texture out of guest VRAM, which
+            // does not carry Z the GPU has written into its depth attachment.
+            //
+            // ⭐ WHEN IT CANNOT BITE, EXACTLY. The hazard needs a Z WRITE into the aliased pages
+            // DURING this batch. `guestDepthWrites` is the union of `st.depthWrite` over every
+            // classified entry (line 665): when it is false, ZMSK masks every Z write in the
+            // batch, the aliased bytes are immutable for its whole duration, and guest VRAM
+            // already holds precisely the bytes the CPU band replay would sample. The two paths
+            // then decode IDENTICAL bytes by construction — this is an exactness argument, not a
+            // tolerance. The second gate below (`g242SyncOverlappingDepth`) still runs and still
+            // fails closed, so a pending GPU depth owner over those pages is published before the
+            // decode exactly as it is for every non-aliasing texture.
+            //
+            // ⭐ ORTHOGONAL TO G568, NOT A REPLACEMENT FOR IT. G568 (`g568TexAliasIsBitDisjoint`,
+            // one line above) admits the same population by a STRONGER argument — a T8H/T4HL/T4HH
+            // texture over PSMZ24 shares words with Z but never shares a BIT, so it is admissible
+            // whether or not the batch writes Z. `[G242:alias]` shows dragon's whole texaliasz
+            // population is exactly that shape (`tbp=0x1a00 psm=0x2c zbp=0xd0`, i.e. a PSMT4HH
+            // texture packed into the spare high byte of the Z buffer — the standard PS2 idiom).
+            // This gate covers the disjoint case G568 cannot: any texture PSM at all, when the
+            // batch simply never writes the aliased bytes. Measure them separately.
+            //
+            // Fails closed on every other shape: a batch that writes Z keeps the proven replay.
+            // Bring-up default: OFF. Rollback once promoted: DC2_G702_NO_TEXALIAS_RO=1.
+            static const bool s_g702TexAliasRo =
+                envFlagEnabled("DC2_G702_TEXALIAS_RO") &&
+                !envFlagEnabled("DC2_G702_NO_TEXALIAS_RO");
+            const bool g702AliasReadOnly = s_g702TexAliasRo && !guestDepthWrites;
+            if ((texAliasesZ || clutAliasesZ) && !g568Disjoint && !g702AliasReadOnly)
             {
                 static std::atomic<uint32_t> s_aliasTexLog{0};
                 const uint32_t n = s_aliasTexLog.fetch_add(1u, std::memory_order_relaxed);
@@ -4302,6 +4967,29 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         }
         const auto g511GenT0 = g511Split ? std::chrono::steady_clock::now()
                                          : std::chrono::steady_clock::time_point{};
+        // ⛔⛔⛔ G706 BUILT, MEASURED AND REVERTED (Rule 31). The stamp below is a sum of per-PAGE
+        // write generations over a conservative page RECTANGLE, plus a +1 slack neighbour for every
+        // non-page-aligned base, plus the CLUT page UNCONDITIONALLY — even for a CT32/CT24/CT16
+        // texture whose decoder never reads a CLUT. A GS page is 8 KiB and `TEX0.TBP0` is a
+        // 256-byte BLOCK number, so all three looked like ways for this sum to move while the
+        // texture's own bytes did not — and each miss costs `g178HashPages`, which
+        // `[G511:texsplit]` prices at 0.69 hashes/flush x **406.9 KiB = 16.6 MB/f = 1.01 ms/f**.
+        //
+        // G706 built the exact 256-byte block-granular tier (block index derived from
+        // `PixelStorageTraits<psm>::Write`'s own address expression, so under-coverage was
+        // impossible by construction) and scored it against the page form in shadow on `dragon`:
+        //
+        //     [G706:blockgen] probes=262,144 pageHit=70,359 (26.84%) blockHit=70,359 (26.84%)
+        //                     blockOnly=0 pageOnly=0 clutDropped=78,386
+        //                     bumpBlocks=1,288,397,366 (859.7/rect) sumBlocks=1,334.8/probe
+        //
+        // **The two tiers agree on every one of 262,144 decisions.** `blockOnly=0`: the finer tier
+        // never converts a page miss into a hit, and dropping the CLUT term on the 78,386
+        // non-paletted probes converts none either. So the escalation is NOT a granularity
+        // artefact — every write that moves the texture's page generation also writes the
+        // texture's own blocks. The block form was 30x the write cost and 50x the query cost for
+        // an identical answer, so it is gone rather than shipped default-OFF.
+        // See plans/phase-G706-fix-log.md §3.
         const uint64_t genNow =
             g178GenSumRect(ctx.tex0.tbp0, ctx.tex0.tbw, ctx.tex0.psm, 0, 0,
                            static_cast<uint32_t>(st.texW), static_cast<uint32_t>(st.texH)) +
@@ -4327,6 +5015,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             envFlagEnabled("DC2_G401_CT24_REDECODE");
         const bool g401ForceDecode =
             s_g401Ct24Redecode && ctx.tex0.psm == GS_PSM_CT24;
+        // G706 shadow: both tiers' verdicts for the SAME question, counted before either is acted
+        // on. `known` keeps the comparison honest - a key with no stamp is not a "miss" for either
+        // form, and counting it as one would flatter or damn both equally.
         if (!g401ForceDecode && !g600TexPaintOn() && it != g_g178TexReg.end() && backendHas &&
             it->second.genSum == genNow)
         {
@@ -4345,10 +5036,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // iterations, so the accessor cannot pollute the loop it gates (G502).
         const bool g513Fast = g513HashLaneActive();
         uint64_t g513Bytes = 0u;
-        const uint64_t hashNow = g178HashPages(vram, vramSize, ctx.tex0.tbp0, ctx.tex0.tbw,
-                                               ctx.tex0.psm, static_cast<uint32_t>(st.texW),
-                                               static_cast<uint32_t>(st.texH), ctx.tex0.cbp,
-                                               g513Fast, &g513Bytes);
+        const uint64_t hashNow =
+            g178HashPages(vram, vramSize, ctx.tex0.tbp0, ctx.tex0.tbw,
+                          ctx.tex0.psm, static_cast<uint32_t>(st.texW),
+                          static_cast<uint32_t>(st.texH), ctx.tex0.cbp,
+                          g513Fast, &g513Bytes);
         if (g511Split)
         {
             g511HashNs += static_cast<uint64_t>(
@@ -4412,8 +5104,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // G513: the stamp must have been written by the SAME byte loop that just produced
         // `hashNow`. Without this the paired A/B's arm switch would compare a reference digest
         // against an 8-lane one — always a MISS, and on a collision a stale texture.
+        // G708: the cached per-page digest body is a THIRD value of the same bytes, so it takes its
+        // own hashVar under the identical contract - a stamp one body wrote is never read by
+        // another, which is what makes the rollback arm switchable inside one binary.
         if (!g401ForceDecode && !g600TexPaintOn() && it != g_g178TexReg.end() && backendHas &&
-            it->second.hashVar == static_cast<uint8_t>(g513Fast ? 1u : 0u) &&
+            it->second.hashVar == g708HashVar(g513Fast) &&
             it->second.contentHash == hashNow)
         {
             it->second.genSum = genNow;
@@ -4429,7 +5124,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // `g622NoteContent` records the hash and reports the repeat on BOTH arms, so the candidate
         // carries no bookkeeping the control does not (G520's arm-symmetry law); only the KEY
         // CHOICE below is the variable.
-        const uint8_t g622HashVar = static_cast<uint8_t>(g513Fast ? 1u : 0u);
+        const uint8_t g622HashVar = g708HashVar(g513Fast);
         const bool g622Repeat = g622NoteContent(st.texKey, hashNow);
         const bool g622Arm = g622TexVarActive();
         const bool g622Mint = g622Arm && !g401ForceDecode && !g600TexPaintOn() &&
@@ -4604,8 +5299,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         }
         s_batch.texUploads.push_back(std::move(up));
         g_g178TexReg[st.texKey] =
-            G178TexReg{genNow, hashNow, st.texW, st.texH,
-                       static_cast<uint8_t>(g513Fast ? 1u : 0u), g622Key};
+            G178TexReg{genNow, hashNow, st.texW, st.texH, g708HashVar(g513Fast), g622Key};
         g684DiagAdd(g_g178TexDecodes, 1u);
         g622NoteFlushKey(st.texKey, g622Key);
         g622TexVarReport();
@@ -4812,6 +5506,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
 
     const auto g298T4 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
+    // G712: could THIS batch's vertex build have run at batch close, beside the `class` pass? Only
+    // if the two flush-produced per-entry tables the builder reads are both absent. One read per
+    // flush, never per entry (Rule 63). Census only — nothing is skipped or reordered here.
+    g712NoteVertsEligibility(!g261AnyBind && s_g281ViewKey.empty(), g_g144List.size());
     // Vertices + state-batched draw runs (submission order preserved — no sorting; blending
     // depends on order).
     const bool g684MergeDrawRuns = !g256ExactRttOn();
@@ -4862,9 +5560,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 // its width from — `g248TargetIndex` returns -1 for it. Take the width from the
                 // surface record instead; every other srcFbp value reaching here is a resident
                 // target by construction.
+                // G700: a persistent surface is likewise not a residency slot, so its width comes
+                // from its own record. Folded into the same max() as G623/G630 — at most one of
+                // the three owns any given fbp, so the others contribute 0.
                 pushTexW = (srcTi >= 0) ? g_g261Res[srcTi].fbW
-                                        : std::max(g623SurfaceFbW(s_g261FboSrc[i]),
-                                                   g630SurfaceFbW(s_g261FboSrc[i]));
+                                        : std::max(std::max(g623SurfaceFbW(s_g261FboSrc[i]),
+                                                            g630SurfaceFbW(s_g261FboSrc[i])),
+                                                   g700SurfaceFbW(s_g261FboSrc[i]));
                 pushTexH = 512;
             }
         }
@@ -5793,6 +6495,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
 #if defined(PS2X_G654_DIAG)
     const auto g654S2 = std::chrono::steady_clock::now(); // end of pre-submit bookkeeping
 #endif
+    // Legacy site. The set collected here is "pages raw at SUBMIT time", which is not the set
+    // whose packed bytes are stale; see the pack-time capture above.
+    if (!s_g716SeedAtPack) g716PrepareSeed(s_batch, fbw);
     bool submitted;
     if (g305Async)
     {
@@ -5819,14 +6524,52 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     }
     else
     {
-        submitted = g275FuseReadback
-            ? g275_backend_submit_depth_readback(
-                  s_batch, depthKey, depthUpload, depthGlY, depthRows,
-                  g275ReadGlY, g275ReadRows, s_g262DepthReadback)
-            : (guestDepth
-                   ? g242_backend_submit_depth(s_batch, depthKey, depthUpload,
-                                               depthGlY, depthRows)
-                   : g178_backend_submit(s_batch));
+        // ⭐⭐⭐ G701: this batch reads nothing back, so the pole thread has nothing to wait for.
+        // Enqueue it and keep going; the single GL worker consumes the queue in FIFO order, so
+        // every later readback, copy or display read is already sequenced behind this render
+        // without a promise round trip. Falls through to the blocking path when the ring is full
+        // or the lever is not armed — which also drains it, since the queue is one FIFO.
+        submitted = false;
+        if (!g275FuseReadback && s_batch.skipReadback)
+            // ⛔⛔⛔ G704: THE DEPTH EXTENSION WAS BUILT HERE AND REVERTED, AND THE REASON IS THE
+            // RESULT. G700 §2.4 refused depth batches because the first draft COPIED the caller's
+            // 850 KB `s_depthUpload` static per flush, and attributed its +3.3 ms/f to that copy.
+            // The copy was NOT the cause: with it gone, the COLOUR-ONLY form (58.8% admission,
+            // `[G701:async] submits=113,757 fallbacks=79,844`) measures **+2.873 ms/f (+10.83%) on
+            // `dragon`, GS own +2.641, with VU1 -0.215 / EE -0.244 / kicks +0.8 flat** — the whole
+            // regression lands on the thread that stops waiting. Handing `s_depthUpload`'s storage
+            // to the slot (a swap, not a copy — exact, and it was written and verified) would only
+            // admit MORE batches to a path that regresses per batch. Reverted under Rule 31.
+            submitted = g701_backend_submit_nowait(
+                s_batch, guestDepth ? depthKey : 0u, guestDepth ? depthUpload : nullptr,
+                depthGlY, guestDepth ? depthRows : 0);
+        if (!submitted)
+            submitted = g275FuseReadback
+                ? g275_backend_submit_depth_readback(
+                      s_batch, depthKey, depthUpload, depthGlY, depthRows,
+                      g275ReadGlY, g275ReadRows, s_g262DepthReadback)
+                : (guestDepth
+                       ? g242_backend_submit_depth(s_batch, depthKey, depthUpload,
+                                                   depthGlY, depthRows)
+                       : g178_backend_submit(s_batch));
+    }
+    // ⭐⭐⭐ G700: the GPU now holds rows [rowLo, rowHi] of this surface and guest VRAM does not.
+    // Claim their pages and anchor them at the current write generation, so (a) the next batch to
+    // this target skips its upload entirely, and (b) any guest write that lands on them is
+    // detected and forces exactly those pages back to VRAM authority. This replaces the readback
+    // that used to run here.
+    if (g700Exact && submitted)
+    {
+        g700NoteRender(g700Slot, rowLo, rowHi);
+        if (guestDepth && g700DepthOn())
+            g700DepthNoteRender(g700Slot, depthRowLo, depthRowHi);
+    }
+    else if (g700Exact && !submitted)
+    {
+        // The backend refused. The CPU replay about to run is authoritative over guest VRAM, so
+        // anything this surface still owes must be published before it reads those bytes.
+        (void)g700Materialize(g700Slot, g_g700Surf[g700Slot].dirtyLo,
+                              g_g700Surf[g700Slot].dirtyHi, 7 /* kG261MatFail */);
     }
 #if defined(PS2X_G654_DIAG)
     const auto g654S3 = std::chrono::steady_clock::now(); // end of the backend enqueue itself
@@ -5926,7 +6669,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     }
     if (g262WaveDepth)
         g_g262DepthInit.insert(depthKey); // full-init (or window update) reached the texture
-    if (g262WaveDepth && guestDepthWrites && !g278DeferDepth)
+    // ⭐⭐⭐ G700: a resident-depth surface does NOT publish its Z back into guest VRAM here. That
+    // readback is the wave-granular barrier G262 needs because between waves VRAM Z is
+    // authoritative; under G700 the SURFACE is authoritative and the ownership token records the
+    // debt, exactly as it does for colour. The publication happens at a real consumer edge or at
+    // the frame boundary — not once per flush per wave.
+    if (g262WaveDepth && guestDepthWrites && !g278DeferDepth && !g700ZResident)
     {
         // G262: materialize the wave's Z writes into guest VRAM immediately (the wave-granular
         // barrier). Between waves VRAM Z stays authoritative, so nothing persists on the GPU and
@@ -6326,6 +7074,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
 #endif
             r.fbw = fbw;
             r.fbW = fbW;
+            g716MarkRows(r, rowLo, rowHi);
             r.dirty = true;
 #if defined(PS2X_G662_DIAG)
             if (g662NewEpoch)
@@ -7007,8 +7756,57 @@ static void g242NoteCpuReplayWrites(uint8_t *vram)
     const bool g581Scoped = g581ScopedCpuSnapOn();
     if ((!g242GpuDepthOn() && !g581Scoped) || vram == nullptr || g_g144List.empty())
         return;
+    // ⭐⭐ G708: same repair as `g261NoteCpuRttWrites`, on the second-largest publisher.
+    // `[G708:bumpsrc]` on `dragon` attributes 20.9% of all byte-identical page re-reads to this
+    // site (source 4); it bumps `fbw*64 x 512` — the WHOLE 512-row target, 128 pages at fbw=8 —
+    // once per distinct target, for a replay that wrote only the rows its entries cover.
+    // The X span stays the established full-target form (the comment above explains why: intra-row
+    // format aliasing). Only the ROW span narrows, to the union of `e.minY..e.maxY`, which G144
+    // capture computes per primitive class as the clamped floor/ceil of the vertex Y extremes and
+    // which G621's oracle-verified law calls "tight and NEVER NARROWER than the real coverage".
+    // A row outside the union is written by no entry of this replay, so nothing stale can survive.
+    // Rollback: DC2_G708_NO_ROWPUB=1 (shared with the source-2 repair, one lever).
+    // ⛔⛔ G709 REVERTED HERE (Rule 31), same lever and same reason as `g261NoteCpuRttWrites`. Its
+    // page-set form narrowed this site's X span too — the "intra-row format aliasing" reservation
+    // in the comment above does NOT block that, because `g178BumpRectImpl` bumps PHYSICAL PAGE
+    // INDICES derived by `g471PageRect` from the writer's own (bp, bw, psm, rect), and a write to
+    // column x lands in page column `x >> pwSh` and nowhere else (exactly the property the shipped
+    // row narrowing relies on for `y >> phSh`). Measured `flushcol` 97.0 -> 91.6 pages/call and
+    // `flushdep` 65.3 -> 26.6 on `ridepod`; the pooled gate was null. Detail:
+    // plans/phase-G709-fix-log.md.
+    static const bool s_g708NoRowPubFlush = envFlagEnabled("DC2_G708_NO_ROWPUB");
+    struct G708FlushPub
+    {
+        uint64_t key = 0u;
+        uint32_t block = 0u, bw = 0u, psm = 0u;
+        int y0 = 0, y1 = -1;
+        bool used = false;
+    };
+    constexpr int kG708FlushSlots = 16;
+    G708FlushPub g708C[kG708FlushSlots]{}, g708D[kG708FlushSlots]{};
+    const auto g708Take = [](G708FlushPub *slots, uint64_t key, uint32_t block, uint32_t bw,
+                             uint32_t psm, int y0, int y1) -> int {
+        // Returns 1 = accumulated, 0 = already-seen key handled, -1 = overflow (caller falls back).
+        for (int i = 0; i < kG708FlushSlots; ++i)
+        {
+            G708FlushPub &s = slots[i];
+            if (!s.used)
+            {
+                s = G708FlushPub{key, block, bw, psm, y0, y1, true};
+                return 1;
+            }
+            if (s.key == key)
+            {
+                s.y0 = std::min(s.y0, y0);
+                s.y1 = std::max(s.y1, y1);
+                return 1;
+            }
+        }
+        return -1;
+    };
     std::unordered_set<uint64_t> colorTargets;
     std::unordered_set<uint64_t> depthTargets;
+    const bool g708RowPub = !s_g708NoRowPubFlush;
     for (const G144Entry &e : g_g144List)
     {
         const uint32_t fbBlock = GSInternal::framePageBaseToBlock(e.ctx.frame.fbp);
@@ -7017,11 +7815,15 @@ static void g242NoteCpuReplayWrites(uint8_t *vram)
         const uint64_t colorKey = static_cast<uint64_t>(fbBlock) |
                                   (static_cast<uint64_t>(fbw) << 16u) |
                                   (static_cast<uint64_t>(fpsm) << 24u);
-        if (colorTargets.insert(colorKey).second)
-            g178NoteVramWriteRectTagged(
-                vram, fbBlock, fbw, fpsm, 0u, 0u,
-                std::max(1u, fbw) * 64u, 512u,
-                4u); // G570 source 4: whole-flush CPU replay color write
+        const bool g708Rows = g708RowPub && e.maxY >= e.minY;
+        if (!g708Rows || g708Take(g708C, colorKey, fbBlock, fbw, fpsm, e.minY, e.maxY) < 0)
+        {
+            if (colorTargets.insert(colorKey).second)
+                g178NoteVramWriteRectTagged(
+                    vram, fbBlock, fbw, fpsm, 0u, 0u,
+                    std::max(1u, fbw) * 64u, 512u,
+                    4u); // G570 source 4: whole-flush CPU replay color write
+        }
 
         const bool zmsk = ((e.ctx.zbuf >> 32u) & 1u) != 0u;
         if (!zmsk)
@@ -7031,11 +7833,35 @@ static void g242NoteCpuReplayWrites(uint8_t *vram)
             const uint64_t depthKey = static_cast<uint64_t>(zbpBlock) |
                                       (static_cast<uint64_t>(fbw) << 16u) |
                                       (static_cast<uint64_t>(zpsm) << 24u);
-            if (depthTargets.insert(depthKey).second)
-                g178NoteVramWriteRectTagged(
-                    vram, zbpBlock, fbw, zpsm, 0u, 0u,
-                    std::max(1u, fbw) * 64u, 512u,
-                    5u); // G570 source 5: whole-flush CPU replay depth write
+            if (!g708Rows || g708Take(g708D, depthKey, zbpBlock, fbw, zpsm, e.minY, e.maxY) < 0)
+            {
+                if (depthTargets.insert(depthKey).second)
+                    g178NoteVramWriteRectTagged(
+                        vram, zbpBlock, fbw, zpsm, 0u, 0u,
+                        std::max(1u, fbw) * 64u, 512u,
+                        5u); // G570 source 5: whole-flush CPU replay depth write
+            }
+        }
+    }
+    if (g708RowPub)
+    {
+        for (int i = 0; i < kG708FlushSlots; ++i)
+        {
+            const G708FlushPub &s = g708C[i];
+            if (s.used && s.y1 >= s.y0 && colorTargets.insert(s.key).second)
+                g178NoteVramWriteRectTagged(vram, s.block, s.bw, s.psm, 0u,
+                                            static_cast<uint32_t>(s.y0),
+                                            std::max(1u, s.bw) * 64u,
+                                            static_cast<uint32_t>(s.y1 - s.y0 + 1), 4u);
+        }
+        for (int i = 0; i < kG708FlushSlots; ++i)
+        {
+            const G708FlushPub &s = g708D[i];
+            if (s.used && s.y1 >= s.y0 && depthTargets.insert(s.key).second)
+                g178NoteVramWriteRectTagged(vram, s.block, s.bw, s.psm, 0u,
+                                            static_cast<uint32_t>(s.y0),
+                                            std::max(1u, s.bw) * 64u,
+                                            static_cast<uint32_t>(s.y1 - s.y0 + 1), 5u);
         }
     }
     if (g581Scoped)

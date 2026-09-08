@@ -2410,6 +2410,17 @@ void g144FlushPending()
             g_g289FrameCarries.fetch_add(1u, std::memory_order_relaxed);
         g474Lap(2); // G289/G345 owner-slot publication
         g272MaterializeAll(5);
+        // ⭐ G700: the frame/presentation boundary is a hard consumer edge — every downstream
+        // reader (presentation, frame dumps, the next frame's texture decodes) sees guest VRAM.
+        // Publish whatever the persistent surfaces still owe. In the steady state most of this is
+        // already settled by the ranged edges, so this is a bounded tail, not a per-flush cost.
+        g700MaterializeAll(5);
+        if (g700StatOn())
+        {
+            static uint64_t s_g700Frames = 0u; // frame-boundary owner thread only
+            if ((++s_g700Frames % 120u) == 0u)
+                g700Report();
+        }
         g474Lap(3); // remaining resident colour owners
         g277CensusHardEdge(5);
         g276FlushPendingDisplay(5); // G276: publish the frame's coalesced display readback here
@@ -2894,6 +2905,8 @@ void g144FlushPendingUploadRange(uint32_t dbp,
         const bool g630UploadPatch =
             g630CanPatchUpload(dbp, dbw, dpsm, dsax, dsay, rrw, rrh, dstUnknown, true) ||
             g634CanIngestUpload(dbp, dbw, dpsm, dsax, dsay, rrw, rrh, dstUnknown);
+        const bool g716UploadPatch =
+            g716CanUpload(dbp, dbw, dpsm, dsax, dsay, rrw, rrh, dstUnknown);
         const uint64_t g327NoteNs = g327CensusOn()
             ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
                   std::chrono::steady_clock::now() - g327T0).count())
@@ -2904,8 +2917,11 @@ void g144FlushPendingUploadRange(uint32_t dbp,
         G656_UP_LAP(kG656UpG278Dep);
         if (g327CensusOn())
             g327T0 = std::chrono::steady_clock::now();
+        const bool g716PreviousObserver = g_g716GpuObserver;
+        if (g716UploadPatch) g_g716GpuObserver = true;
         g261MaterializeForRanges(G144BlockRange{}, dst, false, dstUnknown, kG261MatUpload,
                                  g264Mask, g630UploadPatch);
+        g_g716GpuObserver = g716PreviousObserver;
         G656_UP_LAP(kG656UpG261Mat);
         const uint64_t g327MatNs = g327CensusOn()
             ? static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -3039,6 +3055,30 @@ void g144L2lLatePin()
                              t_g522Pin.dstUnknown, kG261MatLocal, consumed);
 }
 
+// G715: the same pin publication, split by SIDE, so the phase can price the source and destination
+// halves separately. `[G343:shape]` puts 60.7% of an l2l edge's published rows on the SOURCE side —
+// the half a GPU source ingest exists to delete — so if only one half is load-bearing it matters a
+// great deal which. `which`: bit 0 = source range, bit 1 = destination range (3 == g144L2lLatePin).
+// An empty-but-KNOWN range means "nothing on that side", exactly as the G261 upload site passes it.
+void g715LatePinPart(int which)
+{
+    if (!t_g522Pin.armed)
+        return;
+    t_g522Pin.armed = false;
+    g_g522Late.fetch_add(1u, std::memory_order_relaxed);
+    const uint32_t consumed = g285PrepareL2lConsume(
+        t_g522Pin.sbp, t_g522Pin.sbw, t_g522Pin.spsm, t_g522Pin.ssax, t_g522Pin.ssay,
+        t_g522Pin.dbp, t_g522Pin.dbw, t_g522Pin.dpsm, t_g522Pin.dsax, t_g522Pin.dsay,
+        t_g522Pin.rrw, t_g522Pin.rrh, t_g522Pin.src, t_g522Pin.dst,
+        t_g522Pin.srcUnknown, t_g522Pin.dstUnknown);
+    const G144BlockRange src = (which & 1) ? t_g522Pin.src : G144BlockRange{};
+    const G144BlockRange dst = (which & 2) ? t_g522Pin.dst : G144BlockRange{};
+    g261MaterializeForRanges(src, dst,
+                             (which & 1) ? t_g522Pin.srcUnknown : false,
+                             (which & 2) ? t_g522Pin.dstUnknown : false,
+                             kG261MatLocal, consumed);
+}
+
 // G627: called by GS::performLocalToLocalTransfer immediately after the CPU pixel body, which is
 // where guest VRAM first holds the copy's result. A no-op unless this edge took the destination
 // publication off the l2l pin. Global-linkage wrapper for the same reason g144L2lLatePin is one:
@@ -3046,6 +3086,38 @@ void g144L2lLatePin()
 void g627ApplyPendingL2lPatch(uint8_t *vram, uint32_t vramSize)
 {
     g627ApplyPendingL2lPatchImpl(vram, vramSize);
+}
+
+// G714 global-linkage wrappers, same reason. `CanTake` is the pure predicate the publication skip
+// below reads; `TryExecute` is the whole GPU-side operation, called from
+// GS::performLocalToLocalTransfer BEFORE g242PrepareVramReadRect — which is the phase's central
+// invariant: an admitted transfer never materialises its source.
+bool g714CanTakeL2l(uint32_t sbp, uint8_t sbw, uint8_t spsm, uint32_t ssax, uint32_t ssay,
+                    uint32_t dbp, uint8_t dbw, uint8_t dpsm, uint32_t dsax, uint32_t dsay,
+                    uint32_t rrw, uint32_t rrh)
+{
+    return g714CanTakeL2lImpl(sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay,
+                              rrw, rrh, false);
+}
+
+bool g714TryExecuteL2l(uint8_t *vram, uint32_t vramSize,
+                       uint32_t sbp, uint8_t sbw, uint8_t spsm, uint32_t ssax, uint32_t ssay,
+                       uint32_t dbp, uint8_t dbw, uint8_t dpsm, uint32_t dsax, uint32_t dsay,
+                       uint32_t rrw, uint32_t rrh, bool revX, bool revY)
+{
+    return g714TryExecuteL2lImpl(vram, vramSize, sbp, sbw, spsm, ssax, ssay,
+                                 dbp, dbw, dpsm, dsax, dsay, rrw, rrh, revX, revY);
+}
+
+// Pixel-only bookkeeping for an escaping transfer. It must NOT re-run the predicate: by the time
+// performLocalToLocalTransfer reaches the escape, this edge's barrier has already published and
+// cleared `r.dirty`, so a second evaluation reads a state that no longer explains the decision.
+// The classification is taken at the barrier instead (see g144FlushPendingLocalTransferRange).
+void g714NoteEscape(uint32_t rrw, uint32_t rrh)
+{
+    if (!g714StatOn())
+        return;
+    g_g714.escPx += static_cast<uint64_t>(rrw) * rrh;
 }
 
 // The copy did not happen on the CPU after all (an FBO->FBO blit took it). Nothing wrote the
@@ -3185,9 +3257,28 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
         // writing one guest-VRAM byte, so the publication is unobservable to this transfer.
         // Fail-safe: g144L2lLatePin() below replays exactly these two calls if the blit is not
         // taken after all, so the skip can only REORDER a publication, never delete a needed one.
-        const bool g522Skip = g522L2lSkipActive() &&
-                              g289CanDeferLocalCopy(sbp, sbw, spsm, ssax, ssay,
-                                                    dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        // ===== G714: the same skip, for a transfer that will run entirely on the GPU =====
+        // `[G432:l2ledge]` prices g261MaterializeForRanges at 99.7% of this edge. When
+        // g714CanTakeL2l holds, GS::performLocalToLocalTransfer executes the copy against raw GS
+        // VRAM and returns without reading or writing one guest-VRAM byte, so the publication is
+        // unobservable to this transfer — exactly the argument G522 makes for the display blit.
+        // It rides G522's pin, so if the GPU path declines after all, g144L2lLatePin() replays
+        // these two calls verbatim before the CPU body runs. The skip can only ever REORDER a
+        // publication, never delete a needed one.
+        // ⛔⛔ INSTRUMENT PLACEMENT, THE HARD WAY (see the phase log). The census used to live at
+        // the ESCAPE site in performLocalToLocalTransfer — i.e. AFTER this barrier had already run
+        // `g261MaterializeForRanges` and cleared `r.dirty`. Every refusal therefore re-tested a
+        // post-publication state and was misattributed to `nodirty`, which hid the real cause
+        // completely (a run reading `taken=0 nodirty=19999/20000` had in fact been refused here,
+        // for a reason the census never recorded). It is taken HERE, where the state the decision
+        // reads is still intact, and `note=true` classifies the refusal exactly once per edge.
+        const bool g714Skip = g714CanTakeL2lImpl(sbp, sbw, spsm, ssax, ssay,
+                                                 dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
+                                                 g714StatOn());
+        const bool g522Skip = g714Skip ||
+                              (g522L2lSkipActive() &&
+                               g289CanDeferLocalCopy(sbp, sbw, spsm, ssax, ssay,
+                                                     dbp, dbw, dpsm, dsax, dsay, rrw, rrh));
         g522NoteEdge(g522Skip);
         t_g522Pin.armed = g522Skip;
         if (g522Skip)

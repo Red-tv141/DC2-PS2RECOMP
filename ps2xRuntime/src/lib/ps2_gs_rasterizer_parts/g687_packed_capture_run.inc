@@ -266,6 +266,8 @@ __declspec(noinline) static bool g687TryFastCapture(
     e.townDepthScope = townDepthScope;
     e.minY = clampInt(rawMinY, ctx.scissor.y0, ctx.scissor.y1);
     e.maxY = clampInt(rawMaxY, ctx.scissor.y0, ctx.scissor.y1);
+    // ⛔ G709 filled `e.minX/maxX` here too (G687's contract is that it produces the identical
+    // G144Entry as the main capture path). Reverted with that lever.
     e.decoded = g149BuildDecoded(self, gs, ctx, texa, vram);
 
     g161CensusEligibility(ctx, prim.abe);

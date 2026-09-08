@@ -77,6 +77,11 @@ static bool g291StatOn()
 }
 static std::atomic<uint64_t> g_g291TexSkips{0}, g_g291TexMats{0}, g_g291CurPagesSet{0},
     g_g291CurPagesClr{0}, g_g291LayoutResets{0};
+// G704: the per-flush memo over `g291PagesCurrent`'s verdict (see the G704PagesMemo block in
+// rasterizer_vram_materialization.inc). `Bad` is the same-run oracle's disagreement count under
+// DC2_G704_VERIFY_PAGES=1 and must be 0; it is reported beside the hit/miss split so an armed
+// verify run cannot be mistaken for a timing run.
+static std::atomic<uint64_t> g_g704PageMemoHits{0}, g_g704PageMemoMiss{0}, g_g704PageMemoBad{0};
 
 // G292: any GPU-side alias copy makes this target tile potentially newer than guest VRAM.
 // Clear only the exact CT32 64x32 page tile; unrelated uploaded pages in the same row retain
@@ -104,7 +109,14 @@ static void g291ClearCopiedTile(int ti, uint32_t pageRow, uint32_t pageCol)
 
 static void g261Report()
 {
-    if (!g261StatOn() && !g279ProfileOn() && !g310StatOn() && !g340CensusOn())
+    // ⛔ G704 INSTRUMENT REPAIR (Rule 69/71 family). `[G291:stat]` and `[G704:pagememo]` below are
+    // guarded by `g291StatOn()`, but this function returned early unless one of FOUR UNRELATED
+    // flags was also set — so `DC2_G291_STAT=1` on its own has never printed `[G291:stat]` in the
+    // history of that flag. (The `[G291:skip]` lines that DO appear come from an inline site in the
+    // bind tail, which is why the omission was invisible: the flag looked like it worked.)
+    // A flag that needs a second, unrelated flag to speak reads exactly like a flag that measured
+    // nothing. Cold reporter, called at a frame boundary — no hot-path cost.
+    if (!g261StatOn() && !g279ProfileOn() && !g310StatOn() && !g340CensusOn() && !g291StatOn())
         return;
     std::fprintf(stderr,
                  "[G536:pageown] on=%d publications=%llu guarded=%llu pagesKept=%llu\n",
@@ -121,6 +133,19 @@ static void g261Report()
                      (unsigned long long)g_g291CurPagesSet.load(std::memory_order_relaxed),
                      (unsigned long long)g_g291CurPagesClr.load(std::memory_order_relaxed),
                      (unsigned long long)g_g291LayoutResets.load(std::memory_order_relaxed));
+    // G704: printed under the SAME arm as [G291:stat] so the memo's population is read beside the
+    // skip count it is supposed to absorb. `bad` is only ever nonzero under DC2_G704_VERIFY_PAGES.
+    if (g291StatOn())
+    {
+        const uint64_t h = g_g704PageMemoHits.load(std::memory_order_relaxed);
+        const uint64_t m = g_g704PageMemoMiss.load(std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "[G704:pagememo] hits=%llu misses=%llu hitPct=%.2f%% bad=%llu\n",
+                     (unsigned long long)h, (unsigned long long)m,
+                     (h + m) ? 100.0 * static_cast<double>(h) /
+                                   static_cast<double>(h + m) : 0.0,
+                     (unsigned long long)g_g704PageMemoBad.load(std::memory_order_relaxed));
+    }
     std::fprintf(stderr,
                  "[G261:stat] waves=%llu rbSkip=%llu fboBind=%llu fboBindBi=%llu fboRej=%llu inv=%llu unk=%llu "
                  "mat(cpu=%llu inl=%llu up=%llu l2l=%llu l2h=%llu tex=%llu rsync=%llu fail=%llu) "
@@ -1405,6 +1430,14 @@ static void g261Materialize(int ti, int cause)
             g264FlushMirror(ti);
         return;
     }
+    if (s_g716Authority)
+    {
+        if (g_g716GpuObserver && g716RetireTarget(ti, cause)) return;
+        const bool observer = g_g716GpuObserver;
+        g_g716GpuObserver = false;
+        g716MaterializeForRanges(r.range, {}, !r.range.valid, false, cause);
+        g_g716GpuObserver = observer;
+    }
     // G636: the mirror of the FBO-seed hazard. This publication writes the FBO back OVER guest
     // VRAM; a G630 publication of the same pages afterwards would then overwrite it with the OLDER
     // raw content, because G630's authority is settled lazily and this write does not clear it.
@@ -1572,6 +1605,12 @@ static void g261Materialize(int ti, int cause)
                                      ? g599SnapshotPages(r, fbp, r.dirtyLo, r.dirtyHi, vram,
                                                          g_g261VramSize)
                                      : 0u;
+            // G716: this is the shipped FBO->guest publication. By contract every raw claim in
+            // these rows was already retired above (g716MaterializeForRanges / g716RetireTarget),
+            // so a raw page here is an escaped transition, not a legal overlap.
+            g716NoteGuestWrite(fbBlock, r.fbw, GS_PSM_CT32, 0u, static_cast<uint32_t>(r.dirtyLo),
+                               static_cast<uint32_t>(r.fbW),
+                               static_cast<uint32_t>(r.dirtyHi - r.dirtyLo + 1), 7);
             g418UnpackColorRows(vram, g_g261VramSize, s_g261Px, fbBlock, r.fbw, r.fbW,
                                 r.dirtyHi + 1, r.dirtyLo, r.dirtyHi,
                                 /*legacy=*/!g432Fast);
@@ -2944,6 +2983,14 @@ bool g289TryGpuLocalCopy(uint8_t *vram, uint32_t vramSize,
     slot->lastOwnedBlock = ownerRange.last;
     slot->vram = vram;
     slot->vramSize = vramSize;
+    // G716: this whole-page GPU blit supersedes the raw image, too. The established copy
+    // owner now holds these pages; they are NOT guest-authoritative. Existing owner queries
+    // bind/materialize this surface before a raw consumer can patch any of its guest pages.
+    // Leaving the previous raw claim alive lets later T8 views/FB seeds read the OLD image.
+    if (s_g716Authority)
+        for (uint32_t py = 0; py < (rrh >> 5u); ++py)
+            for (uint32_t px = 0; px < (rrw >> 6u); ++px)
+                g716SetRaw(destFbp + py * dbw + px, false);
     s_g289PendingUpload.active = false; // unconditional, exactly as the single-slot code did
     const uint64_t copyN =
         g_g289Copies.fetch_add(1u, std::memory_order_relaxed) + 1u;

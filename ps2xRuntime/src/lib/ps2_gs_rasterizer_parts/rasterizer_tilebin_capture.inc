@@ -230,7 +230,15 @@
                 const size_t g657Entries = g_g144List.size();
                 const uint32_t g657Fbp = g_g144List.empty() ? 0u : g_g144List[0].ctx.frame.fbp;
 #endif
-                if (g178TryFlushGpu(self, g_g144LastGs, g_g144LastGs->m_vram, g_g144LastGs->m_vramSize))
+                // ⭐ G700 P2: name the GPU flush as its own exclusive layer. Empty in the default
+                // build (rule 12c) — G654LayerScope's constructor and destructor have no body.
+                bool g654FlushOk;
+                {
+                    G654LayerScope g654Flush(kG654LayerGpuFlush);
+                    g654FlushOk = g178TryFlushGpu(self, g_g144LastGs, g_g144LastGs->m_vram,
+                                                  g_g144LastGs->m_vramSize);
+                }
+                if (g654FlushOk)
                 {
 #if defined(PS2X_G657_DIAG)
                     if (g657On)
@@ -288,6 +296,11 @@
                                           g528ClassifyFbp(g657Fbp), g657Fbp,
                                           static_cast<unsigned long long>(g657Entries));
 #endif
+                // ⭐ G700 P2: everything from here to the end of the closure is the CPU band
+                // replay and its publication tail — the same span G657's wall lap charges to a
+                // reject family, now also charged to a LAYER so the GS worker's front end is fully
+                // partitioned. Empty in the default build (rule 12c).
+                G654LayerScope g654Replay(kG654LayerCpuReplay);
                 // G603 (default-off, DC2_G603_ADMIT=1): the same choke point, asking the question
                 // G583's reason code cannot answer — WOULD the classifier admit these entries, and
                 // if not, is the first failing conjunct the last one? Must follow g583NoteFallback:
@@ -943,13 +956,22 @@
                 g401NoteCompositeEntries(g_g144LastGs->m_vram, g_g144List);
                 g401NoteDisplayFlush(g_g144LastGs->m_vram, g_g144List, "pre");
                 // G178: same whole-flush GPU attempt as the parallel closure above.
-                if (g178TryFlushGpu(self, g_g144LastGs, g_g144LastGs->m_vram, g_g144LastGs->m_vramSize))
+                // G700 P2: same two layer scopes as the parallel closure, so DC2_G144_SEQ stays a
+                // pure parallelism bisect and the layer split covers both configurations.
+                bool g654SeqFlushOk;
+                {
+                    G654LayerScope g654Flush(kG654LayerGpuFlush);
+                    g654SeqFlushOk = g178TryFlushGpu(self, g_g144LastGs, g_g144LastGs->m_vram,
+                                                     g_g144LastGs->m_vramSize);
+                }
+                if (g654SeqFlushOk)
                 {
                     g401NoteCompositeEntries(g_g144LastGs->m_vram, g_g144List, "post-gpu");
                     g401NoteDisplayFlush(g_g144LastGs->m_vram, g_g144List, "post-gpu");
                     g_g144List.clear();
                     return;
                 }
+                G654LayerScope g654SeqReplay(kG654LayerCpuReplay);
                 // G589: same fail-closed disarm as the parallel closure above.
                 g589DisarmTransaction();
                 // G528: identical prologue to the parallel closure above (see its comment). Routing
@@ -1082,6 +1104,14 @@
         const bool g286Transient =
             g286TransientTarget(ctx.frame.fbp) && diagOff144 && isSprite144 &&
             (gs->m_prim.tme || g558Solid13bOn()) && !gs->m_prim.abe;
+        // ⭐⭐⭐ G703: the BLENDED half of the same sprite population — 72.6% of the whole
+        // drawPrimitive path on `dragon` at 497 us per primitive (see the header block in
+        // rasterizer_command_graph.inc). G286 admitted only `!abe`; this is G573's widening one
+        // primitive class over, under G573's own contract and its own rollback flag.
+        const bool g703Sprite13b =
+            g286TransientTarget(ctx.frame.fbp) && diagOff144 && isSprite144 &&
+            ctx.frame.psm == GS_PSM_CT32 && gs->m_prim.tme && gs->m_prim.abe &&
+            g703Sprite13bOn();
         // G573: one measured Ridepod class only. Keep TRIFAN and every other state inline until
         // independently observed; the downstream classifier remains an all-or-nothing fail-closed
         // gate, so unsupported blend/depth/texture state replays through the exact CPU bands.
@@ -1113,11 +1143,16 @@
         const bool g270LineWave = isLine144 && g270LineWaveActive() && !gs->m_prim.tme &&
                                   diagOff144 &&
                                   (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u);
-        const bool deferrable144 = ((isTri144 || isSprite144) && diagOff144 &&
-                                    (isTri144 ? (gs->m_prim.tme || g178GpuOn()) : true) &&
-                                    (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u ||
-                                      g252RttTarget)) ||
-                                   g260RttTri || g270LineWave || g286Transient || g573Tri13b;
+        // G713: `!t_g713ExecInline` is constant-false only on the exec thread's re-entry of a
+        // primitive the PARSE thread already classified non-deferrable. In every shipped run
+        // `g_g713On` is false and the whole conjunct folds away.
+        const bool deferrable144 = (((isTri144 || isSprite144) && diagOff144 &&
+                                     (isTri144 ? (gs->m_prim.tme || g178GpuOn()) : true) &&
+                                     (ctx.frame.fbp == 0x0u || ctx.frame.fbp == 0x68u ||
+                                       g252RttTarget)) ||
+                                    g260RttTri || g270LineWave || g286Transient || g573Tri13b ||
+                                    g703Sprite13b) &&
+                                   !(g_g713On && t_g713ExecInline);
         if (g_g312SegStat)
             t_g312Seg2bEnd = std::chrono::steady_clock::now(); // G312 seg2b end (eligibility computed)
         g595Lap(kG595Elig); // G595: the deferral predicate itself
@@ -1185,6 +1220,30 @@
                 g_g286Captured.fetch_add(1u, std::memory_order_relaxed);
             if (g573Tri13b)
                 g573NoteTri13bAdmission(pt144);
+            // ⚠️ A path counter is not optional on an admission lever (g538_null_ab_needs_a_path
+            // _counter): a null paired reading is worthless unless something proves the arms took
+            // different paths. Weighted by PIXELS because `[G526:inl]` prices this population at
+            // 119.45 ns/px — the pixel count is what the lever actually moves.
+            if (g703Sprite13b && g703Sprite13bStatOn())
+            {
+                // `cv0`/`cv1`/`cofy` are declared further down (after the target-switch block), so
+                // read the vertex queue directly here.
+                const GSVertex &g703v0 = gs->m_vtxQueue[0];
+                const GSVertex &g703v1 = gs->m_vtxQueue[1];
+                const int g703ox = ctx.xyoffset.ofx >> 4;
+                const int g703oy = ctx.xyoffset.ofy >> 4;
+                const int g703x0 = clampInt(static_cast<int>(g703v0.x) - g703ox,
+                                            ctx.scissor.x0, ctx.scissor.x1);
+                const int g703x1 = clampInt(static_cast<int>(g703v1.x) - g703ox,
+                                            ctx.scissor.x0, ctx.scissor.x1);
+                const int g703y0 = clampInt(static_cast<int>(g703v0.y) - g703oy,
+                                            ctx.scissor.y0, ctx.scissor.y1);
+                const int g703y1 = clampInt(static_cast<int>(g703v1.y) - g703oy,
+                                            ctx.scissor.y0, ctx.scissor.y1);
+                g703NoteSprite13bAdmission(
+                    static_cast<uint32_t>(std::abs(g703x1 - g703x0) + 1) *
+                    static_cast<uint32_t>(std::abs(g703y1 - g703y0) + 1));
+            }
             const std::chrono::steady_clock::time_point g156CapT0 =
                 g_g156Stat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             // G312 segment census: close seg2 (post-pile -> capture start) and report periodically.
@@ -1232,9 +1291,13 @@
             // G266: a same-fbp FBW switch is a batch boundary too (see g266FbwSplitOn). The
             // legacy default path (split off) keeps the historical fbp-only condition — its CPU
             // replay handles mixed widths and the default must stay bit-identical.
-            const bool g266FbwSwitch = g266FbwSplitOn() && !g_g144List.empty() &&
-                                       ctx.frame.fbw != g_g144List.front().ctx.frame.fbw;
-            if (!g_g144List.empty() && (ctx.frame.fbp != g_g144BlockFbp || g266FbwSwitch))
+            // G713: `g_g144Open` is `&g_g144List` in every shipped run; under the pipeline it is
+            // the PARSE thread's own capture buffer, so this whole boundary test is parse-local
+            // and cannot observe the exec thread's flush working buffer.
+            std::vector<G144Entry> &g713Open = *g_g144Open;
+            const bool g266FbwSwitch = g266FbwSplitOn() && !g713Open.empty() &&
+                                       ctx.frame.fbw != g713Open.front().ctx.frame.fbw;
+            if (!g713Open.empty() && (ctx.frame.fbp != *g_g144OpenFbp || g266FbwSwitch))
             {
                 if (g254DependencyStatEnabled())
                 {
@@ -1243,16 +1306,23 @@
                     candidate.prim = gs->m_prim;
                     candidate.texclut = gs->m_texclut;
                     const uint32_t depMask = g254DependencyMask(candidate);
-                    g254NoteSwitch(depMask, g_g144BlockFbp, ctx.frame.fbp, g_g144List.size());
+                    g254NoteSwitch(depMask, *g_g144OpenFbp, ctx.frame.fbp, g713Open.size());
                 }
-                g253NoteMidBarrier(true, g_g144List.front().ctx.frame.fbp,
-                                   ctx.frame.fbp, g_g144List.size(), pt144,
+                g253NoteMidBarrier(true, g713Open.front().ctx.frame.fbp,
+                                   ctx.frame.fbp, g713Open.size(), pt144,
                                    gs->m_prim.tme, gs->m_prim.abe);
                 // G260: a target switch is a batch boundary, not an execution point. Close the
                 // open batch into the frame graph (O(1) move) and keep recording; the graph
                 // executes at the next real dependency edge or the frame boundary, batch by
                 // batch in submission order. Legacy path (NR off): drain immediately as before.
-                if (g260NrOn())
+                if (g713PipeArmed() && g713PipeBatchOn())
+                {
+                    // G713: close and POST. The exec thread applies the same fail-safe cap on its
+                    // own side (g713ExecBatchImpl), because the parse thread must never touch the
+                    // graph or run a flush.
+                    g713ParseFlushOpen();
+                }
+                else if (g260NrOn())
                 {
                     g260CloseOpenBatch();
                     // DC2_G260_EAGER=1 (bisect lever): execute at every batch close — restores
@@ -1270,7 +1340,7 @@
                 }
             }
             g526Lap(kG526Sw); // G526: target-switch batch close / mid-flush drain
-            g_g144BlockFbp = ctx.frame.fbp;
+            *g_g144OpenFbp = ctx.frame.fbp;
             // Screen bbox rows computed EXACTLY as drawTriangle/drawSprite (same ofy + scissor
             // clamp) so the band prefilter is tight and never narrower than the real coverage.
             const GSVertex &cv0 = gs->m_vtxQueue[0];
@@ -1374,6 +1444,10 @@
             e.townDepthScope = g_dc2TownDepthScope.load(std::memory_order_relaxed);
             e.minY = clampInt(crawMinY, ctx.scissor.y0, ctx.scissor.y1);
             e.maxY = clampInt(crawMaxY, ctx.scissor.y0, ctx.scissor.y1);
+            // ⛔ G709 filled `e.minX/maxX` here with `floor(min vx) - ofx - 1 .. ceil(max vx) -
+            // ofx + 1` clamped to the scissor — the conservative form the G458 cull above already
+            // uses, and a proven superset of every leaf rasterizer's own x-span rule. Reverted with
+            // the publication transaction it fed; see plans/phase-G709-fix-log.md §7.
             g526Lap(kG526Build); // G526: bbox + G144Entry field fill
             // G149: decode this tri's texture ONCE now (guest thread), so all band lanes read it
             // lock-free at replay. Null unless texcache-enabled + eligible. Sprites never use the
@@ -1419,10 +1493,11 @@
             // Rollback: DC2_G510_NO_CAPMOVE=1. Paired gate: DC2_G419_AB=capmove | g510both.
             g521ReportEntrySize(); // G521: one-shot layout report, inert unless DC2_G521_SIZE=1
 #if !DC2_G521_INPLACEARM
+            // G713: `g713Open` is `g_g144List` unless the pipeline is armed (see g713_pipe_types).
             if (g510CapMoveActive())
-                g_g144List.push_back(std::move(e));
+                g713Open.push_back(std::move(e));
             else
-                g_g144List.push_back(e);
+                g713Open.push_back(e);
 #else
             if (!g521InPlace)
             {
@@ -1482,6 +1557,20 @@
                         static_cast<uint32_t>(gs->m_prim.tme), ctx.frame.fbp, ctx.tex0.tbp0,
                         g_g144List.size());
             }
+        }
+        // ⭐ G713 BYPASS. A non-deferrable primitive rasterises against guest VRAM AND can enter
+        // GL (its prologue calls g272MaterializeAll / g261PrepareInline, which materialise from
+        // resident FBOs). Both belong to the exec thread, so the whole tail below runs THERE,
+        // once, via a blocking round trip — and because the parse thread is stopped inside that
+        // call, the tail may read `gs` live. `t_g713ExecInline` makes the re-entry take exactly
+        // this branch. Census: `[G713:pipe] call/f`.
+        if (g_g713On && !t_g713ExecInline)
+        {
+            g713ParseFlushOpen(); // ordering: entries captured before this primitive go first
+            G713InlineArg g713Arg{this, gs};
+            g713CallOnExec(&g713ExecInlineThunk, &g713Arg);
+            g526SetExit(kG526Defer);
+            return;
         }
         if (g260NrOn())
         {

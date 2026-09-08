@@ -68,10 +68,22 @@ static bool g568BitAliasOn()
     }();
     if (paired)
         return g568BitAliasArm() > 0;
-    // Bring-up default: OFF. Flip to `!envFlagEnabled("DC2_G568_NO_BITALIAS") &&
-    // !envFlagDisabled("DC2_G568_BITALIAS")` on promotion.
-    static const bool on = envFlagEnabled("DC2_G568_BITALIAS") &&
-                           !envFlagEnabled("DC2_G568_NO_BITALIAS");
+    // ⭐⭐⭐ G704 PROMOTION (2026-09-03), default-OFF since G568.
+    //   Timing: `dragon` A/B/B/A stacked with G703 and the G704 bind hoists — **-0.460 ms/f
+    //           (-1.76%)**, GS own -0.435, BOTH order blocks negative (-0.193 / -0.727), control
+    //           drift 0.078, route arrival 0.968, kicks/f flat 2143-2145.
+    //   Alone:  -0.204 ms/f (drift 0.162). `[G657:rejwall]` predicts ~2.5 ms/f from the fallback
+    //           WALL it converts; wall does not convert to frame time (Rule 23/68), and the
+    //           conversion itself is COMPLETE — `[G242:alias]` drops 594 events -> 0 when armed.
+    //   Pixels: Rule 14 gate on the `ridepod` opening, `tools/g635_bisect.py --lo 700 --hi 1400`:
+    //           candidate p90 3.92 / max 26.17 against a control-vs-control floor of
+    //           p90 7.15 / max 37.26 — BELOW the noise floor on both.
+    // Exactness is G568's own and unchanged: a T8H/T4HL/T4HH texture over PSMZ24 shares words with
+    // the Z window but never shares a BIT, and every Z path in this port is a read-modify-write
+    // that preserves the high byte.
+    // Rollback: DC2_G568_NO_BITALIAS=1 (or DC2_G568_BITALIAS=0).
+    static const bool on = !envFlagEnabled("DC2_G568_NO_BITALIAS") &&
+                           !envFlagDisabled("DC2_G568_BITALIAS");
     return on;
 }
 

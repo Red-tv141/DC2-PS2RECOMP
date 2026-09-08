@@ -77,6 +77,8 @@ static void g340CensusUnknownAllDirty(int cause)
 
 static void g261MaterializeAllDirty(int cause)
 {
+    g716MaterializeForRanges({}, {}, true, true, cause);
+    g700MaterializeAll(cause); // G700 surfaces share the address space; publish them too
     if (!g261WaveOn())
         return;
     for (uint32_t i = 0; i < kG248TargetCount; ++i)
@@ -104,6 +106,11 @@ static void g261MaterializeForRanges(const G144BlockRange &src, const G144BlockR
     // any legacy range gate can early-return on "no G261 target dirty".
     if (!g630GpuUploadPatch)
         g630MaterializeForRanges(src, dst, srcUnknown, dstUnknown, cause);
+    g716MaterializeForRanges(src, dst, srcUnknown, dstUnknown, cause);
+    // G700 owns the same address space for every target OUTSIDE the fourteen-address residency
+    // table, so its debt must be published at this edge too — before the legacy gate below can
+    // early-return on "no G261 target dirty", which says nothing about a G700 surface.
+    g700MaterializeForRanges(src, dst, srcUnknown, dstUnknown, cause);
     if (!g261WaveOn() || !g261AnyDirty())
         return;
     if (srcUnknown || dstUnknown)
@@ -226,6 +233,7 @@ static uint32_t g285PrepareL2lConsume(uint32_t sbp, uint8_t sbw, uint8_t spsm,
         // rows instead of the eager 32 (famRb 381984R -> 432544R at matched grabs, famUp
         // unchanged). The eager prefix publish is the cheaper side of this edge. Behavior branch
         // removed; the [G345:escape] defer counters remain (read 0) as the census record.
+        if (s_g716Authority) g716ClearRows(r, r.dirtyLo + pubRows, 511);
         r.dirtyHi = r.dirtyLo + pubRows - 1;
         g261Materialize(static_cast<int>(i), kG261MatLocal);
         // Remaining FBO rows are deliberately stale until the caller copies. Never let the
@@ -890,6 +898,11 @@ static void g661NoteConsumerScope(const G144Entry &e, const G261Res &r)
 
 static void g261PrepareCpuReplay()
 {
+    g716PrepareCpuBatch();
+    // ⭐ G700: a CPU band replay samples guest VRAM directly, so it is a consumer edge for the
+    // persistent surfaces exactly as it is for the G261 residency. Runs before the legacy gate,
+    // which says nothing about a G700 surface.
+    g700PrepareForBatch(g_g144List);
     if (!g261WaveOn() || !g261AnyDirty() || g_g144List.empty())
         return;
     for (const G144Entry &e : g_g144List)
@@ -1105,12 +1118,93 @@ struct G582DedupScope
 // generation bump is disabled (it would poison GPU-resident targets with stale-VRAM uploads),
 // so publish the RTT-family write generations HERE instead — the exact bump an inline draw
 // would have done, after the replay actually changed the bytes.
+//
+// ⭐⭐⭐ G708: THE ROW SPAN OF THIS PUBLICATION IS THE FRAME'S LARGEST FALSE INVALIDATION.
+//
+// The comment this replaces said it outright — "the scissor rect here is a SUPERSET of the inline
+// path's clamped bbox, so this is conservative in the safe direction". It is conservative in the
+// safe direction for CORRECTNESS and catastrophic for the derived state that hangs off these
+// generations. A CPU-replayed entry whose primitive covers 20 rows bumps every page of a
+// 512x416 CT32 target: 104 pages of write generation moved for a write that touched 8.
+//
+// MEASURED, on the shipped binary, `dragon`, `[G708:pagedig]` + `[G708:rewrite]`:
+//
+//     rehashed=710,920 pages  identical=530,120 (74.6%)  changed=180,800 (25.4%)
+//     [G708:bumpsrc] cpurttcol=76.1%  flushcol=20.9%  cpurttdep=1.0%  imgupload=1.8%  l2ldst=0.1%
+//
+// i.e. three quarters of every page the texture pass re-reads and re-hashes out of guest VRAM is
+// BYTE-IDENTICAL to what it already held, and THREE QUARTERS OF THAT is attributable to this
+// function. 4.24 GiB of VRAM re-read per 120 s route, to discover nothing changed.
+//
+// THE FIX. `G144Entry` already carries the exact row extent: `e.minY/e.maxY` is
+// `clampInt(crawMinY/crawMaxY, scissor.y0, scissor.y1)`, and `crawMinY/crawMaxY` are computed at
+// capture (rasterizer_tilebin_capture.inc:1363/1403/1416) as the floor/ceil of the primitive's own
+// vertex Y extremes, per primitive class, with the same `ofy` the rasterizer uses. G621's published
+// readback window is built from the identical pair and has been oracle-verified for many phases;
+// its law is the one that matters here - the extent is "tight and NEVER NARROWER than the real
+// coverage". A row outside it is written by no draw, so its generation must not move.
+//
+// WHY THE UNION AND NOT PER ENTRY. Bumping each entry's own band would be exact too, but it trades
+// one 104-page call for N smaller ones and can cost MORE page visits than it saves (G663's law:
+// an iteration count is not a cost). Unioning the rows per DISTINCT COLUMN KEY keeps the call and
+// rect count identical to the shipped path and can only ever shrink the row span, so the page
+// visits are <= the shipped path's on every input.
+//
+// EXACTNESS. Same rect set, same column span, row span = the union of extents each of which is a
+// superset of that entry's real coverage. Every page the replay writes is still bumped.
+// Rollback: DC2_G708_NO_ROWPUB=1.
+static const bool s_g708NoRowPub = envFlagEnabled("DC2_G708_NO_ROWPUB");
+
+struct G708PubSlot
+{
+    uint32_t block = 0u, bw = 0u, psm = 0u, x0 = 0u, w = 0u;
+    int y0 = 0, y1 = -1;
+    bool used = false;
+};
+
+// Accumulate `[e.minY, e.maxY]` into the slot whose (target, width, format, column span) key this
+// entry matches. Returns false only on table overflow, where the caller falls back to the shipped
+// whole-scissor bump for that entry so the publication can never be missed.
+static bool g708PubAdd(G708PubSlot *slots, int n, uint32_t block, uint32_t bw, uint32_t psm,
+                       uint32_t x0, uint32_t w, int y0, int y1)
+{
+    for (int i = 0; i < n; ++i)
+    {
+        G708PubSlot &s = slots[i];
+        if (!s.used)
+        {
+            s = G708PubSlot{block, bw, psm, x0, w, y0, y1, true};
+            return true;
+        }
+        if (s.block == block && s.bw == bw && s.psm == psm && s.x0 == x0 && s.w == w)
+        {
+            s.y0 = std::min(s.y0, y0);
+            s.y1 = std::max(s.y1, y1);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ⛔⛔ G709 REVERTED HERE (Rule 31). It replaced the row-union RECT below with a 512-bit PAGE SET
+// accumulating each entry's own 2-D bounding box. Exact (`DC2_G709_VERIFY`: bad=0 over 157,433
+// commits), pixel-clean (Rule 14 p90 6.29 against an 18.78 floor) and it converted the population
+// — on `dragon` the four CPU-replay sources went 1,072.8 -> 438.2 page visits/f and guest VRAM
+// revalidation re-read 4.36 -> 2.93 MB/f. But **the colour publication barely narrowed on the route
+// that matters**: on `ridepod` this site went 100.4 -> 97.6 pages per call of a ~128-page target,
+// because after narrowing that IS the exact union — a few large primitives per batch span the
+// target, and a union is only small if every member is small (Rule 87). Prize bounded at
+// 0.02-0.08 ms/f; pooled A/B/B/A t = -0.41, only admissible block +0.261.
+// ⇒ Do not re-add against `cpurttcol`. Detail: plans/phase-G709-fix-log.md.
 static void g261NoteCpuRttWrites(uint8_t *vram)
 {
     if (!g261WaveOn() || vram == nullptr)
         return;
     G582DedupScope g582;
     G582BumpSet g582Color, g582Depth;
+    constexpr int kG708PubSlots = 12;
+    G708PubSlot g708Color[kG708PubSlots]{}, g708Depth[kG708PubSlots]{};
+    const bool g708RowPub = !s_g708NoRowPub;
     for (const G144Entry &e : g_g144List)
     {
         const GSContext &c = e.ctx;
@@ -1118,8 +1212,7 @@ static void g261NoteCpuRttWrites(uint8_t *vram)
         // site in rasterizer_tilebin_capture.inc). A discovered target's deferred writes need the
         // identical page-generation bump an inline draw performs at the end of drawPrimitive;
         // without it a GPU-cached texture decoded from those pages stays stale — wrong pixels,
-        // silently. The scissor rect here is a superset of the inline path's clamped bbox, so this
-        // is conservative in the safe direction.
+        // silently.
         if (!g527DeferTarget(c.frame.fbp))
             continue;
         if (c.scissor.x1 >= c.scissor.x0 && c.scissor.y1 >= c.scissor.y0)
@@ -1127,16 +1220,32 @@ static void g261NoteCpuRttWrites(uint8_t *vram)
             const uint32_t w = static_cast<uint32_t>(c.scissor.x1 - c.scissor.x0 + 1);
             const uint32_t h = static_cast<uint32_t>(c.scissor.y1 - c.scissor.y0 + 1);
             const uint32_t fbBlock = framePageBaseToBlock(c.frame.fbp);
+            const bool hasDepth = ((c.zbuf >> 32u) & 1u) == 0u;
+            const uint32_t zbpBlock = static_cast<uint32_t>(c.zbuf & 0x1FFu) << 5u;
+            const uint32_t zpsm = static_cast<uint32_t>((c.zbuf >> 24u) & 0xFu);
+            if (g708RowPub)
+            {
+                // `e.minY/maxY` are already clamped into this entry's own scissor, so they are
+                // inside [scissor.y0, scissor.y1] by construction; an empty extent (maxY < minY)
+                // is a primitive the replay could not have written and contributes nothing.
+                if (e.maxY >= e.minY &&
+                    g708PubAdd(g708Color, kG708PubSlots, fbBlock, c.frame.fbw, c.frame.psm,
+                               static_cast<uint32_t>(c.scissor.x0), w, e.minY, e.maxY) &&
+                    (!hasDepth ||
+                     g708PubAdd(g708Depth, kG708PubSlots, zbpBlock, c.frame.fbw, zpsm,
+                                static_cast<uint32_t>(c.scissor.x0), w, e.minY, e.maxY)))
+                    continue;
+                // Overflow (or an empty row extent): fall through to the shipped whole-scissor
+                // bump for this entry. Publication is never skipped, only ever narrowed.
+            }
             if (g582.take(g582Color, fbBlock, c.frame.fbw, c.frame.psm,
                           c.scissor.x0, c.scissor.y0, w, h))
                 g178NoteVramWriteRectTagged(vram, fbBlock,
                                             c.frame.fbw, c.frame.psm,
                                             c.scissor.x0, c.scissor.y0, w, h,
                                             2u); // G570 source 2: post-CPU-replay RTT color write
-            if (((c.zbuf >> 32u) & 1u) == 0u)
+            if (hasDepth)
             {
-                const uint32_t zbpBlock = static_cast<uint32_t>(c.zbuf & 0x1FFu) << 5u;
-                const uint32_t zpsm = static_cast<uint32_t>((c.zbuf >> 24u) & 0xFu);
                 if (g582.take(g582Depth, zbpBlock, c.frame.fbw, zpsm,
                               c.scissor.x0, c.scissor.y0, w, h))
                     g178NoteVramWriteRectTagged(
@@ -1144,6 +1253,31 @@ static void g261NoteCpuRttWrites(uint8_t *vram)
                         c.scissor.x0, c.scissor.y0, w, h,
                         3u); // G570 source 3: post-CPU-replay RTT depth write
             }
+        }
+    }
+    if (g708RowPub)
+    {
+        for (int i = 0; i < kG708PubSlots; ++i)
+        {
+            const G708PubSlot &s = g708Color[i];
+            if (!s.used || s.y1 < s.y0)
+                continue;
+            const uint32_t rows = static_cast<uint32_t>(s.y1 - s.y0 + 1);
+            if (g582.take(g582Color, s.block, s.bw, s.psm, s.x0,
+                          static_cast<uint32_t>(s.y0), s.w, rows))
+                g178NoteVramWriteRectTagged(vram, s.block, s.bw, s.psm, s.x0,
+                                            static_cast<uint32_t>(s.y0), s.w, rows, 2u);
+        }
+        for (int i = 0; i < kG708PubSlots; ++i)
+        {
+            const G708PubSlot &s = g708Depth[i];
+            if (!s.used || s.y1 < s.y0)
+                continue;
+            const uint32_t rows = static_cast<uint32_t>(s.y1 - s.y0 + 1);
+            if (g582.take(g582Depth, s.block, s.bw, s.psm, s.x0,
+                          static_cast<uint32_t>(s.y0), s.w, rows))
+                g178NoteVramWriteRectTagged(vram, s.block, s.bw, s.psm, s.x0,
+                                            static_cast<uint32_t>(s.y0), s.w, rows, 3u);
         }
     }
     g582.finish("g261rtt");
@@ -1209,6 +1343,11 @@ static void g261PrepareInline(const GSContext &ctx, const GSPrimReg &prim,
                           ctx.scissor.x1 >= ctx.scissor.x0 && ctx.scissor.y1 >= ctx.scissor.y0) ||
                          (depth.active && !depth.range.valid) || (tme && !tex.valid);
     g630MaterializeForRanges(tex, color, unknown, unknown, kG261MatInline);
+    g716MaterializeForRanges(tex, color, unknown, unknown, kG261MatInline);
+    if (depth.active)
+        g716MaterializeForRanges(clut, depth.range, false, !depth.range.valid, kG261MatInline);
+    else if (clut.valid)
+        g716MaterializeForRanges(clut, {}, false, false, kG261MatInline);
     if (depth.active)
         g630MaterializeForRanges(G144BlockRange{}, depth.range, false, !depth.range.valid,
                                  kG261MatInline);

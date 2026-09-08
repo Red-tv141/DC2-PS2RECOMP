@@ -81,6 +81,12 @@ bool g630_backend_prepare_t8_view(const std::shared_ptr<G630T8Packet> &packet);
 bool g634_backend_prepare_raw_view(const std::shared_ptr<G634RawViewPacket> &packet);
 // G634b: format-agnostic Host->Local IMAGE ingestion as masked raw-VRAM word deltas.
 bool g634_backend_submit_raw_upload(const std::shared_ptr<G634RawUploadPacket> &packet);
+// G714: batched GPU-resident raw-VRAM local->local execution. `available` reports whether the
+// three compute programs and the 4 MiB raw image exist, so the front end can fail CLOSED at
+// ADMISSION rather than discovering it after it has already skipped the CPU copy.
+bool g714_backend_submit_l2l(const std::shared_ptr<G714L2lPacket> &packet);
+bool g714_backend_submit_l2l_sync(const std::shared_ptr<G714L2lPacket> &packet);
+bool g714_backend_available();
 bool g630_backend_poll(bool wait, std::vector<uint8_t> &results);
 bool g630_backend_read_vram(std::vector<uint32_t> &out);
 // G631: band form of the above. `out.size()` tells the caller whether it got the requested band

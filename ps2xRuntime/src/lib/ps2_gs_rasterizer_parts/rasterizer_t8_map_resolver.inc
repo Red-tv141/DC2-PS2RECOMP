@@ -1,3 +1,14 @@
+// G707: the logical atlas's SOURCE texture base, named rather than repeated as a literal at five
+// sites in this file. It is a conjunct of `g309EntryShape` AND of `g310EntryShape`'s own tuple
+// below, so `tbp0 != kG707AtlasTbp` proves that whole disjunction false — the containment G707
+// hoisted the three atlas scans on.
+// ⛔ That hoist was proven exact (`[G594:g310] calls/f` unchanged: 9.680 control vs 9.826
+// candidate) and measured NULL (GS own −0.010 ms/f, blocks −0.259 / +0.517 mixed sign), so it is
+// reverted under Rule 31. Only the NAME survives, and it generates identical code to the literal it
+// replaced. Kept because the coupling is real: anything that reasons about "the atlas base" has to
+// change with these predicates. See plans/phase-G707-fix-log.md.
+static constexpr uint32_t kG707AtlasTbp = 0x2720u;
+
 // ===== G599: the 512-TEXEL-WIDE PSMT8 VIEW (default OFF, DC2_G599_T8WIDE=1) =====
 // `texW > 256` rejects the consumer that actually paints the MAP-15 sky band. `[G599:src]` — the
 // census taken at the one point where a read's source is final — shows the display targets
@@ -1082,6 +1093,8 @@ static bool g280RestoreOverlayTile(int dstTi, const G280Ovl &o)
         x0 + 64 > r.fbW || y0 + 32 > 512)
         return false;
     const uint32_t fbBlock = framePageBaseToBlock(kG261Fbp[dstTi]);
+    if (g716Consumes(4u) && g716AnyRaw() && o.pageBlock / 32u < 512 && g_g716Raw[o.pageBlock / 32u])
+        return g716RestoreRawPage(dstTi, o.pageBlock / 32u);
     static std::vector<uint32_t> s_px; // flush-owner thread only
     s_px.assign(64u * 32u, 0u);
     for (int gy = 0; gy < 32; ++gy)
@@ -1287,7 +1300,7 @@ static bool g280TapBounds(const G144Entry &e, const G178EntryState &st, const G2
 static uint32_t g289OwnerSourceToken(const G144Entry &e)
 {
     const bool ct24 = e.ctx.tex0.psm == GS_PSM_CT24;
-    if (e.ctx.tex0.tbp0 == 0x2720u)
+    if (e.ctx.tex0.tbp0 == kG707AtlasTbp)
         return ct24 ? kG289AliasCt24Token : kG289AliasCt32Token;
     if (e.ctx.tex0.tbp0 == 0x2760u)
         return ct24 ? kG289WorkCt24Token : kG289WorkCt32Token;
@@ -1454,7 +1467,7 @@ static bool g289PrepareOwnerViewSources(const std::vector<G178EntryState> &state
                 }
         }
         sources[i] = token;
-        needAlias |= e.ctx.tex0.tbp0 == 0x2720u;
+        needAlias |= e.ctx.tex0.tbp0 == kG707AtlasTbp;
         ++binds;
     }
     if (binds == 0u)
@@ -1473,7 +1486,7 @@ static bool g309EntryShape(uint32_t batchFbp, const G144Entry &e,
 {
     return g265DisplayTarget(batchFbp) && !st.skip && e.prim.tme && e.prim.fst &&
            e.prim.type == GS_PRIM_TRISTRIP && st.bilinear &&
-           e.ctx.tex0.psm == GS_PSM_CT32 && e.ctx.tex0.tbp0 == 0x2720u &&
+           e.ctx.tex0.psm == GS_PSM_CT32 && e.ctx.tex0.tbp0 == kG707AtlasTbp &&
            e.ctx.tex0.tbw == 8u && st.texW == 512 && st.texH == 512;
 }
 
@@ -1491,7 +1504,7 @@ static bool g310EntryShape(uint32_t batchFbp, const G144Entry &e,
     if (g310StatOn() && e.ctx.tex0.psm == GS_PSM_CT24 &&
         g265DisplayTarget(batchFbp) && !st.skip && e.prim.tme && e.prim.fst &&
         e.prim.type == GS_PRIM_SPRITE && st.bilinear &&
-        e.ctx.tex0.tbp0 == 0x2720u && e.ctx.tex0.tbw == 8u &&
+        e.ctx.tex0.tbp0 == kG707AtlasTbp && e.ctx.tex0.tbw == 8u &&
         st.texW == 512 && st.texH == 512)
     {
         static std::atomic<uint32_t> s_ct24Log{0};
@@ -1508,7 +1521,7 @@ static bool g310EntryShape(uint32_t batchFbp, const G144Entry &e,
     return g265DisplayTarget(batchFbp) && !st.skip && e.prim.tme && e.prim.fst &&
            e.prim.type == GS_PRIM_SPRITE && st.bilinear &&
            st.wrapU == 1u && st.wrapV == 1u && format && ct24Alpha &&
-           e.ctx.tex0.tbp0 == 0x2720u && e.ctx.tex0.tbw == 8u &&
+           e.ctx.tex0.tbp0 == kG707AtlasTbp && e.ctx.tex0.tbw == 8u &&
            st.texW == 512 && st.texH == 512;
 }
 
@@ -2082,6 +2095,7 @@ static void g282CommitFanout(const std::vector<G282Fanout> &plan)
         const int ti = static_cast<int>(f.dstTi);
         G261Res &r = g_g261Res[ti];
         const int y0 = static_cast<int>(f.dstRow) * 32;
+        g716MarkRows(r, y0, y0 + 31);
         r.dirty = true;
         r.dirtyLo = std::min(r.dirtyLo, y0);
         r.dirtyHi = std::max(r.dirtyHi, y0 + 31);

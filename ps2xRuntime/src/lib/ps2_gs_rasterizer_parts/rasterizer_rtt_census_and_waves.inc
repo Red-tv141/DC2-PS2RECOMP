@@ -1015,6 +1015,12 @@ bool g275_backend_submit_depth_readback(G178Batch &batch, uint64_t depthKey,
                                         std::vector<float> &depthReadback);
 bool g242_backend_read_depth(uint64_t depthKey, int width, int height,
                              int depthY, int depthRows, std::vector<float> &depthReadback);
+// G701: fire-and-forget submission of a readback-free batch (ps2_gs_gpu_raster.cpp).
+bool g701_backend_submit_nowait(G178Batch &batch, uint64_t depthKey,
+                                const std::vector<float> *depthUpload, int depthY, int depthRows);
+bool g701_backend_take_failure();
+void g701_backend_report();
+void g705_backend_report();
 // G305: one-slot move-owned async submit bridges (ps2_gs_gpu_raster.cpp), default-off.
 bool g178_backend_submit_async(G178Batch &batch);
 bool g178_backend_drain_async(bool &ok);
@@ -1391,6 +1397,99 @@ void g178NoteVramWriteRect(uint8_t *vram, uint32_t bpBlocks, uint32_t bw64, uint
     g178NoteVramWriteRectTagged(vram, bpBlocks, bw64, psm, x, y, w, h, 0u);
 }
 
+// ⛔ G709 added `g709PrepareVramWriteRect` here — the MATERIALIZE half of
+// g178NoteVramWriteRectTagged without the generation bump, so the publication transaction could run
+// the aliased-depth authority transition on a conservative bounding rect while bumping only the
+// exact page union. Removed with that lever; nothing else called it.
+
+// ===== G709 §3 DECIDING CENSUS: how many host->local IMAGE pages are BYTE-IDENTICAL? ==========
+//
+// The brief asks for a content-exact per-page path for host->local IMAGE traffic, on the argument
+// that G705 only refuted WHOLE-upload redundancy and a page inside a differing upload may still be
+// unchanged. That is a real distinction, and it has never been counted — so count it before
+// building anything.
+//
+// WHY THIS DECIDES IT. The write itself is a per-pixel SWIZZLED STORE (GSMem::WriteCT32 and
+// friends). A pure store touches the destination line for ownership but never loads its old value,
+// so a compare-before-write adds a load + compare + branch to the hottest upload loop in the
+// runtime. That only pays if the identical fraction is LARGE. The publication half of the prize is
+// already bounded and tiny: `[G708:bumpsrc]` attributes 9.0% of the frame's identical page
+// re-reads to `imgupload`, which at 123 identical pages/f and G708's own realized exchange rate
+// (-0.379 ms/f for -6.6 MB/f of avoided revalidation read) is ~0.005 ms/f. So the only version of
+// this lever worth building is the one that skips the WRITE, and this census is its prerequisite.
+//
+// Behaviour-pure and default OFF (DC2_G709_IMGCENSUS=1): it only reads VRAM and counts. It is a
+// census, never a timing arm — it hashes every touched page TWICE per transfer.
+static const bool s_g709ImgCensus = envFlagEnabled("DC2_G709_IMGCENSUS");
+static uint64_t g_g709ImgPre[kG178PageCount];
+static uint8_t  g_g709ImgPreValid[kG178PageCount];
+static std::atomic<uint64_t> g_g709ImgPages{0}, g_g709ImgSame{0}, g_g709ImgXfers{0};
+
+static uint64_t g709HashPage8k(const uint8_t *p)
+{
+    constexpr uint64_t kP = 1099511628211ull;
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < 8192u; i += 8)
+    {
+        uint64_t v;
+        std::memcpy(&v, p + i, 8);
+        h = (h ^ v) * kP;
+    }
+    return h;
+}
+
+// `after=false` immediately before the transfer's write loop, `after=true` immediately after.
+void g709NoteImageWritePages(const uint8_t *vram, uint32_t vramSize, uint32_t bpBlocks,
+                             uint32_t bw64, uint32_t psm, uint32_t x, uint32_t y,
+                             uint32_t w, uint32_t h, bool after)
+{
+    if (!s_g709ImgCensus || vram == nullptr || w == 0u || h == 0u)
+        return;
+    const G471PageRect pr = g471PageRect(bpBlocks, bw64, psm, x, y, w, h);
+    const uint32_t slack = (g572ExactAlignedGenOn() && (bpBlocks & 31u) == 0u) ? 0u : 1u;
+    uint64_t pages = 0u, same = 0u;
+    for (uint32_t py = pr.py0; py <= pr.py1; ++py)
+        for (uint32_t px = pr.px0; px <= pr.px1 + slack; ++px)
+        {
+            const uint32_t pg = (pr.basePage + py * pr.widthPages + px) &
+                                (kG178PageCount - 1u);
+            const size_t off = static_cast<size_t>(pg) * 8192u;
+            if (off + 8192u > vramSize)
+                continue;
+            const uint64_t hnow = g709HashPage8k(vram + off);
+            if (!after)
+            {
+                g_g709ImgPre[pg] = hnow;
+                g_g709ImgPreValid[pg] = 1u;
+                continue;
+            }
+            if (g_g709ImgPreValid[pg] == 0u)
+                continue;
+            g_g709ImgPreValid[pg] = 0u;
+            ++pages;
+            if (g_g709ImgPre[pg] == hnow)
+                ++same;
+        }
+    if (!after)
+        return;
+    g_g709ImgPages.fetch_add(pages, std::memory_order_relaxed);
+    g_g709ImgSame.fetch_add(same, std::memory_order_relaxed);
+    const uint64_t n = g_g709ImgXfers.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if ((n % 20000ull) == 0ull)
+    {
+        const uint64_t tp = g_g709ImgPages.load(std::memory_order_relaxed);
+        const uint64_t ts = g_g709ImgSame.load(std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "[G709:imgpage] xfers=%llu pages=%llu identical=%llu (%.1f%%) changed=%llu\n",
+                     static_cast<unsigned long long>(n),
+                     static_cast<unsigned long long>(tp),
+                     static_cast<unsigned long long>(ts),
+                     tp ? 100.0 * static_cast<double>(ts) / static_cast<double>(tp) : 0.0,
+                     static_cast<unsigned long long>(tp - ts));
+        std::fflush(stderr);
+    }
+}
+
 // ===== G261 GPU-RESIDENT RTT WAVES (DEFAULT-ON since G266; see g261WaveOn above) =====
 // Residency state for the five G248 RTT targets. `dirty` = the target's FBO holds rows guest
 // VRAM does not (a wave rendered with readback skipped). Ownership contract: every CPU
@@ -1400,6 +1499,7 @@ void g178NoteVramWriteRect(uint8_t *vram, uint32_t bpBlocks, uint32_t bw64, uint
 // under MTGS / EE thread at the frame barrier — never concurrently), same as g_g178FbSnap.
 struct G261Res
 {
+    std::array<uint64_t, 8> g716Rows{}; // exact pending GPU render rows
     bool dirty = false;
     int dirtyLo = 512, dirtyHi = -1; // GS rows the FBO has and VRAM lacks
     // G662: the COLUMN union of the scissors of every wave that dirtied this target, i.e. the

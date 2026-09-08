@@ -225,6 +225,12 @@ static void g498PublishOwnedRows(int site, uint8_t *vram, uint32_t vramSize,
 {
     if (vram == nullptr || fbW <= 0 || rowHi < rowLo)
         return;
+    // G716: both owner-publish sites write FBO colour straight into guest VRAM. If any of those
+    // pages is raw-authoritative this supersedes the raw claim without retiring it, leaving two
+    // live representations. site 0 = display flush / G289 owner, site 1 = G289 owner (2nd site).
+    g716NoteGuestWrite(dstBlock, bw, GS_PSM_CT32, 0u, static_cast<uint32_t>(rowLo),
+                       static_cast<uint32_t>(fbW), static_cast<uint32_t>(rowHi - rowLo + 1),
+                       site == 0 ? 1 : 2);
     const bool stat = g498StatOn();
     const auto t0 = stat ? std::chrono::steady_clock::now()
                          : std::chrono::steady_clock::time_point{};

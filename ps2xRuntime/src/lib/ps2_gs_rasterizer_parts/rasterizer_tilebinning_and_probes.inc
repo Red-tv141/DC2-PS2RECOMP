@@ -54,6 +54,9 @@ struct G144Entry
     bool townDepthScope;
     GSVertex v[3];
     int minY, maxY; // screen-space bbox rows (post-scissor) for band-overlap prefilter
+    // ⛔ G709 added `int minX, maxX` here (the column extent, by the conservative G458-cull law) for
+    // the page-set publication transaction. REVERTED with that lever — the struct is back to the
+    // exact aggregate every other phase measured, and G521's size probe is unperturbed.
     G149Buf decoded; // G149: pre-decoded texture buffer (null unless texcache eligible); kept alive here
 #if DC2_G521_PADBYTES > 0
     uint8_t g521Pad[DC2_G521_PADBYTES];

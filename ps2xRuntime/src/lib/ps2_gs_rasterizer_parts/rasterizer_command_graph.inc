@@ -187,6 +187,93 @@ bool g286TransientTarget(uint32_t fbp)
     return g286TransientTargetOn() && fbp == 0x13bu;
 }
 
+// ===== G703: BLENDED SPRITE ADMISSION ON THE 0x13b TRANSIENT TARGET =====
+//
+// ⭐⭐⭐ THE LARGEST SINGLE ITEM `[G526:draw]` HAS EVER NAMED ON `dragon`. Per-primitive path
+// attribution over 2.4 M primitives:
+//
+//   rej=0/0.0   cull=312,694/29.0 ms   defer=2,083,620/662.4 ms   inline=3,686/1,832.7 ms
+//   usEach(cull=0.09  defer=0.32  inline=497.20)
+//
+// **3,686 primitives — 0.15% of the population — are 72.6% of the whole drawPrimitive path**, at
+// 497 microseconds each. `[G526:inl]` names them as ONE shape:
+//
+//   type=6 SPRITE  fbp=0x13b  fpsm=0x0 CT32  tme=1  abe=1  tgt=-1
+//   n=3,686  usEach=497.1  pxEach=4,162  nsPerPx=119.45
+//
+// and `[G526:split]` says where the 497 us goes: **drain=160 us + edge=80 us + raster=257 us**.
+// Each one forces a whole-graph drain and a full ownership/materialize edge BEFORE rasterizing
+// 4,162 pixels scalar on the GS worker at ~380 host cycles per pixel.
+//
+// WHY THEY ARE INLINE. `g286Transient` at the capture site (rasterizer_tilebin_capture.inc) reads
+//
+//     g286TransientTarget(fbp) && diagOff144 && isSprite144 &&
+//     (prim.tme || g558Solid13bOn()) && !prim.abe;
+//                                       ^^^^^^^^^^
+//
+// G286/G287 admitted only OPAQUE sprites. Every blended one — which is this entire population —
+// fails `deferrable144` and takes the non-deferrable path.
+//
+// ⭐ THIS IS EXACTLY G573, ONE PRIMITIVE CLASS OVER. G573 widened the same target's admission from
+// opaque sprites to `tme && abe` TRIANGLE/TRISTRIP and measured **-8.697 ms/f (-14.13%)** on the
+// Ridepod boss, 13.5 sigma, with no interval seeing both arms. The sprite half of the same
+// population was never done.
+//
+// WHY IT IS SAFE — G573's argument verbatim, because it is the same contract:
+//   * Admission changes WHEN and IN WHAT GROUPING the work runs, not how a pixel is computed. The
+//     downstream whole-flush classifier is unchanged and still fails closed: a batch whose blend,
+//     depth or texture state the GPU path does not implement replays through the exact banded CPU
+//     replay — the SAME scalar rasterizer, in submission order.
+//   * Ownership is untouched. The flush's own `g286Transient` is address-only
+//     (`g286TransientTarget(fbp)`), so a batch of these sprites takes G286's proven publication
+//     contract exactly as an opaque-sprite batch does.
+//   * Even in the worst case — every batch fails the classifier and replays on the CPU — the
+//     per-primitive **drain (160 us) and edge (80 us)** disappear, because those are the price of
+//     being non-deferrable, not the price of rasterizing.
+//
+// Levers: DC2_G703_SPRITE13B=1 arms it (bring-up default OFF); DC2_G703_NO_SPRITE13B=1 rolls it
+// back once promoted; DC2_G703_STAT=1 prints `[G703:admit]`.
+static bool g703Sprite13bOn()
+{
+    // ⭐⭐⭐ G704 PROMOTION (2026-09-03). G703 gated alone at -0.427 ms/f (-1.61%) and again
+    // stacked with DC2_G568_BITALIAS and the G704 bind hoists at **-0.460 ms/f (-1.76%)**, GS own
+    // -0.435, BOTH order blocks negative (-0.193 / -0.727), control drift 0.078, kicks/f flat.
+    //   Population: `[G526:inl]` measured these 3,686 blended textured SPRITEs at fbp=0x13b as
+    //   **72.6% of the whole drawPrimitive path** at 497 us each, and `[G703:admit]`'s mean pixel
+    //   count (4,163) matches that census's 4,162 to one part in four thousand, so the arm
+    //   converts exactly the shape that was named.
+    //   Pixels: Rule 14 gate on the `ridepod` opening — candidate p90 3.92 / max 26.17 against a
+    //   control-vs-control floor of p90 7.15 / max 37.26, i.e. BELOW the noise floor.
+    // Exactness is G573's contract, unchanged: admission changes WHEN and IN WHAT GROUPING the
+    // work runs, never how a pixel is computed, and the whole-flush classifier still fails closed
+    // onto the same scalar rasterizer in submission order.
+    // Rollback: DC2_G703_NO_SPRITE13B=1 (or DC2_G703_SPRITE13B=0).
+    static const bool s_on = !envFlagEnabled("DC2_G703_NO_SPRITE13B") &&
+                             !envFlagDisabled("DC2_G703_SPRITE13B");
+    return s_on;
+}
+
+static bool g703Sprite13bStatOn()
+{
+    static const bool s_on = envFlagEnabled("DC2_G703_STAT");
+    return s_on;
+}
+
+static void g703NoteSprite13bAdmission(uint32_t px)
+{
+    if (!g703Sprite13bStatOn())
+        return;
+    // GS-worker only. Plain counters keep diagnostics out of paired/default timing (G573's shape).
+    static uint64_t total = 0u, pixels = 0u;
+    ++total;
+    pixels += px;
+    if (total <= 8u || (total % 4096u) == 0u)
+        std::fprintf(stderr, "[G703:admit] n=%llu pixels=%llu avgPx=%.0f\n",
+                     static_cast<unsigned long long>(total),
+                     static_cast<unsigned long long>(pixels),
+                     total ? static_cast<double>(pixels) / static_cast<double>(total) : 0.0);
+}
+
 // ===== G573: RIDEPOD TRANSIENT 0x13b TRIANGLE ADMISSION =====
 //
 // G286/G287 proved the immediate-readback transient target, but capture deliberately admitted only
@@ -955,6 +1042,10 @@ namespace
         std::vector<G144Entry> entries;
         G260RangeSet wr; // color target + active Z (read-modify-write surfaces)
         G260RangeSet rd; // texture + CLUT source pages
+        // G712: this batch's prepared `class` pass, or nullptr when the mechanism is disarmed or
+        // could not take it. Heap-allocated deliberately — the graph MOVES batches (the executed
+        // prefix is erased), and a heap record keeps the worker's pointer valid across that move.
+        G712Prep *prep = nullptr;
     };
 
     // ===== G523: BATCH-MERGE HEADROOM CENSUS (DC2_G523_MERGE=1, read-only, behaviour-pure) =====
@@ -1537,6 +1628,21 @@ namespace
         g_g260OpenWr.reset();
         g_g260OpenRd.reset();
         g_g260Graph.push_back(std::move(b));
+        // ⭐ G712 PREP-AHEAD POST SITE. From here until this batch executes, its entry buffer is
+        // immutable (see g712_prep_body.inc §2), so its `class` pass — a pure function of those
+        // entries — can run on a worker instead of on the pole thread at flush time. The post
+        // never blocks and never fails: a disarmed mechanism or a full queue simply returns
+        // nullptr / does nothing, and the flush classifies inline exactly as it does today.
+        {
+            G260Batch &g712B = g_g260Graph.back();
+            // fbp/fbw are taken from entry 0 exactly as g178TryFlushGpu takes them, so the
+            // consumer's identity check is an equality on the same two derivations, not on
+            // `b.fbp` (which is the block key, equal in practice but derived elsewhere).
+            if (!g712B.entries.empty())
+                g712B.prep = g712PrepOpen(g712B.entries.data(), g712B.entries.size(),
+                                          g712B.entries.front().ctx.frame.fbp,
+                                          g712B.entries.front().ctx.frame.fbw);
+        }
         ++g_g260Closes;
         if (g_g260Graph.size() > g_g260MaxGraph)
             g_g260MaxGraph = g_g260Graph.size();
@@ -1665,6 +1771,7 @@ namespace
             g272SetDisplayBatch(b.fbp, g_g144List.front().ctx.frame.fbw);
             g_g528Wr = &b.wr; // G528: scope the flush prologue to this batch (see the decls above)
             g_g528Rd = &b.rd;
+            g_g712CurPrep = b.prep; // G712: this batch's prepared `class` pass, or nullptr
             ++g_g260BatchesExecuted;
             g_g260EntriesExecuted += g_g144List.size();
             // Ownership rule (the G255 lesson, applied to CPU replay): a replayed batch's color/Z
@@ -1722,6 +1829,8 @@ namespace
             g272SetDisplayBatch(0xFFFFFFFFu, 0u);
             g_g528Wr = nullptr; // G528: the batch is no longer executing — fail closed again
             g_g528Rd = nullptr;
+            g_g712CurPrep = nullptr;
+            g712PrepRelease(b.prep); // consumed (or bypassed) — recycle the record
             g_g144List.swap(b.entries); // reclaim the (now empty) storage's capacity
             g_g260Pool.push_back(std::move(b.entries));
         }
@@ -1770,6 +1879,7 @@ namespace
             g272SetDisplayBatch(b.fbp, g_g144List.front().ctx.frame.fbw);
             g_g528Wr = &b.wr; // G528: scope the flush prologue to this batch (see the decls above)
             g_g528Rd = &b.rd;
+            g_g712CurPrep = b.prep; // G712: this batch's prepared `class` pass, or nullptr
             ++g_g260BatchesExecuted;
             g_g260EntriesExecuted += g_g144List.size();
             if (g178GpuOn() && !g261WaveOn())
@@ -1810,6 +1920,8 @@ namespace
             g272SetDisplayBatch(0xFFFFFFFFu, 0u);
             g_g528Wr = nullptr; // G528: the batch is no longer executing — fail closed again
             g_g528Rd = nullptr;
+            g_g712CurPrep = nullptr;
+            g712PrepRelease(b.prep); // consumed (or bypassed) — recycle the record
             g_g144List.swap(b.entries);
             g_g260Pool.push_back(std::move(b.entries));
         }
@@ -1907,6 +2019,7 @@ namespace
 constexpr uint32_t kG178PageCount = 512; // 4MB VRAM / 8KB GS page
 std::atomic<uint64_t> g_g178PageGen[kG178PageCount]; // zero-initialized
 
+
 // G633: optional event sink for the persistent raw-VRAM domain. The hook is installed only when
 // compiled residency is armed, so the shipped non-resident path pays one predictable null branch
 // per guest write rectangle and never enters the residency planner.
@@ -1915,6 +2028,9 @@ using G633GuestWriteHook = void (*)(uint32_t basePage, uint32_t widthPages,
                                     uint32_t px0, uint32_t px1, bool exactAligned,
                                     uint32_t source);
 G633GuestWriteHook g_g633GuestWriteHook = nullptr;
+using G716WriteHook = void (*)(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t,
+                               uint32_t, uint32_t, uint32_t);
+G716WriteHook g_g716WriteHook = nullptr;
 
 // page geometry (pixels per GS page) by PSM — used only to compute conservative page RANGES.
 void g178PageDims(uint32_t psm, uint32_t &pw, uint32_t &ph)
@@ -2293,6 +2409,7 @@ void g178BumpRectImpl(uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
                       uint32_t x, uint32_t y, uint32_t w, uint32_t h,
                       uint32_t g570Source = 0u)
 {
+    if (g_g716WriteHook) g_g716WriteHook(bpBlocks, bw64, psm, x, y, w, h, g570Source);
     // G272 diagnostic: identify every generation publisher that touches a display range while its
     // FBO is ahead of VRAM. This is required to distinguish conservative page-range noise from an
     // actual escaped writer before the display residency arm can ever be promoted.
@@ -2613,11 +2730,16 @@ uint64_t g513HashMarkedFast(const uint8_t *vram, uint32_t vramSize, const bool *
     return hsh;
 }
 
+// G708: the persistent per-page digest tier lives here, immediately above its only consumer.
+#include "g708_page_digest.inc"
+
 // Collect the distinct VRAM page indices a texture's conservative range covers (same walk as
 // g178GenSumRect, deduped), then FNV-hash those pages' raw bytes. ~8-32 pages for title textures
 // — a sequential ~64-256KB hash, far cheaper than a swizzle+CLUT whole-texture decode.
 // G513: `fast` selects the byte loop; the PAGE SET and the page ORDER are identical either way, so
 // the only variable between the two arms is the inner loop's dependency structure.
+// ⭐ G708: `mark` is the same page set for all three bodies, so the cached body computes the SAME
+// FUNCTION OF THE SAME BYTES and only differs in what it is allowed to skip re-reading.
 uint64_t g178HashPages(const uint8_t *vram, uint32_t vramSize,
                        uint32_t bpBlocks, uint32_t bw64, uint32_t psm,
                        uint32_t w, uint32_t h,
@@ -2644,6 +2766,8 @@ uint64_t g178HashPages(const uint8_t *vram, uint32_t vramSize,
 
     if (bytesOut)
         *bytesOut = 0u;
+    if (g708PageDigestOn())
+        return g708HashMarkedCached(vram, vramSize, mark, bytesOut);
     return fast ? g513HashMarkedFast(vram, vramSize, mark, bytesOut)
                 : g513HashMarkedRef(vram, vramSize, mark, bytesOut);
 }
