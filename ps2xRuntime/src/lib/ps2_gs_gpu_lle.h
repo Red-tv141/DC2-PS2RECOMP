@@ -108,6 +108,10 @@ struct G178Batch
     bool skipReadback = false;          // leave the result in the FBO; `readback` stays empty
     bool rttRawAlpha = false;           // apply the G255 raw-source-alpha RTT store without the env
     std::vector<uint32_t> fbPixels;     // fbW*fbH RGBA when uploadFb (GL row order)
+    std::vector<uint32_t> g716SeedPages; // raw-authoritative pages overlay the guest seed on GPU
+    uint32_t g716SeedFbw = 0;
+    int g716SeedLo = 512, g716SeedHi = -1;
+    std::vector<uint32_t> g716SeedExpected, g716SeedEarlyPages; // non-mutating seed oracle
     std::vector<G178TexUpload> texUploads;
     std::vector<G178Vtx> verts;
     std::vector<G178Draw> draws;

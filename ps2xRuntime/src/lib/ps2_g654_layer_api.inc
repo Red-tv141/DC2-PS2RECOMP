@@ -37,6 +37,16 @@ enum G654Layer
     kG654LayerGsLocal,      // register-triggered local->local transfers
     kG654LayerGifWalk,      // GS::processGIFPacket - the tag walk (P16)
     kG654LayerDrawPrim,     // drawPrimitive, reached from the tag walk (P16)
+    // ⭐ G700 P2: the two layers that were MISSING, and together they are the largest block on the
+    // GS worker. `[G332:gsw]` puts the worker at 22.2 ms/f with **18.4 ms/f (83%) in the front
+    // end**; the shipped six layers attribute drawPrim (~21%), GSimage (~33%), GSlocal and the tag
+    // walk's own body, leaving ~37% of the thread inside `GIFwalk`'s inclusive span with no name —
+    // and `GSimage`'s 33% is likewise mostly the flush it DRAINS rather than the image writer
+    // (G656 §2.1: 95.9% of that layer is `range`). Both unnamed remainders are the same two
+    // things. Naming them makes the front end fully partitioned, which is what Rule 24 asks for
+    // before any lever inside it can be ranked.
+    kG654LayerGpuFlush,     // g178TryFlushGpu - front-end preparation + the blocking submit
+    kG654LayerCpuReplay,    // the banded CPU replay a failed/ineligible flush falls back to
     kG654LayerCount
 };
 

@@ -108,6 +108,16 @@ static uint64_t g156ThreadCpuNs()
 static uint64_t g156ThreadCpuNs() { return 0ull; }
 #endif
 
+// G713: the parse/exec pipeline. `g713_raster_arm` is defined at global scope at the end of
+// ps2_gs_rasterizer.cpp (the arm has to happen where the open-batch indirections live); everything
+// else comes from the cold pipeline TU.
+#include "ps2_g713_pipeline_api.inc"
+void g713_raster_arm();
+static void g713BoundaryThunk(void *p)
+{
+    (*static_cast<std::function<void()> *>(p))();
+}
+
 // G332: defined at global scope in ps2_gs_gpu_raster.cpp (lle_gpu_raster_backend.inc). Forward-
 // declared here at global scope so the anon-namespace g332ReportBoundary() resolves it externally.
 void g332_backend_snapshot(uint64_t nsOut[4], uint64_t cntOut[4]);
@@ -1369,7 +1379,17 @@ namespace
                     g336_boundary_begin(); // G336: open the publish-capture window (no-op unless armed)
                     try
                     {
-                        if (item.frameBoundaryFn)
+                        // ⭐ G713: the boundary closure is the G144 flush plus
+                        // GS::latchHostPresentationFrame — both GL and both guest VRAM, so both
+                        // belong to the exec thread. Posting it and blocking is exactly the
+                        // boundary's own semantics ("this frame's draws are all ahead of us and
+                        // VRAM is complete"), and it bounds pipeline depth to one frame.
+                        if (g713PipeArmed() && item.frameBoundaryFn)
+                        {
+                            g713RasterFlushOpen(); // the open capture batch precedes the closure
+                            g713CallOnExec(&g713BoundaryThunk, &item.frameBoundaryFn);
+                        }
+                        else if (item.frameBoundaryFn)
                             item.frameBoundaryFn();
                     }
                     catch (const std::exception &e)
@@ -1416,6 +1436,8 @@ namespace
                     g332ReportBoundary();
                     g453ReportBoundary();
                     g494ReportBoundary();
+                    g713_raster_arm(); // G713: one-shot arm (a static-bool branch, 60x/second)
+                    g713PipeReport();
                     // G447: blocking-edge split of the window span (no-op unless DC2_G447_EDGE=1).
                     g447ReportBoundary(static_cast<unsigned long long>(
                         g_g151WorkerBusyNs.load(std::memory_order_relaxed)));

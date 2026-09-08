@@ -109,6 +109,11 @@ extern std::atomic<uint64_t> g_g604RawAlphaFbpBits[8];
 // G650 (ROADMAP P6): contention-aware core scheduler. Defined at GLOBAL scope in
 // ps2_runtime_parts/g650_thread_affinity.inc (ps2_runtime.cpp TU).
 extern void g650PinThread(int role);
+// G716: the SCRIPT clock, for the surface-divergence trace. A raw batch counter is NOT a
+// cross-arm key — boot is I/O-timed, so two arms reach different batch indices at the same
+// script instant (measured: vertex hashes diverge from batch 316 with zero raw pages live).
+// Same global-scope contract as the arms above. Defined in dc2_game_override.cpp.
+extern std::atomic<uint32_t> g_dc2ScriptFrame;
 
 #include "ps2_gs_gpu_raster_parts/gpu_raster_infrastructure.inc"
 #include "ps2_gs_gpu_raster_parts/persistent_t8_decoder.inc"
@@ -188,6 +193,9 @@ bool g630_backend_submit_upload(const std::shared_ptr<G630UploadPacket> &) { ret
 bool g630_backend_prepare_t8_view(const std::shared_ptr<G630T8Packet> &) { return false; }
 bool g634_backend_prepare_raw_view(const std::shared_ptr<G634RawViewPacket> &) { return false; }
 bool g634_backend_submit_raw_upload(const std::shared_ptr<G634RawUploadPacket> &) { return false; }
+bool g714_backend_submit_l2l(const std::shared_ptr<G714L2lPacket> &) { return false; }
+bool g714_backend_submit_l2l_sync(const std::shared_ptr<G714L2lPacket> &) { return false; }
+bool g714_backend_available() { return false; }
 bool g630_backend_poll(bool, std::vector<uint8_t> &out) { out.clear(); return false; }
 bool g630_backend_read_vram(std::vector<uint32_t> &) { return false; }
 bool g630_backend_read_depth(std::vector<uint32_t> &) { return false; }
@@ -197,6 +205,12 @@ bool g566_backend_authority_submit(
     std::vector<uint8_t> &&, const std::shared_ptr<G566VuAuthorityResult> &) { return false; }
 bool g178_backend_submit_async(G178Batch &) { return false; }
 bool g178_backend_drain_async(bool &ok) { ok = true; return false; }
+// G701: no-GPU build. Refusing the fire-and-forget path keeps the caller on its blocking route.
+bool g701_backend_submit_nowait(G178Batch &, uint64_t, const std::vector<float> *, int, int)
+{ return false; }
+bool g701_backend_take_failure() { return false; }
+void g701_backend_report() {}
+void g705_backend_report() {}
 bool g242_backend_submit_depth(G178Batch &, uint64_t, const std::vector<float> *, int, int) { return false; }
 bool g275_backend_submit_depth_readback(G178Batch &, uint64_t, const std::vector<float> *,
                                         int, int, int, int, std::vector<float> &) { return false; }

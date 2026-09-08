@@ -74,11 +74,14 @@ extern std::atomic<uint32_t> g_dc2ScriptFrame;
 // G650 (ROADMAP P3): the PACKED descriptor bodies as macros, shared by writeRegisterPacked's
 // switch and processGIFPacket's inline walk. Must precede both.
 #include "ps2_gs_gpu_parts/g650_gif_packed_inline.inc"
+// G713 PIPELINE: the transfer/IMAGE producer's snapshot latches and its exec-side bodies. Must
+// precede gpu_gif_and_registers.inc (the TRXDIR seam + the three IMAGE call sites).
+#include "ps2_gs_gpu_parts/g713_pipe_gs.inc"
 #include "ps2_gs_gpu_parts/gpu_gif_and_registers.inc"
 // G424: run-based host->local IMAGE upload writer, PROMOTED default-on
 // (-2.45 ms/f, -4.69%); kill DC2_G424_NO_FAST_IMAGE=1.
 // Must precede gpu_transfers_and_kick.inc, which calls into it from GS::processImageData.
-// g424_fast_image_upload.inc revision: 4 (G359 .inc rebuild marker - touch on every edit)
+// g424_fast_image_upload.inc revision: 5 (G706 aligned complete-block decomposition)
 #include "ps2_gs_gpu_parts/g424_fast_image_upload.inc"
 // G596: table-driven same-format LOCAL->LOCAL transfer body (rollback DC2_G596_NO_FASTCOPY=1;
 // bring-up DC2_G596_FASTCOPY=1 is a no-op now the body is default-ON). Must precede

@@ -216,6 +216,14 @@ int g592PubConsArm();
 int g594FastWalkArm();
 int g594FastHashArm();
 int g594FastDeswzArm();
+// G712: the prep-ahead task pool, defined in the COLD TU ps2_g712_pipeline.cpp. Same global-linkage
+// rule as everything above — g712_prep_types.inc and g712_prep_body.inc both land inside the
+// anonymous namespace that rasterizer_draw_prim_probe.inc opens, so a declaration there would name
+// a different, never-defined symbol (the G568 lesson; it failed exactly that way once).
+bool g712PrepAheadEnabled();
+bool g712PrepStatOn();
+bool g712PrepPoolStart(void (*fn)(void *job));
+void g712PrepPoolPost(void *job);
 void g589BeginDrain();
 void g589EndDrain();
 void g589NoteBatch();
@@ -322,6 +330,13 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 #include "ps2_gs_rasterizer_parts/g527_target_registry.inc"
 
 // G568: bit-field-disjoint texture/Z alias admission. It must sit HERE, beside g527, and not later:
+// ⭐ G713: the parse/exec pipeline's declarations, at GLOBAL scope and BEFORE the anonymous
+// namespace opens below. Putting them inside it gives every one internal linkage and the TU fails
+// to link against the cold pipeline TU's definitions — the same trap this comment block records
+// for g568BitAliasArm, hit and fixed. `g650PinThread` is declared here for the same reason.
+#include "ps2_g713_pipeline_api.inc"
+extern void g650PinThread(int role);
+
 // rasterizer_draw_prim_probe.inc below opens an anonymous namespace that stays open until
 // rasterizer_rtt_census_and_waves.inc closes it, so an include placed between the two would put
 // this file's forward declaration of g568BitAliasArm() in the anonymous namespace while
@@ -363,7 +378,23 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 #endif
 
 
+// G712 PREP-AHEAD, part 1 of 2: declarations only (no code emitted). The POST site is
+// g260CloseOpenBatch inside the command graph below, but the job body cannot be written until
+// g178ClassifyEntry exists, so the graph sees an opaque handle. Part 2 is included further down,
+// after g419_ab_instrument.inc (which owns the G510 memo arm this reads).
+#include "ps2_gs_rasterizer_parts/g712_prep_types.inc"
+
+// G713 PIPELINE, part 1 of 2: the two open-batch indirections (`g_g144Open` / `g_g144OpenFbp`)
+// that separate the PARSE thread's capture buffer from the EXEC thread's flush working buffer.
+// Must precede the command graph and the capture site, which both name them.
+#include "ps2_gs_rasterizer_parts/g713_pipe_types.inc"
+
 #include "ps2_gs_rasterizer_parts/rasterizer_command_graph.inc"
+
+// G713 PIPELINE, part 2 of 2: the parse-side conflict tests and the exec-side batch adopt. Needs
+// G260Batch / g_g260Graph / g260RangeSetsConflict from the graph above, and g144RangeForRect from
+// rasterizer_draw_prim_probe.inc.
+#include "ps2_gs_rasterizer_parts/g713_pipe_parse.inc"
 
 #if defined(PS2X_G655_LEGACY_DIAG)
 #include "ps2_gs_rasterizer_parts/rasterizer_g336_runway.inc"
@@ -373,6 +404,8 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_rtt_census_and_waves.inc"
+#include "ps2_gs_rasterizer_parts/g716_upload_address.inc"
+#include "ps2_gs_rasterizer_parts/g716_authority_state.inc"
 
 // G636: the arms/counters for the two-authority arbitration, plus forward declarations of the three
 // G630 entry points the two EARLY repair sites need. Must sit at the SAME scope as
@@ -565,6 +598,20 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 #include "ps2_gs_rasterizer_parts/g630_gpu_domain.inc"
 #endif
 
+// ⭐⭐⭐ G700: the address-generic persistent surface authority. Replaces the fourteen-address
+// residency allowlist (`g248TargetIndex`) with per-page ownership over any FRAME.FBP, so a target
+// switch is an FBO bind rather than a VRAM upload + render + readback round trip. MUST precede
+// rasterizer_mat_support.inc: g261MaterializeForRanges calls into it so both residency models
+// publish at the same transfer edges, in the same order.
+#include "ps2_gs_rasterizer_parts/g700_resident_authority.inc"
+// ⛔ G709 lived here — the page-set publication transaction. REVERTED under Rule 31: exact
+// (oracle bad=0 over 157,433 commits) and it converted the population (`cpurttdep`/`flushdep`
+// −59.3% page visits on `ridepod`, guest VRAM revalidation re-read −31.2% on `dragon`), but the
+// prize is bounded at 0.02–0.08 ms/f by counted quantities and its pooled A/B/B/A returned
+// t = −0.41 with the only Rule-16-admissible block reading +0.261. Do not re-add without a route
+// whose `cpurttcol` publication is NOT already the exact union of its entries' boxes — on
+// `ridepod` that union is 97.6 of ~128 pages, i.e. the writes really are that wide (Rule 87).
+// See plans/phase-G709-fix-log.md.
 // G662: the materialization SUPPORT half — G340 census, the G261 materialize entry points, G285
 // local-to-local consume, the G264/G326 upload-mirror planner, the G661/G662 probes, the CPU-replay
 // prologue, G582 dedup, the G305 async drain and G581 snapshot invalidation. Split out of
@@ -572,6 +619,19 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // 6,280-line `g178TryFlushGpu`. MUST be included IMMEDIATELY BEFORE its parent: one translation
 // unit, byte-identical preprocessor output (rule 12b).
 #include "ps2_gs_rasterizer_parts/rasterizer_mat_support.inc"
+// ⛔ G710's flush ceiling probe is UNWIRED (Rule 31, G711). Its `#else` stubs were all `constexpr`,
+// so every use folded — but the source text still perturbed this TU's layout, and a cross-binary
+// A/B/B/A priced that at +0.42…+0.65 ms/f of GS own. The file is retained, uncompiled, at
+// `ps2_gs_rasterizer_parts/g710_flush_ceiling.inc`; see plans/phase-G711-fix-log.md §8 to re-wire.
+// G690: the small-batch de-admission lever lived here and was REVERTED under Rule 31 — measured
+// +0.332 ms/f pooled with both order blocks positive, and +2.41 ms/f at the full-de-admission
+// ceiling. See plans/phase-G690-fix-log.md §4/§5. Do not re-add without a number beating those.
+// G712 PREP-AHEAD, part 2 of 2: the record, the job body and the help-or-wait consumer. MUST
+// follow rasterizer_rtt_census_and_waves.inc (g178ClassifyEntry, g262CensusOn) and
+// g419_ab_instrument.inc (g510ClsMemoActive, g510CensusOn), and MUST precede
+// rasterizer_vram_materialization.inc, whose `class` pass is the consumer.
+#include "ps2_gs_rasterizer_parts/g712_prep_body.inc"
+
 #include "ps2_gs_rasterizer_parts/rasterizer_vram_materialization.inc"
 
 // G627 revision: 1 — PSMT8-in-CT32 local-transfer destinations without the destination-triggered
@@ -580,6 +640,15 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // rasterizer_draw_sprite.inc, which holds its only call site inside
 // g144FlushPendingLocalTransferRange. Content edit here forces MSBuild to consume the .inc (G359).
 #include "ps2_gs_rasterizer_parts/g627_psmt8_lane_mirror.inc"
+
+// G714 revision: 1 — same-format local->local executed against GPU-resident raw GS VRAM, so the
+// edge's `g261MaterializeForRanges` (99.7% of its blocking time, `[G432:l2ledge]`) never runs.
+// MUST follow g627_psmt8_lane_mirror.inc (it reuses the same residency vocabulary — G261Res /
+// kG261Fbp / g261UpdateWindow / g280NoteFboContentChange / g310NoteProducerWrite / g_g178FbSnap)
+// and MUST precede rasterizer_draw_sprite.inc, which holds both call sites. Content edit here
+// forces MSBuild to consume the .inc (G359).
+#include "ps2_gs_rasterizer_parts/g714_gpu_l2l.inc"
+#include "ps2_gs_rasterizer_parts/g716_authority.inc"
 
 
 // G592 revision: 1 — the private-mirror PUBLICATION's consumer test (the READ half of the
@@ -665,6 +734,15 @@ static void g687PrimePackedCapture(
 #include "ps2_gs_rasterizer_parts/rasterizer_tilebin_capture.inc"
 
 #include "ps2_gs_rasterizer_parts/g687_packed_capture_run.inc"
+
+// G704: expose the G261/G291 cumulative reporter at global scope so the cold 60-frame runtime
+// reporter can call it when DC2_G291_STAT is the only armed diagnostic.  The reporter body lives
+// in the anonymous namespace above; an internal guard alone was insufficient because every old
+// call site was itself gated by an unrelated G261/G279/G283 diagnostic.
+void g704_page_memo_report()
+{
+    g261Report();
+}
 
 
 // G369 cutscene gray-screen census (default-off: DC2_G369_CENSUS=1). Must sit AFTER the
@@ -831,3 +909,16 @@ static void g687PrimePackedCapture(
 //       the DC2_G536_MATCHK=1 probe that proved the invariant is violated at publication time.
 //       g261Materialize must not overwrite pages the guest wrote since the residency anchored.
 //       (force recompile v1)
+
+// ==============================================================================================
+// G713 — GLOBAL-SCOPE EXPORTS (the anonymous namespace opened by rasterizer_draw_prim_probe.inc
+// is closed by rasterizer_rtt_census_and_waves.inc, so everything below is at file scope).
+//
+// `g713_raster_arm()` is called once per frame boundary from ps2_gif_arbiter.cpp. Arming from the
+// boundary rather than from drawPrimitive keeps the one-shot test off a 10,000-calls-per-frame
+// path entirely: it is a single static-bool branch, 60 times a second.
+// ==============================================================================================
+void g713_raster_arm()
+{
+    g713ArmIfRequested(nullptr);
+}

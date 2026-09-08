@@ -15,7 +15,7 @@
 // G424: the horizontal-run IMAGE upload writers at the bottom of this file live in an .inc.
 // MSBuild does not reliably rebuild a .cpp when only an included .inc changed (G359 trap), so this
 // marker comment must be touched whenever g424_image_run_writers.inc is edited.
-// g424_image_run_writers.inc revision: 5 (G477 swizzle-row hoisted CT32/Z32/P4 run writers)
+// g424_image_run_writers.inc revision: 6 (G706 complete 8x8 CT32/Z32 SIMD block writer)
 // g477_fast_run_writers.inc revision: 8 (partial-row PSMT4 complete 32-column groups)
 // g512_texdecode_row_readers.inc revision: 4 (G651 widened paletted group predicate 8/4/2 +
 //                                             P4HL/P4HH SSE2 word-group extraction + no-mask arm)

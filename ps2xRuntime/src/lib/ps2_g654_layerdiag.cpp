@@ -23,11 +23,14 @@ namespace
 
 enum
 {
-    kLayerCount = 6
+    // ⚠️ MUST TRACK G654Layer IN ps2_g654_layer_api.inc. G700 P2 added gpuFlush and cpuReplay —
+    // the two layers that own the unnamed 37% of the GS worker's span (see the comment beside
+    // kG654LayerGpuFlush). A count that lags the enum silently drops the new layers' rows.
+    kLayerCount = 8
 };
 
 const char *kLayerName[kLayerCount] = {
-    "VIF1", "GIFsubmit", "GSimage", "GSlocal", "GIFwalk", "drawPrim"
+    "VIF1", "GIFsubmit", "GSimage", "GSlocal", "GIFwalk", "drawPrim", "gpuFlush", "cpuReplay"
 };
 
 struct ThreadRow

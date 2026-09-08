@@ -39,6 +39,7 @@ struct G630UploadPacket
 
 struct G630T8Packet
 {
+    std::vector<uint32_t> expected; // G716 diagnostic only: independent CPU decode of raw bytes
     std::vector<uint32_t> mapWords;   // one-time exact 128x64 PSMT8 page permutation
     std::vector<uint32_t> clut;
     std::vector<uint32_t> patchPages;
@@ -80,4 +81,58 @@ struct G634RawUploadPacket
     std::vector<uint32_t> ops;
     uint32_t psm = 0u;
     bool verify = false;
+};
+
+// ==================================================================================================
+// G714: ONE same-format GS local->local transfer, resolved, executed entirely GPU-side against the
+// persistent raw GS VRAM image (2048x512 R32UI, row p == guest page p — G630's representation).
+//
+// The packet carries the RESOLVED OPERATION, never GS registers: the front end has already decided
+// which guest pages are CPU-authoritative (`patchPages`/`patchWords`, a straight page memcpy — no
+// per-pixel work), which pages a resident CT32 target owns (`fboIn`, pulled GPU->GPU), and which
+// rows the copy's result must be pushed back into (`fboOut`). Worker order is:
+//
+//     patch guest pages -> raw     (glTexSubImage2D runs, G631 coalesced)
+//     fboIn:  FBO  -> raw          (compute; a target owns those pages, guest VRAM is stale there)
+//     copy:   raw  -> raw          (compute; one invocation per DESTINATION word, no write races)
+//     fboOut: raw  -> FBO          (compute; the G630 view program, unchanged)
+//
+// Nothing in that chain reads back to the CPU, so the transfer costs no `g261Materialize`.
+// ==================================================================================================
+struct G714L2lPacket
+{
+    uint32_t g716Mode = 0u; // 1: row handoff, 2: raw memory copy; guest patch precedes ingestion
+    std::vector<uint32_t> g716Protected; // pages excluded from FBO ingestion
+    // One-time tables. Empty on every packet after the backend has latched them.
+    std::vector<uint32_t> ct32PageWords; // exact 64x32 CT32 page word map (shared with G630)
+    std::vector<uint32_t> fwd;           // texel index -> byte offset within its 8 KiB page
+    std::vector<uint32_t> inv;           // element index -> texel index (the inverse of `fwd`)
+    uint32_t tableKey = 0xFFFFFFFFu;     // the PSM `fwd`/`inv` describe; 0xFFFFFFFF = "unchanged"
+
+    std::vector<uint32_t> patchPages;    // ascending guest-authoritative pages, applied after fboIn
+    std::vector<uint32_t> patchWords;    // exactly 2048 words per patchPages entry, same order
+
+    // 5 ints per entry: fbp, fbw, fbW, rowLo, rowHi (GS rows, both inclusive, 32-aligned bands).
+    std::vector<int32_t> fboIn;
+    std::vector<int32_t> fboOut;
+
+    uint32_t sbp = 0u, dbp = 0u;             // BITBLTBUF base, in blocks
+    uint32_t sPagesPerRow = 1u, dPagesPerRow = 1u;
+    uint32_t pw = 0u, ph = 0u, bpp = 0u;     // page geometry of the (single, shared) PSM
+    uint32_t ssax = 0u, ssay = 0u, dsax = 0u, dsay = 0u, rrw = 0u, rrh = 0u;
+    uint32_t revX = 0u, revY = 0u;           // TRXPOS traversal
+    uint32_t dPgX0 = 0u, dPgY0 = 0u, dPgNx = 0u, dPgNy = 0u; // destination page grid
+    // G715 diagnostic (DC2_G715_IDENTONLY=1): run ONLY `g714In` then `g714Out` on the same bands —
+    // no guest patch, no copy — while the front end lets the shipped CPU path do the entire
+    // transfer. `g714Out o g714In` must be the identity, so a pixel change under this arm isolates
+    // the FBO<->raw boundary from the copy, the patch, the publication skip and the admission.
+    uint32_t identOnly = 0u;
+    // ⭐ G715 VRAMDST. The shipped renderer never puts an l2l destination's bytes into the resident
+    // FBO — `kG627PromotedDefaultOn == false`, so the CPU body writes guest VRAM, the tag bumps
+    // those pages' generations, and G536 hands the pages to guest VRAM. Reproduce that: read the
+    // destination page span back out of raw and let the front end place exactly the transfer's
+    // bytes in guest VRAM, leaving the FBO's rendered colour alone. `noFboOut` drops leg (4).
+    std::vector<uint32_t> *dstOut = nullptr; // front-end owned; filled with pages dstPgLo..+Count
+    uint32_t dstPgLo = 0u, dstPgCount = 0u;
+    uint32_t noFboOut = 0u;
 };
