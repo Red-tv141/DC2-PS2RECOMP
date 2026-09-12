@@ -110,16 +110,24 @@ namespace
     static_assert(offsetof(VU1State, clip) == (size_t)G610_OFF_CLIP, "G611: clip offset");
     static_assert(sizeof(float) == 4u && sizeof(int32_t) == 4u, "G610: scalar widths");
 
-    constexpr int32_t G610_OFF_HVEC = 0;     // G430HistBlock::vec[8][4]
-    constexpr int32_t G610_OFF_HSTAMP = 128; // ::stamp[8]
-    constexpr int32_t G610_OFF_HDEST = 224;  // ::dest[8]
-    constexpr int32_t G610_OFF_HKIND = 232;  // ::kind[8]
-    constexpr int32_t G610_OFF_HHEAD = 240;  // ::head
+    // G726: these are now ENTRY-RELATIVE displacements against a base of `R9 + slot*32`, not
+    // field-array bases. `G610_OFF_HENT` is the entry stride and the emitter's SIB scale is chosen
+    // from it; the static_asserts below are what make the change safe, because the emitted
+    // addressing is checked against the C++ layout at compile time rather than by inspection.
+    constexpr int32_t G610_OFF_HENT = 32;    // sizeof(G430HistEntry)
+    constexpr int32_t G610_OFF_HVEC = 0;     // G430HistEntry::vec[4]
+    constexpr int32_t G610_OFF_HSTAMP = 16;  // ::stamp
+    constexpr int32_t G610_OFF_HDEST = 28;   // ::dest
+    constexpr int32_t G610_OFF_HKIND = 29;   // ::kind  (dest+1: one 16-bit store covers both)
+    constexpr int32_t G610_OFF_HHEAD = 256;  // G430HistBlock::head
 
-    static_assert(offsetof(G430HistBlock, vec) == (size_t)G610_OFF_HVEC, "G610: hist vec");
-    static_assert(offsetof(G430HistBlock, stamp) == (size_t)G610_OFF_HSTAMP, "G610: hist stamp");
-    static_assert(offsetof(G430HistBlock, dest) == (size_t)G610_OFF_HDEST, "G610: hist dest");
-    static_assert(offsetof(G430HistBlock, kind) == (size_t)G610_OFF_HKIND, "G610: hist kind");
+    static_assert(sizeof(G430HistEntry) == (size_t)G610_OFF_HENT, "G610: hist entry stride");
+    static_assert(offsetof(G430HistEntry, vec) == (size_t)G610_OFF_HVEC, "G610: hist vec");
+    static_assert(offsetof(G430HistEntry, stamp) == (size_t)G610_OFF_HSTAMP, "G610: hist stamp");
+    static_assert(offsetof(G430HistEntry, dest) == (size_t)G610_OFF_HDEST, "G610: hist dest");
+    static_assert(offsetof(G430HistEntry, kind) == (size_t)G610_OFF_HKIND, "G610: hist kind");
+    static_assert(G610_OFF_HKIND == G610_OFF_HDEST + 1, "G610: fused dest/kind store");
+    static_assert(offsetof(G430HistBlock, e) == 0u, "G610: hist entries at block base");
     static_assert(offsetof(G430HistBlock, head) == (size_t)G610_OFF_HHEAD, "G610: hist head");
     static_assert(G430_HIST == 8, "G610 emits `and r10d,7` for the ring wrap");
 
@@ -524,6 +532,34 @@ namespace
         void movaps(unsigned xd, unsigned xs) { sseR(0x28, xd, xs); }
         void movssLd(unsigned x, unsigned b, int32_t d) { sseF3M(0x10, x, b, d); }
         void movssSt(unsigned x, unsigned b, int32_t d) { sseF3M(0x11, x, b, d); }
+        // ---- G730 additions ----
+        // `movss xd, xs` in its REGISTER form (F3 0F 10 /r, mod = 11). Unlike the memory form it
+        // MERGES: the low 32 bits come from `xs` and the upper 96 of `xd` survive — which is exactly
+        // `applyDest` with dest == 0x8, in one uop and with no memory at all.
+        void movssR(unsigned xd, unsigned xs) { sseF3R(0x10, xd, xs); }
+        // `pextrw r32, xmm, imm8` (66 0F C5 /r ib). The reg field is the GPR and the rm field is the
+        // XMM — the reverse of `movd`. Word index `2*lane` is the LOW half of lane `lane`, so this
+        // plus `movsx r32, r16` is `(int32_t)(int16_t)(bits(vf[is][comp]) & 0xFFFF)` — MTIR's own
+        // expression, read out of a RESIDENT register instead of a stale state image.
+        void pextrw(unsigned r, unsigned x, uint8_t imm)
+        { u8(0x66); rex(false, r, 0u, x); u8(0x0F); u8(0xC5); modRR(r, x); u8(imm); }
+        // movaps [rsp + disp32], xmm  /  movaps xmm, [rsp + disp32].
+        // RSP's low three bits are 100, so ModRM rm = 100 means "a SIB byte follows" and `memD`
+        // cannot express this base at all. The SIB is index = 100 (none), base = 100 (RSP) = 0x24.
+        void movapsStRsp(unsigned x, int32_t d)
+        {
+            rex(false, x, 0u, 0u); u8(0x0F); u8(0x29);
+            u8((uint8_t)(0x80u | ((x & 7u) << 3) | 4u)); u8(0x24); i32(d);
+        }
+        void movapsLdRsp(unsigned x, int32_t d)
+        {
+            rex(false, x, 0u, 0u); u8(0x0F); u8(0x28);
+            u8((uint8_t)(0x80u | ((x & 7u) << 3) | 4u)); u8(0x24); i32(d);
+        }
+        // sub rsp, imm32 / add rsp, imm32 — REX.W 81 /5 and /0 with rm = RSP encoded directly
+        // (mod = 11 needs no SIB). Emitted as constants so a wrong byte is a wrong constant here.
+        void subImm64Rsp(int32_t v) { u8(0x48); u8(0x81); u8(0xEC); i32(v); }
+        void addImm64Rsp(int32_t v) { u8(0x48); u8(0x81); u8(0xC4); i32(v); }
         void movssLdX(unsigned x, unsigned b, unsigned ix, int32_t d) { sseF3MX(0x10, x, b, ix, d); }
         void movssStX(unsigned x, unsigned b, unsigned ix, int32_t d) { sseF3MX(0x11, x, b, ix, d); }
         void movdToX(unsigned x, unsigned r) { sse66R(0x6E, x, r); }
@@ -598,6 +634,9 @@ namespace
         void orM(unsigned r, unsigned b, int32_t d)    // or  r32, [b+d]
         { rex(false, r, 0u, b); u8(0x0B); memD(r, b, d); }
         void shlImm(unsigned r, uint8_t v) { rex(false, 0u, 0u, r); u8(0xC1); modRR(4u, r); u8(v); }
+        // G726: `C1 /5 ib`. Needed because the ring cursor is now carried PRE-SCALED as a byte
+        // offset and has to be converted back to a slot index before it is stored to `head`.
+        void shrImm(unsigned r, uint8_t v) { rex(false, 0u, 0u, r); u8(0xC1); modRR(5u, r); u8(v); }
         void movImm32(unsigned r, uint32_t v)
         { rex(false, 0u, 0u, r); u8((uint8_t)(0xB8u + (r & 7u))); u32(v); }
         void movImm64(unsigned r, uint64_t v)
@@ -606,6 +645,13 @@ namespace
         { rex(false, 0u, 0u, b); u8(0xC7); memD(0u, b, d); u32(v); }
         void movStImm8X(unsigned b, unsigned ix, int32_t d, uint8_t v)
         { rex(false, 0u, ix, b); u8(0xC6); memX(0u, b, ix, 1u, d); u8(v); }
+        // G726: `66 C7 /0 iw` - store a 16-bit immediate through base+index*scale+disp. The 0x66
+        // operand-size prefix MUST precede REX (Intel SDM 2.2.1: legacy prefixes come first, and a
+        // REX before 0x66 is silently ignored, which would emit a 32-bit store and clobber `mac`).
+        // Exists so the adjacent `dest` and `kind` bytes of one history entry are written by ONE
+        // store instead of two.
+        void movStImm16X(unsigned b, unsigned ix, unsigned sc, int32_t d, uint16_t v)
+        { u8(0x66); rex(false, 0u, ix, b); u8(0xC7); memX(0u, b, ix, sc, d); u8((uint8_t)v); u8((uint8_t)(v >> 8)); }
         void movSt64X(unsigned r, unsigned b, unsigned ix, unsigned sc, int32_t d)
         { rex(true, r, ix, b); u8(0x89); memX(r, b, ix, sc, d); }
         void movStX32(unsigned r, unsigned b, unsigned ix, int32_t d)
@@ -676,6 +722,12 @@ namespace
         void storeViRaw(unsigned dst)
         { movSt32(G610_RAX, G610_RCX, G610_OFF_VI + (int32_t)(4u * dst)); }
     };
+
+// ⭐ G730 — THE HOST-REGISTER RESIDENCY ALLOCATOR. Included HERE, inside this file's anonymous
+// namespace and immediately after the encoder, because it emits through `G610Emit` and every
+// VF/ACC access site below routes through its four accessors. It must come BEFORE §6 (the
+// translator) and it is shared verbatim by the G612 region backend, exactly as `g610EmitUpper` is.
+#include "vu1_g730_regalloc.inc"
 
     // -------------------------------------------------------------------------------------------
     // §6 THE TRANSLATOR
@@ -804,7 +856,7 @@ namespace
         hb.head = 0;
         (void)g421FastUpper<true, true, true>(st, upper, kind, false, false, true, 0, &hb, slot,
                                               descBits);
-        return ((const uint32_t *)hb.vec[0])[0];
+        return ((const uint32_t *)hb.e[0].vec)[0];
     }
 
     void g611OrderFail(uint8_t kind, const char *what, uint32_t got)
@@ -935,7 +987,11 @@ namespace
         const unsigned fs = FS(upper), ft = FT(upper), fd = FD(upper);
         const uint8_t dest = DEST(upper);
 
-        e.movupsLd(G610_X0, G610_RCX, G610_OFF_VF + (int32_t)(16u * fs));
+        // ⭐ G730: `vs` is READ-ONLY for the whole of this function — every arithmetic form copies
+        // it into X2/X3 before modifying anything — so when VF[fs] is resident the load disappears
+        // and the arithmetic names the pool register directly. `xVs` is that register; it is X0
+        // exactly when the location is not bound, which is the pre-G730 emission byte for byte.
+        const unsigned xVs = g730SrcVf(e, fs, G610_X0);
 
         if (d.cls == 8u)
         {
@@ -951,15 +1007,15 @@ namespace
             // register is an argument or the ring cursor), so the two movemask results are joined in
             // an XMM instead of a second GPR: park `lt << 3`, compute `gt`, `por`, read back.
             usedG611 = true;
-            e.movupsLd(G610_X1, G610_RCX, G610_OFF_VF + (int32_t)(16u * ft));
-            e.movaps(G610_X2, G610_X1);
+            const unsigned xVt = g730SrcVf(e, ft, G610_X1);
+            e.movaps(G610_X2, xVt);
             e.shufps(G610_X2, G610_X2, 0xFFu);          // vt.w splat
             e.andpsM(G610_X2, G610_R11, G610_C_ABS);    // aw = |vt.w|
             e.movaps(G610_X3, G610_X2);
             e.xorpsM(G610_X3, G610_R11, G610_C_SIGN);   // nw = -|vt.w|
             e.movaps(G610_X4, G610_X2);
-            e.cmpltps(G610_X4, G610_X0);                // aw < vs   == vs > aw  (ordered)
-            e.movaps(G610_X5, G610_X0);
+            e.cmpltps(G610_X4, xVs);                    // aw < vs   == vs > aw  (ordered)
+            e.movaps(G610_X5, xVs);
             e.cmpltps(G610_X5, G610_X3);                // vs < nw               (ordered)
             e.movmskps(G610_RAX, G610_X5);
             e.andImm(G610_RAX, 7);
@@ -981,23 +1037,23 @@ namespace
             switch (d.cls)
             {
             case 3u: // ITOF : (float)bits(vs) * scale     -> VF[ft]
-                e.cvtdq2ps(G610_X2, G610_X0);
+                e.cvtdq2ps(G610_X2, xVs);
                 e.mulpsM(G610_X2, G610_R11, G610_C_ITOF + (int32_t)(16u * d.bc));
                 break;
             case 4u: // FTOI : bits((int32_t)(vs * scale))  -> VF[ft]
-                e.movaps(G610_X2, G610_X0);
+                e.movaps(G610_X2, xVs);
                 e.mulpsM(G610_X2, G610_R11, G610_C_FTOI + (int32_t)(16u * d.bc));
                 e.cvttps2dq(G610_X2, G610_X2);
                 break;
             case 5u: // ABS
-                e.movaps(G610_X2, G610_X0);
+                e.movaps(G610_X2, xVs);
                 e.andpsM(G610_X2, G610_R11, G610_C_ABS);
                 break;
             case 6u: // MOVE
-                e.movaps(G610_X2, G610_X0);
+                e.movaps(G610_X2, xVs);
                 break;
             case 7u: // MR32 : {vs.y, vs.z, vs.w, vs.x}
-                e.movaps(G610_X2, G610_X0);
+                e.movaps(G610_X2, xVs);
                 e.shufps(G610_X2, G610_X2, 0x39u);   // _MM_SHUFFLE(0,3,2,1)
                 break;
             default:
@@ -1005,28 +1061,40 @@ namespace
                 return false;
             }
             // None of these five writes MAC/STATUS or the G430 history; all write VF[ft].
-            e.storeDest(G610_X2, G610_RCX, G610_OFF_VF + (int32_t)(16u * ft), dest,
-                        G610_X4, G610_X5);
+            g730StoreVf(e, G610_X2, ft, dest, G610_X4, G610_X5);
             return true;
         }
 
         // cls 1 (-> VF[fd]) / cls 2 (-> ACC). Operand b:
+        //
+        // ⭐ G730: `xB` is the register that HOLDS b. The broadcast forms have to write their
+        // register (the splat is `shufps xd, xd`), so they always land in the X1 scratch — but a
+        // resident vt still saves the LOAD, because `movaps X1, pool` is eliminated at rename while
+        // `movups X1, [rcx+…]` is a real load that forwards from whatever last stored that VF.
+        // The full-vt form is read-only and can name the pool register itself.
+        unsigned xB = G610_X1;
         switch (d.src)
         {
         case 0u: // broadcast lane bc of vt
-            e.movupsLd(G610_X1, G610_RCX, G610_OFF_VF + (int32_t)(16u * ft));
+        {
+            const int bvt = g730VfReg(ft);
+            if (bvt >= 0)
+                e.movaps(G610_X1, (unsigned)bvt);
+            else
+                e.movupsLd(G610_X1, G610_RCX, G610_OFF_VF + (int32_t)(16u * ft));
             e.shufps(G610_X1, G610_X1, (uint8_t)(d.bc * 0x55u));
             break;
-        case 1u: // Q
+        }
+        case 1u: // Q — never bound: the hook publishes it between the halves of a G611 Q-split
             e.movssLd(G610_X1, G610_RCX, G610_OFF_Q);
             e.shufps(G610_X1, G610_X1, 0x00u);
             break;
-        case 2u: // I
+        case 2u: // I — never bound: the G652 LOI path writes it straight into the state image
             e.movssLd(G610_X1, G610_RCX, G610_OFF_I);
             e.shufps(G610_X1, G610_X1, 0x00u);
             break;
         default: // full vt
-            e.movupsLd(G610_X1, G610_RCX, G610_OFF_VF + (int32_t)(16u * ft));
+            xB = g730SrcVf(e, ft, G610_X1);
             break;
         }
 
@@ -1039,34 +1107,36 @@ namespace
         switch (d.op)
         {
         case 0u: // _mm_add_ps(vs, b)
-            if (ord.mulDstIsB) { e.movaps(G610_X2, G610_X1); e.addps(G610_X2, G610_X0); }
-            else               { e.movaps(G610_X2, G610_X0); e.addps(G610_X2, G610_X1); }
+            if (ord.mulDstIsB) { e.movaps(G610_X2, xB);   e.addps(G610_X2, xVs); }
+            else               { e.movaps(G610_X2, xVs);  e.addps(G610_X2, xB); }
             break;
-        case 1u: e.movaps(G610_X2, G610_X0); e.subps(G610_X2, G610_X1); break; // _mm_sub_ps(vs,b)
+        case 1u: e.movaps(G610_X2, xVs); e.subps(G610_X2, xB); break;          // _mm_sub_ps(vs,b)
         case 4u: // _mm_mul_ps(vs, b)
-            if (ord.mulDstIsB) { e.movaps(G610_X2, G610_X1); e.mulps(G610_X2, G610_X0); }
-            else               { e.movaps(G610_X2, G610_X0); e.mulps(G610_X2, G610_X1); }
+            if (ord.mulDstIsB) { e.movaps(G610_X2, xB);   e.mulps(G610_X2, xVs); }
+            else               { e.movaps(G610_X2, xVs);  e.mulps(G610_X2, xB); }
             break;
-        case 5u: e.movaps(G610_X2, G610_X0); e.maxps(G610_X2, G610_X1); break; // _mm_max_ps(vs,b)
-        case 6u: e.movaps(G610_X2, G610_X0); e.minps(G610_X2, G610_X1); break; // _mm_min_ps(vs,b)
+        case 5u: e.movaps(G610_X2, xVs); e.maxps(G610_X2, xB); break;          // _mm_max_ps(vs,b)
+        case 6u: e.movaps(G610_X2, xVs); e.minps(G610_X2, xB); break;          // _mm_min_ps(vs,b)
         case 2u: // _mm_add_ps(acc, _mm_mul_ps(vs, b))
-            if (ord.mulDstIsB) { e.movaps(G610_X3, G610_X1); e.mulps(G610_X3, G610_X0); }
-            else               { e.movaps(G610_X3, G610_X0); e.mulps(G610_X3, G610_X1); }
+            if (ord.mulDstIsB) { e.movaps(G610_X3, xB);   e.mulps(G610_X3, xVs); }
+            else               { e.movaps(G610_X3, xVs);  e.mulps(G610_X3, xB); }
+            // ⭐ G730: with ACC resident this is `addps X2, xmmACC` — the store-to-load forward that
+            // chained consecutive FMACs through the state image is gone from the dependency chain.
             if (ord.outerDstIsMul)
             {
                 e.movaps(G610_X2, G610_X3);
-                e.addpsM(G610_X2, G610_RCX, G610_OFF_ACC);
+                g730AddAccInto(e, G610_X2);
             }
             else
             {
-                e.movupsLd(G610_X2, G610_RCX, G610_OFF_ACC);
+                g730LoadAccInto(e, G610_X2);
                 e.addps(G610_X2, G610_X3);
             }
             break;
         case 3u: // _mm_sub_ps(acc, _mm_mul_ps(vs, b)) — the subtract cannot be commuted
-            if (ord.mulDstIsB) { e.movaps(G610_X3, G610_X1); e.mulps(G610_X3, G610_X0); }
-            else               { e.movaps(G610_X3, G610_X0); e.mulps(G610_X3, G610_X1); }
-            e.movupsLd(G610_X2, G610_RCX, G610_OFF_ACC); e.subps(G610_X2, G610_X3);
+            if (ord.mulDstIsB) { e.movaps(G610_X3, xB);   e.mulps(G610_X3, xVs); }
+            else               { e.movaps(G610_X3, xVs);  e.mulps(G610_X3, xB); }
+            g730LoadAccInto(e, G610_X2); e.subps(G610_X2, G610_X3);
             break;
         // G611 — the two CROSS-LANE outer-product forms. `d.src == 3` for both, so X1 already holds
         // the whole `vt`. Both build G488's permutation
@@ -1074,11 +1144,11 @@ namespace
         // (`_MM_SHUFFLE(3,0,2,1)` = 0xC9 and `_MM_SHUFFLE(3,1,0,2)` = 0xD2), which is execUpper's
         // operand pairing lane for lane.
         case 7u: // OPMSUB : ACC - (vs x vt), w lane forced to +0.0
-            e.movaps(G610_X2, G610_X0); e.shufps(G610_X2, G610_X2, 0xC9u);   // a
-            e.movaps(G610_X3, G610_X1); e.shufps(G610_X3, G610_X3, 0xD2u);   // bb
+            e.movaps(G610_X2, xVs); e.shufps(G610_X2, G610_X2, 0xC9u);       // a
+            e.movaps(G610_X3, xB);  e.shufps(G610_X3, G610_X3, 0xD2u);       // bb
             if (ord.mulDstIsB) { e.mulps(G610_X3, G610_X2); e.movaps(G610_X2, G610_X3); }
             else               { e.mulps(G610_X2, G610_X3); }                // a * bb
-            e.movupsLd(G610_X3, G610_RCX, G610_OFF_ACC);
+            g730LoadAccInto(e, G610_X3);
             e.subps(G610_X3, G610_X2);                                       // acc - (a*bb)
             // `result[3] = 0.0f`: masking w to all-zero bits IS the +0.0f bit pattern for any value
             // the subtract left there, so the destination store sees exactly what execUpper wrote.
@@ -1087,11 +1157,11 @@ namespace
             usedG611 = true;
             break;
         case 8u: // OPMULA : (vs x vt) -> ACC, w lane keeps the CURRENT ACC.w
-            e.movaps(G610_X2, G610_X0); e.shufps(G610_X2, G610_X2, 0xC9u);   // a
-            e.movaps(G610_X3, G610_X1); e.shufps(G610_X3, G610_X3, 0xD2u);   // bb
+            e.movaps(G610_X2, xVs); e.shufps(G610_X2, G610_X2, 0xC9u);       // a
+            e.movaps(G610_X3, xB);  e.shufps(G610_X3, G610_X3, 0xD2u);       // bb
             if (ord.mulDstIsB) { e.mulps(G610_X3, G610_X2); e.movaps(G610_X2, G610_X3); }
             else               { e.mulps(G610_X2, G610_X3); }                // p = a * bb
-            e.movupsLd(G610_X3, G610_RCX, G610_OFF_ACC);                     // acc, read BEFORE
+            g730LoadAccInto(e, G610_X3);                                     // acc, read BEFORE
             e.movaps(G610_X4, G610_X2);
             e.unpckhps(G610_X4, G610_X3);                // {p.z, acc.z, p.w, acc.w}
             e.shufps(G610_X2, G610_X4, 0xC4u);           // {p.x, p.y, p.z, acc.w}
@@ -1114,16 +1184,17 @@ namespace
                 return false;
             }
             usedG611 = true;
-            // flushA -> X3, flushB -> X4 (X5 is the shared second temporary).
-            g611EmitFlushSubnormals(e, G610_X0, G610_X3, G610_X5);
-            g611EmitFlushSubnormals(e, G610_X1, G610_X4, G610_X5);
+            // flushA -> X3, flushB -> X4 (X5 is the shared second temporary). Both operands are
+            // read-only here, so a resident `vs`/`vt` feeds the canonicalisation directly.
+            g611EmitFlushSubnormals(e, xVs, G610_X3, G610_X5);
+            g611EmitFlushSubnormals(e, xB, G610_X4, G610_X5);
             if (d.op == 5u)                              // MAX: chooseA = flushA > flushB
             { e.movaps(G610_X5, G610_X4); e.cmpltps(G610_X5, G610_X3); }
             else                                         // MIN: chooseA = flushA < flushB
             { e.movaps(G610_X5, G610_X3); e.cmpltps(G610_X5, G610_X4); }
             e.movaps(G610_X3, G610_X5);
-            e.andps(G610_X3, G610_X0);                   // chooseA & a
-            e.andnps(G610_X5, G610_X1);                  // ~chooseA & b
+            e.andps(G610_X3, xVs);                       // chooseA & a
+            e.andnps(G610_X5, xB);                       // ~chooseA & b
             e.orps(G610_X3, G610_X5);                    // gpuResult
             e.movapsLd(G610_X4, G610_R11, G610_C_DEST + (int32_t)(16u * dest));
             e.movaps(G610_X5, G610_X4);
@@ -1140,22 +1211,41 @@ namespace
         // history and only the last <=8 FMAC pushes before an exit are live. It is not elided
         // because the prize does not CONVERT — VU1 exceeds every other pole on exactly one of the 23
         // canonical windows, and that window is at the 60 FPS cap (plans/phase-G711-fix-log.md §12).
-        // `H.vec[s]` has a 16-byte stride and x86 SIB scales only to 8, so the byte offset is built
-        // in two steps: RAX = s*8, then an index scaled by 2. RAX is free here — the stamp value is
-        // computed on the next line, after the store. (The oracle caught the scale-1 first version
-        // on its very first block: `[G610:verify-BAD] hist.vec at=0`.)
-        e.lea64Idx(G610_RAX, G610_R10, 8u, 0);
-        e.movupsStXS(histReg, G610_R9, G610_RAX, 2u, G610_OFF_HVEC); // vec[s]
+        // ⭐ G726: ONE entry, ONE cache line, THREE stores (was four, across three lines).
+        //
+        // The entry stride is 32 and x86 SIB scales only to 8, so the byte offset is built in two
+        // steps exactly as before: RAX = s*8, then an index scaled by 4 gives s*32. RAX is free
+        // here - the stamp value is computed on the next line, after the vec store. (The oracle
+        // caught the scale-1 first version of the OLD addressing on its very first block:
+        // `[G610:verify-BAD] hist.vec at=0`. The same oracle covers this change.)
+        //
+        // `dest` and `kind` are now adjacent bytes inside the entry, so the two `mov byte, imm8`
+        // stores fuse into one `mov word, imm16`. Both values are compile-time constants here, so
+        // the fusion is a pure encoding change with no extra work to build the immediate.
+        // ⚠️ R10 CARRIES THE CURSOR PRE-SCALED, as a BYTE OFFSET `slot*32`, not a slot index.
+        // The entry stride is 32 and an x86 SIB scale tops out at 8, so a slot-index cursor would
+        // need a `lea` per push to build `slot*32` - and that scratch is RAX, which is already the
+        // stamp VALUE by the time the stamp store issues. (That is a real bug, not a hypothetical:
+        // the first version of this edit indexed the stamp store at scale 8 off a slot cursor and
+        // would have written every stamp to the wrong entry.) Pre-scaling removes the `lea`
+        // entirely, so all three stores are plain `[R9 + R10 + disp]` at scale 1 and RAX is free.
+        // The prologue shifts left by 5 after loading `head`, the epilogue shifts right by 5 before
+        // storing it back, and the wrap mask is 0xFF because 8 entries * 32 B = 256.
+        e.movupsStXS(histReg, G610_R9, G610_R10, 1u, G610_OFF_HVEC); // e[s].vec
         e.lea64(G610_RAX, G610_R8, (int32_t)pairIndexInBlock);       // stampBase + j
-        e.movSt64X(G610_RAX, G610_R9, G610_R10, 8u, G610_OFF_HSTAMP);
-        e.movStImm8X(G610_R9, G610_R10, G610_OFF_HDEST, dest);
-        e.movStImm8X(G610_R9, G610_R10, G610_OFF_HKIND, G428_MK_PENDING);
-        e.incR32(G610_R10);
-        e.andImm(G610_R10, 7);
+        e.movSt64X(G610_RAX, G610_R9, G610_R10, 1u, G610_OFF_HSTAMP);
+        e.movStImm16X(G610_R9, G610_R10, 1u, G610_OFF_HDEST,
+                      (uint16_t)((uint16_t)dest | ((uint16_t)G428_MK_PENDING << 8)));
+        e.addImm(G610_R10, G610_OFF_HENT);
+        e.andImm(G610_R10, (G430_HIST * G610_OFF_HENT) - 1);
 
-        e.storeDest(G610_X2, G610_RCX,
-                    (d.cls == 1u) ? (G610_OFF_VF + (int32_t)(16u * fd)) : G610_OFF_ACC,
-                    dest, G610_X4, G610_X5);
+        // ⭐ G730: cls 1 writes VF[fd], cls 2 writes ACC. When the target is resident this is a
+        // register move (full dest), a single `movss` (dest == 0x8) or a pure-ALU blend — the
+        // load-modify-store round trip a partial dest costs in the memory form is gone.
+        if (d.cls == 1u)
+            g730StoreVf(e, G610_X2, fd, dest, G610_X4, G610_X5);
+        else
+            g730StoreAcc(e, G610_X2, dest, G610_X4, G610_X5);
         return true;
     }
 
@@ -1220,22 +1310,44 @@ namespace
 
         // ---- VF <-> VI moves ----
         case G422_LK_MOVE:
-            e.movupsLd(G610_X3, G610_RCX, G610_OFF_VF + (int32_t)(16u * is));
-            e.storeDest(G610_X3, G610_RCX, G610_OFF_VF + (int32_t)(16u * it), dest,
-                        G610_X4, G610_X5);
+        {
+            // Read-only source, so a resident VF[is] is used in place and MOVE with a full dest
+            // between two bound registers becomes ONE `movaps`.
+            const unsigned xs = g730SrcVf(e, is, G610_X3);
+            g730StoreVf(e, xs, it, dest, G610_X4, G610_X5);
             return true;
+        }
         case G422_LK_MR32:
-            e.movupsLd(G610_X3, G610_RCX, G610_OFF_VF + (int32_t)(16u * is));
+        {
+            const int bs = g730VfReg(is);
+            if (bs >= 0)
+                e.movaps(G610_X3, (unsigned)bs);
+            else
+                e.movupsLd(G610_X3, G610_RCX, G610_OFF_VF + (int32_t)(16u * is));
             e.shufps(G610_X3, G610_X3, 0x39u);       // {y,z,w,x}
-            e.storeDest(G610_X3, G610_RCX, G610_OFF_VF + (int32_t)(16u * it), dest,
-                        G610_X4, G610_X5);
+            g730StoreVf(e, G610_X3, it, dest, G610_X4, G610_X5);
             return true;
+        }
         case G422_LK_MTIR:   // vi[it] = (int16_t)low16(bits(vf[is][comp]))
         {
             if (it == 0u) return true;
             const unsigned comp = (unsigned)((lower >> 21) & 0x3u);
-            e.movsx16M(G610_RAX, G610_RCX,
-                       G610_OFF_VF + (int32_t)(16u * is) + (int32_t)(4u * comp));
+            // ⛔ G730 CORRECTNESS, not optimisation. This is the ONE compiled site that reads a VF
+            // register as an INTEGER out of the state image, so a resident-and-dirty VF[is] would
+            // make the image stale under it. `pextrw` at word index 2*comp is the LOW half of lane
+            // `comp`, and `movsx r32, r16` completes the interpreter's own
+            // `(int32_t)(int16_t)(value & 0xFFFF)`.
+            const int bs = g730VfReg(is);
+            if (bs >= 0)
+            {
+                e.pextrw(G610_RAX, (unsigned)bs, (uint8_t)(2u * comp));
+                e.movsx16R(G610_RAX, G610_RAX);
+            }
+            else
+            {
+                e.movsx16M(G610_RAX, G610_RCX,
+                           G610_OFF_VF + (int32_t)(16u * is) + (int32_t)(4u * comp));
+            }
             e.storeViRaw(it);
             return true;
         }
@@ -1244,48 +1356,54 @@ namespace
             e.movsx16R(G610_RAX, G610_RAX);
             e.movdToX(G610_X3, G610_RAX);
             e.shufps(G610_X3, G610_X3, 0x00u);
-            e.storeDest(G610_X3, G610_RCX, G610_OFF_VF + (int32_t)(16u * it), dest,
-                        G610_X4, G610_X5);
+            g730StoreVf(e, G610_X3, it, dest, G610_X4, G610_X5);
             return true;
 
         // ---- quadword memory ----
+        //
+        // ⚠️ VU DATA RAM IS A DIFFERENT OBJECT FROM THE VU1State IMAGE. Quadword memory is addressed
+        // through RDX and the state image through RCX, so no LQ/SQ can alias a resident VF or ACC
+        // and residency needs no barrier here — only the VF SIDE of each transfer changes.
         case G422_LK_LQ:
             g610EmitAddrImm(e, is, imm11, dataSize);
             e.movupsLdX(G610_X3, G610_RDX, G610_RAX, 0);
-            e.storeDest(G610_X3, G610_RCX, G610_OFF_VF + (int32_t)(16u * it), dest,
-                        G610_X4, G610_X5);
+            g730StoreVf(e, G610_X3, it, dest, G610_X4, G610_X5);
             return true;
         case G422_LK_LQI:
             g610EmitAddrU16(e, is, dataSize);
             e.movupsLdX(G610_X3, G610_RDX, G610_RAX, 0);
-            e.storeDest(G610_X3, G610_RCX, G610_OFF_VF + (int32_t)(16u * it), dest,
-                        G610_X4, G610_X5);
+            g730StoreVf(e, G610_X3, it, dest, G610_X4, G610_X5);
             g610EmitViStep(e, is, +1);
             return true;
         case G422_LK_LQD:
             g610EmitViStep(e, is, -1);               // the decrement happens FIRST
             g610EmitAddrU16(e, is, dataSize);
             e.movupsLdX(G610_X3, G610_RDX, G610_RAX, 0);
-            e.storeDest(G610_X3, G610_RCX, G610_OFF_VF + (int32_t)(16u * it), dest,
-                        G610_X4, G610_X5);
+            g730StoreVf(e, G610_X3, it, dest, G610_X4, G610_X5);
             return true;
         case G422_LK_SQ:
+        {
             g610EmitAddrImm(e, it, imm11, dataSize);
-            e.movupsLd(G610_X3, G610_RCX, G610_OFF_VF + (int32_t)(16u * is));
-            g610EmitStoreQuadMasked(e, G610_X3, dest);
+            const unsigned xs = g730SrcVf(e, is, G610_X3);
+            g610EmitStoreQuadMasked(e, xs, dest);
             return true;
+        }
         case G422_LK_SQI:
+        {
             g610EmitAddrU16(e, it, dataSize);
-            e.movupsLd(G610_X3, G610_RCX, G610_OFF_VF + (int32_t)(16u * is));
-            g610EmitStoreQuadMasked(e, G610_X3, dest);
+            const unsigned xs = g730SrcVf(e, is, G610_X3);
+            g610EmitStoreQuadMasked(e, xs, dest);
             g610EmitViStep(e, it, +1);
             return true;
+        }
         case G422_LK_SQD:
+        {
             g610EmitViStep(e, it, -1);
             g610EmitAddrU16(e, it, dataSize);
-            e.movupsLd(G610_X3, G610_RCX, G610_OFF_VF + (int32_t)(16u * is));
-            g610EmitStoreQuadMasked(e, G610_X3, dest);
+            const unsigned xs = g730SrcVf(e, is, G610_X3);
+            g610EmitStoreQuadMasked(e, xs, dest);
             return true;
+        }
 
         // ---- 32-bit integer memory ----
         //
@@ -1446,9 +1564,21 @@ namespace
                 anyHist = true;
                 break;
             }
+        // ⭐ G730: choose the host-register residency for this whole block BEFORE any byte is
+        // emitted, and install it for the duration. `G730Scope` is RAII because this function has
+        // a dozen refusal returns and a leaked context would let the NEXT body name pool registers
+        // its own prologue never loaded.
+        G730Ctx g730Ctx;
+        g730PlanBlock(g730Ctx, firstIndex, count);
+        G730Scope g730Scope(&g730Ctx);
+        g730EmitPrologue(e, g730Ctx);
+
         // Reserve the prologue; if `anyHist`, load the ring cursor once (G504's exactness argument).
         if (anyHist)
+        {
             e.movLd32(G610_R10, G610_R9, G610_OFF_HHEAD);
+            e.shlImm(G610_R10, 5); // G726: carry the cursor as a BYTE OFFSET, slot*32
+        }
         e.movImm64(G610_R11, (uint64_t)(uintptr_t)&g610Consts);
 
         int why = G610_RF_ENCODE;
@@ -1497,15 +1627,18 @@ namespace
             // only when the same precomputed bit says a writer of this pair can reach register 0.
             if ((fp.pair.g425Flags & G425_PF_TOUCHES_ZERO) != 0u)
             {
-                e.movapsLd(G610_X4, G610_R11, G610_C_VF0);
-                e.movupsSt(G610_X4, G610_RCX, G610_OFF_VF);
+                g730EmitRepinVf0(e, G610_X4);
                 e.movStImm32(G610_RCX, G610_OFF_VI, 0u);
             }
             if (e.bad)
                 break;
         }
         if (anyHist && usesHist)
+        {
+            e.shrImm(G610_R10, 5); // G726: byte offset -> slot index, the form `head` stores
             e.movSt32(G610_R10, G610_R9, G610_OFF_HHEAD);
+        }
+        g730EmitEpilogue(e, g730Ctx);
         e.ret();
 
         if (e.bad)
@@ -1674,11 +1807,11 @@ namespace
         if (ha.head != hb.head) { *what = "hist.head"; *at = -1; return false; }
         for (int k = 0; k < G430_HIST; ++k)
         {
-            if (std::memcmp(ha.vec[k], hb.vec[k], 16) != 0)
+            if (std::memcmp(ha.e[k].vec, hb.e[k].vec, 16) != 0)
             { *what = "hist.vec"; *at = k; return false; }
-            if (ha.stamp[k] != hb.stamp[k]) { *what = "hist.stamp"; *at = k; return false; }
-            if (ha.dest[k] != hb.dest[k]) { *what = "hist.dest"; *at = k; return false; }
-            if (ha.kind[k] != hb.kind[k]) { *what = "hist.kind"; *at = k; return false; }
+            if (ha.e[k].stamp != hb.e[k].stamp) { *what = "hist.stamp"; *at = k; return false; }
+            if (ha.e[k].dest != hb.e[k].dest) { *what = "hist.dest"; *at = k; return false; }
+            if (ha.e[k].kind != hb.e[k].kind) { *what = "hist.kind"; *at = k; return false; }
         }
         for (uint32_t k = 0u; k < ramBytes; ++k)
             if (ra[k] != rb[k]) { *what = "vuram"; *at = (long)k; return false; }
@@ -1726,6 +1859,10 @@ namespace
                      (unsigned long long)s_g611OpsBlocks, (unsigned long long)s_g611OpsPairs,
                      (unsigned long long)s_g611SplitBlocks, (unsigned long long)s_g611SplitPairs,
                      (unsigned long long)s_g611SplitFail);
+        // G730's translate-time residency census. It is the proof that the allocator actually
+        // reached the emitter: an unarmed run prints `on=0 bound=0`, which a clean control is
+        // otherwise indistinguishable from (Rule 69/90).
+        g730Report();
         std::fflush(stderr);
     }
 

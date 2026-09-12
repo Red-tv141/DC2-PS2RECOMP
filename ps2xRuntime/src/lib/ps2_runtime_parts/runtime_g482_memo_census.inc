@@ -220,14 +220,24 @@ static inline void g482FrameTick()
     ++w.frames;
     if (w.frames < 30u)
         return;
-    const double f = (double)w.frames;
+    // ⛔⛔ G738: `w.frames` counts HOST PRESENT TICKS, not frames — `g_dc2PresentTick` free-runs at
+    // ~58 Hz independently of the guest (G598). This census prints `execAll=%.2fms/f`,
+    // `hash=%.3fms/f` and `NET(exec-hash)=%+.2fms/f`, i.e. millisecond-per-frame figures that get
+    // compared against a frame time, so the units have to match. On a 30 FPS route the old divisor
+    // was ~2x too large and every ms/f here was ~2x too small. Divide by the real rendered-frame
+    // clock and print the ratio (same repair as `[G496:cal]`, `[G480:pkt]` and `[G645:eepool]`).
+    static uint32_t s_lastReal = 0u;
+    const uint32_t realNow = g_dc2RenderedFrame.load(std::memory_order_relaxed);
+    const double realFrames = (double)(realNow - s_lastReal);
+    s_lastReal = realNow;
+    const double f = realFrames > 0.0 ? realFrames : (double)w.frames;
     const uint64_t geom = w.kicks - w.resume;
     std::fprintf(stderr,
                  "[G482:memo] frames=%u kicks/f=%.0f resume/f=%.0f dupIntraFULL/f=%.1f (%.2f%%) "
                  "unsound=%llu | execAll=%.2fms/f execDup=%.2fms/f (%.2f%%) | "
                  "hash=%.3fms/f (%.0f calls/f, %.0fns/call) | restore=%.0fKB/f pkt=%.0fKB/f | "
                  "NET(exec-hash)=%+.2fms/f | weakDup/f=%.1f (%.2f%%) ofWhich dataMatch=%.1f%% "
-                 "regMatch=%.1f%%\n",
+                 "regMatch=%.1f%% | G738 frames=%.0f presentTicks=%u ratio=%.2f\n",
                  w.frames, (double)w.kicks / f, (double)w.resume / f,
                  (double)w.dupIntra / f,
                  geom ? 100.0 * (double)w.dupIntra / (double)geom : 0.0,
@@ -241,6 +251,7 @@ static inline void g482FrameTick()
                  (double)w.weakDup / f,
                  geom ? 100.0 * (double)w.weakDup / (double)geom : 0.0,
                  w.weakDup ? 100.0 * (double)w.weakDataMatch / (double)w.weakDup : 0.0,
-                 w.weakDup ? 100.0 * (double)w.weakRegMatch / (double)w.weakDup : 0.0);
+                 w.weakDup ? 100.0 * (double)w.weakRegMatch / (double)w.weakDup : 0.0,
+                 f, w.frames, f > 0.0 ? (double)w.frames / f : 0.0);
     w = G482Win();
 }

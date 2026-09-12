@@ -50,6 +50,20 @@ struct ProgramHeader
     uint32_t align;
 };
 
+// ⭐⭐⭐ G739: THE DISPATCH HISTORY RING, AT GLOBAL SCOPE.
+//
+// ⛔ It used to be a `thread_local DispatchHistory` INSIDE the anonymous
+// namespace below -- internal linkage, therefore invisible to the 7,807 generated translation
+// units. The inlined call-site dispatch probe (ps2_runtime_macros.h) has to push to the SAME ring
+// as the out-of-line `pushDispatchPc`, or a crash report taken after G739 would print only the
+// dispatches that happened to miss the direct table.
+//
+// ⛔ NO INITIALISER, DELIBERATELY: a namespace-scope `thread_local` without one is
+// zero-initialised with no dynamic init, so MSVC emits a bare TLS access from every reader. Give
+// it `{}` or a constructor and every access in every generated TU grows an `_Init_thread_header`
+// epoch check -- G619's law, which G649 and G651 each had to apply to this very call chain.
+thread_local Ps2DispatchRing g_ps2DispatchRing;
+
 namespace
 {
     constexpr uint32_t kGuestHeapDefaultBase = 0x00100000u;
@@ -110,14 +124,18 @@ namespace
                (static_cast<uint32_t>(pixels[offset + 3u]) << 24);
     }
 
-    struct DispatchHistory
-    {
-        std::array<uint32_t, 64> pcs{};
-        uint32_t next = 0u;
-        bool wrapped = false;
-    };
+    // ⭐ G739: the ring type moved to ps2_runtime_macros.h and the object is EXTERNAL, because the
+    // inlined call-site dispatch probe in generated code pushes to it directly. Two rings would
+    // mean `formatDispatchHistory()` printed only the dispatches that happened to take the slow
+    // path, so a crash report taken after the fix would show a near-empty trace.
+    //
+    // ⛔ NO INITIALISER. A namespace-scope `thread_local` without one is zero-initialised with no
+    // dynamic init; add a constructor and MSVC puts an `_Init_thread_header` epoch check on every
+    // access from every one of the 7,807 generated TUs (G619's law).
+    using DispatchHistory = Ps2DispatchRing;
+    static constexpr uint32_t kDispatchHistorySlots =
+        static_cast<uint32_t>(sizeof(Ps2DispatchRing::pcs) / sizeof(uint32_t));
 
-    thread_local DispatchHistory g_dispatchHistory;
     thread_local std::unordered_map<PS2Runtime *, uint32_t> g_guestExecutionDepths;
 
     // ===== G619: the guest-execution depth cell, without the per-dispatch heap round trip =====
@@ -215,13 +233,11 @@ namespace
     {
         if (!g_g651DispTrace)
             return;
-        DispatchHistory &h = g_dispatchHistory;
-        h.pcs[h.next] = pc;
-        h.next = (h.next + 1u) % static_cast<uint32_t>(h.pcs.size());
-        if (h.next == 0u)
-        {
-            h.wrapped = true;
-        }
+        // ⭐ G739: ONE implementation of the ring write, shared with the inlined call-site probe.
+        // `g_ps2DirectTrace` mirrors `g_g651DispTrace` (set by `g739ArmDispatchFast`), so the
+        // predicate above and the one inside are the same answer -- the duplicate test is a
+        // predicted branch on an already-loaded line, and it buys a single ring writer.
+        ps2PushDispatchPcInline(pc);
 
         // F50.2: env-gated hang locator. When DC2_TRACE_HANG is set, periodically
         // dump the dispatch ring so a no-crash spin loop reveals its repeating cycle.
@@ -240,8 +256,8 @@ namespace
 
     std::string formatDispatchHistory()
     {
-        const DispatchHistory &h = g_dispatchHistory;
-        const uint32_t count = h.wrapped ? static_cast<uint32_t>(h.pcs.size()) : h.next;
+        const DispatchHistory &h = g_ps2DispatchRing;
+        const uint32_t count = h.wrapped ? kDispatchHistorySlots : h.next;
         if (count == 0u)
         {
             return "(empty)";
@@ -251,7 +267,7 @@ namespace
         bool first = true;
         for (uint32_t i = 0u; i < count; ++i)
         {
-            const uint32_t idx = (h.next + h.pcs.size() - count + i) % static_cast<uint32_t>(h.pcs.size());
+            const uint32_t idx = (h.next + kDispatchHistorySlots - count + i) % kDispatchHistorySlots;
             if (!first)
             {
                 oss << " -> ";
@@ -264,8 +280,8 @@ namespace
 
     uint32_t selectDispatchRecoveryPc(const PS2Runtime *runtime)
     {
-        const DispatchHistory &h = g_dispatchHistory;
-        const uint32_t count = h.wrapped ? static_cast<uint32_t>(h.pcs.size()) : h.next;
+        const DispatchHistory &h = g_ps2DispatchRing;
+        const uint32_t count = h.wrapped ? kDispatchHistorySlots : h.next;
         if (count == 0u)
         {
             return 0u;
@@ -274,7 +290,7 @@ namespace
         uint32_t firstHigh = 0u;
         for (uint32_t step = 1u; step <= count; ++step)
         {
-            const uint32_t idx = (h.next + h.pcs.size() - step) % static_cast<uint32_t>(h.pcs.size());
+            const uint32_t idx = (h.next + kDispatchHistorySlots - step) % kDispatchHistorySlots;
             const uint32_t pc = h.pcs[idx];
             if (pc < 0x00100000u)
             {

@@ -191,6 +191,83 @@ namespace
     uint64_t g_g446CallerTotal = 0;
     uint64_t g_g446CallerNone = 0;
 
+    // ===== G733: A REAL UNWIND BESIDE THE SCAN =====
+    //
+    // WHY. The scan below takes the FIRST qword above Rsp that lands in our code section. On a
+    // thread that is PARKED, every live frame belongs to ntdll, so the first in-image qword the scan
+    // can reach is whatever DEAD guest frame happens to lie beyond the live ones. G733 caught this:
+    // on `dungeon1` the table read `20.24% n=10633 Alloc__9mgCMemoryFi_0x139d20+0x904` against a
+    // `NtWaitForAlertByThreadId` leaf of 20.87% n=10965 - a near-perfect join, and false. That guest
+    // function is 28 instructions (4 daddu, 4 lw, 3 b, 3 addiu, 2 addu, 2 ld, 1 jal, 1 jr, ...) with
+    // NO loop, NO syscall and NO wait; its single `jal` is a printf failure path. A bump allocator
+    // cannot be the live caller of a 20% block.
+    //
+    // So the error concentrates exactly on WAIT leaves - the samples whose counterparty we most want
+    // to name. RtlLookupFunctionEntry + RtlVirtualUnwind is the real x64 unwinder and cannot walk
+    // into a dead frame.
+    //
+    // ARMED BY DC2_G733_UNWIND=1, and it does NOT replace the scan: both run, both are reported, and
+    // agree/disagree are counted. The DISAGREEMENT RATE is the evidence; a silent swap would prove
+    // nothing. Cost is paid only when armed (CONTEXT_INTEGER is also requested then, because
+    // RtlVirtualUnwind needs the nonvolatiles to restore them).
+    //
+    // ATTENTION - deadlock surface, bounded deliberately. RtlLookupFunctionEntry can take the
+    // loader's inverted-function-table lock; if the SUSPENDED thread holds it exclusively (mid
+    // LoadLibrary) the sampler would block. This is a diagnostic-only path, never in the deliverable,
+    // it starts after DC2_G563_SAMPLE_DELAY_SEC, and the walk is capped at kG733MaxFrames.
+    constexpr int kG733MaxFrames = 32;
+    G446Bucket g_g733UnwTable[kG446Slots]{};
+    uint64_t g_g733UnwTotal = 0;   // out-of-exe samples the unwinder was run on
+    uint64_t g_g733UnwNone = 0;    // ... where it found no in-image frame at all
+    uint64_t g_g733Agree = 0;      // scan and unwind named the same address
+    uint64_t g_g733Disagree = 0;   // ... named different addresses (both non-zero)
+
+    bool g733UnwindOn()
+    {
+        static const bool on = (std::getenv("DC2_G733_UNWIND") != nullptr);
+        return on;
+    }
+
+    // Walks up from the captured context and returns the first frame whose Rip is in our code
+    // section. Takes CONTEXT BY VALUE: RtlVirtualUnwind mutates it. Must be called while the target
+    // is still SUSPENDED - it reads that thread's live stack.
+    uint64_t g733FirstInImageFrame(CONTEXT c, uint64_t lo, uint64_t hi)
+    {
+        for (int frame = 0; frame < kG733MaxFrames; ++frame)
+        {
+            const uint64_t rip = static_cast<uint64_t>(c.Rip);
+            if (rip == 0ull)
+                return 0ull;
+            if (rip >= lo && rip < hi)
+                return rip;
+
+            DWORD64 imageBase = 0;
+            PRUNTIME_FUNCTION rf = RtlLookupFunctionEntry(static_cast<DWORD64>(rip), &imageBase, nullptr);
+            if (rf == nullptr)
+            {
+                // Leaf function: no unwind data, the return address sits at [Rsp]. Read it the same
+                // defensive way the scan does, so a bad Rsp returns FALSE instead of faulting inside
+                // the sampler thread.
+                uint64_t ra = 0;
+                SIZE_T got = 0;
+                if (!ReadProcessMemory(GetCurrentProcess(),
+                                       reinterpret_cast<LPCVOID>(static_cast<uintptr_t>(c.Rsp)),
+                                       &ra, sizeof(ra), &got) ||
+                    got != sizeof(ra) || ra == 0ull)
+                    return 0ull;
+                c.Rip = static_cast<DWORD64>(ra);
+                c.Rsp += sizeof(uint64_t);
+                continue;
+            }
+
+            PVOID handlerData = nullptr;
+            ULONG64 establisher = 0;
+            RtlVirtualUnwind(UNW_FLAG_NHANDLER, imageBase, static_cast<DWORD64>(rip), rf,
+                             &c, &handlerData, &establisher, nullptr);
+        }
+        return 0ull;
+    }
+
     // G619: the stack scan accepted any qword inside the IMAGE, and SizeOfImage covers .rdata and
     // .data as well as .text. On the EE thread that let a stale DATA pointer (a vtable, a string
     // literal, a global's address left in the frame) win over the real return address: 63% of the
@@ -276,8 +353,37 @@ namespace
         std::snprintf(out, outLen, "0x%llx", static_cast<unsigned long long>(rip));
     }
 
-    // Function start for a rip: SymFromAddr's symbol base, so every PC inside one function folds
-    // into one row. Falls back to the module base (system DLLs without exported detail).
+    // ⛔⛔⛔ G736: THE FOLD HAD NO EXTENT CHECK, AND IT MISNAMED THE POLE THREAD'S BIGGEST ROW.
+    //
+    // G478's comment 240 lines below already states the law — "a public-symbol name is a
+    // hypothesis; every `static` folds into the preceding exported symbol" — but this function
+    // returned `sym->Address` UNCONDITIONALLY, so a fold was indistinguishable from a hit and the
+    // bucket key itself became the wrong function. G735 §6.0's executor distribution, the only
+    // profile ever taken of the current pole thread, therefore reads:
+    //
+    //     4.62% n=465 rip=0x7ff69fa4c6fc g477RunWriteArm+0x0
+    //
+    // `g477RunWriteArm` in that exact binary is **4 bytes** (`or eax,-1 ; ret`) and has **ZERO
+    // callers** — verified by scanning every `E8`/`E9` rel32 in `.text` for its address. It cannot
+    // execute at all, let alone hold 4.62% of a thread. The symbol 4 bytes later is
+    // `GSMem::g477RunWriteP4<false>`, the PSMT4 IMAGE run writer, which G477's own header measured
+    // at 3.92% of the GS worker. Same shape for `g672RowPairArm` (8 B, 0 callers, 0.58%) → the row
+    // belongs to `g419PackFbRows`.
+    //
+    // ⛔ AND THE ESCAPE HATCH G478 BUILT FOR EXACTLY THIS WAS SILENTLY DEAD: the run emitted
+    // **zero** `[G446:execprofline]` rows, i.e. `SymGetLineFromAddr64` failed on every one of the
+    // 40 top rows, so nothing contradicted the folded names. A `lineOk=` health field now reports
+    // that instead of leaving it invisible (`lineOk=0/N` means the loaded PDB carries publics but
+    // no private/line info, and EVERY name in the table is a fold).
+    //
+    // Two repairs, both here:
+    //   1. `sym->Size` is checked. A match whose extent cannot cover `disp` is NOT a hit, so the
+    //      PC keeps its own identity instead of being merged into a neighbour's bucket.
+    //   2. every row prints its PREFERRED-BASE RVA (`rva=`), which is a FACT the linker `/MAP`
+    //      resolves exactly — `tools/g736_resolve_pcsample.py`. The name stays a hypothesis.
+    //
+    // Rule (G736-1): a symboliser that folds must publish the extent it folded over, or the fold
+    // is unfalsifiable.
     uint64_t g446FuncBase(uint64_t rip)
     {
         alignas(SYMBOL_INFO) char buf[sizeof(SYMBOL_INFO) + 511];
@@ -287,8 +393,24 @@ namespace
         sym->MaxNameLen = 511;
         DWORD64 disp = 0;
         if (SymFromAddr(GetCurrentProcess(), static_cast<DWORD64>(rip), &disp, sym) != FALSE)
-            return static_cast<uint64_t>(sym->Address);
+        {
+            // Size == 0 means the symbol carries no extent (publics-only PDB, or a DLL export), so
+            // the fold is a guess in BOTH directions and the address is kept as-is rather than
+            // merged. Size > 0 with disp inside it is a genuine containment.
+            if (sym->Size != 0 && disp < static_cast<DWORD64>(sym->Size))
+                return static_cast<uint64_t>(sym->Address);
+            return rip;
+        }
         return rip;
+    }
+
+    // Preferred-base RVA of an in-image PC — the one value in this report that no symbol fold can
+    // corrupt. 0 for anything outside our image (those rows already print module+RVA).
+    uint64_t g736PrefRva(uint64_t rip)
+    {
+        return (rip >= g_g446ExeLo && rip < g_g446ExeHi)
+                   ? (rip - g_g446ExeLo + 0x140000000ull)
+                   : 0ull;
     }
 
     bool g563RawPcOnlyOn()
@@ -314,7 +436,17 @@ namespace
             if (g_g446StageCount[s] == 0)
                 continue;
             std::fprintf(stderr,
-                         "[G446:stage]   %-15s %5.2f%% n=%llu ofWhichKernelWait=%5.2f%%\n",
+                         // ⛔ G737: this field was called `ofWhichKernelWait`, and it is NOT a wait
+                         // measure — `g_g446StageWait[s]` counts samples whose `rip` fell OUTSIDE
+                         // THIS IMAGE (see the increment beside g_g446StageCount). On a thread that
+                         // owns the GL context that set includes the display driver's own CPU: this
+                         // session's `[G737:pair]` joint table resolves 4.22% of the executor to
+                         // `NtQueryInformationThread` called from `G178Backend::renderBatch` and
+                         // 3.47% from `g433DoReadPixels` — driver work, not parking. G736 §6.0 had
+                         // to correct that misreading in prose after the fact; the field now says
+                         // what it counts, so the correction does not have to be remembered.
+                         "[G446:stage]   %-15s %5.2f%% n=%llu ofWhichOutOfExe=%5.2f%%"
+                         " (NOT a wait: includes driver CPU — split it with DC2_G737_PAIRS=1)\n",
                          g446StageName(s),
                          100.0 * static_cast<double>(g_g446StageCount[s]) / denom,
                          static_cast<unsigned long long>(g_g446StageCount[s]),
@@ -492,6 +624,76 @@ namespace
                              static_cast<unsigned long long>(craw[i].count),
                              static_cast<unsigned long long>(pref), file, lineNo, cname);
             }
+
+            // ===== G733: the same table, built by a REAL UNWIND, printed beside the scan =====
+            // Rule 69/90: print the population and the self-check beside the result. The
+            // agree/disagree split IS the result - it measures how wrong the scan is, rather than
+            // quietly replacing it with an answer the reader cannot check.
+            if (g733UnwindOn())
+            {
+                static G446Bucket uraw[32];
+                size_t nU = 0;
+                for (size_t i = 0; i < kG446Slots; ++i)
+                {
+                    const G446Bucket &b = g_g733UnwTable[i];
+                    if (b.count == 0)
+                        continue;
+                    if (nU < 32)
+                    {
+                        uraw[nU++] = b;
+                    }
+                    else
+                    {
+                        size_t lowest = 0;
+                        for (size_t k = 1; k < nU; ++k)
+                            if (uraw[k].count < uraw[lowest].count)
+                                lowest = k;
+                        if (b.count > uraw[lowest].count)
+                            uraw[lowest] = b;
+                    }
+                }
+                std::sort(uraw, uraw + nU,
+                          [](const G446Bucket &a, const G446Bucket &b) { return a.count > b.count; });
+
+                const double uden = (g_g733Agree + g_g733Disagree) > 0
+                                        ? static_cast<double>(g_g733Agree + g_g733Disagree)
+                                        : 1.0;
+                std::fprintf(stderr,
+                             "[G733:unwind] unwound=%llu noFrame=%llu  agree=%llu disagree=%llu "
+                             "(disagreeRate=%5.2f%% of comparable)  maxFrames=%d\n",
+                             static_cast<unsigned long long>(g_g733UnwTotal),
+                             static_cast<unsigned long long>(g_g733UnwNone),
+                             static_cast<unsigned long long>(g_g733Agree),
+                             static_cast<unsigned long long>(g_g733Disagree),
+                             100.0 * static_cast<double>(g_g733Disagree) / uden,
+                             kG733MaxFrames);
+                for (size_t i = 0; i < nU; ++i)
+                {
+                    const uint64_t pref = (g_g446ExeLo != 0 && uraw[i].rip >= g_g446ExeLo &&
+                                           uraw[i].rip < g_g446ExeHi)
+                                              ? uraw[i].rip - g_g446ExeLo + 0x140000000ull
+                                              : 0ull;
+                    char uname[560];
+                    g446Symbolize(uraw[i].rip, uname, sizeof(uname));
+                    IMAGEHLP_LINE64 uline{};
+                    uline.SizeOfStruct = sizeof(uline);
+                    DWORD uDisp = 0;
+                    const char *ufile = "?";
+                    unsigned long uLineNo = 0ul;
+                    if (SymGetLineFromAddr64(GetCurrentProcess(), static_cast<DWORD64>(uraw[i].rip),
+                                             &uDisp, &uline) != FALSE &&
+                        uline.FileName != nullptr)
+                    {
+                        const char *base = std::strrchr(uline.FileName, '\\');
+                        ufile = base ? base + 1 : uline.FileName;
+                        uLineNo = uline.LineNumber;
+                    }
+                    std::fprintf(stderr, "[G733:unwcaller] %5.2f%% n=%llu pref=0x%llx %s:%lu  %s\n",
+                                 100.0 * static_cast<double>(uraw[i].count) / denom,
+                                 static_cast<unsigned long long>(uraw[i].count),
+                                 static_cast<unsigned long long>(pref), ufile, uLineNo, uname);
+                }
+            }
         }
     }
 
@@ -563,7 +765,17 @@ namespace
             if (g_g446StageCount[s] == 0)
                 continue;
             std::fprintf(stderr,
-                         "[G446:stage]   %-15s %5.2f%% n=%llu ofWhichKernelWait=%5.2f%%\n",
+                         // ⛔ G737: this field was called `ofWhichKernelWait`, and it is NOT a wait
+                         // measure — `g_g446StageWait[s]` counts samples whose `rip` fell OUTSIDE
+                         // THIS IMAGE (see the increment beside g_g446StageCount). On a thread that
+                         // owns the GL context that set includes the display driver's own CPU: this
+                         // session's `[G737:pair]` joint table resolves 4.22% of the executor to
+                         // `NtQueryInformationThread` called from `G178Backend::renderBatch` and
+                         // 3.47% from `g433DoReadPixels` — driver work, not parking. G736 §6.0 had
+                         // to correct that misreading in prose after the fact; the field now says
+                         // what it counts, so the correction does not have to be remembered.
+                         "[G446:stage]   %-15s %5.2f%% n=%llu ofWhichOutOfExe=%5.2f%%"
+                         " (NOT a wait: includes driver CPU — split it with DC2_G737_PAIRS=1)\n",
                          g446StageName(s),
                          100.0 * static_cast<double>(g_g446StageCount[s]) / denom,
                          static_cast<unsigned long long>(g_g446StageCount[s]),
@@ -576,6 +788,7 @@ namespace
         // sample actually landed on, which no fold can corrupt. Printed for the fn-base rip AND
         // for that function's single hottest raw PC, since the base of a folded row belongs to the
         // wrong function while the hot PC belongs to the real one.
+        size_t g736LineOk = 0;
         for (size_t i = 0; i < nTop; ++i)
         {
             char name[560];
@@ -600,19 +813,52 @@ namespace
             if (SymGetLineFromAddr64(GetCurrentProcess(), static_cast<DWORD64>(hotPc), &lineDisp,
                                      &line) != FALSE)
             {
+                ++g736LineOk;
                 const char *base = line.FileName ? std::strrchr(line.FileName, '\\') : nullptr;
-                std::fprintf(stderr, "[G446:%sline]   %5.2f%% hotPc=0x%llx n=%llu %s:%lu\n",
+                std::fprintf(stderr,
+                             "[G446:%sline]   %5.2f%% hotPc=0x%llx hotRva=0x%llx n=%llu %s:%lu\n",
                              g_g446Label,
                              100.0 * static_cast<double>(top[i].count) / denom,
                              static_cast<unsigned long long>(hotPc),
+                             static_cast<unsigned long long>(g736PrefRva(hotPc)),
                              static_cast<unsigned long long>(hotN),
                              base ? base + 1 : line.FileName, line.LineNumber);
             }
-            std::fprintf(stderr, "[G446:%s]   %5.2f%% n=%llu rip=0x%llx %s\n", g_g446Label,
+            // ⭐ G736: `rva=` is the preferred-base address and is a FACT — resolve it against the
+            // `/MAP` whose TIMESTAMP matches this binary (FINAL §10) with
+            // tools/g736_resolve_pcsample.py. `hotRva=` is the same for the bucket's hottest raw
+            // PC, which is the one that belongs to the REAL function when the name is a fold.
+            // The trailing name is a hypothesis; `sz=` is the extent DbgHelp claims for it, and
+            // `sz=0` means it claimed none, i.e. the fold is unbounded in both directions.
+            uint64_t symSize = 0u;
+            {
+                alignas(SYMBOL_INFO) char sbuf[sizeof(SYMBOL_INFO) + 511];
+                SYMBOL_INFO *s = reinterpret_cast<SYMBOL_INFO *>(sbuf);
+                std::memset(s, 0, sizeof(SYMBOL_INFO));
+                s->SizeOfStruct = sizeof(SYMBOL_INFO);
+                s->MaxNameLen = 511;
+                DWORD64 d = 0;
+                if (SymFromAddr(GetCurrentProcess(), static_cast<DWORD64>(top[i].rip), &d, s))
+                    symSize = static_cast<uint64_t>(s->Size);
+            }
+            std::fprintf(stderr,
+                         "[G446:%s]   %5.2f%% n=%llu rip=0x%llx rva=0x%llx hotRva=0x%llx sz=%llu %s\n",
+                         g_g446Label,
                          100.0 * static_cast<double>(top[i].count) / denom,
                          static_cast<unsigned long long>(top[i].count),
-                         static_cast<unsigned long long>(top[i].rip), name);
+                         static_cast<unsigned long long>(top[i].rip),
+                         static_cast<unsigned long long>(g736PrefRva(top[i].rip)),
+                         static_cast<unsigned long long>(g736PrefRva(hotPc)),
+                         static_cast<unsigned long long>(symSize), name);
         }
+        // ⛔ THE HEALTH LINE THIS REPORT NEVER HAD. G478 built the FILE:LINE fallback precisely
+        // because the names are folds — and in G735's executor run it produced ZERO rows and
+        // nobody noticed, so 40 folded names went into the ledger unchallenged. `lineOk=0/N` means
+        // the loaded PDB has publics but no private/line info: every name below is a fold and only
+        // `rva=`/`hotRva=` are usable.
+        std::fprintf(stderr, "[G446:%ssym] lineOk=%zu/%zu  (0 => every name in this table is a fold;"
+                             " resolve rva= against the timestamp-matching .map)\n",
+                     g_g446Label, g736LineOk, nTop);
 
         // G503: OUR CALL SITES for every sample that landed outside our image. See the
         // g446RecordInto note above for why (35% of the EE thread was unattributable DLL leaves)
@@ -675,6 +921,11 @@ namespace
                              static_cast<unsigned long long>(pref), cname);
             }
         }
+
+        // ⭐ G737: the JOINT table, printed immediately after the two marginals it joins so a reader
+        // can check it against them. Self-gated on DC2_G737_PAIRS; `denom` is this sampler's own
+        // total, so its percentages are directly comparable with both tables above.
+        g737ReportPairs(g_g446Label, denom, g_g446ExeLo, g_g446ExeHi);
 
         // G483: RAW-PC report in PREFERRED-BASE form (DC2_G483_RAWPC=1).
         //
@@ -749,17 +1000,21 @@ namespace
 
         CONTEXT ctx;
         uint64_t stackWin[kG446StackWords];
+        const bool unwindOn = g733UnwindOn();   // G733: read once, never per sample
         for (;;)
         {
             std::this_thread::sleep_for(std::chrono::microseconds(periodUs));
             if (SuspendThread(target) == static_cast<DWORD>(-1))
                 break; // target gone
             std::memset(&ctx, 0, sizeof(ctx));
-            ctx.ContextFlags = CONTEXT_CONTROL;
+            // G733: RtlVirtualUnwind restores nonvolatile integer registers, so it needs them.
+            ctx.ContextFlags = unwindOn ? (CONTEXT_CONTROL | CONTEXT_INTEGER) : CONTEXT_CONTROL;
             const BOOL ok = GetThreadContext(target, &ctx);
             // G503: grab the stack window BEFORE resuming — after ResumeThread the frame is gone.
             // Only for out-of-exe rips, which is the only case that needs a caller.
             size_t nStack = 0;
+            uint64_t unwCaller = 0ull;
+            bool unwRan = false;
             if (ok && (static_cast<uint64_t>(ctx.Rip) < g_g446ExeLo ||
                        static_cast<uint64_t>(ctx.Rip) >= g_g446ExeHi))
             {
@@ -770,6 +1025,14 @@ namespace
                     got >= sizeof(uint64_t))
                 {
                     nStack = static_cast<size_t>(got / sizeof(uint64_t));
+                }
+                // G733: the real unwind, run HERE because it reads the suspended thread's stack.
+                if (unwindOn)
+                {
+                    const uint64_t ulo = (g_g619CodeHi != 0ull) ? g_g619CodeLo : g_g446ExeLo;
+                    const uint64_t uhi = (g_g619CodeHi != 0ull) ? g_g619CodeHi : g_g446ExeHi;
+                    unwCaller = g733FirstInImageFrame(ctx, ulo, uhi);
+                    unwRan = true;
                 }
             }
             ResumeThread(target);
@@ -797,6 +1060,32 @@ namespace
                         g446RecordInto(g_g446CallerTable, caller, nullptr);
                     else
                         ++g_g446CallerNone;
+
+                    // ⭐ G737: the JOINT (leaf x call site) table. The two tables above are
+                    // independent one-dimensional histograms, so a reader pairing row 1 of one with
+                    // row 1 of the other is guessing — and on this thread that guess is wrong in a
+                    // specific, expensive way: `NtWaitForAlertByThreadId` (a park) and
+                    // `NtQueryInformationThread` (a non-blocking query, i.e. COST) share the same
+                    // undifferentiated 84% of out-of-exe samples. Defined in the cold pipeline TU.
+                    g737NotePair(rip, unwCaller, caller);
+
+                    // G733: record the unwinder's answer in its OWN table and score the agreement.
+                    // Both tables are reported; the disagreement rate is the finding.
+                    if (unwRan)
+                    {
+                        ++g_g733UnwTotal;
+                        if (unwCaller != 0ull)
+                            g446RecordInto(g_g733UnwTable, unwCaller, nullptr);
+                        else
+                            ++g_g733UnwNone;
+                        if (caller != 0ull && unwCaller != 0ull)
+                        {
+                            if (caller == unwCaller)
+                                ++g_g733Agree;
+                            else
+                                ++g_g733Disagree;
+                        }
+                    }
                 }
                 int stage = 7;
                 if (g_g446Stage != nullptr)
@@ -915,6 +1204,43 @@ void g503RegisterEeThread()
     static const bool s_on = (std::getenv("DC2_G503_EEPROF") != nullptr);
     if (!s_on)
         return;
-    g446ArmSamplerOnThisThread(nullptr, "eeprof");
+    // G733: wire the breadcrumb this file's stage table was built for. ps2_gif_arbiter.cpp already
+    // stores 1/2/3 into g_g189EEStage around every EE-side block (m_cvSpace, m_cvFrameSlot,
+    // waitRegisterSlot) and restores 0 after; passing nullptr here filed every EE sample under
+    // stage 7 and discarded that classification. With it wired, g_g446StageWait[] names WHICH EE
+    // wait the out-of-exe samples belong to - the question the caller table cannot answer.
+    extern std::atomic<int> *g189_ee_stage_slot();
+    g446ArmSamplerOnThisThread(g189_ee_stage_slot(), "eeprof");
+#endif
+}
+
+// ===== G735: the same sampler, pointed at the G713/G721 EXECUTOR thread ========================
+//
+// ⭐⭐⭐ THE THREAD NOBODY HAS EVER SAMPLED. `g446RegisterGsWorkerThread` is called from the GS
+// worker's own entry in ps2_gif_arbiter.cpp — which, since G721 split the GS front end, is the
+// PARSE thread. The EXECUTOR is a different thread with a different body, and G734 measured it at
+// 17.9 ms/f and 90% occupancy against a 20.0 ms/f frame: it IS the pole, and no distribution of it
+// exists.
+//
+// This matters more than "one more instrument". G735 §5.6 showed the only decomposition the phase
+// had — `[G720:cpu]`'s inlined lap timer — attributes CODE MOTION rather than code in a /GL /LTCG
+// PGO build: its `residb` span charges 2.1 ms/f to 124 lines whose only call fires ONCE per route.
+// A PC sampler has the opposite failure mode (Rule 45: it ranks code DENSITY, and its absolute
+// frame numbers are inadmissible) but it cannot be fooled by inlining or reordering, because it
+// reads the instruction pointer that is actually executing.
+//
+// Singleton, exactly like the other three instances: arm at most one of DC2_G446_GSPROF /
+// DC2_G478_VU1PROF / DC2_G503_EEPROF / DC2_G735_EXECPROF per run.
+//
+// ⚠️ G732's map trap applies when resolving the rips: `build64/Release/dc2_runner.map` usually
+// describes the last EXPERIMENTAL link, not the deliverable. Resolve against the .map that
+// tools/g730_build.ps1 copied beside the exe being run, matched by timestamp.
+void g735RegisterExecThread()
+{
+#ifdef _WIN32
+    static const bool s_on = (std::getenv("DC2_G735_EXECPROF") != nullptr);
+    if (!s_on)
+        return;
+    g446ArmSamplerOnThisThread(nullptr, "execprof");
 #endif
 }

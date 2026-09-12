@@ -144,12 +144,14 @@ __declspec(noinline) bool dc2_g665_vu_pipe_restore(const uint8_t *in, size_t byt
     s_g428PreMac = r.u32();
     s_g428Armed = r.u32() != 0u;
 
-    for (auto &vec : s_g430HB.vec)
-        for (float &v : vec) v = r.f32();
-    for (int64_t &v : s_g430HB.stamp) v = static_cast<int64_t>(r.u64());
-    for (uint32_t &v : s_g430HB.mac) v = r.u32();
-    for (uint8_t &v : s_g430HB.dest) v = static_cast<uint8_t>(r.u32());
-    for (uint8_t &v : s_g430HB.kind) v = static_cast<uint8_t>(r.u32());
+    // G726: field-major order, matching vu1_g541_pipeline_snapshot.inc's writer byte for byte.
+    // The ring is an array of entries now; the SERIALISED FORM is deliberately unchanged.
+    for (auto &E : s_g430HB.e)
+        for (float &v : E.vec) v = r.f32();
+    for (auto &E : s_g430HB.e) E.stamp = static_cast<int64_t>(r.u64());
+    for (auto &E : s_g430HB.e) E.mac = r.u32();
+    for (auto &E : s_g430HB.e) E.dest = static_cast<uint8_t>(r.u32());
+    for (auto &E : s_g430HB.e) E.kind = static_cast<uint8_t>(r.u32());
     s_g430HB.head = static_cast<int>(r.u32());
     s_g430PairBase = static_cast<int64_t>(r.u64());
     s_g430HistArmed = r.u32() != 0u;

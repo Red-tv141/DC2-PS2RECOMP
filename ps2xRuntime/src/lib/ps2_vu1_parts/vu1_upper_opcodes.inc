@@ -63,7 +63,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                              "g430hb=%llu/%zu g430vec=%llu g428pend=%llu g428pre=%llu "
                              "vucode=%llu vudata=%llu sizeof(VU1State)=%zu\n",
                              m64(&m_state), alignof(VU1State), m64(m_state.vf), m64(m_state.acc),
-                             m64(&s_g430HB), alignof(G430HistBlock), m64(s_g430HB.vec),
+                             m64(&s_g430HB), alignof(G430HistBlock), m64(s_g430HB.e[0].vec),
                              m64(s_g428PendVec), m64(s_g428PreVec),
                              m64(vuCode), m64(vuData), sizeof(VU1State));
                 std::fflush(stderr);
@@ -747,7 +747,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
     if (g430Hist && !s_g430HistArmed)
     {
         for (int i = 0; i < G430_HIST; ++i)
-            s_g430HB.stamp[i] = INT64_MIN;
+            s_g430HB.e[i].stamp = INT64_MIN;
         s_g430HB.head = 0;
         // Resolve the deferred ring in place first (oldest-first CARRY propagation), so every
         // slot below is a plain value.

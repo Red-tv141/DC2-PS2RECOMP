@@ -762,6 +762,29 @@
                 // translate-time property carried in the same slot record the line above loaded.
                 // The first bring-up run refused 62% of entries on the naive `qd == 0 && pd == 0`
                 // form — `[G612:why] skipQp = 6,877,254` against `runs = 4,194,304`.
+                // ⛔⛔⛔ G731 WAS BUILT HERE, MEASURED, AND REVERTED UNDER RULE 31. Do not rebuild
+                // it. "Publish a DUE (qd == 1) Q at this gate instead of refusing the entry" is
+                // EXACT — proved over 8,000,000 blocks + 6,000,000 regions with `bad=0` — and it
+                // does exactly what it claims: `skipQp` 216.5 M -> 136.5 M (-37%) and region
+                // `runs` 167.8 M -> 260.0 M (+55%) on `dragon`.
+                //
+                // ⛔ AND IT IS A REGRESSION, because the population it recovers is the wrong SHAPE.
+                // Those 92.3 M extra entries carried only +299 M pairs = **3.24 pairs per recovered
+                // entry** (`[G612:reg] avg` 38.91 -> 26.26), and the reason is structural: qd == 1
+                // means a DIV issued six pairs ago, so the admitted region runs until the NEXT DIV,
+                // which is itself an exit. The bucket is *the short gaps between divides*.
+                // A G610 BLOCK has no prologue at all (G610 §2); a G612 REGION has three pushes,
+                // the 5th-argument load and budget setup. A region earns that back with native
+                // back-edges over a LOOP, and a 3.24-pair run has no loop — so the lever moved
+                // ~299 M pairs off a zero-prologue path onto a prologue-bearing one.
+                // MEASURED: `[G483:runprof] loopNsPerPair` 8.5197 -> 8.7943 (**+0.2746 ns/pair,
+                // +3.2%, about +0.81 ms/f**) at `pairs/call` identity of 0.00%.
+                //
+                // ⚠️ THE HEADLINE COUNTERS READ AS A WIN ("skipQp -37%, entries +55%, exact over
+                // 211 M pairs"). The number that decides it is PAIRS PER RECOVERED ENTRY, which only
+                // the paired admission census produces. Full evidence: plans/phase-G730-plan.md
+                // §12.2-§12.5. The `[G731:skipqd]` census below is retained because it is what
+                // priced the direction; the lever itself is gone.
                 if (*s_qDelayP == 0 || s_g612.slot[currentPc >> 3u].readsQ == 0u)
                 {
                     const uint32_t g612N =
@@ -781,7 +804,28 @@
                     }
                 }
                 else
+                {
                     ++s_g612SkipQp;
+                    // ⭐ G731 CENSUS (translate-free, stat-gated, never in a timing run). `skipQp`
+                    // is the LARGEST admission loss in this backend — 258,714,781 refusals against
+                    // 197,132,288 successful region runs on `dragon`, i.e. 57% of entry attempts,
+                    // barely better than the 62% the naive pre-`readsQ` form refused.
+                    //
+                    // But "a Q publication is pending" is not one population, it is a DISTRIBUTION
+                    // over `qDelay`, and one bucket of it is trivially recoverable: a counter
+                    // holding 1 publishes BEFORE the next pair, so the entry could simply publish
+                    // it and proceed — which is exactly what the BLOCK path already does
+                    // (`g610QpSingleSegment`: `if (qd == 1) { qd = 0; st.q = s_vuQPending; }`).
+                    // Whether that is worth building depends entirely on how much of the 57% sits
+                    // in bucket 1, and nothing has ever measured it. Bucket the value here.
+                    if (g612StatOn())
+                    {
+                        const int g731Qd = *s_qDelayP;
+                        ++s_g731SkipQd[(g731Qd >= 0 && g731Qd < (int)G731_QD_BUCKETS)
+                                           ? (size_t)g731Qd
+                                           : (G731_QD_BUCKETS - 1u)];
+                    }
+                }
             }
 #endif
 #if DC2_G532_FLAGHEAD

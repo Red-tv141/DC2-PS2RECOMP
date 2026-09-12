@@ -67,6 +67,92 @@ namespace
 
 namespace
 {
+    // ===== G724: IS THE UPLOAD WRITING BYTES THAT ARE ALREADY THERE? ============================
+    //
+    // G704's upload-redundancy note states the premise and the arithmetic: DC2 re-uploads the same
+    // textures every frame and the G424/G477 headers call them "usually byte-identical", which is
+    // why `g178GenSumRect`'s page generations are bumped spuriously and the content-hash tier of
+    // `tex` exists at all. It also settled the DESIGN: a per-upload digest loses to a COMPARE,
+    // because a compare is traffic-neutral at the write (it reads the destination it was about to
+    // overwrite) and pays only on uploads rather than on every consumer. It was never built,
+    // because the census that decides it was compile-time only.
+    //
+    // ⭐ WHAT MAKES IT WORTH BUILDING NOW: under G721 the whole upload path runs on the EXECUTOR,
+    // which is the pole, while the PARSE thread sits blocked ~10 ms/f. Anything this compare can
+    // prove is redundant is work deleted from the pole. And 99.99% of uploaded bytes now go through
+    // the block path (`[G706:block] share=99.99%`), so ONE place sees essentially all of them.
+    //
+    // Two arms, deliberately separate:
+    //   DC2_G724_UPSTAT=1  census only - compare, then store unconditionally. BEHAVIOUR-PURE, so
+    //                      the share it reports is the share the shipped path would have seen.
+    //   DC2_G724_UPSKIP=1  compare, and skip the store when the block is byte-identical. Skipping
+    //                      a store of bytes already present cannot change VRAM; what it changes is
+    //                      that the destination line is not dirtied and not written back.
+    //
+    // ⛔ This does NOT yet skip `g149BumpVramGen` or the g178 write-rect note - those run BEFORE
+    // the writer and would need the compare hoisted ahead of them. That is the phase-2 lever this
+    // census exists to price, and it is the one with the flush-count consequence.
+    bool g724UpStatOn()
+    {
+        static const bool v = [] {
+            const char *e = std::getenv("DC2_G724_UPSTAT");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        return v;
+    }
+    bool g724UpSkipOn()
+    {
+        static const bool v = [] {
+            const char *e = std::getenv("DC2_G724_UPSKIP");
+            return e != nullptr && e[0] != '\0' && e[0] != '0';
+        }();
+        return v;
+    }
+
+    // Plain counters: under the pipeline every upload runs on the executor, and outside it on the
+    // GS thread. A census race would cost a report digit, never behaviour.
+    uint64_t g_g724Blocks = 0u, g_g724Same = 0u, g_g724Calls = 0u;
+
+    inline void g724Report()
+    {
+        if ((++g_g724Calls & 8191u) != 0u)
+            return;
+        std::fprintf(stderr, "[G724:upskip] calls=%llu blocks=%llu identical=%llu (%.2f%%)\n",
+                     static_cast<unsigned long long>(g_g724Calls),
+                     static_cast<unsigned long long>(g_g724Blocks),
+                     static_cast<unsigned long long>(g_g724Same),
+                     g_g724Blocks ? 100.0 * static_cast<double>(g_g724Same) /
+                                        static_cast<double>(g_g724Blocks)
+                                  : 0.0);
+        std::fflush(stderr);
+    }
+
+    // Build the swizzled 256-byte block into a local buffer with the identical shuffle sequence
+    // g706SwizzleBlock32 uses, compare it against the destination, and store only when it differs
+    // (or always, under the census-only arm). Returns true when the destination already held it.
+    inline bool g724SwizzleBlock32Cmp(u8 *dst, const u8 *src, u32 srcPitch, bool skipStore)
+    {
+        alignas(16) u8 staged[8u * 8u * 4u];
+        for (u32 pair = 0u; pair < 4u; ++pair)
+        {
+            const u8 *s0 = src + pair * 2u * srcPitch;
+            const u8 *s1 = s0 + srcPitch;
+            const __m128i a0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(s0));
+            const __m128i a1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(s0 + 16u));
+            const __m128i b0 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(s1));
+            const __m128i b1 = _mm_loadu_si128(reinterpret_cast<const __m128i *>(s1 + 16u));
+            u8 *d = staged + pair * 64u;
+            _mm_store_si128(reinterpret_cast<__m128i *>(d), _mm_unpacklo_epi64(a0, b0));
+            _mm_store_si128(reinterpret_cast<__m128i *>(d + 16u), _mm_unpackhi_epi64(a0, b0));
+            _mm_store_si128(reinterpret_cast<__m128i *>(d + 32u), _mm_unpacklo_epi64(a1, b1));
+            _mm_store_si128(reinterpret_cast<__m128i *>(d + 48u), _mm_unpackhi_epi64(a1, b1));
+        }
+        const bool same = std::memcmp(dst, staged, sizeof(staged)) == 0;
+        if (!same || !skipStore)
+            std::memcpy(dst, staged, sizeof(staged));
+        return same;
+    }
+
     template <PixelStorageMode psm, typename TableT>
     inline void g706WriteBlockRect32(const TableT &table, u8 *data, u32 bp, u32 bw,
                                      u32 x, u32 y, const u8 *src, u32 srcPitch,
@@ -75,6 +161,8 @@ namespace
         using Traits = PixelStorageTraits<psm>;
         constexpr u32 kMask = static_cast<u32>(MEMORY_SIZE) - 4u;
         constexpr u32 kBlockBytes = 8u * 8u * 4u;
+        const bool g724Skip = g724UpSkipOn();
+        const bool g724Cmp = g724Skip || g724UpStatOn();
 
         for (u32 by = 0u; by < blocksHigh; ++by)
         {
@@ -96,9 +184,18 @@ namespace
                                                   srcBlock + row * srcPitch, 8u);
                     continue;
                 }
+                if (g724Cmp)
+                {
+                    ++g_g724Blocks;
+                    if (g724SwizzleBlock32Cmp(data + byteBase, srcBlock, srcPitch, g724Skip))
+                        ++g_g724Same;
+                    continue;
+                }
                 g706SwizzleBlock32(data + byteBase, srcBlock, srcPitch);
             }
         }
+        if (g724Cmp)
+            g724Report();
     }
 }
 

@@ -24,6 +24,11 @@ extern bool g541_backend_null_compute();
 // No-op unless DC2_G478_VU1PROF=1.
 extern void g478RegisterVu1WorkerThread();
 
+// ⭐ G735: real-CPU thread slots (defined in ps2_g713_pipeline.cpp, which already carries
+// <windows.h> and is a COLD TU). Declared here rather than via the G713 API header because this
+// file is included inside a namespace and only needs the one entry point.
+extern void g735CaptureThreadHandle(int slot);
+
 // G478 kick-item pool paired gate (DC2_G419_AB=kickpool). -1 = not selected, 0 = control, 1 = cand.
 extern int g478KickPoolArm();
 
@@ -126,6 +131,11 @@ extern std::atomic<uint64_t> g_dc2PresentTick;  // global scope (defined in dc2_
                                                 // .inc is included before runtime_dispatch_and_memory.inc's
                                                 // own extern, and it must NOT be declared inside the anon
                                                 // namespace below (G260 anon-namespace-linkage trap).
+// ⛔ G738: the clock that IS a frame. `g_dc2PresentTick` is the host present loop's tick and G598
+// established it free-runs at ~58 Hz independently of the guest, so it is a window TRIGGER and
+// never a rate denominator. `[G482:memo]` (included below) was dividing ms/f figures by it. Same
+// global-scope rule as the line above.
+extern std::atomic<uint32_t> g_dc2RenderedFrame;
 
 namespace {
 
@@ -667,6 +677,46 @@ public:
                 const bool instr = g303InstrOn();
                 const auto stall0 = instr ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
+                // ⭐⭐ G726: SPIN BEFORE PARKING. G482's comment above states the fast lock-free
+                // `ready` path is taken "on essentially every kick and NOTHING ever sleeps on
+                // m_cvDone" — measured when the GS worker was the pole and VU1 ran ~1,900 kicks
+                // ahead. **G725 invalidated that premise.** With GS own down ~4 ms/f the GS worker
+                // catches up, and the G726 board reads `dragon:tail` at `gsStalls/f = 814..1001`
+                // with `gsStallMs/f = 8.5..12.4` — i.e. ~11 us per stall, which is a park/wake
+                // round trip, not production time. Same signature, and same fix, as the 1060
+                // futex parks a frame that made `map15:sky` regress +11.31 ms/f.
+                //
+                // The kick being awaited is one VU1 microprogram that normally completes in
+                // microseconds, so a bounded spin converts most of these parks into a load. On a
+                // genuinely-behind VU1 the spin exhausts and the mutex path below runs exactly as
+                // before, so the worst case is unchanged and the cost is bounded.
+                // ⛔ DEFAULT OFF, AND THAT IS DELIBERATE. Arm with `DC2_G726_KICK_SPIN=8192`.
+                //
+                // The promoted G726 deliverable (SHA 2B76C9EC..., FINAL_PROJECT_STATE.md §4a) and
+                // its 23-window board were both built and measured WITHOUT this spin. Shipping it
+                // default-ON would mean the source no longer reproduces the board that justified
+                // shipping it. Its own gate did not complete, and the triage is ambiguous:
+                // `dragon` per-stall cost falls ~11 us -> ~7.4 us at an unchanged ~1000 stalls/f,
+                // but the frame reads 20.23-21.77 against a board window of 20.87.
+                //
+                // ⚠️ And the census argues the ceiling is small: on `dragon` VU1 busy is 18.6-20.2
+                // while `gsWorkerMs/f` is only 14.2-15.6, so most of that stall is the GS worker
+                // LEGITIMATELY WAITING on a VU1 pole, not recoverable park latency. Unlike the
+                // `g713Sync` spin - where the awaited node was a microsecond-scale readback bypass
+                // and the win was 14 ms/f - there is no comparable headroom here.
+                {
+                    static const uint32_t s_kickSpin = [] {
+                        const char *v = std::getenv("DC2_G726_KICK_SPIN");
+                        return (v != nullptr) ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u;
+                    }();
+                    for (uint32_t i = 0; i < s_kickSpin; ++i)
+                    {
+                        if (item->ready.load(std::memory_order_acquire) || m_stop)
+                            break;
+                        _mm_pause();
+                    }
+                }
+                if (!item->ready.load(std::memory_order_acquire))
                 {
                     // G482: publish this thread's intent to sleep BEFORE taking the done mutex, so
                     // the VU1 worker's `ready` store and its waiter test cannot both land in the
@@ -763,6 +813,13 @@ private:
         // premise gate re-opened the VU1 direction (sensitivity 0.80 vs the GS worker's 0.76), and
         // this thread has never had a sample distribution — only occupancy timers.
         g478RegisterVu1WorkerThread();
+        // ⭐ G735: duplicate a handle to THIS thread so the acceptance board can read its REAL CPU
+        // with GetThreadTimes. The comment above is the reason: `[G303:vu1w] busyMs/f` is an
+        // OCCUPANCY timer, and G735 measured what that costs — ranking the executor's occupancy
+        // against EE's GetThreadTimes column made G734 call the executor the pole on 12 of 18
+        // windows, where on real CPU it is the pole on none. VU1 has the same defect and is a
+        // live pole candidate, so it needs the same column. One call, once.
+        g735CaptureThreadHandle(1 /* kG735SlotVu1 */);
         g650PinThread(1 /* G650_ROLE_VU1 */); // G650 P6
         // G442 CEILING PROBE (default OFF: DC2_G442_FTZ=1). Nothing in this tree touches MXCSR, so
         // the VU1 interpreter's SSE2 FMACs run with subnormal support ON and every subnormal

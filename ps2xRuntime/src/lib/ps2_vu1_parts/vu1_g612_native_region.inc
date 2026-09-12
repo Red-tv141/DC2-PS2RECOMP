@@ -127,7 +127,13 @@ namespace
 
     constexpr uint32_t G612_MAX_BB = 48u;          // basic blocks per region
     constexpr uint32_t G612_MAX_PAIRS = 512u;      // emitted pairs per region
-    constexpr size_t G612_MAX_REGION_BYTES = 96u * 1024u;
+    // ⚠️ G730 RAISED THIS FROM 96 KB. A region's entry thunks are PER BASIC BLOCK, and each one now
+    // carries the residency prologue (up to `sub rsp` + 10 `movaps` saves + 10 `movups` loads ≈ 177
+    // bytes). At the 48-block cap that is ~8.5 KB of thunk that did not exist before, and a region
+    // that overflows is REFUSED — which would silently move pairs from L1 to the interpreter and
+    // make `pairs/call` incomparable across an A/B. The arena is unchanged, so the only cost is
+    // ~200 instead of ~340 regions between arena resets, and resets are counted.
+    constexpr size_t G612_MAX_REGION_BYTES = 160u * 1024u;
     constexpr size_t G612_ARENA_BYTES = 32u * 1024u * 1024u;
     // ⚠️ SIZED FROM A MEASUREMENT, NOT A GUESS. The first bring-up run set this to 96 and
     // `[G612:why] table = 1308` — thirteen regions refused for table space for every one admitted.
@@ -450,6 +456,10 @@ namespace
     thread_local uint64_t s_g612CacheHit = 0u, s_g612CacheMiss = 0u, s_g612ArenaResets = 0u;
     thread_local uint64_t s_g612Runs = 0u, s_g612Pairs = 0u, s_g612MaxPairs = 0u;
     thread_local uint64_t s_g612SkipQp = 0u, s_g612SkipBudget = 0u, s_g612SkipSize = 0u;
+    // G731: the `qDelay` value at every skipQp refusal, bucketed. The last bucket is "16 or more".
+    // Stat-gated at the (single) increment site, so a timing run pays nothing for it.
+    constexpr unsigned G731_QD_BUCKETS = 17u;
+    thread_local uint64_t s_g731SkipQd[G731_QD_BUCKETS] = {};
     thread_local uint64_t s_g612Verified = 0u;
     thread_local uint64_t s_g612RfWhy[G612_RF_COUNT] = {};
     // ⭐ WHERE the regions stop, by slot. "The regions ran 4.1 pairs on average" is not a
@@ -563,14 +573,14 @@ namespace
         int64_t bestStamp = INT64_MIN;
         for (int i = 0; i < G430_HIST; ++i)
         {
-            const int64_t stamp = h.stamp[i];
+            const int64_t stamp = h.e[i].stamp;
             if (stamp <= target && stamp > bestStamp)
             {
                 bestStamp = stamp;
                 best = i;
             }
         }
-        return best >= 0 && h.kind[best] == G428_MK_PENDING;
+        return best >= 0 && h.e[best].kind == G428_MK_PENDING;
     }
     // ============================================================================================
     // ⭐ G651 (ROADMAP Priority 3) — FCGET EMITTED INSIDE THE REGION BODY
@@ -932,9 +942,78 @@ namespace
     {
         if ((fp.pair.g425Flags & G425_PF_TOUCHES_ZERO) == 0u)
             return;
-        e.movapsLd(G610_X4, G610_R11, G610_C_VF0);
-        e.movupsSt(G610_X4, G610_RCX, G610_OFF_VF);
+        g730EmitRepinVf0(e, G610_X4);
         e.movStImm32(G610_RCX, G610_OFF_VI, 0u);
+    }
+
+    // ============================================================================================
+    // ⭐ G730 — THE REGION RESIDENCY PLAN.
+    //
+    // A region's binding must be INVARIANT over the whole CFG: every basic block agrees on which
+    // host register holds which VU location, all the entry thunks emit the same prologue, and the
+    // ONE shared epilogue every exit funnels through writes the same set back. That is what removes
+    // the merge/phi problem a per-instruction allocator would have at each of up to 48 joins.
+    //
+    // LOOP WEIGHTING. A region exists to run a LOOP — that is G612's own premise, and G607 measured
+    // the five dominant loops at 51.65% of executed pairs with a mean 10.7 iterations per ENTRY. A
+    // flat static use count would therefore rank a preamble that runs once above a body that runs
+    // ten times. A back edge here is a STATIC branch whose target is at or before its own basic
+    // block; every block between the two is inside that loop and is weighted up.
+    // ============================================================================================
+    constexpr uint32_t G730_LOOP_W = 8u;
+
+    void g730PlanRegion(G730Ctx &ctx, const G612Plan &p)
+    {
+        uint32_t w[G612_MAX_BB];
+        for (uint32_t k = 0u; k < p.nBb; ++k)
+            w[k] = 1u;
+        for (uint32_t m = 0u; m < p.nBb; ++m)
+        {
+            if (p.bb[m].term != G612_T_BR && p.bb[m].term != G612_T_JMP)
+                continue;
+            const uint32_t t = p.bb[m].takenSlot;
+            if (t > p.bb[m].start)
+                continue;                        // a forward branch is not a back edge
+            for (uint32_t k = 0u; k < p.nBb; ++k)
+                if (p.bb[k].start >= t && p.bb[k].start <= p.bb[m].start)
+                    w[k] = G730_LOOP_W;
+        }
+
+        G730Use u;
+        int32_t seq = 0;
+        auto scan = [&u, &seq](uint32_t slot, uint32_t weight, bool withLower) {
+            const G479FusedPair &fp = s_g410Cache.fused[slot];
+            // An I-bit (LOI) pair's lower WORD is a float immediate, not an instruction; its
+            // decoded `lowerKind` is meaningless and must not contribute operand counts.
+            const bool loi = (fp.pair.pairFlags == G410_PAIR_I_BIT);
+            const uint32_t lower = (withLower && !loi) ? (uint32_t)fp.source : 0u;
+            const uint8_t lowerKind = (withLower && !loi) ? fp.pair.lowerKind
+                                                          : (uint8_t)G422_LK_NOP;
+            g730ScanPair((uint32_t)(fp.source >> 32), fp.pair.upperKind, lower, lowerKind,
+                         fp.pair.g425Flags, weight, seq++, u);
+        };
+
+        for (uint32_t k = 0u; k < p.nBb; ++k)
+        {
+            const G612Bb &bb = p.bb[k];
+            // ⭐ ONE WALK PER BASIC BLOCK. A def-use edge is only counted where the emitted code
+            // really has one, and a region's blocks are reached from several predecessors — so a
+            // "write in block A, read in block B" pair is NOT a guaranteed forward and must not be
+            // scored as one. Per-BB walks are the conservative reading; they under-count the
+            // loop-carried edges a back edge creates, which the x8 loop weight already stands in
+            // for. (This is a HEURISTIC, so under-counting costs speed, never correctness.)
+            u.newWalk();
+            for (uint32_t j = 0u; j < bb.plain; ++j)
+                scan(bb.start + j, w[k], true);
+            if (bb.term == G612_T_EXIT || bb.term == G612_T_FALL)
+                continue;
+            // The terminator pair: its UPPER is emitted here, its LOWER *is* the branch.
+            scan(bb.start + bb.plain, w[k], false);
+            // The delay slot is a plain eligible pair (precondition 2).
+            scan(bb.start + bb.plain + 1u, w[k], true);
+        }
+        g730Select(ctx, u, true);
+        g730NoteBody(ctx);
     }
 
     // One pair: upper, lower, G425 re-pin. Returns false to abandon the region — precondition 7:
@@ -1020,6 +1099,13 @@ namespace
             else
                 e.bad = true;
         };
+
+        // ⭐ G730: the residency binding is chosen ONCE for the whole region, before any byte is
+        // emitted, and installed for the duration of this function. Every entry thunk below emits
+        // the same prologue from it and the one shared epilogue emits the matching write-back.
+        G730Ctx g730Ctx;
+        g730PlanRegion(g730Ctx, p);
+        G730Scope g730Scope(&g730Ctx);
 
         // ---- the bodies ----
         for (uint32_t k = 0u; k < p.nBb && !e.bad; ++k)
@@ -1155,7 +1241,16 @@ namespace
 
         // ---- the shared epilogue ----
         const uint32_t epilogueAt = (uint32_t)e.n;
+        // G726: this region shares `g610EmitUpper` verbatim, so it shares its cursor convention -
+        // R10 carries the ring position PRE-SCALED as a byte offset (slot*32). Convert back to a
+        // slot index before storing it to `head`, exactly as the block emitter's epilogue does.
+        e.shrImm(G610_R10, 5);
         e.movSt32(G610_R10, G610_R9, G610_OFF_HHEAD);   // G504: stored once per invocation
+        // ⭐ G730: EVERY exit from a region body reaches this epilogue — budget, dynamic jump,
+        // unemittable pair, E-bit, branch to a slot outside the region — so this is the one place
+        // resident VU state has to be published back to the image. It writes back before restoring
+        // the callee-saved XMMs and before `add rsp`, in that order.
+        g730EmitEpilogue(e, g730Ctx);
         x.movR64(G610_RAX, G610_R8);
         x.subR64(G610_RAX, G612_RBP);                   // consumed = (stampBase + n) - stampBase
         x.popR(G612_RDI);
@@ -1216,10 +1311,17 @@ namespace
             x.pushR(G612_RSI);
             x.pushR(G612_RDI);
             // The 5th integer argument sits at [rsp+0x28] on entry; three pushes moved it by 24.
+            // ⚠️ THIS READ MUST PRECEDE G730'S `sub rsp` — the prologue below moves RSP again and
+            // this displacement is measured from the post-push RSP, not from the frame base.
             x.movLd32Rsp(G612_RSI, 0x28 + 0x18);
             x.movR64(G612_RBP, G610_R8);                // the original stampBase
             x.addR64(G612_RSI, G610_R8);                // rsi = stampBase + budget
+            // ⭐ G730: save the callee-saved pool registers and load this region's resident VU
+            // state. Three pushes have already left RSP 16-byte aligned, so the frame is 16*K with
+            // no padding (`g730Select`'s `regionForm`).
+            g730EmitPrologue(e, g730Ctx);
             e.movLd32(G610_R10, G610_R9, G610_OFF_HHEAD);
+            e.shlImm(G610_R10, 5); // G726: slot index -> byte offset, see the epilogue above
             e.movImm64(G610_R11, (uint64_t)(uintptr_t)&g610Consts);
             const size_t at = x.jmpRel32();
             if (!g612Patch(e, at, (int64_t)bb.bodyOff))
@@ -1515,6 +1617,20 @@ namespace
             std::fprintf(stderr, " %s=%llu", kG612RfName[k],
                          (unsigned long long)s_g612RfWhy[k]);
         std::fprintf(stderr, "\n");
+        // G731: where the skipQp refusals actually sit. `qd=1` is the exactly-publishable bucket.
+        {
+            uint64_t tot = 0u;
+            for (unsigned k = 0u; k < G731_QD_BUCKETS; ++k)
+                tot += s_g731SkipQd[k];
+            std::fprintf(stderr, "[G731:skipqd] total=%llu |", (unsigned long long)tot);
+            for (unsigned k = 0u; k < G731_QD_BUCKETS; ++k)
+                if (s_g731SkipQd[k] != 0u)
+                    std::fprintf(stderr, " qd%s%u=%llu(%.1f%%)",
+                                 (k == G731_QD_BUCKETS - 1u) ? ">=" : "=", k,
+                                 (unsigned long long)s_g731SkipQd[k],
+                                 tot ? 100.0 * (double)s_g731SkipQd[k] / (double)tot : 0.0);
+            std::fprintf(stderr, "\n");
+        }
         uint32_t topIdx[8] = {};
         uint32_t topVal[8] = {};
         for (uint32_t i = 0u; i < G612_SLOTS; ++i)

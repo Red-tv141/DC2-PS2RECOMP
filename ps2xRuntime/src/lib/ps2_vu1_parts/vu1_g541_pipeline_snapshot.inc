@@ -47,12 +47,15 @@ void dc2_g541_vu_pipe_snapshot(std::vector<uint8_t> &out)
     u32(s_g428PreMac);
     u32(s_g428Armed ? 1u : 0u);
 
-    for (const auto &vec : s_g430HB.vec)
-        for (float v : vec) f32(v);
-    for (int64_t v : s_g430HB.stamp) u64(static_cast<uint64_t>(v));
-    for (uint32_t v : s_g430HB.mac) u32(v);
-    for (uint8_t v : s_g430HB.dest) u32(v);
-    for (uint8_t v : s_g430HB.kind) u32(v);
+    // G726 changed the ring from struct-of-arrays to an array of 32-byte entries. The SNAPSHOT
+    // BYTE ORDER is deliberately unchanged - field by field, slot within field - so a corpus
+    // captured before the layout change still compares against one captured after it.
+    for (const auto &E : s_g430HB.e)
+        for (float v : E.vec) f32(v);
+    for (const auto &E : s_g430HB.e) u64(static_cast<uint64_t>(E.stamp));
+    for (const auto &E : s_g430HB.e) u32(E.mac);
+    for (const auto &E : s_g430HB.e) u32(E.dest);
+    for (const auto &E : s_g430HB.e) u32(E.kind);
     u32(static_cast<uint32_t>(s_g430HB.head));
     u64(static_cast<uint64_t>(s_g430PairBase));
     u32(s_g430HistArmed ? 1u : 0u);

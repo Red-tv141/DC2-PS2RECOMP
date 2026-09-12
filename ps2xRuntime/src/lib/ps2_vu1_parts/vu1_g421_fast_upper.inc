@@ -463,10 +463,11 @@ namespace
     {
         G430HistBlock &H = G501Pin ? *hb : (hb ? *hb : s_g430HB);
         const int slot = H.head;
-        _mm_store_ps(H.vec[slot], r);
-        H.stamp[slot] = stamp;
-        H.dest[slot] = dest;
-        H.kind[slot] = G428_MK_PENDING;
+        G430HistEntry &E = H.e[slot];
+        _mm_store_ps(E.vec, r);
+        E.stamp = stamp;
+        E.dest = dest;
+        E.kind = G428_MK_PENDING;
         H.head = (slot + 1 < G430_HIST) ? slot + 1 : 0;
     }
 
@@ -508,10 +509,11 @@ namespace
     {
         G430HistBlock &H = G501Pin ? *hb : (hb ? *hb : s_g430HB);
         const int s = slot;
-        _mm_store_ps(H.vec[s], r);
-        H.stamp[s] = stamp;
-        H.dest[s] = dest;
-        H.kind[s] = G428_MK_PENDING;
+        G430HistEntry &E = H.e[s];
+        _mm_store_ps(E.vec, r);
+        E.stamp = stamp;
+        E.dest = dest;
+        E.kind = G428_MK_PENDING;
         slot = (s + 1 < G430_HIST) ? s + 1 : 0;
     }
 
@@ -526,9 +528,10 @@ namespace
     {
         G430HistBlock &H = s_g430HB;
         const int slot = H.head;
-        H.stamp[slot] = stamp;
-        H.mac[slot] = mac;
-        H.kind[slot] = G428_MK_EAGER;
+        G430HistEntry &E = H.e[slot];
+        E.stamp = stamp;
+        E.mac = mac;
+        E.kind = G428_MK_EAGER;
         H.head = (slot + 1 < G430_HIST) ? slot + 1 : 0;
     }
 
@@ -550,7 +553,7 @@ namespace
         int64_t bestStamp = INT64_MIN;
         for (int i = 0; i < G430_HIST; ++i)
         {
-            const int64_t s = H.stamp[i];
+            const int64_t s = H.e[i].stamp;
             if (s <= target && s > bestStamp)
             {
                 bestStamp = s;
@@ -559,9 +562,10 @@ namespace
         }
         if (best < 0)
             return 0u; // no writer has ever executed: the legacy pipe reads its zero init
-        if (H.kind[best] == G428_MK_PENDING)
-            return g421MakeMacReg(_mm_load_ps(H.vec[best]), H.dest[best]);
-        return H.mac[best];
+        const G430HistEntry &E = H.e[best];
+        if (E.kind == G428_MK_PENDING)
+            return g421MakeMacReg(_mm_load_ps(E.vec), E.dest);
+        return E.mac;
     }
 
 // ---------------------------------------------------------------------------------------------
@@ -603,8 +607,14 @@ namespace
     static_assert(G430_HIST == 8, "G520's packed key assumes an 8-slot MAC history ring");
     static DC2_G330_FORCEINLINE uint32_t g430ResolveFast(G430HistBlock &H, int64_t target)
     {
-        const int64_t s0 = H.stamp[0], s1 = H.stamp[1], s2 = H.stamp[2], s3 = H.stamp[3];
-        const int64_t s4 = H.stamp[4], s5 = H.stamp[5], s6 = H.stamp[6], s7 = H.stamp[7];
+        // ⚠️ G726 TRADE-OFF, stated where it is paid. Under the old struct-of-arrays layout these
+        // eight stamps were 64 contiguous bytes - ONE cache line. Under the G726 entry layout they
+        // are 32 bytes apart, so this sweep touches all four lines of the ring. That is the right
+        // side of the trade because this reader runs at a FLAG-READING pair (2.06% of pairs) and at
+        // run() exit, while the push it pays for runs on ~45%; and the whole ring is 256 B of
+        // thread_local that stays L1-resident either way, so what changes is line count, not misses.
+        const int64_t s0 = H.e[0].stamp, s1 = H.e[1].stamp, s2 = H.e[2].stamp, s3 = H.e[3].stamp;
+        const int64_t s4 = H.e[4].stamp, s5 = H.e[5].stamp, s6 = H.e[6].stamp, s7 = H.e[7].stamp;
         const int64_t k0 = (s0 <= target) ? (s0 * 8 + 7) : INT64_MIN;
         const int64_t k1 = (s1 <= target) ? (s1 * 8 + 6) : INT64_MIN;
         const int64_t k2 = (s2 <= target) ? (s2 * 8 + 5) : INT64_MIN;
@@ -623,9 +633,10 @@ namespace
         if (best == INT64_MIN)
             return 0u; // no writer has ever executed: the legacy pipe reads its zero init
         const int bi = 7 - static_cast<int>(best & 7);
-        if (H.kind[bi] == G428_MK_PENDING)
-            return g421MakeMacReg(_mm_load_ps(H.vec[bi]), H.dest[bi]);
-        return H.mac[bi];
+        const G430HistEntry &E = H.e[bi];
+        if (E.kind == G428_MK_PENDING)
+            return g421MakeMacReg(_mm_load_ps(E.vec), E.dest);
+        return E.mac;
     }
 
     // G519's law, and it is LOAD-BEARING: this body contains the very scan the lever exists to

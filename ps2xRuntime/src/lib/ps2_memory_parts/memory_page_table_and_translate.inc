@@ -269,6 +269,20 @@ std::atomic<bool> g_dc2G138DumpGateOpen{true};
 // blind to a consumer that is 0.06% of the traffic. Written once per guest frame (one relaxed
 // store, unconditional); read by diagnostics only, never by a behaviour path.
 std::atomic<uint32_t> g_dc2ScriptFrame{0u};
+// ⭐⭐⭐ G738: THE RENDERED-FRAME CLOCK, exported cross-TU, for the same reason and from the same
+// site. `g_dc2ScriptFrame` is the SCRIPT clock and runs at ~2.214 script frames per rendered frame
+// (G706 Rule 76), so it is not a rate denominator.
+//
+// The GL/executor thread has no frame signal at all, and the two censuses that needed one invented
+// their own: `g496NoteFrame()` / `g496GlNoteFrame()` counted render batches with `!b.skipReadback`
+// and called the result a frame. Measured on the shipped G732 image, `dungeon1` steady state, that
+// is **8.12 rendered frames**, so `[G496:gl]`'s `issued/f` and `[G496:cal]`'s `injMs/f` were both
+// that factor too small — and `[G496:cal]`'s ballast sensitivity is the source of the "the GPU
+// executes only ~1.3 ms of a frame" figure the arc reasoned from.
+//
+// Written once per guest frame from the mgEndFrame override (one relaxed store, unconditional);
+// read by diagnostics only, never by a behaviour path.
+std::atomic<uint32_t> g_dc2RenderedFrame{0u};
 namespace
 {
     struct Dc2G138GsDump

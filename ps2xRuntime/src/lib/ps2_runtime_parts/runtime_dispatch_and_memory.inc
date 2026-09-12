@@ -250,7 +250,46 @@ static const bool s_g651NoPreempt = [] {
     return v && v[0] && v[0] != '0';
 }();
 
-bool PS2Runtime::shouldPreemptGuestExecution()
+// ================================================================================================
+// ⭐⭐⭐ G739 — THE BACK-EDGE PREEMPTION CHECK, INLINED AT THE CALL SITE
+// ================================================================================================
+//
+// G651 (above) removed the per-access TLS epoch check from this predicate and left the rest. What
+// it could not remove is the CALL: `code_generator.cpp` emits `runtime->shouldPreemptGuestExecution()`
+// on every non-call-like back edge of every recompiled guest loop -- 4,144 static sites,
+// 134,653 calls/frame counted on `s05` -- and `dc2_game` is built WITHOUT `/GL`, so it is a real
+// cross-library call into `ps2_runtime.lib` every time. On 98-99% of those calls the whole answer
+// is "the counter has not reached the interval yet".
+//
+// SPLIT, NOT REWRITTEN. The counter moves to namespace scope so the inlined form in
+// ps2_runtime_macros.h and this authority share ONE object; the increment happens in exactly one
+// place per path; and the decision logic below is byte-for-byte what it was.
+//
+// ⭐ EXACTNESS. `yieldInterval` is 64 or 100, so a counter value below 64 yields `false` under
+// either. The two early-outs above it (`DC2_G57_NO_PREEMPT`, the scoped title-draw suppression)
+// also yield `false`. So `++c < 64 => false` is not an approximation of this function, it is a
+// sub-case of it. At 64 the inline form hands over to `ps2ShouldPreemptSlow`, which is this
+// function minus the increment the caller already performed.
+//
+// ⛔ `DC2_G651_DISP_STAT` DISARMS THE INLINE FORM. Otherwise `[G651:disp] preempt=` would count one
+// call in 64 instead of every call -- an instrument that silently became a 1.6% sample of its own
+// population. Rule 44's class. `DC2_G57_NO_PREEMPT` disarms it too, so that experiment keeps its
+// exact "this function is never reached" shape rather than "reached 1 time in 64".
+//
+// Rollback: DC2_G739_NO_INLINE_PREEMPT=1.
+thread_local uint32_t g_ps2BackEdgeCounter; // no initialiser: zero-init, no dynamic init, no guard
+// ⛔ Initialised HERE, not in `g739ArmDispatchFast`, because `s_g651NoPreempt` lives in this file
+// and this file is included after that one. Same TU, so dynamic init runs in definition order and
+// both operands above are already final; every reader is a generated function that cannot run
+// until `main` has entered `PS2Runtime::run`.
+bool g_ps2PreemptFast = !s_g651NoPreempt && !g_g651DispStat &&
+                        (std::getenv("DC2_G739_NO_INLINE_PREEMPT") == nullptr);
+// Seeded with the no-waiter interval so the very first back edge on any thread compares against a
+// real value; the authority republishes it on every slow entry. ⛔ 64 here would silently halve the
+// lever on every route with no waiter queued -- see the note in ps2_runtime_macros.h.
+std::atomic<uint32_t> g_ps2PreemptLimit{100u};
+
+bool ps2ShouldPreemptSlow(PS2Runtime *runtime)
 {
     // G57 experiment: allow disabling back-edge preemption entirely to confirm
     // a mid-loop preemption return is the corruption source. Env-gated.
@@ -264,16 +303,27 @@ bool PS2Runtime::shouldPreemptGuestExecution()
     if (g_dc2PreemptSuppressDepth.load(std::memory_order_relaxed) > 0)
         return false;
 
-    thread_local uint32_t s_backEdgeYieldCounter = 0u;
-    const uint32_t waiterCount = m_guestExecutionWaiters.load(std::memory_order_acquire);
+    const uint32_t waiterCount = runtime->guestExecutionWaiterCountForTesting();
     const uint32_t yieldInterval = (waiterCount != 0u) ? 64u : 100u;
-    if (++s_backEdgeYieldCounter < yieldInterval)
+    // ⭐ Publish it for the inlined form. Without this the inline threshold has to be the MINIMUM
+    // interval (64) to stay exact, and every back edge from 64 to 99 -- 36% of them on a route with
+    // no waiter queued -- keeps paying the out-of-line call it exists to remove.
+    g_ps2PreemptLimit.store(yieldInterval, std::memory_order_relaxed);
+    if (g_ps2BackEdgeCounter < yieldInterval)
     {
         return false;
     }
 
-    s_backEdgeYieldCounter = 0u;
+    g_ps2BackEdgeCounter = 0u;
     return true;
+}
+
+// The public API is unchanged for every direct caller: it owns the increment, then defers to the
+// shared decision above. `ps2ShouldPreempt` (the inlined form) owns the increment on its path.
+bool PS2Runtime::shouldPreemptGuestExecution()
+{
+    ++g_ps2BackEdgeCounter;
+    return ps2ShouldPreemptSlow(this);
 }
 
 uint8_t PS2Runtime::Load8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
@@ -343,7 +393,7 @@ __m128i PS2Runtime::Load128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr)
 
 void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8_t value)
 {
-    ps2TraceGuestWrite(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
+    PS2_TRACE_GUEST_WRITE(rdram, vaddr, 1u, value, 0u, "WRITE8", ctx);
     try
     {
         m_memory.write8(vaddr, value);
@@ -356,7 +406,7 @@ void PS2Runtime::Store8(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint8
 
 void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint16_t value)
 {
-    ps2TraceGuestWrite(rdram, vaddr, 2u, value, 0u, "WRITE16", ctx);
+    PS2_TRACE_GUEST_WRITE(rdram, vaddr, 2u, value, 0u, "WRITE16", ctx);
     try
     {
         m_memory.write16(vaddr, value);
@@ -369,7 +419,7 @@ void PS2Runtime::Store16(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint32_t value)
 {
-    ps2TraceGuestWrite(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
+    PS2_TRACE_GUEST_WRITE(rdram, vaddr, 4u, value, 0u, "WRITE32", ctx);
     try
     {
         m_memory.write32(vaddr, value);
@@ -382,7 +432,7 @@ void PS2Runtime::Store32(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint
 
 void PS2Runtime::Store64(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, uint64_t value)
 {
-    ps2TraceGuestWrite(rdram, vaddr, 8u, value, 0u, "WRITE64", ctx);
+    PS2_TRACE_GUEST_WRITE(rdram, vaddr, 8u, value, 0u, "WRITE64", ctx);
     try
     {
         m_memory.write64(vaddr, value);
@@ -397,7 +447,7 @@ void PS2Runtime::Store128(uint8_t *rdram, R5900Context *ctx, uint32_t vaddr, __m
 {
     alignas(16) uint64_t _parts[2];
     _mm_storeu_si128(reinterpret_cast<__m128i *>(_parts), value);
-    ps2TraceGuestWrite(rdram, vaddr, 16u, _parts[0], _parts[1], "WRITE128", ctx);
+    PS2_TRACE_GUEST_WRITE(rdram, vaddr, 16u, _parts[0], _parts[1], "WRITE128", ctx);
     try
     {
         m_memory.write128(vaddr, value);

@@ -388,8 +388,12 @@ void PS2Runtime::configureIoPathsFromElf(const std::string &elfPath)
 // can only ever short-circuit a HIT, and it can only hold a hit the map also holds.
 //
 // Rollback: DC2_G646_NO_DISPATCH=1. Census: DC2_G646_STAT=1 -> [G646:dispatch].
-static constexpr uint32_t kG646Lo = 0x00100000u;
-static constexpr uint32_t kG646Hi = 0x00380000u;
+// ⭐ G739: these three are now DERIVED from `PS2_DIRECT_LO`/`PS2_DIRECT_HI` in
+// ps2_runtime_macros.h, which is what the inlined call-site probe in generated code indexes with.
+// One source of truth: the runtime's `g646Get` and the inline probe cannot disagree about the
+// window or the slot arithmetic, because there is only one definition of either.
+static constexpr uint32_t kG646Lo = PS2_DIRECT_LO;
+static constexpr uint32_t kG646Hi = PS2_DIRECT_HI;
 static constexpr size_t kG646Slots = (kG646Hi - kG646Lo) >> 2;
 // File scope, not a function-local static: this is read on every indirect dispatch, where an MSVC
 // magic-static guard is itself measurable (G619's law).
@@ -397,6 +401,30 @@ static const bool s_g646DispatchOn = (std::getenv("DC2_G646_NO_DISPATCH") == nul
 static const bool s_g646StatOn = (std::getenv("DC2_G646_STAT") != nullptr);
 static PS2Runtime::RecompiledFunction *g_g646Direct = nullptr;
 static std::atomic<uint64_t> g_g646Hits{0ull}, g_g646Misses{0ull};
+
+// ⭐⭐⭐ G739: the three symbols the INLINED call-site probe in generated code reads. Declared in
+// ps2_runtime_macros.h; see the long note there for the defect (G652's generated-side fast
+// dispatch had zero call sites) and the evidence. `g_ps2DirectFast` is the single gate that keeps
+// every observer bit-identical, and it is computed by `g739ArmDispatchFast()` below, which is the
+// only writer.
+PS2Runtime::RecompiledFunction *g_ps2DirectTable = nullptr;
+bool g_ps2DirectFast = false;
+bool g_ps2DirectTrace = true;
+static const bool s_g739NoInlineDispatch = (std::getenv("DC2_G739_NO_INLINE_DISPATCH") != nullptr);
+static const bool s_g739Oracle = (std::getenv("DC2_G739_ORACLE") != nullptr);
+static const bool s_g739Stat = (std::getenv("DC2_G739_STAT") != nullptr);
+static std::atomic<uint64_t> g_g739Slow{0ull}, g_g739SlowHit{0ull}, g_g739SlowMiss{0ull};
+static std::atomic<uint64_t> g_g739OracleChecks{0ull}, g_g739OracleBad{0ull};
+// Defined below, once every observer predicate it reads is in scope. Same TU, internal linkage.
+static void g739ArmDispatchFast();
+
+// G732: the entry-point oracle that cleared the jalr-fallback removal lives in
+// `g732_entry_oracle.inc`. It is UNHOOKED under Rule 31 -- its two call sites sat in
+// lookupFunction() and hasFunction(), which `[G446:eeprof]` reads at ~1.0% and ~0.8% of the EE
+// thread, and inert code in a hot translation unit is not free (measured up to +0.484 ms/f).
+// The file is retained, not deleted: it is the instrument that priced the direction, and it is
+// re-armable by restoring this #include plus the two call sites marked "G732 oracle" below.
+// Its verdict is recorded in plans/phase-G732-plan.md §5.4.
 
 // ============================================================================================
 // ⭐ G651 (ROADMAP Priority 1, objective 2) — THE INTERNAL COUNTING INSTRUMENT for the EE
@@ -478,6 +506,13 @@ static void g646Set(uint32_t address, PS2Runtime::RecompiledFunction func)
         // Deliberately leaked, like every other process-lifetime runtime table here: a dispatch
         // may still be in flight on another thread at teardown.
         g_g646Direct = new PS2Runtime::RecompiledFunction[kG646Slots]();
+        // ⭐ G739: publish the same pointer to generated code. It is written exactly once, during
+        // registration, strictly before any guest dispatch can run, and never reallocated --
+        // `g646ClearAll` memsets in place and both `m_functionTable.clear()` sites are the
+        // constructor and the destructor. So a reader in a generated TU sees either nullptr (with
+        // `g_ps2DirectFast` false, which is the only state in which nullptr is reachable) or the
+        // final pointer.
+        g_ps2DirectTable = g_g646Direct;
     }
     g_g646Direct[(address - kG646Lo) >> 2] = func;
 }
@@ -513,12 +548,19 @@ void PS2Runtime::registerFunction(uint32_t address, RecompiledFunction func)
 {
     m_functionTable[address] = func;
     g646Set(address, func);
+    // ⭐ G739: the table only becomes usable by the inlined call-site probe once it EXISTS, and it
+    // is allocated lazily by the g646Set above. Re-deriving the gate here means the flag can never
+    // be true while `g_ps2DirectTable` is null, without a separate "init is done" hook that a
+    // future caller could forget. Registration is init-only (~40k calls), so the cost is nil.
+    g739ArmDispatchFast();
+    // G732 oracle call site (unhooked): g732NoteRegistration(address, (void *)func);
 }
 
 bool PS2Runtime::hasFunction(uint32_t address) const
 {
     if (g_g651DispStat)
         g_g651HasCalls.fetch_add(1ull, std::memory_order_relaxed);
+    // G732 oracle call site (unhooked): if (g_g732EntryOracleOn) g732NoteLookup(address);
     if (g646Get(address) != nullptr)
     {
         g646Note(true);
@@ -876,9 +918,206 @@ PS2Runtime::RecompiledFunction ps2LookupFunctionRuntimeFast(PS2Runtime *runtime,
     return g652LookupFunctionFast(runtime, address, g_g652NoRuntimeFastDispatch);
 }
 
+// ================================================================================================
+// ⭐⭐⭐ G739 — ARMING AND AUTHORITY FOR THE INLINED CALL-SITE DISPATCH PROBE
+// ================================================================================================
+//
+// ⛔ THE OBSERVER LIST IS COPIED FROM `g652LookupFunctionFast` ABOVE, NOT FROM MEMORY. That
+// function is the existing, correct statement of "every observer is dormant, so a single table
+// probe is a complete answer":
+//
+//     !disabled && s_g646DispatchOn && !s_g646StatOn && !g_g649DispatchDiagOn &&
+//     !g_g651DispStat && !g_g186SpBal
+//
+// G739 adds exactly three conjuncts, each for a side effect the INLINE form cannot perform:
+//   * `g_g646Direct != nullptr` -- the table must exist. It is allocated on the first
+//     registration, so this is false only before the corpus registers and after nothing.
+//   * `!g_g649HangTrace` -- `pushDispatchPc` carries the `DC2_TRACE_HANG` periodic ring dump, and
+//     the inline push does not. Arming the hang locator therefore disarms the fast path so the
+//     locator keeps seeing every dispatch.
+//   * `!s_g739NoInlineDispatch && !s_g739Oracle` -- the rollback, and the oracle (which needs
+//     every call to reach `ps2DirectCallSlow` so it can compare the two answers).
+//
+// `g_ps2DirectTrace` mirrors `g_g651DispTrace` so `DC2_G651_NO_DISPTRACE=1` still selects the arm
+// without the ring store, on the inline path as well as the out-of-line one.
+//
+// WHEN. Called from `registerFunction`, i.e. ~40,000 times during init and never again. It is a
+// handful of predicated loads and two stores; it is not on any hot path.
+static void g739ArmDispatchFast()
+{
+    g_ps2DirectTrace = g_g651DispTrace;
+    g_ps2DirectFast = (g_g646Direct != nullptr) && s_g646DispatchOn && !s_g646StatOn &&
+                      !g_g649DispatchDiagOn && !g_g651DispStat && !g_g186SpBal &&
+                      !g_g649HangTrace && !g_g652NoGeneratedFastDispatch &&
+                      !s_g739NoInlineDispatch && !s_g739Oracle;
+#if defined(PS2X_G739_TBLBALLAST)
+    // The table-load ballast (§4 probe). Read here rather than at namespace scope so it shares this
+    // function's single init point.
+    if (const char *tb = std::getenv("DC2_G739_TBLBALLAST"))
+        g_ps2TblBallast = (uint32_t)std::strtoul(tb, nullptr, 10);
+#endif
+}
+
+// The authority, and the only path a miss can take. One call where the generator used to emit two.
+//
+// ⭐ THE ORACLE LIVES HERE, NOT AT THE CALL SITE, so that a shipping binary pays NOTHING for it --
+// not even a predicted load. `DC2_G739_ORACLE=1` forces `g_ps2DirectFast` false (see above), which
+// routes EVERY dispatch through this function; the probe expression below is then evaluated
+// beside the public API's answer and compared. An inert oracle cannot produce a non-zero
+// `checks=` count, which is what makes `bad=0` mean something (G732's REMOVEDHITS/inferredHits
+// shape).
+static void g739NoteSlow(PS2Runtime::RecompiledFunction answer, uint32_t address)
+{
+    if (!s_g739Stat && !s_g739Oracle)
+        return;
+
+    // Exactly the expression the inline forms evaluate, minus the `g_ps2DirectFast` gate the
+    // oracle itself is holding low.
+    PS2Runtime::RecompiledFunction probe = nullptr;
+    if (g_g646Direct != nullptr && (address - PS2_DIRECT_LO) < PS2_DIRECT_SPAN &&
+        (address & 3u) == 0u)
+        probe = g_g646Direct[(address - PS2_DIRECT_LO) >> 2];
+
+    if (s_g739Stat)
+    {
+        // `slowHit` is the population the inline probe WOULD have answered: a slow entry with a
+        // live table row means the fast path was disarmed, not that the address is unknown. That
+        // is the number that says whether arming it can convert anything at all.
+        g_g739Slow.fetch_add(1ull, std::memory_order_relaxed);
+        (probe ? g_g739SlowHit : g_g739SlowMiss).fetch_add(1ull, std::memory_order_relaxed);
+    }
+
+    if (!s_g739Oracle)
+        return;
+
+    // A probe MISS is always admissible: the inline form falls through to this function, which is
+    // the authority, so a miss can only ever cost speed. Only a probe HIT that disagrees with the
+    // authority is a defect.
+    const uint64_t n = g_g739OracleChecks.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+    if (probe != nullptr && probe != answer)
+    {
+        const uint64_t bad = g_g739OracleBad.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+        if (bad <= 16ull)
+            std::fprintf(stderr, "[G739:oracle-BAD] n=%llu addr=0x%x probe=%p authority=%p\n",
+                         static_cast<unsigned long long>(bad), address, (void *)probe,
+                         (void *)answer);
+    }
+    if ((n % 200000000ull) == 0ull)
+        std::fprintf(stderr, "[G739:oracle] checks=%llu bad=%llu\n",
+                     static_cast<unsigned long long>(n),
+                     static_cast<unsigned long long>(
+                         g_g739OracleBad.load(std::memory_order_relaxed)));
+}
+
+PS2Runtime::RecompiledFunction ps2DirectCallSlow(PS2Runtime *runtime, uint32_t address)
+{
+    const PS2Runtime::RecompiledFunction answer =
+        runtime->hasFunction(address) ? runtime->lookupFunction(address) : nullptr;
+    g739NoteSlow(answer, address);
+    return answer;
+}
+
+// `lookupFunction`'s own contract: never nullptr. A probe hit must equal it; a probe miss defers
+// to it, including the recovery handler it returns for an unregistered address.
+PS2Runtime::RecompiledFunction ps2LookupDirectSlow(PS2Runtime *runtime, uint32_t address)
+{
+    const PS2Runtime::RecompiledFunction answer = runtime->lookupFunction(address);
+    g739NoteSlow(answer, address);
+    return answer;
+}
+
+// ================================================================================================
+// ⭐ G739 (4) — THE TABLE-LOAD BALLAST. Probe only, never promotable; see ps2_runtime_macros.h.
+// ⛔ COMPILE-TIME GATED (`-DPS2X_G739_TBLBALLAST=ON`). Absent from the gate binary and from any
+// shipping image, bytes and all — see the note at `g_ps2TblBallast` for why a runtime flag here
+// would have been the very defect §3.4 removes.
+// ================================================================================================
+#if defined(PS2X_G739_TBLBALLAST)
+uint32_t g_ps2TblBallast = 0u;
+volatile uint64_t g_ps2TblBallastSink = 0ull;
+std::atomic<uint64_t> g_ps2TblBallastLoads{0ull};
+
+// ⛔ `noinline`: this must not be inlined into 46,551 generated call sites. The arm is a probe, and
+// G710's law (compile-time-dead text in a hot TU cost +0.362 ms/f) applies twice over to LIVE text
+// duplicated 46,551 times. One out-of-line call, reached only when the arm is set.
+__declspec(noinline) void ps2TblBallastRun(uint32_t address)
+{
+    const uint32_t n = g_ps2TblBallast;
+    if (n == 0u || g_ps2DirectTable == nullptr)
+        return;
+    // Walk by a large ODD stride so successive probes land on different cache lines and different
+    // pages, across the same slot range the real dispatch uses. Odd keeps the walk co-prime with the
+    // table size, so it cannot degenerate into re-reading one slot (Rule G738-2: a ballast that
+    // re-touches what is already hot prices nothing, and the tell is a flat response to N).
+    //
+    // ⚠️ WHAT THIS PRICES, STATED HONESTLY. The walk lands mostly on EMPTY slots — only ~5,789 of
+    // 655,360 are ever live — whereas a real dispatch lands on a live one. For a memory-hierarchy
+    // question that is the right comparison (both are scattered reads into the same 5.2 MB array,
+    // and `new T[n]()` value-initialises, so every page is committed and every read is real), but
+    // an empty slot is never resident from a previous dispatch, so the number this returns is an
+    // UPPER BOUND on the per-load cost. That is the useful direction: if even the pessimistic price
+    // is small, the dense-index direction is dead without building it.
+    constexpr uint32_t kStride = 20011u; // prime
+    uint32_t idx = (address - PS2_DIRECT_LO) >> 2;
+    uint64_t acc = 0ull;
+    for (uint32_t i = 0; i < n; ++i)
+    {
+        idx += kStride;
+        if (idx >= (uint32_t)kG646Slots)
+            idx -= (uint32_t)kG646Slots;
+        acc ^= (uint64_t)(uintptr_t)g_ps2DirectTable[idx];
+    }
+    // `volatile` sink: MSVC may not drop the loads, and nothing downstream depends on the value, so
+    // the arm cannot change a single dispatch answer.
+    g_ps2TblBallastSink ^= acc;
+    g_ps2TblBallastLoads.fetch_add(n, std::memory_order_relaxed);
+}
+#endif // PS2X_G739_TBLBALLAST
+
+// Reported from the same place `[G651:disp]` is (frame_end_and_core_helpers.inc), so the two share
+// a denominator (G738-4: a per-frame rate is only as good as its clock).
+void g739DispatchReport(uint64_t presents)
+{
+#if defined(PS2X_G739_TBLBALLAST)
+    // ⛔ The ballast must be able to print its own denominator WITHOUT DC2_G739_STAT, or the price
+    // run would have to arm a census that touches the same counters it is timing (Rule 63).
+    const bool ballastArmed = (g_ps2TblBallast != 0u);
+#else
+    constexpr bool ballastArmed = false;
+#endif
+    if (!s_g739Stat && !s_g739Oracle && !ballastArmed)
+        return;
+    const double p = presents ? static_cast<double>(presents) : 1.0;
+    const uint64_t slow = g_g739Slow.load(std::memory_order_relaxed);
+    // ⭐ `ballastLoads/f` is the price DENOMINATOR, and it is MEASURED, not computed from the flag
+    // (Rule G738-3): an assumed `N x dispatches` denominator cannot detect that the flag leaked
+    // from a previous arm in the same PowerShell session, which is exactly how G738 §7 lost three
+    // arms before its own measured denominator caught it.
+#if defined(PS2X_G739_TBLBALLAST)
+    const uint64_t bl = g_ps2TblBallastLoads.load(std::memory_order_relaxed);
+    const uint32_t bn = g_ps2TblBallast;
+#else
+    const uint64_t bl = 0ull;
+    const uint32_t bn = 0u;
+#endif
+    std::fprintf(stderr,
+                 "[G739:disp] fastArmed=%d presents=%llu slow=%llu (%.0f/f) slowHit=%llu "
+                 "slowMiss=%llu | oracleChecks=%llu oracleBad=%llu | tblBallast=%u "
+                 "ballastLoads=%llu (%.0f/f)\n",
+                 g_ps2DirectFast ? 1 : 0, (unsigned long long)presents,
+                 (unsigned long long)slow, slow / p,
+                 (unsigned long long)g_g739SlowHit.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g739SlowMiss.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g739OracleChecks.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g739OracleBad.load(std::memory_order_relaxed),
+                 bn, (unsigned long long)bl, bl / p);
+    std::fflush(stderr);
+}
+
 PS2Runtime::RecompiledFunction PS2Runtime::lookupFunction(uint32_t address)
 {
     pushDispatchPc(address);
+    // G732 oracle call site (unhooked): if (g_g732EntryOracleOn) g732NoteLookup(address);
 
     // G649: one predicate, one cold call. See g649DispatchDiagnostics above.
     if (g_g649DispatchDiagOn)

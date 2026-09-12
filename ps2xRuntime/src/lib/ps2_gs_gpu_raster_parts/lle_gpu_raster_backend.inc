@@ -1090,7 +1090,7 @@ void main()
     // read back. The batch is used in place (no copy); the caller owns its lifetime.
     bool submit(G178Batch &batch)
     {
-        return submitImpl(&batch, 0u, nullptr, 0, 0, nullptr);
+        return submitImpl(&batch, 0u, nullptr, 0, 0, nullptr, 0, 0, false, /*g723Caller=*/0);
     }
 
     // ===== G701 =====================================================================
@@ -1351,7 +1351,8 @@ void main()
     bool submitDepth(G178Batch &batch, uint64_t depthKey,
                      const std::vector<float> *depthUpload, int depthY, int depthRows)
     {
-        return submitImpl(&batch, depthKey, depthUpload, depthY, depthRows, nullptr);
+        return submitImpl(&batch, depthKey, depthUpload, depthY, depthRows, nullptr,
+                          0, 0, false, /*g723Caller=*/1);
     }
 
     // G275: render a guest-depth batch and read its written row window while that texture is
@@ -1367,7 +1368,7 @@ void main()
             readY > batch.fbH || readRows > batch.fbH - readY)
             return false;
         return submitImpl(&batch, depthKey, depthUpload, depthY, depthRows,
-                          &depthReadback, readY, readRows, true);
+                          &depthReadback, readY, readRows, true, /*g723Caller=*/2);
     }
 
     bool readDepth(uint64_t depthKey, int width, int height,
@@ -1380,7 +1381,7 @@ void main()
         readBatch.fbW = width;
         readBatch.fbH = height;
         return submitImpl(&readBatch, depthKey, nullptr, depthY, depthRows,
-                          &depthReadback, depthY, depthRows, false);
+                          &depthReadback, depthY, depthRows, false, /*g723Caller=*/3);
     }
 
     // G261: synchronous FBO color row-window readback (deferred RTT-wave materialization).
@@ -1766,12 +1767,77 @@ void main()
     }
 
 private:
+    // ===== G723: WHICH CALLER TAKES THE BLOCKING SUBMIT EDGE (default OFF, DC2_G723_SUB=1) =====
+    //
+    // WHY. `[G447:edge] backend-render` fires **44.3x/frame** on `dungeon1` while `[G415:stage]`
+    // counts only **20.04 renderBatch/frame** — measured in ONE process, so the counters are
+    // comparable. 24.2 submissions per frame therefore take the blocking edge WITHOUT producing a
+    // colour renderBatch, and no existing census can see them: `[G415:stage]` classifies colour
+    // populations only, and `DC2_G242_STAT` / `DC2_G275_STAT` emit nothing at all on this route.
+    // `submitImpl` has exactly four call sites, so four counters settle it.
+    //
+    // Behaviour-pure: two clock reads per submission, behind one cached bool.
+    static bool g723SubOn()
+    {
+        static const bool on = g158EnvFlag("DC2_G723_SUB");
+        return on;
+    }
+    static constexpr int kG723Callers = 4; // 0 colour, 1 depth, 2 depth+readback, 3 readDepth
+    static inline std::atomic<uint64_t> g_g723SubN[kG723Callers]{};
+    static inline std::atomic<uint64_t> g_g723SubNs[kG723Callers]{};
+    static const char *g723CallerName(int c)
+    {
+        static const char *const kNames[kG723Callers] = {"colour", "depth", "depthRb", "readDepth"};
+        return (c >= 0 && c < kG723Callers) ? kNames[c] : "?";
+    }
+
     bool submitImpl(G178Batch *batch, uint64_t depthKey,
                     const std::vector<float> *depthUpload, int depthY, int depthRows,
                     std::vector<float> *depthReadback,
                     int depthReadY = 0, int depthReadRows = 0,
-                    bool renderThenReadDepth = false)
+                    bool renderThenReadDepth = false,
+                    int g723Caller = 0)
     {
+        struct G723Scope
+        {
+            bool on;
+            int c;
+            std::chrono::steady_clock::time_point t0;
+            explicit G723Scope(bool armed, int caller) : on(armed), c(caller)
+            {
+                if (on)
+                    t0 = std::chrono::steady_clock::now();
+            }
+            ~G723Scope()
+            {
+                if (!on)
+                    return;
+                const uint64_t ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - t0).count());
+                g_g723SubNs[c].fetch_add(ns, std::memory_order_relaxed);
+                const uint64_t n = g_g723SubN[c].fetch_add(1u, std::memory_order_relaxed) + 1u;
+                uint64_t all = 0;
+                for (int i = 0; i < kG723Callers; ++i)
+                    all += g_g723SubN[i].load(std::memory_order_relaxed);
+                if (all <= 8u || (all % 8192u) == 0u)
+                {
+                    char buf[256];
+                    int off = std::snprintf(buf, sizeof(buf), "[G723:sub] total=%llu |",
+                                            (unsigned long long)all);
+                    for (int i = 0; i < kG723Callers && off > 0 && off < (int)sizeof(buf); ++i)
+                        off += std::snprintf(buf + off, sizeof(buf) - (size_t)off,
+                                             " %s=%llu/%.3fms",
+                                             g723CallerName(i),
+                                             (unsigned long long)g_g723SubN[i].load(
+                                                 std::memory_order_relaxed),
+                                             g_g723SubNs[i].load(std::memory_order_relaxed) / 1.0e6);
+                    (void)n;
+                    std::fprintf(stderr, "%s\n", buf);
+                }
+            }
+        } g723Scope(g723SubOn(), g723Caller);
+
         if (batch == nullptr || !m_ready.load(std::memory_order_acquire))
             return false;
         // G415: consume the front-end's published colour-readback window for THIS submit only.
@@ -1829,10 +1895,25 @@ private:
         return s_count;
     }
 
+    // ⭐ G735: is the render-event hook ARMED AT ALL? Both arms are default-absent, and with both
+    // absent `dc2ShouldExecuteRenderEvent` is a pure `return true` wrapped around one shared-atomic
+    // RMW — paid ~850 times a frame on the executor, together with the per-draw vertex bounding-box
+    // scan that exists ONLY to fill its arguments. Reading the arms once lets the draw loop skip
+    // both. Behaviour-neutral by construction: nothing reads `evId` when the hook is disarmed, and
+    // the function's only other statements are guarded by these same two flags.
+    static inline bool dc2RenderEventHookArmed()
+    {
+        static const bool armed = (std::getenv("DC2_RENDER_EVENT_LIMIT") != nullptr) ||
+                                  (std::getenv("DC2_RENDER_EVENT_DUMP") != nullptr);
+        return armed;
+    }
+
     static inline bool dc2ShouldExecuteRenderEvent(const char *type, uint32_t fbp, uint64_t texKey, uint32_t srcFbp,
                                                   float minX, float minY, float maxX, float maxY,
                                                   int verts, uint32_t blend, uint32_t ztst, uint32_t zw, int mode)
     {
+        if (!dc2RenderEventHookArmed())
+            return true;
         const uint64_t evId = dc2RenderEventCounter().fetch_add(1u, std::memory_order_relaxed) + 1u;
         static const int s_eventLimit = [] {
             const char *v = std::getenv("DC2_RENDER_EVENT_LIMIT");
@@ -1979,6 +2060,15 @@ private:
         GLuint id = 0;
         int w = 0, h = 0;
         uint64_t lastUse = 0;
+        // ⭐ G741: intrusive LRU order links, so eviction pops a victim instead of scanning for one.
+        // `unordered_map` guarantees that POINTERS and REFERENCES to elements stay valid across
+        // rehash and across the erase of OTHER elements (only iterators to those are invalidated),
+        // which is exactly the property this list needs — and the same property the G620 one-entry
+        // draw memo beside it already relies on. `g741Key` lets an unlink find its own map key.
+        uint64_t g741Key = 0;
+        TexEntry *g741Prev = nullptr;
+        TexEntry *g741Next = nullptr;
+        bool g741Linked = false;
         // G492: set only by prepareCt24ViewOnWorker, and only for storage IT allocated at (w,h).
         // Lives on the entry so eviction/recreation or a build by any other path clears it — the
         // storage-reuse arm can then never skip an allocation it did not make.
@@ -2180,6 +2270,8 @@ private:
             if (kv.second.id != 0)
                 glDeleteTextures(1, &kv.second.id);
         m_texCache.clear();
+        m_g741LruHead = nullptr; // G741: the list lived in the erased entries
+        m_g741LruTail = nullptr;
         m_texBytes = 0;
         {
             std::lock_guard<std::mutex> lk(m_residentMtx);
@@ -2830,6 +2922,46 @@ private:
             catch (...)
             {
                 ok = false;
+            }
+            // ⭐⭐⭐ G735 EARLY KICK — start the GPU instead of letting the driver bank the frame.
+            //
+            // `[G495:rb]` brackets each colour readback with `glFinish()`, so its `drain` column is
+            // a REAL GPU-pipeline wait, not transport: on `dungeon1` the 0x139 read reports
+            // `drain=0.942 xfer=0.212` with `ahead(items=28.5 draws=780 rend=13.0)` — 4.4x more
+            // time waiting for the pipe than moving the pixels, against an accumulator holding
+            // essentially the WHOLE frame's rendering. G671 measured this GPU ~95% idle, so those
+            // 780 draws are not a busy GPU: they are commands the driver has buffered and not yet
+            // submitted, and the readback is the first thing that forces them out.
+            //
+            // The fix is not to move, defer or delete the read — every one of those has been
+            // refuted (FINAL §7). It is to stop arriving at the read with the whole frame still
+            // unsubmitted. One `glFlush` per rendered item hands the driver its work as it is
+            // produced, so the GPU runs CONCURRENTLY with the executor's own CPU front end — the
+            // one resource pair in this process that is genuinely unbalanced (executor 89% busy,
+            // GPU ~5%). `glFlush` changes no GL state, no command order and no result; it only
+            // says "do not keep holding these".
+            //
+            // ⚠️ It is not free — a submit has driver cost and ~44 render items reach here per
+            // frame — so the lever carries a stride: DC2_G735_KICK=<n> flushes after every n-th
+            // rendered item. 0 (default) is off; 1 is every item; 4 is a coarse kick. It is a
+            // TIMING lever only: no arm can change what is drawn.
+            {
+                static const uint32_t s_g735Kick = [] {
+                    const char *v = std::getenv("DC2_G735_KICK");
+                    return (v == nullptr || *v == '\0')
+                               ? 0u
+                               : static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
+                }();
+                if (s_g735Kick != 0u && ok && item.batch != nullptr &&
+                    item.colorReadback == nullptr && item.depthReadback == nullptr)
+                {
+                    static uint32_t s_g735KickSeq = 0u;
+                    if (++s_g735KickSeq >= s_g735Kick)
+                    {
+                        s_g735KickSeq = 0u;
+                        glFlush();
+                    }
+                }
             }
             g495GpuEnd();
             // G425: readback-redundancy ceiling census (default OFF, DC2_G425_RBCENSUS=1).
@@ -4081,7 +4213,7 @@ void main()
         if (out.id == 0u)
         {
             glGenTextures(1, &out.id);
-            if (out.id == 0u) { m_texCache.erase(p.texKey); return false; }
+            if (out.id == 0u) { g741LruUnlink(out); m_texCache.erase(p.texKey); return false; } // G741
         }
         else
             m_texBytes -= std::min(m_texBytes,
@@ -4101,6 +4233,7 @@ void main()
         out.w = p.width;
         out.h = p.height;
         out.lastUse = m_batchCounter + 1u;
+        g741LruTouch(p.texKey, out); // G741
         m_texBytes += static_cast<size_t>(p.width) * p.height * 4u;
 
         m_f.glUseProgram_(m_g630T8Prog);
@@ -4184,7 +4317,7 @@ void main()
         if (out.id == 0u)
         {
             glGenTextures(1, &out.id);
-            if (out.id == 0u) { m_texCache.erase(p.texKey); return false; }
+            if (out.id == 0u) { g741LruUnlink(out); m_texCache.erase(p.texKey); return false; } // G741
         }
         else
             m_texBytes -= std::min(m_texBytes,
@@ -4204,6 +4337,7 @@ void main()
         out.w = p.width;
         out.h = p.height;
         out.lastUse = m_batchCounter + 1u;
+        g741LruTouch(p.texKey, out); // G741
         m_texBytes += static_cast<size_t>(p.width) * p.height * 4u;
 
         m_f.glUseProgram_(m_g634RawProg);
@@ -6043,6 +6177,7 @@ void main()
                     glDeleteTextures(1, &it->second.id);
                 m_texBytes -= std::min(
                     m_texBytes, static_cast<size_t>(it->second.w) * it->second.h * 4u);
+                g741LruUnlink(it->second); // G741
                 m_texCache.erase(it);
             }
             std::lock_guard<std::mutex> lk(m_residentMtx);
@@ -6097,6 +6232,7 @@ void main()
             m_texBytes += static_cast<size_t>(texW) * texH * 4u;
         }
         out.lastUse = m_batchCounter + 1u;
+        g741LruTouch(texKey, out); // G741
 
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g281Fbo);
         m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0,
@@ -7004,6 +7140,43 @@ void main()
         static const bool s_g433Stat = (std::getenv("DC2_G433_RBSTAT") != nullptr);
         const auto t0 = s_g433Stat ? std::chrono::steady_clock::now()
                                    : std::chrono::steady_clock::time_point{};
+        // ===== ⭐⭐⭐ G735 FENCE BALLAST (default 0) ===================================================
+        //
+        // THE QUESTION IT DECIDES, AND WHY REMOVAL CANNOT ANSWER IT. `[G495:rb]`'s DRAIN column sums
+        // to **3.07 ms/f across the frame's 7 colour readbacks**, while G496's derivative ballast
+        // measures the GPU's ENTIRE per-frame execution at **~1.3 ms**. A fence can only wait for
+        // work that exists, so the 2.4x gap is either (a) GPU work the geometry ballast never
+        // counted — `[G495:rb]` shows `texKB=1024` and `wrcol=3.0` queued ahead of these reads, i.e.
+        // real texture uploads — or (b) per-fence round-trip latency paid seven times for one GPU
+        // frame. Only (b) is attackable, by coalescing fences the way G276 already coalesces the
+        // display readbacks.
+        //
+        // Removal cannot separate them: `DC2_G433_NO_RB=1` deletes the read, which corrupts VRAM and
+        // therefore changes downstream work (G724 measured it **+0.460 ms/f WORSE** for exactly that
+        // reason), and `g454SkipReadbackAt` needs `-DPS2X_G419_DIAG=ON` and corrupts too.
+        //
+        // ⭐ BALLAST PRICES IT THE OTHER WAY, and is exact: run the fence N EXTRA times. `glFinish`
+        // changes no result, no GL state and no command order — the second call on an already-drained
+        // pipe is definitionally pure fence latency. So:
+        //
+        //     cost per fence = (frame delta) / (N x readbacks per frame)
+        //
+        // If one extra fence per read costs ~0, fence latency is free, the 3.07 ms/f is genuine GPU
+        // execution, and the whole coalescing direction is dead for ~15 lines and one route run.
+        // If it costs ~0.25 ms/f, the frame's 7 fences carry ~1.7 ms/f of latency and coalescing is
+        // worth building.
+        //
+        // ⚠️ This is a PROBE, never promotable: it only ever makes the frame slower. Workload is
+        // identical by construction (same rows, same Mpx, same commands, same order), which is what
+        // `DC2_G433_NO_RB` could never claim.
+        static const uint32_t s_g735FenceBallast = [] {
+            const char *v = std::getenv("DC2_G735_FENCE_BALLAST");
+            return (v == nullptr || *v == '\0')
+                       ? 0u
+                       : static_cast<uint32_t>(std::strtoul(v, nullptr, 0));
+        }();
+        for (uint32_t g735fb = 0; g735fb < s_g735FenceBallast; ++g735fb)
+            glFinish();
         // ===== G495 drain/transfer split (default OFF, DC2_G495_RB=1) ================================
         // [G418:edge] instruments only the ONE render-batch readback; these SIX readColor items have
         // never been split. glFinish changes no result, no GL state and no command order, so the
@@ -7991,6 +8164,7 @@ void main()
                     glDeleteTextures(1, &it->second.id);
                 m_texBytes -= std::min(
                     m_texBytes, static_cast<size_t>(it->second.w) * it->second.h * 4u);
+                g741LruUnlink(it->second); // G741
                 m_texCache.erase(it);
             }
             std::lock_guard<std::mutex> lk(m_residentMtx);
@@ -8101,6 +8275,7 @@ void main()
         out.w = texW;
         out.h = texH;
         out.lastUse = m_batchCounter + 1u;
+        g741LruTouch(texKey, out); // G741
         m_texBytes += static_cast<size_t>(texW) * texH * 4u;
 
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g281Fbo);
@@ -8233,23 +8408,253 @@ void main()
         return true;
     }
 
+    // ===== G741: THE TEXTURE-CACHE LRU, AND THE COUNTER IT NEVER HAD =============================
+    //
+    // SHAPE. One call per flush (the shipped site is the `else` arm of the G620 texture resolve,
+    // :8797). The `while` body selects its victim with a FULL LINEAR SCAN of `m_texCache`, so the
+    // function is O(entries x evictions) — and `m_texCache` is an `unordered_map`, i.e. a linked
+    // list of nodes in MSVC, so each probe is a pointer chase into a fresh cache line. This runs on
+    // the G713 executor, which G740 §4d.2 measured SATURATED on `dungeon1` (`execMs/f = 18.0` of a
+    // 19.5 ms frame).
+    //
+    // ⛔ BUT ITS WHOLE MAGNITUDE IS "DOES IT FIRE", AND NOTHING COULD ANSWER THAT. The cap is
+    // 256 MB (`kG178TexCacheCapBytes`); below it the function is one compare and a return. There was
+    // no counter anywhere in this function, so "never evicts" and "evicts constantly, walking
+    // thousands of nodes" produced byte-identical evidence: none. That is the same class of silence
+    // Rule G737-1 is about, in the cache rather than in a refusal.
+    //
+    // So: count it before rewriting it. The counters below are incremented ONLY inside the `while`
+    // body — the path that is already paying a full map walk — except `calls`, one non-atomic member
+    // increment per flush on the single owning thread. No shipping arm pays for this, and Rule 63 is
+    // satisfied by construction: nothing in this phase changes the eviction count.
+    //
+    // ⭐ IF `evictions` IS NON-ZERO, the O(1) replacement is a known quantity: thread an intrusive
+    // doubly-linked order list through `TexEntry`, re-link on each `lastUse` write (:4201, :4304,
+    // :6179, :8230) and pop the cold end, keeping the `lastUse != m_batchCounter` pin so an in-use
+    // entry is still never evicted. ⛔ Do NOT add that code on speculation: it is a refactor in the
+    // hot GL TU, and G710 measured compile-time-DEAD text in a hot TU at +0.362 ms/f.
+    //
+    // Arm: DC2_G741_EVICT_STAT=1. Prints at n == 1 as well as periodically (G657 law 10).
+    void g741EvictReport(const char *when)
+    {
+        std::fprintf(stderr,
+                     "[G741:evict] when=%s calls=%llu evictions=%llu walked=%llu "
+                     "walkedPerEvict=%.1f pinnedBreaks=%llu entries=%zu bytes=%.1fMB "
+                     "peakBytes=%.1fMB cap=%.0fMB\n",
+                     when,
+                     (unsigned long long)m_g741EvictCalls,
+                     (unsigned long long)m_g741Evictions,
+                     (unsigned long long)m_g741EvictWalked,
+                     m_g741Evictions != 0ull
+                         ? (double)m_g741EvictWalked / (double)m_g741Evictions
+                         : 0.0,
+                     (unsigned long long)m_g741EvictPinned,
+                     m_texCache.size(),
+                     (double)m_texBytes / 1048576.0,
+                     (double)m_g741PeakTexBytes / 1048576.0,
+                     (double)kG178TexCacheCapBytes / 1048576.0);
+    }
+
+    // ===== ⭐⭐⭐ G741: THE O(1) VICTIM SELECTION ==================================================
+    //
+    // MEASURED, on the shipped route set, with the census above (`DC2_G741_EVICT_STAT=1`):
+    //
+    //   dungeon1  entries=448   evictions=1,536  walkedPerEvict=648    walked=995,423
+    //   s03       entries=6,464 evictions=8,704  walkedPerEvict=2,913  walked=25,352,882
+    //
+    // On `s03` the steady tail walks **3.31 M map nodes per 512 evictions** — ~4,900 node visits per
+    // frame, every one a dependent pointer chase into a fresh cache line (MSVC's `unordered_map` is
+    // a node list), on the G713 executor that G740 §4d.2 measured SATURATED. And `walkedPerEvict` is
+    // still RISING across the run (2,438 -> 2,691 -> 2,913) because the scan is O(entries) while the
+    // cache fills toward its 256 MB cap, so the cost is a function of route length, not of workload.
+    //
+    // WHY A LIST IS EXACT HERE. `lastUse` is only ever assigned `m_batchCounter` or
+    // `m_batchCounter + 1`, and `m_batchCounter` never decreases, so touch ORDER is `lastUse` order
+    // and the list from head to tail is sorted ascending — the head IS the minimum the scan looked
+    // for. The pinned rule (`lastUse != m_batchCounter`) is preserved by skipping pinned entries from
+    // the head; because pinned entries are the most recently touched they sit at the TAIL, so the
+    // skip is empty in the ordinary case and bounded by one batch's texture count in the worst.
+    //
+    // ⚠️ THE ONE PLACE THE TWO FORMS CAN DISAGREE, STATED RATHER THAN HIDDEN. Within a single batch a
+    // site that stamps `m_batchCounter + 1` (the T8/CT24/raw view paths) is touched BEFORE a site
+    // that stamps `m_batchCounter`, so list order and numeric order can invert for that pair. Both
+    // entries were evictable under the old rule (`+1 != m_batchCounter`), so either choice is legal
+    // and only the cache-hit order could differ — but it is counted, not assumed:
+    // `DC2_G741_LRU_VERIFY=1` runs the full scan beside the pop on every eviction and reports any
+    // key mismatch.
+    //
+    // ⛔ ROLLBACK: `DC2_G741_NO_LRU=1` restores the full-scan victim search verbatim.
+    void g741LruUnlink(TexEntry &t)
+    {
+        if (!t.g741Linked)
+            return;
+        if (t.g741Prev != nullptr) t.g741Prev->g741Next = t.g741Next;
+        else                       m_g741LruHead = t.g741Next;
+        if (t.g741Next != nullptr) t.g741Next->g741Prev = t.g741Prev;
+        else                       m_g741LruTail = t.g741Prev;
+        t.g741Prev = nullptr;
+        t.g741Next = nullptr;
+        t.g741Linked = false;
+    }
+
+    // Called at every `lastUse` write, so the list order and `lastUse` order cannot drift apart.
+    void g741LruTouch(uint64_t key, TexEntry &t)
+    {
+        t.g741Key = key;
+        g741LruUnlink(t);
+        t.g741Prev = m_g741LruTail;
+        t.g741Next = nullptr;
+        if (m_g741LruTail != nullptr) m_g741LruTail->g741Next = &t;
+        else                          m_g741LruHead = &t;
+        m_g741LruTail = &t;
+        t.g741Linked = true;
+    }
+
+    // The full scan, kept verbatim as the rollback arm AND as the oracle's reference answer.
+    // ⚠️ `found` is an explicit out-param rather than a key-zero sentinel: nothing in this file
+    // proves 0 is absent from `m_texCache` (it means "untextured" for a DRAW, which is a different
+    // namespace), and a sentinel that assumes it would be a silent bug if a zero key ever landed.
+    bool g741VictimByScan(uint64_t &victimKey, uint64_t &walked) const
+    {
+        uint64_t oldestKey = 0;
+        uint64_t oldestUse = ~0ull;
+        bool found = false;
+        for (const auto &kv : m_texCache)
+        {
+            ++walked;
+            if (kv.second.lastUse < oldestUse && kv.second.lastUse != m_batchCounter)
+            {
+                oldestUse = kv.second.lastUse;
+                oldestKey = kv.first;
+                found = true;
+            }
+        }
+        victimKey = oldestKey;
+        return found;
+    }
+
     void evictIfNeeded()
     {
+        static const bool s_g741EvictStat = g158EnvFlag("DC2_G741_EVICT_STAT");
+        static const bool s_g741LruVerify = g158EnvFlag("DC2_G741_LRU_VERIFY");
+        // ⛔⛔ DEFAULT OFF — THE MECHANISM CONVERTED AND THE FRAME DID NOT. The victim search goes
+        // from 2,913 map nodes per eviction to 1.0 and the oracle proves the same victims
+        // (`WORSE=0` over 8,192 evictions, every disagreement an exact `lastUse` tie), but the
+        // order-balanced gate on `s03` is a NULL: pooled **+0.071 ms/f, t = 0.2**, blocks
+        // -0.295 / +0.438, and the harness flags the route NON-STATIONARY (band spread 1.303 ms/f).
+        // So this ships OFF, exactly as G737's T8UVMAP and G740's async boundary did on their nulls:
+        // current source reproduces the accepted behaviour, and the arm costs one gate to revisit.
+        // ⚠️ Resolving the ~0.3 ms/f this mechanism predicts against the measured sd of 0.518 needs
+        // K ~ 12 blocks (~9 h), not a longer arm (Rule 80) — that is the price of a verdict here.
+        //   DC2_G741_LRU=1     arm the O(1) pop
+        //   DC2_G741_NO_LRU=1  force the scan even when armed (the control spelling the gate used)
+        static const bool s_g741NoLru =
+            !g158EnvFlag("DC2_G741_LRU") || g158EnvFlag("DC2_G741_NO_LRU");
+        // The list is maintained unconditionally (7 touch sites, ~6 pointer writes each) so that the
+        // armed and unarmed paths differ ONLY in the victim search. That is what made the gate above
+        // a same-binary comparison with no layout confound (Rule 46) — and it is also the honest
+        // accounting of where the predicted win goes: an unlink+push-back touches 2 neighbour entries
+        // at random in a 6,464-entry map, so the arm ADDS ~2 random cache misses per touch while
+        // removing ~4,900 per frame.
+        ++m_g741EvictCalls;
+        if (m_texBytes > m_g741PeakTexBytes)
+            m_g741PeakTexBytes = m_texBytes;
+        // The census must prove it is ARMED AND REACHED before any row is read from it, so report
+        // the first call even though nothing has been evicted yet — a later all-zero `evictions`
+        // column is then a measurement rather than a silence.
+        if (s_g741EvictStat && m_g741EvictCalls == 1ull)
+            g741EvictReport("first");
         while (m_texBytes > kG178TexCacheCapBytes && !m_texCache.empty())
         {
             uint64_t oldestKey = 0;
-            uint64_t oldestUse = ~0ull;
-            for (const auto &kv : m_texCache)
+            uint64_t g741Walked = 0ull;
+            bool g741Found = false;
+            if (s_g741NoLru)
             {
-                if (kv.second.lastUse < oldestUse && kv.second.lastUse != m_batchCounter)
+                g741Found = g741VictimByScan(oldestKey, g741Walked);
+            }
+            else
+            {
+                // Pop the cold end, skipping only entries pinned to the current batch.
+                for (TexEntry *p = m_g741LruHead; p != nullptr; p = p->g741Next)
                 {
-                    oldestUse = kv.second.lastUse;
-                    oldestKey = kv.first;
+                    ++g741Walked;
+                    if (p->lastUse != m_batchCounter)
+                    {
+                        oldestKey = p->g741Key;
+                        g741Found = true;
+                        break;
+                    }
+                }
+                if (s_g741LruVerify)
+                {
+                    uint64_t refWalked = 0ull;
+                    uint64_t refKey = 0ull;
+                    const bool refFound = g741VictimByScan(refKey, refWalked);
+                    ++m_g741LruChecks;
+                    // Count the scan this replaced, so the oracle run also reports the prize.
+                    m_g741LruRefWalked += refWalked;
+                    if (refFound != g741Found || (refFound && refKey != oldestKey))
+                    {
+                        // ⭐ CLASSIFY THE DISAGREEMENT — a bare count cannot be dispositioned.
+                        // The scan picks `argmin(lastUse)`; on a TIE its winner is whichever key the
+                        // hash buckets happened to visit first, i.e. arbitrary. So:
+                        //   tie   : both candidates have the SAME lastUse. Either answer is the same
+                        //           coldness by the only metric this code has, and the scan's own
+                        //           pick was unspecified. Benign by construction.
+                        //   worse : the list picked a STRICTLY WARMER entry than the scan found.
+                        //           That would be a real ordering defect. Must be zero.
+                        const auto lruIt = m_texCache.find(oldestKey);
+                        const auto refIt = m_texCache.find(refKey);
+                        const uint64_t lruUse =
+                            (g741Found && lruIt != m_texCache.end()) ? lruIt->second.lastUse : 0ull;
+                        const uint64_t refUse =
+                            (refFound && refIt != m_texCache.end()) ? refIt->second.lastUse : 0ull;
+                        const bool tie = (refFound && g741Found && lruUse == refUse);
+                        if (tie)
+                            ++m_g741LruTies;
+                        else
+                            ++m_g741LruWorse;
+                        const uint64_t bad = ++m_g741LruBad;
+                        if (bad <= 16ull || (!tie && m_g741LruWorse <= 16ull))
+                            std::fprintf(stderr,
+                                         "[G741:lru-BAD] n=%llu class=%s lruKey=%llx use=%llu "
+                                         "found=%d scanKey=%llx use=%llu found=%d batch=%llu "
+                                         "entries=%zu\n",
+                                         (unsigned long long)bad, tie ? "tie" : "WORSE",
+                                         (unsigned long long)oldestKey,
+                                         (unsigned long long)lruUse, g741Found ? 1 : 0,
+                                         (unsigned long long)refKey,
+                                         (unsigned long long)refUse, refFound ? 1 : 0,
+                                         (unsigned long long)m_batchCounter,
+                                         m_texCache.size());
+                    }
+                    if ((m_g741LruChecks % 4096ull) == 0ull)
+                        std::fprintf(stderr,
+                                     "[G741:lru] checks=%llu bad=%llu (tie=%llu WORSE=%llu) "
+                                     "lruWalked=%llu scanWalked=%llu scanPerCheck=%.1f\n",
+                                     (unsigned long long)m_g741LruChecks,
+                                     (unsigned long long)m_g741LruBad,
+                                     (unsigned long long)m_g741LruTies,
+                                     (unsigned long long)m_g741LruWorse,
+                                     (unsigned long long)m_g741EvictWalked,
+                                     (unsigned long long)m_g741LruRefWalked,
+                                     (double)m_g741LruRefWalked / (double)m_g741LruChecks);
                 }
             }
-            if (oldestUse == ~0ull)
-                break; // everything is in use by the current batch — can't evict
+            m_g741EvictWalked += g741Walked;
+            if (!g741Found)
+            {
+                // Everything is in use by the current batch — cannot evict. Counted separately:
+                // this is a walk that paid full price and freed nothing, and a non-zero value here
+                // means the cap is being enforced against a working set that does not fit.
+                ++m_g741EvictPinned;
+                if (s_g741EvictStat)
+                    g741EvictReport("pinned");
+                break;
+            }
             TexEntry &t = m_texCache[oldestKey];
+            g741LruUnlink(t);
             m_texBytes -= static_cast<size_t>(t.w) * t.h * 4u;
             glDeleteTextures(1, &t.id);
             m_texCache.erase(oldestKey);
@@ -8257,6 +8662,9 @@ void main()
                 std::lock_guard<std::mutex> lk(m_residentMtx);
                 m_resident.erase(oldestKey);
             }
+            ++m_g741Evictions;
+            if (s_g741EvictStat && (m_g741Evictions == 1ull || (m_g741Evictions % 512ull) == 0ull))
+                g741EvictReport("evict");
         }
     }
 
@@ -8567,6 +8975,7 @@ void main()
             t.w = up.w;
             t.h = up.h;
             t.lastUse = m_batchCounter;
+            g741LruTouch(up.key, t); // G741
             m_texBytes += static_cast<size_t>(up.w) * up.h * 4u;
             {
                 std::lock_guard<std::mutex> lk(m_residentMtx);
@@ -8604,7 +9013,8 @@ void main()
         {
             for (const G178Draw &d : b.draws)
                 if (d.texKey != 0u)
-                    m_texCache.find(d.texKey)->second.lastUse = m_batchCounter;
+                    { TexEntry &g741t = m_texCache.find(d.texKey)->second;
+                      g741t.lastUse = m_batchCounter; g741LruTouch(d.texKey, g741t); } // G741
             evictIfNeeded();
             for (size_t i = 0; i < b.draws.size(); ++i)
             {
@@ -8634,6 +9044,7 @@ void main()
                     memoEnt = &it->second;
                 }
                 memoEnt->lastUse = m_batchCounter;
+                g741LruTouch(k, *memoEnt); // G741
                 drawTextures[i] = memoEnt;
             }
             evictIfNeeded();
@@ -9027,6 +9438,16 @@ void main()
         m_f.glBufferData_(GL158_ARRAY_BUFFER,
                           static_cast<GLsizeiptrLocal>(b.verts.size() * sizeof(G178Vtx)),
                           b.verts.data(), GL178_STREAM_DRAW);
+        // G738: the per-batch prologue — four calls here plus the FBO bind, viewport,
+        // glActiveTexture and glEnable(GL_SCISSOR_TEST) below, and the two/three uniform2f. At
+        // 49.7 batches/frame this is ~500 calls/f that no census counted. One atomic per batch.
+        g496GlNoteN(kG738GlBatch, 4ull, 0ull);
+        if (g738IdentityOn())
+        {
+            g_g738Batches.fetch_add(1ull, std::memory_order_relaxed);
+            g_g738DrawsSeen.fetch_add(static_cast<uint64_t>(b.draws.size()),
+                                      std::memory_order_relaxed);
+        }
         const GLint locFbSize = g560MultiDraw ? m_locG560FbSize : m_locFbSize;
         const GLint locFbScale = g560MultiDraw ? m_locG560FbScale : m_locFbScale;
         const GLint locMode = g560MultiDraw ? m_locG560Mode : m_locMode;
@@ -9039,6 +9460,7 @@ void main()
         const GLint locUvRoundU = g560MultiDraw ? m_locG560UvRoundU : m_locUvRoundU;
         const GLint locUvRoundV = g560MultiDraw ? m_locG560UvRoundV : m_locUvRoundV;
         m_e.glUniform2f_(locFbSize, static_cast<GLfloat>(b.fbW), static_cast<GLfloat>(b.fbH));
+        g496GlNoteN(kG738GlBatch, 3ull, 0ull); // uniform2f x1..2 + glActiveTexture + glEnable
         if (locFbScale >= 0)
             // G675: scaleX == scaleY == S, and S == 1 when high-res is off, so the old
             // `active ? scale : 1.0f` ternaries were a branch that could only ever pick the same
@@ -9562,6 +9984,14 @@ void main()
                     m_f.glActiveTexture_(GL158_TEXTURE0 + kG309BaseUnit);
                     glBindTexture(GL_TEXTURE_2D, m_g309BaseTex);
                     m_f.glActiveTexture_(GL158_TEXTURE0);
+                    // G738: the composite branch is the densest per-draw site in the loop —
+                    // kG309SourceCount glActiveTexture + the same number of glBindTexture, of
+                    // which only unit 0's bind goes through the G496 cache, plus four more here.
+                    // None of it was counted.
+                    g496GlNoteN(kG738GlActiveTex,
+                                static_cast<uint64_t>(kG309SourceCount) + 3ull, 0ull);
+                    g496GlNoteN(kG738GlRawBind,
+                                static_cast<uint64_t>(kG309SourceCount) - 1ull + 2ull, 0ull);
                     mode |= 2048;
                 }
                 else
@@ -9592,6 +10022,10 @@ void main()
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT);
                         g647NoteParam(4u, 0u);
+                        // G738: four glTexParameteri per producer-surface draw, outside the G496
+                        // per-TexEntry record by design (G496b's own comment). `[G496:gl]
+                        // texparam` therefore reads ~8 issued/frame while this site is unbounded.
+                        g496GlNoteN(kG738GlRawParam, 4ull, 0ull);
                         g647ParamTex = src.colorTex;
                         g647MinF = filter;
                         g647MagF = filter;
@@ -9626,6 +10060,7 @@ void main()
                             ++issued;
                         }
                         g647NoteParam(issued, 4u - issued);
+                        g496GlNoteN(kG738GlRawParam, issued, 4ull - issued);
                     }
                 }
                 mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
@@ -9784,14 +10219,26 @@ void main()
                               static_cast<int>(d.uvRoundV) |
                                   (static_cast<int>(d.uvPeriodV & 4095u) << 8), g496GlCache);
             }
-            float minX = 1e6f, minY = 1e6f, maxX = -1e6f, maxY = -1e6f;
-            for (int vi = 0; vi < d.vtxCount; ++vi)
+            // ⭐ G735: this bounding box exists for ONE consumer — `dc2ShouldExecuteRenderEvent`'s
+            // log line — and that hook is default-disarmed, so the scan walked every vertex of
+            // every draw (~850 draws/frame, 32 B per `G178Vtx`) to fill arguments nobody reads.
+            // Compute it only when the hook can actually use it. `execDraw` is `true` on exactly
+            // the same condition the hook returns `true` on when disarmed, so the branch is exact.
+            bool execDraw = true;
+            if (dc2RenderEventHookArmed())
             {
-                const G178Vtx &vx = b.verts[static_cast<size_t>(d.firstVtx + vi)];
-                minX = std::min(minX, vx.x);
-                minY = std::min(minY, vx.y);
-                maxX = std::max(maxX, vx.x);
-                maxY = std::max(maxY, vx.y);
+                float minX = 1e6f, minY = 1e6f, maxX = -1e6f, maxY = -1e6f;
+                for (int vi = 0; vi < d.vtxCount; ++vi)
+                {
+                    const G178Vtx &vx = b.verts[static_cast<size_t>(d.firstVtx + vi)];
+                    minX = std::min(minX, vx.x);
+                    minY = std::min(minY, vx.y);
+                    maxX = std::max(maxX, vx.x);
+                    maxY = std::max(maxY, vx.y);
+                }
+                execDraw = dc2ShouldExecuteRenderEvent("draw", b.fbp, d.texKey, d.srcFbp, minX, minY,
+                                                       maxX, maxY, d.vtxCount, d.blend,
+                                                       d.depthFunc & 0x0Fu, d.depthWrite, mode);
             }
             // ⛔⛔ G675 REMOVED — THIS WAS THE HIGH-RES-ONLY CORRUPTION.
             //
@@ -9805,7 +10252,6 @@ void main()
             // by construction, because the vertex shader maps LOGICAL coordinates onto a
             // PHYSICAL viewport. The clear was a symptom patch for the scale mismatches this
             // phase removed at the source (PS2_PROJECT_STATE.md rule 1: no per-screen fixes).
-            const bool execDraw = dc2ShouldExecuteRenderEvent("draw", b.fbp, d.texKey, d.srcFbp, minX, minY, maxX, maxY, d.vtxCount, d.blend, d.depthFunc & 0x0Fu, d.depthWrite, mode);
             if (execDraw)
             {
                 if (!g560MultiDraw && g255RttAlpha && d.blend != 0u)
@@ -9824,6 +10270,14 @@ void main()
                     g496Uniform1i(g496Uni, kG496UMode, locMode, mode | 32, g496GlCache);
                     glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
                     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+                    // ⭐ G738: the G255 RTT second alpha pass is 2 draws + 3 glColorMask for ONE
+                    // logical draw. `[G559:runs]` measures physical - logical = 1,214 extra draws
+                    // per frame on `dungeon1`, so this branch alone adds ~1,214 draws and ~3,642
+                    // glColorMask per frame, none of which any census counted.
+                    g496GlNoteN(kG738GlDraw, 2ull, 0ull);
+                    g496GlNoteN(kG738GlColorMask, 3ull, 0ull);
+                    g738DrawBallastIssue();
+                    g738DrawBallastIssue();
                 }
                 else
                 {
@@ -9831,7 +10285,13 @@ void main()
                         mode |= 32;
                     g496Uniform1i(g496Uni, kG496UMode, locMode, mode, g496GlCache);
                     glDrawArrays(GL_TRIANGLES, d.firstVtx, g560VtxCount);
+                    g496GlNoteN(kG738GlDraw, 1ull, 0ull);
+                    g738DrawBallastIssue();
                 }
+                g738StateBallastIssue();
+                // G738: the non-elidable price of a `uniform` call — the largest class in the
+                // corrected census (4,484 issued/frame). Issued after the draw, restores `mode`.
+                g738UniBallastIssue(g496Uni, locMode, mode);
             }
             static uint32_t s_auditBatchCounter = 0;
             if (m_batchCounter <= 300 && (m_batchCounter % 60 == 0))
@@ -9987,11 +10447,15 @@ void main()
         int g415ReadRows = 0;
         if (!b.skipReadback)
         {
-            // G496 calibration frame clock on the GL worker: exactly one render batch per frame
-            // reads back (G495 §2 measured rb/frames = 0.99), so this is the divisor that turns the
-            // ballast's accumulated GPU nanoseconds into a real ms/FRAME. No-op unless DC2_G496_CAL.
+            // ⛔ G738: THIS SITE IS NOT A FRAME. The comment here used to read "exactly one render
+            // batch per frame reads back (G495 §2 measured rb/frames = 0.99), so this is the
+            // divisor"; measured on the shipped G732 image, `dungeon1` steady state, it fires
+            // **8.12 times per rendered frame**. `g496NoteFrame` still ticks here because this is
+            // where the GPU timer queries are harvested, but it now divides by `g_dc2RenderedFrame`
+            // and prints the ratio. `g496GlNoteFrame()` is GONE — the GL-call census is reported
+            // from the `[G154:perf]` window on the EE thread, which is the only place in the
+            // process that knows what a frame is.
             g496NoteFrame();
-            g496GlNoteFrame();
             // G415: read only the GS row window this batch's caller actually consumes, into that
             // window's existing offsets in the full-height buffer. Buffer row index == GL row, so
             // the destination pointer offset is glY*fbW and every consumer index is unchanged.
@@ -10393,6 +10857,19 @@ void main()
     std::vector<TexEntry *> m_g620DrawTex;
     size_t m_texBytes = 0;
     uint64_t m_batchCounter = 0;
+    // G741: the texture-cache eviction census (see evictIfNeeded). Plain members, not atomics —
+    // every write is on the single GL-owning thread, same contract as m_texBytes/m_batchCounter
+    // beside them. `calls` is one increment per flush; the rest only move on the eviction path,
+    // which is already paying a full map walk.
+    uint64_t m_g741EvictCalls = 0, m_g741Evictions = 0, m_g741EvictWalked = 0;
+    uint64_t m_g741EvictPinned = 0;
+    size_t m_g741PeakTexBytes = 0;
+    // G741: the intrusive LRU order list over m_texCache (head = coldest). Pointers into an
+    // unordered_map stay valid across rehash and across other elements' erase.
+    TexEntry *m_g741LruHead = nullptr;
+    TexEntry *m_g741LruTail = nullptr;
+    uint64_t m_g741LruChecks = 0, m_g741LruBad = 0, m_g741LruRefWalked = 0;
+    uint64_t m_g741LruTies = 0, m_g741LruWorse = 0;
     uint64_t m_g257RealBatches = 0;
     uint64_t m_g258TraceBatches = 0;
     // G362 census: textured legacy-path draws taking the guarded fixed-point point fetch vs the

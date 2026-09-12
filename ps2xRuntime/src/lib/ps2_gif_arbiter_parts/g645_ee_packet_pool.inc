@@ -146,15 +146,25 @@ inline void g645NoteWindow()
 {
     if (!s_g645StatOn)
         return;
+    // ⛔ G738: `g_dc2PresentTick` IS NOT A FRAME. It is the host present loop's tick, which G598
+    // established "free-runs at ~58 Hz independently of the guest" — so on any route that does not
+    // hold 58 FPS, a rate divided by tick deltas is wrong by (presentHz / renderedHz). This census
+    // used it as the divisor. The trigger is still the tick (it gives a fine reporting cadence);
+    // the DIVISOR is now the real rendered-frame clock, and the ratio is printed so nobody has to
+    // rediscover the factor. Same repair as `[G496:cal]`, whose readback-batch "frame" was 8.12x.
     static thread_local uint64_t s_lastTick = 0ull, s_frames = 0ull;
     static thread_local uint64_t s_lastHits = 0ull, s_lastMiss = 0ull;
+    static thread_local uint32_t s_lastReal = 0u;
     const uint64_t tick = g_dc2PresentTick.load(std::memory_order_relaxed);
     if (tick == s_lastTick)
         return;
     s_lastTick = tick;
     if (++s_frames < 120ull)
         return;
-    const double f = static_cast<double>(s_frames);
+    const uint32_t realNow = g_dc2RenderedFrame.load(std::memory_order_relaxed);
+    const double realFrames = static_cast<double>(realNow - s_lastReal);
+    s_lastReal = realNow;
+    const double f = realFrames > 0.0 ? realFrames : static_cast<double>(s_frames);
     const uint64_t dHits = g_g645Hits - s_lastHits;
     const uint64_t dMiss = g_g645Miss - s_lastMiss;
     size_t binNow = 0u, winNow = 0u;
@@ -169,9 +179,11 @@ inline void g645NoteWindow()
         winNow = bin.free.size();
     }
     std::fprintf(stderr,
-                 "[G645:eepool] frames=%llu pkts/f=%.0f hit=%.1f%% refills/f=%.1f big/f=%.0f "
+                 "[G645:eepool] frames=%.0f presentTicks=%llu (ratio=%.2f) pkts/f=%.0f "
+                 "hit=%.1f%% refills/f=%.1f big/f=%.0f "
                  "binNow=%zu winHit=%llu winMiss=%llu winNow=%zu\n",
-                 static_cast<unsigned long long>(s_frames), (double)(dHits + dMiss) / f,
+                 f, static_cast<unsigned long long>(s_frames),
+                 f > 0.0 ? static_cast<double>(s_frames) / f : 0.0, (double)(dHits + dMiss) / f,
                  (dHits + dMiss) ? 100.0 * (double)dHits / (double)(dHits + dMiss) : 0.0,
                  (double)g_g645Refills / f, (double)g_g645Big / f, binNow,
                  static_cast<unsigned long long>(g_g645WinHits.load(std::memory_order_relaxed)),

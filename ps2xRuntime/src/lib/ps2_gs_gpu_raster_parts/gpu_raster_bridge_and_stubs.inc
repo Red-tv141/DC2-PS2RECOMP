@@ -378,3 +378,28 @@ void g178StartPersistentBackend()
     if (G178Backend::instance().ready())
         std::fprintf(stderr, "[G178:backend] persistent LLE GPU raster backend started\n");
 }
+
+// ⭐⭐⭐ G738: GL COMMAND-STREAM CENSUS BRIDGE.
+//
+// Defined at GLOBAL scope on purpose. The counters it reads are anonymous-namespace statics in
+// g496_gl_state_cache.inc, which unqualified lookup reaches from here because this file is part of
+// the same translation unit and is included after the namespace closes. The FUNCTION, however, must
+// have external linkage: its caller is the cold reporter in ps2_g713_pipeline.cpp, and it is read
+// on the EE thread once per `[G154:perf]` window.
+//
+// ⛔ This is the half of the fix that matters. The old reporter divided by `g_g496GlFrames`, which
+// `renderBatch` incremented once per readback batch — measured 8.12 rendered frames on the shipped
+// G732 image — and printed `frames=600` next to the result. No denominator is decided here; the
+// caller supplies the window's own rendered-frame count.
+void g738_glcall_snapshot(G738GlSnapshot &out)
+{
+    for (int i = 0; i < kG738GlClsCount; ++i)
+    {
+        out.issued[i] = g_g496GlIssued[i].load(std::memory_order_relaxed);
+        out.elided[i] = g_g496GlElided[i].load(std::memory_order_relaxed);
+    }
+    out.drawBallastCalls = g_g738DrawBallastCalls.load(std::memory_order_relaxed);
+    out.stateBallastCalls = g_g738StateBallastCalls.load(std::memory_order_relaxed);
+    out.batches = g_g738Batches.load(std::memory_order_relaxed);
+    out.drawsSeen = g_g738DrawsSeen.load(std::memory_order_relaxed);
+}

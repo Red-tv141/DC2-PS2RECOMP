@@ -64,7 +64,13 @@
 
 static const bool s_g674G496GlCacheDefaultOn =
     (std::getenv("DC2_G496_NO_GLCACHE") == nullptr);
-static const bool s_g674G496GlStatOn = (std::getenv("DC2_G496_GLSTAT") != nullptr);
+// ⭐ G738: ONE flag arms the counters AND the reporter. `DC2_G738_GLCENSUS` gates the cold report
+// in ps2_g738_glcall.inc; if it did not also arm the counters here, a run with only that flag set
+// would print zeros — which is G704's rule verbatim ("a flag that needs a second, unrelated flag to
+// speak reads exactly like a flag that measured nothing"). `DC2_G496_GLSTAT` is kept as an alias so
+// existing scripts still arm the counting half.
+static const bool s_g674G496GlStatOn = (std::getenv("DC2_G496_GLSTAT") != nullptr) ||
+                                       (std::getenv("DC2_G738_GLCENSUS") != nullptr);
 static DC2_G674_HOT_FLAG_INLINE bool g496GlCacheDefaultOn()
 {
     return s_g674G496GlCacheDefaultOn;
@@ -72,75 +78,201 @@ static DC2_G674_HOT_FLAG_INLINE bool g496GlCacheDefaultOn()
 static DC2_G674_HOT_FLAG_INLINE bool g496GlStatOn() { return s_g674G496GlStatOn; }
 
 // Call classes for the census.
+//
+// ⭐⭐⭐ G738: the class list now covers the WHOLE stream this loop issues, not just the six that
+// the G496 cache happens to elide. `glDrawArrays` had no class at all, which is why every figure
+// ever quoted from `[G496:gl]` described state calls only. The numbering of 0..5 is unchanged so
+// the existing cache sites below are byte-identical; `kG496GlClsCount` follows
+// `kG738GlClsCount`, and `ps2_g738_glcall_api.inc` is the single definition of both.
+//
+// ⛔ That header is included by ps2_gs_gpu_raster.cpp at GLOBAL scope, above the anonymous
+// namespace these parts sit inside. It must not be included from here: the parts are inside
+// `namespace { }`, so a first inclusion at this point would give `G738GlSnapshot` and
+// `g738_glcall_snapshot` INTERNAL linkage and the cold reporter's call would fail to link — the
+// same C7631/LNK2001 trap G734 documented for `g713_exec_busy_ns`.
 enum G496GlCls
 {
-    kG496GlScissor = 0,
-    kG496GlDepth = 1,
-    kG496GlBlend = 2,
-    kG496GlBindTex = 3,
-    kG496GlTexParam = 4,
-    kG496GlUniform = 5,
-    kG496GlClsCount = 6
+    kG496GlScissor = kG738GlScissor,
+    kG496GlDepth = kG738GlDepth,
+    kG496GlBlend = kG738GlBlend,
+    kG496GlBindTex = kG738GlBindTex,
+    kG496GlTexParam = kG738GlTexParam,
+    kG496GlUniform = kG738GlUniform,
+    kG496GlClsCount = kG738GlClsCount
 };
 
-static const char *const kG496GlClsName[kG496GlClsCount] = {
-    "scissor", "depth", "blend", "bindtex", "texparam", "uniform"};
-
-// GL-worker thread only, like every other resource in this backend.
-static uint64_t g_g496GlIssued[kG496GlClsCount];
-static uint64_t g_g496GlElided[kG496GlClsCount];
-static uint64_t g_g496GlLastIssued[kG496GlClsCount];
-static uint64_t g_g496GlLastElided[kG496GlClsCount];
-static uint64_t g_g496GlFrames = 0ull, g_g496GlLastFrames = 0ull;
+// GL-worker thread only, like every other resource in this backend — but READ from the EE thread
+// once per `[G154:perf]` window (g738_glcall_snapshot), so these are relaxed atomics rather than
+// plain counters. A relaxed `fetch_add` is a locked op, which is why the census stays opt-in and
+// why Rule 63 forbids arming it in the same run as the ballast (see ps2_g738_glcall_api.inc).
+static std::atomic<uint64_t> g_g496GlIssued[kG496GlClsCount];
+static std::atomic<uint64_t> g_g496GlElided[kG496GlClsCount];
+// G738: the ballast's own call counts — the denominator that turns a frame delta into ns/call.
+static std::atomic<uint64_t> g_g738DrawBallastCalls{0ull};
+static std::atomic<uint64_t> g_g738StateBallastCalls{0ull};
+// G738: workload identity for the census. `batches` is render batches whose draw loop ran and
+// `drawsSeen` is G178Draw entries visited, so a reader can divide calls by draws without needing
+// `[G559:runs]` and without assuming the two instruments share a denominator.
+static std::atomic<uint64_t> g_g738Batches{0ull};
+static std::atomic<uint64_t> g_g738DrawsSeen{0ull};
 
 static inline void g496GlNote(int cls, bool issued)
 {
     if (!g496GlStatOn())
         return;
     if (issued)
-        ++g_g496GlIssued[cls];
+        g_g496GlIssued[cls].fetch_add(1ull, std::memory_order_relaxed);
     else
-        ++g_g496GlElided[cls];
+        g_g496GlElided[cls].fetch_add(1ull, std::memory_order_relaxed);
 }
 
-// Per-frame windowed report, driven by the same GL-worker frame clock as the calibration census.
-static void g496GlStatReport()
-{
-    const double frames = static_cast<double>(g_g496GlFrames - g_g496GlLastFrames);
-    if (frames <= 0.0)
-        return;
-    char line[512];
-    int off = std::snprintf(line, sizeof(line), "[G496:gl] frames=%.0f", frames);
-    uint64_t totI = 0ull, totE = 0ull;
-    for (int i = 0; i < kG496GlClsCount; ++i)
-    {
-        const uint64_t di = g_g496GlIssued[i] - g_g496GlLastIssued[i];
-        const uint64_t de = g_g496GlElided[i] - g_g496GlLastElided[i];
-        totI += di;
-        totE += de;
-        if ((di + de) > 0ull && off < static_cast<int>(sizeof(line)) - 1)
-            off += std::snprintf(line + off, sizeof(line) - off, " %s=%.0f/%.0f",
-                                 kG496GlClsName[i], static_cast<double>(di) / frames,
-                                 static_cast<double>(di + de) / frames);
-        g_g496GlLastIssued[i] = g_g496GlIssued[i];
-        g_g496GlLastElided[i] = g_g496GlElided[i];
-    }
-    g_g496GlLastFrames = g_g496GlFrames;
-    std::fprintf(stderr, "%s | issued/f=%.0f of %.0f (elided %.1f%%)\n", line,
-                 static_cast<double>(totI) / frames,
-                 static_cast<double>(totI + totE) / frames,
-                 (totI + totE) > 0ull ? 100.0 * static_cast<double>(totE) /
-                                            static_cast<double>(totI + totE)
-                                      : 0.0);
-}
-
-static inline void g496GlNoteFrame()
+// Bulk form, for a site that issues a known number of calls in one statement group (the four
+// `glTexParameteri` of the producer-surface branch, the three `glColorMask` of the RTT second
+// pass, the six-call batch prologue). One atomic per site instead of one per call.
+static inline void g496GlNoteN(int cls, uint64_t issued, uint64_t elided)
 {
     if (!g496GlStatOn())
         return;
-    if ((++g_g496GlFrames % 600ull) == 0ull)
-        g496GlStatReport();
+    if (issued != 0ull)
+        g_g496GlIssued[cls].fetch_add(issued, std::memory_order_relaxed);
+    if (elided != 0ull)
+        g_g496GlElided[cls].fetch_add(elided, std::memory_order_relaxed);
 }
+
+// ⛔⛔⛔ G738 REMOVED `g496GlStatReport()` AND `g496GlNoteFrame()`.
+//
+// They were the defect. `g496GlNoteFrame()` was called once per render batch with
+// `!b.skipReadback` and treated that as a frame; measured on the shipped G732 image it is **8.12
+// rendered frames**, so every rate the reporter printed was ~8x too small — and it printed
+// `frames=600` beside them, which reads like a real denominator. The report now lives in
+// `ps2_g738_glcall.inc`, is called from the `[G154:perf]` window on the EE thread, and divides by
+// that window's own rendered-frame count. Nothing on this thread decides what a frame is.
+//
+// A successor must not re-add a frame clock here: there is no frame signal on the GL worker. The
+// one that looked like a frame signal was a readback batch.
+
+// ===== G738: THE DIRECT PRICE OF A GL CALL =====================================================
+//
+// G629's law says price a mechanism before building against it, and the two numbers this project
+// has for GL call issue are both inadmissible (a stage timer, and a counter with a readback-batch
+// denominator — see ps2_g738_glcall_api.inc). These two ballasts give an EVENT price instead.
+//
+//   DC2_G738_DRAWBALLAST=N   after each physical draw, issue N extra `glDrawArrays(GL_TRIANGLES,
+//                            0, 0)`. A zero-vertex draw emits no primitive, rasterizes nothing and
+//                            writes no byte, so the GPU cost is zero and the output is unchanged —
+//                            what it buys is N more trips through the driver's draw-validation and
+//                            command-encode path, which is exactly the quantity a draw-call
+//                            reduction would remove.
+//   DC2_G738_STATEBALLAST=N  the same for redundant STATE: N extra `glDepthMask(GL_TRUE)` calls
+//                            with the value the state already holds. Inert by construction (the
+//                            draw loop sets depth state per draw through the G496 cache, and the
+//                            ballast runs AFTER the draw), and it prices the other 8,482 calls.
+//
+// ⛔ Both are PRICES, not levers: they can only make the frame slower. ns/call =
+// (Δframe_ms × 1e6) / (N × calls/f), read against the census's own ballast counters so the
+// denominator is measured rather than assumed.
+//
+// ⛔ Do NOT arm DC2_G738_GLCENSUS in a ballast run (Rule 63): the census's cost scales with the
+// call count the ballast changes. The ballast counters below are the exception — they are one
+// atomic per BALLAST GROUP, not per call, and they are what make the price computable.
+static const int s_g738DrawBallast = [] {
+    const char *v = std::getenv("DC2_G738_DRAWBALLAST");
+    if (v == nullptr || v[0] == '\0')
+        return 0;
+    const int n = std::atoi(v);
+    return n < 0 ? 0 : (n > 64 ? 64 : n);
+}();
+static const int s_g738StateBallast = [] {
+    const char *v = std::getenv("DC2_G738_STATEBALLAST");
+    if (v == nullptr || v[0] == '\0')
+        return 0;
+    const int n = std::atoi(v);
+    return n < 0 ? 0 : (n > 64 ? 64 : n);
+}();
+// ⭐⭐⭐ DC2_G738_UNIBALLAST=N — THE ONLY ONE OF THE THREE THAT CANNOT BE ELIDED.
+//
+// ⛔ MEASURED, and this is why it exists. The first two ballasts both price ~0: 106,400 extra
+// zero-count `glDrawArrays` per frame (32x the frame's entire draw stream) moved `dungeon1` by
+// **-1.44 ms/f**, and 69,920 extra redundant `glDepthMask` by ~+8 ns/call. Both arms set a value
+// the driver already holds, or draw a primitive count of zero, so a compare-and-skip in nvoglv64
+// makes the arm a no-op and the "price" is the price of nothing. A flat response across a 4x
+// change in N is the tell, and it appeared exactly as this file's own caveat predicted.
+//
+// This form alternates `uMode` between the real value and the real value with BIT 30 set, an even
+// number of times, so that:
+//   * every call is a genuine state change and no driver can compare-and-skip it;
+//   * the LAST write restores the real value, so the G496 uniform cache's record still describes
+//     GL's real state and the next draw is unaffected;
+//   * bit 30 is unused by every shader in this backend (uMode's live fields stop at bit 21, and
+//     the G560 build masks `uMode & 65535`), and the ballast runs AFTER the draw, so even the
+//     intermediate value cannot reach a fragment.
+// It prices the `uniform` class, which the corrected census puts at 4,484 issued/frame — the
+// single largest class in the real stream.
+static const int s_g738UniBallast = [] {
+    const char *v = std::getenv("DC2_G738_UNIBALLAST");
+    if (v == nullptr || v[0] == '\0')
+        return 0;
+    int n = std::atoi(v);
+    if (n < 0)
+        n = 0;
+    if (n > 64)
+        n = 64;
+    return n & ~1; // even, so the final write restores the real value
+}();
+static DC2_G674_HOT_FLAG_INLINE int g738DrawBallast() { return s_g738DrawBallast; }
+static DC2_G674_HOT_FLAG_INLINE int g738StateBallast() { return s_g738StateBallast; }
+
+// The non-elidable uniform ballast. Templated on the uniform functor for the same reason
+// `g496Uniform1i` is: `m_f.glUniform1i_` is a member of the backend, not reachable from here.
+// `mode` is written LAST, so GL and the G496 cache agree when this returns.
+template <typename UniFn>
+static DC2_G674_HOT_FLAG_INLINE void g738UniBallastIssue(UniFn &&uniFn, GLint loc, int mode)
+{
+    const int n = s_g738UniBallast;
+    if (n == 0 || loc < 0)
+        return;
+    const int flipped = mode | (1 << 30);
+    for (int i = 0; i < n; i += 2)
+    {
+        uniFn(loc, flipped);
+        uniFn(loc, mode);
+    }
+    g_g738StateBallastCalls.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+}
+
+// Workload identity for the census, one atomic per batch / per draw-loop iteration. Armed by the
+// census flag OR either ballast, because a ballast run needs `drawsSeen` to compute ns/call and
+// must be able to get it without arming the per-call census (Rule 63).
+static DC2_G674_HOT_FLAG_INLINE bool g738IdentityOn()
+{
+    return g496GlStatOn() || s_g738DrawBallast != 0 || s_g738StateBallast != 0;
+}
+
+// One extra trip through the driver's draw path per call, with nothing to draw.
+//
+// ⛔ WHY A ZERO-COUNT DRAW IS THE RIGHT BALLAST. `glDrawArrays(GL_TRIANGLES, 0, 0)` still
+// validates the bound program, VAO, framebuffer completeness and every piece of dirty state, and
+// still encodes a command; it assembles no primitive, so it rasterizes nothing, writes no byte and
+// cannot change a pixel. That makes the arm exact by construction (the workload invariant is the
+// census's own `drawsSeen`, which the ballast does not touch) while isolating the CPU-side cost
+// this project has never measured directly.
+//
+// ⚠️ CAVEAT a successor must check before quoting the price: if a driver short-circuits count==0
+// before the encode, this UNDER-states the per-draw cost, making any conclusion drawn from it
+// conservative in the safe direction. The tell is a near-zero ns/call at large N.
+static DC2_G674_HOT_FLAG_INLINE void g738DrawBallastIssue()
+{
+    const int n = s_g738DrawBallast;
+    if (n == 0)
+        return;
+    for (int i = 0; i < n; ++i)
+        glDrawArrays(GL_TRIANGLES, 0, 0);
+    g_g738DrawBallastCalls.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+}
+
+// The state ballast needs `g_g496Gl`, which is declared below, so it is defined at the bottom of
+// this file. Both are declared here so the call sites read in one place.
+static DC2_G674_HOT_FLAG_INLINE void g738StateBallastIssue();
 
 // --- the cache ---------------------------------------------------------------------------------
 struct G496GlState
@@ -370,4 +502,30 @@ static inline void g496Uniform1i(UniFn &&uniFn, int slot, GLint loc, int value, 
     s.uni[slot] = value;
     s.uniSet[slot] = true;
     g496GlNote(kG496GlUniform, true);
+}
+
+// ⭐ G738: the redundant-STATE ballast, defined here because it reads `g_g496Gl`.
+//
+// `glDepthMask` with the value the state already holds. The driver must marshal the call and the
+// value it writes is the value that was there, so the arm is inert: it cannot change a pixel and
+// it cannot desynchronise the G496 cache (the cache's `depthWrite` record still describes GL's
+// real state afterwards). Issued AFTER the draw, so the draw it follows is unaffected.
+//
+// This is the price of the OTHER 8,482 calls/frame — the cached-state classes. Divide the frame
+// delta by (N x drawsSeen/f) exactly as for the draw ballast.
+static DC2_G674_HOT_FLAG_INLINE void g738StateBallastIssue()
+{
+    const int n = s_g738StateBallast;
+    if (n == 0)
+        return;
+    // -1 is "unknown" in this cache. Re-issuing a guess there would be a real state change, so the
+    // ballast abstains and does not count the draw — that keeps the arm inert by construction and
+    // keeps the ns/call denominator honest (it counts only calls that were actually issued).
+    const int cur = g_g496Gl.depthMask;
+    if (cur < 0)
+        return;
+    const GLboolean v = cur != 0 ? GL_TRUE : GL_FALSE;
+    for (int i = 0; i < n; ++i)
+        glDepthMask(v);
+    g_g738StateBallastCalls.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
 }

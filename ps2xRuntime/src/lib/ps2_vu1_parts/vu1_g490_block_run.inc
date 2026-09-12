@@ -3821,15 +3821,15 @@ namespace
                                  "[G610:verify-BAD] hist.vec[%ld] jit=%08x %08x %08x %08x "
                                  "gen=%08x %08x %08x %08x dest=%u kind=%u head jit=%d gen=%d\n",
                                  at,
-                                 *(const uint32_t *)&s_g610SnapJit.hb.vec[at][0],
-                                 *(const uint32_t *)&s_g610SnapJit.hb.vec[at][1],
-                                 *(const uint32_t *)&s_g610SnapJit.hb.vec[at][2],
-                                 *(const uint32_t *)&s_g610SnapJit.hb.vec[at][3],
-                                 *(const uint32_t *)&hb->vec[at][0],
-                                 *(const uint32_t *)&hb->vec[at][1],
-                                 *(const uint32_t *)&hb->vec[at][2],
-                                 *(const uint32_t *)&hb->vec[at][3],
-                                 (unsigned)hb->dest[at], (unsigned)hb->kind[at],
+                                 *(const uint32_t *)&s_g610SnapJit.hb.e[at].vec[0],
+                                 *(const uint32_t *)&s_g610SnapJit.hb.e[at].vec[1],
+                                 *(const uint32_t *)&s_g610SnapJit.hb.e[at].vec[2],
+                                 *(const uint32_t *)&s_g610SnapJit.hb.e[at].vec[3],
+                                 *(const uint32_t *)&hb->e[at].vec[0],
+                                 *(const uint32_t *)&hb->e[at].vec[1],
+                                 *(const uint32_t *)&hb->e[at].vec[2],
+                                 *(const uint32_t *)&hb->e[at].vec[3],
+                                 (unsigned)hb->e[at].dest, (unsigned)hb->e[at].kind,
                                  (int)s_g610SnapJit.hb.head, (int)hb->head);
                 g610VerifyFail(what, firstIndex, count, at);
             }

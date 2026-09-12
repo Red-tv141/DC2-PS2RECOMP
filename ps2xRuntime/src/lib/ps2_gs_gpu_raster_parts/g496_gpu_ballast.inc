@@ -186,6 +186,9 @@ struct G496Cal
     uint64_t gpuNs = 0, batches = 0, drawsIssued = 0, vertsIssued = 0;
     uint64_t lastGpuNs = 0, lastBatches = 0, lastDraws = 0, lastVerts = 0;
     uint64_t frames = 0, lastFrames = 0;
+    // G738: the real rendered-frame clock at the previous report. `frames`/`lastFrames` above count
+    // READBACK BATCHES and are kept only so the report can print the ratio it used to hide.
+    uint32_t lastRealFrame = 0u;
 };
 
 static G496Cal g_g496Cal;
@@ -264,8 +267,21 @@ static inline void g496PassBallast()
     g496CalEnd(static_cast<uint64_t>(reps), 3ull * static_cast<uint64_t>(reps));
 }
 
-// GL-worker frame clock: the ONE render batch per frame that reads back (G495 §2). Every figure the
-// report prints is a WINDOW DELTA against the previous report.
+// ⛔⛔⛔ G738 REPAIRED THE DENOMINATOR. It used to read:
+//
+//     "GL-worker frame clock: the ONE render batch per frame that reads back (G495 §2)."
+//     ++g.frames;  ...  frames = g.frames - g.lastFrames;
+//
+// `g.frames` counts render batches with `!b.skipReadback`. MEASURED on the shipped G732 image,
+// `dungeon1` steady state: **8.12 RENDERED FRAMES per increment** — G495 §2's `rb/frames = 0.99`
+// was a different route. So `injMs/f` (this probe's whole output) was 8x too small on this route,
+// and `injMs/f` is what the file above derives "the GPU's own execution for a whole frame is on
+// the order of ~1.3 ms" and "sensitivity 0.7-0.9" from.
+//
+// The report is still emitted from the GL worker — it needs `g.gpuNs`, which only this thread
+// harvests — but it now divides by the delta of the process's REAL rendered-frame clock
+// (`g_dc2RenderedFrame`, published once per guest frame by the mgEndFrame override) and PRINTS
+// BOTH, so a reader can see the ratio instead of inheriting it.
 static inline void g496NoteFrame()
 {
     if (!g496CalOn())
@@ -274,15 +290,18 @@ static inline void g496NoteFrame()
     ++g.frames;
     if ((g.frames % 600ull) != 0ull)
         return;
-    const double frames = static_cast<double>(g.frames - g.lastFrames);
+    const double rbBatches = static_cast<double>(g.frames - g.lastFrames);
+    const uint32_t realNow = g_dc2RenderedFrame.load(std::memory_order_relaxed);
+    const double frames = static_cast<double>(realNow - g.lastRealFrame);
     const double harvested = static_cast<double>(g.batches - g.lastBatches);
+    g.lastRealFrame = realNow;
     if (frames <= 0.0)
         return;
     const double injMs = static_cast<double>(g.gpuNs - g.lastGpuNs) / 1.0e6 / frames;
     std::fprintf(stderr,
-                 "[G496:cal] win frames=%.0f injMs/f=%.3f ballast(batches/f=%.1f draws/f=%.1f "
-                 "verts/f=%.0f) gpuMs/batch=%.3f\n",
-                 frames, injMs, harvested / frames,
+                 "[G496:cal] win frames=%.0f rbBatches=%.0f (ratio=%.2f) injMs/f=%.3f "
+                 "ballast(batches/f=%.1f draws/f=%.1f verts/f=%.0f) gpuMs/batch=%.3f\n",
+                 frames, rbBatches, rbBatches / frames, injMs, harvested / frames,
                  static_cast<double>(g.drawsIssued - g.lastDraws) / frames,
                  static_cast<double>(g.vertsIssued - g.lastVerts) / frames,
                  harvested > 0.0

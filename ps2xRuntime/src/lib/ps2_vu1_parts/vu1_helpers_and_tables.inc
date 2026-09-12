@@ -71,19 +71,31 @@ struct G141PerfScope
         if (unitPtr && unitSum) *unitSum += *unitPtr;
         if (++(*win) >= window)
         {
-            if (unitPtr && unitSum && *unitSum > 0ull)
+            // ⛔⛔⛔ G740: THIS `fprintf` RUNS ON THE VU1 (MTVU) WORKER — a pole thread — once per
+            // 2,000 `run()` calls, i.e. roughly once per frame. Measured with the G478 PC sampler on
+            // `dungeon1`, same binary and route, `NtWriteFile` is **9.4-12.5 % of every sample on
+            // that thread** with `DC2_PERF=1` and ZERO without it. stderr is unbuffered, the harness
+            // redirects it to a file, and four hot threads share one CRT file lock.
+            //
+            // It is not cosmetic: `[G735:cpu] vu1CpuMs/f` is a `GetThreadTimes` delta (kernel time
+            // included), so every VU1 pole figure taken under `DC2_PERF=1` is inflated by this line.
+            // The accumulator above still runs — `[G141:perf] n=… VU1proper=…` is printed once per
+            // window from the EE frame boundary and is unaffected. Opt in with DC2_G141_VERBOSE=1.
+            static const bool s_g141Verbose = (std::getenv("DC2_G141_VERBOSE") != nullptr);
+            if (s_g141Verbose)
             {
-                std::fprintf(stderr, "[G141:perf] %s avgUs=%.2f window=%u %s=%llu avgNsPerUnit=%.2f\n",
-                             tag, (*sum * 1000.0) / static_cast<double>(*win), *win, unitLabel,
-                             static_cast<unsigned long long>(*unitSum),
-                             (*sum * 1.0e6) / static_cast<double>(*unitSum));
+                if (unitPtr && unitSum && *unitSum > 0ull)
+                    std::fprintf(stderr,
+                                 "[G141:perf] %s avgUs=%.2f window=%u %s=%llu avgNsPerUnit=%.2f\n",
+                                 tag, (*sum * 1000.0) / static_cast<double>(*win), *win, unitLabel,
+                                 static_cast<unsigned long long>(*unitSum),
+                                 (*sum * 1.0e6) / static_cast<double>(*unitSum));
+                else
+                    std::fprintf(stderr, "[G141:perf] %s avgUs=%.2f window=%u\n", tag,
+                                 (*sum * 1000.0) / static_cast<double>(*win), *win);
+            }
+            if (unitPtr && unitSum)
                 *unitSum = 0ull;
-            }
-            else
-            {
-                std::fprintf(stderr, "[G141:perf] %s avgUs=%.2f window=%u\n", tag,
-                             (*sum * 1000.0) / static_cast<double>(*win), *win);
-            }
             *sum = 0.0;
             *win = 0u;
         }
@@ -330,24 +342,60 @@ namespace
     // hoists a single base pointer per run() and every field is a constant displacement off it.
     // Layout order is the old declaration order; every field keeps its type, extent and initial
     // value, so nothing about what is stored or read changes.
+    // ⭐ G726: ARRAY OF STRUCTS, and the reason is store locality, not taste.
+    //
+    // G436 folded six thread_local objects into one to kill five redundant TLS base
+    // materialisations. That fixed the ADDRESSING but left the LAYOUT struct-of-arrays, and
+    // struct-of-arrays is the wrong shape for this access pattern: every writer of this ring writes
+    // ONE SLOT'S WORTH of every field at once, and no reader ever sweeps a single field across all
+    // eight slots except the stamp scan. Under SoA a single push at slot `s` wrote
+    //
+    //     vec[s]    at   0 + 16s      -> one cache line
+    //     stamp[s]  at 128 +  8s      -> a SECOND cache line
+    //     dest[s]   at 224 +  s   \
+    //     kind[s]   at 232 +  s   /   -> a THIRD cache line, in two separate 1-byte stores
+    //                                    that are 8 bytes apart and so cannot be fused
+    //
+    // i.e. three lines dirtied and four stores issued per FMAC. G711's ballast ladder priced this
+    // push at 0.5250 ns/pair = **1.518 ms/f of VU1 busy on `dragon`, 7.6% of it** - three times the
+    // operand and ACC round-trips combined - and its standing hypothesis was that the compiled pair
+    // is STORE-PORT / store-to-load-forward bound rather than FP bound.
+    //
+    // With a 32-byte entry, one push touches ONE line and `dest`/`kind` become adjacent bytes, so
+    // they fuse into a single 16-bit immediate store. 32 is chosen deliberately: it keeps `vec`
+    // 16-byte aligned at every slot (the emitter and `_mm_store_ps` both need that) and it is a
+    // power of two, so the emitter still indexes with a scaled SIB byte and no multiply.
+    //
+    // ⛔ NOT a dead-history elision. The ring is 8 entries and G612 makes every flag consumer a
+    // REGION EXIT, which tempts "only the last <=8 pushes before an exit are live, skip the rest" -
+    // but `[G490:block] avg=9.15` pairs per compiled block means block-scope elision reaches ~12%
+    // of pushes, and region-scope is impossible because a region exit is dynamic and the emitter
+    // cannot know at push time that it is inside the final eight. See plans/phase-G726-plan.md.
+    struct alignas(16) G430HistEntry
+    {
+        float vec[4];    // @ 0
+        int64_t stamp;   // @16
+        uint32_t mac;    // @24
+        uint8_t dest;    // @28
+        // G428_MK_PENDING = parked vector; G428_MK_EAGER = already-classified value in `mac`.
+        uint8_t kind;    // @29
+        uint16_t pad;    // @30 - keeps the entry exactly 32 B; never read.
+    };
     struct G430HistBlock
     {
-        alignas(16) float vec[G430_HIST][4];
-        int64_t stamp[G430_HIST];
-        uint32_t mac[G430_HIST];
-        uint8_t dest[G430_HIST];
-        // G428_MK_PENDING = parked vector; G428_MK_EAGER = already-classified value in `mac`.
-        uint8_t kind[G430_HIST];
-        int head;
+        G430HistEntry e[G430_HIST]; // @  0
+        int head;                   // @256
     };
+#define G430_HIST_INIT_ENTRY {{0.0f, 0.0f, 0.0f, 0.0f}, -1, 0u, 0u, 2u, 0u}
     thread_local G430HistBlock s_g430HB = {
-        {},
-        {-1, -1, -1, -1, -1, -1, -1, -1},
-        {},
-        {},
-        {2u, 2u, 2u, 2u, 2u, 2u, 2u, 2u},
+        {G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY,
+         G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY},
         0,
     };
+#undef G430_HIST_INIT_ENTRY
+    static_assert(sizeof(G430HistEntry) == 32u, "G726: the emitter indexes entries with scale*8");
+    static_assert(offsetof(G430HistEntry, dest) + 1u == offsetof(G430HistEntry, kind),
+                  "G726: dest and kind must be adjacent so one 16-bit store covers both");
     // Pairs executed by this thread before the current run(); stamps are this plus `cycle`.
     thread_local int64_t s_g430PairBase = 0;
     // Whether the history representation is currently the live one.
