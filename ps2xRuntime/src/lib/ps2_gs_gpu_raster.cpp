@@ -1,5 +1,7 @@
 #include <cstdint>
 #include "ps2_g674_hot_flag.inc"
+// G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
+#include "ps2_g736_ab_arm_stubs.inc"
 
 // G652: three-segment SSBO upload ring + finite persistent command-ring proof (force rebuild v1).
 // G630: persistent raw-VRAM stream with separately clocked GPU job classes (force rebuild v2).
@@ -114,6 +116,17 @@ extern void g650PinThread(int role);
 // script instant (measured: vertex hashes diverge from batch 316 with zero raw pages live).
 // Same global-scope contract as the arms above. Defined in dc2_game_override.cpp.
 extern std::atomic<uint32_t> g_dc2ScriptFrame;
+// ⭐ G738: the RENDERED-frame clock (defined in ps2_memory.cpp). The GL worker has no frame signal
+// of its own; the two G496 censuses had been counting readback batches as frames, which measured
+// 8.12 rendered frames on `dungeon1`.
+extern std::atomic<uint32_t> g_dc2RenderedFrame;
+// ⭐⭐⭐ G738: the GL command-stream census API. Included HERE, at global scope, above the
+// anonymous namespace the parts sit inside, for the same reason as every extern above it — the
+// snapshot bridge in gpu_raster_bridge_and_stubs.inc has to have EXTERNAL linkage so the cold
+// reporter in ps2_g713_pipeline.cpp can call it. The header is types and declarations only; the
+// counters live in g496_gl_state_cache.inc and the formatting in ps2_g738_glcall.inc, so no
+// formatting text enters this hot TU (G710: +0.362 ms/f for compile-time-dead text here).
+#include "ps2_g738_glcall_api.inc"
 
 #include "ps2_gs_gpu_raster_parts/gpu_raster_infrastructure.inc"
 #include "ps2_gs_gpu_raster_parts/persistent_t8_decoder.inc"

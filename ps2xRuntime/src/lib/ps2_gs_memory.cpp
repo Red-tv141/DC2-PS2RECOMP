@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <cstring>
 #include "ps2_g674_hot_flag.inc"
+// G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
+#include "ps2_g736_ab_arm_stubs.inc"
 // G651: SSE2 only, on purpose — the P4HL/P4HH word-group extraction in
 // g512_texdecode_row_readers.inc would be one `_mm_shuffle_epi8` under SSSE3, and this project
 // keeps one baseline (the same call g491_readback_format.inc made).

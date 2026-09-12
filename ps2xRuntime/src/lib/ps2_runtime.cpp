@@ -1,3 +1,5 @@
+// G739: the inlined call-site dispatch probe + back-edge preempt fast path (force rebuild v1).
+//       G652's generated-side fast dispatch had ZERO call sites; see ps2_runtime_macros.h.
 // G652: cross-thread critical-path hooks + fast dispatch helpers (force rebuild v1).
 // G566: exact GPU-authoritative VU1 command producer and asynchronous packet-result handoff (v1).
 // G545: incremental CPU-authoritative VU1 worker -> persistent GPU shadow stream (v2 trace).
@@ -5,6 +7,8 @@
 // G483: it also splits [G441:kick]'s exec bucket by kick kind ([G483:kind]) and by stop reason
 // ([G483:stop]).
 #include "ps2_runtime_parts/dc2_logger.inc"
+// G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
+#include "ps2_g736_ab_arm_stubs.inc"
 // G650 (ROADMAP P6): contention-aware core scheduler. ⛔ The DEFINITION deliberately does NOT live
 // in this TU — it needs <windows.h>, and pulling that in ahead of raylib.h / ThreadNaming.h
 // redefines `Rectangle`, `CloseWindow`, `ShowCursor` and `HMODULE`. It is compiled inside

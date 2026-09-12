@@ -1,5 +1,7 @@
 #include <cstdint>
 #include "ps2_g674_hot_flag.inc"
+// G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
+#include "ps2_g736_ab_arm_stubs.inc"
 
 int g473SimdMergeArm();
 // G508: A/B arm for the m_stateMutex lock-skip lever, read once per GIF packet in

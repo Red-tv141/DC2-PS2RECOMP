@@ -53,11 +53,31 @@
 // resolve against ps2_runtime.cpp's definition (the G214 trap). Re-declaring an already-declared
 // extern with the same type at the same scope is well-formed.
 extern std::atomic<uint64_t> g_dc2PresentTick;
+// ⛔ G738: and the clock that is actually a frame. `g_dc2PresentTick` is the HOST present loop's
+// tick and G598 established it "free-runs at ~58 Hz independently of the guest", so every census
+// below that divided by tick deltas was reporting `x / presentTicks`, not `x / frame`. Same
+// file-scope linkage rule as the line above.
+extern std::atomic<uint32_t> g_dc2RenderedFrame;
 
+// ⭐ G740: `count` mirrors `free.size()`, published under `mtx` and read WITHOUT it.
+//
+// THE DEFECT IT REMOVES. The capture side below refills from `bin` whenever its thread-local list
+// is empty — and takes `bin.mtx` to discover that `bin.free` is ALSO empty. G738 §9 measured the
+// consequence directly: `refills/f = 2,378-2,831` against `4,652` hits, i.e. 1.96 buffers per
+// refill, so on the order of 2,300 of those mutex acquisitions per frame returned NOTHING. They
+// are taken on the VU1 worker — the pole thread — against a GS-worker return side that takes the
+// same mutex once per window (~2,800/f on `dungeon1`), so both sides were contending for a lock
+// that, most of the time, had nothing to hand over.
+//
+// An `empty` check cannot be wrong in a harmful direction: a stale "non-empty" costs exactly the
+// acquisition it costs today, and a stale "empty" costs one pooled buffer (the capture falls back
+// to `emplace_back`, which is the exact pre-G480 statement and the mechanism's own control arm).
+// The hit RATE is unchanged in either case; only the futile acquisitions disappear.
 struct G480PktBin
 {
     std::mutex mtx;
     std::vector<std::vector<uint8_t>> free;
+    std::atomic<uint32_t> count{0u}; // == free.size(), published under mtx, read lock-free
 };
 
 // Defined exactly once, in ps2_gif_arbiter.cpp (the TU that owns the return side).
@@ -94,7 +114,8 @@ struct G480PktCensus
 {
     uint64_t captures = 0ull, bytes = 0ull, hits = 0ull, misses = 0ull, refills = 0ull;
     uint64_t lastTick = 0ull, lastCaptures = 0ull, lastBytes = 0ull, lastHits = 0ull;
-    uint64_t frames = 0ull;
+    uint64_t frames = 0ull;   // G738: PRESENT TICKS, kept only to print the ratio
+    uint32_t lastReal = 0u;   // G738: the real rendered-frame clock at the previous report
 };
 
 static const bool s_g480CensusOn = (std::getenv("DC2_G480_PKTCENSUS") != nullptr);
@@ -115,7 +136,8 @@ inline void g480CapturePacket(std::vector<std::vector<uint8_t>> &out,
     bool hit = false;
     if (pooled)
     {
-        if (s_local.empty())
+        // ⭐ G740: bail on an empty bin WITHOUT taking its mutex. See the note on G480PktBin.
+        if (s_local.empty() && g480PktBin().count.load(std::memory_order_relaxed) != 0u)
         {
             G480PktBin &bin = g480PktBin();
             std::lock_guard<std::mutex> lk(bin.mtx);
@@ -127,6 +149,7 @@ inline void g480CapturePacket(std::vector<std::vector<uint8_t>> &out,
                 s_local.push_back(std::move(bin.free.back()));
                 bin.free.pop_back();
             }
+            bin.count.store(static_cast<uint32_t>(bin.free.size()), std::memory_order_relaxed);
             if (census)
                 ++s_census.refills;
         }
@@ -156,7 +179,11 @@ inline void g480CapturePacket(std::vector<std::vector<uint8_t>> &out,
             s_census.lastTick = tick;
             if (++s_census.frames >= 120ull)
             {
-                const double f = (double)s_census.frames;
+                // ⛔ G738: divide by RENDERED frames, not present ticks (see the extern above).
+                const uint32_t realNow = g_dc2RenderedFrame.load(std::memory_order_relaxed);
+                const double realFrames = (double)(realNow - s_census.lastReal);
+                s_census.lastReal = realNow;
+                const double f = realFrames > 0.0 ? realFrames : (double)s_census.frames;
                 const uint64_t dCap = s_census.captures - s_census.lastCaptures;
                 const uint64_t dBytes = s_census.bytes - s_census.lastBytes;
                 const uint64_t dHits = s_census.hits - s_census.lastHits;
@@ -167,9 +194,11 @@ inline void g480CapturePacket(std::vector<std::vector<uint8_t>> &out,
                     binNow = bin.free.size();
                 }
                 std::fprintf(stderr,
-                             "[G480:pkt] frames=%llu pkts/f=%.0f bytes/pkt=%.0f hit=%.1f%% "
+                             "[G480:pkt] frames=%.0f presentTicks=%llu (ratio=%.2f) pkts/f=%.0f "
+                             "bytes/pkt=%.0f hit=%.1f%% "
                              "refills/f=%.1f binNow=%zu\n",
-                             (unsigned long long)s_census.frames, (double)dCap / f,
+                             f, (unsigned long long)s_census.frames,
+                             f > 0.0 ? (double)s_census.frames / f : 0.0, (double)dCap / f,
                              dCap ? (double)dBytes / (double)dCap : 0.0,
                              dCap ? 100.0 * (double)dHits / (double)dCap : 0.0,
                              (double)s_census.refills / f, binNow);
@@ -217,6 +246,7 @@ inline void g480FlushReturns()
                 break;
             bin.free.push_back(std::move(b));
         }
+        bin.count.store(static_cast<uint32_t>(bin.free.size()), std::memory_order_relaxed); // G740
     }
     staged.clear();
 }

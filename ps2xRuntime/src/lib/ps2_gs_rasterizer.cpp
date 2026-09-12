@@ -1,4 +1,6 @@
 #include "ps2_g674_hot_flag.inc"
+// G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
+#include "ps2_g736_ab_arm_stubs.inc"
 // G687: force-recompile marker for the fixed-state 0x412 capture run. revision: 1
 // G659: consume compile-time diagnostic revisions for the 33-priority closure phase (rev 1).
 // G630: large-view source attribution for the remaining residency break (force rebuild v9).
@@ -335,7 +337,16 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 // to link against the cold pipeline TU's definitions — the same trap this comment block records
 // for g568BitAliasArm, hit and fixed. `g650PinThread` is declared here for the same reason.
 #include "ps2_g713_pipeline_api.inc"
+// ⭐ G737: the direct-FBO-bind refusal census. Declared at GLOBAL scope, for exactly the reason the
+// comment above gives — the implementation lives in the COLD ps2_g713_pipeline.cpp so this hot TU
+// carries three declarations and one call site instead of a classifier (G710's +0.362 ms/f law).
+#include "ps2_g737_route_census_api.inc"
 extern void g650PinThread(int role);
+// ⭐ G735: the G446 PC sampler, pointed at the G713/G721 executor thread. Defined at GLOBAL scope in
+// ps2_gif_arbiter_parts/g446_gsworker_pcsample.inc (a different TU), so it must be declared HERE,
+// outside the anonymous namespace this file opens below — the same G568 linkage trap the comment
+// above records for g650PinThread.
+extern void g735RegisterExecThread();
 
 // rasterizer_draw_prim_probe.inc below opens an anonymous namespace that stays open until
 // rasterizer_rtt_census_and_waves.inc closes it, so an include placed between the two would put
@@ -744,6 +755,47 @@ void g704_page_memo_report()
     g261Report();
 }
 
+// ⭐⭐⭐ G737: EXPOSE THE G623 BLOCKED-REASON HISTOGRAM TO A SHIP-CONFIG READER.
+//
+// `g623Decide` bumps `g_g623Blk[blocked]` UNCONDITIONALLY — the counters are live in the
+// deliverable, because `g623Tracked()` includes the default-ON `g623ProdSrcOn()`. What is NOT live
+// is the way out: `g623Report()` returns early unless `g623CensusOn()`, and its only call site is
+// itself wrapped in `#if defined(PS2X_G684_HOT_DIAG)`. Every release build sets that OFF, so the
+// one instrument that names WHY the producer-FBO bind is refused has accumulated for the whole run
+// and been discarded, in every shipping binary since G623.
+//
+// That is not a small omission. `[G261:stat] mat(tex)` is 31 % of guest-VRAM publications on
+// `dungeon1` (7,741 calls, 1.59 M read-back rows), every one of them a textured read that fell back
+// to a blocking `glReadPixels` because some conjunct of a bind refused — and the two other censuses
+// that could have named the conjunct, `[G262:bindrej]` and `[G599:bind]`, are behind the SAME
+// compile guard. G735 §6.2d had to reason from `fboRej=0` instead, which G736 then proved was a
+// dead counter.
+//
+// This accessor is COLD (one call per 60-frame perf window) and lives here rather than in the cold
+// TU only because `g_g623Blk` has internal linkage in this file. It adds no hot-path text: the
+// formatting lives in ps2_g737_route_census.inc.
+void g737_g623_snapshot(G737G623Snapshot &out)
+{
+    out = G737G623Snapshot{};
+    out.n = g_g623N.load(std::memory_order_relaxed);
+    out.clean = g_g623Clean.load(std::memory_order_relaxed);
+    out.binds = g_g623Binds.load(std::memory_order_relaxed);
+    out.unconsidered = g_g623Unconsidered.load(std::memory_order_relaxed);
+    out.blkCount = (kG623BlkN < 16) ? static_cast<int>(kG623BlkN) : 16;
+    for (int i = 0; i < out.blkCount; ++i)
+        out.blk[i] = g_g623Blk[i].load(std::memory_order_relaxed);
+    out.uvProved = g_g737UvProved.load(std::memory_order_relaxed);
+    out.uvBuilt = g_g737UvBuilt.load(std::memory_order_relaxed);
+    out.uvRefused = g_g737UvRefused.load(std::memory_order_relaxed);
+    out.uvTexels = g_g737UvTexels.load(std::memory_order_relaxed);
+    out.uvFullTexels = g_g737UvFullTexels.load(std::memory_order_relaxed);
+}
+
+const char *g737_g623_block_name(int i)
+{
+    return (i >= 0 && i < static_cast<int>(kG623BlkN)) ? kG623BlkName[i] : "?";
+}
+
 
 // G369 cutscene gray-screen census (default-off: DC2_G369_CENSUS=1). Must sit AFTER the
 // anonymous namespace opened in rasterizer_headers_and_diagnostics.inc has closed, because it
@@ -915,8 +967,8 @@ void g704_page_memo_report()
 // is closed by rasterizer_rtt_census_and_waves.inc, so everything below is at file scope).
 //
 // `g713_raster_arm()` is called once per frame boundary from ps2_gif_arbiter.cpp. Arming from the
-// boundary rather than from drawPrimitive keeps the one-shot test off a 10,000-calls-per-frame
-// path entirely: it is a single static-bool branch, 60 times a second.
+// first-packet setup rather than from drawPrimitive keeps the test off the capture path
+// and establishes the executor before the first fused GL context adoption.
 // ==============================================================================================
 void g713_raster_arm()
 {

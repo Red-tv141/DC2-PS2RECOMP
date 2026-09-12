@@ -2,6 +2,8 @@
 #include "runtime/ps2_gs_gpu.h"
 #include "ps2_log.h"
 #include "ps2_g674_hot_flag.inc"
+// G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
+#include "ps2_g736_ab_arm_stubs.inc"
 #include "ps2_gif_arbiter_parts/g370_nan_source_probe.inc"
 #include "ps2_g480_packet_pool.inc"
 
@@ -55,6 +57,10 @@ extern bool g497WinBufActive();
 // G650 (ROADMAP P6): contention-aware core scheduler. Defined in
 // ps2_runtime_parts/g650_thread_affinity.inc (ps2_runtime.cpp TU) at GLOBAL scope on purpose.
 extern void g650PinThread(int role);
+// ⭐ G735: real-CPU thread slots, defined in ps2_g713_pipeline.cpp. Declared at FILE scope for the
+// same linkage reason g650PinThread is (a declaration inside an anonymous namespace names a
+// different, never-defined symbol).
+extern void g735CaptureThreadHandle(int slot);
 
 // G652 P4: compile-time control permits an independent old-layout/new-layout binary gate.
 #ifndef DC2_G652_GIF_COLD
@@ -112,7 +118,10 @@ static uint64_t g156ThreadCpuNs() { return 0ull; }
 // ps2_gs_rasterizer.cpp (the arm has to happen where the open-batch indirections live); everything
 // else comes from the cold pipeline TU.
 #include "ps2_g713_pipeline_api.inc"
-void g713_raster_arm();
+// ⭐ G737: the PC sampler's joint (leaf x call site) table. Same contract and same reason as the
+// line above — defined in the COLD pipeline TU, declared at global scope here, because this TU
+// holds `processGIFPacket` and G710 priced dead diagnostic text in a hot TU at +0.362 ms/f.
+#include "ps2_g737_route_census_api.inc"
 static void g713BoundaryThunk(void *p)
 {
     (*static_cast<std::function<void()> *>(p))();
@@ -195,6 +204,51 @@ namespace
     bool g412StatOn()
     {
         static const bool on = f50_12_env_flag("DC2_G412_STAT");
+        return on;
+    }
+
+    // ⭐⭐⭐ G740 — DO NOT PARK THE PARSE THREAD AT THE FRAME BOUNDARY.
+    //
+    // THE DEFECT, MEASURED ON A SHIPPED-CONFIG BINARY (`dungeon1`, 32 ms/f):
+    //
+    //     [G713:pipe]  syncWaits/f = 1.00   syncMs/f = 12.164     <- the parse thread, parked
+    //     [G734:exec]  execMs/f = 19.3      idleMs/f = 14.5       <- the executor, starved
+    //     [G412:pipeline] successor = 59-60/60                    <- and a window WAS queued
+    //
+    // The single blocking `g713CallOnExec` at the boundary makes the two GS stages alternate
+    // instead of overlap: the parse thread parks for 38 % of the frame while the executor drains,
+    // and the executor then idles for 45 % of the frame while the parse thread catches up on the
+    // backlog it was not allowed to touch. `successor` proves the backlog exists every frame.
+    //
+    // WHY THE BLOCK WAS THERE, AND WHY IT IS REDUNDANT. Its own comment gives two reasons:
+    //   1. "this frame's draws are all ahead of us and VRAM is complete" — that is FIFO ORDER, and
+    //      order is what the ring already guarantees. The closure runs at its ring position either
+    //      way; blocking changes only who waits for it.
+    //   2. "it bounds pipeline depth to one frame" — `m_pendingFrameMarkers < framePipelineDepth()`
+    //      already bounds the EE to two markers, and this change moves the credit release to the
+    //      END of the closure, so that bound is preserved exactly.
+    //
+    // WHY THE CLOSURE IS SAFE TO RUN LATE. Under G412 (`g412_cross_frame_enabled()`, default ON)
+    // the present latch consumes an IMMUTABLE snapshot of PMODE/SMODE2/DISPFB/DISPLAY/BGCOLOR and
+    // the vsync tick, captured on the EE thread before the barrier is enqueued — it reads no live
+    // register. Everything else it touches (`g_g144List`, `g_g260Graph`, guest VRAM, GL) is
+    // exec-private under G721, and every frame-N+1 mutation the parse thread can produce is a node
+    // posted AFTER this one. The non-deferrable inline primitive keeps its blocking
+    // `g713CallOnExec`, so the one caller that does read live parse state is untouched.
+    //
+    // ⛔ DEFAULT OFF pending its gate. Arm: DC2_G740_ASYNC_BOUNDARY=1.
+    //    Rollback name reserved for promotion: DC2_G740_NO_ASYNC_BOUNDARY=1.
+    bool g740AsyncBoundaryOn()
+    {
+        static const bool on = [] {
+            const bool v = f50_12_env_flag("DC2_G740_ASYNC_BOUNDARY") &&
+                           !f50_12_env_flag("DC2_G740_NO_ASYNC_BOUNDARY");
+            // One line, once. Rule: assert the lever is COMPILED and ARMED before reading any arm.
+            // The arm's own confirmation is `[G713:pipe] syncWaits/f`, which must fall 1.00 -> 0.00.
+            std::fprintf(stderr, "[G740:boundary] async=%d\n", v ? 1 : 0);
+            std::fflush(stderr);
+            return v;
+        }();
         return on;
     }
 
@@ -903,6 +957,15 @@ namespace
         bool g317HadQueuedSuccessor = false;
     };
 
+    // ⭐ G740: the frame-boundary closure, heap-owned so it can outlive the parse thread's
+    // `QueueItem`. See g740AsyncBoundaryOn() above for why the boundary may run late.
+    struct G740BoundaryJob
+    {
+        std::function<void()> fn;
+    };
+    // Defined after G150Mtgs, because it has to reach instance() to release the frame credit.
+    void g740BoundaryThunk(void *p);
+
     class G150Mtgs
     {
     public:
@@ -910,6 +973,25 @@ namespace
         {
             static G150Mtgs m;
             return m;
+        }
+
+        // ⭐ G740: the exec thread has finished a frame-boundary closure. This is the half of the
+        // old post-sync block that is ORDER-CRITICAL — the EE may not be given its frame credit
+        // back until the closure has actually consumed frame N's presentation state. Everything
+        // else that used to follow the sync (the reporters) is diagnostic and stays on the parse
+        // thread. Runs on the EXEC thread; takes `m_mtx` for ~100 ns, once per frame.
+        void g740BoundaryComplete()
+        {
+            std::lock_guard<std::mutex> lk(m_mtx);
+            --m_pendingFrameMarkers;
+            if (m_g740BoundaryInFlight > 0)
+                --m_g740BoundaryInFlight;
+            // Release the EE thread: it may now write the next frame's presentation registers
+            // (waitRegisterSlot()) and/or enqueue the next frame's own marker. Same statement the
+            // parse thread used to run, at the same point in the closure's lifetime.
+            m_cvFrameSlot.notify_all();
+            if (m_items.empty() && !m_busy && m_g740BoundaryInFlight == 0)
+                m_cvIdle.notify_all();
         }
 
         // EE thread: hand one drain() window (already path-sorted-equivalent when 1 packet) to the
@@ -1055,7 +1137,13 @@ namespace
             std::unique_lock<std::mutex> lk(m_mtx);
             if (!m_started)
                 return;
-            m_cvIdle.wait(lk, [&] { return m_stop || (m_items.empty() && !m_busy); });
+            // ⭐ G740: "the queue is empty and the worker is not mid-item" stopped implying "frame N
+            // is fully applied" the moment the boundary closure became a handed-off node — the
+            // parse thread can be idle while the exec thread is still inside the latch. Every
+            // drain/idle predicate therefore also waits for the in-flight boundary count.
+            m_cvIdle.wait(lk, [&] {
+                return m_stop || (m_items.empty() && !m_busy && m_g740BoundaryInFlight == 0);
+            });
 
             // G151 diagnostic: worker busy ms/frame over a 30-frame window (this is the frame boundary
             // on the EE thread — the worker is idle here). Grounds the MTGS+G144 ceiling analysis.
@@ -1089,7 +1177,9 @@ namespace
             std::unique_lock<std::mutex> lk(m_mtx);
             if (!m_started)
                 return;
-            m_cvIdle.wait(lk, [&] { return m_stop || (m_items.empty() && !m_busy); });
+            m_cvIdle.wait(lk, [&] { // G740: see frameDrain()
+                return m_stop || (m_items.empty() && !m_busy && m_g740BoundaryInFlight == 0);
+            });
         }
 
         void shutdown()
@@ -1098,7 +1188,9 @@ namespace
                 std::unique_lock<std::mutex> lk(m_mtx);
                 if (!m_started)
                     return;
-                m_cvIdle.wait(lk, [&] { return m_items.empty() && !m_busy; });
+                m_cvIdle.wait(lk, [&] { // G740: see frameDrain()
+                    return m_items.empty() && !m_busy && m_g740BoundaryInFlight == 0;
+                });
                 m_stop = true;
             }
             m_cvWork.notify_all();
@@ -1106,6 +1198,7 @@ namespace
             m_cvFrameSlot.notify_all();
             if (m_thread.joinable())
                 m_thread.join();
+            g713PipeStop();
         }
 
         ~G150Mtgs() { shutdown(); }
@@ -1117,6 +1210,23 @@ namespace
         {
             // G157 owns one immutable frame marker. G412 adds exactly one successor-frame credit;
             // this bounds both the MTGS queue and MTVU's side-channel batches.
+            //
+            // ⚠️ G734 DIAGNOSTIC PROBE ONLY (DC2_G734_DEPTH=N, default absent => unchanged).
+            // NEVER PROMOTE. It exists to answer one question with a measurement instead of an
+            // argument: is the EE thread's park at m_cvFrameSlot an ARTIFICIAL throttle, or is it
+            // backpressure from a saturated consumer? If frame time is flat while markerWait grows
+            // across a depth sweep, the park is conservation and every "deepen the pipeline /
+            // retire asynchronously" direction is closed on mechanism. Depths > 2 admit more than
+            // one successor frame, which G412's immutable PCRTC/vsync snapshot makes safe for the
+            // PRESENT LATCH but which this project has never validated for pixel output — so the
+            // probe is for PERF ROUTES ONLY and its graphics behaviour is explicitly unwarranted.
+            static const int s_g734Depth = [] {
+                const char *v = std::getenv("DC2_G734_DEPTH");
+                const int n = (v != nullptr) ? std::atoi(v) : 0;
+                return (n > 0 && n <= 64) ? n : 0;
+            }();
+            if (s_g734Depth != 0)
+                return s_g734Depth;
             return g412_cross_frame_enabled() ? 2 : 1;
         }
 
@@ -1281,6 +1391,11 @@ namespace
             // G447: mark this thread so the blocking-edge census pools ONLY the GS worker (the EE
             // thread reaches several of the same backend entry points at the frame barrier).
             g447MarkGsWorkerThread();
+            // ⭐ G735: real-CPU slot for the PARSE thread. The board's `gsOwn` is
+            // `g303_gs_worker_busy_ns()` minus the stall — an OCCUPANCY figure from this thread's
+            // window branch — so it has the same defect G735 found in `[G734:gsx] execMs/f`.
+            // Defined in ps2_g713_pipeline.cpp (cold TU, already carries <windows.h>).
+            g735CaptureThreadHandle(2 /* kG735SlotParse */);
             g650PinThread(2 /* G650_ROLE_GS */); // G650 P6
 
             // G159 (default OFF, DC2_G158_GPURASTER=1; needs DC2_G150_MTGS=1 to run this thread
@@ -1352,7 +1467,7 @@ namespace
                     }
                     lk.lock();
                     m_busy = false;
-                    if (m_items.empty())
+                    if (m_items.empty() && m_g740BoundaryInFlight == 0) // G740
                         m_cvIdle.notify_all();
                     continue;
                 }
@@ -1376,7 +1491,18 @@ namespace
                     const bool g332On = g332WorkerCensusOn();
                     const auto g332T0 = g332On ? std::chrono::steady_clock::now()
                                                : std::chrono::steady_clock::time_point{};
-                    g336_boundary_begin(); // G336: open the publish-capture window (no-op unless armed)
+                    // ⭐ G740: when the async boundary is armed the closure is HANDED OFF instead of
+                    // waited on, so the publish-capture window and the try/catch travel with it
+                    // into g740BoundaryThunk. `g740Async` also suppresses the credit release at the
+                    // bottom of this branch — the thunk owns it now.
+                    const bool g740Async = g740AsyncBoundaryOn() && g713PipeArmed() &&
+                                           static_cast<bool>(item.frameBoundaryFn);
+                    // Set only once the node is PUBLISHED. Every failure path below therefore
+                    // still releases the frame credit on this thread — a lost credit would park
+                    // the EE at `m_cvFrameSlot` forever.
+                    bool g740Posted = false;
+                    if (!g740Async)
+                        g336_boundary_begin(); // G336: open the publish-capture window (no-op unless armed)
                     try
                     {
                         // ⭐ G713: the boundary closure is the G144 flush plus
@@ -1384,7 +1510,21 @@ namespace
                         // belong to the exec thread. Posting it and blocking is exactly the
                         // boundary's own semantics ("this frame's draws are all ahead of us and
                         // VRAM is complete"), and it bounds pipeline depth to one frame.
-                        if (g713PipeArmed() && item.frameBoundaryFn)
+                        if (g740Async)
+                        {
+                            g713RasterFlushOpen(); // the open capture batch precedes the closure
+                            G740BoundaryJob *g740Job = new G740BoundaryJob();
+                            g740Job->fn = std::move(item.frameBoundaryFn);
+                            // Publish the in-flight count BEFORE the post: the thunk may run on the
+                            // exec thread the instant the node is visible, and it decrements it.
+                            {
+                                std::lock_guard<std::mutex> g740Lk(m_mtx);
+                                ++m_g740BoundaryInFlight;
+                            }
+                            g740Posted = true;
+                            g713PostCall(&g740BoundaryThunk, g740Job);
+                        }
+                        else if (g713PipeArmed() && item.frameBoundaryFn)
                         {
                             g713RasterFlushOpen(); // the open capture batch precedes the closure
                             g713CallOnExec(&g713BoundaryThunk, &item.frameBoundaryFn);
@@ -1400,7 +1540,8 @@ namespace
                     {
                         std::fprintf(stderr, "[G157:pipeline] frame-boundary unknown exception\n");
                     }
-                    g336_boundary_end(); // G336: close the window; next captures are next-frame consumers
+                    if (!g740Posted)
+                        g336_boundary_end(); // G336: close the window; next captures are next-frame consumers
                     if (s_g184Stat)
                     {
                         const uint64_t ns = static_cast<uint64_t>(
@@ -1436,8 +1577,16 @@ namespace
                     g332ReportBoundary();
                     g453ReportBoundary();
                     g494ReportBoundary();
-                    g713_raster_arm(); // G713: one-shot arm (a static-bool branch, 60x/second)
                     g713PipeReport();
+                    // ⭐ G726: decide whether threading is paying on THIS route. Runs on the parse
+                    // thread with the ring drained (the boundary call has already synced), which is
+                    // the only point where switching to inline drain cannot race a node in flight.
+                    // ⛔ G740: that premise is exactly what the async boundary removes — the ring is
+                    // NOT drained here any more, so flipping `s_serial` could race a node in flight.
+                    // Skipped under the arm. (`g713AdaptThreshold()` is "never" by default, so this
+                    // costs nothing today; it is the invariant that matters, not the call.)
+                    if (!g740Posted)
+                        g713PipeAdaptTick();
                     // G447: blocking-edge split of the window span (no-op unless DC2_G447_EDGE=1).
                     g447ReportBoundary(static_cast<unsigned long long>(
                         g_g151WorkerBusyNs.load(std::memory_order_relaxed)));
@@ -1448,15 +1597,20 @@ namespace
                     m_busy = false;
                     // The closure consumed frame N's presentation state (immutable under G412).
                     // Releasing this credit admits at most one successor beyond the current producer.
-                    --m_pendingFrameMarkers;
+                    // ⭐ G740: under the async arm the closure has NOT run yet, so the credit is
+                    // released by `g740BoundaryComplete()` on the exec thread instead — at the same
+                    // point in the closure's lifetime, which is what keeps the depth bound exact.
+                    if (!g740Posted)
+                        --m_pendingFrameMarkers;
                     if (g412StatOn() && g412_cross_frame_enabled() &&
                         (++m_g412CompletedBoundaries % 60u) == 0u)
                     {
                         std::fprintf(
                             stderr,
-                            "[G412:pipeline] frames=60 depth=2 maxPending=%d "
+                            "[G412:pipeline] frames=60 depth=%d maxPending=%d "
                             "markerWait=%llu/%llu %.2fms regWait=%llu/%llu %.2fms "
                             "successor=%llu/%llu\n",
+                            framePipelineDepth(),
                             m_g412MaxPending,
                             static_cast<unsigned long long>(m_g412BoundaryWaits),
                             static_cast<unsigned long long>(m_g412BoundaryCalls),
@@ -1478,8 +1632,9 @@ namespace
                     }
                     // Release the EE thread: it may now write the next frame's presentation
                     // registers (waitRegisterSlot()) and/or enqueue the next frame's own marker.
-                    m_cvFrameSlot.notify_all();
-                    if (m_items.empty())
+                    if (!g740Posted)
+                        m_cvFrameSlot.notify_all();
+                    if (m_items.empty() && m_g740BoundaryInFlight == 0)
                         m_cvIdle.notify_all();
                     continue;
                 }
@@ -1588,7 +1743,7 @@ namespace
                     lk.lock();
                 }
                 m_busy = false;
-                if (m_items.empty())
+                if (m_items.empty() && m_g740BoundaryInFlight == 0) // G740
                     m_cvIdle.notify_all();
             }
         }
@@ -1783,7 +1938,37 @@ namespace
         uint64_t m_g412BoundaryPopsWithSuccessor = 0u;
         uint64_t m_g412CompletedBoundaries = 0u;
         int m_g412MaxPending = 0;
+        // ⭐ G740: boundary closures posted to the exec thread and not yet completed. Guarded by
+        // `m_mtx`. It exists so `frameDrain()` / `waitIdle()` / `shutdown()` keep meaning "frame N
+        // is fully applied" once the parse thread stops waiting for the closure itself.
+        int m_g740BoundaryInFlight = 0;
     };
+
+    // ⭐ G740: runs on the EXEC thread, at the boundary node's FIFO position — i.e. after every
+    // frame-N node and before every frame-N+1 node. Owns the closure; releases the frame credit
+    // last, so an exception inside the closure cannot strand the EE at `m_cvFrameSlot`.
+    void g740BoundaryThunk(void *p)
+    {
+        G740BoundaryJob *job = static_cast<G740BoundaryJob *>(p);
+        // G336: the publish-capture window belongs around the CLOSURE, which is here now.
+        g336_boundary_begin();
+        try
+        {
+            if (job->fn)
+                job->fn();
+        }
+        catch (const std::exception &e)
+        {
+            std::fprintf(stderr, "[G740:boundary] exception: %s\n", e.what());
+        }
+        catch (...)
+        {
+            std::fprintf(stderr, "[G740:boundary] unknown exception\n");
+        }
+        g336_boundary_end();
+        G150Mtgs::instance().g740BoundaryComplete();
+        delete job;
+    }
 } // namespace
 
 bool g150_mtgs_enabled()
@@ -2018,6 +2203,19 @@ void g189_set_closure_stage(int stage, uint32_t n)
 int g189_worker_stage() { return g_g189WorkerStage.load(std::memory_order_relaxed); }
 uint64_t g189_worker_n() { return g_g189WorkerN.load(std::memory_order_relaxed); }
 int g189_ee_stage() { return g_g189EEStage.load(std::memory_order_relaxed); }
+
+// G733: the ADDRESS of the breadcrumb, not a snapshot of it.
+//
+// `g_g189EEStage` already classifies every EE-side block in this file - 1 = wait-enqueueWindow-space
+// (m_cvSpace), 2 = wait-frameBoundary-credit (m_cvFrameSlot), 3 = waitRegisterSlot - and the G446 PC
+// sampler already buckets its samples by a `std::atomic<int>*` breadcrumb into g_g446StageCount /
+// g_g446StageWait. The two were never connected: `g503ArmEeProfiler` armed the EE sampler with
+// `nullptr`, so every EE sample was filed under stage 7 ("unknown") and the classification this file
+// maintains on every wait was thrown away. Rule 69/70: an instrument with no call site.
+//
+// The sampler only ever LOADS through this pointer, and the object has static storage duration, so
+// handing out its address is safe for the lifetime of the process.
+std::atomic<int> *g189_ee_stage_slot() { return &g_g189EEStage; }
 
 GifArbiter::GifArbiter(ProcessPacketFn processFn)
     : m_processFn(std::move(processFn))

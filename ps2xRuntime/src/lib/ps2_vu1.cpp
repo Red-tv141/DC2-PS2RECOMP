@@ -3,6 +3,8 @@
 // edit here forces MSBuild to consume the .inc (G359). revision: 28 (G612 native region backend)
 // G652: native-region LOI admission + flag-materialization census (force rebuild v1).
 #include "ps2_g674_hot_flag.inc"
+// G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
+#include "ps2_g736_ab_arm_stubs.inc"
 #include "ps2_vu1_parts/vu1_helpers_and_tables.inc"
 #include "ps2_vu1_parts/vu1_g370_store_watch.inc"
 #include "ps2_g480_packet_pool.inc"
@@ -14,6 +16,11 @@
 #include "ps2_vu1_parts/vu1_g426_fused_upper.inc"
 #include "ps2_vu1_parts/vu1_g421_census.inc"
 #include "ps2_vu1_parts/vu1_g475_vnop_trace.inc"
+// G730: HOST-REGISTER RESIDENCY for the compiled backends (vu1_g730_regalloc.inc). It is NOT
+// included here — it is included from inside vu1_g610_native_jit.inc's anonymous namespace, right
+// after the encoder it emits through, because both compiled backends must see the same allocator.
+// This comment is also the MSBuild rebuild trigger (G359): a .inc edit alone does not make MSBuild
+// consume the TU. revision: 29 (G730 register residency)
 // G610: the NATIVE VU1 BLOCK COMPILATION BACKEND — x86-64 emitter + translator. Must come AFTER
 // vu1_g421_fast_upper.inc (it reads `g421DescTableConst` and `g421MaskTableConst`) and BEFORE
 // vu1_g490_block_run.inc, which holds the compiled-block ENTRY and calls `g610CompileAll` from the

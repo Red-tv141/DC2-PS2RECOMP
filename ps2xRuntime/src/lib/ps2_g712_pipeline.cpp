@@ -57,6 +57,12 @@
 #include <thread>
 #include <vector>
 
+// G726: the G650 affinity map lives in ps2_runtime.cpp's TU. Declared extern at GLOBAL scope here,
+// exactly as ps2_gs_rasterizer.cpp:338 and ps2_gif_arbiter.cpp:57 do — an anonymous-namespace
+// declaration would give it internal linkage and produce an unresolved external (the G568 linkage
+// trap this file's own header comment records for `G712Prep`).
+extern void g650PinThread(int role);
+
 namespace
 {
 
@@ -95,8 +101,44 @@ G712Pool &g712Pool()
     return p;
 }
 
+// ⭐⭐ G726: WHICH CORE THE PREP WORKER RUNS ON. G650 ships HARD affinity (measured -0.775 ms/f on
+// `dragon`, -0.578 on `dungeon1`), so every other thread in this process is CONFINED to its own
+// core: EE=0, VU1=1, GS=2, GL=3, MAIN=4, and the G713 executor pins role 3 (free under G705's fused
+// transport). This pool pinned NOTHING, leaving the scheduler free to place it on the EE or VU1
+// core — and under G725 it is a promoted, default-ON thread rather than a bring-up experiment.
+//
+// The G726 board shows the symptom: on `dragon:tail` GS own more than halved (18.98 -> 7.61) while
+// **VU1 busy ROSE 18.35 -> 20.00 with no VU1 code change at all**. A worker that gets slower
+// without being modified is sharing a core or being descheduled.
+//
+// Role 4 (MAIN / host present loop) is the least contended slice under the shipped fused-GL
+// topology: it carries no per-kick or per-flush duty, whereas 0/1/2 are the three poles and 3 is
+// the executor. Arm with `DC2_G726_PREP_ROLE=4`.
+//
+// ⛔ DEFAULT IS UNPINNED (-1), AND THAT IS DELIBERATE. This hypothesis is NOT gated: it was
+// identified by reading the affinity map, not by measurement. The promoted G726 deliverable
+// (SHA 2B76C9EC...) and its 23-window board were both produced with this pool UNPINNED, so an
+// unmeasured default-ON pin would mean the shipped source no longer reproduces the board that
+// justified shipping it. Gate it first (`DC2_G726_PREP_ROLE=4` vs unset, `dragon`, one binary,
+// discarded warm-up), then flip the default.
+int g712PrepRole()
+{
+    static const int s_role = [] {
+        if (const char *v = std::getenv("DC2_G726_PREP_ROLE"))
+        {
+            const int parsed = std::atoi(v);
+            return (parsed >= 0 && parsed < 5 /* G650_ROLE_COUNT */) ? parsed : -1;
+        }
+        return -1; // unpinned: the behaviour the promoted board measured
+    }();
+    return s_role;
+}
+
 void g712WorkerLoop()
 {
+    // Pinned from INSIDE the worker: g650PinThread acts on GetCurrentThread().
+    if (g712PrepRole() >= 0)
+        g650PinThread(g712PrepRole());
     G712Pool &p = g712Pool();
     for (;;)
     {
@@ -123,7 +165,20 @@ void g712WorkerLoop()
 
 bool g712PrepAheadEnabled()
 {
-    static const bool on = g712EnvOn("DC2_G712_PREPAHEAD");
+    // ⭐ G725: PROMOTED DEFAULT ON, together with the G713/G721 pipeline it rides on.
+    //
+    // Mechanism, measured on `dungeon1` (tag g722stat1, whole run): posted=168198 served=168094
+    // (99.9%), helped=30733 (18.3%), waited=8065 (4.8%), reject=104, **mismatch=0** with the
+    // `DC2_G712_VERIFY` oracle on over 24k batches. After the G724 split census the classify loop
+    // inside the flush measures **0.008 ms/f** - i.e. the pass really is gone from the pole thread,
+    // which is the entire claim. Timing: G722's pooled -1.529 was INADMISSIBLE (2.212 ms/f control
+    // drift, cold first arm), and the defensible warm-pair estimate is **-0.452 ms/f**, which is
+    // also what the mechanism predicts. Re-gated on the promoted binary behind a discarded warm-up
+    // arm; the rollback below is the control.
+    //
+    // ⛔ ROLLBACK: DC2_G712_NO_PREPAHEAD=1 (the batch's `class` pass runs inline on the flush
+    //    thread, exactly the pre-G712 code, and the worker thread is never started).
+    static const bool on = !g712EnvOn("DC2_G712_NO_PREPAHEAD");
     return on;
 }
 
@@ -155,7 +210,27 @@ bool g712PrepPoolStart(G712PrepJobFn fn)
     p.threads.reserve(n);
     for (uint32_t i = 0; i < n; ++i)
         p.threads.emplace_back(g712WorkerLoop);
-    std::fprintf(stderr, "[G712:prep] ARMED threads=%u hc=%u\n", n, hc);
+    // ⭐⭐ G726: PIN THE PREP WORKER. G650 ships HARD affinity (measured -0.775 ms/f on `dragon`,
+    // -0.578 on `dungeon1`), so every OTHER thread in this process is confined to its own core:
+    // EE=0, VU1=1, GS=2, GL=3, MAIN=4, and the G713 executor pins role 3 (free under G705's fused
+    // transport). This pool pinned NOTHING, so the scheduler was free to place it on the EE or VU1
+    // core — and it is now a promoted, default-ON thread rather than a bring-up experiment.
+    //
+    // The G726 board shows why that matters: on `dragon:tail` GS own more than halved
+    // (18.98 -> 7.61) while **VU1 busy ROSE 18.35 -> 20.00 with no VU1 code change at all**. A
+    // worker that got slower without being modified is being descheduled or sharing a core.
+    //
+    // Role 4 (MAIN / host present loop) is the least contended slice under the shipped fused-GL
+    // topology: it has no per-kick or per-flush duty, whereas 0/1/2 are the three poles and 3 is
+    // the executor. `DC2_G726_PREP_ROLE=<n>` overrides (clamped to the declared range);
+    // `DC2_G726_PREP_ROLE=-1` restores the unpinned behaviour this board measured.
+    // ⚠️ `g650PinThread` pins the CALLING thread (`GetCurrentThread()`), so the pin is applied by
+    // each worker at the top of `g712WorkerLoop`, not from here. See g712PrepRole() below.
+    std::fprintf(stderr, "[G712:prep] pin role=%d threads=%u\n", g712PrepRole(), n);
+    // G725: default ON, so record WHICH decision armed it and keep the legacy positive-arm literal
+    // in the image for the `grep -c <flag> <exe>` compiled-in check.
+    std::fprintf(stderr, "[G712:prep] ARMED threads=%u hc=%u arm=%s\n", n, hc,
+                 g712EnvOn("DC2_G712_PREPAHEAD") ? "explicit" : "default");
     std::fflush(stderr);
     s_ok = true;
     return true;
