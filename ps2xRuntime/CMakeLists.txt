@@ -133,6 +133,27 @@ option(PS2X_G684_LEGACY_G560_RUNS "Compile retired G560/G561/G570 ordered-run ex
 # observer-only paths out of the accepted graph. Turn this on only when reproducing their evidence.
 option(PS2X_G684_HOT_DIAG "Compile legacy runtime-selected diagnostics in the accepted GS graph" OFF)
 option(PS2X_G704_UPCENSUS "G704: compare host->local IMAGE uploads against the bytes already in VRAM (probe only)" OFF)
+# ⭐⭐⭐ G741: the PER-ENTRY half of the G178 census.
+#
+# G737 §1's law (Rule G737-1) says a REFUSAL census must not be compile-gated, and G741 applied it:
+# the 26 `g_g178Fallbacks` sites, both reject-reason buckets and the VRAM->FBO upload/skip split are
+# now unconditional (`g741ShipAdd`), because each is a PER-FLUSH event at ~44 flushes/frame — ~1
+# us/frame of instrument, which is what makes Rule 63 inapplicable to them.
+#
+# The texture-cache counters are different in kind: `g_g178TexHits` / `TexHashHits` / `TexDecodes`
+# and the four G622 counters sit in the per-ENTRY bind loop, ~350 entries x ~47 flushes = ~16,000
+# events/frame, and that population is exactly what a cache lever moves. Arming them in a timing arm
+# is the Rule 63 violation itself. This option makes them readable in a purpose-built CENSUS binary,
+# which is never a timing arm; `[G178:stat]` prints `avail=` so a structural zero can never be quoted
+# as a measurement (Rule G736-1).
+option(PS2X_G741_CENSUS "G741: compile the per-ENTRY texture-cache census (census binary only, never a timing arm)" OFF)
+# G736: the 100 A/B arm selectors collapse to `return -1` without PS2X_G419_DIAG, but the shipped
+# deliverable still emitted each one as its OWN 4-byte out-of-line function (`or eax,-1 ; ret`) and
+# paid a cross-TU call per tile-bin cull, per sprite UV predicate, per IMAGE run and per packed GIF
+# descriptor. src/lib/ps2_g736_ab_arm_stubs.inc supplies the inline form to every consuming TU so
+# those calls fold away. Turning this ON restores the out-of-line form EXACTLY — it exists so a
+# cross-binary A/B/B/A (Rule 46) can be built from one source tree, and as the rollback.
+option(PS2X_G736_LEGACY "G736: restore every pre-G736 hot-path code shape (gate A arm / rollback)" OFF)
 # G710's ship-config flush stage decomposition was UNWIRED by G711 (Rule 31 / Rule 71: a knob with
 # no use site comes out). Its `#else` stubs were all `constexpr` and every use folded, but the
 # source text still perturbed ps2_gs_rasterizer.cpp's layout, and a cross-binary A/B/B/A priced that
@@ -691,6 +712,70 @@ endif()
 if(PS2X_G684_HOT_DIAG)
     set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
                  "PS2X_G684_HOT_DIAG=1")
+endif()
+
+# G741: the per-ENTRY texture-cache census. Same single TU as PS2X_G684_HOT_DIAG above — every
+# `g741CensusAdd` site and the `avail=` predicate that reports them live in ps2_gs_rasterizer.cpp's
+# include set.
+if(PS2X_G741_CENSUS)
+    set_property(SOURCE src/lib/ps2_gs_rasterizer.cpp APPEND PROPERTY COMPILE_DEFINITIONS
+                 "PS2X_G741_CENSUS=1")
+endif()
+
+# ⭐⭐⭐ G739: the guest-store path-watch debugger.
+#
+# `ps2TraceGuestWrite` was called on the NON-SPECIAL (fast) branch of every WRITE8/16/32/64/128 --
+# 65,547 static sites across the 7,807-TU generated corpus, the hottest code in the project -- and
+# gated only at RUNTIME. So a shipping build paid a null test plus a two-compare range test on
+# every guest store to answer a question nobody was asking. That is NO-GO row 639 / Rule 31, and
+# this project has measured the class twice: G653 priced ~60 lines of inert code in one hot TU at
+# +0.484 ms/f, G710 measured `#if`-excluded text with folding `constexpr` stubs at +0.362 ms/f.
+#
+# ⛔ PUBLIC, not PRIVATE: `dc2_game` links ps2_runtime PUBLIC and includes ps2_runtime_macros.h in
+# all 7,807 of its TUs, so a PRIVATE definition would arm the runtime's five Store*() sites and
+# leave the 65,547 generated ones disarmed -- half a feature, which is worse than either state.
+#
+# ⭐ The name is `PS2X_G739_*` on purpose: tools/verify_release.py scans the cache for
+# `^PS2X_G\d+` set to ON and fails the release gate on any of them, so this option is covered by
+# the existing gate without touching it (Rule G738-5's class, applied forwards).
+option(PS2X_G739_PATH_WATCH "Compile the guest-store path-watch debugger into every store" OFF)
+if(PS2X_G739_PATH_WATCH)
+    target_compile_definitions(ps2_runtime PUBLIC "PS2X_G739_PATH_WATCH=1")
+endif()
+
+# ⭐ G739 §4 — the dispatch-table LOAD price probe (DC2_G739_TBLBALLAST=N at runtime).
+#
+# ⛔ COMPILE-TIME, for the same reason the option above is: a runtime `if (ballast)` would put a
+# global load, a compare and a branch on the fast path of all 46,551 generated dispatch sites of a
+# SHIPPING build, to support a probe that ships disarmed. That is NO-GO row 639 / Rule 31 — the
+# defect the path-watch option removes — and a phase may not exempt its own instrument from the law
+# it is enforcing elsewhere. PUBLIC so `dc2_game`'s 7,807 TUs see the same definition the runtime
+# does; without it the macro expands to `((void)0)` and the probe has no bytes anywhere.
+#
+# Price binary only. `verify_release.py`'s `^PS2X_G\d+` cache scan fails the release gate if it is
+# ever left ON.
+option(PS2X_G739_TBLBALLAST "Compile the G739 dispatch-table load price probe" OFF)
+if(PS2X_G739_TBLBALLAST)
+    target_compile_definitions(ps2_runtime PUBLIC "PS2X_G739_TBLBALLAST=1")
+endif()
+
+# G736 rollback / gate A arm. Every TU that includes ps2_g736_ab_arm_stubs.inc must receive it,
+# or the inline and out-of-line forms would coexist and the link would see two definitions.
+# ps2_gs_rasterizer.cpp additionally owns the G623 producer-surface lookup this restores.
+if(PS2X_G736_LEGACY)
+    foreach(_g736src
+            src/dc2_game_override.cpp
+            src/lib/ps2_gs_rasterizer.cpp
+            src/lib/ps2_gs_gpu.cpp
+            src/lib/ps2_gs_gpu_raster.cpp
+            src/lib/ps2_gs_memory.cpp
+            src/lib/ps2_gif_arbiter.cpp
+            src/lib/ps2_memory.cpp
+            src/lib/ps2_runtime.cpp
+            src/lib/ps2_vu1.cpp)
+        set_property(SOURCE ${_g736src} APPEND PROPERTY COMPILE_DEFINITIONS
+                     "PS2X_G736_LEGACY=1")
+    endforeach()
 endif()
 
 # G704: the upload-redundancy census. Scoped to ps2_gs_memory.cpp ALONE — it adds a full
