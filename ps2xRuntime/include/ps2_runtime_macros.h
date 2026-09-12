@@ -23,6 +23,295 @@ PS2Runtime::RecompiledFunction ps2TryRegisteredFunctionFast(PS2Runtime *runtime,
 PS2Runtime::RecompiledFunction ps2LookupFunctionFast(PS2Runtime *runtime, uint32_t address);
 PS2Runtime::RecompiledFunction ps2TryRegisteredFunctionRuntimeFast(PS2Runtime *runtime, uint32_t address);
 PS2Runtime::RecompiledFunction ps2LookupFunctionRuntimeFast(PS2Runtime *runtime, uint32_t address);
+
+// ================================================================================================
+// ⭐⭐⭐ G739 — THE DISPATCH FAST PATH, AT THE CALL SITE
+// ================================================================================================
+//
+// ⛔⛔⛔ THE DEFECT THIS EXISTS TO FIX. The four declarations immediately above are G652's
+// "helpers used by generated code". A whole-tree grep (runtime + the 7,807-file `recomp/` corpus)
+// finds **ZERO callers of three of them**; only `ps2LookupFunctionRuntimeFast` is used, once, by
+// `PS2Runtime::dispatchLoop`. The generator never emitted the other two, so
+// `DC2_G652_NO_GENERATED_FASTDISPATCH` has always rolled back a mechanism that did not exist.
+//
+// What the corpus emits instead, at every one of its 44,220 / 46,551 static call sites
+// (`code_generator.cpp` JAL/J/JALR arms):
+//
+//     if (runtime->hasFunction(0x13E3B0u)) {                 // out-of-line call #1
+//         auto targetFn = runtime->lookupFunction(0x13E3B0u); // out-of-line call #2
+//
+// `dc2_game` is compiled WITHOUT `/GL` (NO-GO row 636 forbids enabling it: blind `/GL /LTCG`
+// measured +5.02 ms/f on VU1), so MSVC cannot inline either one. Both are genuine cross-library
+// calls into `ps2_runtime.lib`.
+//
+// ⭐ WHAT THEY COST, from the runtime's OWN counting instrument, not a sampler top-N
+// (`runtime_host_display.inc`, the `[G651:disp]` block):
+//
+//     s05:  lookup = 151,190 calls/f   has = 145,351/f   preempt = 134,653/f   mapFallback = 0
+//           [G446:eeprof] lookupFunction 5.24% of a 15.1 ms/f EE thread => ~5.2 ns ~= 19 cycles
+//           [G646:dispatch] rate = 100.00%   <- the unordered_map behind the table is NEVER read
+//
+// Every one of ~296,000 calls per frame is answered by ONE array load. The call is the whole cost.
+// G733 6e.4 named this "the best-priced EE lever on the table" and it was never built.
+//
+// WHAT THIS IS. The same single probe, inlined at the call site. At a `jal`/`j` site `addr` is a
+// compile-time constant, so the range test and the index arithmetic FOLD: one bool load, one array
+// load, one test. It is a PURE ACCELERATOR over the table G646 already owns -- `m_functionTable`
+// stays the single authority, and every miss (out of range, misaligned, cleared, unregistered, or
+// ANY observer armed) falls through to the unchanged public API. The answer is identical by
+// construction, and the fast path can only ever short-circuit a hit the map also holds.
+//
+// ⭐ EVERY OBSERVER IS HANDLED BY ONE BOOL, NOT BY A SECOND PREDICATE PER SITE. `g_ps2DirectFast`
+// is false unless the table is live AND every diagnostic / statistic / trampoline that
+// `g652LookupFunctionFast` tests is dormant (see `g739ArmDispatchFast` for the enumerated list --
+// it is copied from that function's own predicate, not from memory). Arm any of them and every
+// call site takes the slow path verbatim, which is what keeps `DC2_G646_STAT`,
+// `DC2_G651_DISP_STAT`, `DC2_G186_SPBAL`, `DC2_TRACE_HANG` and the G649 dispatch diagnostics
+// bit-identical to the pre-G739 binary.
+//
+// Rollback: DC2_G739_NO_INLINE_DISPATCH=1 -- folds into `g_ps2DirectFast`, so BOTH ARMS LIVE IN
+//           ONE BINARY WITH IDENTICAL CODE LAYOUT. That is Rule 46 satisfied without a second
+//           link, the same form G734 used to gate DC2_G726_KICK_SPIN on the ship binary.
+// Oracle:   DC2_G739_ORACLE=1 -> [G739:oracle] compares this probe against the public API on
+//           every dispatch and counts disagreements. It forces `g_ps2DirectFast` false so the
+//           comparison runs on the authority path; see `ps2DirectCallSlow`.
+// Census:   DC2_G739_STAT=1   -> [G739:disp] fast/slow/miss counts per report.
+
+// The dispatch table's address window. ⭐ SINGLE SOURCE OF TRUTH: `runtime_init_and_signals.inc`
+// derives its `kG646Lo` / `kG646Hi` / `kG646Slots` from these, so the inline probe and the
+// runtime's own `g646Get` can never disagree about the geometry.
+inline constexpr uint32_t PS2_DIRECT_LO = 0x00100000u;
+inline constexpr uint32_t PS2_DIRECT_HI = 0x00380000u;
+inline constexpr uint32_t PS2_DIRECT_SPAN = PS2_DIRECT_HI - PS2_DIRECT_LO;
+
+// The dispatch history ring that crash reports read. ⛔ It lives HERE, not in the runtime TU,
+// because the inline probe must push to the SAME ring the out-of-line `pushDispatchPc` uses --
+// two rings would mean `formatDispatchHistory()` printed only the dispatches that happened to take
+// the slow path. `uint32_t wrapped` rather than `bool` so the struct is a trivially copyable POD
+// with no padding surprises.
+struct Ps2DispatchRing
+{
+    uint32_t pcs[64];
+    uint32_t next;
+    uint32_t wrapped;
+};
+
+// ⛔ NO INITIALISER, ON PURPOSE. A namespace-scope `thread_local` with no initialiser is
+// zero-initialised with NO dynamic init, so MSVC emits a plain TLS slot access. Give it a
+// constructor or a function-local `static` and MSVC inserts a per-ACCESS `_Init_thread_header`
+// epoch check instead -- the exact trap G619 measured and G649/G651 had to fix three times in this
+// same call chain (`g_g649HangTrace`, `s_g646DispatchOn`, `s_noPreempt`).
+extern thread_local Ps2DispatchRing g_ps2DispatchRing;
+
+extern PS2Runtime::RecompiledFunction *g_ps2DirectTable; // nullptr until the first registration
+extern bool g_ps2DirectFast;                             // table live AND every observer dormant
+extern bool g_ps2DirectTrace;                            // mirrors g_g651DispTrace (default ON)
+
+// ================================================================================================
+// ⭐ G739 (4) — PRICING THE TABLE LOAD ITSELF (`DC2_G739_TBLBALLAST=N`, default 0 = absent)
+// ================================================================================================
+//
+// THE QUESTION. Once the CALL is inlined away (above), the residue of a guest dispatch is ONE
+// dependent load out of `g_ps2DirectTable`. That table is 655,360 slots x 8 B = **5.2 MB**, and
+// `[G651:disp] distinctTargets ~= 5789` says only ~5,789 of those slots are ever touched — ~370 KB
+// of scattered cache lines against a 256 KB L2. At 318,000 probes/frame on `fight:rain` the term is
+// somewhere between **0.1 ms/f** (every probe an L1 hit) and **3.5 ms/f** (every probe an L3 hit),
+// and nothing in this project has ever measured which.
+//
+// ⭐ THE INSTRUMENT THAT ASKS IT WAS ALREADY BUILT AND NEVER READ. `g651NoteTarget`'s own comment:
+// *"`distinct` is a Bloom-ish coverage estimate of how many DIFFERENT dispatch targets a window
+// touches — it decides whether the 5.2 MB direct table is being STREAMED (a cache-miss lever) or
+// re-hit (not one)."* It answered 5,789 and no phase acted on it.
+//
+// THE METHOD IS G738 §2.2's, because that is the only one that survived there: price the EVENT by
+// ADDING N more of it and reading `dFrame / (N x probes/f)`. Removal cannot answer this (deleting
+// the load deletes the dispatch), and a stage timer inside a PGO TU attributes code motion
+// (G735 §2).
+//
+// ⛔ IT MUST NOT BE ELIDABLE — Rule G738-2, where two of three ballasts priced nothing because the
+// driver/compiler skipped them, and the tell was a FLAT response to N. So:
+//   * the loaded value is XOR-accumulated into a `volatile` sink, which MSVC may not drop;
+//   * the index is derived from the dispatch address itself and walks by a large odd stride, so it
+//     lands on other LIVE-range slots rather than a single cached one, and the compiler cannot
+//     fold the sequence;
+//   * the ballast counts ITS OWN loads (Rule G738-3: a price whose denominator is computed from
+//     the flag cannot detect that the flag leaked; one that is measured can).
+//
+// ⚠️ PROBE ONLY, NEVER PROMOTABLE — it can only make the frame slower. Read the response to N=0/4/16
+// and quote the SLOPE between the two ballast points, which cancels any fixed control offset.
+//
+// ⛔⛔ COMPILE-TIME GATED, AND THE FIRST DRAFT OF THIS FILE GOT IT WRONG. A runtime `if (ballast)`
+// here is not free: it puts a global load, a compare and a branch on the fast path of ALL 46,551
+// generated dispatch sites of a SHIPPING build, to support a probe that ships disarmed. That is
+// precisely NO-GO row 639 / Rule 31 — the defect this very phase fixes in §3.4 for the path-watch
+// debugger — and G653 priced ~60 lines of it at +0.484 ms/f in ONE hot TU. Keep diagnostics out of
+// hot TUs by COMPILE-TIME exclusion, never by a runtime flag; a phase may not exempt its own
+// instrument from the law it is enforcing elsewhere.
+//
+// Build the price binary with `-DPS2X_G739_TBLBALLAST=ON`; the gate binary and the deliverable
+// carry zero bytes of it. Both ballast arms then live in that one binary, so layout still cancels.
+#if defined(PS2X_G739_TBLBALLAST)
+extern uint32_t g_ps2TblBallast; // 0 when the env arm is absent
+extern volatile uint64_t g_ps2TblBallastSink;
+extern std::atomic<uint64_t> g_ps2TblBallastLoads;
+void ps2TblBallastRun(uint32_t address);
+#define PS2_G739_TBL_BALLAST(addr)                                                                 \
+    do                                                                                             \
+    {                                                                                              \
+        if (g_ps2TblBallast != 0u)                                                                 \
+            ps2TblBallastRun(addr);                                                                \
+    } while (0)
+#else
+#define PS2_G739_TBL_BALLAST(addr) ((void)0)
+#endif
+
+// The unchanged public API, behind one call instead of two. Also the oracle's home.
+PS2Runtime::RecompiledFunction ps2DirectCallSlow(PS2Runtime *runtime, uint32_t address);
+// `runtime->lookupFunction(address)` verbatim, for the two emission arms that call it WITHOUT a
+// `hasFunction` guard and use the result unconditionally. ⛔ Those arms may not use
+// `ps2DirectCall`: `lookupFunction` never returns nullptr -- on a miss it returns the recovery
+// handler and logs -- so collapsing the two contracts would turn a recoverable bad dispatch into
+// a null call.
+PS2Runtime::RecompiledFunction ps2LookupDirectSlow(PS2Runtime *runtime, uint32_t address);
+
+#if defined(_MSC_VER)
+#define PS2_G739_FORCEINLINE __forceinline
+#else
+#define PS2_G739_FORCEINLINE inline __attribute__((always_inline))
+#endif
+
+// ⛔ `__forceinline`, NOT `inline`. Measured on the ship flags (/O2 /Ob2, no /GL): plain `inline`
+// left MSVC emitting a real `call ?ps2PushDispatchPcInline` from the probe's fast path -- which
+// would have put a cross-function call back on the exact path this phase exists to take one off.
+PS2_G739_FORCEINLINE void ps2PushDispatchPcInline(uint32_t pc)
+{
+    if (!g_ps2DirectTrace)
+        return;
+    Ps2DispatchRing &h = g_ps2DispatchRing;
+    h.pcs[h.next] = pc;
+    h.next = (h.next + 1u) & 63u;
+    if (h.next == 0u)
+        h.wrapped = 1u;
+}
+
+// Returns the registered body for `address`, or nullptr if there is none -- exactly the answer
+// `runtime->hasFunction(a) ? runtime->lookupFunction(a) : nullptr` produces today, including the
+// `pushDispatchPc` side effect that only fires on a hit.
+inline PS2Runtime::RecompiledFunction ps2DirectCall(PS2Runtime *runtime, uint32_t address)
+{
+    PS2_G739_TBL_BALLAST(address); // §4 price probe; compiles to nothing without PS2X_G739_TBLBALLAST
+    if (g_ps2DirectFast && (address - PS2_DIRECT_LO) < PS2_DIRECT_SPAN && (address & 3u) == 0u)
+    {
+        const PS2Runtime::RecompiledFunction fn =
+            g_ps2DirectTable[(address - PS2_DIRECT_LO) >> 2];
+        if (fn != nullptr)
+        {
+            ps2PushDispatchPcInline(address);
+            return fn;
+        }
+    }
+    return ps2DirectCallSlow(runtime, address);
+}
+
+// Same probe, `lookupFunction`'s contract: never nullptr, recovery handler on a miss.
+inline PS2Runtime::RecompiledFunction ps2LookupDirect(PS2Runtime *runtime, uint32_t address)
+{
+    PS2_G739_TBL_BALLAST(address);
+    if (g_ps2DirectFast && (address - PS2_DIRECT_LO) < PS2_DIRECT_SPAN && (address & 3u) == 0u)
+    {
+        const PS2Runtime::RecompiledFunction fn =
+            g_ps2DirectTable[(address - PS2_DIRECT_LO) >> 2];
+        if (fn != nullptr)
+        {
+            ps2PushDispatchPcInline(address);
+            return fn;
+        }
+    }
+    return ps2LookupDirectSlow(runtime, address);
+}
+
+// ================================================================================================
+// ⭐ G739 (2) — THE BACK-EDGE PREEMPTION CHECK, AT THE CALL SITE
+// ================================================================================================
+//
+// `code_generator.cpp` emits `if (runtime->shouldPreemptGuestExecution()) return;` on EVERY
+// non-call-like back edge of every recompiled guest loop -- 4,144 static sites, **134,653 calls
+// per frame** on `s05`, measured by `[G446:eeprof]` at **6.10% of the whole EE thread on
+// `dungeon6`** and 2.29% on `s05` (`runtime_dispatch_and_memory.inc`, the G651 note).
+//
+// The body's answer is `false` on 98-99% of those calls, and reaching that answer costs a
+// cross-library call, a TLS materialisation for the counter, a load of two namespace-scope bools,
+// an ACQUIRE atomic load of `m_guestExecutionWaiters`, and the ret.
+//
+// EXACTNESS. The real rule yields when a per-thread counter reaches an interval that is 64 when a
+// waiter is queued on the guest-execution mutex and 100 when none is. The inline form reproduces
+// the answer exactly as long as it compares against THAT interval -- and the two early-outs above
+// it (`DC2_G57_NO_PREEMPT`, the scoped title-draw suppression) only ever return false, so they
+// cannot make a sub-interval count yield. The counter is the SAME `thread_local` object in both
+// forms and the increment happens in exactly one place, so the two cannot drift.
+//
+// ⛔⛔ A FIXED THRESHOLD OF 64 IS NOT GOOD ENOUGH, AND THIS PHASE CAUGHT THAT IN ITS OWN FIX BEFORE
+// GATING IT. 64 is the MINIMUM interval, so comparing against it is exact -- but with no waiter
+// queued the real interval is 100, and every back edge from 64 to 99 would fall through to the
+// out-of-line call only to be told "not yet". On `fight:rain` that is 36% of 132,941 calls/frame
+// still paying the call this lever exists to remove: the mechanism would have delivered 64% of its
+// own prize while reading as perfectly correct. Publishing the live interval fixes it.
+//
+// ⚠️ THE ONE DIVERGENCE, STATED RATHER THAN WAVED AWAY. The authority re-reads the waiter count on
+// every call, so it notices a NEWLY ARRIVED waiter immediately and shortens 100 -> 64 mid-interval.
+// The inline form notices at its next slow entry, so a waiter that arrives mid-interval is served
+// up to 36 back edges later than before. Back edges run 63,000-133,000 per frame, the 64-vs-100
+// pair is a fairness heuristic and not a contract, and `DC2_G739_NO_INLINE_PREEMPT=1` restores the
+// old behaviour exactly.
+//
+// ⛔ `DC2_G651_DISP_STAT` DISARMS THE INLINE FORM. Otherwise `[G651:disp] preempt=` would count one
+// call in 100 instead of every call -- an instrument that silently became a 1% sample of its own
+// population. Rule 44's class. `DC2_G57_NO_PREEMPT` disarms it too, so that experiment keeps its
+// exact "this function is never reached" shape rather than "reached 1 time in 100".
+//
+// Rollback: DC2_G739_NO_INLINE_PREEMPT=1.
+extern thread_local uint32_t g_ps2BackEdgeCounter;
+extern bool g_ps2PreemptFast;
+// The interval the authority last computed. Relaxed atomic: on x86-64 a relaxed load is one `mov`,
+// so it costs what a plain global read costs while staying out of UB when several guest threads
+// publish it concurrently. Both values it can ever hold are valid, so a racing write cannot produce
+// a wrong decision -- only an interval that is one step stale, which is the divergence above.
+extern std::atomic<uint32_t> g_ps2PreemptLimit;
+bool ps2ShouldPreemptSlow(PS2Runtime *runtime); // counter already advanced by the caller
+
+inline bool ps2ShouldPreempt(PS2Runtime *runtime)
+{
+    if (!g_ps2PreemptFast)
+        return runtime->shouldPreemptGuestExecution();
+    if (++g_ps2BackEdgeCounter < g_ps2PreemptLimit.load(std::memory_order_relaxed))
+        return false;
+    return ps2ShouldPreemptSlow(runtime);
+}
+
+// ================================================================================================
+// ⭐ G739 (3) — THE PATH-WATCH DEBUGGER IS NOT ON THE STORE FAST PATH ANY MORE
+// ================================================================================================
+//
+// `ps2TraceGuestWrite` (ps2_runtime.h) is a development path-watch: it tests whether a guest store
+// intersects the fixed 512-byte window at `PS2_PATH_WATCH_ADDR = 0x01EFFFA0` and logs it. It was
+// called on the NON-SPECIAL (fast) branch of every WRITE8/16/32/64/128 -- **65,547 static sites**,
+// on the hottest code in the project -- and gated only at RUNTIME, so a shipping build pays a
+// null test plus the two-compare range test on every single guest store, forever, to answer a
+// question nobody is asking.
+//
+// ⛔ That is NO-GO row 639 / Rule 31's own class, and this project has measured the class twice:
+// G653 priced ~60 lines of inert code in one hot TU at **+0.484 ms/f**, and G710 measured
+// `#if`-excluded probe text with `constexpr` stubs -- every use site folding -- at **+0.362 ms/f**
+// in `ps2_gs_rasterizer.cpp`. The standing law is "keep diagnostics out of hot TUs by COMPILE-TIME
+// exclusion, never by a runtime flag", so that is what this is.
+//
+// Re-arm with `cmake -DPS2X_G739_PATH_WATCH=ON`; the feature itself is unchanged.
+#if defined(PS2X_G739_PATH_WATCH)
+#define PS2_TRACE_GUEST_WRITE(...) ps2TraceGuestWrite(__VA_ARGS__)
+#else
+#define PS2_TRACE_GUEST_WRITE(...) ((void)0)
+#endif
+
 inline const bool g_ps2EeWorkStat = (std::getenv("DC2_G182_EE_STAT") != nullptr);
 
 class Ps2EeWaitScope
@@ -383,7 +672,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             runtime->Store8(rdram, ctx, _addr, (val));                               \
         else                                                                         \
         {                                                                            \
-            ps2TraceGuestWrite(rdram, _addr, 1u, (uint8_t)(val), 0u, "WRITE8", ctx); \
+            PS2_TRACE_GUEST_WRITE(rdram, _addr, 1u, (uint8_t)(val), 0u, "WRITE8", ctx); \
             FAST_WRITE8(_addr, (val));                                               \
         }                                                                            \
     } while (0)
@@ -396,7 +685,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             runtime->Store16(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
-            ps2TraceGuestWrite(rdram, _addr, 2u, (uint16_t)(val), 0u, "WRITE16", ctx); \
+            PS2_TRACE_GUEST_WRITE(rdram, _addr, 2u, (uint16_t)(val), 0u, "WRITE16", ctx); \
             FAST_WRITE16(_addr, (val));                                                \
         }                                                                              \
     } while (0)
@@ -409,7 +698,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             runtime->Store32(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
-            ps2TraceGuestWrite(rdram, _addr, 4u, (uint32_t)(val), 0u, "WRITE32", ctx); \
+            PS2_TRACE_GUEST_WRITE(rdram, _addr, 4u, (uint32_t)(val), 0u, "WRITE32", ctx); \
             FAST_WRITE32(_addr, (val));                                                \
         }                                                                              \
     } while (0)
@@ -422,7 +711,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
             runtime->Store64(rdram, ctx, _addr, (val));                                \
         else                                                                           \
         {                                                                              \
-            ps2TraceGuestWrite(rdram, _addr, 8u, (uint64_t)(val), 0u, "WRITE64", ctx); \
+            PS2_TRACE_GUEST_WRITE(rdram, _addr, 8u, (uint64_t)(val), 0u, "WRITE64", ctx); \
             FAST_WRITE64(_addr, (val));                                                \
         }                                                                              \
     } while (0)
@@ -438,7 +727,7 @@ static inline void Ps2FastWrite128(uint8_t *rdram, uint32_t addr, __m128i value)
         {                                                                            \
             const uint64_t _lo = static_cast<uint64_t>(PS2_EXTRACT_EPI64_0(_value)); \
             const uint64_t _hi = static_cast<uint64_t>(PS2_EXTRACT_EPI64_1(_value)); \
-            ps2TraceGuestWrite(rdram, _addr, 16u, _lo, _hi, "WRITE128", ctx);        \
+            PS2_TRACE_GUEST_WRITE(rdram, _addr, 16u, _lo, _hi, "WRITE128", ctx);        \
             FAST_WRITE128(_addr, _value);                                            \
         }                                                                            \
     } while (0)
