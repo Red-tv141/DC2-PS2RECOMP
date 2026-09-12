@@ -406,6 +406,25 @@ static void g154_observe_frame(uint8_t *rdram,
                     g704_page_memo_report();
             }
 
+            // ⭐ G737: the direct-FBO-bind refusal histogram. Keyed to its OWN flag and nothing
+            // else — G704's Rule (a flag that needs a second, unrelated flag to speak reads
+            // exactly like a flag that measured nothing) is the reason `DC2_G291_STAT` above got
+            // its own block, and this one is written the same way from the start.
+            g737ReportRouteCensus(); // self-gated on DC2_G737_TEXREJ; one cached test
+
+            // ⭐⭐⭐ G738: the GL command-stream census, with a REAL frame denominator.
+            //
+            // `[G496:gl]` printed `frames=600` beside its rates, but `g496GlNoteFrame()` was called
+            // once per render batch with `!b.skipReadback` — measured **8.12 rendered frames** on
+            // the shipped G732 image, `dungeon1` steady state. Every rate it ever printed was that
+            // factor too small, and `issued/f=1044 of 3719` is really 8,482 of 30,217 per frame.
+            // G704's Rule 44 was written about this exact reporter.
+            //
+            // It is reported HERE because this is the only place in the process that knows what a
+            // frame is: `s_windowFrames` is the same denominator `[G154:perf]`, `[G182:ee]`,
+            // `[G303:vu1w]` and `[G734:gsx]` use, so the row joins the board by `n`.
+            g738ReportGlCalls(n, s_windowFrames); // self-gated on DC2_G738_GLCENSUS
+
             // G434: per-window workload invariant for the drawPrimitive deletion probe. Same
             // window and denominator as [G154:perf], so kicks/f is directly comparable arm to arm.
             {

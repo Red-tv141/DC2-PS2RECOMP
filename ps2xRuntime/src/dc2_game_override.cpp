@@ -8,6 +8,8 @@
 
 #include "game_overrides.h"
 #include "ps2_runtime.h"
+// G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
+#include "lib/ps2_g736_ab_arm_stubs.inc"
 #include "lib/ps2_runtime_parts/dc2_logger.inc"
 #include "lib/ps2_runtime_parts/dc2_crash_reporter.inc"
 // ⭐ G651: the G650/G651 core scheduler is DEFINED here. It needs <windows.h>, which this TU
@@ -71,6 +73,8 @@ extern void g503RegisterEeThread();
 // ps2_runtime_parts/runtime_init_and_signals.inc. Declared at GLOBAL scope, above the anonymous
 // namespace, so it binds to the external symbol (appendix-dc2-project.md §3's linkage trap).
 extern void g651DispatchReport(unsigned long long presents);
+// ⭐ G739: the inlined-dispatch census/oracle, same file, same linkage rule, same cadence.
+extern void g739DispatchReport(unsigned long long presents);
 extern uint64_t ps2EeWaitCpuNs();
 
 // G183: statistical PC-sampling profiler. G182 found EE is 90-99% on-CPU with 92-93% of
@@ -177,6 +181,16 @@ void g705_backend_report();
 // from DC2_G291_STAT alone; otherwise the inline [G291:skip] stream makes a dead summary reporter
 // look healthy and the page-memo oracle cannot prove that any memo hit was verified.
 void g704_page_memo_report();
+
+// ⭐ G737: the direct-FBO-bind refusal histogram, from the cold G713 pipeline TU. Declared at
+// GLOBAL scope for the same reason as the line above — a block-scope `extern` inside this file's
+// anonymous namespace would name a different symbol and fail to link.
+void g737ReportRouteCensus();
+
+// ⭐⭐⭐ G738: the GL command-stream census, from the same cold TU and under the same global-scope
+// rule. Called from the `[G154:perf]` window with that window's REAL rendered-frame count, because
+// `[G496:gl]`'s own denominator was a readback batch (8.12 frames, measured).
+void g738ReportGlCalls(uint32_t n, uint32_t windowFrames);
 
 // G141: perf ns accumulators, defined in ps2_gs_rasterizer.cpp / ps2_vu1.cpp (external linkage).
 extern std::atomic<uint64_t> g_g141GsRasterNs;
@@ -289,6 +303,10 @@ extern std::atomic<bool> g_dc2G138DumpGateOpen;
 // it to window themselves on the defect's script moment. Same file-scope rule as the two above —
 // declaring it inside the anonymous namespace below would name a different, never-defined symbol.
 extern std::atomic<uint32_t> g_dc2ScriptFrame;
+// ⭐ G738: the RENDERED-frame clock, published from the same override for the same cross-TU reason
+// — but it is the one the GL-worker censuses needed and never had. `g_dc2ScriptFrame` runs at
+// ~2.214 per rendered frame, so it is not a rate denominator. Same file-scope rule as above.
+extern std::atomic<uint32_t> g_dc2RenderedFrame;
 // G56: main-title map geometry-submission chain (delegated by the G56 chain taps).
 extern void Draw__9CMapPartsFv_0x15e3d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void PreDraw__9CMapPartsFv_0x166a00(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -466,6 +484,20 @@ extern void g144FlushPending();
 extern bool g150_mtgs_enabled();
 extern void g150_frame_barrier(std::function<void()> latch);
 extern void g150_wait_idle();
+// ⭐ G734: the GS EXECUTOR thread's monotonic busy/idle totals, for the acceptance board's missing
+// column. Declared here at FILE scope on purpose — the reporting site in
+// frame_end_and_core_helpers.inc sits inside an anonymous namespace, so an `extern` written there
+// declares an internal-linkage symbol and the link fails with LNK2001 on
+// `` `anonymous namespace'::g713_exec_busy_ns ``. Defined in ps2_g713_pipeline.cpp.
+extern uint64_t g713_exec_busy_ns();
+extern uint64_t g713_exec_idle_ns();
+// ⭐ G735: the executor's REAL CPU, for the same reason and with the same linkage constraint —
+// this must sit at FILE scope, not inside the reporting site's anonymous namespace.
+extern uint64_t g713_exec_cpu_ns();
+// ⭐ G735: the generalised slot reader (0 = executor, 1 = VU1 worker, 2 = GS parse worker), so the
+// board gets a REAL CPU column for every worker thread and not just the executor. Same file-scope
+// linkage requirement as the accessors above.
+extern uint64_t g735ThreadCpuNs(int slot);
 // G412: depth-two frame pipeline and immutable worker-side presentation latch.
 extern bool g412_cross_frame_enabled();
 extern uint64_t g412_capture_vsync_tick();

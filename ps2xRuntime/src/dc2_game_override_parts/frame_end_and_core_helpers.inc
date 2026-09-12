@@ -137,6 +137,10 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
     // a captured frame — describe the same scene (G598 §1). One relaxed store per guest frame,
     // unconditional so a census does not need a flag of its own to be windowed.
     g_dc2ScriptFrame.store(g598_script_frame(n), std::memory_order_relaxed);
+    // ⭐ G738: publish the RENDERED-frame clock too. `n` is the only true frame counter in the
+    // process, and the GL-worker censuses that needed a denominator had been counting readback
+    // batches (8.12 real frames on `dungeon1`) instead. One more relaxed store per guest frame.
+    g_dc2RenderedFrame.store(n, std::memory_order_relaxed);
 
     // ===== G503: the fourth derivative probe, and the EE thread's first PC sampler =====
     //
@@ -498,12 +502,56 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                 const uint64_t gsBusyNs = g303_gs_worker_busy_ns();
                 const double gsBusyMsPerF = (double)(gsBusyNs - s_lastGsBusyNs) / 1e6 / w;
                 s_lastGsBusyNs = gsBusyNs;
+                // ⭐⭐⭐ G735: REAL CPU for the VU1 worker and the GS parse thread, beside their
+                // occupancy figures. `busyMs/f` and `gsWorkerMs/f` are both OCCUPANCY (G434/G476
+                // say so of the former; the latter is `g_g151WorkerBusyNs`, the parse thread's
+                // window branch) — and G735 measured what ranking occupancy against EE's
+                // GetThreadTimes column costs: G734 called the executor the pole on 12 of 18
+                // windows where, on real CPU, it is the pole on none. These two columns exist so
+                // the board can stop doing that to VU1 and the parse thread as well.
+                // ⛔⛔⛔ G738: THE BASELINE MUST BE PRIMED FROM THE FIRST READ, NOT FROM ZERO.
+                //
+                // These were `static uint64_t s_lastVu1Cpu = 0ull`, so the first window in which
+                // the slot's handle exists computed `(cumulative - 0) / w` and printed the
+                // thread's WHOLE CPU since it started as if it were a per-frame rate. That is the
+                // origin of `[G735:cpu] vu1CpuMs/f=34.90` on a run whose frame is ~19 ms — a
+                // value larger than the frame, which G737 §9.5 recorded as an unresolved
+                // contradiction ("both cannot be true as stated").
+                //
+                // The handles are captured at THREAD ENTRY, and the VU1/MTVU worker and the GS
+                // parse worker both start lazily, so the slot flips from 0 to a large accumulated
+                // value mid-run — which is why it shows up as one impossible window rather than
+                // only at n=1. `primed` is per-slot for exactly that reason.
+                //
+                // ⚠️ This matters beyond a stray line: `tools/g653_pole_table.py`'s `poleW`
+                // classifier scores VU1 from this column, and a single window reading 34.90 ms/f
+                // makes VU1 the pole on that window by construction.
+                static uint64_t s_lastVu1Cpu = 0ull, s_lastParseCpu = 0ull;
+                static bool s_vu1CpuPrimed = false, s_parseCpuPrimed = false;
+                const uint64_t vu1CpuNow = g735ThreadCpuNs(1 /* kG735SlotVu1 */);
+                const uint64_t parseCpuNow = g735ThreadCpuNs(2 /* kG735SlotParse */);
+                if (!s_vu1CpuPrimed && vu1CpuNow != 0ull)
+                {
+                    s_lastVu1Cpu = vu1CpuNow;
+                    s_vu1CpuPrimed = true;
+                }
+                if (!s_parseCpuPrimed && parseCpuNow != 0ull)
+                {
+                    s_lastParseCpu = parseCpuNow;
+                    s_parseCpuPrimed = true;
+                }
+                const double vu1CpuMs = (double)(vu1CpuNow - s_lastVu1Cpu) / 1e6 / w;
+                const double parseCpuMs = (double)(parseCpuNow - s_lastParseCpu) / 1e6 / w;
+                s_lastVu1Cpu = vu1CpuNow;
+                s_lastParseCpu = parseCpuNow;
                 if (vuwKicks != 0ull)
                     std::fprintf(stderr,
                                  "[G303:vu1w] n=%u window=%u busyMs/f=%.1f kicks/f=%.0f gsStallMs/f=%.1f gsStalls/f=%.0f gsWorkerMs/f=%.1f "
-                                 "| [G344:merge] collectMs/f=%.1f overheadMs/f=%.2f windows/f=%.0f\n",
+                                 "| [G344:merge] collectMs/f=%.1f overheadMs/f=%.2f windows/f=%.0f "
+                                 "| [G735:cpu] vu1CpuMs/f=%.2f parseCpuMs/f=%.2f\n",
                                  n, s_perfWindow, vuwMsPerF, vuwKicksPerF, stallMsPerF, stallsPerF, gsBusyMsPerF,
-                                 collectMsPerF, mergeOverheadMsPerF, collectCallsPerF);
+                                 collectMsPerF, mergeOverheadMsPerF, collectCallsPerF,
+                                 vu1CpuMs, parseCpuMs);
             }
             if (s_g182PerfOn)
             {
@@ -515,11 +563,129 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                              n, s_perfWindow, avgFrameMs, eeCpuMs, eeWaitCpuMs, eeWorkCpuMs,
                              100.0 * eeCpuMs / std::max(0.001, avgFrameMs),
                              100.0 * eeWorkCpuMs / std::max(0.001, avgFrameMs));
+                // ⭐⭐⭐ G734: THE GS EXECUTOR THREAD — the board's missing column.
+                //
+                // `gsOwn` (the board's GS term) is `g303_gs_worker_busy_ns() - gsStall`, and
+                // `g_g151WorkerBusyNs` is documented in ps2_gif_arbiter.cpp as "window-ONLY, so it
+                // under-reports the pole". Since G726 split the GS worker, the frame-boundary
+                // branch AND this whole thread have been invisible to `max(gsOwn, vu1Busy,
+                // eeWork)`. On `dungeon1` the board reads gsOwn 7.8-8.2 ms/f while the executor is
+                // ~17 ms/f busy at ~87% occupancy - so the route was labelled EE-limited while the
+                // busiest thread in the process was never a candidate.
+                //
+                // Printed on the SAME `n`/window cadence as [G182:ee] and [G303:vu1w] so
+                // tools/g653_pole_table.py can join it by frame number.
+                // ⛔ The two accessors are declared at FILE scope in dc2_game_override.cpp, NOT
+                // here: this reporting site is inside an anonymous namespace, so an `extern`
+                // written here declares an internal-linkage symbol and the link fails with
+                // LNK2001 on `` `anonymous namespace'::g713_exec_busy_ns ``.
+                // ⛔ G738: same defect, same fix. The executor thread also starts lazily, so the
+                // first window in which `gsxBusy != 0` used to charge the whole accumulated
+                // occupancy AND the whole accumulated CPU to one window's frames. `[G734:gsx]`
+                // declines to print while `gsxBusy == 0`, which hid it behind one impossible row
+                // rather than a run of them.
+                static uint64_t s_lastGsxBusy = 0ull, s_lastGsxIdle = 0ull, s_lastGsxCpu = 0ull;
+                static bool s_gsxPrimed = false;
+                const uint64_t gsxBusy = g713_exec_busy_ns();
+                const uint64_t gsxIdle = g713_exec_idle_ns();
+                // ⭐⭐⭐ G735: the executor's REAL CPU, in the same unit as `[G182:ee] cpuMs/f`.
+                //
+                // ⛔ `execMs/f` beside it is OCCUPANCY — `execTotalNs` brackets a whole drain cycle,
+                // so the blocking `glReadPixels`, the row pool's coop join and every lock inside
+                // that cycle count as BUSY; only the ring-empty park reaches `idleMs/f`. G734 ranked
+                // that column against EE's `GetThreadTimes` column and concluded the executor is the
+                // pole on 12 of 18 windows. G735's PC sample of this thread reads **46.2 % genuine
+                // wait**, and re-ranking on own CPU puts it at the pole on ZERO of them.
+                //
+                // ⇒ `cpuMs/f` is the column a pole classifier must use. `execMs/f` stays because
+                // occupancy is still the right answer to "is this thread saturated or slow", which
+                // is what it was added for — but the two are NOT interchangeable.
+                const uint64_t gsxCpu = g713_exec_cpu_ns();
+                if (!s_gsxPrimed && gsxBusy != 0ull)
+                {
+                    s_lastGsxBusy = gsxBusy;
+                    s_lastGsxIdle = gsxIdle;
+                    s_lastGsxCpu = gsxCpu;
+                    s_gsxPrimed = true;
+                }
+                const double gsxBusyMs = (double)(gsxBusy - s_lastGsxBusy) / 1e6 / w;
+                const double gsxIdleMs = (double)(gsxIdle - s_lastGsxIdle) / 1e6 / w;
+                const double gsxCpuMs = (double)(gsxCpu - s_lastGsxCpu) / 1e6 / w;
+                s_lastGsxBusy = gsxBusy;
+                s_lastGsxIdle = gsxIdle;
+                s_lastGsxCpu = gsxCpu;
+                if (gsxBusy != 0ull)
+                    std::fprintf(stderr,
+                                 "[G734:gsx] n=%u window=%u execMs/f=%.2f idleMs/f=%.2f occupancy=%.0f%% "
+                                 "cpuMs/f=%.2f workShare=%.0f%%\n",
+                                 n, s_perfWindow, gsxBusyMs, gsxIdleMs,
+                                 100.0 * gsxBusyMs / std::max(0.001, gsxBusyMs + gsxIdleMs),
+                                 gsxCpuMs, 100.0 * gsxCpuMs / std::max(0.001, gsxBusyMs));
+                // ⭐⭐⭐ G736: THE OTHER TWO WORK COLUMNS — G735 §6.2e's priority 1, FINISHED HERE.
+                //
+                // ⛔ G735 generalised the executor's `GetThreadTimes` capture into a SLOT TABLE
+                // (`g735CaptureThreadHandle`, `g735ThreadCpuNs`, slots 1 = VU1/MTVU worker,
+                // 2 = GS parse worker) and wired the CAPTURE into both thread entries
+                // (`runtime_mtvu_and_env.inc:817`, `ps2_gif_arbiter.cpp:1311`). It then recorded the
+                // column as "WRITTEN, NOT YET BUILT". It was never "not yet built" — it was built
+                // and shipped in `dc2_runner_g735cpu.exe`, and **no reader was ever written**:
+                // `g735ThreadCpuNs(kG735SlotVu1)` and `(kG735SlotParse)` have ZERO call sites in the
+                // whole tree, so `[G735:cpu]` printed nothing on any run, including the 10-route
+                // board taken with that exact binary. Rule 69/70/71, one more time: a capture with
+                // no readout is indistinguishable from an instrument that measured nothing.
+                //
+                // ⚠️ WHY IT MATTERS. `tools/g653_pole_table.py`'s `poleW` classifier is
+                // `max(gsExecCpu, vu1Busy, eeWork)` — and `vu1Busy` is `[G303:vu1w] busyMs/f`, which
+                // G434/G476 document as OCCUPANCY. It reads 12–21 ms/f on windows whose whole frame
+                // is 17–24 ms, which is not credible as pure work. So the current board still ranks
+                // ONE occupancy column against TWO work columns, which is the exact defect that cost
+                // G735 its premise (G734's "the executor is the pole on 12 of 18 windows" became
+                // "on 1" when the executor alone was converted).
+                //
+                // These two are `GetThreadTimes` deltas on a duplicated handle, read on the SAME
+                // `n`/window cadence as `[G182:ee]` and `[G734:gsx]`, so every column of a row now
+                // comes from one process, one window, one `n`, and all four are in the same unit.
+                // Zero means "no handle" (thread never started, or not Windows), which the reporter
+                // below declines to print exactly as `[G734:gsx]` declines on `gsxBusy == 0`.
+                {
+                    // ⛔ G738: primed from the first non-zero read, not from zero — see the long
+                    // note at the `[G303:vu1w]` copy of these two columns above. This reader is the
+                    // one `tools/g653_pole_table.py` joins, so an unprimed first window here lands
+                    // directly in the board.
+                    static uint64_t s_lastVu1Cpu = 0ull, s_lastParseCpu = 0ull;
+                    static bool s_vu1Primed = false, s_parsePrimed = false;
+                    const uint64_t vu1Cpu = g735ThreadCpuNs(1 /* kG735SlotVu1 */);
+                    const uint64_t parseCpu = g735ThreadCpuNs(2 /* kG735SlotParse */);
+                    if (!s_vu1Primed && vu1Cpu != 0ull)
+                    {
+                        s_lastVu1Cpu = vu1Cpu;
+                        s_vu1Primed = true;
+                    }
+                    if (!s_parsePrimed && parseCpu != 0ull)
+                    {
+                        s_lastParseCpu = parseCpu;
+                        s_parsePrimed = true;
+                    }
+                    if (vu1Cpu != 0ull || parseCpu != 0ull)
+                    {
+                        const double vu1CpuMs = (double)(vu1Cpu - s_lastVu1Cpu) / 1e6 / w;
+                        const double parseCpuMs = (double)(parseCpu - s_lastParseCpu) / 1e6 / w;
+                        std::fprintf(stderr,
+                                     "[G735:cpu] n=%u window=%u vu1CpuMs/f=%.2f parseCpuMs/f=%.2f "
+                                     "eeCpuMs/f=%.2f gsxCpuMs/f=%.2f\n",
+                                     n, s_perfWindow, vu1CpuMs, parseCpuMs, eeWorkCpuMs, gsxCpuMs);
+                        s_lastVu1Cpu = vu1Cpu;
+                        s_lastParseCpu = parseCpu;
+                    }
+                }
             }
             // ⭐ G651 (ROADMAP P1 objective 2): the dispatch-family counting instrument, printed on
             // the same cadence so its calls/f can be divided into the sampler's percentage share.
             // No-ops unless DC2_G651_DISP_STAT=1.
             g651DispatchReport(static_cast<uint64_t>(n));
+            // ⭐ G739: same denominator as [G651:disp] by construction (G738-4 — a per-frame rate
+            // is only as good as its clock, and this process has three).
+            g739DispatchReport(static_cast<uint64_t>(n));
             std::fprintf(stderr,
                          "[G146:g144] n=%u window=%u flush: mid=%.1fms/%.2fx upload=%.1fms/%.2fx frame=%.1fms/%.2fx\n",
                          n, s_perfWindow,
@@ -534,15 +700,34 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                 const double packetMs = s_sumG147PacketMs / w;
                 const double drawMs = s_sumG147DrawMs / w;
                 const double imageMs = s_sumImageMs / w;
+                // ⛔⛔ G740 — THIS SUBTRACTION SPANS TWO THREADS AND WAS PRINTING A NEGATIVE ms/f.
+                //
+                // `packet` is timed where `processGIFPacket` runs — the PARSE thread. Since G721,
+                // `draw` (drawPrimitive) and `image` (GSimage) execute on the EXEC thread, so
+                // `packet - draw - image` subtracts one thread's spans from another's and is not a
+                // residue of anything. Measured on `dungeon1`, shipped config:
+                //
+                //     [G147:gif] packet=18.6ms/9592x draw=16.0ms/14000x parserOther=-12.1ms
+                //
+                // ⚠️ `ps2_g713_pipeline.cpp`'s own header defines the parse stage as
+                // "`[G147:gif] parserOther` MINUS `[G146:perf] GSlocal`" — a definition built on
+                // this quantity. Print the terms, and refuse to print the difference when it cannot
+                // be one (a negative value is the proof that the three are not nested).
                 const double parserOtherMs = packetMs - drawMs - imageMs;
+                char g740Other[32];
+                if (parserOtherMs >= 0.0)
+                    std::snprintf(g740Other, sizeof(g740Other), "%.1fms", parserOtherMs);
+                else
+                    std::snprintf(g740Other, sizeof(g740Other), "n/a(cross-thread)");
                 std::fprintf(stderr,
-                             "[G147:gif] n=%u window=%u packet=%.1fms/%.2fx draw=%.1fms/%.2fx parserOther=%.1fms tags=%.1f packedRegs=%.1f reglistRegs=%.1f imageKB=%.1f\n",
+                             "[G147:gif] n=%u window=%u packet=%.1fms/%.2fx draw=%.1fms/%.2fx image=%.1fms parserOther=%s tags=%.1f packedRegs=%.1f reglistRegs=%.1f imageKB=%.1f\n",
                              n, s_perfWindow,
                              packetMs,
                              static_cast<double>(s_sumG147PacketCount) / w,
                              drawMs,
                              static_cast<double>(s_sumG147DrawCount) / w,
-                             parserOtherMs,
+                             imageMs,
+                             g740Other,
                              static_cast<double>(s_sumG147Tags) / w,
                              static_cast<double>(s_sumG147PackedRegs) / w,
                              static_cast<double>(s_sumG147ReglistRegs) / w,
