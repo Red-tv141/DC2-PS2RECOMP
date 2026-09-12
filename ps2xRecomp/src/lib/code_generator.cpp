@@ -330,7 +330,11 @@ namespace ps2recomp
                 (branchInst.opcode == OPCODE_SPECIAL && branchInst.function == SPECIAL_JALR);
             if (target <= sourcePc && !isCallLikeEdge)
             {
-                ss << fmt::format("{}if (runtime->shouldPreemptGuestExecution()) {{\n", indent);
+                // G739: `ps2ShouldPreempt` is the same decision with the 1-in-64 fast case
+                // inlined. `runtime->shouldPreemptGuestExecution()` stays the authority and is
+                // still what runs at the interval, and DC2_G739_NO_INLINE_PREEMPT=1 routes every
+                // call back to it. See ps2_runtime_macros.h.
+                ss << fmt::format("{}if (ps2ShouldPreempt(runtime)) {{\n", indent);
                 ss << fmt::format("{}    return;\n", indent);
                 ss << fmt::format("{}}}\n", indent);
                 ss << fmt::format("{}goto label_{:x};\n", indent, target);
@@ -413,8 +417,16 @@ namespace ps2recomp
 
                 if (!funcName.empty())
                 {
-                    ss << fmt::format("    if (runtime->hasFunction(0x{:X}u)) {{\n", target);
-                    ss << fmt::format("        auto targetFn = runtime->lookupFunction(0x{:X}u);\n", target);
+                    // ⭐⭐⭐ G739: ONE inlined table probe instead of two out-of-line
+                    // cross-library calls. `dc2_game` is built without /GL, so
+                    // `hasFunction` + `lookupFunction` were two real calls per guest call --
+                    // ~296,000 per frame, ~19 cycles each, every one of them answered by a single
+                    // array load (`[G646:dispatch] rate = 100.00%`). `ps2DirectCall` returns the
+                    // same pointer or nullptr, with the same `pushDispatchPc` side effect on a
+                    // hit, and falls through to the unchanged public API on any miss or whenever
+                    // an observer is armed. See ps2_runtime_macros.h.
+                    ss << fmt::format(
+                        "    if (auto targetFn = ps2DirectCall(runtime, 0x{:X}u)) {{\n", target);
                     if (branchInst.opcode == OPCODE_J)
                     {
                         ss << "        targetFn(rdram, ctx, runtime); return;\n";
@@ -479,7 +491,12 @@ namespace ps2recomp
                     if (!emittedRelocCall)
                     {
                         ss << "    {\n";
-                        ss << fmt::format("        auto targetFn = runtime->lookupFunction(0x{:X}u);\n", target);
+                        // G739: `lookupFunction`'s contract (never nullptr; recovery handler on a
+                        // miss), accelerated by the same inlined probe. ⛔ NOT `ps2DirectCall`:
+                        // this arm has no `hasFunction` guard and calls the result
+                        // unconditionally, so a nullptr return would turn a recoverable bad
+                        // dispatch into a null call.
+                        ss << fmt::format("        auto targetFn = ps2LookupDirect(runtime, 0x{:X}u);\n", target);
                         ss << "        const uint32_t __entryPc = ctx->pc;\n";
                         ss << "        targetFn(rdram, ctx, runtime);\n";
                         if (branchInst.opcode == OPCODE_J)
@@ -543,7 +560,9 @@ namespace ps2recomp
             else
             {
                 ss << "        {\n";
-                ss << "            auto targetFn = runtime->lookupFunction(jumpTarget);\n";
+                // G739: same probe on the INDIRECT arm. `jumpTarget` is a runtime value here, so
+                // the range test does not fold -- two compares against one cross-library call.
+                ss << "            auto targetFn = ps2LookupDirect(runtime, jumpTarget);\n";
                 ss << "            const uint32_t __entryPc = ctx->pc;\n";
                 ss << "            targetFn(rdram, ctx, runtime);\n";
                 ss << fmt::format("            if (ctx->pc == __entryPc) {{ ctx->pc = 0x{:X}u; }}\n", fallthroughPc);
@@ -913,7 +932,24 @@ namespace ps2recomp
             for (const Instruction* jrInst : indirectJumps) {
                 if (jrInst->function == SPECIAL_JALR)
                 {
+                    // G732: a JALR is an indirect CALL, not a computed jump. It transfers
+                    // control OUT of this function and its only in-function continuation is
+                    // the instruction after its delay slot, which is registered exactly here.
+                    // It must NOT fall through to the jump-table scan below: that scan looks
+                    // for a switch dispatch, never finds one (there is no table behind a
+                    // function pointer), and sets needsIndirectFallback -- which marks EVERY
+                    // instruction in the function an entry point, putting a label and an
+                    // entry-switch case on all of them.
+                    //
+                    // That was never a sound guard for JALR in the first place: the fallback
+                    // registers addresses of the CALLING function, which does nothing for a
+                    // jalr whose target lies inside some OTHER function. It is a
+                    // misclassification, and it cost 281 functions / 70,464 guest
+                    // instructions -- 13.35% of the corpus -- their whole optimisable shape.
+                    // Measured: removing the resulting labels is worth -37.6% host
+                    // instructions on the affected bodies. See plans/phase-G732-plan.md.
                     queueResumeEntryTarget(jrInst->address + 8u);
+                    continue;
                 }
 
                 bool foundTable = false;
