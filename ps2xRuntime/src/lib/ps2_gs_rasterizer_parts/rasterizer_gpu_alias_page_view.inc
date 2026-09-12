@@ -172,6 +172,20 @@ static void g261Report()
                  (unsigned long long)g_g267TriEligible.load(std::memory_order_relaxed),
                  (unsigned long long)g_g267TriFootReject.load(std::memory_order_relaxed),
                  (unsigned long long)g_g267TriAliasReject.load(std::memory_order_relaxed));
+    // ⭐ G735: the rows half of `mat(...)`. A publication's cost is its READBACK, which scales with
+    // rows, so a call count alone cannot rank the causes — and until this phase the call count was
+    // dead too (see the increment site).
+    std::fprintf(stderr,
+                 "[G735:matrows] cpu=%llu inl=%llu up=%llu l2l=%llu l2h=%llu tex=%llu rsync=%llu "
+                 "fail=%llu (rows)\n",
+                 (unsigned long long)g_g735MatRows[0].load(std::memory_order_relaxed),
+                 (unsigned long long)g_g735MatRows[1].load(std::memory_order_relaxed),
+                 (unsigned long long)g_g735MatRows[2].load(std::memory_order_relaxed),
+                 (unsigned long long)g_g735MatRows[3].load(std::memory_order_relaxed),
+                 (unsigned long long)g_g735MatRows[4].load(std::memory_order_relaxed),
+                 (unsigned long long)g_g735MatRows[5].load(std::memory_order_relaxed),
+                 (unsigned long long)g_g735MatRows[6].load(std::memory_order_relaxed),
+                 (unsigned long long)g_g735MatRows[7].load(std::memory_order_relaxed));
     std::fprintf(stderr, "[G261:res]");
     for (uint32_t i = 0; i < kG248TargetCount; ++i)
         std::fprintf(stderr, " %03x(mat=%llu win=%d..%d dirty=%d)", kG261Fbp[i],
@@ -789,8 +803,24 @@ static void g536RestoreGuestOwnedPages(const std::vector<G536PageSave> &saved, u
         if (off + 8192ull <= vramSize)
             std::memcpy(vram + off, s.bytes.data(), 8192);
     }
+    // ⭐ G737 INSTRUMENT REPAIR (dead-counter #8, and the worst of the family so far). These three
+    // counters went through `g684DiagAdd`, which is `(void)counter` unless PS2X_G684_HOT_DIAG — OFF
+    // in every release build — while their reporter `[G536:pageown]` is printed UNCONDITIONALLY at
+    // the top of `g261Report()`, which a ship binary reaches through `DC2_G261_STAT=1`.
+    //
+    // ⛔ So a shipping run prints `[G536:pageown] on=1 publications=0 guarded=0 pagesKept=0`:
+    // the guard reports itself ARMED and never engaging. Measured on `dc2_runner_g736ab.exe`,
+    // `dungeon1`. `plans/env-flags.md` meanwhile records this guard at "**16.7 % of publications,
+    // ~5.8 pages kept each**" — a figure that can only ever have come from a HOT_DIAG build, beside
+    // a ship-config zero that reads like a refutation of it.
+    //
+    // Unconditional now. All three sites are once per PUBLICATION (~2/frame, and this one adds
+    // `saved.size()` in ONE add, not one per page), and the statement they sit beside is a blocking
+    // `glReadPixels` — so this is the same site and the same argument G735 used for `g_g261Mat` and
+    // G736 for `fboRej`. Rule 63 does not apply: no lever in this phase changes the publication
+    // count, and the counter is not armed inside either arm of a timing gate.
     if (!saved.empty())
-        g684DiagAdd(g_g536PagesKept, saved.size());
+        g_g536PagesKept.fetch_add(saved.size(), std::memory_order_relaxed);
 }
 
 static void g536NoteMaterialize(const G261Res &r, uint32_t fbp, int cause)
@@ -1432,6 +1462,16 @@ static void g261Materialize(int ti, int cause)
     }
     if (s_g716Authority)
     {
+        // Native source selection has first refusal. Its fallback can retire row debt to raw;
+        // the later pass decodes on GPU or publishes only at an actual CPU byte observer.
+        if (s_g717LateTexture && g_g717TexturePhase && cause == kG261MatTexAlias)
+        {
+            const bool previousObserver = g_g716GpuObserver;
+            g_g716GpuObserver = true;
+            const bool retired = g716RetireTarget(ti, cause);
+            g_g716GpuObserver = previousObserver;
+            if (retired) return;
+        }
         if (g_g716GpuObserver && g716RetireTarget(ti, cause)) return;
         const bool observer = g_g716GpuObserver;
         g_g716GpuObserver = false;
@@ -1593,9 +1633,12 @@ static void g261Materialize(int ti, int cause)
             g536CollectGuestOwnedPages(r, fbp, r.dirtyLo, r.dirtyHi, vram, g_g261VramSize,
                                        s_g536Saved);
             t_g597InMatPrePub = false; // G597: the guard has read the anchor
-            g684DiagAdd(g_g536PubTotal, 1u);
+            // ⭐ G737: unconditional — see the note at g536RestoreGuestOwnedPages. `[G536:pageown]`
+            // is printed by a reporter a SHIP binary reaches, so a `g684DiagAdd` here does not make
+            // the instrument silent, it makes it report a zero that looks like a measurement.
+            g_g536PubTotal.fetch_add(1u, std::memory_order_relaxed);
             if (!s_g536Saved.empty())
-                g684DiagAdd(g_g536PubGuarded, 1u);
+                g_g536PubGuarded.fetch_add(1u, std::memory_order_relaxed);
             // G599 (default OFF): snapshot the target's own pages so the publication's ACTUAL
             // byte effect can be measured, not inferred. Straddles the guard's restore so what it
             // reports is the net effect on guest VRAM, which is what a consumer reads.
@@ -1717,7 +1760,21 @@ static void g261Materialize(int ti, int cause)
                      "[G261:materialize-fail] fbp=0x%x rows=%d..%d fbW=%d cause=%d — residency "
                      "dropped, VRAM stays authoritative\n",
                      fbp, r.dirtyLo, r.dirtyHi, r.fbW, cause);
-        g684DiagAdd(g_g261Mat[kG261MatFail], 1u);
+        // ⛔⛔⛔ G737 INSTRUMENT REPAIR (dead counter #9, and the one that matters most).
+        //
+        // G735's Rule-69 repair made `g_g261Mat[cause]` unconditional at the SUCCESS site below
+        // (`g_g261Mat[cause & 7].fetch_add(...)`) — for seven of the eight causes. This one, the
+        // FAILURE slot, was left on `g684DiagAdd`, which is `(void)counter` unless
+        // PS2X_G684_HOT_DIAG. So `[G261:stat] mat(… fail=0)` — printed by a reporter a SHIP binary
+        // reaches, immediately beside seven counters that ARE live — has read a structural zero on
+        // every shipping run since G684. Every `fail=0` in this project's evidence, including every
+        // one quoted in phases G735–G737, means "the option was off", not "no publication failed".
+        //
+        // A materialize failure drops residency and leaves guest VRAM authoritative — it is a
+        // CORRECTNESS signal, and it is the single counter in this line that must never be silently
+        // zero. Free to fix: the statement immediately above it is an unconditional `fprintf` on the
+        // same branch, so this path already does I/O and cannot be hot by construction.
+        g_g261Mat[kG261MatFail].fetch_add(1u, std::memory_order_relaxed);
         // FBO↔VRAM equality is unknown now — force a fresh upload. Reset in place (callers may
         // hold live references into g_g178FbSnap; erase would invalidate them). G351: both
         // surface snapshots (the split routes 0x139 across two FBO keys).
@@ -1738,7 +1795,36 @@ static void g261Materialize(int ti, int cause)
     r.dirtyHi = -1;
     g261UpdateWindow(ti); // window shrinks to cov rows; gen baseline re-anchored past our bump
     g310NoteTargetClean(ok);
-    g684DiagAdd(g_g261MatByTarget[ti & 7], 1u);
+    // ⛔⛔⛔ G735 — RULE 69, AND IT INVALIDATED EVERY READING OF `[G261:stat] mat(...)`.
+    //
+    // Both of this function's completion counters were DEAD on a shipping binary:
+    // `g_g261MatByTarget` went through `g684DiagAdd`, which is `(void)counter` unless
+    // `PS2X_G684_HOT_DIAG` is defined, and `g_g261Mat[cause]` was itself inside
+    // `#if defined(PS2X_G684_HOT_DIAG)`. Every release build sets that option OFF.
+    //
+    // So `[G261:stat] mat(cpu=0 inl=0 up=0 l2l=0 l2h=0 tex=0 rsync=0 fail=0)` and
+    // `[G261:res] 139(mat=0 …)` were STRUCTURALLY ZERO — they reported the option, not the game —
+    // and G735 §2 used exactly those zeros to argue "this publication path publishes nothing in
+    // 28,672 flushes". It publishes plenty: `[G495:rb]`, whose counters are real, prices the
+    // 0x139 window read at **2.0 reads/frame × (drain 1.165 + xfer 0.295) = 2.92 ms/f**, 63% of
+    // the whole colour readback and ~15% of the frame.
+    //
+    // The counters are now unconditional. This function runs ~2/frame and already performs a
+    // blocking `glReadPixels`; two relaxed atomic adds against that are unmeasurable, and Rule 63
+    // does not apply — no lever in this phase changes the materialize COUNT.
+    //
+    // `g261Report()`'s periodic self-call stays HOT_DIAG-only: on a ship binary the report is
+    // driven by `[G261:stat]`'s own reporting path, and a 512-call period here would print from
+    // inside a publication.
+    // ⛔ G735, SECOND DEFECT IN THIS ONE LINE: the index was masked `ti & 7` against a table of
+    // `kG248TargetCount` = 14 entries, so targets 8..13 (0x13d, 0x157, 0x14b, 0x151, 0x13f, 0x141)
+    // FOLDED onto slots 0..5 and were reported as 0x139, 0x13c, 0x143, 0x146, 0x155, 0x159. The
+    // fold was invisible while the whole counter was dead (see the Rule-69 note above); the moment
+    // it started counting, `[G261:res] 139(mat=13663)` became a sum over two different targets.
+    // `g_g279MatNs` / `g_g279MatRows` mask by cause into an 8-entry table, which is correct — the
+    // cause space really is 8 wide. This one is not.
+    if (ti >= 0 && static_cast<uint32_t>(ti) < kG248TargetCount)
+        g_g261MatByTarget[ti].fetch_add(1u, std::memory_order_relaxed);
     if (g279Profile)
     {
         g_g279MatNs[cause & 7].fetch_add(
@@ -1748,10 +1834,17 @@ static void g261Materialize(int ti, int cause)
         g_g279MatRows[cause & 7].fetch_add(
             static_cast<uint64_t>(std::max(rows, 0)), std::memory_order_relaxed);
     }
-#if defined(PS2X_G684_HOT_DIAG)
     const uint64_t n = g_g261Mat[cause & 7].fetch_add(1u, std::memory_order_relaxed) + 1u;
+    // ⭐ G735: also record the ROW COUNT per cause, so the census can say whether a publication is
+    // a whole-window read (rows=448 here) or a narrowed one — the question G621's row-window lever
+    // exists to answer and which a bare call count cannot.
+    g_g735MatRows[cause & 7].fetch_add(static_cast<uint64_t>(std::max(rows, 0)),
+                                       std::memory_order_relaxed);
+#if defined(PS2X_G684_HOT_DIAG)
     if ((n % 512u) == 0u)
         g261Report();
+#else
+    (void)n;
 #endif
 }
 
@@ -2018,6 +2111,17 @@ static void g288PublishDisplayForGpuBatch()
 
     g_g288GpuAudits.fetch_add(1u, std::memory_order_relaxed);
     const G144BlockRange pending = g277PendingDisplayRange();
+    // ⭐ G735 AGGREGATE PUBLICATION GATE (see rasterizer_command_graph.inc). This audit's only two
+    // outcomes are "disjoint, return" and "publish"; the batch's aggregate wr/rd sets decide
+    // disjointness in O(intervals) instead of re-deriving four block ranges for each of ~278
+    // entries. The per-entry loop additionally EXEMPTS same-(fbp,fbw) entries from the colour test
+    // while `wr` includes them, so the aggregate is strictly the more conservative of the two — it
+    // can only refuse a skip the loop would have taken, never take one the loop would refuse.
+    if (g735BatchCannotTouch(pending))
+    {
+        g_g288GpuDisjoint.fetch_add(1u, std::memory_order_relaxed);
+        return;
+    }
     bool overlap = false;
     bool unknown = !pending.valid;
     uint32_t reason = unknown ? 0x10u : 0u; // 1=color, 2=depth, 4=texture, 8=CLUT, 16=unknown

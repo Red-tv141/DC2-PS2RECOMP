@@ -186,6 +186,12 @@ static uint64_t g589AtlasKeyNow()
                    (static_cast<uint64_t>(g_g310Frozen ? 1u : 0u) << 1) |
                    (static_cast<uint64_t>(g_g310RefreshPending ? 1u : 0u) << 2) |
                    (static_cast<uint64_t>(g_g310FrozenInvalid ? 1u : 0u) << 3));
+    // ⭐ G718: the atlas now also sources pages from G700 persistent surfaces, so their identity,
+    // coverage, debt and content stamp are inputs to `g310EnsureCurrent` and must be in its key.
+    // `g718AtlasStateKey()` returns 0 when G700 or the atlas source is unarmed, and the mix is
+    // skipped entirely then, so the shipped key is unchanged bit for bit.
+    if (const uint64_t g718Key = g718AtlasStateKey())
+        g589Mix(h, g718Key);
     return h;
 }
 

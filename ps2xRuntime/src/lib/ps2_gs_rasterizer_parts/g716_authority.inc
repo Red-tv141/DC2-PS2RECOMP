@@ -255,15 +255,14 @@ static bool g716ExecuteL2l(uint8_t *vram, uint32_t size,
     g_g716GpuObserver = true;
     g715LatePinPart(3);
     g_g716GpuObserver = false;
-    // NOL2L is the retire-only arm. It must run the framebuffer handoff above (that is the ONLY
-    // producer of raw pages other than this copy, and it is reachable only through the observer
-    // set here), then DECLINE, so the shipped CPU body performs the transfer. Declining routes the
-    // caller through g144L2lLatePin -> g261MaterializeForRanges, which publishes raw back to guest
-    // with the observer clear, so the CPU body still reads current bytes.
-    // ⚠️ Without this the flag produced an INERT arm: g716RetireTarget requires the observer, so
-    // disabling this function disabled the whole architecture and its 87/87 meant nothing.
+    // NOL2L exercises the handoff, then lets the real CPU transfer run. g715LatePinPart already
+    // DISARMED the deferred pin; the caller's g144L2lLatePin therefore cannot publish these pages.
+    // This diagnostic CPU observer must explicitly acquire its bytes before declining.
     if (s_g716NoL2l)
     {
+        const auto src = g144RangeForRect(sbp, psm, sbw, sx, sy, w, h);
+        const auto dst = g144RangeForRect(dbp, dpsm, dbw, dx, dy, w, h);
+        g716MaterializeForRanges(src, dst, !src.valid, !dst.valid, kG261MatLocal);
         if (++g_g716Copies <= 4 || g_g716Copies % 4096 == 0) g716Report();
         return false;
     }
@@ -363,7 +362,7 @@ static uint64_t g716TryTexture(const G144Entry &e, const G178EntryState &st)
     // direct bind carries (the target's own colour/alpha contract). All three bases the oracle
     // sampled -- 0x2720, 0x2b20, 0x2740 -- are exactly these surfaces, and every content oracle
     // passes on them because the bytes are not what differs.
-    if (s_g716NoRtt)
+    if (s_g716NoRtt && !s_g717LateTexture)
         for (uint32_t t = 0; t < kG248TargetCount; ++t)
             if (g_g261Res[t].range.valid && g144RangeOverlaps(g_g261Res[t].range, tex))
                 return 0;
@@ -464,12 +463,20 @@ static uint64_t g716TryTexture(const G144Entry &e, const G178EntryState &st)
         // check of the TEX0 -> address -> TEXA chain rather than the raw image against itself.
         if (s_g716Verify && g_g144LastVram != nullptr && (g_g716Views % 64u) == 0u)
         {
+            // G717 validates without altering live guest bytes or authority. The private shadow
+            // drains prior raw work and overlays exactly those raw pages onto the guest snapshot.
+            // The old MIRROR-based experiment remains available for the frozen G716 arm.
+            const auto shadow = s_g717LateTexture ? g716ShadowMemory(tex) : std::vector<uint8_t>{};
+            const uint8_t *reference = s_g717LateTexture ? shadow.data() : g_g144LastVram;
             p->expected.assign(size_t(st.texW) * st.texH, 0u);
             const uint32_t w = uint32_t(st.texW);
             for (int v = 0; v < st.texH; ++v)
             {
                 uint32_t *const row = p->expected.data() + size_t(v) * w;
-                GSMem::G512ReadRowCT32(g_g144LastVram, p->tbp, p->tbw, uint32_t(v), w, row);
+                // G718: the shipped row reader takes a non-const `u8 *` but only reads. The oracle
+                // holds either a private shadow copy or the live VRAM base; neither is written here.
+                GSMem::G512ReadRowCT32(const_cast<uint8_t *>(reference), p->tbp, p->tbw,
+                                       uint32_t(v), w, row);
                 if (p->psm == GS_PSM_CT24)
                     for (uint32_t x = 0; x < w; ++x)
                     {

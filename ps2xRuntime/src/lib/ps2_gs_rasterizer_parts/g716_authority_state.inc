@@ -8,6 +8,9 @@ static const bool s_g716CpuView = envFlagEnabled("DC2_G716_CPUVIEW");
 static const bool s_g716CpuSeed = envFlagEnabled("DC2_G716_CPUSEED");
 static const bool s_g716Verify = envFlagEnabled("DC2_G716_VERIFY");
 static const bool s_g716RawUpload = envFlagEnabled("DC2_G716_RAWUPLOAD");
+// G717: resolve the native GPU representation before requesting any guest bytes.
+static const bool s_g717LateTexture = envFlagEnabled("DC2_G717_LATE_TEXTURE");
+static bool g_g717TexturePhase = false;
 // Producer bisect. Raw pages have exactly two producers: the framebuffer row handoff
 // (g716RetireTarget) and the GPU-to-GPU raw copy (g716ExecuteL2l). Disabling one leaves the other
 // fully GPU-consumed, so unlike the CPUVIEW/CPUSEED consumer split it does NOT change what the

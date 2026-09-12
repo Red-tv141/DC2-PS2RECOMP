@@ -110,6 +110,173 @@ static bool g281BuildT8MapCold(const G144Entry &e, int srcTi, int texW, int texH
     return true;
 }
 
+// ==============================================================================================
+// ⭐⭐⭐ G737 — PROVE THE TEXELS THE CONSUMER SAMPLES, NOT THE TEXELS TEX0 DECLARES
+// ==============================================================================================
+//
+// THE DEFECT. `g281BuildT8MapCold` above walks the WHOLE declared TEX0 rectangle (`1 << TW` by
+// `1 << TH`) and returns false at the FIRST texel whose source row leaves the producer's resident
+// coverage window. The consumer samples a sub-rectangle of that, and on `dungeon1` the difference
+// decides the whole population:
+//
+//   [G737:texrej]  100% of mat(tex) is  tbp=0x2720 tbw=6 psm=T8 tex=512x256 prim=SPRITE fst=1
+//                  against a producer with fbw=2 fbW=128 cov=0..191 — and it samples uv=0..203,140..161
+//
+//   the DECLARED 512x256 spans ~13 PSMT8 pages; the producer owns 12, and rows past `covHi` fail
+//   the `sy` conjunct. G618's own header records the outcome: **660,000 calls, 7 built, 659,993
+//   refused, 100% on `sy`, after walking 1.96 BILLION texels.**
+//
+//   the SAMPLED 204x22 lands in PSMT8 pages 6..7 => pageRow 3 => source rows 96..127, columns
+//   0..127 — inside `fbW=128` and inside `cov=0..191`. It passes.
+//
+// So the view is refused for texels the draw cannot read. That is a VALIDITY bug in the admission,
+// not a limit of the mechanism — the same "declared extent vs sampled extent" confusion that makes
+// `g144TextureRange` conservative one level up.
+//
+// WHY THIS IS EXACT.
+//   * Inside the rectangle the emitted words are bit-identical to the full build: same formula,
+//     same order, same fail-closed returns. Only the LOOP BOUNDS differ.
+//   * Outside it the map is filled with the FIRST PROVEN texel's word, so every texel of the view
+//     addresses a proven, single-owner source pixel. The view is never undefined, and a stray
+//     sample can only read a valid producer pixel — never out of bounds, never a foreign owner.
+//   * The caller may only use the view when the draw's own texel extent lies inside the rectangle,
+//     and it qualifies `viewKey` with the rectangle, so a view proven for one rectangle can never
+//     be reused by an entry sampling a different one (`s_g310BuiltViews` is keyed on that value).
+//   * The caller expands the rectangle by one texel on every side and requires the extent to be
+//     inside `[0,texW) x [0,texH)`, so a GL_LINEAR tap and a REPEAT/CLAMP wrap cannot reach past it.
+//
+// ⚠️ Deliberately NOT wired into the G326 plan cache or the G618 negative cache: both are keyed on
+// `(e, srcTi, texW, texH)` with no rectangle, so a sub-rect product must not be stored under a
+// whole-texture key. A sub-rect build is ~30x cheaper than the walk it replaces (204x22 against
+// 512x256) and `s_g310BuiltViews` still de-duplicates within a flush, so the lost memoization
+// cannot cost what the caches were built to save.
+//
+//   DC2_G737_T8UVMAP=1     arm (default OFF until gated)
+//   DC2_G737_NO_T8UVMAP=1  rollback once promoted
+static bool g737T8UvMapOn()
+{
+    static const bool s_on = !envFlagEnabled("DC2_G737_NO_T8UVMAP") &&
+                             envFlagEnabled("DC2_G737_T8UVMAP");
+    return s_on;
+}
+
+static std::atomic<uint64_t> g_g737UvBuilt{0}, g_g737UvRefused{0}, g_g737UvTexels{0},
+    g_g737UvFullTexels{0}, g_g737UvProved{0};
+
+// ⛔ `proveOnly` EXISTS BECAUSE THE FIRST BUILD OF THIS LEVER COST +2.29 ms/f WHILE CONVERTING
+// NOTHING. The map this returns must be `texW * texH` for the backend, so a full `assign` plus an
+// outside-the-rectangle fill touches 131,072 words per call at the measured 512x256 shape — 100 %
+// of the walk the rectangle exists to avoid. The ADMISSION only needs the boolean, and it runs per
+// ENTRY; the BUILD needs the words, and it runs once per (view key, flush). Separating them is what
+// makes "8.69 % of the walk" true of the cost and not only of the proof.
+static bool g737BuildT8MapRect(const G144Entry &e, int srcTi, int texW, int texH,
+                               int uLo, int uHi, int vLo, int vHi,
+                               std::vector<uint32_t> &out, bool proveOnly = false)
+{
+    static const G281Ct32Inverse s_inv;
+    if (!s_inv.ok || srcTi < 0 || srcTi >= static_cast<int>(kG248TargetCount) ||
+        texW <= 0 || texH <= 0 || texW > g599T8MaxW() || texH > 512)
+        return false;
+    if (uLo < 0 || vLo < 0 || uHi >= texW || vHi >= texH || uHi < uLo || vHi < vLo)
+        return false;
+    const G261Res &src = g_g261Res[srcTi];
+    if (!src.dirty || !src.range.valid || src.fbw == 0u || src.fbW <= 0 || src.fbW > 512)
+        return false;
+    const uint32_t srcBase = framePageBaseToBlock(kG261Fbp[srcTi]);
+    const uint32_t pageBwT8 = std::max<uint32_t>(1u, e.ctx.tex0.tbw >> 1u);
+    if (!proveOnly)
+        out.assign(static_cast<size_t>(texW) * static_cast<size_t>(texH), 0u);
+
+    constexpr uint32_t kG599PageMemo = 256u;
+    uint8_t pageOk[kG599PageMemo] = {};
+    uint32_t firstPacked = 0u;
+    bool haveFirst = false;
+    for (int vv = vLo; vv <= vHi; ++vv)
+        for (int uu = uLo; uu <= uHi; ++uu)
+        {
+            const uint32_t off = GSMem::AddressP8(
+                e.ctx.tex0.tbp0, pageBwT8,
+                static_cast<uint32_t>(uu), static_cast<uint32_t>(vv));
+            const uint32_t pageBlock = (off >> 13u) << 5u;
+            const uint32_t memoIdx = pageBlock >= srcBase ? ((pageBlock - srcBase) >> 5u)
+                                                          : kG599PageMemo;
+            if (memoIdx >= kG599PageMemo || pageOk[memoIdx] == 0u)
+            {
+                const G144BlockRange page{pageBlock, pageBlock + 31u, true};
+                if (page.last > 0x3FFFu || page.first < src.range.first ||
+                    page.last > src.range.last || pageBlock < srcBase ||
+                    ((pageBlock - srcBase) & 31u) != 0u)
+                    return false;
+                for (uint32_t t = 0; t < kG248TargetCount; ++t)
+                {
+                    if (static_cast<int>(t) == srcTi || !g_g261Res[t].dirty)
+                        continue;
+                    if (!g_g261Res[t].range.valid ||
+                        g280DirtyTargetOwnsPage(static_cast<int>(t), pageBlock))
+                        return false;
+                }
+                if (memoIdx < kG599PageMemo)
+                    pageOk[memoIdx] = 1u;
+            }
+
+            const uint32_t pageOff = (pageBlock - srcBase) >> 5u;
+            const uint32_t pageRow = pageOff / src.fbw;
+            const uint32_t pageCol = pageOff % src.fbw;
+            const uint32_t word = (off & 8191u) >> 2u;
+            if (word >= s_inv.x.size())
+                return false;
+            const int sx = static_cast<int>(pageCol) * 64 + s_inv.x[word];
+            const int sy = static_cast<int>(pageRow) * 32 + s_inv.y[word];
+            if (sx < 0 || sx >= src.fbW || sy < src.covLo || sy > src.covHi ||
+                sy < 0 || sy >= 512)
+                return false;
+            const uint32_t glY = static_cast<uint32_t>(511 - sy);
+            const uint32_t lane = off & 3u;
+            const uint32_t packed = (static_cast<uint32_t>(sx) & 0xFFu) |
+                                    ((glY & 0xFFu) << 8u) |
+                                    ((((glY >> 8u) & 1u) | (lane << 1u) |
+                                      (((static_cast<uint32_t>(sx) >> 8u) & 1u) << 3u))
+                                     << 16u) |
+                                    0xFF000000u;
+            if (!proveOnly)
+                out[static_cast<size_t>(vv) * static_cast<size_t>(texW) +
+                    static_cast<size_t>(uu)] = packed;
+            if (!haveFirst)
+            {
+                firstPacked = packed;
+                haveFirst = true;
+            }
+        }
+    if (!haveFirst)
+        return false;
+    if (proveOnly)
+    {
+        g_g737UvProved.fetch_add(1u, std::memory_order_relaxed);
+        return true;
+    }
+    // Every texel outside the proven rectangle addresses the first PROVEN source pixel. The view is
+    // therefore fully defined and in-bounds everywhere; correctness is carried by the caller's
+    // containment check plus the rectangle-qualified view key, not by these words.
+    for (int vv = 0; vv < texH; ++vv)
+    {
+        const bool rowInside = (vv >= vLo && vv <= vHi);
+        uint32_t *row = out.data() + static_cast<size_t>(vv) * static_cast<size_t>(texW);
+        for (int uu = 0; uu < texW; ++uu)
+        {
+            if (rowInside && uu >= uLo && uu <= uHi)
+                continue;
+            row[uu] = firstPacked;
+        }
+    }
+    g_g737UvBuilt.fetch_add(1u, std::memory_order_relaxed);
+    g_g737UvTexels.fetch_add(
+        static_cast<uint64_t>(uHi - uLo + 1) * static_cast<uint64_t>(vHi - vLo + 1),
+        std::memory_order_relaxed);
+    g_g737UvFullTexels.fetch_add(
+        static_cast<uint64_t>(texW) * static_cast<uint64_t>(texH), std::memory_order_relaxed);
+    return true;
+}
+
 // ===== G618: the same map, with the PER-PAGE work lifted out of the PER-TEXEL loop =====
 //
 // WHY THIS LOOP. The G618 premise gate measured `dungeon1`'s entry/run window (n=241..1081, the
@@ -894,6 +1061,36 @@ static bool g598T8AnyOn()
     return s_on && g261WaveOn();
 }
 
+// ⭐⭐⭐ G737: `st.bilinear` IS REQUIRED BY ALL THREE T8-VIEW ADMISSIONS, AND IT IS NOT A SAFETY
+// PROPERTY.
+//
+// `g310Shape`, `g281TryEntry` and `g598TryT8EntryAny` each demand `st.bilinear` — not "tolerate
+// it", REQUIRE it. Measured consequence on `dungeon1` (`[G737:texrej]`, this phase): **100 % of
+// `mat(tex)` — 31 % of every guest-VRAM publication, 1.59 M readback rows — is a PSMT8 (95.6 %) or
+// PSMT4HH (4.4 %) read whose shape is `prim=SPRITE fst=1 bilin=0`, sampling a resident CT32
+// target's own base. It fails the direct-FBO bind on `psm != CT32` and it fails every T8-view
+// admission on `bilin == 0`, so it falls back to a blocking `glReadPixels` of the producer's whole
+// dirty window. Arming `DC2_G598_T8ANY=1 DC2_G599_T8WIDE=1` changes NOTHING for it: the two runs
+// are bit-identical at matched `waves` (`fboBind=1202081`, `mat(tex)=4013` in both).
+//
+// The conjunct cannot bear on correctness, by the file's own argument one screen up — the one it
+// already makes in writing for `fst` and for `prim`: `g281BuildT8Map` derives its byte map from
+// `tex0.tbp0` / `tbw` / TW / TH and never reads a coordinate, a filter mode or a primitive type.
+// `bilinear` is SAMPLER state that the backend applies to the finished view (`d.bilinear` selects
+// GL_LINEAR vs GL_NEAREST on the srcFbp path, exactly as it does for a decoded VRAM texture), so
+// admitting a NEAREST consumer changes which texels it reads, not whether the snapshot is right.
+// The page-ownership proof in `g281BuildT8Map` — range, alignment, no foreign dirty owner — is
+// untouched and still decides.
+//
+//   DC2_G737_T8NEAREST=1     arm (default OFF until gated)
+//   DC2_G737_NO_T8NEAREST=1  rollback once promoted
+static bool g737T8NearestOn()
+{
+    static const bool s_on = !envFlagEnabled("DC2_G737_NO_T8NEAREST") &&
+                             envFlagEnabled("DC2_G737_T8NEAREST");
+    return s_on;
+}
+
 #if defined(PS2X_G684_HOT_DIAG)
 static bool g598T8WhyOn()
 {
@@ -948,8 +1145,22 @@ static int g598FindT8Source(uint32_t tbp0)
 // Triangle-family twin of g310TryT8Entry with the destination/base whitelist replaced by the source
 // lookup above. Every remaining conjunct is one the shipped code already applies, in the same order,
 // so a rejection here is a rejection the default path would also have made.
-static int g598TryT8EntryAny(const G144Entry &e, const G178EntryState &st)
+// ⛔ G737, A BUG IN THIS PHASE'S OWN FIRST ATTEMPT, RECORDED. The sampled-rectangle builder was
+// wired only into the view-BUILD site in rasterizer_vram_materialization.inc — but this admission
+// runs its OWN whole-texture `g281BuildT8Map` probe below ("the real safety property") and returns
+// -1 before the caller ever reaches the build. The measured result was `[G737:t8uv] built=3744
+// refusedToFullProof=0` beside an UNCHANGED `map(page-ownership) n=24762` and a bit-identical
+// `mat(tex)` — a lever that fires, and fires only where it was already unnecessary.
+// ⭐ Rule (G737-2): when an admission and its consumer each run the same proof, widening one of
+// them is a no-op. Find every evaluation of the predicate before believing a widening converted.
+// The rectangle is therefore passed IN, from the one place that can compute it (the caller owns the
+// entry's texel extent), and the probe uses the same builder the build site will use.
+static int g598TryT8EntryAny(const G144Entry &e, const G178EntryState &st,
+                             bool uvRect = false, int uLo = 0, int uHi = -1,
+                             int vLo = 0, int vHi = -1, bool *usedRect = nullptr)
 {
+    if (usedRect != nullptr)
+        *usedRect = false;
     // ⭐ Every reject counter is gated on the CENSUS flag, not on the lever. The shape reject fires
     // once per entry per flush on a ~141 k-descriptor pole thread; an unconditional atomic there
     // would be a standing tax the moment this promotes to default-ON (G593's lesson, in the
@@ -976,10 +1187,21 @@ static int g598TryT8EntryAny(const G144Entry &e, const G178EntryState &st)
     const bool shapeOk =
         e.prim.type == GS_PRIM_TRIANGLE || e.prim.type == GS_PRIM_TRISTRIP ||
         e.prim.type == GS_PRIM_TRIFAN || e.prim.type == GS_PRIM_SPRITE;
-    if (st.texKey == 0u || st.skip || !e.prim.tme || !shapeOk ||
-        !st.bilinear || e.ctx.tex0.psm != GS_PSM_T8 ||
-        st.texW <= 0 || st.texH <= 0 || st.texW > g599T8MaxW() || st.texH > 512)
+    // ⭐ G737: `!st.bilinear` is split out of the conjunction so the census can say whether the
+    // FILTER MODE was the only thing that refused — the distinction `[G598:t8] rej(shape=)` lumps
+    // together and which turned out to be 100% of the `mat(tex)` population.
+    const bool g737FilterBlocks = !st.bilinear && !g737T8NearestOn();
+    const bool g737ShapeBlocks =
+        st.texKey == 0u || st.skip || !e.prim.tme || !shapeOk ||
+        e.ctx.tex0.psm != GS_PSM_T8 ||
+        st.texW <= 0 || st.texH <= 0 || st.texW > g599T8MaxW() || st.texH > 512;
+    if (g737ShapeBlocks || g737FilterBlocks)
     {
+        if (g737TexRejectOn() && e.ctx.tex0.psm == GS_PSM_T8)
+            g737NoteT8(g737ShapeBlocks ? kG737T8ShapeOther : kG737T8ShapeBilinear,
+                       e.ctx.frame.fbp, e.ctx.tex0.tbp0, e.ctx.tex0.tbw, e.ctx.tex0.psm,
+                       st.texW, st.texH, static_cast<uint32_t>(e.prim.type),
+                       e.prim.fst ? 1 : 0, st.bilinear ? 1 : 0);
         // Report a T8 entry that HAS a resident source but was refused on shape — the line that
         // names the next gap instead of leaving it as an unexplained `rej(shape=)` bucket.
         if (why && e.ctx.tex0.psm == GS_PSM_T8 &&
@@ -1007,6 +1229,9 @@ static int g598TryT8EntryAny(const G144Entry &e, const G178EntryState &st)
     {
         if (why)
             g_g598T8RejNoSrc.fetch_add(1u, std::memory_order_relaxed);
+        g737NoteT8(kG737T8NoSrc, e.ctx.frame.fbp, e.ctx.tex0.tbp0, e.ctx.tex0.tbw,
+                   e.ctx.tex0.psm, st.texW, st.texH, static_cast<uint32_t>(e.prim.type),
+                   e.prim.fst ? 1 : 0, st.bilinear ? 1 : 0);
         return -1;
     }
     if (why)
@@ -1017,6 +1242,9 @@ static int g598TryT8EntryAny(const G144Entry &e, const G178EntryState &st)
     {
         if (why)
             g_g598T8RejClut.fetch_add(1u, std::memory_order_relaxed);
+        g737NoteT8(kG737T8Clut, e.ctx.frame.fbp, e.ctx.tex0.tbp0, e.ctx.tex0.tbw,
+                   e.ctx.tex0.psm, st.texW, st.texH, static_cast<uint32_t>(e.prim.type),
+                   e.prim.fst ? 1 : 0, st.bilinear ? 1 : 0);
         return -1;
     }
     for (uint32_t t = 0; t < kG248TargetCount; ++t)
@@ -1026,16 +1254,44 @@ static int g598TryT8EntryAny(const G144Entry &e, const G178EntryState &st)
         {
             if (why)
                 g_g598T8RejClut.fetch_add(1u, std::memory_order_relaxed);
+            g737NoteT8(kG737T8Clut, e.ctx.frame.fbp, e.ctx.tex0.tbp0, e.ctx.tex0.tbw,
+                       e.ctx.tex0.psm, st.texW, st.texH, static_cast<uint32_t>(e.prim.type),
+                       e.prim.fst ? 1 : 0, st.bilinear ? 1 : 0);
             return -1;
         }
     // The real safety property: exact byte map with single-owner pages, fail-closed.
+    // ⭐ G737: the rectangle proof is tried first and the whole-texture proof is the fallback, so
+    // this admission can only ever ADMIT MORE — never fewer — than it did before the arm existed.
+    // ⛔ ORDER MATTERS, AND THE FIRST BUILD HAD IT BACKWARDS (+2.29 ms/f, §4.7). The whole-texture
+    // proof runs FIRST: it is memoised by the G326 plan cache and by G618's negative ring, and when
+    // it succeeds the caller keeps the UN-qualified view key, so `s_g310BuiltViews` still collapses
+    // every entry sharing a texture to ONE backend view per flush. Only the population the
+    // whole-texture proof REFUSES falls through to the rectangle, and only that population pays a
+    // rectangle-qualified key. Trying the rectangle first fragments the per-flush view cache by
+    // (texture x rectangle) and multiplies the backend view builds — which is exactly what the
+    // first measurement showed.
     static std::vector<uint32_t> s_probeMap;
-    if (!g281BuildT8Map(e, srcTi, st.texW, st.texH, s_probeMap))
+    bool probeOk = g281BuildT8Map(e, srcTi, st.texW, st.texH, s_probeMap);
+    if (!probeOk && uvRect &&
+        g737BuildT8MapRect(e, srcTi, st.texW, st.texH, uLo, uHi, vLo, vHi, s_probeMap,
+                           /*proveOnly=*/true))
+    {
+        probeOk = true;
+        if (usedRect != nullptr)
+            *usedRect = true;
+    }
+    if (!probeOk)
     {
         if (why)
             g_g598T8RejMap.fetch_add(1u, std::memory_order_relaxed);
+        g737NoteT8(kG737T8Map, e.ctx.frame.fbp, e.ctx.tex0.tbp0, e.ctx.tex0.tbw,
+                   e.ctx.tex0.psm, st.texW, st.texH, static_cast<uint32_t>(e.prim.type),
+                   e.prim.fst ? 1 : 0, st.bilinear ? 1 : 0);
         return -1;
     }
+    g737NoteT8(kG737T8Admit, e.ctx.frame.fbp, e.ctx.tex0.tbp0, e.ctx.tex0.tbw,
+               e.ctx.tex0.psm, st.texW, st.texH, static_cast<uint32_t>(e.prim.type),
+               e.prim.fst ? 1 : 0, st.bilinear ? 1 : 0);
     if (g598T8WhyOn())
     {
         const uint64_t n = g_g598T8Admit.load(std::memory_order_relaxed);

@@ -124,6 +124,13 @@ static constexpr uint32_t kG310LogicalCt24Token = 0xfffffff4u;
 struct G310PageState
 {
     int8_t sourceTi = -1; // -1 guest VRAM; otherwise resident-target index
+    // ⭐ G718: -1, or the G700 PERSISTENT SURFACE slot this atlas page is copied from. A surface at
+    // an address outside the fourteen-entry `kG261Fbp` allowlist has no `sourceTi`, so before this
+    // every one of its pages took the GUEST path — decode 8 KiB out of VRAM and upload it — which
+    // is what forced `g700PrepareForBatch` to publish the whole surface on every flush that
+    // sampled it (`[G700:cause] mats cpuReplay=...`, `[G718:prep] sample tex(tbp=0x2760) ->
+    // surf(fbp=0x13b)`). PCSX2 sources such a read from the target's own texture; so does this.
+    int8_t sourceSlot = -1;
     uint64_t sourceGen = 0u;
     uint64_t guestGen = 0u;
     uint64_t guestHash = 0u;
@@ -492,6 +499,23 @@ static std::atomic<uint64_t> g_g311Refreshes{0}, g_g311RefreshWork{0},
     g_g311VerifyMiss{0};
 static std::atomic<uint64_t> g_g311DeltaHist[8]{};
 static bool g310Requested();
+// ⭐ G718 — the G700 persistent surface registry is defined 118 includes later
+// (g700_resident_authority.inc, line 606 of ps2_gs_rasterizer.cpp) but the G310 logical atlas that
+// consumes it is included at line 488. These three are the whole interface: which surface owns an
+// atlas page, that surface's backend FBO key, and the on-demand publication the atlas's guest
+// fallback needs. Declared here so the atlas can name them; defined with the rest of G700.
+static int g718AtlasSourceForPage(uint32_t pageBlock, uint32_t *outRow, uint32_t *outCol,
+                                  uint64_t *outGen);
+static uint32_t g718AtlasSourceFbp(int slot);
+static void g718PublishForAtlasGuestRun(uint32_t pageY, uint32_t pageX0, uint32_t pageCount);
+static bool g718AtlasGpuSourceOn();
+// G718: the part of `g589AtlasKeyNow()` that describes the G700 surfaces. Without it a memoized
+// g310EnsureCurrent could be reused across a batch that re-rendered a surface the atlas sources.
+static uint64_t g718AtlasStateKey();
+// Mirror of `kG700Slots`; g700_resident_authority.inc static_asserts the two agree.
+static constexpr uint32_t kG718AtlasSlots = 48u;
+static std::atomic<uint64_t> g_g718AtlasCopies{0}, g_g718AtlasCopiedPages{0};
+
 static bool g310On();
 static bool g310VerifyOn();
 static bool g310StatOn();
@@ -986,6 +1010,11 @@ static int g275ZSwizzleLanes()
 static std::unordered_set<uint64_t> g_g262DepthInit;
 static std::atomic<uint64_t> g_g261Mat[8] = {};
 static std::atomic<uint64_t> g_g261MatByTarget[kG248TargetCount] = {};
+// ⭐ G735: ROWS published per cause, beside the call count. `[G261:stat]`'s `mat(...)` row could
+// only ever say HOW MANY publications ran, never how wide each one was — and the whole cost of this
+// path is the readback, which scales with rows. See the Rule-69 note at the increment site in
+// rasterizer_gpu_alias_page_view.inc for why these counters were structurally zero until now.
+static std::atomic<uint64_t> g_g735MatRows[8] = {};
 // G279 diagnosis (default-off, DC2_G279_PROFILE=1): wall-time split for the remaining
 // GPU-residency publication paths. Counts/rows are bucketed by the existing G261 cause enum;
 // display publication uses the existing 0..8 consumer-edge causes. This is behavior-pure and

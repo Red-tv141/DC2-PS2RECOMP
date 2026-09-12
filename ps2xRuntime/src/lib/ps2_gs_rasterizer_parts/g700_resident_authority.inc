@@ -133,6 +133,137 @@ static bool g700VerifyOn()
     return on;
 }
 
+// ⭐ G718: row-scoped publication. The shipped G700 surrendered `dirtyLo..dirtyHi` — the WHOLE
+// surface — whenever any reader's block range touched any page of it. On `dungeon1` that measured
+// `mats == renders` (33,061 each) at 306 rows per publication, i.e. the persistent model paid the
+// transient model's readback anyway. Rollback: DC2_G718_NO_ROWSCOPE=1.
+// ⛔ MEASURED NULL, kept OPT-IN. `[G718:prep]` reported `saved=0.0%` on `dungeon1`: the reader
+// covers the whole surface, so no row window is narrower than the debt. Exact and strictly
+// narrower by construction, so it stays available — but it is not part of the promoted
+// configuration, which is G700 alone.
+static bool g718RowScopeOn()
+{
+    static const bool on =
+        envFlagEnabled("DC2_G718_ROWSCOPE") && !envFlagEnabled("DC2_G718_NO_ROWSCOPE");
+    return on;
+}
+
+// ⭐⭐⭐ G718 TARGET-ALIAS PUBLICATION — a batch's framebuffer/depth UPLOAD reads guest VRAM for
+// rows that routinely alias another persistent surface. Correctness fix for the promoted
+// configuration, so DEFAULT-ON. Rollback: DC2_G718_NO_TGTPUB=1.
+static bool g718TargetPubOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G718_NO_TGTPUB");
+    return on;
+}
+static std::atomic<uint64_t> g_g718TgtPubs{0};
+
+// A scissor permits writes; it does not prove those rows were written. Match the
+// production G621 publication footprint when establishing persistent authority.
+//
+// ⛔⛔⛔ MEASURED: DEFAULT-ON WAS A MECHANISM-KILLER AND A PIXEL NULL. Narrowing the CLAIM to
+// `g621PubLo..g621PubHi` without narrowing the QUERY (`g700NeedUpload` still asks about the whole
+// batch row window) leaves the rows between the write span and the scissor unowned, so the very
+// next batch uploads. `dungeon1`, `dc2_runner_g718ship3.exe`, same route, same census:
+//
+//     writespan ON   uploads=37,329  skipped=52     (0.1%)
+//     writespan OFF  uploads=23,162  skipped=14,219 (38.0%)
+//
+// i.e. it deleted 99.7% of the upload skipping the persistent surface exists to produce. And it
+// bought nothing: the whole-frame pixel table is IDENTICAL to fifteen significant digits with it
+// on or off (`g718v3_dungeon1` vs `g718v4_nows`, sf1892 mean 0.010448042168674699 / 226 px in
+// both). ⭐ That pair is also the proof that the surviving defect is NOT stale FBO content: at
+// 0.1% skipping the FBO is re-uploaded from guest VRAM on essentially every render and the wrong
+// pixels do not move. Rolled back to OPT-IN; the code is retained because it is exact.
+static bool g718WriteSpanOn()
+{
+    static const bool on = envFlagEnabled("DC2_G718_WRITESPAN") &&
+                           !envFlagEnabled("DC2_G718_NO_WRITESPAN");
+    return on;
+}
+
+// ⭐⭐⭐ G718 PAGE ARBITRATION. `g700PageIsGpu` asks `s.owned[p]` and the generation anchor, and
+// NEITHER answers "is this surface still the one the reverse index names for that VRAM page".
+// On `dungeon1` the four live surfaces are 0x13b (fbw=8, 128 pages: 0x13b..0x1ba) and 0x13f /
+// 0x141 / 0x14b (fbw=2, 32 pages each) — all three of the small ones live INSIDE 0x13b's page span,
+// and they overlap each other. A GPU render bumps no guest generation, so after A and then B render
+// the same VRAM page both hold `owned[p]=1` with an intact anchor and both answer "GPU has the
+// newer copy" for one page whose two FBOs disagree. Ownership must be exclusive: the reverse index
+// is the arbiter, a claim steals the page from the previous owner, and a surface that lost a page
+// falls back to guest VRAM (an upload), which is the fail-closed direction.
+// Rollback: DC2_G718_NO_ARB=1.
+static bool g718ArbOn()
+{
+    static const bool on = envFlagEnabled("DC2_G718_ARB") && !envFlagEnabled("DC2_G718_NO_ARB");
+    return on;
+}
+static std::atomic<uint64_t> g_g718Steals{0}, g_g718ArbRejects{0};
+
+// ⭐ G718 TRANSIENT ORDERING PROBES — both DEFAULT OFF, both diagnostics for the one surviving
+// whole-frame defect (dungeon1 sf1892: 226 px, bottom two rows, |d|<=30, present in every
+// transient-takeover configuration measured so far and absent from every colour-only one).
+//   TRNPUB: under takeover, still run the legacy `g261PrepareCpuReplay()` the takeover deletes,
+//           restoring the sibling-publication ORDER the four hardcoded contracts imposed.
+//   TRNRB:  under takeover, publish the surface's whole covered span immediately after the render,
+//           which is what the per-flush readback used to do. If this closes the defect, the defect
+//           is the publication FOOTPRINT, not authority; if it does not, publication is exonerated.
+static bool g718TrnPubOn()
+{
+    static const bool on = envFlagEnabled("DC2_G718_TRNPUB");
+    return on;
+}
+static bool g718TrnRbOn()
+{
+    static const bool on = envFlagEnabled("DC2_G718_TRNRB");
+    return on;
+}
+static std::atomic<uint64_t> g_g718TrnPubs{0}, g_g718TrnRbs{0}, g_g718TrnRbRows{0};
+
+// The four hardcoded transient FRAME bases the takeover replaces. Used by the TRNRB probe, which
+// runs at the render site where `g700TrnTakeover` itself is out of scope. The predicates come from
+// rasterizer_command_graph.inc, included well before this file in ps2_gs_rasterizer.cpp.
+static bool g718IsTakeoverFbp(uint32_t fbp)
+{
+    return g286TransientTarget(fbp) || g570Transient13dTarget(fbp) ||
+           g586Transient141Target(fbp) || g587Transient15dTarget(fbp);
+}
+
+// ⭐⭐⭐ G718 LATE PREPARE — publish only for readers that did NOT get a GPU source. See the block
+// above `g718PrepareUnbound` near the end of this file for the full argument.
+static bool g718LatePrepOn()
+{
+    static const bool on =
+        envFlagEnabled("DC2_G718_LATEPREP") && !envFlagEnabled("DC2_G718_NO_LATEPREP");
+    return on;
+}
+
+// Census for the consumer edge, so a publication's CAUSE can be told from its COST. Only ever
+// reached under DC2_G700_STAT=1 (the caller tests it), so the shipped path pays nothing.
+static std::atomic<uint64_t> g_g718PrepUnknown{0}, g_g718PrepTex{0}, g_g718PrepClut{0},
+    g_g718PrepRows{0}, g_g718PrepDebtRows{0}, g_g718Preps{0};
+static std::atomic<uint32_t> g_g718PrepSampleTbp{0}, g_g718PrepSampleTbw{0},
+    g_g718PrepSamplePsm{0}, g_g718PrepSampleFbp{0}, g_g718PrepSampleFbw{0};
+
+static void g718NotePrepare(bool unknown, bool texHit, uint32_t rows, uint32_t debtRows,
+                            const G144Entry &e, uint32_t sfbp, uint32_t sfbw)
+{
+    g_g718Preps.fetch_add(1u, std::memory_order_relaxed);
+    if (unknown)
+        g_g718PrepUnknown.fetch_add(1u, std::memory_order_relaxed);
+    else if (texHit)
+        g_g718PrepTex.fetch_add(1u, std::memory_order_relaxed);
+    else
+        g_g718PrepClut.fetch_add(1u, std::memory_order_relaxed);
+    g_g718PrepRows.fetch_add(rows, std::memory_order_relaxed);
+    g_g718PrepDebtRows.fetch_add(debtRows, std::memory_order_relaxed);
+    // One sampled offender, refreshed cheaply: which texture is reading which surface.
+    g_g718PrepSampleTbp.store(e.ctx.tex0.tbp0, std::memory_order_relaxed);
+    g_g718PrepSampleTbw.store(e.ctx.tex0.tbw, std::memory_order_relaxed);
+    g_g718PrepSamplePsm.store(e.ctx.tex0.psm, std::memory_order_relaxed);
+    g_g718PrepSampleFbp.store(sfbp, std::memory_order_relaxed);
+    g_g718PrepSampleFbw.store(sfbw, std::memory_order_relaxed);
+}
+
 // ---------------------------------------------------------------------------------------------
 // The surface object
 // ---------------------------------------------------------------------------------------------
@@ -168,6 +299,17 @@ struct G700Surface
 
     uint64_t lastUse = 0u;
     uint64_t renders = 0u;
+
+    // ⭐ G718: per-PAGE-ROW block ranges, computed once per reset. A publication triggered by a
+    // reader only has to surrender the rows that reader actually touches — the shipped code
+    // published `dirtyLo..dirtyHi` (the whole surface) for a texture that reads 64 of 416 rows,
+    // which is why `matRows/mat` measured 306 on `dungeon1` with `mats == renders`.
+    // 512 rows / (1 << pageHShift) => 16 entries for CT32/CT24, 8 for CT16.
+    static constexpr uint32_t kMaxPageRows = kG700FbH >> 5;
+    uint32_t pageRowCount = 0u;
+    uint32_t pageRowFirst[kMaxPageRows]{};
+    uint32_t pageRowLast[kMaxPageRows]{};
+    uint8_t pageRowValid[kMaxPageRows]{};
 };
 
 static G700Surface g_g700Surf[kG700Slots];
@@ -285,7 +427,53 @@ static void g700Reset(int slot, uint32_t fbw, uint32_t psm)
     s.depthLive = false;
     s.depthLo = kG700FbH;
     s.depthHi = -1;
+    // G718: tabulate this geometry's page-row block ranges once, so a reader-triggered publication
+    // can be scoped to the rows the reader overlaps instead of the whole outstanding debt.
+    const uint32_t rowsPerPageRow = 1u << s.pageHShift;
+    s.pageRowCount = std::min<uint32_t>(G700Surface::kMaxPageRows,
+                                        static_cast<uint32_t>(kG700FbH) >> s.pageHShift);
+    for (uint32_t pr = 0; pr < s.pageRowCount; ++pr)
+    {
+        const G144BlockRange r =
+            g144RangeForRect(framePageBaseToBlock(s.fbp), static_cast<uint8_t>(s.psm), s.fbw, 0u,
+                             pr * rowsPerPageRow, static_cast<uint32_t>(s.fbW), rowsPerPageRow);
+        s.pageRowValid[pr] = r.valid ? 1u : 0u;
+        s.pageRowFirst[pr] = r.first;
+        s.pageRowLast[pr] = r.last;
+    }
     g_g700Resets.fetch_add(1u, std::memory_order_relaxed);
+}
+
+// ⭐ G718: the row window of `s` that a reader of `a` (and optionally `b`) actually observes.
+// Returns false when nothing overlaps. An invalid/unknown range fails closed to the whole debt,
+// exactly as the shipped code did unconditionally.
+static bool g700OverlapRows(const G700Surface &s, const G144BlockRange &a, const G144BlockRange &b,
+                            bool unknown, int &outLo, int &outHi)
+{
+    outLo = s.dirtyLo;
+    outHi = s.dirtyHi;
+    if (unknown || s.pageRowCount == 0u)
+        return true;
+    const uint32_t rowsPerPageRow = 1u << s.pageHShift;
+    int lo = kG700FbH, hi = -1;
+    for (uint32_t pr = 0; pr < s.pageRowCount; ++pr)
+    {
+        if (!s.pageRowValid[pr])
+            return true; // this geometry cannot be reasoned about; keep the shipped behaviour
+        const uint32_t f = s.pageRowFirst[pr], l = s.pageRowLast[pr];
+        const bool hit = (a.valid && a.first <= l && f <= a.last) ||
+                         (b.valid && b.first <= l && f <= b.last);
+        if (!hit)
+            continue;
+        lo = std::min<int>(lo, static_cast<int>(pr * rowsPerPageRow));
+        hi = std::max<int>(hi, static_cast<int>((pr + 1u) * rowsPerPageRow) - 1);
+    }
+    if (hi < lo)
+        return false;
+    // Never publish rows the surface does not owe.
+    outLo = std::max(lo, s.dirtyLo);
+    outHi = std::min(hi, s.dirtyHi);
+    return outHi >= outLo;
 }
 
 // Acquire (or create) the persistent surface for this target. Returns -1 when the geometry is
@@ -366,6 +554,14 @@ static inline bool g700PageIsGpu(G700Surface &s, int slot, uint32_t p)
     if (p >= s.pageCount || !s.owned[p])
         return false;
     const uint32_t vp = (s.basePage + p) & (kG700VramPages - 1u);
+    // I6 (G718): ownership is EXCLUSIVE. An overlapping surface that claimed this page later is the
+    // owner; this one holds a stale claim over bytes another FBO now defines.
+    if (g718ArbOn() && g_g700PageOwner[vp] != static_cast<uint8_t>(slot + 1))
+    {
+        s.owned[p] = 0u;
+        g_g718ArbRejects.fetch_add(1u, std::memory_order_relaxed);
+        return false;
+    }
     if (g_g178PageGen[vp].load(std::memory_order_relaxed) != s.anchor[p])
     {
         // A guest write landed on a claimed page. Guest VRAM is now the newer copy for it; drop
@@ -418,6 +614,22 @@ static void g700NoteRender(int slot, int rowLo, int rowHi)
             if (p >= s.pageCount)
                 continue;
             const uint32_t vp = (s.basePage + p) & (kG700VramPages - 1u);
+            // I6 (G718): claiming a page STEALS it. Drop the previous owner's claim explicitly
+            // rather than leaving two surfaces both believing their FBO defines these bytes.
+            if (g718ArbOn())
+            {
+                const uint8_t prev = g_g700PageOwner[vp];
+                if (prev != 0u && prev != static_cast<uint8_t>(slot + 1))
+                {
+                    G700Surface &o = g_g700Surf[prev - 1u];
+                    const uint32_t op = (vp - o.basePage) & (kG700VramPages - 1u);
+                    if (op < o.pageCount && o.owned[op])
+                    {
+                        o.owned[op] = 0u;
+                        g_g718Steals.fetch_add(1u, std::memory_order_relaxed);
+                    }
+                }
+            }
             s.owned[p] = 1u;
             s.anchor[p] = g_g178PageGen[vp].load(std::memory_order_relaxed);
             g_g700PageOwner[vp] = static_cast<uint8_t>(slot + 1);
@@ -430,22 +642,6 @@ static void g700NoteRender(int slot, int rowLo, int rowHi)
     ++s.renders;
     g_g700Renders.fetch_add(1u, std::memory_order_relaxed);
     g700RecomputeDebtBounds();
-}
-
-// The FBO was just refreshed from guest VRAM over rows [rowLo, rowHi]: for those rows the two
-// copies agree, so the surface may claim them without owing a publication.
-static void g700NoteUpload(int slot, int rowLo, int rowHi)
-{
-    if (slot < 0 || rowHi < rowLo)
-        return;
-    G700Surface &s = g_g700Surf[slot];
-    const int dLo = s.dirtyLo, dHi = s.dirtyHi;
-    g700NoteRender(slot, rowLo, rowHi);
-    // An upload is not a debt: restore the pre-call dirty span, widened only where the surface
-    // already owed a publication.
-    s.dirtyLo = dLo;
-    s.dirtyHi = dHi;
-    g_g700Uploads.fetch_add(1u, std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -515,6 +711,19 @@ static bool g700Materialize(int slot, int rowLo, int rowHi, int cause)
     return true;
 }
 
+// ⭐ G718: does ANY persistent surface exist? The flush's bind pre-pass — which owns every
+// FBO-source decision, including `g700DirectSampleSrc` and the G310 atlas refresh — was gated on
+// `g261AnyDirty()`, i.e. on the fourteen-address legacy table alone. One cached bool when unarmed.
+static bool g700AnyLive()
+{
+    if (!g700On())
+        return false;
+    for (uint32_t i = 0; i < kG700Slots; ++i)
+        if (g_g700Surf[i].live)
+            return true;
+    return false;
+}
+
 static bool g700AnyDirty()
 {
     if (!g700On())
@@ -557,7 +766,14 @@ static void g700MaterializeForRanges(const G144BlockRange &src, const G144BlockR
         const G144BlockRange r = g700DirtyRange(s);
         if (!r.valid || (src.valid && g144RangeOverlaps(r, src)) ||
             (dst.valid && g144RangeOverlaps(r, dst)))
-            (void)g700Materialize(static_cast<int>(i), s.dirtyLo, s.dirtyHi, cause);
+        {
+            // ⭐ G718: surrender only the rows the transfer observes. `!r.valid` still fails closed.
+            int lo = s.dirtyLo, hi = s.dirtyHi;
+            if (g718RowScopeOn() && r.valid &&
+                !g700OverlapRows(s, src, dst, false, lo, hi))
+                continue; // the debt and the transfer share pages but not page-rows
+            (void)g700Materialize(static_cast<int>(i), lo, hi, cause);
+        }
     }
 }
 
@@ -603,8 +819,177 @@ static inline bool g700DebtTouches(const G144BlockRange &r)
 // bytes another surface is still holding on the GPU.
 static void g700PrepareForBatch(const std::vector<G144Entry> &entries)
 {
+    // ⭐ G718: under the late-prepare arm this pass is replaced wholesale by `g718PrepareUnbound`,
+    // which runs after the bind pre-pass and therefore knows which readers already have a GPU
+    // source. Publishing here — before any bind decision exists — is what made `mats == renders`.
+    if (g718LatePrepOn())
+        return;
     if (!g700On() || g_g700DebtLo > g_g700DebtHi || entries.empty())
         return;
+    // ==========================================================================================
+    // ⭐⭐⭐ G735 — THE AGGREGATE CONSUMER GATE, AND THE PER-BATCH MEMO
+    // ==========================================================================================
+    //
+    // MEASURED ON THE SHIPPED BINARY (`DC2_G720_PROFILE`, a 1/32-sampled production timer),
+    // `dungeon1`, 44.4 flushes/frame, 278 entries/flush:
+    //
+    //     submit 4.959   residb 2.061   deps 1.818   verts 1.251   fbz 1.000   preflight 0.748 …
+    //
+    // `residb` is the second-largest stage of the whole flush and the largest one containing no
+    // draw. It is NOT the g261 publication scan — `g261PrepareCpuReplay` returns at its
+    // `!g261AnyDirty()` early-out — it is THIS FUNCTION, reached through it. The corrupting
+    // ceiling probe `DC2_G524_NO_TRNMAT=1`, which deletes that one call, takes `residb`
+    // **2.264 → 0.026 ms/f**, which is the attribution.
+    //
+    // And it publishes nothing: `[G261:stat] mat(cpu=0 inl=0 up=0 l2l=0 l2h=0 tex=0 rsync=0
+    // fail=0)` over 28,672 flushes. What the cost actually is: TWO full walks of the entry list
+    // (the G718 target-alias pass and the texture/CLUT pass below), each re-deriving a block range
+    // per entry, run TWICE per flush — once from the flush preflight and once from
+    // `g261PrepareCpuReplay` — i.e. ~1,100 range derivations per flush to prove a negative.
+    //
+    // Both walks are decided by one question: does anything this batch reads or writes intersect
+    // the union of unpublished surface debt? `g_g700DebtLo..g_g700DebtHi` IS that union, already
+    // maintained by `g700RecomputeDebtBounds`, and the batch's aggregate `wr`/`rd` sets already
+    // hold every entry's colour+depth and texture+CLUT ranges (accumulated on the PARSE thread by
+    // `g260NoteAppend`). `g735BatchCannotTouch` is the containment test and FAILS CLOSED on a
+    // poisoned, degenerate or unavailable aggregate — exactly the cases where the walks' own
+    // `!tgt.valid` / `!tex.valid` arms force a publication.
+    //
+    // The MEMO covers the second call. The two calls per flush see the same entries and, unless
+    // the first one published something, the same surface state — so the second can only reach the
+    // same decision. The key is (batch epoch, entry buffer) and the digest covers every field the
+    // two walks read, so a changed surface always re-runs the walk.
+    //
+    // ⛔ ROLLBACK: DC2_G735_NO_PUBGATE=1 (shared with the other G735 gates).
+    if (g735PubGateOn() && &entries == &g_g144List)
+    {
+        // ⛔⛔ MEASURED: THE GLOBAL DEBT UNION IS USELESS AS A GATE. The first form of this test
+        // used `{g_g700DebtLo, g_g700DebtHi}` — the min/max over every live surface — and
+        // `residb` moved 2.155 → 2.113 ms/f, i.e. **the gate never fired**. With dozens of live
+        // surfaces that union spans most of the addresses a batch touches, so a containment test
+        // against it can only ever say "maybe". The union is fine as the walks' own per-entry
+        // PRE-FILTER (it is one compare against a range already in a register); it is not a
+        // decision procedure. Test the surfaces INDIVIDUALLY instead: 48 slots, of which only the
+        // live-and-dirty ones are examined, against 278 entries × 2 walks × 2 calls.
+        //
+        // ⭐ Rule (G735-3): an aggregate gate must be tested against the SAME granularity the scan
+        // decides at. Gating a per-surface decision on the union of all surfaces is not a
+        // containment argument, it is a coarser question with a different answer.
+        uint64_t g735Digest = 0xcbf29ce484222325ull;
+        const auto mix = [&g735Digest](uint64_t v) {
+            g735Digest = (g735Digest ^ v) * 0x100000001b3ull;
+        };
+        mix(static_cast<uint64_t>(g_g700DebtLo) << 32 | g_g700DebtHi);
+        for (uint32_t i = 0; i < kG700Slots; ++i)
+        {
+            const G700Surface &s = g_g700Surf[i];
+            if (!s.live)
+                continue;
+            mix((static_cast<uint64_t>(i) << 56) ^ (static_cast<uint64_t>(s.fbp) << 40) ^
+                (static_cast<uint64_t>(s.fbw) << 32) ^
+                (static_cast<uint64_t>(static_cast<uint32_t>(s.dirtyLo)) << 16) ^
+                static_cast<uint64_t>(static_cast<uint32_t>(s.dirtyHi)));
+        }
+        static const void *s_g735PrepKey = nullptr;
+        static uint64_t s_g735PrepEpoch = ~0ull;
+        static uint64_t s_g735PrepDigest = 0u;
+        const uint64_t g735Epoch = g_g260BatchesExecuted;
+        if (s_g735PrepKey == static_cast<const void *>(entries.data()) &&
+            s_g735PrepEpoch == g735Epoch && s_g735PrepDigest == g735Digest)
+        {
+            g735NoteG700Memo();
+            return; // already walked this exact batch against this exact surface state
+        }
+        s_g735PrepKey = static_cast<const void *>(entries.data());
+        s_g735PrepEpoch = g735Epoch;
+        s_g735PrepDigest = g735Digest;
+    }
+    // ⭐⭐⭐ G718 — THE TARGET-ALIAS EDGE. This pass tested only what a batch READS AS A TEXTURE.
+    // It never tested what the batch WRITES: a flush uploads its framebuffer (and depth) out of
+    // guest VRAM for the rows it is about to render, and on this game those rows routinely ALIAS a
+    // persistent surface. On `s05` the two surfaces are `0x153` (fbw=1) and `0x13f` (fbw=2), and
+    // both sit INSIDE the page span of the 512-wide `0x139` work target — so a `0x139` batch's
+    // upload read pages the surfaces still owned. Symptom: `s05` sf 5896, **207,290 differing
+    // pixels**, a diffuse low-amplitude error over the whole scene (`max=36`, no 8x8 tile over 20).
+    // ⛔ The identical 207,290-pixel signature is recorded in `plans/phase-G717-ledger.md` for a
+    // COMPLETELY DIFFERENT GPU-authority mechanism — which is what says the hole is in the edge
+    // list, not in either mechanism.
+    // ==========================================================================================
+    // ⭐⭐⭐ G735 — SURFACE-LIST PRUNING (this is the lever; the whole-union gate above was not)
+    // ==========================================================================================
+    //
+    // Both walks below used to iterate ALL kG700Slots = 48 slots FOR EVERY ENTRY, re-testing
+    // `s.live`, `s.dirtyHi < s.dirtyLo` and re-deriving `g700DirtyRange(s)` each time. On
+    // `dungeon1` that is 278 entries × 48 = 13,344 inner iterations per walk, two walks per call,
+    // two calls per flush, 44.4 flushes/frame — 2.4 million inner iterations per frame, and
+    // `[G720:cpu] residb = 2.06–2.26 ms/f` is what they cost.
+    //
+    // The slot table is the OUTER loop's natural home, not the inner one: whether a surface is
+    // live and dirty does not depend on the entry. Build the candidate list ONCE, and prune it
+    // with the batch's aggregate range sets — a surface the whole batch provably cannot read or
+    // write can never be hit by any single entry of it (`g735BatchCannotTouch` fails closed on a
+    // null, poisoned or degenerate aggregate, which is exactly where the walks' own
+    // `!tgt.valid` / `!tex.valid` arms force a publication anyway).
+    //
+    // ⚠️ `g700Materialize` MUTATES `s.dirtyLo/Hi`, so the per-entry body still re-reads liveness
+    // and re-derives the range — the candidate list prunes WHICH slots are visited, it does not
+    // cache their state. That keeps the transformation exact under publication.
+    uint32_t g735Cand[kG700Slots];
+    uint32_t g735NCand = 0u;
+    {
+        const bool g735Prune = g735PubGateOn() && &entries == &g_g144List;
+        uint32_t g735Reason = 0u; // 1=poisoned aggregate 2=surface overlap 4=underivable range
+        uint32_t g735LiveDirty = 0u;
+        for (uint32_t i = 0; i < kG700Slots; ++i)
+        {
+            const G700Surface &s = g_g700Surf[i];
+            if (!s.live || s.dirtyHi < s.dirtyLo)
+                continue;
+            ++g735LiveDirty;
+            if (g735Prune)
+            {
+                const G144BlockRange r = g700DirtyRange(s);
+                if (!r.valid)
+                    g735Reason |= 4u;
+                else if (g735BatchCannotTouch(r))
+                    continue; // no entry of this batch can touch it — drop the slot
+                else
+                    g735Reason |= (g_g528Wr == nullptr || g_g528Rd == nullptr ||
+                                   g_g528Wr->unknown || g_g528Rd->unknown || g_g528Wr->degen)
+                                      ? 1u : 2u;
+            }
+            g735Cand[g735NCand++] = i;
+        }
+        g735NoteG700Gate(g735NCand == 0u, g735Reason, entries.size(), g735LiveDirty, g735NCand);
+        if (g735NCand == 0u)
+            return; // nothing this batch can reach is holding unpublished bytes
+    }
+    // Rollback: DC2_G718_NO_TGTPUB=1.
+    if (g718TargetPubOn())
+    {
+        for (const G144Entry &e : entries)
+        {
+            const G144BlockRange tgt = g144TargetRange(e);
+            if (tgt.valid && !g700DebtTouches(tgt))
+                continue;
+            for (uint32_t ci = 0; ci < g735NCand; ++ci)
+            {
+                const uint32_t i = g735Cand[ci];
+                G700Surface &s = g_g700Surf[i];
+                if (!s.live || s.dirtyHi < s.dirtyLo || s.fbp == e.ctx.frame.fbp)
+                    continue; // a surface never has to publish for its OWN batch
+                const G144BlockRange r = g700DirtyRange(s);
+                if (!tgt.valid || !r.valid || g144RangeOverlaps(r, tgt))
+                {
+                    g_g718TgtPubs.fetch_add(1u, std::memory_order_relaxed);
+                    (void)g700Materialize(static_cast<int>(i), s.dirtyLo, s.dirtyHi,
+                                          0 /* kG261MatCpuReplay */);
+                }
+            }
+            if (g_g700DebtLo > g_g700DebtHi)
+                return; // everything published
+        }
+    }
     for (const G144Entry &e : entries)
     {
         if (!e.prim.tme)
@@ -615,16 +1000,29 @@ static void g700PrepareForBatch(const std::vector<G144Entry> &entries)
         const bool unknown = !tex.valid;
         if (!unknown && !g700DebtTouches(tex) && !g700DebtTouches(clut))
             continue;
-        for (uint32_t i = 0; i < kG700Slots; ++i)
+        for (uint32_t ci = 0; ci < g735NCand; ++ci)
         {
+            const uint32_t i = g735Cand[ci];
             G700Surface &s = g_g700Surf[i];
             if (!s.live || s.dirtyHi < s.dirtyLo)
                 continue;
             const G144BlockRange r = g700DirtyRange(s);
             if (unknown || !r.valid || g144RangeOverlaps(r, tex) ||
                 (clut.valid && g144RangeOverlaps(r, clut)))
-                (void)g700Materialize(static_cast<int>(i), s.dirtyLo, s.dirtyHi,
-                                      0 /* kG261MatCpuReplay */);
+            {
+                // ⭐ G718: a reader that samples 64 rows of a 416-row surface must not force the
+                // whole surface back to guest VRAM. `unknown` and `!r.valid` still fail closed.
+                int lo = s.dirtyLo, hi = s.dirtyHi;
+                if (g718RowScopeOn() && !unknown && r.valid &&
+                    !g700OverlapRows(s, tex, clut, false, lo, hi))
+                    continue;
+                if (g700StatOn())
+                    g718NotePrepare(unknown, tex.valid && g144RangeOverlaps(r, tex),
+                                    static_cast<uint32_t>(hi - lo + 1),
+                                    static_cast<uint32_t>(s.dirtyHi - s.dirtyLo + 1), e, s.fbp,
+                                    s.fbw);
+                (void)g700Materialize(static_cast<int>(i), lo, hi, 0 /* kG261MatCpuReplay */);
+            }
         }
         if (g_g700DebtLo > g_g700DebtHi)
             return; // everything published
@@ -896,6 +1294,245 @@ static inline uint32_t g700DirectSampleSrc(const G144Entry &e, uint32_t dstFbp)
 }
 
 // ---------------------------------------------------------------------------------------------
+// ⭐⭐⭐ G718 — LATE PREPARE: publish only for readers that did NOT get a GPU source
+// ---------------------------------------------------------------------------------------------
+//
+// `g700PrepareForBatch` runs at the TOP of `g178TryFlushGpu`, before any bind decision exists, so
+// it publishes for EVERY entry whose texture or CLUT range touches a surface's debt — including
+// the entries the bind pre-pass is about to serve straight from that surface's FBO. That is the
+// whole of `[G700:cause] mats cpuReplay`, and it is why `mats == renders`.
+//
+// The late pass runs where `s_g261FboSrc[]` is final: an entry with an FBO source never reads
+// guest VRAM for its texture, so it owes no publication. Everything else is published exactly as
+// before, row-scoped. An empty `fboSrc` (the pre-pass did not run for this flush) means NO entry
+// got a source, so every one is treated as unbound — identical to the old behaviour.
+//
+// ⚠️ CLUTs are always published: a paletted texture reads its CLUT out of guest VRAM even when the
+// texels come from an FBO.
+//
+// Arm: DC2_G718_LATEPREP=1 (bring-up default OFF). Rollback once promoted: DC2_G718_NO_LATEPREP=1.
+// (`g718LatePrepOn` is declared with the other arming predicates at the top of this file, because
+// `g700PrepareForBatch` — defined above — has to consult it.)
+
+static std::atomic<uint64_t> g_g718LateEntries{0}, g_g718LateBound{0}, g_g718LatePublished{0};
+
+static void g718PrepareUnbound(const std::vector<G144Entry> &entries,
+                               const std::vector<uint32_t> &fboSrc)
+{
+    if (!g700On() || g_g700DebtLo > g_g700DebtHi || entries.empty())
+        return;
+    const bool haveSrc = fboSrc.size() == entries.size();
+    for (size_t i = 0; i < entries.size(); ++i)
+    {
+        const G144Entry &e = entries[i];
+        if (!e.prim.tme)
+            continue;
+        g_g718LateEntries.fetch_add(1u, std::memory_order_relaxed);
+        const bool bound = haveSrc && fboSrc[i] != 0u;
+        const G144BlockRange clut =
+            g144IsPalettedPsm(e.ctx.tex0.psm) ? g144ClutRange(e) : G144BlockRange{};
+        // A bound entry owes nothing for its TEXELS. Its CLUT is still a guest-VRAM read.
+        const G144BlockRange tex = bound ? G144BlockRange{} : g144TextureRange(e);
+        if (bound)
+            g_g718LateBound.fetch_add(1u, std::memory_order_relaxed);
+        const bool unknown = !bound && !tex.valid;
+        if (!unknown && !g700DebtTouches(tex) && !g700DebtTouches(clut))
+            continue;
+        for (uint32_t s = 0; s < kG700Slots; ++s)
+        {
+            G700Surface &surf = g_g700Surf[s];
+            if (!surf.live || surf.dirtyHi < surf.dirtyLo)
+                continue;
+            const G144BlockRange r = g700DirtyRange(surf);
+            if (!(unknown || !r.valid || (tex.valid && g144RangeOverlaps(r, tex)) ||
+                  (clut.valid && g144RangeOverlaps(r, clut))))
+                continue;
+            int lo = surf.dirtyLo, hi = surf.dirtyHi;
+            if (g718RowScopeOn() && !unknown && r.valid &&
+                !g700OverlapRows(surf, tex, clut, false, lo, hi))
+                continue;
+            g_g718LatePublished.fetch_add(1u, std::memory_order_relaxed);
+            (void)g700Materialize(static_cast<int>(s), lo, hi, 0 /* kG261MatCpuReplay */);
+        }
+        if (g_g700DebtLo > g_g700DebtHi)
+            return; // everything published
+    }
+}
+
+// ⛔⛔ THE HOLE THE LATE PASS OPENS, AND ITS CLOSURE.
+//
+// The shipped `g700PrepareForBatch` ran at the TOP of the flush, so guest VRAM was whole before
+// ANY of the flush's ~15 `return false` sites could hand the batch to the CPU band replay — and
+// that replay reads guest VRAM for every entry, including the ones the pre-pass bound to an FBO.
+// Moving the publication after the pre-pass removes that guarantee twice over: an EARLY rejection
+// (before the pre-pass) now publishes nothing at all, and a LATE one (`kG266FrTexAliasZ`,
+// `kG266FrSubmit`, `kG266FrZReadback`) published only for the unbound entries.
+//
+// Closed at the CALLER, which is the one place every rejection converges: when
+// `g178TryFlushGpu` returns false the batch is about to be rasterized on the CPU out of guest
+// VRAM, so every surface surrenders its whole debt first. Two call sites, both in
+// rasterizer_tilebin_capture.inc. Costs nothing on the success path and nothing when unarmed.
+static void g718PublishBeforeCpuReplay()
+{
+    if (!g700On() || !g718LatePrepOn())
+        return;
+    g700MaterializeAll(0 /* kG261MatCpuReplay */);
+}
+
+// ---------------------------------------------------------------------------------------------
+// ⭐⭐⭐ G718 — THE G310 LOGICAL ATLAS SOURCES FROM A PERSISTENT SURFACE
+// ---------------------------------------------------------------------------------------------
+//
+// THE DEFECT. `g310ApplyDesired` picks each of the atlas's 128 pages from one of two places: a
+// GPU blit out of a resident target's FBO (`kG261Fbp[t]`, the fourteen-address allowlist), or a
+// guest path that decodes 8 KiB out of VRAM and uploads it. A G700 surface is at neither, so every
+// page it owns took the guest path — and that is what obliged `g700PrepareForBatch` to publish the
+// whole surface on every flush that sampled it. `[G718:prep]` named the exact pair on `dungeon1`:
+// texture `tbp=0x2760 tbw=8 psm=CT24` reading surface `fbp=0x13b fbw=8`, 1,198 publications at 240
+// rows each, `saved=0.0%` — the reader covers the surface, so no row scoping can help. PCSX2
+// resolves that read to the target's own texture (`LookupSource` returning a target-backed source).
+//
+// EXACTNESS. A page is offered only when the surface still OWNS it with an intact generation
+// anchor, i.e. exactly when the FBO is the newer copy. The atlas grid and a CT32/CT24 surface share
+// the same 64x32 page geometry, so the blit is a page-for-page copy with no format conversion —
+// the identical operation the legacy `kG261Fbp[t]` loop already performs. Anything else (CT16's
+// 64x64 pages, a surface wider than the atlas, a disowned page) returns -1 and keeps the guest
+// path, which `g718PublishForAtlasGuestRun` now makes correct on demand.
+//
+// Rollback: DC2_G718_NO_ATLASGPU=1.
+
+// ⚠️ OPT-IN. On `dungeon1` this fires zero times (`[G718:atlas] gpuSrcPages=0`) — the readers bind
+// the surface directly instead of going through the atlas — so it is not part of the promoted
+// configuration and has never been exercised by a pixel gate. Retained because the population is
+// route-dependent and the mechanism is exact where it does fire.
+static bool g718AtlasGpuSourceOn()
+{
+    static const bool on =
+        envFlagEnabled("DC2_G718_ATLASGPU") && !envFlagEnabled("DC2_G718_NO_ATLASGPU");
+    return on;
+}
+
+static_assert(kG718AtlasSlots == kG700Slots,
+              "G718: the atlas's slot-count mirror must match the G700 surface table");
+
+static std::atomic<uint64_t> g_g718AtlasPages{0}, g_g718AtlasRejGeom{0}, g_g718AtlasRejOwn{0},
+    g_g718AtlasSyncs{0}, g_g718AtlasSyncRows{0};
+
+// Which G700 surface holds atlas page `pageBlock`, and where inside that surface it lives.
+// Returns the slot, or -1 to leave the page on the guest path.
+static int g718AtlasSourceForPage(uint32_t pageBlock, uint32_t *outRow, uint32_t *outCol,
+                                  uint64_t *outGen)
+{
+    if (!g700On() || !g718AtlasGpuSourceOn())
+        return -1;
+    const uint32_t vp = (pageBlock >> 5u) & (kG700VramPages - 1u);
+    const uint8_t owner = g_g700PageOwner[vp];
+    if (owner == 0u)
+        return -1;
+    const int slot = static_cast<int>(owner) - 1;
+    G700Surface &s = g_g700Surf[slot];
+    // The atlas grid is CT32 64x32 pages, at most 8 columns and 16 rows.
+    if (!s.live || s.widthPages == 0u || s.widthPages > 8u || s.pageHShift != 5u ||
+        (s.psm != GS_PSM_CT32 && s.psm != GS_PSM_CT24))
+    {
+        g_g718AtlasRejGeom.fetch_add(1u, std::memory_order_relaxed);
+        return -1;
+    }
+    const uint32_t p = (vp - s.basePage) & (kG700VramPages - 1u);
+    if (p >= s.pageCount || !g700PageIsGpu(s, slot, p))
+    {
+        g_g718AtlasRejOwn.fetch_add(1u, std::memory_order_relaxed);
+        return -1;
+    }
+    const uint32_t row = p / s.widthPages;
+    const uint32_t col = p % s.widthPages;
+    if (row >= 16u || col >= 8u)
+    {
+        g_g718AtlasRejGeom.fetch_add(1u, std::memory_order_relaxed);
+        return -1;
+    }
+    // The FBO must actually define the rows this page covers.
+    const int y0 = static_cast<int>(row) * 32;
+    if (s.covHi < s.covLo || y0 < s.covLo || y0 + 31 > s.covHi)
+    {
+        g_g718AtlasRejGeom.fetch_add(1u, std::memory_order_relaxed);
+        return -1;
+    }
+    if (outRow) *outRow = row;
+    if (outCol) *outCol = col;
+    // Content stamp: every successful batch, including its optional upload, calls
+    // g700NoteRender. An atlas page is re-copied whenever the surface can have changed.
+    if (outGen) *outGen = s.renders;
+    g_g718AtlasPages.fetch_add(1u, std::memory_order_relaxed);
+    return slot;
+}
+
+// Everything about the G700 surfaces that can change which page the atlas copies, or what that
+// page contains. Folded into `g589AtlasKeyNow()` so the drain-transaction memo cannot serve a
+// stale atlas across a batch that rendered into a sourced surface.
+static uint64_t g718AtlasStateKey()
+{
+    if (!g700On() || !g718AtlasGpuSourceOn())
+        return 0u;
+    uint64_t h = 0x9E3779B97F4A7C15ull;
+    for (uint32_t i = 0; i < kG700Slots; ++i)
+    {
+        const G700Surface &s = g_g700Surf[i];
+        if (!s.live)
+            continue;
+        const uint64_t v = (static_cast<uint64_t>(s.fbp) << 48) ^
+                           (static_cast<uint64_t>(static_cast<uint32_t>(s.covLo)) << 32) ^
+                           static_cast<uint64_t>(static_cast<uint32_t>(s.covHi));
+        h ^= v + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        h ^= s.renders + 0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+        h ^= (static_cast<uint64_t>(static_cast<uint32_t>(s.dirtyLo)) << 32 |
+              static_cast<uint64_t>(static_cast<uint32_t>(s.dirtyHi))) +
+             0x9E3779B97F4A7C15ull + (h << 6) + (h >> 2);
+    }
+    return h;
+}
+
+static uint32_t g718AtlasSourceFbp(int slot)
+{
+    if (slot < 0 || static_cast<uint32_t>(slot) >= kG700Slots || !g_g700Surf[slot].live)
+        return 0u;
+    return g_g700Surf[slot].fbp;
+}
+
+// The atlas is about to DECODE these pages out of guest VRAM. Any surface still holding them on
+// the GPU must publish first — scoped to the page-rows actually read. This is the backstop that
+// makes the guest fallback correct without a blanket publication at the top of the flush.
+static void g718PublishForAtlasGuestRun(uint32_t pageY, uint32_t pageX0, uint32_t pageCount)
+{
+    if (!g700On() || g_g700DebtLo > g_g700DebtHi)
+        return;
+    for (uint32_t k = 0; k < pageCount; ++k)
+    {
+        const uint32_t pageBlock = 0x2720u + ((pageY * 8u) + pageX0 + k) * 32u;
+        const uint32_t vp = (pageBlock >> 5u) & (kG700VramPages - 1u);
+        const uint8_t owner = g_g700PageOwner[vp];
+        if (owner == 0u)
+            continue;
+        const int slot = static_cast<int>(owner) - 1;
+        G700Surface &s = g_g700Surf[slot];
+        if (!s.live || s.dirtyHi < s.dirtyLo || s.widthPages == 0u)
+            continue;
+        const uint32_t p = (vp - s.basePage) & (kG700VramPages - 1u);
+        if (p >= s.pageCount)
+            continue;
+        const uint32_t row = p / s.widthPages;
+        const int lo = std::max(static_cast<int>(row) << s.pageHShift, s.dirtyLo);
+        const int hi = std::min((static_cast<int>(row + 1u) << s.pageHShift) - 1, s.dirtyHi);
+        if (hi < lo)
+            continue;
+        g_g718AtlasSyncs.fetch_add(1u, std::memory_order_relaxed);
+        g_g718AtlasSyncRows.fetch_add(static_cast<uint64_t>(hi - lo + 1),
+                                      std::memory_order_relaxed);
+        (void)g700Materialize(slot, lo, hi, 0 /* kG261MatCpuReplay */);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Census
 // ---------------------------------------------------------------------------------------------
 
@@ -924,6 +1561,19 @@ static void g700Report()
                  (unsigned long long)g_g700Disowns.load(std::memory_order_relaxed),
                  (unsigned long long)g_g700DepthKeeps.load(std::memory_order_relaxed),
                  (unsigned long long)g_g700DirectBinds.load(std::memory_order_relaxed));
+    // Exercise proof for the G718 ordering/arbitration arms. `arb=1 steals=0` is a REFUTATION of
+    // the aliasing hypothesis on this route; `arb=0` beside a verdict means the arm never ran.
+    std::fprintf(stderr,
+                 "[G718:arb] arb=%u steals=%llu rejects=%llu | trnpub=%u pubs=%llu | trnrb=%u "
+                 "rbs=%llu rbRows=%llu\n",
+                 g718ArbOn() ? 1u : 0u,
+                 (unsigned long long)g_g718Steals.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g718ArbRejects.load(std::memory_order_relaxed),
+                 g718TrnPubOn() ? 1u : 0u,
+                 (unsigned long long)g_g718TrnPubs.load(std::memory_order_relaxed),
+                 g718TrnRbOn() ? 1u : 0u,
+                 (unsigned long long)g_g718TrnRbs.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g718TrnRbRows.load(std::memory_order_relaxed));
     {
         static const char *const kCause[8] = {"cpuReplay", "inline", "upload", "local",
                                               "l2h",       "bound",  "resync", "fail"};
@@ -957,6 +1607,54 @@ static void g700Report()
                                      (unsigned long long)v);
         }
         std::fprintf(stderr, "%s\n", buf);
+    }
+    // ⭐ G718: the consumer edge, priced. `rows` vs `debtRows` is exactly what row scoping saves;
+    // `tex`/`clut`/`unknown` says WHY a reader forced a publication, and the sample names the
+    // texture that did it so an RT-as-texture bind can be aimed at a real address.
+    {
+        const uint64_t preps = g_g718Preps.load(std::memory_order_relaxed);
+        const uint64_t rows = g_g718PrepRows.load(std::memory_order_relaxed);
+        const uint64_t debt = g_g718PrepDebtRows.load(std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "[G718:prep] preps=%llu tex=%llu clut=%llu unknown=%llu | rows=%llu "
+                     "debtRows=%llu saved=%.1f%% | sample tex(tbp=0x%x tbw=%u psm=%u) "
+                     "surf(fbp=0x%x fbw=%u) rowscope=%u\n",
+                     (unsigned long long)preps,
+                     (unsigned long long)g_g718PrepTex.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g718PrepClut.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g718PrepUnknown.load(std::memory_order_relaxed),
+                     (unsigned long long)rows, (unsigned long long)debt,
+                     debt ? 100.0 * (double)(debt - rows) / (double)debt : 0.0,
+                     g_g718PrepSampleTbp.load(std::memory_order_relaxed),
+                     g_g718PrepSampleTbw.load(std::memory_order_relaxed),
+                     g_g718PrepSamplePsm.load(std::memory_order_relaxed),
+                     g_g718PrepSampleFbp.load(std::memory_order_relaxed),
+                     g_g718PrepSampleFbw.load(std::memory_order_relaxed),
+                     g718RowScopeOn() ? 1u : 0u);
+        std::fprintf(stderr,
+                     "[G718:atlas] gpuSrcPages=%llu copies=%llu copiedPages=%llu | rejGeom=%llu "
+                     "rejOwn=%llu | guestSyncs=%llu guestSyncRows=%llu armed=%u\n",
+                     (unsigned long long)g_g718AtlasPages.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g718AtlasCopies.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g718AtlasCopiedPages.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g718AtlasRejGeom.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g718AtlasRejOwn.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g718AtlasSyncs.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g718AtlasSyncRows.load(std::memory_order_relaxed),
+                     g718AtlasGpuSourceOn() ? 1u : 0u);
+        std::fprintf(stderr,
+                     "[G718:late] armed=%u entries=%llu bound=%llu (%.1f%%) published=%llu\n",
+                     g718LatePrepOn() ? 1u : 0u,
+                     (unsigned long long)g_g718LateEntries.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g718LateBound.load(std::memory_order_relaxed),
+                     g_g718LateEntries.load(std::memory_order_relaxed)
+                         ? 100.0 *
+                               (double)g_g718LateBound.load(std::memory_order_relaxed) /
+                               (double)g_g718LateEntries.load(std::memory_order_relaxed)
+                         : 0.0,
+                     (unsigned long long)g_g718LatePublished.load(std::memory_order_relaxed));
+        std::fprintf(stderr, "[G718:tgtpub] armed=%u pubs=%llu\n", g718TargetPubOn() ? 1u : 0u,
+                     (unsigned long long)g_g718TgtPubs.load(std::memory_order_relaxed));
     }
     for (uint32_t i = 0; i < kG700Slots; ++i)
     {

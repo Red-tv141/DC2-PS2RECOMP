@@ -221,8 +221,31 @@ static inline bool g623HaveSurfaces()
 
 // The consumer's base -> surface lookup. Keyed on the texture BASE BLOCK, not on the fbp, because
 // that is what the consumer names.
+//
+// ⭐ G736: WAS A FULL LINEAR WALK OF THE MAP, ON EVERY TEXTURED ENTRY OF EVERY FLUSH.
+//
+// `g623Decide` calls this before any of its cheap entry-local conjuncts (`alreadyBound`, PSM,
+// `fst`, prim type, tex dims), so it ran ~350 times per flush x ~47 flushes/frame. What it walked
+// is `std::unordered_map<uint32_t, G623Surface>` — MSVC implements that as a LINKED LIST of nodes,
+// and `G623Surface` is **1,096 bytes** (`uint64_t gen[128]`), so every probe was one pointer chase
+// into a fresh cache line per surface. And `g_g623Surf` is **never erased or cleared** (the only
+// writes are `operator[]` in `g623NotePublished`), so the walk grows monotonically with the number
+// of distinct transient fbps the route has ever published: the cost per entry rises over the run.
+//
+// ⭐ IT NEVER NEEDED A WALK. `fbBlock` is `framePageBaseToBlock(fbp)` = `fbp << 5`
+// (`ps2_gs_common.h:42`) — INJECTIVE — and that is the only value any caller passes
+// (`rasterizer_vram_materialization.inc:1436` is the sole definition of `fbBlock`, and :7382 the
+// sole call). So at most ONE entry in the map can carry a given base, the map is already keyed by
+// `fbp`, and the base names its own key: `fbp == tbp0 >> 5`.
+//
+// Exact, not merely equivalent: the surviving `s.fbBlock == tbp0 && s.fbw == tbw && s.valid` test
+// is the identical predicate the walk applied, so a hit is the same surface the walk would have
+// returned and a miss is the same miss. A `tbp0` that is not 32-block aligned cannot be any fbp's
+// base at all, which the walk discovered by failing every comparison and this discovers in one.
 static const G623Surface *g623SurfaceForBase(uint32_t tbp0, uint32_t tbw)
 {
+#if defined(PS2X_G736_LEGACY)
+    // Gate A arm / rollback: the pre-G736 full walk, verbatim.
     for (const auto &kv : g_g623Surf)
     {
         const G623Surface &s = kv.second;
@@ -230,6 +253,56 @@ static const G623Surface *g623SurfaceForBase(uint32_t tbp0, uint32_t tbw)
             return &s;
     }
     return nullptr;
+#else
+    if ((tbp0 & 31u) != 0u)
+        return nullptr; // no fbp << 5 can land here
+    const auto it = g_g623Surf.find(tbp0 >> 5u);
+    if (it == g_g623Surf.end())
+        return nullptr;
+    const G623Surface &s = it->second;
+    return (s.valid && s.fbBlock == tbp0 && s.fbw == tbw) ? &s : nullptr;
+#endif
+}
+
+// ⭐ G736 ORACLE (`DC2_G736_G623_VERIFY=1`, default OFF). Runs BOTH forms on every call and counts
+// a disagreement. The argument for exactness is the injectivity of `fbp << 5`, so what this checks
+// is the premise, not the arithmetic: if any caller ever stamps a surface whose `fbBlock` is not
+// `fbp << 5`, `bad` becomes non-zero instead of the lookup silently missing.
+//
+// ⚠️ The arm is a NAMESPACE-SCOPE `const bool`, not a function-local `static const bool`: the
+// latter compiles to an `_Init_thread_epoch` TLS compare on every call, which is precisely the
+// per-entry cost G704 removed from this same pre-pass. The default path is one load and one
+// perfectly-predicted branch, identical in both gate arms.
+static std::atomic<uint64_t> g_g736G623Checks{0}, g_g736G623Bad{0}, g_g736G623Walk{0};
+static const bool s_g736G623Verify = envFlagEnabled("DC2_G736_G623_VERIFY");
+static void g736G623VerifySlow(uint32_t tbp0, uint32_t tbw, const G623Surface *got)
+{
+    const G623Surface *want = nullptr;
+    uint64_t walked = 0u;
+    for (const auto &kv : g_g623Surf)
+    {
+        ++walked;
+        const G623Surface &s = kv.second;
+        if (s.valid && s.fbBlock == tbp0 && s.fbw == tbw) { want = &s; break; }
+    }
+    g_g736G623Walk.fetch_add(walked, std::memory_order_relaxed);
+    const uint64_t n = g_g736G623Checks.fetch_add(1u, std::memory_order_relaxed) + 1u;
+    if (want != got)
+    {
+        const uint64_t bad = g_g736G623Bad.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (bad <= 16u)
+            std::fprintf(stderr, "[G736:g623-BAD] n=%llu tbp=0x%x tbw=%u want=%p got=%p\n",
+                         (unsigned long long)bad, tbp0, tbw, (const void *)want,
+                         (const void *)got);
+    }
+    if ((n % 2000000u) == 0u)
+        std::fprintf(stderr,
+                     "[G736:g623] checks=%llu bad=%llu surfaces=%zu walkedPerCall=%.2f\n",
+                     (unsigned long long)n,
+                     (unsigned long long)g_g736G623Bad.load(std::memory_order_relaxed),
+                     g_g623Surf.size(),
+                     static_cast<double>(g_g736G623Walk.load(std::memory_order_relaxed)) /
+                         static_cast<double>(n));
 }
 
 // Consumed by the DRAW pass, which must push UVs against the PRODUCER's fbW x 512 space.
@@ -454,6 +527,8 @@ static uint32_t g623Decide(uint32_t dstFbp, const G144Entry &e, const G178EntryS
     if (!g623Tracked() || !e.prim.tme || st.skip || st.texKey == 0u)
         return 0u;
     const G623Surface *sp = g623SurfaceForBase(e.ctx.tex0.tbp0, e.ctx.tex0.tbw);
+    if (s_g736G623Verify)
+        g736G623VerifySlow(e.ctx.tex0.tbp0, e.ctx.tex0.tbw, sp);
     // THE DENOMINATOR IS THE POPULATION, not every entry the pre-pass walks (G618: divide a census
     // by the work VISITED *in the population*). An entry whose base is not a produced surface's
     // base is not a round trip this lever could ever delete, so it is not counted at all — folding

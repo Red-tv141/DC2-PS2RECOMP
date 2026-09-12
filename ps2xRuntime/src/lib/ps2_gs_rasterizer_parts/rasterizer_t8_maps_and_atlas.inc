@@ -512,6 +512,7 @@ static void g309VerifyAgainstLegacy(const std::vector<uint32_t> &composite)
 struct G310DesiredPage
 {
     int8_t sourceTi = -1;
+    int8_t sourceSlot = -1; // G718: G700 persistent-surface slot, when sourceTi is -1
     uint8_t sourceRow = 0u;
     uint8_t sourceCol = 0u;
     uint64_t sourceGen = 0u;
@@ -729,6 +730,27 @@ static bool g310BuildDesired(std::array<G310DesiredPage, 128> &desired,
                 }
             }
         }
+        // ⭐⭐⭐ G718: pages the legacy allowlist did NOT claim may still be held on the GPU by a
+        // G700 persistent surface. Offer those from the surface's own FBO instead of decoding them
+        // out of guest VRAM. Runs after the legacy walk and only over unclaimed pages, so with
+        // G700 unarmed (or DC2_G718_NO_ATLASGPU=1) every page takes exactly the branch it did
+        // before and `desired` is bit-identical.
+        for (size_t page = 0u; page < desired.size(); ++page)
+        {
+            if (claimed[page] != 0u || desired[page].sourceTi >= 0)
+                continue;
+            const uint32_t pageBlock = 0x2720u + static_cast<uint32_t>(page) * 32u;
+            uint32_t row = 0u, col = 0u;
+            uint64_t gen = 0u;
+            const int slot = g718AtlasSourceForPage(pageBlock, &row, &col, &gen);
+            if (slot < 0)
+                continue;
+            G310DesiredPage &d = desired[page];
+            d.sourceSlot = static_cast<int8_t>(slot);
+            d.sourceRow = static_cast<uint8_t>(row);
+            d.sourceCol = static_cast<uint8_t>(col);
+            d.sourceGen = gen;
+        }
         if (g310StatOn())
             for (const G310DesiredPage &d : desired)
                 g_g310SourcePages[
@@ -765,11 +787,18 @@ static bool g310BuildDesired(std::array<G310DesiredPage, 128> &desired,
         }
         uint64_t bad = 0u;
         for (size_t page = 0u; page < ref.size(); ++page)
+        {
+            // G718: a page sourced from a G700 surface has no legacy counterpart to compare
+            // against — the reference walk only knows `kG261Fbp`. Its own exactness is the
+            // ownership token, not this oracle.
+            if (desired[page].sourceSlot >= 0)
+                continue;
             if (desired[page].sourceTi != ref[page].sourceTi ||
                 desired[page].sourceRow != ref[page].sourceRow ||
                 desired[page].sourceCol != ref[page].sourceCol ||
                 desired[page].sourceGen != ref[page].sourceGen)
                 ++bad;
+        }
         g_g594WalkChecks.fetch_add(ref.size(), std::memory_order_relaxed);
         if (bad != 0u)
         {
@@ -856,9 +885,9 @@ static uint32_t g311DeltaCount(const std::array<G310PageState, 128> &next,
         const G310PageState &n = next[p];
         const G310PageState &o = prev[p];
         const bool same =
-            n.sourceTi == o.sourceTi &&
-            (n.sourceTi >= 0 ? n.sourceGen == o.sourceGen
-                             : n.guestHash == o.guestHash);
+            n.sourceTi == o.sourceTi && n.sourceSlot == o.sourceSlot &&
+            ((n.sourceTi >= 0 || n.sourceSlot >= 0) ? n.sourceGen == o.sourceGen
+                                                    : n.guestHash == o.guestHash);
         if (!same)
             ++changed;
     }
@@ -900,11 +929,14 @@ static bool g310ApplyDesired(
         const G310PageState &old = g_g310Pages[page];
         G310PageState state{};
         state.sourceTi = d.sourceTi;
-        if (d.sourceTi >= 0)
+        state.sourceSlot = d.sourceSlot;
+        if (d.sourceTi >= 0 || d.sourceSlot >= 0)
         {
             state.sourceGen = d.sourceGen;
-            gpuWrite[page] =
-                old.sourceTi != d.sourceTi || old.sourceGen != d.sourceGen;
+            // G718: a page whose SOURCE KIND changed must always be re-copied, even when the two
+            // generations happen to coincide — they are numbers from different counters.
+            gpuWrite[page] = old.sourceTi != d.sourceTi || old.sourceSlot != d.sourceSlot ||
+                             old.sourceGen != d.sourceGen;
             if (!gpuWrite[page])
                 ++noops;
         }
@@ -914,13 +946,19 @@ static bool g310ApplyDesired(
                 0x2720u + static_cast<uint32_t>(page) * 32u;
             const uint64_t guestGen =
                 g_g178PageGen[pageBlock >> 5u].load(std::memory_order_relaxed);
-            if (old.sourceTi < 0 && old.guestGen == guestGen)
+            if (old.sourceTi < 0 && old.sourceSlot < 0 && old.guestGen == guestGen)
             {
                 state = old;
                 ++noops;
                 next[page] = state;
                 continue;
             }
+            // ⭐ G718: this page falls to the guest path and `g310GuestPageMeta` is about to HASH
+            // its VRAM bytes. Any G700 surface still holding it on the GPU must publish first —
+            // scoped to that page's rows. Without this the hash (and the upload below) would read
+            // bytes the surface has not surrendered.
+            g718PublishForAtlasGuestRun(static_cast<uint32_t>(page) / 8u,
+                                        static_cast<uint32_t>(page) % 8u, 1u);
             if (!g310GuestPageMeta(page, state.guestGen, state.guestHash))
             {
                 g_g310FailMissing.fetch_add(1u, std::memory_order_relaxed);
@@ -928,12 +966,12 @@ static bool g310ApplyDesired(
                 return false;
             }
             const bool sameGuest =
-                old.sourceTi < 0 && old.guestHash == state.guestHash;
+                old.sourceTi < 0 && old.sourceSlot < 0 && old.guestHash == state.guestHash;
             guestWrite[page] = !sameGuest;
             if (sameGuest)
                 ++noops;
         }
-        if (old.sourceTi != state.sourceTi)
+        if (old.sourceTi != state.sourceTi || old.sourceSlot != state.sourceSlot)
             ++moves;
         next[page] = state;
     }
@@ -957,6 +995,11 @@ static bool g310ApplyDesired(
             const int x = static_cast<int>(runLo * 64u);
             const int y = static_cast<int>(512u - (py + 1u) * 32u);
             const int width = static_cast<int>(pages * 64u);
+            // G718: same contract as the per-page hash above — surrender any GPU-held rows in
+            // this run before decoding it out of guest VRAM. Normally already a no-op, because the
+            // hash pass published them; kept so the decode's correctness does not depend on the
+            // hash pass having visited the same pages.
+            g718PublishForAtlasGuestRun(py, runLo, pages);
             if (!g310DecodeGuestRun(py, runLo, pages, s_guestPixels))
             {
                 g310Invalidate("guest-upload", true);
@@ -1025,6 +1068,65 @@ static bool g310ApplyDesired(
         }
         g_g310GpuJobs.fetch_add(1u, std::memory_order_relaxed);
         g_g310GpuPages.fetch_add(copiedPages, std::memory_order_relaxed);
+    }
+    // ⭐⭐⭐ G718: the same page blit, sourced from a G700 PERSISTENT SURFACE's FBO. Structurally
+    // identical to the legacy loop above — only the source key differs — so the atlas gains
+    // addresses outside `kG261Fbp` without any new backend operation. With G700 unarmed no page
+    // ever carries a `sourceSlot`, `gpuWrite` is false for all of them, and this loop is 48
+    // predicted-not-taken compares per refresh (~8.5 refreshes/frame).
+    for (uint32_t slot = 0u; slot < kG718AtlasSlots; ++slot)
+    {
+        static std::vector<int32_t> s_g718Rects;
+        s_g718Rects.clear();
+        uint64_t copiedPages = 0u;
+        for (uint32_t py = 0u; py < 16u; ++py)
+        {
+            uint32_t px = 0u;
+            while (px < 8u)
+            {
+                const size_t index = static_cast<size_t>(py) * 8u + px;
+                if (!gpuWrite[index] ||
+                    desired[index].sourceSlot != static_cast<int8_t>(slot))
+                {
+                    ++px;
+                    continue;
+                }
+                const uint32_t runLo = px;
+                const uint32_t srcRow = desired[index].sourceRow;
+                const uint32_t srcCol = desired[index].sourceCol;
+                ++px;
+                while (px < 8u)
+                {
+                    const size_t nextIndex = static_cast<size_t>(py) * 8u + px;
+                    const G310DesiredPage &n = desired[nextIndex];
+                    if (!gpuWrite[nextIndex] ||
+                        n.sourceSlot != static_cast<int8_t>(slot) || n.sourceRow != srcRow ||
+                        n.sourceCol != srcCol + (px - runLo))
+                        break;
+                    ++px;
+                }
+                const uint32_t pages = px - runLo;
+                s_g718Rects.push_back(static_cast<int32_t>(srcCol * 64u));
+                s_g718Rects.push_back(static_cast<int32_t>(512u - (srcRow + 1u) * 32u));
+                s_g718Rects.push_back(static_cast<int32_t>(runLo * 64u));
+                s_g718Rects.push_back(static_cast<int32_t>(512u - (py + 1u) * 32u));
+                s_g718Rects.push_back(static_cast<int32_t>(pages * 64u));
+                s_g718Rects.push_back(32);
+                copiedPages += pages;
+            }
+        }
+        if (s_g718Rects.empty())
+            continue;
+        const uint32_t srcFbp = g718AtlasSourceFbp(static_cast<int>(slot));
+        if (srcFbp == 0u || !g310_backend_copy_logical_pages(srcFbp, s_g718Rects))
+        {
+            g310Invalidate("g718-gpu-copy", true);
+            return false;
+        }
+        g_g310GpuJobs.fetch_add(1u, std::memory_order_relaxed);
+        g_g310GpuPages.fetch_add(copiedPages, std::memory_order_relaxed);
+        g_g718AtlasCopies.fetch_add(1u, std::memory_order_relaxed);
+        g_g718AtlasCopiedPages.fetch_add(copiedPages, std::memory_order_relaxed);
     }
 
     g_g310Pages = next;

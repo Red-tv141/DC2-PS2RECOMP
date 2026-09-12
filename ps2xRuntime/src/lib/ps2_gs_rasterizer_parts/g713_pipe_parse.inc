@@ -14,6 +14,14 @@
 static std::mutex g_g713CarrierMtx;
 static std::vector<G260Batch *> g_g713Carriers;
 
+// G723: open the G712 prep record on the PARSE thread instead of at executor adoption. Default OFF;
+// see the post site in g713ParseFlushOpen for why the extra lead time is the point.
+static bool g722PrepAtParseOn()
+{
+    static const bool on = envFlagEnabled("DC2_G722_PREP_AT_PARSE");
+    return on;
+}
+
 static G260Batch *g713TakeCarrier()
 {
     {
@@ -59,6 +67,19 @@ static void g713ParseFlushOpen()
     b->wr = g_g260OpenWr;
     b->rd = g_g260OpenRd;
     b->prep = nullptr;
+    // ⭐ G723 LEAD TIME. Posting the prep job at ADOPTION gives the worker only the executor's own
+    // ring latency, and the census says that is not always enough: `helped=18.3%` of batches had
+    // their `class` pass run by the executor because the worker had not started, plus `waited=4.8%`
+    // that made the executor block on it. Posting HERE hands the job over one whole executor
+    // backlog earlier (`syncMs/f` says parse runs ~10 ms ahead), which is what those two numbers
+    // are asking for. Pointer identity survives the handover: both `b->entries.swap()` here and
+    // `d.entries.swap(b->entries)` at adoption exchange vector HEADERS, so the heap buffer the
+    // record points at — and the flush's own `g_g144List.swap(b.entries)` — is the same allocation
+    // throughout, which is exactly what the consumer's identity check compares.
+    if (g722PrepAtParseOn() && !b->entries.empty())
+        b->prep = g712PrepOpen(b->entries.data(), b->entries.size(),
+                               b->entries.front().ctx.frame.fbp,
+                               b->entries.front().ctx.frame.fbw);
     g_g260OpenWr.reset();
     g_g260OpenRd.reset();
     g713PostBatch(b);
@@ -101,12 +122,29 @@ static bool g713CloseForLocalCopyImpl(uint32_t sbp, uint32_t sbw, uint32_t spsm,
 // ---------------------------------------------------------------------------------------------
 // EXEC: adopt one closed batch into the graph. Identical bookkeeping to `g260CloseOpenBatch`'s
 // tail, including the fail-safe cap, so a piped run reaches the same drain causes as a shipped one.
+//
+// ⭐ G722 THIRD STAGE. `g260CloseOpenBatch`'s G712 prep-ahead post site is bypassed by the
+// pipeline, so the identical post is made HERE instead. Placing it on adoption rather than on
+// parse-side close is not a detail: g712_prep_body.inc's free list is deliberately lock-free
+// because "allocation and release happen ONLY on the GS worker thread", and under the pipeline the
+// consumer (`g178TryFlushGpu`) and `g712PrepRelease` both run on the EXEC thread. Posting from
+// `g713ParseFlushOpen` would have put the free list on two threads; posting from adoption keeps
+// open/consume/release on one, so the invariant the mechanism was written against still holds.
+//
+// The overlap this buys is real for the same reason G712 states: an adopted batch is immutable
+// until it drains, and the census shows several batch closes per drain, so `class` (2.279 ms/f in
+// the G720 stage census) can run on the prep worker while the executor is still submitting the
+// batches ahead of it. Nothing is deleted, so the G304 conservation law does not apply.
 // ---------------------------------------------------------------------------------------------
 static void g713ExecBatchImpl(void *p)
 {
     G260Batch *b = static_cast<G260Batch *>(p);
     if (b->entries.empty())
     {
+        // Defensive: a parse-side record is only opened for a non-empty batch, so this cannot
+        // normally hold one. Recycling the carrier while a worker still owns its record would be
+        // the one unrecoverable shape here, so refuse to depend on that argument.
+        g712PrepRelease(b->prep);
         g713GiveCarrier(b);
         return;
     }
@@ -117,6 +155,16 @@ static void g713ExecBatchImpl(void *p)
     d.rd = b->rd;
     d.prep = nullptr;
     d.entries.swap(b->entries);
+    // A record opened on the parse thread (G723 lead-time arm) travels with the carrier; adopt it
+    // rather than opening a second one for the same buffer.
+    d.prep = b->prep;
+    b->prep = nullptr;
+    // fbp/fbw from entry 0, exactly as the shipped post site derives them, so the consumer's
+    // identity check is an equality on the same two derivations.
+    if (d.prep == nullptr && !d.entries.empty())
+        d.prep = g712PrepOpen(d.entries.data(), d.entries.size(),
+                              d.entries.front().ctx.frame.fbp,
+                              d.entries.front().ctx.frame.fbw);
     // Hand the carrier a recycled buffer so the parse thread never re-grows one.
     if (!g_g260Pool.empty())
     {
@@ -133,18 +181,38 @@ static void g713ExecBatchImpl(void *p)
 }
 
 // ---------------------------------------------------------------------------------------------
-// EXEC thread bring-up. `g650PinThread` gives the exec thread the GS worker's own affinity role:
-// it IS the GS worker now, as far as every core-scheduling promotion since G650 is concerned, and
-// the parse thread becomes the new front end.
+// EXEC thread bring-up. The fused backend's former worker core is available for
+// execution. Reusing the parser's GS role would pin both CPU stages to one core.
+//
+// ⚠️ G723: role 3 is free ONLY because G705's fused transport removed the backend worker. With
+// DC2_G705_NO_FUSEGL=1 that worker comes back and pins role 3 itself
+// (lle_gpu_raster_backend.inc), so the executor and the GL worker would share one core and any
+// three-stage measurement would be meaningless. `DC2_G721_EXEC_ROLE=<n>` selects the executor's
+// G650 role (default 3, the shipped fused-path choice); set it to 4 (MAIN) when restoring the
+// backend worker. Clamped to the declared role range; anything else falls back to 3.
 // ---------------------------------------------------------------------------------------------
 static void g713ExecThreadInit()
 {
-    ::g650PinThread(2 /* G650_ROLE_GS */); // declared at global scope in ps2_gs_rasterizer.cpp
+    int role = 3; // G650_ROLE_GL
+    if (const char *v = std::getenv("DC2_G721_EXEC_ROLE"))
+    {
+        const int parsed = std::atoi(v);
+        if (parsed >= 0 && parsed < 5 /* G650_ROLE_COUNT */)
+            role = parsed;
+    }
+    std::fprintf(stderr, "[G713:pipe] exec role=%d\n", role);
+    std::fflush(stderr);
+    ::g650PinThread(role); // declared at global scope in ps2_gs_rasterizer.cpp
+    // ⭐ G735: arm the G446 PC sampler ON THIS THREAD. `g446RegisterGsWorkerThread` points at the
+    // PARSE thread; the executor — 17.9 ms/f at 90% occupancy, the measured pole — has never had a
+    // distribution. Default OFF (DC2_G735_EXECPROF=1); singleton, so never arm it together with
+    // DC2_G446_GSPROF / DC2_G478_VU1PROF / DC2_G503_EEPROF.
+    ::g735RegisterExecThread();
 }
 
 // ---------------------------------------------------------------------------------------------
-// One-shot arm, from the first captured primitive (so the GS is fully constructed and the runtime
-// has read its environment). Re-points the two open-batch indirections and starts the exec thread.
+// One-shot arm after first-packet hook registration and before its GS operations.
+// Re-points the open-batch indirections and starts the executor before GL adoption.
 // ---------------------------------------------------------------------------------------------
 static void g713ArmIfRequested(GSRasterizer *self)
 {

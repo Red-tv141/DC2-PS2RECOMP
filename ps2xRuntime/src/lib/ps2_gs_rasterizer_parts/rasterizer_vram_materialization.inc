@@ -1,5 +1,8 @@
+#include "g720_cpu_stages.inc"
+
 static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t vramSize)
 {
+    G720CpuStages g720Stages(g_g144List.size());
     g324NoteObserver(0u); // next native flush is a G310/FBO state observer
     G324FlushDiag g324Diag{};
     const bool g324IsArmed = g324Armed();
@@ -32,7 +35,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g581InvalidateCpuFallbackSnapshots();
     }
     G310BatchFreeze g310Freeze;
-    g684DiagAdd(g_g178Flushes, 1u);
+    // G741: the DENOMINATOR of every refusal rate below, so it must be live wherever
+    // `g_g178Fallbacks` is. It was not: this read `g684DiagAdd` while `g_g178GpuFlushes` (:7557)
+    // was already an unconditional `fetch_add`, so `[G178:stat]` would have printed `flushes=0`
+    // beside a real `gpu=N` even if its reporter had been reachable. One per flush (~44/frame).
+    g741ShipAdd(g_g178Flushes, 1u);
     // Resolve the exact 0x14a alias suffix before the generic owner-conflict audit: this batch
     // itself is the proven destructive prefix writer.
     const uint32_t g289DirectDisplaySrc = g289DirectDisplayToken();
@@ -166,6 +173,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const bool g323Armed = s_g323Census || s_g323Empty;
     const auto g273T0 = s_g273Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
+    g720Stages.lap(G720CpuStages::ResidA); // G724: preflight ends; residency prologue begins
     const auto g298T0 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
     // G589: record this batch's position inside the open drain transaction. Under
@@ -192,6 +200,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const bool g587Transient15d = g587Transient15dTarget(fbp);
     // G604: the same non-persistent contract, selected by PROPERTY (see rasterizer_command_graph).
     const bool g604DiscovTrn = g604DiscovTransientTarget(fbp);
+    g720Stages.lap(G720CpuStages::ResidB); // G724: contracts decided; G700 candidacy begins
     // ⭐⭐⭐ G700: is this target a candidate for PERSISTENT residency? The four transient
     // contracts above (`g286`/`g570`/`g586`/`g587`) and the two display buffers keep their own
     // proven paths; everything else is a discovered target that today either pays a full
@@ -264,28 +273,37 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // pro0trn = 0.0323 ms/flush x 33.4 = 1.08 ms/f: the same number from two instruments.
         static const bool s_g524NoTrnMat = envFlagEnabled("DC2_G524_NO_TRNMAT");
         if (!s_g524NoTrnMat)
-            g261PrepareCpuReplay();
+            g735TrnPub(0u);
+    }
+    // ⭐ G718 TRNPUB probe (default OFF). The takeover deletes the sibling publication these four
+    // contracts run before their framebuffer upload. Restore it, without restoring the contract,
+    // to test whether the surviving whole-frame defect is an ORDERING loss rather than an
+    // authority one. Counted so a null cannot be mistaken for an unarmed arm.
+    if (g700TrnTakeover && g718TrnPubOn())
+    {
+        g_g718TrnPubs.fetch_add(1u, std::memory_order_relaxed);
+        g735TrnPub(1u);
     }
     if (g570Transient13d && !g700TrnTakeover)
     {
         // 0x13d overlaps 0x139 physically. Publish every resident sibling before framebuffer
         // upload, then keep this target transient so the reverse edge can never find it dirty.
         g_g570TransientAttempts.fetch_add(1u, std::memory_order_relaxed);
-        g261PrepareCpuReplay();
+        g735TrnPub(2u);
     }
     if (g586Transient141 && !g700TrnTakeover)
     {
         // 0x141 is another physical sibling of the resident 0x139 family.  Publish every sibling
         // before upload, then keep both colour and Z under the non-persistent per-flush contract.
         g_g586TransientAttempts.fetch_add(1u, std::memory_order_relaxed);
-        g261PrepareCpuReplay();
+        g735TrnPub(3u);
     }
     if (g587Transient15d && !g700TrnTakeover)
     {
         // 0x15d is tested under the same command-local ownership contract, but its gate and
         // oracle are independent from the rejected 0x141 experiment.
         g_g587TransientAttempts.fetch_add(1u, std::memory_order_relaxed);
-        g261PrepareCpuReplay();
+        g735TrnPub(4u);
     }
     if (g604DiscovTrn && !g700Cand)
     {
@@ -301,11 +319,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // upload (`g700NeedUpload` below), the ranged publication runs there instead — scoped to
         // the pages actually read rather than to every resident sibling. `[G523:fit]` books this
         // one call as `pro0trn` = 0.0323 ms per flush x 33.4 flushes = 1.08 ms/f.
-        g261PrepareCpuReplay();
+        g735TrnPub(5u);
     }
     // G523 prologue lap P0: transient-target admission (and its g261PrepareCpuReplay).
     const auto g523P0 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
+    g720Stages.lap(G720CpuStages::Resid); // G724: G700 candidacy ends; RTT admission + acquire begins
     const bool g255Rtt = g255GpuRttOn() && g248TargetIndex(fbp) >= 0;
     if (g255Rtt)
         g255NoteAttempt(fbp);
@@ -372,7 +391,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     if (fbW <= 0 || fbW > 1024)
     {
         g_g266FlushRej = kG266FrFbW;
-        g684DiagAdd(g_g178Fallbacks, 1u);
+        g741ShipAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -417,6 +436,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // -wave predicates and the G266 FBW residency reset (which can run a blocking g261Materialize).
     const auto g523P2 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
+    g720Stages.lap(G720CpuStages::ClsWin); // G724: residency ends; prep-consume + row window begins
     // Pass 1: validate every entry + derive draw state. All-or-nothing.
     static std::vector<G178EntryState> s_states;
     s_states.clear();
@@ -574,6 +594,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                         : std::chrono::steady_clock::time_point{};
     uint64_t g655ClassIdentityNs = 0u, g655ClassClassifierNs = 0u,
              g655ClassRangeNs = 0u;
+    g720Stages.lap(G720CpuStages::Class); // G724: row window ends; the classify loop begins
     // ⭐ G712: adopt the prepared pass. `s_states` is SWAPPED, not copied — the record goes back to
     // the free list carrying the old `s_states` buffer, so neither side ever reallocates in steady
     // state. The eleven reductions are the identical arithmetic over the identical entries; the
@@ -630,7 +651,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                  e.ctx.tex0.tbp0, e.ctx.tex0.psm,
                                  static_cast<size_t>(&e - g_g144List.data()), g_g144List.size());
             }
-            g684DiagAdd(g_g178Fallbacks, 1u);
+            g741ShipAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false; // mixed targets in one flush — shouldn't happen (block flush on fbp change)
         }
@@ -687,7 +708,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             g583NoteRejectEntry(e);
             if (g261Wave)
                 g_g261RttClassifyRej.fetch_add(1u, std::memory_order_relaxed);
-            g684DiagAdd(g_g178Fallbacks, 1u);
+            g741ShipAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             if (g510Census)
             {
@@ -721,8 +742,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 // One GL attachment cannot represent two guest Z targets in one all-or-nothing
                 // flush. Preserve exact ordering by sending the whole list to the CPU replay.
                 g_g266FlushRej = kG266FrMixedZ;
-                g684DiagAdd(g_g178Fallbacks, 1u);
-                g684DiagAdd(g_g178RejectState, 1u);
+                g741ShipAdd(g_g178Fallbacks, 1u);
+                g741ShipAdd(g_g741RejFlushState, 1u); // G741: per-FLUSH tier (see rasterizer_command_graph.inc)
                 g581InvalidateCpuFallbackSnapshots();
                 return false;
             }
@@ -929,6 +950,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         s_g289OwnerSrc.clear();
     if (rowHi < rowLo)
         return true; // everything skipped — nothing to draw, nothing to read back
+    g720Stages.lap(G720CpuStages::Fbz);
     const auto g298T1 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
     // ===== G576: internal split of G298's `fbz` bucket (behaviour-pure, DC2_G576_FBZSPLIT=1) =====
@@ -1060,7 +1082,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                          g282DepthLo, g282DepthHi, guestDepth ? 1u : 0u,
                          guestDepthWrites ? 1u : 0u);
         g_g266FlushRej = kG266FrCpuOnlyRtt;
-        g684DiagAdd(g_g178Fallbacks, 1u);
+        g741ShipAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -1133,7 +1155,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                          g586BadFbp, g586BadFbw, g586BadPsm, g586BadPrim, g586BadTme);
         }
         g_g266FlushRej = kG266FrCpuOnlyRtt;
-        g684DiagAdd(g_g178Fallbacks, 1u);
+        g741ShipAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -1167,7 +1189,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                          g282DepthLo, g282DepthHi, guestDepth ? 1u : 0u,
                          guestDepthWrites ? 1u : 0u);
         g_g266FlushRej = kG266FrCpuOnlyRtt;
-        g684DiagAdd(g_g178Fallbacks, 1u);
+        g741ShipAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -1280,7 +1302,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         }
 #endif
         g_g266FlushRej = kG266FrCpuOnlyRtt;
-        g684DiagAdd(g_g178Fallbacks, 1u);
+        g741ShipAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -1372,7 +1394,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             (void)g700Materialize(g700Slot, g_g700Surf[g700Slot].dirtyLo,
                                   g_g700Surf[g700Slot].dirtyHi, 7 /* kG261MatFail */);
         g_g266FlushRej = kG266FrCpuOnlyRtt;
-        g684DiagAdd(g_g178Fallbacks, 1u);
+        g741ShipAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -1410,7 +1432,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g_g266FlushRej = kG266FrRttDepth;
         if (g261Wave)
             g_g261RttDepthRej.fetch_add(1u, std::memory_order_relaxed);
-        g684DiagAdd(g_g178Fallbacks, 1u);
+        g741ShipAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -1623,8 +1645,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             }
 #endif
             g_g266FlushRej = kG266FrColorZAlias;
-            g684DiagAdd(g_g178Fallbacks, 1u);
-            g684DiagAdd(g_g178RejectState, 1u);
+            g741ShipAdd(g_g178Fallbacks, 1u);
+            g741ShipAdd(g_g741RejFlushState, 1u); // G741: per-FLUSH tier (see rasterizer_command_graph.inc)
             g581InvalidateCpuFallbackSnapshots();
             return false;
         }
@@ -1726,7 +1748,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 if (!g278FlushPendSlot(p, 0))
                 {
                     g_g266FlushRej = kG266FrZReadback;
-                    g684DiagAdd(g_g178Fallbacks, 1u);
+                    g741ShipAdd(g_g178Fallbacks, 1u);
                     g581InvalidateCpuFallbackSnapshots();
                     return false;
                 }
@@ -1745,6 +1767,20 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         }
         // Pass 2: one walk over the recorded draws tests texture/CLUT reads against every
         // surviving owner's unpublished rows (ranges are built once per entry).
+        // ⭐ G735 AGGREGATE PUBLICATION GATE. This walk only ever ACTS on a texture/CLUT hit, so
+        // the batch's aggregate READ set decides the whole loop: if no surviving candidate's dirty
+        // rows intersect `rd`, no entry's `tex` or `clut` can intersect them either (both are
+        // members of `rd` by construction, and an underivable one poisons it). Entries the loop
+        // skips (`s_states[i].skip`) are still inside `rd`, so the gate is the conservative side.
+        if (anyCandidate && g735PubGateOn())
+        {
+            bool g735AnyReach = false;
+            for (int s = 0; s < kG278PendSlots && !g735AnyReach; ++s)
+                if (candidate[s] && !g735BatchCannotRead(slotDirty[s]))
+                    g735AnyReach = true;
+            if (!g735AnyReach)
+                anyCandidate = false;
+        }
         if (anyCandidate)
         {
             for (size_t i = 0; i < g_g144List.size(); ++i)
@@ -1777,7 +1813,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         if (!g278FlushPendSlot(s_g278PendTab[s], 0))
                         {
                             g_g266FlushRej = kG266FrZReadback;
-                            g684DiagAdd(g_g178Fallbacks, 1u);
+                            g741ShipAdd(g_g178Fallbacks, 1u);
                             g581InvalidateCpuFallbackSnapshots();
                             return false;
                         }
@@ -1795,7 +1831,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                   static_cast<uint32_t>(rowHi - rowLo + 1)))
     {
         g_g266FlushRej = kG266FrDepthSetup;
-        g684DiagAdd(g_g178Fallbacks, 1u);
+        g741ShipAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -2044,9 +2080,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     if (g700Exact)
     {
         const bool g700Up = g700NeedUpload(g700Slot, rowLo, rowHi);
-        if (!g700Up)
-            g_g700UploadSkips.fetch_add(1u, std::memory_order_relaxed);
-        else
+        if (g700Up)
             // An upload READS guest VRAM for these pages, so anything another resident surface
             // still owes over them must be published first — the same consumer edge the transient
             // contract took unconditionally in its prologue, now scoped to the pages actually read.
@@ -2310,7 +2344,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (s_batch.uploadFb)
     {
-        g684DiagAdd(g_g178FbUploads, 1u);
+        // G741: per FLUSH (this `if` runs once per g178TryFlushGpu), and its `else` sibling at the
+        // skip site below. The pair is the per-flush VRAM->FBO authority-transition rate.
+        g741ShipAdd(g_g178FbUploads, 1u);
         // G417 diagnostic-only CPU split. Keep the allocation/zero, metadata/setup, and joined
         // CT32 row pack separate so the backend GL edge is not blamed for front-end preparation.
         static const bool s_g417Profile = envFlagEnabled("DC2_G417_PROFILE");
@@ -2627,7 +2663,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     }
     else
     {
-        g684DiagAdd(g_g178FbUploadSkips, 1u);
+        g741ShipAdd(g_g178FbUploadSkips, 1u); // G741: per flush — see the upload site above
         // G420: the zero-fill elision needs a live buffer to elide against, and clear() drops
         // size() to 0 so the next uploadFb would value-initialise the whole thing again. Nothing
         // outside uploadFb reads fbPixels (every backend use is gated on b.uploadFb, and
@@ -2684,7 +2720,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         if (guestZpsm != 0x1u || depthRowHi < depthRowLo)
         {
             g_g266FlushRej = kG266FrDepthSetup;
-            g684DiagAdd(g_g178Fallbacks, 1u);
+            g741ShipAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false;
         }
@@ -3110,7 +3146,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                       0u, 0u, static_cast<uint32_t>(fbW), kFbH, depthKey))
         {
             g_g266FlushRej = kG266FrDepthSetup;
-            g684DiagAdd(g_g178Fallbacks, 1u);
+            g741ShipAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false;
         }
@@ -3131,7 +3167,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             state.dirtyLo = kFbH;
             state.dirtyHi = -1;
             g_g266FlushRej = kG266FrDepthSetup;
-            g684DiagAdd(g_g178Fallbacks, 1u);
+            g741ShipAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false;
         }
@@ -3162,6 +3198,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         } // end G242 persistent-depth path (G262 per-wave path above)
     }
 
+    g720Stages.lap(G720CpuStages::Deps);
     const auto g298T2 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
     const auto g323T2 = g323Armed ? std::chrono::steady_clock::now()
@@ -3234,6 +3271,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     bool g623PrePassRan = false;
     g630BeginTexturePass();
     g_g716Built.clear();
+    struct G717TextureScope
+    {
+        bool previous = g_g717TexturePhase;
+        ~G717TextureScope() { g_g717TexturePhase = previous; }
+    } g717TextureScope;
+    g_g717TexturePhase = s_g717LateTexture;
     // G716 reader test (default off): every consumer below this point runs in the same flush, so
     // this is the one place that dominates all of them.
     g716MirrorRawToGuest();
@@ -3252,14 +3295,38 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // G710 ceiling probe (`deps`): deny the whole bind pre-pass. The `else` arm below already
     // handles "the pre-pass did not run for this flush" exactly (G623's own path), so this is
     // structurally supported — it only denies every FBO source, which is corrupting, not unsafe.
-    if ((g261WaveOn() && g261AnyDirty()) || g716AnyRaw() || g630HaveSurfaces() || g289DirectDisplaySrc != 0u ||
-        g289OwnerViewReady)
+    // ⭐⭐⭐ G718: `g700DirectSampleSrc` — the RT-as-texture bind, PCSX2's `LookupSource` returning
+    // a target-backed source — lives INSIDE this pre-pass, but the pre-pass was gated on
+    // `g261AnyDirty()`, which only knows the fourteen-address `g_g261Res` allowlist. A G700
+    // persistent surface makes no legacy slot dirty, so on exactly the flushes that sample one the
+    // whole pre-pass was skipped and the bind could never be reached. `[G700:auth] directBinds=0`
+    // over a whole `dungeon1` run was that, not a shape rejection: the census showed
+    // `bindRej noSurface` only, with `self`/`width`/`format`/`rows` all zero.
+    // G623's own header records the same skip from the other side ("the display batch that samples
+    // the 0x13b post-process target arrives on a flush where NO resident target is dirty").
+    // ⛔ MEASURED: the first form of this used `g700AnyLive()` and ran the pre-pass on every flush
+    // while any surface existed — which is always. `directBinds` went 0 -> 1,664,437, but
+    // `dungeon1` went 25.99 -> 29.34 ms/f (+3.35): `deps` is the most expensive fixed stage in the
+    // flush table (0.0327 ms/flush, 93% fixed) and paying it on flushes that previously skipped it
+    // outright costs more than the binds save. Rule 88, from the other direction.
+    // `g700AnyDirty()` is the exact condition under which a reader would otherwise force a
+    // PUBLICATION: a surface with no outstanding debt is already congruent with guest VRAM, so the
+    // ordinary decode is both correct and free of readback, and a bind buys only the decode.
+    // ⛔⛔ AND THE NARROWED FORM CONVERTED NOTHING EITHER. `g700AnyDirty()` measured 26.58 against
+    // the un-widened 25.99, and the late-prepare arm built on top of it 26.67 — all three inside
+    // the host's ~0.4 ms/f arm-independent spread, with `directBinds` at 1.4-2.7 M and the
+    // reader-driven publications cut 5,722 -> 360. Deleting 94% of them moved nothing, because the
+    // UPLOAD edge absorbed them (7,969 -> 39,730): G304 conservation, again.
+    // ⇒ the widening is tied to `g718LatePrepOn()` (default OFF) so the PROMOTED configuration is
+    // exactly the arm that measured -6.52: G700 alone, with this gate as shipped.
+    if ((g261WaveOn() && g261AnyDirty()) || (g718LatePrepOn() && g700AnyDirty()) || g716AnyRaw() ||
+        g630HaveSurfaces() || g289DirectDisplaySrc != 0u || g289OwnerViewReady)
     {
         s_g261FboSrc.assign(g_g144List.size(), 0u);
         s_g281ViewKey.assign(g_g144List.size(), 0u);
         s_g281ViewSrc.assign(g_g144List.size(), -1);
         s_g310BuiltViews.clear();
-        if (g716AnyRaw())
+        if (!s_g717LateTexture && g716AnyRaw())
             for (size_t i = 0; i < g_g144List.size(); ++i)
                 if (const uint64_t key = g716TryTexture(g_g144List[i], s_states[i]))
                 { s_g281ViewKey[i] = key; s_g281ViewSrc[i] = -2; }
@@ -3316,7 +3383,57 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     e.ctx.tex0.tbw == 2u && st.texW == 128 && st.texH == 128;
                 if (!g310Shape && !g598Any)
                     continue;
-                const uint64_t viewKey = g281ViewKey(st.texKey);
+                // ⭐⭐⭐ G737: THE TEXELS THIS DRAW SAMPLES, not the ones TEX0 declares.
+                // `g281BuildT8Map` proves the WHOLE `1<<TW` x `1<<TH` rectangle and refuses at the
+                // first texel whose source row leaves the producer's coverage window — measured on
+                // `dungeon1` as `[G618:t8map] rej(page=6 sy=216)`, i.e. 97% `sy`, against a
+                // population (`[G737:texrej]`, 100% of mat(tex)) that declares 512x256 and samples
+                // 204x22. Proving the sampled rectangle admits it; see g737BuildT8MapRect.
+                //
+                // Only FST entries qualify: their texel extent is exact. The rectangle is expanded
+                // by one texel on every side (a GL_LINEAR tap) and must lie inside the texture, so
+                // no wrap mode can reach past it. `viewKey` is qualified with the rectangle, so a
+                // view proven for one rectangle can never be reused by an entry sampling another —
+                // which is what makes the per-flush `s_g310BuiltViews` reuse below safe.
+                bool g737UvRect = false;
+                int g737U0 = 0, g737U1 = -1, g737V0 = 0, g737V1 = -1;
+                if (g737T8UvMapOn() && e.prim.fst && st.texW > 0 && st.texH > 0)
+                {
+                    const int nv = (e.prim.type == GS_PRIM_SPRITE) ? 2 : 3;
+                    int u0 = INT32_MAX, u1 = INT32_MIN, v0 = INT32_MAX, v1 = INT32_MIN;
+                    for (int k = 0; k < nv; ++k)
+                    {
+                        const int uu = static_cast<int>(e.v[k].u >> 4);
+                        const int vv = static_cast<int>(e.v[k].v >> 4);
+                        u0 = std::min(u0, uu); u1 = std::max(u1, uu);
+                        v0 = std::min(v0, vv); v1 = std::max(v1, vv);
+                    }
+                    // Sprite endpoints are exclusive right/bottom (max tap = hi-1); a triangle can
+                    // reach the vertex texel itself. Same rule the direct-FBO bind window uses.
+                    if (e.prim.type == GS_PRIM_SPRITE)
+                    {
+                        --u1;
+                        --v1;
+                    }
+                    if (u1 >= u0 && v1 >= v0)
+                    {
+                        g737U0 = std::max(0, u0 - 1);
+                        g737V0 = std::max(0, v0 - 1);
+                        g737U1 = std::min(st.texW - 1, u1 + 1);
+                        g737V1 = std::min(st.texH - 1, v1 + 1);
+                        // Inside the texture with room for the filter tap, and a STRICT sub-rect —
+                        // a full-coverage read has nothing to gain and keeps the legacy path.
+                        g737UvRect = u0 >= 0 && v0 >= 0 && u1 < st.texW && v1 < st.texH &&
+                                     (g737U1 - g737U0 + 1) * (g737V1 - g737V0 + 1) <
+                                         st.texW * st.texH;
+                    }
+                }
+                // The BASE key is what every already-admitted entry keeps, so `s_g310BuiltViews`
+                // still collapses a whole texture to ONE backend view per flush. Only an entry the
+                // whole-texture proof REFUSED and the rectangle rescued gets a qualified key —
+                // decided below, after the admission says which proof it used.
+                const uint64_t viewKeyBase = g281ViewKey(st.texKey);
+                uint64_t viewKey = viewKeyBase;
                 if (g310Shape && s_g310BuiltViews.count(viewKey) != 0u)
                 {
                     s_g281ViewKey[i] = viewKey;
@@ -3326,10 +3443,23 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 // The legacy tuple keeps its own resolver (its `srcTi` is 0x139 by construction and
                 // its fbw/fbW conjuncts are part of that evidence); anything else goes through the
                 // general source lookup. Both end in g281BuildT8Map's fail-closed page proof.
-                const int srcTi = g310Shape ? g310TryT8Entry(0x139u, e, st)
-                                            : g598TryT8EntryAny(e, st);
+                bool g737UsedRect = false;
+                const int srcTi =
+                    g310Shape ? g310TryT8Entry(0x139u, e, st)
+                              : g598TryT8EntryAny(e, st, g737UvRect, g737U0, g737U1,
+                                                  g737V0, g737V1, &g737UsedRect);
                 if (srcTi < 0)
                     continue;
+                // Qualify the key ONLY for an entry the rectangle rescued: a view proven over a
+                // sub-rectangle must never be reused by an entry sampling a different one, and an
+                // entry the whole-texture proof admitted must keep sharing the unqualified view.
+                if (g737UsedRect)
+                    viewKey = viewKeyBase ^
+                              (0x9E3779B97F4A7C15ull *
+                               ((static_cast<uint64_t>(g737U0) << 48) ^
+                                (static_cast<uint64_t>(g737U1) << 32) ^
+                                (static_cast<uint64_t>(g737V0) << 16) ^
+                                static_cast<uint64_t>(g737V1)));
                 // A view already built this flush for this texture key is reused whatever admitted
                 // it — the snapshot is a pure function of (producer FBO, byte map, CLUT).
                 if (s_g310BuiltViews.count(viewKey) != 0u)
@@ -3341,8 +3471,23 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 const bool syncOk =
                     g242SyncOverlappingDepth(vram, e.ctx.tex0.cbp, 1u, GS_PSM_CT32,
                                              0u, 0u, 64u, 32u);
-                const bool mapOk =
-                    syncOk && g281BuildT8Map(e, srcTi, st.texW, st.texH, s_g310Map);
+                // ⭐ G737: try the sampled rectangle FIRST when it is armed and strictly smaller,
+                // and fall back to the whole-texture proof when it refuses — so the arm can only
+                // ADD admissions, never remove one. `g_g737UvRefused` counts the fallbacks.
+                // Build with whichever proof the admission used, so the map that reaches the
+                // backend is exactly the one that was proven. `g737UsedRect` is only ever true for
+                // an entry the whole-texture proof refused, so the fallback below is the shipped
+                // path verbatim for everything else.
+                bool mapOk = false;
+                if (syncOk && g737UsedRect)
+                {
+                    mapOk = g737BuildT8MapRect(e, srcTi, st.texW, st.texH,
+                                               g737U0, g737U1, g737V0, g737V1, s_g310Map);
+                    if (!mapOk)
+                        g_g737UvRefused.fetch_add(1u, std::memory_order_relaxed);
+                }
+                if (!mapOk)
+                    mapOk = syncOk && g281BuildT8Map(e, srcTi, st.texW, st.texH, s_g310Map);
                 bool ok = mapOk;
                 if (ok)
                 {
@@ -3794,7 +3939,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 continue; // G310 decoded this exact self-atlas snapshot before publication.
             G656_BIND_LAP(kG656BindEarly);
 
-            if (const uint64_t rawKey = g716TryTexture(e, st))
+            if (const uint64_t rawKey = s_g717LateTexture ? 0u : g716TryTexture(e, st))
             {
                 s_g281ViewKey[i] = rawKey;
                 s_g281ViewSrc[i] = -2;
@@ -4026,8 +4171,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     ? g633TexturePlanConst(st.residencyPlan) : nullptr;
                 const G144BlockRange g630Tex = g633Plan != nullptr
                     ? g633Plan->texRange : g144TextureRange(e);
-                g716MaterializeForRanges(g630Tex, g144ClutRange(e), !g630Tex.valid, false,
-                                         kG261MatTexAlias);
+                if (!s_g717LateTexture)
+                    g716MaterializeForRanges(g630Tex, g144ClutRange(e), !g630Tex.valid, false,
+                                             kG261MatTexAlias);
                 // G632 census: WHY both direct-view gates declined, as one per-draw bitmask
                 // (G628's law). `auth=1` marks the draws that are real `tex` breaks — the ones
                 // whose texture pages are actually GPU-authoritative right now.
@@ -4335,7 +4481,97 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                             }
                             g_g338BuildFail.fetch_add(1u, std::memory_order_relaxed);
                         }
-                        g684DiagAdd(g_g261FboRejects, 1u);
+                        // ⭐ G736 INSTRUMENT REPAIR — the same defect G735 §2a found one field to
+
+                        // the left, in the same census line. `g684DiagAdd` is `(void)counter`
+
+                        // unless `PS2X_G684_HOT_DIAG`, which every release build sets OFF, so
+
+                        // `[G261:stat] fboRej=` has read exactly 0 on every shipping binary in the
+
+                        // history of that flag — while `fboBind=` beside it (an unconditional
+
+                        // `fetch_add`) read 5.7 M on one `dungeon1` run.
+
+                        //
+
+                        // ⛔ That zero was then USED. G735 §6.2d reasoned "`fboRej=0` — not one
+
+                        // bind was ever REJECTED, so those readers never reached the bind decision
+
+                        // at all; they were excluded upstream", and made it the tell for the whole
+
+                        // `tex` cause (31% of publications, 1.59 M rows). The counter could not
+
+                        // have reported a rejection: `mat(tex)=7,887` on the same run is exactly
+
+                        // the population that flows through this line.
+
+                        //
+
+                        // Unconditional now, for the same reason G735 made `g_g261Mat` so: this is
+
+                        // the statement immediately before a blocking `glReadPixels` publication,
+
+                        // ~1.3 calls/frame, and Rule 63 does not apply because no lever in this
+
+                        // phase changes the number of materializations.
+
+                        g_g261FboRejects.fetch_add(1u, std::memory_order_relaxed);
+
+                        // ⭐⭐⭐ G737: WHICH CONJUNCT REFUSED. `fboRej` above sits immediately before
+                        // the materialize, so it equals `mat(tex)` by construction and cannot name a
+                        // cause; `[G262:bindrej]` twenty lines up and `[G599:bind]` in the loop head
+                        // both CAN — and both are `#if defined(PS2X_G684_HOT_DIAG)`, which every
+                        // release build sets OFF, so neither has emitted a line in a shipping
+                        // configuration since G684. This is the ship-config replacement: default
+                        // OFF (DC2_G737_TEXREJ=1), out of line in the cold pipeline TU, reached
+                        // ~1.3x/frame. See ps2_g737_route_census.inc.
+                        if (g737TexRejectOn())
+                        {
+                            G737TexRejectFacts g737f{};
+                            g737f.dstFbp = fbp;
+                            g737f.tgtFbp = kG261Fbp[t];
+                            g737f.texPsm = e.ctx.tex0.psm;
+                            g737f.texTbp0 = e.ctx.tex0.tbp0;
+                            g737f.tgtBlock = tBlock;
+                            g737f.texTbw = e.ctx.tex0.tbw;
+                            g737f.tgtFbw = r.fbw;
+                            g737f.primType = static_cast<uint32_t>(e.prim.type);
+                            g737f.rangeValid = r.range.valid ? 1u : 0u;
+                            g737f.tgtRangeLo = r.range.valid ? r.range.first : 0u;
+                            g737f.tgtRangeHi = r.range.valid ? r.range.last : 0u;
+                            // The CONSUMER's own extent. `tex` here is `g704TexRange`, already
+                            // computed above for the overlap test that brought us to this branch,
+                            // so this is a copy, not a recomputation.
+                            g737f.texRangeValid = tex.valid ? 1u : 0u;
+                            g737f.texRangeLo = tex.valid ? tex.first : 0u;
+                            g737f.texRangeHi = tex.valid ? tex.last : 0u;
+                            g737f.texW = st.texW;
+                            g737f.texH = st.texH;
+                            g737f.tgtFbW = r.fbW;
+                            g737f.covLo = r.covLo;
+                            g737f.covHi = r.covHi;
+                            g737f.dirtyLo = r.dirtyLo;
+                            g737f.dirtyHi = r.dirtyHi;
+                            g737f.fst = e.prim.fst ? 1u : 0u;
+                            g737f.bilinear = st.bilinear ? 1u : 0u;
+                            g737f.dstIsResident = (g248TargetIndex(fbp) >= 0) ? 1u : 0u;
+                            int g737u0 = INT32_MAX, g737u1 = INT32_MIN;
+                            int g737v0 = INT32_MAX, g737v1 = INT32_MIN;
+                            const int g737nv = (e.prim.type == GS_PRIM_SPRITE) ? 2 : 3;
+                            for (int g737k = 0; g737k < g737nv; ++g737k)
+                            {
+                                const int uu = static_cast<int>(e.v[g737k].u >> 4);
+                                const int vv = static_cast<int>(e.v[g737k].v >> 4);
+                                g737u0 = std::min(g737u0, uu); g737u1 = std::max(g737u1, uu);
+                                g737v0 = std::min(g737v0, vv); g737v1 = std::max(g737v1, vv);
+                            }
+                            g737f.u0 = g737u0; g737f.u1 = g737u1;
+                            g737f.v0 = g737v0; g737f.v1 = g737v1;
+                            g737NoteTexReject(g737f);
+                        }
+
                         g266NoteTexBindMat(fbp, t, e, st);
                         // G342 (default-off): time THIS tex-alias materialize and attribute it to
                         // the consumer's shape. rows must be read BEFORE materialize clears dirty.
@@ -4485,6 +4721,14 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 s_g261FboSrc.clear();
         }
     }
+    // ⭐⭐⭐ G718 LATE PREPARE. `s_g261FboSrc[]` is final here — every FBO-source decision this
+    // flush will make has been made. An entry with a source never reads guest VRAM for its texels,
+    // so it owes no publication; the surfaces publish only for the readers that genuinely need
+    // bytes. Under `DC2_G718_LATEPREP=1` this REPLACES the blanket `g700PrepareForBatch` at the
+    // top of the flush (which is skipped by the same flag) — that one ran before any bind existed
+    // and therefore published for readers the pre-pass was about to serve from the FBO.
+    if (g718LatePrepOn())
+        g718PrepareUnbound(g_g144List, s_g261FboSrc);
 #if defined(PS2X_G654_DIAG)
     // G654 P12: cross-tab the key repetition against the OUTCOME. Count only flushes where the
     // bind-decision pre-pass actually ran; skipped pre-passes made no decision and are not `none`.
@@ -4551,9 +4795,27 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // G633: a later pre-pass ownership event can invalidate a view admitted earlier in this pass.
     // Repair only those event-queued consumers now, after all coherence preparation and before any
     // native draw consumes the resident token.
+    // Native FBO/alias consumers keep their sampling contract. Only entries that fell through
+    // those decisions may substitute a decoded raw texture for the ordinary CPU texture.
+    if (s_g717LateTexture && g716AnyRaw())
+    {
+        if (s_g281ViewKey.empty())
+        {
+            s_g281ViewKey.assign(g_g144List.size(), 0u);
+            s_g281ViewSrc.assign(g_g144List.size(), -1);
+        }
+        for (size_t i = 0; i < g_g144List.size(); ++i)
+        {
+            if ((g261AnyBind && s_g261FboSrc[i] != 0u) || s_g281ViewKey[i] != 0u) continue;
+            if (const uint64_t key = g716TryTexture(g_g144List[i], s_states[i]))
+            { s_g281ViewKey[i] = key; s_g281ViewSrc[i] = -2; }
+        }
+    }
+    g_g717TexturePhase = false;
     g633FinalizeTexturePass();
     const bool g261HaveFboSrc = g261AnyBind; // s_g261FboSrc sized to the list only when true
 
+    g720Stages.lap(G720CpuStages::Tex);
     const auto g298T3 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
     uint64_t g323DepsNs = 0u;
@@ -4813,6 +5075,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             const int srcTi = s_g281ViewSrc[i];
             if (srcTi == -2)
                 continue; // G630 raw-domain T8 decode is already queued ahead of this draw.
+            if (s_g717LateTexture)
+            {
+                const auto clutRange = g144ClutRange(e);
+                g716MaterializeForRanges(clutRange, {}, !clutRange.valid, false, 8);
+            }
             static std::vector<uint32_t> s_map, s_clut;
             const bool srcOk = srcTi >= 0;
             const bool syncOk =
@@ -4948,8 +5215,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                  guestZbpPage, depthRowLo, depthRowHi, st.texW, st.texH,
                                  texAliasesZ ? 1u : 0u, clutAliasesZ ? 1u : 0u);
                 g_g266FlushRej = kG266FrTexAliasZ;
-                g684DiagAdd(g_g178Fallbacks, 1u);
-                g684DiagAdd(g_g178RejectTex, 1u);
+                g741ShipAdd(g_g178Fallbacks, 1u);
+                g741ShipAdd(g_g741RejFlushTex, 1u); // G741: per-FLUSH tier (see rasterizer_command_graph.inc)
                 g581InvalidateCpuFallbackSnapshots();
                 return false;
             }
@@ -4961,7 +5228,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                                    0u, 0u, 64u, 32u)))
         {
             g_g266FlushRej = kG266FrTexAliasZ;
-            g684DiagAdd(g_g178Fallbacks, 1u);
+            g741ShipAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false;
         }
@@ -5021,7 +5288,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         if (!g401ForceDecode && !g600TexPaintOn() && it != g_g178TexReg.end() && backendHas &&
             it->second.genSum == genNow)
         {
-            g684DiagAdd(g_g178TexHits, 1u);
+            g741CensusAdd(g_g178TexHits, 1u);
             g600NoteTexHit(e, st.texW, st.texH, st.texKey, "gen");
             g620NoteTexHit(g620Dec, st.texKey, false);
             g622NoteFlushKey(st.texKey, regKey); // G622: draws must reference the resident key
@@ -5030,6 +5297,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // Gen mismatch (or unknown): DC2 re-uploads texture data every frame, usually byte-
         // identical — hash the source pages before paying the swizzle+CLUT decode. Hash-equal +
         // still resident → refresh the gen stamp and keep the GPU copy.
+        if (s_g717LateTexture)
+        {
+            const auto texRange = g144TextureRange(e);
+            g716MaterializeForRanges(texRange, g144ClutRange(e), !texRange.valid, false,
+                                     kG261MatTexAlias);
+        }
         const auto g511HashT0 = g511Split ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
         // G513: `fast` selects the byte loop. Read ONCE per call (~23/frame) against ~9,200 loop
@@ -5112,7 +5385,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             it->second.contentHash == hashNow)
         {
             it->second.genSum = genNow;
-            g684DiagAdd(g_g178TexHashHits, 1u);
+            g741CensusAdd(g_g178TexHashHits, 1u);
             g600NoteTexHit(e, st.texW, st.texH, st.texKey, "hash");
             g620NoteTexHit(g620Dec, st.texKey, true);
             g622NoteFlushKey(st.texKey, regKey); // G622: draws must reference the resident key
@@ -5134,9 +5407,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         bool g622Hit = false;
         if (g622Mint)
         {
-            g684DiagAdd(g_g622Probes, 1u);
+            g741CensusAdd(g_g622Probes, 1u);
             if (g622Key != st.texKey)
-                g684DiagAdd(g_g622Mints, 1u);
+                g741CensusAdd(g_g622Mints, 1u);
             g622Hit = g178_backend_has_tex(g622Key);
         }
         // Under the oracle a hit is RECORDED BUT NOT TAKEN: the decode below runs anyway and its
@@ -5152,8 +5425,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             // The resident image under `g622Key` was decoded from a source with this same content
             // hash under this same hash body, and the decode is a pure function of (descriptor,
             // source bytes, CLUT) — the descriptor is in `st.texKey` and the bytes are in `hashNow`.
-            g684DiagAdd(g_g622Hits, 1u);
-            g684DiagAdd(g_g622HitPx, static_cast<uint64_t>(st.texW) *
+            g741CensusAdd(g_g622Hits, 1u);
+            g741CensusAdd(g_g622HitPx, static_cast<uint64_t>(st.texW) *
                                          static_cast<uint64_t>(st.texH));
             g_g178TexReg[st.texKey] =
                 G178TexReg{genNow, hashNow, st.texW, st.texH, g622HashVar, g622Key};
@@ -5300,7 +5573,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         s_batch.texUploads.push_back(std::move(up));
         g_g178TexReg[st.texKey] =
             G178TexReg{genNow, hashNow, st.texW, st.texH, g708HashVar(g513Fast), g622Key};
-        g684DiagAdd(g_g178TexDecodes, 1u);
+        g741CensusAdd(g_g178TexDecodes, 1u);
         g622NoteFlushKey(st.texKey, g622Key);
         g622TexVarReport();
 #else
@@ -5376,7 +5649,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             g_g178TexReg[st.texKey] =
                 G178TexReg{job.genSum, job.contentHash, st.texW, st.texH,
                            job.hashVariant, job.residentKey};
-            g684DiagAdd(g_g178TexDecodes, 1u);
+            g741CensusAdd(g_g178TexDecodes, 1u);
             g622TexVarReport();
         }
     };
@@ -5504,6 +5777,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         }
     }
 
+    g720Stages.lap(G720CpuStages::Verts);
     const auto g298T4 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
     // G712: could THIS batch's vertex build have run at batch close, beside the `class` pass? Only
@@ -6216,6 +6490,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g684FinishDecodes();
 #endif
 
+    g720Stages.lap(G720CpuStages::Submit);
     const auto g298T5 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
 #if defined(PS2X_G654_DIAG)
@@ -6398,7 +6673,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     if (g310Freeze.active && !g310FrozenUsable())
     {
         g_g266FlushRej = kG266FrSubmit;
-        g684DiagAdd(g_g178Fallbacks, 1u);
+        g741ShipAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -6560,9 +6835,34 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // that used to run here.
     if (g700Exact && submitted)
     {
-        g700NoteRender(g700Slot, rowLo, rowHi);
+        // Count the final submitted decision, after all upload proofs. The old
+        // upload counter lived in an uncalled helper and always reported zero.
+        if (s_batch.uploadFb)
+            g_g700Uploads.fetch_add(1u, std::memory_order_relaxed);
+        else
+            g_g700UploadSkips.fetch_add(1u, std::memory_order_relaxed);
+        // G621 publishes only the actual write span. Claiming the wider scissor
+        // makes untouched padding authoritative and later publishes those bytes.
+        // Keep the same production footprint for persistent colour authority.
+        g700NoteRender(g700Slot, g718WriteSpanOn() ? g621PubLo : rowLo,
+                       g718WriteSpanOn() ? g621PubHi : rowHi);
         if (guestDepth && g700DepthOn())
             g700DepthNoteRender(g700Slot, depthRowLo, depthRowHi);
+        // ⭐ G718 TRNRB probe (default OFF): publish the WHOLE covered span right here, which is
+        // exactly what the per-flush readback the takeover deleted used to do. Diagnostic only —
+        // it surrenders the entire persistent win by construction. If the defect survives this,
+        // publication footprint is exonerated and the cause is upstream of VRAM.
+        if (g718TrnRbOn() && g718IsTakeoverFbp(g_g700Surf[g700Slot].fbp))
+        {
+            const G700Surface &trnS = g_g700Surf[g700Slot];
+            if (trnS.covHi >= trnS.covLo)
+            {
+                g_g718TrnRbs.fetch_add(1u, std::memory_order_relaxed);
+                g_g718TrnRbRows.fetch_add(
+                    static_cast<uint64_t>(trnS.covHi - trnS.covLo + 1), std::memory_order_relaxed);
+                (void)g700Materialize(g700Slot, trnS.covLo, trnS.covHi, 6 /* kG261MatResync */);
+            }
+        }
     }
     else if (g700Exact && !submitted)
     {
@@ -6609,6 +6909,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     }
     const auto g273T2 = s_g273Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
+    g720Stages.lap(G720CpuStages::Post);
     const auto g298T6 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
 #if defined(PS2X_G654_DIAG)
@@ -6639,7 +6940,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 }
         }
         g_g266FlushRej = kG266FrSubmit;
-        g684DiagAdd(g_g178Fallbacks, 1u);
+        g741ShipAdd(g_g178Fallbacks, 1u);
         g581InvalidateCpuFallbackSnapshots();
         return false;
     }
@@ -6655,7 +6956,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         {
             g282DropResidencyAfterFanoutFailure();
             g_g266FlushRej = kG266FrSubmit;
-            g684DiagAdd(g_g178Fallbacks, 1u);
+            g741ShipAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false;
         }
@@ -6696,7 +6997,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             std::fprintf(stderr, "[G262:depth] Z readback FAIL fbp=0x%x rows=%d..%d\n",
                          fbp, depthRowLo, depthRowHi);
             g_g266FlushRej = kG266FrZReadback;
-            g684DiagAdd(g_g178Fallbacks, 1u);
+            g741ShipAdd(g_g178Fallbacks, 1u);
             g581InvalidateCpuFallbackSnapshots();
             return false;
         }
@@ -6805,7 +7106,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 if (!g278FlushPendingDepth(0))
                 {
                     g_g266FlushRej = kG266FrZReadback;
-                    g684DiagAdd(g_g178Fallbacks, 1u);
+                    g741ShipAdd(g_g178Fallbacks, 1u);
                     g581InvalidateCpuFallbackSnapshots();
                     return false;
                 }
@@ -6843,7 +7144,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 if (!g278FlushPendSlot(s_g278PendTab[0], 0))
                 {
                     g_g266FlushRej = kG266FrZReadback;
-                    g684DiagAdd(g_g178Fallbacks, 1u);
+                    g741ShipAdd(g_g178Fallbacks, 1u);
                     g581InvalidateCpuFallbackSnapshots();
                     return false;
                 }
@@ -6867,7 +7168,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     if (!g278FlushPendSlot(p, 0))
                     {
                         g_g266FlushRej = kG266FrZReadback;
-                        g684DiagAdd(g_g178Fallbacks, 1u);
+                        g741ShipAdd(g_g178Fallbacks, 1u);
                         g581InvalidateCpuFallbackSnapshots();
                         return false;
                     }
@@ -7406,6 +7707,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 static_cast<unsigned long long>(g_g324ObserverN[2]));
         }
     }
+    g720Stages.accepted = true;
     if (s_g298Profile)
     {
         static uint64_t s_classNs = 0u, s_fbzNs = 0u, s_depsNs = 0u, s_texNs = 0u,
@@ -7635,28 +7937,66 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                          static_cast<double>(s_verts) / nGpu,
                          static_cast<double>(s_draws) / nGpu);
     }
-#if defined(PS2X_G684_HOT_DIAG)
-    static const bool s_stat = (std::getenv("DC2_G178_STAT") != nullptr);
-#else
-    constexpr bool s_stat = false;
-#endif
-    if (s_stat && (nGpu % 300u) == 0u)
+    // ⭐⭐⭐ G741: `[G178:stat]` — THE GPU-RASTER vs CPU-BAND-REPLAY ROUTING CENSUS.
+    //
+    // ⛔ WHAT WAS WRONG WITH IT. The arm was `constexpr bool s_stat = false` in every release build,
+    // so this reporter printed **nothing at all** on any shipping binary — and the columns it reads
+    // were dead too (`g684DiagAdd`), so even with `PS2X_G684_HOT_DIAG=ON` the pair was only
+    // self-consistent by accident: `g_g178GpuFlushes` (:7557) was already an unconditional
+    // `fetch_add` while its own denominator `g_g178Flushes` was not. That is Rule G737-1's exact
+    // failure mode on the single highest-value routing decision in the renderer.
+    //
+    // Now: the arm is a live env read, the per-FLUSH columns are unconditional (`g741ShipAdd`), the
+    // per-ENTRY columns remain Rule-63-safe behind `PS2X_G741_CENSUS`, and `avail=` states which
+    // tier is compiled so a structural zero can never be quoted as a measurement (Rule G736-1).
+    //
+    // ⚠️ READ THE DENOMINATORS BEFORE THE RATES (Rule 44). `flushes` counts EVERY
+    // `g178TryFlushGpu` call; `gpu` counts only those that reached the backend. `fallback/flushes`
+    // is therefore the refusal rate, and `fallback + gpu == flushes` is the identity that proves no
+    // refusal path is missing a counter.
+    //
+    // ⚠️ AND THIS REPORTER ONLY FIRES ON A GPU-SUCCESSFUL FLUSH — it sits past every refusal's
+    // `return false`. A route that refused 100% of its flushes would print nothing, which is NOT
+    // the same as a clean run. `[G583:rejcensus]` (DC2_G583_REJCENSUS=1) is the fallback-side
+    // reporter and ranks the refusals by REPLAYED ENTRIES; read the two together.
+    static const bool s_stat = envFlagEnabled("DC2_G178_STAT");
+    // G657 measurement law 10 / G735 §5.5: a period-only reporter cannot distinguish "zero" from
+    // "fewer than one period", so print at n == 1 as well.
+    if (s_stat && (nGpu == 1u || (nGpu % 300u) == 0u))
+    {
+        const uint64_t g741Fl = g_g178Flushes.load(std::memory_order_relaxed);
+        const uint64_t g741Fb = g_g178Fallbacks.load(std::memory_order_relaxed);
         std::fprintf(stderr,
-            "[G178:stat] flushes=%llu gpu=%llu fallback=%llu texDecodes=%llu texHits=%llu "
-            "texHashHits=%llu fbUp=%llu fbSkip=%llu rej(state=%llu blend=%llu tex=%llu) "
-            "lastBatch(verts=%zu draws=%zu texUps=%zu rows=%d)\n",
-            (unsigned long long)g_g178Flushes.load(std::memory_order_relaxed),
+            // ⚠️ TWO REJECT GROUPS, TWO DENOMINATORS (Rule G741-2). `rejFlush(...)` is per FLUSH and
+            // is a subset of `fallback`; `rejEntry(...)` is per ENTRY inside g178ClassifyEntry and
+            // can exceed `flushes` by the batch size. Never add them and never divide one by the
+            // other's denominator — the un-split form printed `state=206` against `fallback=104`.
+            "[G178:stat] flushes=%llu gpu=%llu fallback=%llu (%.2f%% of flushes, identity %s) "
+            "texDecodes=%llu texHits=%llu texHashHits=%llu fbUp=%llu fbSkip=%llu "
+            "rejFlush(state=%llu tex=%llu) rejEntry(state=%llu blend=%llu tex=%llu) "
+            "lastBatch(verts=%zu draws=%zu texUps=%zu rows=%d) avail=perflush%s\n",
+            (unsigned long long)g741Fl,
             (unsigned long long)nGpu,
-            (unsigned long long)g_g178Fallbacks.load(std::memory_order_relaxed),
+            (unsigned long long)g741Fb,
+            g741Fl != 0u ? 100.0 * (double)g741Fb / (double)g741Fl : 0.0,
+            // fallback + gpu == flushes proves every refusal path increments. A mismatch means a
+            // `return false` exists with no counter on it — the defect this census exists to find.
+            (g741Fb + nGpu == g741Fl) ? "OK" : "MISMATCH",
             (unsigned long long)g_g178TexDecodes.load(std::memory_order_relaxed),
             (unsigned long long)g_g178TexHits.load(std::memory_order_relaxed),
             (unsigned long long)g_g178TexHashHits.load(std::memory_order_relaxed),
             (unsigned long long)g_g178FbUploads.load(std::memory_order_relaxed),
             (unsigned long long)g_g178FbUploadSkips.load(std::memory_order_relaxed),
+            (unsigned long long)g_g741RejFlushState.load(std::memory_order_relaxed),
+            (unsigned long long)g_g741RejFlushTex.load(std::memory_order_relaxed),
             (unsigned long long)g_g178RejectState.load(std::memory_order_relaxed),
             (unsigned long long)g_g178RejectBlend.load(std::memory_order_relaxed),
             (unsigned long long)g_g178RejectTex.load(std::memory_order_relaxed),
-            s_batch.verts.size(), s_batch.draws.size(), s_batch.texUploads.size(), rows);
+            s_batch.verts.size(), s_batch.draws.size(), s_batch.texUploads.size(), rows,
+            // ⛔ texDecodes/texHits/texHashHits are STRUCTURALLY ZERO without this tier.
+            g741CensusCompiled() ? "+perentry" : " (texDecodes/texHits/texHashHits are STRUCTURAL "
+                                                "ZEROS: rebuild -DPS2X_G741_CENSUS=ON to read them)");
+    }
     if (g255Rtt && !guestDepth && g255VerifyThis)
     {
         // Leave the proven CPU replay authoritative in verification mode. The GPU result is kept

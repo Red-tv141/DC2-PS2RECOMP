@@ -238,6 +238,12 @@
                     g654FlushOk = g178TryFlushGpu(self, g_g144LastGs, g_g144LastGs->m_vram,
                                                   g_g144LastGs->m_vramSize);
                 }
+                // ⭐ G718: the CPU band replay below reads guest VRAM for EVERY entry, so a
+                // rejected flush must find every surface's debt published. Under the late-prepare
+                // arm the top-of-flush publication no longer runs, so this is the edge that
+                // guarantees it. Inert unless DC2_G718_LATEPREP=1.
+                if (!g654FlushOk)
+                    g718PublishBeforeCpuReplay();
                 if (g654FlushOk)
                 {
 #if defined(PS2X_G657_DIAG)
@@ -971,6 +977,8 @@
                     g_g144List.clear();
                     return;
                 }
+                // ⭐ G718: same CPU-replay edge as the parallel closure above.
+                g718PublishBeforeCpuReplay();
                 G654LayerScope g654SeqReplay(kG654LayerCpuReplay);
                 // G589: same fail-closed disarm as the parallel closure above.
                 g589DisarmTransaction();

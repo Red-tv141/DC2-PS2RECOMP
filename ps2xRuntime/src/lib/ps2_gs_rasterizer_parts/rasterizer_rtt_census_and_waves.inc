@@ -460,7 +460,11 @@ static void g583NoteFallback(const std::vector<G144Entry> &list)
     g_g583FallbackEntries[k] += list.size();
     ++g_g583FallbackN;
     g_g583FallbackEntriesN += list.size();
-    if ((g_g583FallbackN % 2048ull) == 0ull)
+    // G741: G657 measurement law 10 / G735 §5.5 — a period-only reporter cannot distinguish "zero"
+    // from "fewer than one period", and 2048 fallbacks is several seconds of a clean route. Print at
+    // n == 1 so the census proves it is ARMED AND REACHED before any row is read from it, which is
+    // exactly what `[G735:pubgate]`'s silence failed to do for a whole phase.
+    if (g_g583FallbackN == 1ull || (g_g583FallbackN % 2048ull) == 0ull)
         g583ReportFallbacks();
 }
 

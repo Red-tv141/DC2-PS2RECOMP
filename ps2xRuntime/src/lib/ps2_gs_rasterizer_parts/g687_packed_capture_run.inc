@@ -187,12 +187,16 @@ __declspec(noinline) static bool g687TryFastCapture(
     if (!run.primed)
         return false;
 
+    // G721: this producer bypasses the normal capture body. It must use the
+    // parser's open vector too; the executor may be traversing g_g144List now.
+    std::vector<G144Entry> &open = *g_g144Open;
+
     // A fixed-state tag cannot reach any of these conditions. Fail back to the complete path if a
     // future parser/queue change violates that premise; the optional oracle makes it fatal.
     const bool stateChanged = run.verify && g687StateChanged(run, ctx, prim, texa, texclut, pabe);
     const bool structuralBreak = self != run.self || gs != run.gs || vram != run.vram ||
-                                 prim.type != GS_PRIM_TRISTRIP || g_g144List.empty() ||
-                                 ctx.frame.fbp != g_g144BlockFbp;
+                                 prim.type != GS_PRIM_TRISTRIP || open.empty() ||
+                                 ctx.frame.fbp != *g_g144OpenFbp;
     if (stateChanged || structuralBreak)
     {
         if (run.verify)
@@ -200,7 +204,7 @@ __declspec(noinline) static bool g687TryFastCapture(
             std::fprintf(stderr,
                          "[G687:verify] invariant failure state=%u structure=%u fbp=0x%x block=0x%x\n",
                          stateChanged ? 1u : 0u, structuralBreak ? 1u : 0u,
-                         ctx.frame.fbp, g_g144BlockFbp);
+                         ctx.frame.fbp, *g_g144OpenFbp);
             std::fflush(stderr);
             std::abort();
         }
@@ -279,17 +283,17 @@ __declspec(noinline) static bool g687TryFastCapture(
         g595NoteAppend(e);
     g336NoteConsumer(e);
 
-    const size_t oldSize = run.verify ? g_g144List.size() : 0u;
+    const size_t oldSize = run.verify ? open.size() : 0u;
     const G149Tex *const decoded = run.verify && e.decoded ? e.decoded.get() : nullptr;
     if (g510CapMoveActive())
-        g_g144List.push_back(std::move(e));
+        open.push_back(std::move(e));
     else
-        g_g144List.push_back(e);
+        open.push_back(e);
 
     if (run.verify)
     {
-        const G144Entry &slot = g_g144List.back();
-        const bool bad = g_g144List.size() != oldSize + 1u ||
+        const G144Entry &slot = open.back();
+        const bool bad = open.size() != oldSize + 1u ||
                          std::memcmp(&slot.ctx, &ctx, sizeof(ctx)) != 0 ||
                          std::memcmp(&slot.prim, &prim, sizeof(prim)) != 0 ||
                          std::memcmp(&slot.texa, &texa, sizeof(texa)) != 0 ||

@@ -333,6 +333,33 @@ struct G146PerfScope
     }
 };
 
+// ⛔⛔⛔ G740 — THIS SCOPE'S PER-WINDOW `fprintf` IS A SYSCALL ON A POLE THREAD, AND IT IS WHAT
+// `DC2_PERF=1` TURNS ON.
+//
+// Measured with the G478 PC sampler on the VU1 (MTVU) worker, `dungeon1`, same binary, same route:
+//
+//     DC2_PERF=1 :  27.24% NtWaitForAlertByThreadId   9.41% NtWriteFile   1.53% memmove
+//     (removed)  :  21.94% NtWaitForAlertByThreadId   ---- NtWriteFile    2.16% memmove
+//
+// `NtWriteFile` — 9.4-12.5 % of every sample on the VU1 worker — is this printer. stderr is
+// unbuffered and the harness redirects it to a file, so each line is a synchronous write, and four
+// hot threads share one CRT file lock. The twin site in `vu1_helpers_and_tables.inc` fires once per
+// 2,000 `VU1Interpreter::run` calls (≈ once a frame) and this one once per 4,000 `drawPrimitive`
+// calls (≈ 3.5 times a frame on `dungeon1`'s 14,000 draws).
+//
+// That is not a cosmetic problem: `[G735:cpu] vu1CpuMs/f` is a `GetThreadTimes` delta, kernel time
+// included, so every VU1 pole figure taken under `DC2_PERF=1` is inflated by this printer — and
+// `DC2_PERF` is the flag G738 §6.1 identified as the one that makes `[G303:vu1w]` print at all.
+//
+// FIX: the ACCUMULATORS stay under `DC2_PERF` (they feed `[G141:perf] n=… GSraster=… VU1proper=…`,
+// which is printed once per window from the EE frame boundary and is the figure anyone actually
+// quotes). Only the per-window line moves behind its own opt-in, `DC2_G141_VERBOSE=1`.
+inline bool g141VerboseOn()
+{
+    static const bool on = (std::getenv("DC2_G141_VERBOSE") != nullptr);
+    return on;
+}
+
 struct G141PerfScope
 {
     bool on;
@@ -358,8 +385,9 @@ struct G141PerfScope
         *sum += std::chrono::duration<double, std::milli>(elapsed).count();
         if (++(*win) >= window)
         {
-            std::fprintf(stderr, "[G141:perf] %s avgUs=%.2f window=%u\n", tag,
-                         (*sum * 1000.0) / static_cast<double>(*win), *win);
+            if (g141VerboseOn()) // G740: see the note above — this is a syscall on a pole thread
+                std::fprintf(stderr, "[G141:perf] %s avgUs=%.2f window=%u\n", tag,
+                             (*sum * 1000.0) / static_cast<double>(*win), *win);
             *sum = 0.0;
             *win = 0u;
         }

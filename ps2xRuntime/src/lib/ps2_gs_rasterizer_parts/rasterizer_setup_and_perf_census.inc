@@ -1134,7 +1134,10 @@ void GSRasterizer::drawPrimitive(GS *gs)
                  gs->m_prim.type == GS_PRIM_TRIFAN)
             g_g141TriCalls.fetch_add(1u, std::memory_order_relaxed);
         static uint64_t s_covTick = 0ull;
-        if ((++s_covTick % 8000ull) == 0ull)
+        // G740: `DC2_PERF=1` alone must not put a synchronous stderr write on a hot GS path —
+        // see the note on G141PerfScope in rasterizer_headers_and_diagnostics.inc. The counters
+        // still accumulate; only the line is behind DC2_G141_VERBOSE=1.
+        if ((++s_covTick % 8000ull) == 0ull && g141VerboseOn())
         {
             static uint64_t lb = 0, li = 0, ld = 0;
             const uint64_t bb = g_g141BboxPx.load(std::memory_order_relaxed);

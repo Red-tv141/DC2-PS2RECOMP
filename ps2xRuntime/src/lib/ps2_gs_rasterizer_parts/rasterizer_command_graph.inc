@@ -977,10 +977,19 @@ namespace
         // That is exactly the invariant the G595 note memo needs, and reset() is the ONE place the
         // open sets are cleared (g260CloseOpenBatch) — so no other site has to be plumbed.
         uint32_t seq = 0;
+        // ⭐ G735: did any appended entry fail to derive a COLOR range while the set was NOT
+        // poisoned? `g260NoteAppend` only calls `markUnknown()` for an invalid colour range when the
+        // scissor is non-degenerate, so a zero-area entry leaves the set clean — but
+        // `g261PrepareCpuReplay`'s per-entry scan treats exactly that entry as `anyUnknown` and
+        // materialises every dirty target. The aggregate gate in `g735PubScanSkippable` therefore
+        // must refuse to skip when this bit is set. Like `unknown`, it only ever goes false->true
+        // between resets, which is what makes the gate's containment argument sound.
+        bool degen = false;
         void reset()
         {
             n = 0;
             unknown = false;
+            degen = false;
             ++seq;
         }
         void add(const G144BlockRange &b)
@@ -1097,20 +1106,29 @@ namespace
             G144BlockRange dirtyRange{};
             if (!g272DirtyInfo(di, dirtyFbp, dirtyFbw, dirtyRange))
                 continue;
-            bool depthAlias = false;
-            for (const G144Entry &e : b.entries)
+            // ⭐ G735: the per-entry depth-alias walk is only ever CONSULTED as the third
+            // disjunct of `otherWrite`, so hoist the two terms that can decide the answer without
+            // it. The batch's aggregate `wr` set already contains every entry's active Z range
+            // (`g260NoteAppend` adds it), so `!wr.overlaps(dirtyRange)` proves no entry's depth
+            // can overlap either — and when `readsDirty` or the fbp/fbw mismatch already decides
+            // the materialise, `depthAlias` cannot change the outcome. Exact: the final predicate
+            // below is the same boolean expression, short-circuited.
+            const bool readsDirty = b.rd.overlaps(dirtyRange);
+            const bool wrOverlap = b.wr.overlaps(dirtyRange);
+            bool otherWrite = wrOverlap && (b.fbp != dirtyFbp || nextFbw != dirtyFbw);
+            if (wrOverlap && !readsDirty && !otherWrite)
             {
-                const G254Surface depth = g254DepthSurface(e);
-                if (depth.active && depth.range.valid &&
-                    g144RangeOverlaps(depth.range, dirtyRange))
+                for (const G144Entry &e : b.entries)
                 {
-                    depthAlias = true;
-                    break;
+                    const G254Surface depth = g254DepthSurface(e);
+                    if (depth.active && depth.range.valid &&
+                        g144RangeOverlaps(depth.range, dirtyRange))
+                    {
+                        otherWrite = true;
+                        break;
+                    }
                 }
             }
-            const bool readsDirty = b.rd.overlaps(dirtyRange);
-            const bool otherWrite = b.wr.overlaps(dirtyRange) &&
-                                    (b.fbp != dirtyFbp || nextFbw != dirtyFbw || depthAlias);
             if (readsDirty || otherWrite)
                 g272MaterializeIndex(di, 1); // recorded GPU consumer/alias edge
         }
@@ -1128,6 +1146,163 @@ namespace
     // path that did not come through the graph — g528FlushPrologue fails closed on that.
     const G260RangeSet *g_g528Wr = nullptr;
     const G260RangeSet *g_g528Rd = nullptr;
+
+    // ==========================================================================================
+    // ⭐⭐⭐ G735 — THE AGGREGATE PUBLICATION GATE
+    // ==========================================================================================
+    //
+    // The flush front end contains a family of PUBLICATION SCANS with one shape: walk every entry
+    // of the batch, re-derive its colour / depth / texture / CLUT block ranges, and test them
+    // against some surface that currently holds unpublished GPU bytes. They exist so a consumer
+    // never reads stale guest VRAM. On the measured route they answer NO on every entry, every
+    // time — `[G261:stat] mat(cpu=0 … fail=0)` over 28,672 flushes — and the biggest of them
+    // (`g261PrepareCpuReplay`, the whole of the `residb` stage) cost **2.061 ms/f on the shipped
+    // binary**, second only to `submit` and larger than any other stage in the flush.
+    //
+    // Every one of those scans is asking a question the batch ALREADY ANSWERS IN AGGREGATE.
+    // `g260NoteAppend` accumulates exactly the same four ranges per entry into `wr` (colour +
+    // active Z) and `rd` (texture + CLUT) as the batch is captured — on the PARSE thread, for the
+    // drain scheduler, at no cost to the executor — and `g260ExecuteAll` publishes the executing
+    // batch's pair as `g_g528Wr` / `g_g528Rd`. If the aggregate does not overlap the surface, then
+    // by containment no individual entry can, and the whole scan is provably a no-op.
+    //
+    // These helpers are the containment test. They FAIL CLOSED — "I cannot decide" is reported as
+    // "may touch", so a caller that trusts them is never less conservative than the scan it
+    // replaces. `add()`'s capacity merge only ever widens an interval, which can likewise only
+    // turn a skippable scan into an executed one.
+    //
+    // ⛔ ROLLBACK: DC2_G735_NO_PUBGATE=1 restores every scan unconditionally.
+    bool g735PubGateOn()
+    {
+        static const bool on = !envFlagEnabled("DC2_G735_NO_PUBGATE");
+        return on;
+    }
+
+    // ⭐ G735 gate census (DC2_G735_STAT=1). A gate that does not fire is indistinguishable from a
+    // gate that fires and saves nothing, and the first form of the G700 gate was exactly that
+    // (residb 2.155 -> 2.113, i.e. nothing). Count the REASON, not just the outcome.
+    std::atomic<uint64_t> g_g735G700Calls{0}, g_g735G700Skip{0}, g_g735G700Memo{0},
+        g_g735G700Entries{0}, g_g735G700Poison{0}, g_g735G700Overlap{0}, g_g735G700BadRange{0};
+
+    bool g735StatOn()
+    {
+        static const bool on = envFlagEnabled("DC2_G735_STAT");
+        return on;
+    }
+
+    void g735NoteG700Memo()
+    {
+        if (g735StatOn())
+            g_g735G700Memo.fetch_add(1u, std::memory_order_relaxed);
+    }
+
+    // ⭐⭐⭐ G735 — WHAT `residb` ACTUALLY IS. Three readings disagreed and one of them had to be
+    // wrong:
+    //   * `[G720:cpu] residb` = 2.06-2.26 ms/f, i.e. 46 us per flush, for 124 lines of predicates;
+    //   * `DC2_G524_NO_TRNMAT=1` (delete ONE `g261PrepareCpuReplay()` call in that span) takes it
+    //     to 0.026 ms/f — which says the call IS the span;
+    //   * but `[G700:auth] live=0 acquires=0 renders=0 mats=0` says G700 is entirely INERT on this
+    //     route, `[G261:stat] mat(...)=0` says nothing is ever published, and `[G735:pubgate]`
+    //     never printed at all, which says `g261PrepareCpuReplay`'s per-entry loop is not even
+    //     reached.
+    // A call that is provably a no-op cannot cost 46 us. This prices it DIRECTLY instead of by
+    // subtraction: one `steady_clock` pair per call, only when `DC2_G735_STAT=1`, plus a count of
+    // which of the five transient-contract branches fired. Prints at n==1 as well as periodically
+    // (G657 measurement law 10: a period-only reporter cannot tell "zero" from "fewer than one
+    // period").
+    std::atomic<uint64_t> g_g735TrnCalls{0}, g_g735TrnNs{0}, g_g735TrnBySite[6]{};
+
+    void g735NoteTrnPub(uint32_t site, uint64_t ns)
+    {
+        const uint64_t n = g_g735TrnCalls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        g_g735TrnNs.fetch_add(ns, std::memory_order_relaxed);
+        if (site < 6u)
+            g_g735TrnBySite[site].fetch_add(1u, std::memory_order_relaxed);
+        if (n != 1ull && (n % 4096ull) != 0ull)
+            return;
+        const uint64_t total = g_g735TrnNs.load(std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "[G735:trnpub] calls=%llu totalMs=%.1f usPerCall=%.3f "
+                     "site(g286=%llu trnpub=%llu g570=%llu g586=%llu g587=%llu g604=%llu)\n",
+                     (unsigned long long)n, (double)total / 1.0e6,
+                     (double)total / 1.0e3 / (double)n,
+                     (unsigned long long)g_g735TrnBySite[0].load(std::memory_order_relaxed),
+                     (unsigned long long)g_g735TrnBySite[1].load(std::memory_order_relaxed),
+                     (unsigned long long)g_g735TrnBySite[2].load(std::memory_order_relaxed),
+                     (unsigned long long)g_g735TrnBySite[3].load(std::memory_order_relaxed),
+                     (unsigned long long)g_g735TrnBySite[4].load(std::memory_order_relaxed),
+                     (unsigned long long)g_g735TrnBySite[5].load(std::memory_order_relaxed));
+    }
+
+    std::atomic<uint64_t> g_g735G700Live{0}, g_g735G700Cand{0};
+
+    void g735NoteG700Gate(bool skipped, uint32_t reason, size_t entries,
+                          uint32_t liveDirty = 0u, uint32_t cand = 0u)
+    {
+        if (!g735StatOn())
+            return;
+        const uint64_t n = g_g735G700Calls.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        g_g735G700Live.fetch_add(liveDirty, std::memory_order_relaxed);
+        g_g735G700Cand.fetch_add(cand, std::memory_order_relaxed);
+        if (skipped)
+        {
+            g_g735G700Skip.fetch_add(1u, std::memory_order_relaxed);
+            g_g735G700Entries.fetch_add(entries, std::memory_order_relaxed);
+        }
+        if (reason & 1u)
+            g_g735G700Poison.fetch_add(1u, std::memory_order_relaxed);
+        if (reason & 2u)
+            g_g735G700Overlap.fetch_add(1u, std::memory_order_relaxed);
+        if (reason & 4u)
+            g_g735G700BadRange.fetch_add(1u, std::memory_order_relaxed);
+        // G657 measurement law 10: print at n==1 too, or "zero" and "fewer than one period" are
+        // indistinguishable — which is exactly how the first form of this census read as silent.
+        if (n != 1ull && (n % 4096ull) != 0ull)
+            return;
+        std::fprintf(stderr,
+                     "[G735:g700gate] calls=%llu skipped=%llu (%.1f%%) memo=%llu "
+                     "entriesSaved=%llu | slots liveDirty/call=%.2f cand/call=%.2f "
+                     "pruned=%.1f%% | blocked(poison=%llu overlap=%llu badRange=%llu)\n",
+                     (unsigned long long)n,
+                     (unsigned long long)g_g735G700Skip.load(std::memory_order_relaxed),
+                     100.0 * (double)g_g735G700Skip.load(std::memory_order_relaxed) / (double)n,
+                     (unsigned long long)g_g735G700Memo.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g735G700Entries.load(std::memory_order_relaxed),
+                     (double)g_g735G700Live.load(std::memory_order_relaxed) / (double)n,
+                     (double)g_g735G700Cand.load(std::memory_order_relaxed) / (double)n,
+                     g_g735G700Live.load(std::memory_order_relaxed)
+                         ? 100.0 * (1.0 - (double)g_g735G700Cand.load(std::memory_order_relaxed) /
+                                              (double)g_g735G700Live.load(std::memory_order_relaxed))
+                         : 0.0,
+                     (unsigned long long)g_g735G700Poison.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g735G700Overlap.load(std::memory_order_relaxed),
+                     (unsigned long long)g_g735G700BadRange.load(std::memory_order_relaxed));
+    }
+
+    // No entry of the executing batch can READ `b` (texture or CLUT).
+    bool g735BatchCannotRead(const G144BlockRange &b)
+    {
+        if (!g735PubGateOn())
+            return false;
+        const G260RangeSet *rd = g_g528Rd;
+        if (rd == nullptr || rd->unknown || !b.valid)
+            return false;
+        return !rd->overlaps(b);
+    }
+
+    // No entry of the executing batch can READ OR WRITE `b`. `wr.degen` is the zero-area colour
+    // entry: the scans treat an underivable colour range as "unknown ⇒ publish", and that entry
+    // does not poison `wr`, so the gate must refuse the skip when one is present.
+    bool g735BatchCannotTouch(const G144BlockRange &b)
+    {
+        if (!g735PubGateOn())
+            return false;
+        const G260RangeSet *wr = g_g528Wr;
+        const G260RangeSet *rd = g_g528Rd;
+        if (wr == nullptr || rd == nullptr || wr->unknown || rd->unknown || wr->degen || !b.valid)
+            return false;
+        return !wr->overlaps(b) && !rd->overlaps(b);
+    }
     // stats (quiet unless DC2_G260_STAT=1)
     uint64_t g_g260ExecByCause[8] = {};
     uint64_t g_g260BatchesExecuted = 0;
@@ -1340,6 +1515,10 @@ namespace
         bool g314Unknown = false;
         // color target (written and, under blending/fbmsk, read back) — scissor-bounded
         const G144BlockRange color = g144TargetRange(e);
+        // ⭐ G735: record the zero-area case too (see G260RangeSet::degen). One predicted store on
+        // a branch the capture already evaluates.
+        if (!color.valid)
+            g_g260OpenWr.degen = true;
         if (!color.valid &&
             e.ctx.scissor.x1 >= e.ctx.scissor.x0 && e.ctx.scissor.y1 >= e.ctx.scissor.y0)
         {
@@ -2954,6 +3133,32 @@ std::atomic<uint64_t> g_g178Flushes{0}, g_g178GpuFlushes{0}, g_g178Fallbacks{0};
 std::atomic<uint64_t> g_g178TexDecodes{0}, g_g178TexHits{0}, g_g178TexHashHits{0};
 std::atomic<uint64_t> g_g178FbUploads{0}, g_g178FbUploadSkips{0};
 std::atomic<uint64_t> g_g178RejectState{0}, g_g178RejectBlend{0}, g_g178RejectTex{0};
+// ⛔⛔⛔ G741: THE `rej(...)` COLUMN MIXED TWO DENOMINATORS, AND THE FIRST CENSUS CAUGHT IT.
+//
+// `[G178:stat]`'s first-ever reading on a ship-config binary (dungeon1) printed
+// `fallback=104 ... rej(state=206 blend=0 tex=2)` — `state` is TWICE a quantity it is a subset of.
+// It cannot be: a whole-flush refusal happens at most once per flush.
+//
+// The cause is that the three counters above are each incremented from BOTH tiers of the GPU
+// admission, which are different events:
+//   * PER ENTRY, inside `g178ClassifyEntry` — 10 sites for `state` (frame/atest/scissor/...), 1 for
+//     `blend`, 1 for `tex`, all in rasterizer_rtt_census_and_waves.inc. One flush of ~350 entries
+//     can raise these 350 times. These were always unconditional, so this half has always been live.
+//   * PER FLUSH, at a `return false` out of `g178TryFlushGpu` — 2 sites for `state`, 1 for `tex`, in
+//     rasterizer_vram_materialization.inc. This half was dead behind `g684DiagAdd` until G741.
+//
+// So the column was the SUM of an entry count and a flush count, and dividing it by either
+// denominator was meaningless. While the per-flush half read zero the defect was invisible;
+// un-gating it is what made the contradiction printable.
+//
+// ⭐ Rule (G741-2): a refusal counter must name its EVENT, not just its reason. Two tiers of the
+// same admission are two populations; summing them into one field makes every rate derived from it
+// wrong, and the error only surfaces when both halves are live.
+//
+// Fixed by giving the per-FLUSH tier its own counters. The per-entry counters keep their names and
+// their meaning (they are the `[G262:*]` classifier population), and `[G178:stat]` now prints the
+// two groups separately, each beside the denominator it can legally be divided by.
+std::atomic<uint64_t> g_g741RejFlushState{0}, g_g741RejFlushTex{0};
 
 // GSRasterizer::lookupCLUT reads the CLUT WINDOW (cbw/cou/cov) from `gs->m_texclut` and the
 // alpha-key from `gs->m_texa` -- both LIVE state, correct for CPU inline/replay callers (which

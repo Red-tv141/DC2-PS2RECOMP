@@ -1506,6 +1506,7 @@ static std::atomic<uint64_t> s_g438TickSeq{0ull};
 
 // G456 runs twice per sprite on the GS worker. Memo the attribution RMW once per
 // frame; relaxed arm/sequence loads remain cheap and are paid by both paired arms.
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g456UvPredicateArm()
 {
     if (g419AbLever() != static_cast<int>(kG456LeverUvPredicate))
@@ -1520,6 +1521,7 @@ int g456UvPredicateArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 // G473 runs once in the GS worker's frame-boundary latch. A/B selection always forces the exact
 // scalar/candidate pair. The exact SIMD path is promoted default-on; the rollback restores scalar.
@@ -1540,6 +1542,7 @@ int g473SimdMergeArm()
 // distinct page) and 0 for the control (the old per-px pair), or -1 when this lever is not selected
 // so the sites fall through to their own default/rollback flag. Called ~10-20k/f on the GS worker,
 // so it records the arm-used bit at most once per A/B tick like G475 rather than on every call.
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g476PageBumpArm()
 {
     if (g419AbLever() != static_cast<int>(kG476LeverPageBump))
@@ -2104,6 +2107,7 @@ int g515NopPeelArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 // G516: the three decode-time-dispatch arms. Same contract as every block arm above — read ONCE
 // per run() on the VU1 worker, per-frame-sequence memo, G438 block hold. Control arm is 12 (the
@@ -2159,6 +2163,7 @@ int g517IndArm() { return g517ArmFor(static_cast<int>(kG517LeverInd)); }
 
 // G531: VU1 compiled-block flag-consumer tail. Called once per run(), never per pair; the shared
 // helper marks the arm used once per frame on the VU1 worker just like the older block-body arms.
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g531FlagTailArm()
 {
     if (g419AbLever() != static_cast<int>(kG531LeverFlagTail))
@@ -2719,6 +2724,7 @@ int g519CullCmpArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 // PROMOTED DEFAULT-ON (G519). Four paired gates at 3,600 frames each, in the HIGH state
 // (backend 8.3-8.4) the phase was scoped in:
@@ -2787,6 +2793,7 @@ void g519VerifyCull(float cx, float fx, float cy, float fy,
 // G506 priced at 0.030 host cycles per instruction. The per-frame-sequence memo keys on the
 // SEQUENCE, never on the arm value (G501 §6). Returns -1 when not under this A/B so the caller can
 // tell "shipped default" (-1) from "control arm" (0) and gate BEHAVIOUR on the arm VALUE (G504).
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g520MacScanArm()
 {
     if (g419AbLever() != static_cast<int>(kG520LeverMacScan))
@@ -2801,6 +2808,7 @@ int g520MacScanArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 // The shipped default (see the kG520LeverMacScan comment for the exactness argument). Consulted
 // through a cached static so the default path never pays a getenv (G268/G500's law).
@@ -2844,6 +2852,7 @@ void g520NoteResolve(uint32_t fastVal, uint32_t legacyVal, long long target)
 // per-frame memo below marks the frame from that thread — which is correct and necessary: the arm
 // must be attributed on whichever thread consumes it, and 6 relaxed RMWs per frame is nothing
 // (17a law 7c's instrument-cost corollary bites at thousands per frame, not six).
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g491RbFmtArm()
 {
     if (g419AbLever() != static_cast<int>(kG491LeverRbFmt))
@@ -3046,6 +3055,7 @@ int g510ClsMemoArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 // G510 shipped-default predicates. The A/B arm always wins when this phase's gate is armed, so the
 // paired measurement is valid whichever way the default points; the env flags are the standalone
@@ -3071,6 +3081,7 @@ bool g510ClsMemoActive()
 // G522 local->local publication-skip arm. Read once per l2l edge (~10.8/frame on the GS worker),
 // on BOTH arms, so it adds a constant to each bucket and cannot bias the delta (G486 §4).
 // Never key the per-frame memo on the arm VALUE (G501).
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g522L2lSkipArm()
 {
     const int sel = g419AbLever();
@@ -3086,6 +3097,7 @@ int g522L2lSkipArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 // Gate the per-arm BEHAVIOUR on the arm VALUE, never on `arm != 0` (G504's law): -1 means the run
 // is not under this A/B and the shipped default (plus its rollback flag) decides.
@@ -3126,6 +3138,7 @@ void g522NoteEdge(bool skipped)
 // G521 capture in-place arm. Same shape, same rate and same thread as G510's capmove arm (once per
 // captured primitive, ~9,927/frame on the GS worker), and read on BOTH arms, so it adds a constant
 // to each bucket and cannot bias the delta. Never key the per-frame memo on the arm VALUE (G501).
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g521CapInPlaceArm()
 {
     const int sel = g419AbLever();
@@ -3141,6 +3154,7 @@ int g521CapInPlaceArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 bool g521CapInPlaceActive()
 {
@@ -3197,6 +3211,7 @@ std::atomic<uint64_t> g_g510Flushes{0};
 // pollute the measured loop; G502's per-item-census bias, avoided by construction).
 // Candidate arm (1) = skip the `s_batchKeys` hash probe when this entry's effective texture key is
 // the one the previous iteration already proved present in the set.
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g511TexRunArm()
 {
     if (g419AbLever() != static_cast<int>(kG511LeverTexRun))
@@ -3229,6 +3244,7 @@ int g511TexProbeArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 // G511: NOT PROMOTED — default OFF, opt-in with DC2_G511_TEXRUN=1.
 // The lever is exact and removes real work, but G511 §4 PRICED the work it removes with an
@@ -3256,6 +3272,7 @@ bool g511TexProbeActive()
 
 // G511 INFLATION probe #2 arm — read once per GPU FLUSH on the GS WORKER thread, same shape as the
 // two above. Arm 1 repeats the G510 state-identity comparison once more per graph entry.
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g511ClsProbeArm()
 {
     if (g419AbLever() != static_cast<int>(kG511LeverClsProbe))
@@ -3270,6 +3287,7 @@ int g511ClsProbeArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 bool g511ClsProbeActive()
 {
@@ -3327,6 +3345,7 @@ std::atomic<uint64_t> g_g511Sink{0};
 // bool, so the ~326,000 texels it gates never see the accessor (G502's per-item-census bias,
 // avoided by construction). Same per-frame thread-local tick-sequence memo as every other
 // thread-level arm.
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g512FastDecArm()
 {
     if (g419AbLever() != static_cast<int>(kG512LeverFastDec))
@@ -3341,6 +3360,7 @@ int g512FastDecArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 // G504's law: gate per-arm BEHAVIOUR on the arm VALUE, never on `arm != 0` alone — and keep the
 // env rollback on the SAME accessor so a paired run and a forced run cannot disagree about which
@@ -3360,6 +3380,7 @@ bool g512FastDecActive()
 // Read ONCE per g178HashPages call (~23/frame) and passed down as a plain bool, so the ~9,200
 // 64-byte loop iterations it gates never see the accessor (G502's per-item-census bias, avoided by
 // construction). Same per-frame thread-local tick-sequence memo as every other thread-level arm.
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g513HashLaneArm()
 {
     if (g419AbLever() != static_cast<int>(kG513LeverHashLane))
@@ -3374,6 +3395,7 @@ int g513HashLaneArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 // G504's law: gate per-arm BEHAVIOUR on the arm VALUE, never on `arm != 0` alone — and keep the env
 // rollback on the SAME accessor so a paired run and a forced run cannot disagree about which body
@@ -3469,6 +3491,7 @@ void g512PsmNote(uint8_t psm, uint64_t pixels, bool fast, int texW, int texH, in
 // G496b GL-state-elision arm, read once per render batch on the GL BACKEND WORKER thread
 // (~34 reads/frame). Candidate arm (1) = elide GL calls that set the value GL already holds. Same
 // per-frame thread-local tick-sequence memo as every other thread-level arm.
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g496GlStateArm()
 {
     if (g419AbLever() != static_cast<int>(kG496LeverGlState))
@@ -3483,6 +3506,7 @@ int g496GlStateArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 // G492 WORKLOAD INVARIANT (17a law 22). A ceiling probe that deletes work in an incorrect-output
 // arm is only a price if the GUEST ran the same amount of work on both arms. This counts, per arm
@@ -3511,6 +3535,7 @@ void g492NoteEdge(int edge, unsigned long long draws, unsigned long long skipped
 // G482 price-only arm, read once per geometry kick on the VU1 worker (~1,230/f). Same G438 block
 // hold as every other thread-level arm: the memo key is a per-kick cost, so the arm must not
 // alternate inside a pipelined window or the injected work leaks across arms (G438).
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g482MemoHashArm()
 {
     if (g419AbLever() != static_cast<int>(kG482LeverMemoHash))
@@ -3637,8 +3662,10 @@ int g672RowPairArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 bool g438SlowLeverSelected(int which);
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g438SlowArm(int which)
 {
     const int want = (which == 0) ? static_cast<int>(kG438LeverVu1Slow)
@@ -3696,6 +3723,7 @@ int g503ChainPoolArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 bool g438SlowLeverSelected(int which)
 {
@@ -3709,6 +3737,7 @@ bool g438SlowLeverSelected(int which)
 // selected lever (the site then honours the always-on DC2_G439_COALESCE value), 0 on a control
 // frame, 1 on a candidate frame. The call site is GifArbiter::drain(), ~1,600 times per frame, so
 // the `used` bit must not be an unconditional cross-core RMW.
+#if !defined(DC2_G736_INLINE_ARMS)  // G736: shipping builds get the inline `-1` form
 int g439CoalesceArm()
 {
     if (g419AbLever() != static_cast<int>(kG439LeverCoalesce))
@@ -3798,6 +3827,7 @@ int g445KickAllArm()
     }
     return arm != 0u ? 1 : 0;
 }
+#endif // !DC2_G736_INLINE_ARMS
 
 
 // How many extra idempotent repetitions this frame's site should perform (ballast mode only).
@@ -3854,6 +3884,37 @@ static void g419AbTick()
     static uint64_t s_g492Flush[2]{}, s_g492Fb[2]{};
     static uint64_t s_g492LastFlush = 0ull, s_g492LastFb = 0ull;
     {
+        // ⛔⛔⛔ G737 FOUND THIS INVARIANT COULD NOT MEASURE AND FAILED SILENTLY. ⭐ G741 FIXED THE
+        // ⛔⛔⛔ CAUSE INSTEAD OF THE SYMPTOM — and found that the stated reason for the cause was
+        // ⛔⛔⛔ FALSE. The history is kept because the reasoning is the lesson.
+        //
+        // WHAT G737 SAW. `g_g178Flushes` and `g_g178Fallbacks` were incremented through
+        // `g684DiagAdd`, which is `(void)counter` unless PS2X_G684_HOT_DIAG. `PS2X_G419_DIAG` and
+        // `PS2X_G684_HOT_DIAG` are INDEPENDENT options, both default OFF — so the ordinary way to
+        // build this instrument (`-DPS2X_G419_DIAG=ON` alone) produced a workload invariant whose
+        // two columns were identically ZERO on both arms. A workload invariant exists to prove the
+        // arms did the same work; one that reads 0 == 0 ALWAYS PASSES, and its pass is
+        // indistinguishable from a real one.
+        //
+        // ⛔ WHAT IT GOT WRONG. G737 chose to abstain loudly rather than move the counters, on this
+        // reasoning: *"making 26 PER-ENTRY increments unconditional would tax the shipped hot path
+        // (and Rule 63 bites — a fallback count is exactly the quantity an A/B lever changes)"*.
+        //
+        // **They are not per-entry.** G741 read all 26 sites: every one sets `g_g266FlushRej`, calls
+        // `g581InvalidateCpuFallbackSnapshots()` and `return false` OUT of `g178TryFlushGpu`, so at
+        // most ONE can fire per flush, and the measured flush rate is ~44/frame (G735 §1). The cost
+        // objection was wrong by the ratio between a per-entry population (~16,000/frame) and a
+        // per-flush one (~44) — and Rule 63's own arithmetic then clears it: the most a
+        // fallback-reducing lever can move is ~44 relaxed atomic adds per frame, ~1 us/frame,
+        // four orders of magnitude under this host's 0.4 ms/f arm-independent spread. That is the
+        // identical argument G736 §2 used to make `[G261:stat] fboRej` unconditional.
+        //
+        // ⭐ Rule (G741-1): before gating a counter on cost, COUNT HOW OFTEN IT CAN FIRE. "Per
+        // entry" and "per flush" differ by 350x here, and the guess cost two phases the only
+        // instrument that could see the GPU/CPU routing decision.
+        //
+        // The columns below are now live on every build (`g741ShipAdd`), so this abstention is gone
+        // and the invariant measures what its name claims.
         const int a492 = g_g419AbArm.load(std::memory_order_relaxed) != 0u ? 0 : 1;
         const uint64_t fl = g_g178Flushes.load(std::memory_order_relaxed);
         const uint64_t fb = g_g178Fallbacks.load(std::memory_order_relaxed);
@@ -3993,12 +4054,29 @@ static void g419AbTick()
         g419AbLever() == static_cast<int>(kG492LeverNoOther))
     {
         char inv[2][320];
+        // ⭐ G737: `flush=`/`fallback=` come from counters that are compile-gated on
+        // PS2X_G684_HOT_DIAG (see the note at their read site above). When that option is OFF they
+        // are identically zero on BOTH arms, so printing `flush=0.0 fallback=0.00` would show a
+        // perfect workload match that was never measured. Print `n/a` instead — the rest of the
+        // invariant (`render`/`rdcol`/`wrcol`/`copy`/`other`/`draws`) uses `g_g492Edge`/`g_g492Draws`,
+        // which are unconditional and still mean what they say.
+        char fbTail[64];
         for (int a = 0; a < 2; ++a)
         {
             const double f = s_g492Frames[a] != 0u ? static_cast<double>(s_g492Frames[a]) : 1.0;
+            // ⚠️ Two separate calls, not one call with a swapped format string: passing a `double`
+            // to a `%s` conversion to make the arguments line up is undefined behaviour, not a
+            // clever no-op.
+#if defined(PS2X_G684_HOT_DIAG)
+            std::snprintf(fbTail, sizeof(fbTail), "flush=%.1f fallback=%.2f",
+                          static_cast<double>(s_g492Flush[a]) / f,
+                          static_cast<double>(s_g492Fb[a]) / f);
+#else
+            std::snprintf(fbTail, sizeof(fbTail), "flush=n/a fallback=n/a (HOT_DIAG off)");
+#endif
             std::snprintf(inv[a], sizeof(inv[a]),
                           "f=%llu render=%.1f/%.1f rdcol=%.1f wrcol=%.1f copy=%.1f "
-                          "other=%.1f/%.1f draws=%.0f flush=%.1f fallback=%.2f",
+                          "other=%.1f/%.1f draws=%.0f %s",
                           static_cast<unsigned long long>(s_g492Frames[a]),
                           g_g492Edge[a][0].load(std::memory_order_relaxed) / f,
                           g_g492Skip[a][0].load(std::memory_order_relaxed) / f,
@@ -4008,8 +4086,7 @@ static void g419AbTick()
                           g_g492Edge[a][4].load(std::memory_order_relaxed) / f,
                           g_g492Skip[a][4].load(std::memory_order_relaxed) / f,
                           g_g492Draws[a].load(std::memory_order_relaxed) / f,
-                          static_cast<double>(s_g492Flush[a]) / f,
-                          static_cast<double>(s_g492Fb[a]) / f);
+                          fbTail);
         }
         std::fprintf(stderr, "[G492:inv] cand(%s) | ctrl(%s)\n", inv[0], inv[1]);
     }

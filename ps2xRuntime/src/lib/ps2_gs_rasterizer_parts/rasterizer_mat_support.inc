@@ -896,6 +896,172 @@ static void g661NoteConsumerScope(const G144Entry &e, const G261Res &r)
 }
 #endif
 
+// ==============================================================================================
+// ⭐⭐⭐ G735 — THE AGGREGATE PUBLICATION GATE
+// ==============================================================================================
+//
+// MEASURED, ON THE SHIPPED BINARY (not a diag build — `DC2_G720_PROFILE` is a 1/32-sampled
+// production timer). `dungeon1`, 5161 frames, avgFrameMs 19.37, 44.4 flushes/frame:
+//
+//     submit 4.959   residb 2.061   deps 1.818   verts 1.251   fbz 1.000   preflight 0.748
+//     post 0.407     tex 0.357      resid 0.271  clswin 0.076  class 0.007  resida 0.008
+//
+// `residb` — the G700-candidacy / transient-contract prologue, lines 199..323 of
+// rasterizer_vram_materialization.inc — is the SECOND LARGEST stage of the whole flush and the
+// largest one with no draw in it. Its whole body is five branches that each call this function.
+//
+// And this function publishes NOTHING. `[G261:stat]` over the same route:
+//
+//     waves=28672 rbSkip=28672 fboBind=1304629 mat(cpu=0 inl=0 up=0 l2l=0 l2h=0 tex=0 rsync=0 fail=0)
+//     [G261:res] 139(mat=0 win=0..447 dirty=1) 13c(mat=0 ... dirty=0) ... (13 more, all clean)
+//
+// ⇒ exactly ONE resident target (0x139) is dirty, permanently; `g261AnyDirty()` is therefore always
+// true, so the early-out below never fires; the loop then re-derives FOUR block ranges per entry
+// (`g144TargetRange`, `g254DepthSurface`, `g144TextureRange`, `g144ClutRange`) across ~278 entries
+// per flush, tests them against 0x139, and materialises **zero** times in 28,672 flushes.
+// That is ~2 ms/f of the pole thread — 10% of the frame — spent proving a negative.
+//
+// THE FIX IS NOT A FASTER SCAN, IT IS NOT DOING IT. The batch already carries the answer: its
+// `wr` set is the union of every entry's colour+depth range and its `rd` set is the union of every
+// entry's texture+CLUT range, both accumulated for free on the PARSE thread by `g260NoteAppend`
+// (they exist so the drain scheduler can prove independence) and published for the executing batch
+// as `g_g528Wr` / `g_g528Rd`. If no dirty target's range overlaps `wr ∪ rd`, then by containment no
+// individual entry's range can overlap it either, and the scan is provably a no-op.
+//
+// EXACTNESS. The per-entry loop materialises target `i` when
+//     anyUnknown || !r.range.valid || hitColor || hitDepth || hitTex || hitClut
+// The gate refuses to skip when ANY of the following holds, which covers every one of those terms:
+//   * the batch range sets are unavailable (a path that did not come through the graph);
+//   * `wr.unknown` — set by `g260NoteAppend` for an underivable colour or depth range, i.e. the
+//     `!color.valid` (non-degenerate scissor) and `depth.active && !depth.range.valid` halves of
+//     `anyUnknown`;
+//   * `rd.unknown` — its `tme && !tex.valid` half (and the CLUT case, which the loop only uses for
+//     `hitClut`);
+//   * `wr.degen` — the remaining half of `anyUnknown`: a zero-area entry whose colour range is
+//     invalid but which does not poison the set (see G260RangeSet::degen);
+//   * any dirty target with an invalid range (`!r.range.valid` → `hitUnknown`);
+//   * any dirty target whose range overlaps `wr` or `rd`.
+// Over-coverage in the sets is safe in the only direction that matters: `add()` merges on capacity
+// overflow, which can only make the gate refuse a skip it could have taken.
+//
+// ARMS
+//   DC2_G735_NO_PUBGATE=1   ⛔ ROLLBACK — restore the unconditional per-entry scan
+//   DC2_G735_PUBGATE_VFY=1  ORACLE — when the gate says SKIP, run the loop's decision logic anyway
+//                           (never the materialise) and report any entry/target pair that would
+//                           have published. `bad=` must stay 0; it is printed beside `checks=` so a
+//                           clean verdict can never be quoted from an arm that never ran (G589).
+//   DC2_G735_STAT=1         `[G735:pubgate]` census every 8192 calls
+// ==============================================================================================
+static std::atomic<uint64_t> g_g735PubCalls{0}, g_g735PubSkipped{0}, g_g735PubEntriesSaved{0},
+    g_g735PubVfyChecks{0}, g_g735PubVfyBad{0};
+
+static bool g735PubGateVerifyOn()
+{
+    static const bool on = envFlagEnabled("DC2_G735_PUBGATE_VFY");
+    return on;
+}
+static bool g735PubStatOn()
+{
+    static const bool on = envFlagEnabled("DC2_G735_STAT") || g735PubGateVerifyOn();
+    return on;
+}
+
+// True ⇒ the per-entry publication scan below provably materialises nothing and may be skipped.
+static bool g735PubScanSkippable()
+{
+#if defined(PS2X_G661_DIAG)
+    return false; // the diagnostic build's per-entry samplers must keep seeing every entry
+#else
+    if (!g735PubGateOn())
+        return false;
+    for (uint32_t i = 0; i < kG248TargetCount; ++i)
+    {
+        const G261Res &r = g_g261Res[i];
+        if (!r.dirty)
+            continue;
+        // `!r.range.valid` is the loop's `hitUnknown` arm; g735BatchCannotTouch already fails
+        // closed on it, together with a null/poisoned/degenerate aggregate.
+        if (!g735BatchCannotTouch(r.range))
+            return false;
+    }
+    return true;
+#endif
+}
+
+// The oracle. Replays the loop's DECISION for every (entry, dirty target) pair without ever
+// calling g261Materialize, so a gate that skipped a real publication is caught by construction.
+static void g735PubGateVerify()
+{
+    uint64_t bad = 0u;
+    for (const G144Entry &e : g_g144List)
+    {
+        const G144BlockRange color = g144TargetRange(e);
+        const G254Surface depth = g254DepthSurface(e);
+        const bool tme = e.prim.tme;
+        const G144BlockRange tex = tme ? g144TextureRange(e) : G144BlockRange{};
+        const G144BlockRange clut =
+            (tme && g144IsPalettedPsm(e.ctx.tex0.psm)) ? g144ClutRange(e) : G144BlockRange{};
+        const bool anyUnknown = !color.valid || (depth.active && !depth.range.valid) ||
+                                (tme && !tex.valid);
+        for (uint32_t i = 0; i < kG248TargetCount; ++i)
+        {
+            const G261Res &r = g_g261Res[i];
+            if (!r.dirty)
+                continue;
+            if (anyUnknown || !r.range.valid || g144RangeOverlaps(r.range, color) ||
+                (depth.active && g144RangeOverlaps(r.range, depth.range)) ||
+                (tme && g144RangeOverlaps(r.range, tex)) ||
+                (clut.valid && g144RangeOverlaps(r.range, clut)))
+                ++bad;
+        }
+    }
+    g_g735PubVfyChecks.fetch_add(1u, std::memory_order_relaxed);
+    if (bad != 0u)
+    {
+        const uint64_t n = g_g735PubVfyBad.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        if (n <= 16u || (n % 256u) == 0u)
+            std::fprintf(stderr,
+                         "[G735:pubgate] ⛔ BAD n=%llu hits=%llu entries=%zu — the aggregate gate "
+                         "skipped a scan that WOULD have published\n",
+                         (unsigned long long)n, (unsigned long long)bad, g_g144List.size());
+    }
+}
+
+static void g735PubStatReport()
+{
+    const uint64_t c = g_g735PubCalls.load(std::memory_order_relaxed);
+    if (c != 1ull && (c % 4096ull) != 0ull)
+        return; // G657 law 10: n==1 too, or silence cannot be told from a short run
+    std::fprintf(stderr,
+                 "[G735:pubgate] calls=%llu skipped=%llu (%.1f%%) entriesSaved=%llu "
+                 "vfyChecks=%llu bad=%llu\n",
+                 (unsigned long long)c,
+                 (unsigned long long)g_g735PubSkipped.load(std::memory_order_relaxed),
+                 c ? 100.0 * (double)g_g735PubSkipped.load(std::memory_order_relaxed) / (double)c
+                   : 0.0,
+                 (unsigned long long)g_g735PubEntriesSaved.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g735PubVfyChecks.load(std::memory_order_relaxed),
+                 (unsigned long long)g_g735PubVfyBad.load(std::memory_order_relaxed));
+}
+
+// ⭐ G735: price `g261PrepareCpuReplay` DIRECTLY at its five transient-contract call sites, so the
+// `residb` stage stops being attributed by subtraction (see g735NoteTrnPub). Behaviour-pure: when
+// `DC2_G735_STAT` is absent this is one predicted branch and a tail call.
+static void g261PrepareCpuReplay();
+static inline void g735TrnPub(uint32_t site)
+{
+    if (!g735StatOn())
+    {
+        g261PrepareCpuReplay();
+        return;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    g261PrepareCpuReplay();
+    g735NoteTrnPub(site, static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now() - t0).count()));
+}
+
 static void g261PrepareCpuReplay()
 {
     g716PrepareCpuBatch();
@@ -905,6 +1071,27 @@ static void g261PrepareCpuReplay()
     g700PrepareForBatch(g_g144List);
     if (!g261WaveOn() || !g261AnyDirty() || g_g144List.empty())
         return;
+    // ⭐⭐⭐ G735 — see the header above this function. One O(targets) test replaces an O(entries ×
+    // targets) scan that measured 2.061 ms/f and published nothing in 28,672 flushes.
+    {
+        const bool g735Stat = g735PubStatOn();
+        if (g735Stat)
+            g_g735PubCalls.fetch_add(1u, std::memory_order_relaxed);
+        if (g735PubScanSkippable())
+        {
+            if (g735Stat)
+            {
+                g_g735PubSkipped.fetch_add(1u, std::memory_order_relaxed);
+                g_g735PubEntriesSaved.fetch_add(g_g144List.size(), std::memory_order_relaxed);
+                if (g735PubGateVerifyOn())
+                    g735PubGateVerify();
+                g735PubStatReport();
+            }
+            return;
+        }
+        if (g735Stat)
+            g735PubStatReport();
+    }
     for (const G144Entry &e : g_g144List)
     {
 #if defined(PS2X_G661_DIAG)
@@ -943,6 +1130,60 @@ static void g261PrepareCpuReplay()
                 // span, so reading it afterwards measures nothing (G657 measurement law 10).
                 g661NoteConsumerScope(e, r);
 #endif
+                // ⭐⭐⭐ G737: PRICE THE PRIMITIVE-EXTENT COLOUR RANGE, before building it.
+                //
+                // `color` above is `g144TargetRange(e)`, which is built from the WHOLE SCISSOR
+                // (rasterizer_draw_prim_probe.inc:242 — `x0/y0` and `w/h` are the scissor's), while
+                // this entry's own post-scissor row band is already sitting in `e.minY/e.maxY` and
+                // has been shipped since the band-overlap prefilter. `[G266:cpuShape]` measured
+                // 95.6% of this cause as ONE untextured SPRITE into 0x13b with `rej=none`, i.e. a
+                // pure range-overlap decision — so the scissor-vs-primitive gap is exactly the
+                // question. Census only; the shipped predicate above is untouched.
+                if (g737TexRejectOn() && hitColor && color.valid)
+                {
+                    const int yLo = std::max(static_cast<int>(e.ctx.scissor.y0), e.minY);
+                    const int yHi = std::min(static_cast<int>(e.ctx.scissor.y1), e.maxY);
+                    bool narrowHit = true; // fail CLOSED: an empty/invalid band keeps the hit
+                    if (yHi >= yLo)
+                    {
+                        const G144BlockRange narrow = g144RangeForRect(
+                            framePageBaseToBlock(e.ctx.frame.fbp), e.ctx.frame.psm,
+                            e.ctx.frame.fbw, static_cast<uint32_t>(e.ctx.scissor.x0),
+                            static_cast<uint32_t>(yLo),
+                            (e.ctx.scissor.x1 >= e.ctx.scissor.x0)
+                                ? static_cast<uint32_t>(e.ctx.scissor.x1 - e.ctx.scissor.x0) + 1u
+                                : 0u,
+                            static_cast<uint32_t>(yHi - yLo + 1));
+                        narrowHit = !narrow.valid || g144RangeOverlaps(r.range, narrow);
+                    }
+                    g737NoteCpuColorNarrow(true, narrowHit, r.dirtyHi - r.dirtyLo + 1);
+                }
+                // ⭐ G737: the row-scope CEILING for this cause, measured before anything is built.
+                // This publication reads back `[dirtyLo..dirtyHi]` whole (446 rows/call on
+                // `dungeon1`, the widest of the five causes) while the entry that forced it can only
+                // touch the union of its own four ranges. Fails closed: an unknown range charges the
+                // whole window, exactly as the publication itself does.
+                if (g737TexRejectOn())
+                {
+                    uint32_t bandLo = 0xFFFFFFFFu, bandHi = 0u;
+                    bool bandValid = !hitUnknown;
+                    const G144BlockRange *g737Rngs[4] = {&color, &depth.range, &tex, &clut};
+                    const bool g737Use[4] = {true, depth.active, tme, clut.valid};
+                    for (int g737k = 0; g737k < 4; ++g737k)
+                    {
+                        if (!g737Use[g737k])
+                            continue;
+                        if (!g737Rngs[g737k]->valid)
+                        {
+                            bandValid = false;
+                            break;
+                        }
+                        bandLo = std::min(bandLo, g737Rngs[g737k]->first);
+                        bandHi = std::max(bandHi, g737Rngs[g737k]->last);
+                    }
+                    g737NoteCpuScope(framePageBaseToBlock(kG261Fbp[i]), r.fbw, r.dirtyLo,
+                                     r.dirtyHi, bandLo, bandHi, bandValid && bandHi >= bandLo);
+                }
                 g261Materialize(static_cast<int>(i), kG261MatCpuReplay);
             }
         }

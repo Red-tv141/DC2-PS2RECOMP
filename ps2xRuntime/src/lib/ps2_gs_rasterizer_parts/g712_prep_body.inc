@@ -113,9 +113,18 @@ struct G712Prep
 };
 
 // ---------------------------------------------------------------------------------------------
-// Free list. Allocation and release happen ONLY on the GS worker thread (open at batch close,
-// release after the batch executed), so no lock is needed; a worker never touches this list.
+// Free list. In the shipped (non-pipelined) configuration allocation and release both happen on
+// the GS worker thread — open at batch close, release after the batch executed — so this list was
+// written lock-free.
+//
+// ⚠️ G723 changes that premise for ONE configuration. `DC2_G722_PREP_AT_PARSE=1` opens the record
+// on the PARSE thread (at `g713ParseFlushOpen`, which is ~10 ms of executor latency earlier than
+// batch adoption) while `g712PrepRelease` still runs on the EXEC thread. Two threads then touch
+// this list, so it takes a mutex. The lock is unconditional rather than armed: the cost is two
+// uncontended acquisitions per batch — roughly 90 per frame against a 10,000/frame capture — and a
+// conditionally-locked container is a far worse thing to own than that.
 // ---------------------------------------------------------------------------------------------
+static std::mutex g_g712FreeMtx;
 static std::vector<G712Prep *> g_g712Free;
 static uint64_t g_g712Posted = 0u, g_g712Served = 0u, g_g712Helped = 0u,
                 g_g712Waited = 0u, g_g712Rejected = 0u, g_g712Mismatch = 0u,
@@ -326,16 +335,17 @@ static G712Prep *g712PrepOpen(const G144Entry *entries, size_t n, uint32_t fbp, 
     if (g262CensusOn() || g265CensusOn() || g510CensusOn())
         return nullptr;
 
-    G712Prep *p;
-    if (!g_g712Free.empty())
+    G712Prep *p = nullptr;
     {
-        p = g_g712Free.back();
-        g_g712Free.pop_back();
+        std::lock_guard<std::mutex> lk(g_g712FreeMtx);
+        if (!g_g712Free.empty())
+        {
+            p = g_g712Free.back();
+            g_g712Free.pop_back();
+        }
     }
-    else
-    {
+    if (p == nullptr)
         p = new G712Prep();
-    }
     p->entries = entries;
     p->n = n;
     p->fbp = fbp;
@@ -375,7 +385,10 @@ static void g712PrepRelease(G712Prep *&p)
     }
     p->entries = nullptr;
     p->n = 0u;
-    g_g712Free.push_back(p);
+    {
+        std::lock_guard<std::mutex> lk(g_g712FreeMtx);
+        g_g712Free.push_back(p);
+    }
     p = nullptr;
 }
 
