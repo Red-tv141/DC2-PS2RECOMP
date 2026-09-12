@@ -2,6 +2,11 @@
 #include "VU.h"
 //TODO use glm
 
+#include <cstdlib>
+#include <cstring>
+// G675: the display-aspect / field-of-view configuration, shared with the presentation stage.
+#include "../../ps2_widescreen.inc"
+
 namespace ps2_stubs
 {
     void sceVu0ecossin(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
@@ -371,6 +376,32 @@ namespace ps2_stubs
         TODO_NAMED("sceVu0ClipScreen3", rdram, ctx, runtime);
     }
 
+    // ⭐ G675: the field-of-view expansion site. See ps2_widescreen.inc for the derivation of
+    // WHY mgRENDER_INFO's ASPECT matrix m00 is the horizontal-FOV term and why this stub is the
+    // place to change it (SetRenderInfo@0x00138B00 self-copies that matrix through here, after
+    // writing it and before any consumer reads it, and this stub is the runtime's — a static
+    // recompilation cannot be steered by patching the guest instruction).
+    //
+    // The predicate is STRUCTURAL, not an address literal: a self-copy (dst == src) of a matrix
+    // that is a unit matrix except for a positive, non-unit m11 is exactly the shape
+    // SetRenderInfo writes at 0x00138D78..0x00138DB8 and nothing else in the game produces it.
+    // The address is checked too, as a second opinion, and disagreement is reported rather than
+    // silently accepted.
+    bool g675IsProjectionAspectMatrix(const float *m)
+    {
+        if (m[0] != 1.0f)
+            return false;                       // m00 is the literal `lui v0,0x3f80`
+        if (!(m[5] > 0.0f) || m[5] == 1.0f)
+            return false;                       // m11 = 1792/(3*W), never 1 for a real width
+        if (m[10] != 1.0f || m[15] != 1.0f)
+            return false;                       // the rest is sceVu0UnitMatrix's output
+        const int offDiag[12] = {1, 2, 3, 4, 6, 7, 8, 9, 11, 12, 13, 14};
+        for (int i = 0; i < 12; ++i)
+            if (m[offDiag[i]] != 0.0f)
+                return false;
+        return true;
+    }
+
     void sceVu0CopyMatrix(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
     {
         const uint32_t dstAddr = getRegU32(ctx, 4);
@@ -380,6 +411,30 @@ namespace ps2_stubs
         if (dst && src)
         {
             std::memcpy(dst, src, sizeof(float) * 16u);
+
+            const float fovScaleX = dc2GetProjectionScaleX();
+            if (fovScaleX != 1.0f && dstAddr == srcAddr)
+            {
+                float m[16];
+                std::memcpy(m, dst, sizeof(m));
+                if (g675IsProjectionAspectMatrix(m))
+                {
+                    m[0] = fovScaleX;
+                    std::memcpy(dst, m, sizeof(m));
+                    static bool s_announced = false;
+                    if (!s_announced)
+                    {
+                        s_announced = true;
+                        // 0x00380EC0 is mgRenderInfo (mgSetRenderInfo@0x00143600 loads it as
+                        // `lui a0,0x38 ; addiu a0,a0,0xec0`); +0xD0 is the ASPECT matrix.
+                        std::fprintf(stderr,
+                                     "[G675:fov] aspect=%.4f fovScaleX=%.4f at guest 0x%08X "
+                                     "(expected mgRenderInfo+0xD0 = 0x00380F90)%s\n",
+                                     dc2GetDisplayAspect(), fovScaleX, dstAddr,
+                                     dstAddr == 0x00380F90u ? "" : "  <-- UNEXPECTED ADDRESS");
+                    }
+                }
+            }
         }
         setReturnS32(ctx, 0);
     }

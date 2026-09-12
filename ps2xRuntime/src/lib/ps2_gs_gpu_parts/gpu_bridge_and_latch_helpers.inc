@@ -1524,6 +1524,10 @@ bool g176_wait_frame_latched(uint64_t lastGen, uint32_t timeoutMs)
     });
 }
 
+// Private transfer contexts initialize their own members without resetting the
+// active GIF stream or publishing a presentation-latch generation.
+static thread_local bool s_g721PrivateTransferConstruction = false;
+
 GS::GS()
 {
     // F62: build the GSMem swizzle lookup tables once before any upload/sample

@@ -53,10 +53,13 @@ void GS::reset()
         m_hasHostPresentationFrame = false;
     }
     // G176: reset clears the snapshot — advance the generation so present re-reads it.
-    s_g176LatchGeneration.fetch_add(1ull, std::memory_order_release);
-    g176_notify_frame_latched();
-    s_pendingImageBytes = 0u;
-    s_f31UploadPresentationCandidate = {};
+    if (!s_g721PrivateTransferConstruction)
+    {
+        s_g176LatchGeneration.fetch_add(1ull, std::memory_order_release);
+        g176_notify_frame_latched();
+        s_pendingImageBytes = 0u;
+        s_f31UploadPresentationCandidate = {};
+    }
 
     for (int i = 0; i < 2; ++i)
     {

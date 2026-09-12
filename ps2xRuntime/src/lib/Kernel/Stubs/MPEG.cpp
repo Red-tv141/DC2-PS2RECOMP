@@ -1,4 +1,6 @@
 #include "Common.h"
+// G675: FMV must present at 4:3 — signal picture delivery to the presentation stage.
+#include "../../ps2_widescreen.inc"
 #include "MPEG.h"
 
 #if !defined(PS2X_HAS_FFMPEG)
@@ -2126,6 +2128,7 @@ namespace ps2_stubs
                 playback.lastFrame = frame;
                 playback.hasLastFrame = true;
                 haveFrame = true;
+                dc2NoteFmvPicture(); // G675: a movie is on screen -> present it at 4:3
                 if (g_mpeg_stub_state.pictureTraceCount < 32u)
                 {
                     PS2_IF_AGRESSIVE_LOGS({

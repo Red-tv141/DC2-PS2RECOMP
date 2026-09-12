@@ -43,51 +43,57 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         {
             s_g713Reg = true;
             g_g713RealGs = this;
-            G713GsHooks g713H;
-            g713H.xfer = +[](const G713XferSnap *s) {
+            g_g721PrepareTransfer = +[](const G713XferSnap *s) -> GS * {
                 GS *g = g_g713ExecGs;
                 if (g == nullptr)
                 {
-                    if (g_g713RealGs == nullptr)
-                        return;
+                    // GS::reset used to zero shared s_pendingImageBytes here,
+                    // halfway through consuming a continuation. Initialize only
+                    // this private context; preserve all parser-owned state.
+                    struct PrivateConstruction
+                    {
+                        PrivateConstruction() { s_g721PrivateTransferConstruction = true; }
+                        ~PrivateConstruction() { s_g721PrivateTransferConstruction = false; }
+                    } privateConstruction;
                     g = new GS();
                     g->m_vram = g_g713RealGs->m_vram;
                     g->m_vramSize = g_g713RealGs->m_vramSize;
                     g->m_privRegs = g_g713RealGs->m_privRegs;
                     g_g713ExecGs = g;
                 }
-                g->writeRegister(GS_REG_BITBLTBUF, s->bitbltbuf);
-                g->writeRegister(GS_REG_TRXPOS, s->trxpos);
-                g->writeRegister(GS_REG_TRXREG, s->trxreg);
-                // Runs performLocalToLocalTransfer when dir==2; a host->local TRXDIR only resets
-                // the transfer cursor.
-                g->writeRegister(GS_REG_TRXDIR, s->trxdir);
+                g->m_bitbltbuf.sbp = s->sbp;
+                g->m_bitbltbuf.sbw = static_cast<uint8_t>(s->sbw);
+                g->m_bitbltbuf.spsm = static_cast<uint8_t>(s->spsm);
+                g->m_bitbltbuf.dbp = s->dbp;
+                g->m_bitbltbuf.dbw = static_cast<uint8_t>(s->dbw);
+                g->m_bitbltbuf.dpsm = static_cast<uint8_t>(s->dpsm);
+                g->m_trxpos.ssax = static_cast<uint16_t>(s->ssax);
+                g->m_trxpos.ssay = static_cast<uint16_t>(s->ssay);
+                g->m_trxpos.dsax = static_cast<uint16_t>(s->dsax);
+                g->m_trxpos.dsay = static_cast<uint16_t>(s->dsay);
+                g->m_trxpos.dir = static_cast<uint8_t>(s->dir);
+                g->m_trxreg.rrw = static_cast<uint16_t>(s->rrw);
+                g->m_trxreg.rrh = static_cast<uint16_t>(s->rrh);
+                g->m_trxdir = s->trxdir;
+                if (s->resetProgress) g->m_hwregX = g->m_hwregY = 0;
+                return g;
+            };
+            G713GsHooks g713H;
+            g713H.xfer = +[](const G713XferSnap *s) {
+                GS *g = g_g721PrepareTransfer(s);
+                if (s->trxdir == 2u) g->performLocalToLocalTransfer();
                 if (g_g713RealGs)
                     g_g713RealGs->m_lastDisplayBaseBytes = g->m_lastDisplayBaseBytes;
             };
             g713H.image = +[](const G713XferSnap *s, const uint8_t *data, uint32_t bytes) {
-                GS *g = g_g713ExecGs;
-                if (g == nullptr)
-                {
-                    if (g_g713RealGs == nullptr)
-                        return;
-                    g = new GS();
-                    g->m_vram = g_g713RealGs->m_vram;
-                    g->m_vramSize = g_g713RealGs->m_vramSize;
-                    g->m_privRegs = g_g713RealGs->m_privRegs;
-                    g_g713ExecGs = g;
-                }
-                if (s->resetProgress)
-                {
-                    g->writeRegister(GS_REG_BITBLTBUF, s->bitbltbuf);
-                    g->writeRegister(GS_REG_TRXPOS, s->trxpos);
-                    g->writeRegister(GS_REG_TRXREG, s->trxreg);
-                    g->writeRegister(GS_REG_TRXDIR, s->trxdir);
-                }
+                GS *g = g_g721PrepareTransfer(s);
                 g->processImageData(data, bytes);
             };
             g713SetGsHooks(g713H);
             g_g713L2hThunk = +[](void *p) { static_cast<GS *>(p)->performLocalToHostToBuffer(); };
+            // All hooks exist now, and no packet operation has yet adopted GL.
+            // Worker startup is too early; the first frame boundary is too late.
+            g713_raster_arm();
         }
     }
 
@@ -914,7 +920,6 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_BITBLTBUF:
     {
-        g_g713RawBitbltbuf = value; // G713: raw latch for exec replay (parse thread only)
         const uint32_t prevDbp = m_bitbltbuf.dbp;
         const uint8_t prevDbw = m_bitbltbuf.dbw;
         const uint8_t prevDpsm = m_bitbltbuf.dpsm;
@@ -937,14 +942,12 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_trxpos.dsax = static_cast<uint16_t>((value >> 32) & 0x7FF);
         m_trxpos.dsay = static_cast<uint16_t>((value >> 48) & 0x7FF);
         m_trxpos.dir = static_cast<uint8_t>((value >> 59) & 0x3);
-        g_g713RawTrxpos = value; // G713: raw latch for exec replay (parse thread only)
         break;
     }
     case GS_REG_TRXREG:
     {
         m_trxreg.rrw = static_cast<uint16_t>(value & 0xFFF);
         m_trxreg.rrh = static_cast<uint16_t>((value >> 32) & 0xFFF);
-        g_g713RawTrxreg = value; // G713: raw latch for exec replay (parse thread only)
         // G602: [F37:trxreg] moved out of line.
         if (G602_GATE_RG_QUALITY)
             g602ColdRegTrxreg(m_trxreg);
@@ -966,10 +969,14 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         // its result is a CPU-visible buffer the EE reads back through THIS object.
         if (g713PipeArmed() && g713PipeImageOn() && !g713OnExecThread())
         {
-            g_g713Snap.bitbltbuf = g_g713RawBitbltbuf;
-            g_g713Snap.trxpos = g_g713RawTrxpos;
-            g_g713Snap.trxreg = g_g713RawTrxreg;
-            g_g713Snap.trxdir = value;
+            g_g713Snap.sbp = m_bitbltbuf.sbp; g_g713Snap.sbw = m_bitbltbuf.sbw;
+            g_g713Snap.spsm = m_bitbltbuf.spsm; g_g713Snap.dbp = m_bitbltbuf.dbp;
+            g_g713Snap.dbw = m_bitbltbuf.dbw; g_g713Snap.dpsm = m_bitbltbuf.dpsm;
+            g_g713Snap.ssax = m_trxpos.ssax; g_g713Snap.ssay = m_trxpos.ssay;
+            g_g713Snap.dsax = m_trxpos.dsax; g_g713Snap.dsay = m_trxpos.dsay;
+            g_g713Snap.dir = m_trxpos.dir;
+            g_g713Snap.rrw = m_trxreg.rrw; g_g713Snap.rrh = m_trxreg.rrh;
+            g_g713Snap.trxdir = m_trxdir;
             g_g713Snap.resetProgress = 1u;
             g_g713SnapReset = true;
             if (m_trxdir == 2 && m_vram)

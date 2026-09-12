@@ -2,7 +2,7 @@
 // G713 — PIPELINE, the GS TRANSFER/IMAGE producer's state and its post helpers.
 //
 // Included by ps2_gs_gpu.cpp BEFORE gpu_gif_and_registers.inc, which holds the four producer sites
-// (`BITBLTBUF`/`TRXPOS`/`TRXREG` raw latches, the `TRXDIR` seam, and the three IMAGE calls) and the
+// (the resolved `TRXDIR` seam and the three IMAGE calls) and the
 // one-shot hook installation.
 //
 // ⚠️ WHY THE EXEC BODIES ARE NOT IN THIS FILE. Every member the transfer path touches — `m_vram`,
@@ -13,12 +13,10 @@
 // `GS::processGIFPacket`, which is a member and so has the access; a captureless lambda converts to
 // a plain function pointer, which is exactly what the ring stores. Nothing here touches a GS.
 //
-// WHAT MOVES. `performLocalToLocalTransfer` and `processImageData` read nine GS members between
-// them, all derived from four register writes — so a node carries the four RAW 64-bit words and
-// exec replays them through `GS::writeRegister` on a scratch GS. There is no second decoder to
-// drift out of sync with the real one: it IS the real one. The scratch shares `m_vram` with the
-// real GS and keeps its own `m_hwregX/Y`, so a multi-chunk IMAGE transfer holds its cursor across
-// nodes exactly as the guest's chunking requires. Same pattern as the band replay's `s_rg`.
+// G721: nodes carry decoded transfer fields from the parser. The executor applies
+// them to a private transfer context, without replaying register side effects.
+// Existing transfer kernels share the real VRAM and retain private m_hwregX/Y
+// across chunks; context construction cannot reset the parser's GIF continuation.
 //
 // ⛔ LOCAL->HOST DOES NOT MOVE. `performLocalToHostToBuffer` fills `m_localToHostBuffer`, which the
 // EE reads back through the real GS object — a genuinely CPU-visible result. It takes the blocking
@@ -39,10 +37,8 @@ GS *g_g713RealGs = nullptr;
 G713XferSnap g_g713Snap{};
 bool g_g713SnapReset = false;
 
-// The RAW register words as last written by the parse thread. The decoded `m_bitbltbuf` /
-// `m_trxpos` / `m_trxreg` structs are lossy for replay, so the raw words are latched here. Written
-// only by the parse thread, inside `writeRegister`.
-uint64_t g_g713RawBitbltbuf = 0, g_g713RawTrxpos = 0, g_g713RawTrxreg = 0;
+// Executor-only application of the immutable decoded command, installed by GS.
+GS *(*g_g721PrepareTransfer)(const G713XferSnap *) = nullptr;
 
 // Installed once from inside `GS::processGIFPacket` (see the header note).
 void (*g_g713L2hThunk)(void *) = nullptr;
@@ -92,19 +88,18 @@ void g713PostImageFromGs(uint32_t dbp, uint32_t dbw, uint32_t dpsm,
         return;
     if (g713RasterCloseForUpload(dbp, dbw, dpsm, dsax, dsay, rrw, rrh))
         g713RasterFlushOpen();
+    // Capture current destination even when registers changed without TRXDIR.
+    g_g713Snap.dbp = dbp; g_g713Snap.dbw = dbw; g_g713Snap.dpsm = dpsm;
+    g_g713Snap.dsax = dsax; g_g713Snap.dsay = dsay;
+    g_g713Snap.rrw = rrw; g_g713Snap.rrh = rrh;
     g_g713Snap.resetProgress = g_g713SnapReset ? 1u : 0u;
     if (g713DbgOn() && ++g_g713DbgN <= 24u)
     {
         std::fprintf(stderr,
                      "[G713:dbg] img n=%llu bytes=%u reset=%u | live(dbp=0x%x dbw=%u dpsm=0x%x "
-                     "ds=%u,%u rr=%u,%u) | snap(bitblt=%016llx trxpos=%016llx trxreg=%016llx "
-                     "trxdir=%llu)\n",
+                     "ds=%u,%u rr=%u,%u) | resolved(trxdir=%u)\n",
                      static_cast<unsigned long long>(g_g713DbgN), bytes, g_g713Snap.resetProgress,
-                     dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
-                     static_cast<unsigned long long>(g_g713Snap.bitbltbuf),
-                     static_cast<unsigned long long>(g_g713Snap.trxpos),
-                     static_cast<unsigned long long>(g_g713Snap.trxreg),
-                     static_cast<unsigned long long>(g_g713Snap.trxdir));
+                     dbp, dbw, dpsm, dsax, dsay, rrw, rrh, g_g713Snap.trxdir);
         std::fflush(stderr);
     }
     g713PostImage(g_g713Snap, data, bytes);
