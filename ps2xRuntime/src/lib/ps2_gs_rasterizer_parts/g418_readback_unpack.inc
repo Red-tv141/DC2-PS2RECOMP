@@ -68,6 +68,101 @@ static int g418UnpackLanes()
     return lanes;
 }
 
+// ⭐⭐ G743 — THE PIXEL GATE G419 PROMOTED FOR THE PACK WAS NEVER APPLIED TO THE UNPACK.
+//
+// G419 (`g419PackLanes`, promoted default-ON 2026-07-30) established, with a measured table, that
+// **a ROW count cannot express the work** a row-pool fan-out is being asked to do:
+//
+//     target      geometry    8 lanes   1 lane
+//     0x139/w8    448x512     0.102     0.152   <- fan-out pays
+//     0x139/w2    128x128     0.083     0.012   <- fan-out costs 7x the whole loop
+//     0x143/w1     64x64      0.079     0.004
+//
+// ⇒ `GSRowPool` dispatch is a fixed ~0.085 ms (8 lane wake-ups + join), so an 8-lane split only
+// pays above ~154k pixels of serial work; G419 set the admission threshold at 65,536 pixels,
+// safely inside the gap of DC2's bimodal population.
+//
+// ⛔ The unpack — the OTHER half of the same round trip, on the same thread — still gated on
+// `rows >= 8`, which is exactly the predicate G419's own comment calls out as unable to express
+// the work. Measured on `dungeon1` (`[G415:stage]`, G742 binary), the readback populations are
+// 414x512 = 212k px (one batch/frame, above the threshold and correctly split) and
+// **116.5x512 = 59.6k px on 3.9 batches/frame — below it, and dispatched 8 ways anyway**.
+//
+// This matters more than it did when G419 was written: G721 moved the flush onto the G713
+// executor, and G743's PC sample (`DC2_G735_EXECPROF` + `DC2_G737_PAIRS` + `DC2_G733_UNWIND`)
+// measures `GSRowPool::run`'s wake/join syscalls at **6.07 % of every executor sample** — on the
+// thread the frame is serialised on. G498 already measured the direction from the other side:
+// its 8-lane split of the owner-publish unpack read **+0.023 ms/f (null)** while the identical
+// mechanism at `lanes = 1` read **−0.213 ms/f, 4/4 blocks favourable**.
+//
+// EXACT BY CONSTRUCTION, and not merely by argument: `lanes <= 1` takes `fastRows(rowLo, rowHi)`,
+// which is the same closure the lane split hands disjoint row ranges, and is already the path this
+// function takes whenever `rows < 8`. Disjoint guest rows own disjoint VRAM words (G298's
+// contract), so the lane count cannot change a single stored byte — it only chooses how many
+// threads store them. Nothing new is reachable; an existing path is chosen more often.
+//
+// Reads `DC2_G419_LANE_MIN_PX` — deliberately the SAME variable as the pack gate, so the two
+// halves of one round trip can never be configured apart. Rollback `DC2_G743_NO_UNPACK_PXGATE=1`
+// restores the pre-G743 `rows >= 8` admission exactly.
+static bool g743UnpackPxGateOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G743_NO_UNPACK_PXGATE");
+    return on;
+}
+
+static uint64_t g743UnpackLaneMinPixels()
+{
+    static const uint64_t n = [] () -> uint64_t {
+        const char *value = std::getenv("DC2_G419_LANE_MIN_PX");
+        if (value == nullptr)
+            return 65536ull;
+        const int v = std::atoi(value);
+        return v <= 0 ? 0ull : static_cast<uint64_t>(v);
+    }();
+    return n;
+}
+
+// `[G743:unpack]` — the gate's own population, so "armed" and "exercised" are separable facts and
+// neither has to be inferred (the law G741 §1 and G736 §2 were both written about). Prints the
+// split BEFORE and AFTER the pixel test, so a run can show that the row gate admitted a dispatch
+// the pixel gate then refused — which is the entire claim. Default OFF, one predicted branch.
+static bool g743UnpackStatOn()
+{
+    static const bool on = envFlagEnabled("DC2_G743_UNPACK_STAT");
+    return on;
+}
+static std::atomic<uint64_t> g_g743UnCalls{0}, g_g743UnRowOk{0}, g_g743UnPxRefused{0},
+    g_g743UnDispatched{0}, g_g743UnPixels{0};
+static void g743UnpackNote(bool rowOk, bool pxOk, uint64_t pixels, bool dispatched)
+{
+    const uint64_t n = g_g743UnCalls.fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+    if (rowOk)
+        g_g743UnRowOk.fetch_add(1ull, std::memory_order_relaxed);
+    if (rowOk && !pxOk)
+        g_g743UnPxRefused.fetch_add(1ull, std::memory_order_relaxed);
+    if (dispatched)
+        g_g743UnDispatched.fetch_add(1ull, std::memory_order_relaxed);
+    g_g743UnPixels.fetch_add(pixels, std::memory_order_relaxed);
+    if (n == 1ull || (n % 4096ull) == 0ull)
+    {
+        const uint64_t calls = n;
+        const uint64_t rowAdmit = g_g743UnRowOk.load(std::memory_order_relaxed);
+        const uint64_t refused = g_g743UnPxRefused.load(std::memory_order_relaxed);
+        const uint64_t disp = g_g743UnDispatched.load(std::memory_order_relaxed);
+        std::fprintf(stderr,
+                     "[G743:unpack] calls=%llu rowAdmit=%llu pxRefused=%llu dispatched=%llu "
+                     "meanPx=%.0f minPx=%llu gate=%s\n",
+                     static_cast<unsigned long long>(calls),
+                     static_cast<unsigned long long>(rowAdmit),
+                     static_cast<unsigned long long>(refused),
+                     static_cast<unsigned long long>(disp),
+                     static_cast<double>(g_g743UnPixels.load(std::memory_order_relaxed)) /
+                         static_cast<double>(calls),
+                     static_cast<unsigned long long>(g743UnpackLaneMinPixels()),
+                     g743UnpackPxGateOn() ? "on" : "OFF");
+    }
+}
+
 static bool g418VerifyOn()
 {
     static const bool on = envFlagEnabled("DC2_G418_VERIFY");
@@ -381,9 +476,18 @@ static void g418UnpackColorRows(uint8_t *vram, uint32_t vramSize,
             singleRow(y);
     };
     const int rows = rowHi - rowLo + 1;
+    // ⭐ G743: admit the fan-out on PIXELS, not rows — see g743UnpackLaneMinPixels above. The
+    // caller-pinned `lanesOverride` (G498's owner-publish dispatch) is untouched: it already names
+    // its own lane count deliberately, so the gate must not second-guess it.
+    const bool g743PxOk =
+        !g743UnpackPxGateOn() ||
+        (static_cast<uint64_t>(rows) * static_cast<uint64_t>(fbW)) >= g743UnpackLaneMinPixels();
     const int lanes = lanesOverride > 0
                           ? lanesOverride
-                          : ((g418ParUnpackOn() && rows >= 8) ? g418UnpackLanes() : 1);
+                          : ((g418ParUnpackOn() && rows >= 8 && g743PxOk) ? g418UnpackLanes() : 1);
+    if (g743UnpackStatOn() && lanesOverride <= 0)
+        g743UnpackNote(g418ParUnpackOn() && rows >= 8, g743PxOk,
+                       static_cast<uint64_t>(rows) * static_cast<uint64_t>(fbW), lanes > 1);
     if (lanes <= 1)
         fastRows(rowLo, rowHi); // no dispatch at all — GSRowPool::run would still cost its setup
     else

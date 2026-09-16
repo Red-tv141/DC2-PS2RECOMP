@@ -3274,10 +3274,17 @@ void g178DecodeWhole(GSRasterizer *self, GS *gs, uint8_t *vram, const GSContext 
     // chunk of the fused preparation dispatch, raising a second dispatch here would overwrite that
     // one's bounds/job pointer and corrupt both. The outer dispatch already supplies the
     // parallelism — over a strictly larger pool of independent work — so stand the row split down.
-    const int lanes =
+    // G744: the `pixels >= 4096` admission predates G419's measurement of what a GSRowPool split
+    // actually costs (a fixed ~0.085 ms for 8 lane wake-ups plus a join, i.e. break-even at ~154k
+    // pixels of serial pack work; G419 promoted 65,536). 4,096 is 16x below it. The threshold is a
+    // separate knob from the Z sites because ns/pixel differs -- a CLUT-indirect format expand is
+    // not a Z swizzle -- and both are env-tunable so the knee can be swept without a relink.
+    const int lanes = g744LaneGate(
+        kG744SiteTexDecode, static_cast<uint64_t>(pixels),
         s_g298ParTexDecode && !t_g684InPoolChunk && texH >= 8 && pixels >= 4096
             ? s_g298TexDecodeLanes
-            : 1;
+            : 1,
+        g744TexLaneMinPixels());
 
     // ------------------------------------------------------------------------------------------
     // G512: build the fast path's plan ONCE per decode (4 calls/frame), never per lane and never

@@ -3720,8 +3720,14 @@ static bool g278FlushPendSlot(G278PendDepth &slot, int cause)
             }
         }
     };
+    // G744: `rows >= 8` admits at 8 * fbW pixels -- 4,096 at the shipped 512-wide frame, 16x below
+    // the 65,536 G419 measured as the break-even for an 8-lane GSRowPool split. Gate on the work.
     GSRowPool::instance().run(p.rowLo, p.rowHi,
-                              rows >= 8 ? g275ZSwizzleLanes() : 1,
+                              g744LaneGate(kG744SiteZUnpackView,
+                                           static_cast<uint64_t>(rows) *
+                                               static_cast<uint64_t>(p.fbW),
+                                           rows >= 8 ? g275ZSwizzleLanes() : 1,
+                                           g744ZLaneMinPixels()),
                               unpackDepthRows);
     if (!p.privateMirror)
     {

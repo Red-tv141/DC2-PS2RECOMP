@@ -56,9 +56,26 @@
 // Both thresholds are ENV-TUNABLE so the operating point can be swept without a rebuild
 // (g507_probe_at_two_magnitudes / g508_the_curve_is_one_session_too).
 //
+// ⛔⛔⛔ THE LEVER ABOVE IS REFUTED, NOT UNFINISHED. `DC2_G529_INLINEREPLAY` is OPT-IN, so
+// `g529ReplayLanes` returns `constantLanes` unchanged in every shipped build and the whole pixel
+// policy is inert there. That is CORRECT and DELIBERATE, and this header used to say only
+// "bring-up default: OFF" — which reads as unfinished work and cost G744 a full investigation.
+//
+// G529 §4.2 measured it with its own two-magnitude probe (`DC2_G529_PXPERLANE=100000000` forces
+// `lanes=1` everywhere): serialising costs **3.9x** on the discovered class (964 -> 3,773 us/batch)
+// and 2.78x on display, with `[G154] g144 upload` 10.00 -> 24.4 ms/f. The bands are GENUINELY BUSY
+// — the same probe measured the discovered class at **137 ns/pixel**, 41x the display class's 3.3 —
+// so an 8-way split breaks even at ~620 pixels here, not at G419's 65,536. plans/phase-history.md
+// records this as one of G529's three refutations, at **0.00 ms/f**.
+//
+// ⭐ Rule (G744-3): a lane-count threshold is (pool dispatch cost) / (ns per pixel). G419's 65,536
+// is a PACK-LOOP constant (~0.55 ns/px) and is NOT transferable to a heavy per-pixel loop. G744
+// applied the law to the three Z-swizzle sites, which are light, and deliberately did NOT apply
+// G419's number to the texture decode for this reason. See g744_lane_gate.inc.
+//
 //   DC2_G529_STAT=1        census (above). Two clock reads per dispatch + one per lane.
-//   DC2_G529_INLINEREPLAY=1  the lever (bring-up default: OFF)
-//   DC2_G529_NO_INLINEREPLAY=1  rollback once promoted
+//   DC2_G529_INLINEREPLAY=1  the lever — REFUTED (see above); opt-in so the probe stays reproducible
+//   DC2_G529_NO_INLINEREPLAY=1  rollback, if it were ever promoted (it was not)
 //   DC2_G529_PXPERLANE=<n>   px of row-span area required to justify one lane (default 262144)
 //   DC2_G529_MINROWS=<n>     rows required before ANY split is considered (default 8)
 

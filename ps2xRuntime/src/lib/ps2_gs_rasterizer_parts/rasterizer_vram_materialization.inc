@@ -3056,8 +3056,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         }
                     }
                 };
-                const int swizzleLanes =
-                    depthRows >= 8 ? g275ZSwizzleLanes() : 1;
+                // G744: G419's pixel gate. `depthRows >= 8` admits at 8 * fbW = 4,096 pixels on a
+                // 512-wide frame, 16x below the measured break-even for an 8-lane split.
+                const int swizzleLanes = g744LaneGate(
+                    kG744SiteZPack,
+                    static_cast<uint64_t>(depthRows) * static_cast<uint64_t>(fbW),
+                    depthRows >= 8 ? g275ZSwizzleLanes() : 1, g744ZLaneMinPixels());
                 GSRowPool::instance().run(upLoZ, upHiZ, swizzleLanes,
                                           packDepthRows);
                 if (s_g534ZDiff && g534Total.load(std::memory_order_relaxed) != 0u)
@@ -7024,8 +7028,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 }
             }
         };
-        const int swizzleLanes =
-            rbRows >= 8 ? g275ZSwizzleLanes() : 1;
+        // G744: G419's pixel gate; see the pack site above and g744_lane_gate.inc.
+        const int swizzleLanes = g744LaneGate(
+            kG744SiteZUnpackRb, static_cast<uint64_t>(rbRows) * static_cast<uint64_t>(fbW),
+            rbRows >= 8 ? g275ZSwizzleLanes() : 1, g744ZLaneMinPixels());
         GSRowPool::instance().run(depthRowLo, depthRowHi, swizzleLanes,
                                   unpackDepthRows);
         // Publish the Z bytes exactly as an inline CPU Z writer would (the G260 ownership rule):
