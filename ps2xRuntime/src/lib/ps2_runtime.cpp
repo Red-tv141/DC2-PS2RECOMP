@@ -7,6 +7,7 @@
 // G483: it also splits [G441:kick]'s exec bucket by kick kind ([G483:kind]) and by stop reason
 // ([G483:stop]).
 #include "ps2_runtime_parts/dc2_logger.inc"
+#include "ps2_kick_capture.h"
 // G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
 #include "ps2_g736_ab_arm_stubs.inc"
 // G650 (ROADMAP P6): contention-aware core scheduler. ⛔ The DEFINITION deliberately does NOT live

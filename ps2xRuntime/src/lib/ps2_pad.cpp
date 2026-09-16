@@ -46,6 +46,123 @@ namespace
     }
 }
 
+// ---- Stick processing pipeline (G7 stick overhaul) ----
+// Shared by all three input paths: dc2_poll_host_pad, PSPadBackend::readState,
+// and g449PollConfiguredPad. Provides: inner/outer deadzone with smooth rescaling
+// (no discontinuity), configurable power-curve response, circular magnitude
+// clamping, and per-stick tuning. Rollback: DC2_STICK_LINEAR=1.
+
+static float stickEnvFloat(const char *name, float def)
+{
+    const char *v = std::getenv(name);
+    if (!v || !*v) return def;
+    char *end = nullptr;
+    float f = std::strtof(v, &end);
+    return (end != v) ? f : def;
+}
+
+struct StickParams
+{
+    float innerDead;    // inner deadzone radius (0..1)
+    float outerDead;    // outer deadzone radius (innerDead..1)
+    float leftCurve;    // response curve exponent for left stick
+    float rightCurve;   // response curve exponent for right stick
+    float trigThresh;   // analog trigger press threshold
+    bool  linear;       // rollback: true = old linear behaviour
+};
+
+static const StickParams &getStickParams()
+{
+    static const StickParams p = []() {
+        StickParams s;
+        const char *linV = std::getenv("DC2_STICK_LINEAR");
+        s.linear = linV && *linV && std::strcmp(linV, "0") != 0;
+
+        s.innerDead = stickEnvFloat("DC2_STICK_DEADZONE", 0.15f);
+        s.outerDead = stickEnvFloat("DC2_STICK_OUTER", 0.95f);
+        float baseCurve = stickEnvFloat("DC2_STICK_CURVE", 2.2f);
+        s.leftCurve  = stickEnvFloat("DC2_LSTICK_CURVE", baseCurve);
+        s.rightCurve = stickEnvFloat("DC2_RSTICK_CURVE", baseCurve);
+        s.trigThresh = stickEnvFloat("DC2_TRIGGER_THRESH", 0.0f);
+
+        // Clamp to sane ranges.
+        if (s.innerDead < 0.f) s.innerDead = 0.f;
+        if (s.innerDead > 0.9f) s.innerDead = 0.9f;
+        if (s.outerDead <= s.innerDead) s.outerDead = s.innerDead + 0.05f;
+        if (s.outerDead > 1.0f) s.outerDead = 1.0f;
+        if (s.leftCurve < 0.1f) s.leftCurve = 0.1f;
+        if (s.rightCurve < 0.1f) s.rightCurve = 0.1f;
+
+        if (!s.linear)
+            std::fprintf(stderr,
+                "[G7:stick] deadzone=%.2f outer=%.2f lCurve=%.1f rCurve=%.1f trigThresh=%.2f\n",
+                s.innerDead, s.outerDead, s.leftCurve, s.rightCurve, s.trigThresh);
+        return s;
+    }();
+    return p;
+}
+
+// Full stick processing: deadzone → rescale → power curve → byte.
+// The scale factor is applied to the ORIGINAL per-axis values (not a normalised
+// direction), so the controller's native shape is preserved — a square-range pad
+// reaches 0xFF on each axis even on diagonals, matching DualShock 2 behaviour.
+// curve > 1 = less sensitive near centre (2.2 typical); curve = 1 = linear.
+static std::pair<uint8_t, uint8_t> processStick(float rawX, float rawY,
+                                                 float innerDead, float outerDead,
+                                                 float curve)
+{
+    const float mag = std::sqrt(rawX * rawX + rawY * rawY);
+    if (mag < 1e-6f)
+        return { 0x80u, 0x80u };
+
+    // Inner deadzone — output is exactly centre.
+    if (mag < innerDead)
+        return { 0x80u, 0x80u };
+
+    // Compute a 0..1 scaling factor from the radial magnitude.
+    // At mag >= outerDead: scale = 1 (raw passthrough, full per-axis range).
+    // At mag = innerDead: scale = 0 (smooth entry, no jump discontinuity).
+    float scale;
+    if (mag >= outerDead) {
+        scale = 1.0f;
+    } else {
+        float range = outerDead - innerDead;
+        if (range < 0.01f) range = 0.01f;
+        float t = (mag - innerDead) / range;  // 0..1
+        scale = std::pow(t, curve);
+    }
+
+    // Apply scale to ORIGINAL axes — preserves square/circular shape.
+    float outX = rawX * scale;
+    float outY = rawY * scale;
+
+    // Clamp each axis independently (handles pads that report > 1.0).
+    if (outX > 1.0f) outX = 1.0f; else if (outX < -1.0f) outX = -1.0f;
+    if (outY > 1.0f) outY = 1.0f; else if (outY < -1.0f) outY = -1.0f;
+
+    // Convert to 0x80-centred byte.
+    auto toByte = [](float v) -> uint8_t {
+        int b = 128 + static_cast<int>(v * 127.0f);
+        if (b < 0) b = 0; else if (b > 255) b = 255;
+        return static_cast<uint8_t>(b);
+    };
+    return { toByte(outX), toByte(outY) };
+}
+
+// Legacy linear conversion (rollback path, matches the original G7 behaviour).
+static std::pair<uint8_t, uint8_t> processStickLinear(float rawX, float rawY,
+                                                       float deadzone)
+{
+    const float mag = std::sqrt(rawX * rawX + rawY * rawY);
+    if (mag < deadzone) { rawX = 0.f; rawY = 0.f; }
+    auto toByte = [](float v) -> uint8_t {
+        int b = 128 + static_cast<int>(v * 127.0f);
+        if (b < 0) b = 0; else if (b > 255) b = 255;
+        return static_cast<uint8_t>(b);
+    };
+    return { toByte(rawX), toByte(rawY) };
+}
+
 // G449: launcher controller remapping (DC2_CONTROLLER_CONFIG). Included here because it
 // needs the scePad bit constants and firstAvailableGamepad() above, and because raylib's
 // input API is only reachable from this TU. Entirely inert when the flag is unset.
@@ -108,10 +225,19 @@ bool PSPadBackend::readState(int /*port*/, int /*slot*/, uint8_t *data, size_t s
         float ly = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y);
         float rx = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X);
         float ry = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y);
-        data[6] = static_cast<uint8_t>(128 + lx * 127);
-        data[7] = static_cast<uint8_t>(128 + ly * 127);
-        data[4] = static_cast<uint8_t>(128 + rx * 127);
-        data[5] = static_cast<uint8_t>(128 + ry * 127);
+        const auto &sp = getStickParams();
+        if (sp.linear) {
+            // Rollback: original raw linear conversion (no deadzone).
+            data[6] = static_cast<uint8_t>(128 + lx * 127);
+            data[7] = static_cast<uint8_t>(128 + ly * 127);
+            data[4] = static_cast<uint8_t>(128 + rx * 127);
+            data[5] = static_cast<uint8_t>(128 + ry * 127);
+        } else {
+            auto l = processStick(lx, ly, sp.innerDead, sp.outerDead, sp.leftCurve);
+            auto r = processStick(rx, ry, sp.innerDead, sp.outerDead, sp.rightCurve);
+            data[6] = l.first;  data[7] = l.second;
+            data[4] = r.first;  data[5] = r.second;
+        }
     }
     else
     {
@@ -191,21 +317,8 @@ extern "C" bool dc2_poll_host_pad(bool allowKeyboard, uint16_t *outMask,
     uint16_t mask = 0u; // active-high
     auto press = [&mask](uint16_t bit) { mask |= bit; };
 
-    // Axis -> 0x80-centred byte with a radial deadzone (~0.20). raylib axes are
-    // -1..+1; LEFT_Y/RIGHT_Y are +1 when the stick is pushed DOWN. The free-roam
-    // movement code (F66) expects Up -> low byte, Down -> high byte, which matches
-    // (axis -1 -> ~0x01, axis +1 -> ~0xFF).
-    auto deflect = [](float x, float y) -> std::pair<uint8_t, uint8_t> {
-        float mag = std::sqrt(x * x + y * y);
-        constexpr float kDead = 0.20f;
-        if (mag < kDead) { x = 0.f; y = 0.f; }
-        auto toByte = [](float v) -> uint8_t {
-            int b = 128 + static_cast<int>(v * 127.0f);
-            if (b < 0) b = 0; else if (b > 255) b = 255;
-            return static_cast<uint8_t>(b);
-        };
-        return { toByte(x), toByte(y) };
-    };
+    // Stick processing uses the shared pipeline (processStick / processStickLinear).
+    const auto &sp = getStickParams();
 
     uint8_t lx = kPadStickCenter, ly = kPadStickCenter;
     uint8_t rx = kPadStickCenter, ry = kPadStickCenter;
@@ -230,14 +343,25 @@ extern "C" bool dc2_poll_host_pad(bool allowKeyboard, uint16_t *outMask,
         if (IsGamepadButtonDown(gamepad, GAMEPAD_BUTTON_RIGHT_THUMB))     press(PAD_R3);
 
         // Analog triggers also fire L2/R2 (digital pull) for games that read them.
-        if (GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_TRIGGER)  > -0.5f) press(PAD_L2);
-        if (GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_TRIGGER) > -0.5f) press(PAD_R2);
+        // Threshold is configurable (DC2_TRIGGER_THRESH, default 0.0 = 50% pull on
+        // XInput's -1..+1 range). Old value was -0.5 (25% pull, too sensitive).
+        if (GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_TRIGGER)  > sp.trigThresh) press(PAD_L2);
+        if (GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_TRIGGER) > sp.trigThresh) press(PAD_R2);
 
-        auto l = deflect(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X),
-                         GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y));
-        auto r = deflect(GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X),
-                         GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y));
-        lx = l.first; ly = l.second; rx = r.first; ry = r.second;
+        // Sticks: full pipeline or legacy linear depending on rollback flag.
+        const float rawLX = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_X);
+        const float rawLY = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_LEFT_Y);
+        const float rawRX = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_X);
+        const float rawRY = GetGamepadAxisMovement(gamepad, GAMEPAD_AXIS_RIGHT_Y);
+        if (sp.linear) {
+            auto l = processStickLinear(rawLX, rawLY, 0.20f);
+            auto r = processStickLinear(rawRX, rawRY, 0.20f);
+            lx = l.first; ly = l.second; rx = r.first; ry = r.second;
+        } else {
+            auto l = processStick(rawLX, rawLY, sp.innerDead, sp.outerDead, sp.leftCurve);
+            auto r = processStick(rawRX, rawRY, sp.innerDead, sp.outerDead, sp.rightCurve);
+            lx = l.first; ly = l.second; rx = r.first; ry = r.second;
+        }
     }
     else // keyboard fallback (opt-in)
     {
@@ -256,10 +380,15 @@ extern "C" bool dc2_poll_host_pad(bool allowKeyboard, uint16_t *outMask,
         if (IsKeyDown(KEY_ENTER)) press(PAD_START);
         if (IsKeyDown(KEY_TAB)) press(PAD_SELECT);
         // Left stick on WASD so free-roam movement works on keyboard.
+        // Keyboard is binary (no curve); full-scale deflection when held.
         float kx = (IsKeyDown(KEY_D) ? 1.f : 0.f) - (IsKeyDown(KEY_A) ? 1.f : 0.f);
         float ky = (IsKeyDown(KEY_S) ? 1.f : 0.f) - (IsKeyDown(KEY_W) ? 1.f : 0.f);
-        auto l = deflect(kx, ky);
-        lx = l.first; ly = l.second;
+        auto toByte = [](float v) -> uint8_t {
+            int b = 128 + static_cast<int>(v * 127.0f);
+            if (b < 0) b = 0; else if (b > 255) b = 255;
+            return static_cast<uint8_t>(b);
+        };
+        lx = toByte(kx); ly = toByte(ky);
     }
 
     if (outMask) *outMask = mask;

@@ -236,13 +236,24 @@ namespace
     // posted AFTER this one. The non-deferrable inline primitive keeps its blocking
     // `g713CallOnExec`, so the one caller that does read live parse state is untouched.
     //
-    // ⛔ DEFAULT OFF pending its gate. Arm: DC2_G740_ASYNC_BOUNDARY=1.
-    //    Rollback name reserved for promotion: DC2_G740_NO_ASYNC_BOUNDARY=1.
+    // ⭐⭐⭐ G744 PROMOTION (2026-09-13): DEFAULT ON. Rollback `DC2_G740_NO_ASYNC_BOUNDARY=1`.
+    //
+    // G740 §4d.2 gated this ALONE and it was a regression on `dragon` (+16 … +67 ms/f), because
+    // removing the boundary park lets the parse thread race forward and block mid-window instead:
+    // `gsStallMs/f` 14.8-18.9 -> 32.7-70.0. That mechanism is real and is UNCHANGED — what changed
+    // is that the lever for exactly that stall class, `DC2_G726_KICK_SPIN`, is now promoted with it.
+    // Separately: boundary +0.56, spin +0.12 (null). TOGETHER: **-1.21 ms/f, Rule-16 admissible,
+    // drift 0.027, 4/4 sub-blocks negative** (G743 §5c.1), five-route triage 4 negative / 1 null
+    // with no regression anywhere including the round-trip-dense `map15` (+0.119).
+    //
+    // ⛔ NEVER PROMOTE THIS ONE WITHOUT THE SPIN. Each half alone is a regression or a null; the
+    // interaction IS the mechanism (the boundary removal creates the stalls, the spin converts the
+    // resulting parks into spins: `gsStalls/f` rises to ~1,800 while `gsStallMs/f` does not).
+    // G744 §1 swept the spin budget and 8192 is the knee.
     bool g740AsyncBoundaryOn()
     {
         static const bool on = [] {
-            const bool v = f50_12_env_flag("DC2_G740_ASYNC_BOUNDARY") &&
-                           !f50_12_env_flag("DC2_G740_NO_ASYNC_BOUNDARY");
+            const bool v = !f50_12_env_flag("DC2_G740_NO_ASYNC_BOUNDARY");
             // One line, once. Rule: assert the lever is COMPILED and ARMED before reading any arm.
             // The arm's own confirmation is `[G713:pipe] syncWaits/f`, which must fall 1.00 -> 0.00.
             std::fprintf(stderr, "[G740:boundary] async=%d\n", v ? 1 : 0);
@@ -629,6 +640,11 @@ namespace
 // census sees the publish window and the moment next-frame front-end begins. No-op unless armed.
 extern void g336_boundary_begin();
 extern void g336_boundary_end();
+
+// ⭐ G748: publish the frame's PREFERRED DISPLAY SOURCE at the boundary marker's FIFO position.
+// Defined in ps2_gs_gpu.cpp (gpu_display_and_snapshot.inc) — see the long comment above GS::init
+// for why the latch may no longer read that triple live under G740's async boundary.
+extern void g748_boundary_capture_pds();
 
 namespace
 {
@@ -1476,6 +1492,15 @@ namespace
                 {
                     g317ObserveItemFence(item);
                     g_g189WorkerStage.store(3, std::memory_order_relaxed);
+                    // ⭐ G748: snapshot the PREFERRED DISPLAY SOURCE here, at the boundary marker's
+                    // own FIFO position — the last instant at which it still belongs to frame N.
+                    // The G172 capture hoist writes that triple on THIS thread, and under G740 the
+                    // latch no longer runs before this thread walks into frame N+1, so reading it
+                    // live inside the latch presented frame N through frame N+1's RTT source.
+                    // Unconditional: the synchronous path publishes the same values it would have
+                    // read live, so that arm is behaviour-identical. Rollback
+                    // DC2_G748_NO_PDS_SNAPSHOT=1 makes this a no-op and restores the live read.
+                    g748_boundary_capture_pds();
                     // G157: this frame's draws are all ahead of us in FIFO order and have already
                     // been processed, so VRAM is complete; the register-write gate
                     // (waitRegisterSlot(), consulted from ps2_memory.cpp) has been holding off any

@@ -400,6 +400,12 @@ extern void g735RegisterExecThread();
 // Must precede the command graph and the capture site, which both name them.
 #include "ps2_gs_rasterizer_parts/g713_pipe_types.inc"
 
+// G744: G419's pixel-denominated row-pool admission, applied to the four dispatch sites that still
+// admitted on a ROW count. Must precede rasterizer_command_graph.inc (the texture-decode site is
+// its first consumer) and therefore also the two Z sites further down. Needs only envFlagEnabled,
+// from rasterizer_headers_and_diagnostics.inc above.
+#include "ps2_gs_rasterizer_parts/g744_lane_gate.inc"
+
 #include "ps2_gs_rasterizer_parts/rasterizer_command_graph.inc"
 
 // G713 PIPELINE, part 2 of 2: the parse-side conflict tests and the exec-side batch adopt. Needs

@@ -406,4 +406,10 @@ void PS2AudioBackend::stopAll()
 // DC2's EZBGM voice service reads standard WAV/BWF clips through the
 // SOUND.HD3 -> SOUND.DAT sector index. Keep this game-specific service out of
 // the generic public audio header.
+// G750: pause/resume. `StreamPause` and `StreamStop` are both `ezBgm(port|0x60)`,
+// and `StreamPlay` and `StreamRePlay` are both `ezBgm(port|0x50)`, so the host has
+// to carry the suspended state itself: 0x60 now pauses (keeping the playback
+// cursor) and 0x50 resumes a suspended port instead of restarting it. Rollback
+// DC2_G750_NO_VOICE_PAUSE=1. MSBuild does not track `.inc` dependencies — this
+// comment is edited on every `.inc` change.
 #include "ps2_audio_parts/dc2_g386_voice_audio.inc"

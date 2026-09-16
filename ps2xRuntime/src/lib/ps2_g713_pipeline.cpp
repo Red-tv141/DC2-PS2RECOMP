@@ -305,11 +305,43 @@ void g713Consume(G713Ring &r, uint64_t head, bool threaded)
     // own flag rather than left unconditional: a shipping run then pays ONE perfectly-predicted
     // branch per drain cycle (~12/frame) instead of two `QueryPerformanceCounter` reads, which
     // keeps FINAL §7's "dead code is not free in a hot TU" exposure at its minimum.
+    //
+    // ⛔⛔⛔ G743 — THIS GATE MADE `execMs/f` A STRUCTURAL ZERO UNDER `DC2_G713_PIPE_STAT` ALONE.
+    // `[G713:pipe]` prints `execMs/f` and `[G734:exec]` prints `idleMs/f` whenever `stat` is set,
+    // but BOTH accumulators were gated on `board` (= `DC2_G182_EE_STAT`) only. A run armed with
+    // `DC2_G713_PIPE_STAT=1` and nothing else therefore printed
+    //     [G713:pipe] ... execMs/f=0.000
+    //     [G734:exec] idleMs/f=0.000 idleWaits/f=0.00
+    // on every line while `[G713:kind]` — documented two lines below as summing TO `execMs/f` —
+    // reported 17.6 ms/f on the same thread. A subset larger than its parent, printed as a
+    // measurement, with a comment beside it instructing the reader to conclude "SATURATED".
+    // Fixed by gating the accumulation on `board || stat`, which is what each printer requires.
     const bool board = g734BoardOn();
-    const auto begin = board ? std::chrono::steady_clock::now()
+    const bool timed = board || stat;
+    const auto begin = timed ? std::chrono::steady_clock::now()
                              : std::chrono::steady_clock::time_point{};
+    // ⭐⭐ G743 — THE POLE THREAD'S WORK DERIVATIVE. The project ships a fixed busy-spin knob for
+    // the VU1 worker (`DC2_G303_VU1_SLOW_US`, per kick), the GS parse worker
+    // (`DC2_G431_GS_SLOW_US`, per window) and the EE thread (`DC2_G503_EE_SLOW_US`) — and none for
+    // the G713 executor, which is the thread every board since G734 has called the pole. Without
+    // it, "would removing N ms of executor work remove N ms of frame?" can only be argued from
+    // occupancy columns, which is the exact mistake G735 Rule 12 was written about.
+    //
+    // Injected per NODE (`posted/f` is ~196 on `dungeon1`, so `=10` is ~1.96 ms/f), inside the
+    // interval `execNs`/`[G713:kind]` measure, so the injected cost shows up in this thread's own
+    // columns as well as in the frame. Default 0: one perfectly-predicted branch per node.
+    static const long long s_g743ExecSlowUs = [] () -> long long {
+        const char *v = std::getenv("DC2_G743_EXEC_SLOW_US");
+        return v ? std::atoll(v) : 0LL;
+    }();
     while (r.tailC != head)
     {
+        if (s_g743ExecSlowUs > 0)
+        {
+            const auto spinUntil = std::chrono::steady_clock::now() +
+                                   std::chrono::microseconds(s_g743ExecSlowUs);
+            while (std::chrono::steady_clock::now() < spinUntil) { /* executor only */ }
+        }
         G713Node &n = r.node[r.tailC & (kNodeCap - 1u)];
         if (stat)
         {
@@ -338,12 +370,13 @@ void g713Consume(G713Ring &r, uint64_t head, bool threaded)
             r.payTailPub.store(r.payTailC, std::memory_order_relaxed);
         }
     }
-    if (board)
+    if (timed)
     {
         const uint64_t cycleNs = static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - begin).count());
-        r.execTotalNs.fetch_add(cycleNs, std::memory_order_relaxed); // G734: board, never reset
+        if (board)
+            r.execTotalNs.fetch_add(cycleNs, std::memory_order_relaxed); // G734: board, never reset
         if (stat)
             r.execNs.fetch_add(cycleNs, std::memory_order_relaxed);
     }
@@ -367,20 +400,25 @@ void g713ExecLoop()
             // executor's OCCUPANCY — busy time alone cannot distinguish a saturated thread from a
             // slow one, and that distinction is the whole verdict on the EE park. Same board flag
             // as the busy side, one predicted branch per drain cycle.
+            // ⛔ G743: `idleNs`/`idleWaits` are printed by `[G734:exec]` under `DC2_G713_PIPE_STAT`,
+            // so they must be ACCUMULATED under it too — see the long note in `g713Consume`.
             const bool g734Board = g734BoardOn();
-            const auto g734T0 = g734Board ? std::chrono::steady_clock::now()
+            const bool g743Stat = g713PipeStatOn();
+            const bool g743Timed = g734Board || g743Stat;
+            const auto g734T0 = g743Timed ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
             r.work.wait([&] {
                 return r.stop.load(std::memory_order_relaxed) ||
                        r.headPub.load(std::memory_order_acquire) != r.tailC;
             });
-            if (g734Board)
+            if (g743Timed)
             {
                 const uint64_t g734IdleNs = static_cast<uint64_t>(
                     std::chrono::duration_cast<std::chrono::nanoseconds>(
                         std::chrono::steady_clock::now() - g734T0).count());
-                r.idleTotalNs.fetch_add(g734IdleNs, std::memory_order_relaxed);
-                if (g713PipeStatOn())
+                if (g734Board)
+                    r.idleTotalNs.fetch_add(g734IdleNs, std::memory_order_relaxed);
+                if (g743Stat)
                 {
                     r.idleWaits.fetch_add(1u, std::memory_order_relaxed);
                     r.idleNs.fetch_add(g734IdleNs, std::memory_order_relaxed);
@@ -880,10 +918,14 @@ void g713PipeReport()
     // approach the frame span; the residue is the consume loop's own overhead. An executor whose
     // idleMs/f is near zero is SATURATED, and every wait upstream of it (the parse thread's
     // syncMs/f, the EE thread's m_cvFrameSlot park) is conservation, not a removable throttle.
+    // ⛔ G743 (Rule G736-1): publish the ARM beside the value. Before G743 these two accumulators
+    // were gated on `DC2_G182_EE_STAT` while this line printed under `DC2_G713_PIPE_STAT`, so a
+    // disarmed instrument printed `idleMs/f=0.000` — which the note above reads as "SATURATED".
     std::fprintf(stderr,
-                 "[G734:exec] idleMs/f=%.3f idleWaits/f=%.2f\n",
+                 "[G734:exec] idleMs/f=%.3f idleWaits/f=%.2f avail=%s\n",
                  r.idleNs.exchange(0, std::memory_order_relaxed) / (1.0e6 * f),
-                 r.idleWaits.exchange(0, std::memory_order_relaxed) / f);
+                 r.idleWaits.exchange(0, std::memory_order_relaxed) / f,
+                 g713PipeStatOn() ? "armed" : "DISARMED-structural-zero");
     // G724: the same window, split by node kind. These four sum to `execMs/f` by construction.
     std::fprintf(stderr,
                  "[G713:kind] xferMs/f=%.3f imgMs/f=%.3f batchMs/f=%.3f callMs/f=%.3f\n",

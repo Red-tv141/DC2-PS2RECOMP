@@ -2,6 +2,12 @@
 // branchless tree reduction instead of a serial branchy scan of the 8-slot history ring. Content
 // edit here forces MSBuild to consume the .inc (G359). revision: 28 (G612 native region backend)
 // G652: native-region LOI admission + flag-materialization census (force rebuild v1).
+// G746: `__cpuid` for the one-time SSE4.1 probe the G610/G612 emitters use to pick the partial-dest
+// write shape (vu1_g746_blend_dest.inc). Included HERE, at global scope, because that file is
+// consumed from inside vu1_g610_native_jit.inc's anonymous namespace. revision: 32 (G746)
+#if defined(_MSC_VER)
+#include <intrin.h>
+#endif
 #include "ps2_g674_hot_flag.inc"
 // G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
 #include "ps2_g736_ab_arm_stubs.inc"
@@ -20,7 +26,7 @@
 // included here — it is included from inside vu1_g610_native_jit.inc's anonymous namespace, right
 // after the encoder it emits through, because both compiled backends must see the same allocator.
 // This comment is also the MSBuild rebuild trigger (G359): a .inc edit alone does not make MSBuild
-// consume the TU. revision: 29 (G730 register residency)
+// consume the TU. revision: 31 (G745 hoisted G612 cycle-budget test + cross-BB history elision)
 // G610: the NATIVE VU1 BLOCK COMPILATION BACKEND — x86-64 emitter + translator. Must come AFTER
 // vu1_g421_fast_upper.inc (it reads `g421DescTableConst` and `g421MaskTableConst`) and BEFORE
 // vu1_g490_block_run.inc, which holds the compiled-block ENTRY and calls `g610CompileAll` from the
@@ -34,6 +40,7 @@
 // G490: after vu1_g421_fast_upper.inc — its eligibility test reads `g421DescTableConst`, and its
 // block body calls the inlined g421FastUpper / g422FastLower directly.
 #include "ps2_vu1_parts/vu1_g490_block_run.inc"
+// G751: isolate native execution from oracle snapshots and diagnostic stack frames.
 // G533: immutable microprogram-fragment plans and static exact-source specialization
 //       (v8 promoted default-on; direct exact-block gate with G531-canonical fallback).
 #include "ps2_vu1_parts/vu1_g483_run_cycles.inc"
@@ -181,3 +188,4 @@
 //       against -0.755 over 3 runs on the previous link. AT THE INSTRUMENT FLOOR — the scaffolding
 //       was removed and the fold kept (force recompile v3).
 // G531: typed flag-consumer block tail promoted default-on (force recompile v2).
+// G751: optional full-width single-lane stores share both native emitters; cycle-cutoff oracle coverage.
