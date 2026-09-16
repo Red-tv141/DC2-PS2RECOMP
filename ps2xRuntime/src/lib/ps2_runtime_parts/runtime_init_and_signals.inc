@@ -440,23 +440,62 @@ static void g739ArmDispatchFast();
 //    are gated on a namespace-scope bool so the default path pays one predicted branch, and they
 //    print calls-per-present so a share can be converted into ns/call.
 //
-//    `distinct` is a Bloom-ish coverage estimate of how many DIFFERENT dispatch targets a window
-//    touches — it decides whether the 5.2 MB direct table is being streamed (a cache-miss lever)
-//    or re-hit (not one).
+//    `distinctTargets` counts DIFFERENT dispatch targets — it decides whether the 5.2 MB direct
+//    table is being streamed (a cache-miss lever) or re-hit (not one).
+//
+// ⛔⛔ G745 — TWO THINGS THIS COUNTER IS NOT, BOTH OF WHICH HAVE ALREADY MISLED A PHASE.
+//
+//  1. IT IS NOT PER-WINDOW. `g_g651Seen` is never cleared — not by `g651DispatchReport`, not at a
+//     present — so `distinctTargets` is CUMULATIVE OVER THE WHOLE PROCESS. The sentence this note
+//     replaced said "how many different dispatch targets a WINDOW touches"; every number ever read
+//     off it is a whole-run total, and the per-window figure is strictly smaller.
+//
+//  2. ⛔⛔⛔ IT IS NOT THE SIZE OF THE TABLE'S LIVE POPULATION, AND `plans/phase-G739-plan.md` §6a
+//     USED IT AS EXACTLY THAT. That section proposes replacing the 5.2 MB address-indexed table
+//     with a dense generator-assigned index and sizes the replacement as
+//     "5,789 x 8 B = **46 KB**, which fits L2 outright":
+//
+//        live entries in the table  = REGISTERED FUNCTIONS = **58,681**
+//                                     (counted from recomp/register_functions.cpp, this corpus)
+//        distinctTargets            = targets ever DISPATCHED TO  = ~5,789   (9.9% of them)
+//
+//     A dense table must hold every registered function, so it is **58,681 x 8 B = 469 KB**, not
+//     46 KB — **10.2x** the quoted size, and it does NOT fit this host's 256 KB/core L2 either.
+//     And the cache argument does not survive the correction: in a dense ADDRESS-ORDERED table the
+//     ~5,789 hot entries are still scattered ~1 in 10, so they occupy ~4,000 of the 7,335 lines
+//     rather than the 724 lines the 46 KB figure implies. The footprint moves ~370 KB -> ~256 KB,
+//     not 370 KB -> 46 KB.
+//
+//     ⇒ THE DENSE-TABLE DIRECTION IS DEMOTED ON ITS OWN ARITHMETIC, with no build spent. This is
+//     Rule 77 (re-measure a mechanism's SIZING CONSTANT) and G738 §9's precedent, one level
+//     earlier: the constant was wrong before the mechanism was ever built.
 // ============================================================================================
 static const bool g_g651DispStat = (std::getenv("DC2_G651_DISP_STAT") != nullptr);
 static std::atomic<uint64_t> g_g651LookupCalls{0ull};
 static std::atomic<uint64_t> g_g651HasCalls{0ull};
 std::atomic<uint64_t> g_g651PreemptCalls{0ull}; // defined here, used in runtime_dispatch_and_memory.inc
 static std::atomic<uint64_t> g_g651LookupSlow{0ull};
-// 64 Ki bits = one bit per 32 dispatch slots; population count approximates the touched span.
-static constexpr size_t kG651SeenWords = 8192u;
+// ⭐ G745: one bit per dispatch slot, and now ENOUGH OF THEM. The array was 8,192 words = 524,288
+// bits against 655,360 slots, and `g651NoteTarget` closed the gap with `% kG651SeenWords` — so
+// every target at or above 0x300000 set the bit of a target 0x200000 below it and the two were
+// counted once. `(0x380000 - 0x100000) >> 2 = 655,360` slots need 10,240 words; that is 80 KB of
+// bss in a diagnostic whose own flag disarms the fast path it measures, and it makes the count
+// EXACT instead of "Bloom-ish". (The old size was never a Bloom filter: the map is
+// `slot mod 524288`, so its collisions were systematic, not random, and a birthday-bound error
+// estimate did not apply to it.)
+static constexpr size_t kG651SeenWords = ((PS2_DIRECT_SPAN >> 2) + 63u) / 64u;
+static_assert(kG651SeenWords * 64u >= (PS2_DIRECT_SPAN >> 2),
+              "G745: the seen-bitmap must cover every dispatch slot, or distinctTargets aliases");
 static std::atomic<uint64_t> g_g651Seen[kG651SeenWords];
 
 static inline void g651NoteTarget(uint32_t address)
 {
     const uint32_t slot = (address - kG646Lo) >> 2;
-    const size_t w = (slot >> 6) % kG651SeenWords;
+    // ⭐ G745: the bitmap now covers every slot, so the guard is a RANGE TEST, not a wrap. A
+    // `% kG651SeenWords` here silently merged two distinct targets 0x200000 apart into one count.
+    const size_t w = slot >> 6;
+    if (w >= kG651SeenWords)
+        return;
     const uint64_t bit = 1ull << (slot & 63u);
     if ((g_g651Seen[w].load(std::memory_order_relaxed) & bit) == 0ull)
         g_g651Seen[w].fetch_or(bit, std::memory_order_relaxed);
@@ -477,8 +516,15 @@ void g651DispatchReport(uint64_t presents)
         }
     }
     const double p = presents ? static_cast<double>(presents) : 1.0;
+    // ⛔⛔ G745: SAY IT IN THE ROW. `!g_g651DispStat` is a CONJUNCT of `g_ps2DirectFast`
+    // (`g739ArmDispatchFast`), so arming this census forces every generated dispatch off the G739
+    // inline probe and back through `ps2DirectCallSlow` — which is how these counters can see the
+    // calls at all. The counts are therefore EXACT and the TIMING of the run they came from is not
+    // the shipping timing. This phase armed it beside `DC2_G739_STAT=1` and read `fastArmed=0` on a
+    // binary whose fast path is armed; without this line the next reader repeats that.
     std::fprintf(stderr,
-                 "[G651:disp] presents=%llu lookup=%llu (%.0f/f) has=%llu (%.0f/f) "
+                 "[G651:disp] (armed => G739 inline dispatch DISARMED; counts exact, frame is not) "
+                 "presents=%llu lookup=%llu (%.0f/f) has=%llu (%.0f/f) "
                  "preempt=%llu (%.0f/f) mapFallback=%llu distinctTargets~=%llu\n",
                  (unsigned long long)presents,
                  (unsigned long long)g_g651LookupCalls.load(std::memory_order_relaxed),

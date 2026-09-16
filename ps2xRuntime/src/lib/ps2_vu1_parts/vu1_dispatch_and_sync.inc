@@ -1152,13 +1152,38 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
             if (!vuData || dataSize < 16u)
                 return;
 
+            // ⛔⛔ G746 — `off % dataSize` IS A HARDWARE INTEGER DIVIDE, AND `read64Wrap` DID EIGHT OF
+            // THEM FOR ONE ALIGNED 64-BIT READ.
+            //
+            // `dataSize` is a runtime value, so MSVC cannot strength-reduce the `%`: every call
+            // emits `div` (~26 latency on this host, and not pipelined). `read64Wrap` called it
+            // once per BYTE, then reassembled the eight bytes through a stack array and a `memcpy`
+            // — about 210 cycles to read a qword that is almost always contiguous and aligned.
+            // The GIF-tag walk below runs it once per tag, per XGKICK, ~2,200 kicks/frame.
+            //
+            // ⭐ VU DATA RAM IS A POWER OF TWO AND THIS TREE ALREADY DEPENDS ON THAT: the G610
+            // emitter has baked `and eax, (dataSize - 1)` into every emitted LQ/SQ address since
+            // G610 (`g610EmitAddrU16`). The mask is therefore exact, not an assumption — and the
+            // `%` fallback is kept for a hypothetical non-power-of-two size so the change cannot
+            // be wrong even there.
+            const uint32_t g746DataMask =
+                (dataSize != 0u && (dataSize & (dataSize - 1u)) == 0u) ? (dataSize - 1u) : 0u;
             auto wrapOffset = [&](uint32_t off) -> uint32_t
             {
-                return off % dataSize;
+                return g746DataMask != 0u ? (off & g746DataMask) : (off % dataSize);
             };
 
             auto read64Wrap = [&](uint32_t off) -> uint64_t
             {
+                // The contiguous case — every read that does not straddle the end of VU RAM, which
+                // is all of them except at most one per packet.
+                const uint32_t base = wrapOffset(off);
+                if (base + 8u <= dataSize)
+                {
+                    uint64_t value = 0;
+                    std::memcpy(&value, vuData + base, sizeof(value));
+                    return value;
+                }
                 uint8_t bytes[8];
                 for (uint32_t i = 0; i < 8u; ++i)
                 {

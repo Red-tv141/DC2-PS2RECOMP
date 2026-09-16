@@ -76,7 +76,12 @@ void dc2_g483_run_prof_note(uint64_t proNs, uint64_t loopNs, uint64_t epiNs, uin
     const double tot = (pr + lp + ep) > 0.0 ? (pr + lp + ep) : 1.0;
     std::fprintf(stderr,
                  "[G483:runprof] calls=%llu | prologueUs=%.3f (%.1f%%) loopUs=%.3f (%.1f%%) "
-                 "epilogueUs=%.3f (%.1f%%) | pairs/call=%.0f loopNsPerPair=%.1f\n",
+                 // ⭐ G746: `loopNsPerPair` was printed at ONE decimal — a 0.05 ns/pair quantum on
+                 // the number every VU1 rate gate in this project reads, against levers that live
+                 // at 0.02-0.5 ns/pair. Four decimals costs nothing and removes the quantisation
+                 // from every future gate's estimator. The field name and shape are unchanged, so
+                 // every existing `loopNsPerPair=([\d.]+)` parser keeps working.
+                 "epilogueUs=%.3f (%.1f%%) | pairs/call=%.1f loopNsPerPair=%.4f\n",
                  (unsigned long long)g_g483ProCalls,
                  pr / 1e3 / n, 100.0 * pr / tot,
                  lp / 1e3 / n, 100.0 * lp / tot,

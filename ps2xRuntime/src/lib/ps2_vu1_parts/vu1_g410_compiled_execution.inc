@@ -37,14 +37,14 @@ namespace
 {
     struct G410CompiledUpper
     {
-        uint8_t upperVfDest = 0xffu;
-        uint8_t upperKind = 0xffu;
-        uint8_t lowerFs = 0u;
-        uint8_t lowerFt = 0u;
-        uint8_t pairFlags = 0u;
-        uint8_t lowerS2 = 0xffu;
-        uint8_t lowerKind = 0u; // G422: G422_LK_* (0 = not covered -> execLower)
-        uint8_t g425Flags = 0u; // G425: see G425_PF_*
+        uint8_t upperVfDest;
+        uint8_t upperKind;
+        uint8_t lowerFs;
+        uint8_t lowerFt;
+        uint8_t pairFlags;
+        uint8_t lowerS2;
+        uint8_t lowerKind; // G422: G422_LK_* (0 = not covered -> execLower)
+        uint8_t g425Flags; // G425: see G425_PF_*
     };
 
     // G425: set when EITHER slot of this pair can name VF0 or VI0 as a destination. The run
@@ -239,46 +239,46 @@ namespace
 
     struct G410CompiledCache
     {
-        const uint8_t *codeBase = nullptr;
+        const uint8_t *codeBase;
         // G487: the flag-consumer arm this cache's `lowerKind` bytes were decoded under. Every
         // decode site (the bulk prepare, the MPG invalidation path and the cache verifier) reads
         // it from HERE rather than from the arm accessor, so the cache can never hold a mixture:
         // the only place the arm is sampled is g410PreparePairs, once per run(), and sampling it
         // is what triggers the rebuild.
-        bool decodeFlagLower = false;
+        bool decodeFlagLower;
         // G488: the compiled cross-lane/flag-only UPPER arm this cache's `upperKind` bytes were
         // decoded under. Same contract as decodeFlagLower — sampled once, in g410PreparePairs.
-        bool decodeFastOp = false;
+        bool decodeFastOp;
         // G489: the pc-skip arm this cache's `G489_PF_CANBRANCH` bits were decoded under. Same
         // contract as the two above — sampled once, in g410PreparePairs, and a flip rebuilds.
-        bool decodePcSkip = false;
+        bool decodePcSkip;
         // G532b: preserve this byte and every following cache offset. Bit 0 is the old validity
         // bool; bit 1 records whether DIV was decoded into the compiled-lower kind.
-        uint8_t decodeArmState = 0u;
-        std::array<G410CompiledUpper, PS2_VU1_CODE_SIZE / 8u> uppers{};
-        std::array<uint64_t, PS2_VU1_CODE_SIZE / 8u> sources{};
+        uint8_t decodeArmState;
+        std::array<G410CompiledUpper, PS2_VU1_CODE_SIZE / 8u> uppers;
+        std::array<uint64_t, PS2_VU1_CODE_SIZE / 8u> sources;
         // G479: the same two words, interleaved. 16-byte aligned so one record is never split
         // across two cache lines.
-        alignas(16) std::array<G479FusedPair, PS2_VU1_CODE_SIZE / 8u> fused{};
+        alignas(16) std::array<G479FusedPair, PS2_VU1_CODE_SIZE / 8u> fused;
         // G475: maximal sequential run starting at each slot for the compact
         // VNOP-upper + covered non-control-lower trace (0 = ineligible, capped at 255).
-        std::array<uint8_t, PS2_VU1_CODE_SIZE / 8u> g475RunLen{};
+        G756DirectTable<uint8_t, PS2_VU1_CODE_SIZE / 8u> g475RunLen;
         // G490: the same shape for the WIDENED block run — every covered upper class, not only
         // VNOP. Maintained by the same two call sites as g475RunLen, so precise invalidation
         // covers it identically.
-        std::array<uint8_t, PS2_VU1_CODE_SIZE / 8u> g490RunLen{};
+        G756DirectTable<uint8_t, PS2_VU1_CODE_SIZE / 8u> g490RunLen;
         // G516: the pre-resolved dispatch inputs. `g516LowCls` is the dense 0..10 lower class
         // (0 == none of the ten named kinds -> the leaf's `default:`); `g516UpDesc` is
         // `g421DescTableConst.e[upperKind]` materialised, its four bytes packed in declaration
         // order {cls, op, src, bc} so one 32-bit load reconstitutes the descriptor.
-        alignas(64) std::array<uint8_t, PS2_VU1_CODE_SIZE / 8u> g516LowCls{};
-        alignas(64) std::array<uint32_t, PS2_VU1_CODE_SIZE / 8u> g516UpDesc{};
+        alignas(64) G756DirectTable<uint8_t, PS2_VU1_CODE_SIZE / 8u> g516LowCls;
+        alignas(64) G756DirectTable<uint32_t, PS2_VU1_CODE_SIZE / 8u> g516UpDesc;
         // G500: how many CONTROL-TRANSFER TAIL pairs a block may execute at this slot — 0 (this
         // slot is not an admissible branch terminator), 1 (the branch pair alone; its delay slot
         // is not block-eligible and stays with the pair loop) or 2 (the branch pair AND its delay
         // slot). Built by the same g490RebuildRunLengths() pass, from the same precisely
         // invalidated sidecar, so it can never describe a stale encoding either.
-        std::array<uint8_t, PS2_VU1_CODE_SIZE / 8u> g500Tail{};
+        G756DirectTable<uint8_t, PS2_VU1_CODE_SIZE / 8u> g500Tail;
         // G502: `g500Tail[i + g490RunLen[i]]` — the tail available to a block that STARTS at slot i,
         // pre-joined by the same rebuild pass. The hook used to form that index itself
         // (`currentPc + 8*avail`, bounds test, then the load), which is free while the lookup only
@@ -287,24 +287,24 @@ namespace
         // clamps run only when it is non-zero. Exact by construction: the hook only reads it when
         // `g490Count == g490Avail`, and the pass writes 0 whenever `i + g490RunLen[i]` leaves the
         // table, which is the same answer the hook's own `g500BPc + 8 > codeSize` test gives.
-        std::array<uint8_t, PS2_VU1_CODE_SIZE / 8u> g502TailAt{};
-        uint64_t hits = 0u;
-        uint64_t compiles = 0u;
-        uint64_t upperFallbacks = 0u;
-        uint64_t verified = 0u;
-        uint64_t verifyBad = 0u;
-        uint64_t invalidations = 0u;
-        uint64_t invalidatedPairs = 0u;
-        uint64_t lastReportOps = 0u;
+        G756DirectTable<uint8_t, PS2_VU1_CODE_SIZE / 8u> g502TailAt;
+        uint64_t hits;
+        uint64_t compiles;
+        uint64_t upperFallbacks;
+        uint64_t verified;
+        uint64_t verifyBad;
+        uint64_t invalidations;
+        uint64_t invalidatedPairs;
+        uint64_t lastReportOps;
         // G428: how many slots of the WHOLE code store decode to a lower slot that can read the
         // MAC / STATUS delay line. A deferred-classification lever needs STATUS to be provably
         // dead, and STATUS can only be read by executing an FSEQ/FSAND/FSOR pair, so a zero here
         // over the entire (precisely invalidated) code store is a sound static gate.
-        uint32_t statusReaderSlots = 0u;
-        uint32_t macReaderSlots = 0u;
+        uint32_t statusReaderSlots;
+        uint32_t macReaderSlots;
     };
 
-    thread_local G410CompiledCache s_g410Cache;
+    constinit thread_local G410CompiledCache s_g410Cache{};
 
     bool g410CompiledRequested()
     {
@@ -662,7 +662,7 @@ namespace
     {
         const uint32_t upper = static_cast<uint32_t>(source >> 32u);
         const uint32_t lower = static_cast<uint32_t>(source);
-        G410CompiledUpper pair{};
+        G410CompiledUpper pair{0xffu, 0xffu, 0u, 0u, 0u, 0xffu, 0u, 0u};
         pair.upperKind = g410SelectUpperKind(upper, fastOp);
         pair.lowerFs = FS(lower);
         pair.lowerFt = FT(lower);

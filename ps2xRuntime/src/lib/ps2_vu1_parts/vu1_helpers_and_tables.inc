@@ -3,6 +3,7 @@
 #include "runtime/ps2_gif_arbiter.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_log.h"
+#include "ps2_kick_capture.h"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -15,6 +16,7 @@
 #include <limits>
 #include <string>
 #include <vector>
+#include "vu1_g756_direct_table.inc"
 
 // G141: measure-first perf scope (skill 17-performance-optimization.md), env-gated
 // (DC2_PERF=1), aggregate-only print. Self-contained per-TU so no header/cross-TU
@@ -28,15 +30,12 @@ std::atomic<uint64_t> g_g141Vu1RunNs{0};
 // The EE thread later splices the list into the arbiter in kick-order (GifArbiter::submit is
 // single-writer / EE-only). Null on the EE thread → the legacy synchronous submit path is used, so
 // the default (MTVU-off) build is byte-identical. thread_local: only the worker sees it set.
-thread_local std::vector<std::vector<uint8_t>> *g_g297KickCapture = nullptr;
 // G541 corpus sidecar. Non-null only for a bounded, explicitly armed capture; the ordered address
 // identifies which resident VU-data bytes an eventual GPU-resident GS handoff consumes.
-thread_local std::vector<uint32_t> *g_g541KickAddresses = nullptr;
 // G297: the double-buffer DATA top (VIF1 TOPS latched at the kick's MSCAL) snapshotted on the EE at
 // enqueue time. The interpreter reads XTOP live from memory->vif1_regs.top, which the EE mutates at
 // the NEXT MSCAL — on the worker that would read the wrong buffer half. When g_g297KickCapture is
 // set (worker context) the XTOP read uses this captured value instead. Masked (& 0x3FF) at capture.
-thread_local uint32_t g_g297KickTop = 0u;
 
 namespace {
 struct G141PerfScope
@@ -387,7 +386,7 @@ namespace
         int head;                   // @256
     };
 #define G430_HIST_INIT_ENTRY {{0.0f, 0.0f, 0.0f, 0.0f}, -1, 0u, 0u, 2u, 0u}
-    thread_local G430HistBlock s_g430HB = {
+    constinit thread_local G430HistBlock s_g430HB = {
         {G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY,
          G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY},
         0,
@@ -1252,19 +1251,19 @@ namespace
 }
 
 // Instruction field extraction helpers
-static inline uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
-static inline uint8_t FT(uint32_t i) { return (uint8_t)((i >> 16) & 0x1F); }
-static inline uint8_t FS(uint32_t i) { return (uint8_t)((i >> 11) & 0x1F); }
-static inline uint8_t FD(uint32_t i) { return (uint8_t)((i >> 6) & 0x1F); }
-static inline uint8_t BC(uint32_t i) { return (uint8_t)(i & 0x3); }
-static inline uint8_t S2_FUNC(uint32_t i) { return (uint8_t)((((i >> 6) & 0x1F) << 2) | (i & 0x3)); }
+static G756_INLINE uint8_t DEST(uint32_t i) { return (uint8_t)((i >> 21) & 0xF); }
+static G756_INLINE uint8_t FT(uint32_t i) { return (uint8_t)((i >> 16) & 0x1F); }
+static G756_INLINE uint8_t FS(uint32_t i) { return (uint8_t)((i >> 11) & 0x1F); }
+static G756_INLINE uint8_t FD(uint32_t i) { return (uint8_t)((i >> 6) & 0x1F); }
+static G756_INLINE uint8_t BC(uint32_t i) { return (uint8_t)(i & 0x3); }
+static G756_INLINE uint8_t S2_FUNC(uint32_t i) { return (uint8_t)((((i >> 6) & 0x1F) << 2) | (i & 0x3)); }
 
 // Lower instruction field helpers
-static inline uint8_t LIT(uint32_t i) { return (uint8_t)((i >> 16) & 0x1F); }
-static inline uint8_t LIS(uint32_t i) { return (uint8_t)((i >> 11) & 0x1F); }
-static inline uint8_t LID(uint32_t i) { return (uint8_t)((i >> 6) & 0x1F); }
-static inline int16_t IMM11(uint32_t i) { return (int16_t)(int32_t)((int32_t)(i << 21) >> 21); }
-static inline int16_t IMM15(uint32_t i)
+static G756_INLINE uint8_t LIT(uint32_t i) { return (uint8_t)((i >> 16) & 0x1F); }
+static G756_INLINE uint8_t LIS(uint32_t i) { return (uint8_t)((i >> 11) & 0x1F); }
+static G756_INLINE uint8_t LID(uint32_t i) { return (uint8_t)((i >> 6) & 0x1F); }
+static G756_INLINE int16_t IMM11(uint32_t i) { return (int16_t)(int32_t)((int32_t)(i << 21) >> 21); }
+static G756_INLINE int16_t IMM15(uint32_t i)
 {
     uint32_t lo11 = i & 0x7FF;
     uint32_t hi4 = (i >> 21) & 0xF;

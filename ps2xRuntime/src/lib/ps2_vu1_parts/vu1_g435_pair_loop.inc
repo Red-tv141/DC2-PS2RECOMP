@@ -805,7 +805,7 @@
                 }
                 else
                 {
-                    ++s_g612SkipQp;
+                    if (g612StatOn() || s_g747KeepVuCounters) ++s_g612SkipQp;
                     // ⭐ G731 CENSUS (translate-free, stat-gated, never in a timing run). `skipQp`
                     // is the LARGEST admission loss in this backend — 258,714,781 refusals against
                     // 197,132,288 successful region runs on `dragon`, i.e. 57% of entry attempts,
@@ -1146,7 +1146,7 @@
                 //
                 // THE FALLBACK POPULATION PAYS ONE ARRAY LOAD AND TWO TESTS, NOT A CALL: the
                 // `noinline` entry is only reached when the slot already holds an emitted body and
-                // this block has no branch/flag tail. `g610RunNativeBlock` may still refuse (a Q/P
+                // its pair count matches. `g610RunNativeBlock` may still refuse (a Q/P
                 // segment split, a clamped pair count, a stale `dataSize`), in which case it has
                 // mutated nothing and the chain below runs the block exactly as it always has.
                 // G611: `g611Ops` is a loop invariant and `g611` is a byte of the SAME slot record
@@ -1156,41 +1156,24 @@
                     (g611Ops || s_g610.slot[currentPc >> 3u].g611 == 0u) &&
                     g610RunNativeBlock(m_state, currentPc >> 3u, g490Count, vuData, dataSize,
                                        s_qDelayP, s_pDelayP, g430Base + (int64_t)cycle, g436Hb,
-                                       g611QSplit))
+                                       g611QSplit, s_g747NativeTail ? g500Tail : 0u))
                 {
-                    // ⭐ THE TAIL IS NOT CONSUMED — IT IS LEFT TO THE PAIR LOOP.
-                    //
-                    // The first revision refused every block whose run ends in a branch or
-                    // flag-consumer tail, and the census read `fbTail = 161,253,967` against
-                    // 117,440,512 native blocks: 45% of every block entry that HAD a compiled body,
-                    // thrown away — and they are the LONG blocks, because a loop body always ends in
-                    // its own back-edge.
-                    //
-                    // So the native body runs the `g490Count` eligible pairs and then this arm takes
-                    // the G500 `tail == 0` exit verbatim: pc advances by `8 * count`, the cycle
-                    // budget by `count`, and the branch/flag pair is executed by the pair loop on
-                    // its next iterations — which is exactly what happened before G500 attached it
-                    // to the block. Nothing about that pair's semantics changes; it merely pays the
-                    // per-pair envelope again instead of riding inside the block.
-                    //
-                    // ⚠️ THIS MOVES `[G490:block] cover/avg` BETWEEN THE TWO A/B ARMS, by exactly
-                    // `tailPairs x nativeBlocks`. The standing "cover must be unchanged" cross-check
-                    // does NOT apply to this lever; the invariant that does is `[G483:runprof]
-                    // pairs/call`, which counts every executed pair whoever executes it.
-                    if (g500Tail != 0u)
-                        ++s_g610FbTail;
-                    const uint32_t g610Next = currentPc + 8u * g490Count;
-                    m_state.pc = g610Next;
-                    G483_PC_SET(g610Next);
-                    if (g490Stat)
-                        g490NoteBlock(g490Count);
-                    cycle += g490Count - 1u;
-                    continue;
+                    if (!s_g747NativeTail || g500Tail == 0u)
+                    {
+                        if (g500Tail != 0u && (g610StatOn() || s_g747KeepVuCounters))
+                            ++s_g610FbTail;
+                        const uint32_t g610Next = currentPc + 8u * g490Count;
+                        m_state.pc = g610Next;
+                        G483_PC_SET(g610Next);
+                        if (g490Stat)
+                            g490NoteBlock(g490Count);
+                        cycle += g490Count - 1u;
+                        continue;
+                    }
+                    // Attached tails use the shared PC, pending-branch, and budget completion
+                    // below. The else skips the generic prefix, which has already run natively.
                 }
-                // The `continue` above already makes the chain below unreachable on a native block,
-                // but the `else` is kept so this arm still binds correctly if the G517 copy chain
-                // directly above it is ever compiled in (its trailing `else` would otherwise
-                // dangle onto this `if` and leave the chain below running unconditionally).
+                // This else also preserves the optional G517 handler chain above.
                 else
 #endif
 #if DC2_G610_CEIL_ARMS

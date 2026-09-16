@@ -9208,6 +9208,45 @@ void main()
                 g417NoteUpload(b, b.fbH, ns(drainT0, submitT0),
                                ns(submitT0, waitT0), ns(waitT0, done));
             }
+            // ⭐⭐⭐ G743: THE PACK WAS NARROWED THREE TIMES; THE UPLOAD NEVER WAS.
+            //
+            // G290 / G298 / G419 each narrowed the CPU-side PACK — G290's own comment at
+            // `rasterizer_vram_materialization.inc:2358` says uploading the covered rows is
+            // *"pure churn"* — and the batch has carried the resulting window on
+            // `b.g716SeedLo/Hi` (= `upLoEff` / `upHi`, GS rows) ever since. **The GL upload
+            // still pushes all `fbH` rows**, and every row outside that window is a ZERO, put
+            // there by `g420PrepStaging`, whose stated postcondition is *"every element outside
+            // the packed rows is 0"*.
+            //
+            // Measured on `dungeon1` (`[G415:stage]`, G742 binary): `fbp=0x13c/skip`,
+            // `0x13f/read`, `0x141/read`, `0x14b/read` all upload `upRows = 512.0` while their
+            // consumers read `win = 64…128`, and the frame's whole VRAM→FBO traffic is
+            // ~5,155 rows = **10.5 MB/frame** of PCIe, re-uploaded every frame.
+            //
+            // ⛔ Why the CPU-side stage timer under-prices this: `[G415:stage] up` is a
+            // `steady_clock` span around the `glTexSubImage2D` CALL. It does not contain the
+            // driver's staging copy out of pageable memory, the PCIe transfer, or the GPU's
+            // texture write — all of which land later, in the drain that the next `glReadPixels`
+            // blocks on (40.1 % of this thread).
+            //
+            // ⭐ EXACT, and by construction rather than by argument: clearing the colour target to
+            // 0 and uploading only `[g716SeedLo, g716SeedHi]` produces, texel for texel, what
+            // uploading the whole staging buffer produces — because the staging buffer IS zero
+            // outside that window. Nothing defined becomes undefined. Confined to the 1:1 case
+            // (`physW == fbW && physH == fbH`); every scaled path keeps the untouched full upload.
+            //
+            // Arm `DC2_G743_NARROW_UPLOAD=1`, kill `DC2_G743_NO_NARROW_UPLOAD=1`, oracle
+            // `DC2_G743_NARROWUP_VERIFY=1` (uploads BOTH ways and byte-compares the whole texture),
+            // census `[G743:narrowup]`. Default OFF pending its own gate and a graphics route.
+            // ⛔ NOT BUILT IN G743 — SIZE IT WITH `[G308:census]` FIRST. The saving is
+            // `fbH - (g716SeedHi - g716SeedLo + 1)` rows per upload, and that is ZERO whenever the
+            // snapshot union (`upLo/upHi` at `rasterizer_vram_materialization.inc:2357`) already
+            // spans the surface. `[G308:census]` prints exactly this as `potential=%` and costs one
+            // route run; building before reading it would be Rule 24's mistake. The GL-state hazard
+            // is also real and must be designed, not improvised: the clear has to defeat both the
+            // scissor test and the colour mask, and the obvious `glIsEnabled`/`glGetFloatv` restore
+            // would add three DRIVER SYNC QUERIES per upload — re-creating, on the same thread, the
+            // exact defect §2 measured. Use the G496 state cache's setters, never a query.
             else
             {
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, b.fbW, b.fbH,

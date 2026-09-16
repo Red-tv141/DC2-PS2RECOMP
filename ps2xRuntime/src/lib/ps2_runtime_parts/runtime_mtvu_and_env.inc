@@ -122,9 +122,7 @@ bool (*g_f66_drive_dungeon_pad_hook)(uint32_t) = nullptr;
 // Requires MTGS (rides its window sort/drain). Incompatible with VU diagnostics that read shared
 // gs/memory mid-execute (all default-off) → those force the synchronous fallback.
 // ============================================================================
-extern thread_local std::vector<std::vector<uint8_t>> *g_g297KickCapture; // defined in ps2_vu1.cpp
-extern thread_local uint32_t g_g297KickTop;                              // defined in ps2_vu1.cpp
-extern thread_local std::vector<uint32_t> *g_g541KickAddresses;          // defined in ps2_vu1.cpp
+// Shared constant TLS definitions are in ps2_kick_capture.h.
 extern bool g150_mtgs_enabled();                                          // defined in ps2_gif_arbiter.cpp
 extern void dc2_g410_vu_code_written(const uint8_t *codeBase, uint32_t offset, uint32_t sizeBytes);
 extern std::atomic<uint64_t> g_dc2PresentTick;  // global scope (defined in dc2_game_override.cpp); this
@@ -556,6 +554,11 @@ public:
     // G344: TOTAL collectWindowPackets time + call count (all windows). overhead = total - stall.
     uint64_t gsCollectTotalNs() const { return m_gsCollectTotalNs.load(std::memory_order_relaxed); }
     uint64_t gsCollectCalls() const { return m_gsCollectCalls.load(std::memory_order_relaxed); }
+    // ⭐ G745: the part of the kick stall the G726 spin burns as CPU on the PARSE thread. Wall time
+    // is CPU time for a `_mm_pause` loop, so `parseWork = parseCpu - gsSpin` removes an idle wait
+    // that `poleW` was counting as work. See the spin site for the measured inflation.
+    uint64_t gsSpinNs() const { return m_gsSpinNs.load(std::memory_order_relaxed); }
+    uint64_t gsSpins() const { return m_gsSpins.load(std::memory_order_relaxed); }
 
     // EE thread, at every drain() window handoff: seal the current kick batch 1:1 with the window
     // (push even when empty, so the worker's per-window pop stays in lockstep).
@@ -705,15 +708,66 @@ public:
                 // `g713Sync` spin - where the awaited node was a microsecond-scale readback bypass
                 // and the win was 14 ms/f - there is no comparable headroom here.
                 {
+                    // ⭐⭐⭐ G744 PROMOTION (2026-09-13): DEFAULT 8192. Rollback
+                    // `DC2_G726_NO_KICK_SPIN=1` -> 0, i.e. straight to the park.
+                    //
+                    // ⚠️ THE CAVEAT ABOVE IS STILL TRUE AND IS WHY THIS IS PROMOTED *WITH* THE G740
+                    // ASYNC BOUNDARY, NOT ALONE. On its own the spin is a null (+0.12 on `dragon`)
+                    // for exactly the reason written above — most of that stall is the GS worker
+                    // legitimately waiting on a VU1 pole. What the pairing changes is the
+                    // POPULATION: removing the frame-boundary park raises `gsStalls/f` from ~1,315
+                    // to ~1,800 at an unchanged ~10.5 us each, and THOSE are park latency the spin
+                    // can convert. Together: -1.21 ms/f admissible (G743 §5c.1).
+                    //
+                    // ⭐ 8192 IS THE MEASURED KNEE, not a guess: G744 §1 swept 1024/2048/4096/8192/
+                    // 16384 on `dragon` with controls at both ends — the frame is monotone to 8192
+                    // (-0.83, -0.99, -1.09, **-1.34**) and flat after (-1.32 at 16384).
+                    // ⛔ And the parse-thread CPU this costs (~+15 ms/f) is FLAT across that whole
+                    // 16x sweep, so it belongs to the boundary removal and CANNOT be bought back by
+                    // lowering the budget. That is why no adaptive form was built (Rule G744-1).
                     static const uint32_t s_kickSpin = [] {
+                        if (std::getenv("DC2_G726_NO_KICK_SPIN") != nullptr)
+                            return 0u;
                         const char *v = std::getenv("DC2_G726_KICK_SPIN");
-                        return (v != nullptr) ? (uint32_t)std::strtoul(v, nullptr, 0) : 0u;
+                        return (v != nullptr) ? (uint32_t)std::strtoul(v, nullptr, 0) : 8192u;
                     }();
                     for (uint32_t i = 0; i < s_kickSpin; ++i)
                     {
                         if (item->ready.load(std::memory_order_acquire) || m_stop)
                             break;
                         _mm_pause();
+                    }
+                    // ⭐⭐⭐ G745: THE SPIN IS IDLE WAIT CHARGED TO THIS THREAD AS CPU, AND THE BOARD
+                    // RANKS THE POLE BY EXACTLY THAT COLUMN.
+                    //
+                    // `tools/g653_pole_table.py`'s `poleW` is `max(parseCpu, vu1Cpu, eeWork,
+                    // gsExecCpu)`, where `parseCpu` is `GetThreadTimes` on THIS thread. A `_mm_pause`
+                    // loop is 100 % CPU and 0 % work, so every microsecond spent here inflates the
+                    // GS parse thread's "REAL CPU" column by a microsecond. Measured on `dragon`,
+                    // same route and same windows, default vs `DC2_G726_NO_KICK_SPIN=1`:
+                    //
+                    //     spin ON   parseCpuMs/f 25.0-26.0   frame 25.5-26.1
+                    //     spin OFF  parseCpuMs/f 15.1-18.8   frame 27.7-28.8
+                    //
+                    // ⇒ +8.5 ms/f of parse "CPU" that is a wait, on a window whose whole frame is
+                    // 25 ms. That is what put GS parse at the pole on 11 of the 23 G744 windows,
+                    // contradicting G744 §4e's own prose ("three of those four are VU1-poled").
+                    // It is G735's Rule 12 one costume further on: G735 stopped the board ranking
+                    // OCCUPANCY against WORK, and the replacement column turned out to be
+                    // work-plus-spin.
+                    //
+                    // The spin is a real win and stays (G744 §1: -1.21 ms/f paired with G740). What
+                    // changes is that it is now MEASURED, so `parseWork = parseCpu - gsSpin` can be
+                    // ranked instead. Wall time is CPU time for a pause loop, so one clock read per
+                    // STALLED kick is the exact price — and it is taken only when `instr` is armed,
+                    // so the shipping path still does zero clock work here.
+                    if (instr)
+                    {
+                        m_gsSpinNs.fetch_add(
+                            (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                std::chrono::steady_clock::now() - stall0).count(),
+                            std::memory_order_relaxed);
+                        m_gsSpins.fetch_add(1ull, std::memory_order_relaxed);
                     }
                 }
                 if (!item->ready.load(std::memory_order_acquire))
@@ -1309,6 +1363,9 @@ private:
     // G344 premise-gate: total collectWindowPackets time + call count (overhead = total - stall).
     std::atomic<uint64_t> m_gsCollectTotalNs{0ull};
     std::atomic<uint64_t> m_gsCollectCalls{0ull};
+    // ⭐ G745: the G726 kick spin's own wall time (== its CPU) and the number of stalls that spun.
+    std::atomic<uint64_t> m_gsSpinNs{0ull};
+    std::atomic<uint64_t> m_gsSpins{0ull};
 };
 
 } // namespace
@@ -1356,6 +1413,9 @@ uint64_t g297GsCollectStallNs() { return G297Mtvu::activeCached() ? G297Mtvu::in
 uint64_t g297GsCollectStalls() { return G297Mtvu::activeCached() ? G297Mtvu::instance().gsCollectStalls() : 0ull; }
 uint64_t g297GsCollectTotalNs() { return G297Mtvu::activeCached() ? G297Mtvu::instance().gsCollectTotalNs() : 0ull; }
 uint64_t g297GsCollectCalls() { return G297Mtvu::activeCached() ? G297Mtvu::instance().gsCollectCalls() : 0ull; }
+// ⭐ G745: the G726 kick spin's CPU on the PARSE thread — the term `poleW` was scoring as work.
+uint64_t g297GsSpinNs() { return G297Mtvu::activeCached() ? G297Mtvu::instance().gsSpinNs() : 0ull; }
+uint64_t g297GsSpins() { return G297Mtvu::activeCached() ? G297Mtvu::instance().gsSpins() : 0ull; }
 
 
 // ============================================================================

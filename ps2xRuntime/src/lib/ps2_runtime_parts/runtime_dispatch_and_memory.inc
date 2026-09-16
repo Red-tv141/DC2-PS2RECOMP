@@ -1,3 +1,11 @@
+// ⭐ G746: rollback for the duplicated dispatch breadcrumb below. One `getenv` at first use, then a
+// cached bool — never a per-dispatch environment read (G268/G500's cached-accessor law).
+static bool g746DualBreadcrumbOn()
+{
+    static const bool s_on = (std::getenv("DC2_G746_DUAL_BREADCRUMB") != nullptr);
+    return s_on;
+}
+
 void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
 {
     uint32_t lastPc = std::numeric_limits<uint32_t>::max();
@@ -27,10 +35,29 @@ void PS2Runtime::dispatchLoop(uint8_t *rdram, R5900Context *ctx)
             lastPc = pc;
         }
 
-        m_debugPc.store(pc, std::memory_order_relaxed);
-        m_debugRa.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)), std::memory_order_relaxed);
-        m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)), std::memory_order_relaxed);
-        m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0)), std::memory_order_relaxed);
+        // ⭐ G746 — THE SAME FOUR BREADCRUMBS WERE PUBLISHED TWICE, ON EVERY DISPATCH.
+        //
+        // `m_debugPc/Ra/Sp/Gp` and `dc2_crash::g_activeGuestPc/Ra/Sp/Gp` carry bit-for-bit the same
+        // values, written back to back here — eight relaxed atomic stores to eight different cache
+        // lines per iteration of the hottest loop on the EE thread. G733 §6d's real-unwind table
+        // puts `PS2Runtime::dispatchLoop` itself at **3.90 % of the EE thread** (rank 3), and that
+        // is SELF time: this publication is a measurable share of it.
+        //
+        // The four `m_debug*` members have exactly TWO readers in the whole tree and both are cold:
+        // the "Game thread returned" line (once per process) and two `PS2_IF_AGRESSIVE_LOGS`
+        // blocks, which are compiled out of a shipping build. The crash reporter reads the
+        // `g_activeGuest*` set. So one of the two publications was always dead weight.
+        //
+        // ⛔ THE CRASH BREADCRUMB IS UNCHANGED. `updateActiveGuestContext` still runs on every
+        // dispatch with the same four values and the same context pointer — this deletes a
+        // DUPLICATE, not a diagnostic. Rollback `DC2_G746_DUAL_BREADCRUMB=1` restores both.
+        if (g746DualBreadcrumbOn())
+        {
+            m_debugPc.store(pc, std::memory_order_relaxed);
+            m_debugRa.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)), std::memory_order_relaxed);
+            m_debugSp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)), std::memory_order_relaxed);
+            m_debugGp.store(static_cast<uint32_t>(_mm_extract_epi32(ctx->r[28], 0)), std::memory_order_relaxed);
+        }
         dc2_crash::updateActiveGuestContext(pc,
                                            static_cast<uint32_t>(_mm_extract_epi32(ctx->r[31], 0)),
                                            static_cast<uint32_t>(_mm_extract_epi32(ctx->r[29], 0)),
@@ -277,7 +304,7 @@ static const bool s_g651NoPreempt = [] {
 // exact "this function is never reached" shape rather than "reached 1 time in 64".
 //
 // Rollback: DC2_G739_NO_INLINE_PREEMPT=1.
-thread_local uint32_t g_ps2BackEdgeCounter; // no initialiser: zero-init, no dynamic init, no guard
+// g_ps2BackEdgeCounter has its shared inline constinit definition in ps2_runtime_macros.h.
 // ⛔ Initialised HERE, not in `g739ArmDispatchFast`, because `s_g651NoPreempt` lives in this file
 // and this file is included after that one. Same TU, so dynamic init runs in definition order and
 // both operands above are already final; every reader is a generated function that cannot run
@@ -524,7 +551,9 @@ void PS2Runtime::run()
         try
         {
             dispatchLoop(m_memory.getRDRAM(), &m_cpuContext);
-            uint32_t pc = m_debugPc.load(std::memory_order_relaxed);
+            // ⭐ G746: read the breadcrumb that is ALWAYS published (the crash reporter's), not the
+            // duplicate this phase removed from the dispatch loop.
+            uint32_t pc = dc2_crash::g_activeGuestPc.load(std::memory_order_relaxed);
             RUNTIME_LOG("Game thread returned. PC=0x" << std::hex << pc
                       << " RA=0x" << static_cast<uint32_t>(_mm_extract_epi32(m_cpuContext.r[31], 0)) << std::dec << std::endl);
         }
@@ -621,10 +650,12 @@ void PS2Runtime::run()
                 uint64_t curGs = m_memory.gsWriteCount();
                 uint64_t curVif = m_memory.vifWriteCount();
                 const GSRegisters &gs = m_memory.gs();
-                const uint32_t dbgPc = m_debugPc.load(std::memory_order_relaxed);
-                const uint32_t dbgRa = m_debugRa.load(std::memory_order_relaxed);
-                const uint32_t dbgSp = m_debugSp.load(std::memory_order_relaxed);
-                const uint32_t dbgGp = m_debugGp.load(std::memory_order_relaxed);
+                // G746: the dispatch loop no longer duplicates these into `m_debug*`; read the one
+                // set that is always published.
+                const uint32_t dbgPc = dc2_crash::g_activeGuestPc.load(std::memory_order_relaxed);
+                const uint32_t dbgRa = dc2_crash::g_activeGuestRa.load(std::memory_order_relaxed);
+                const uint32_t dbgSp = dc2_crash::g_activeGuestSp.load(std::memory_order_relaxed);
+                const uint32_t dbgGp = dc2_crash::g_activeGuestGp.load(std::memory_order_relaxed);
                 const int activeThreads = g_activeThreads.load(std::memory_order_relaxed);
 
                 std::cout << "[run:tick] tick=" << tick
@@ -659,14 +690,14 @@ void PS2Runtime::run()
                 // runs as one deep C++ call tree from the entry dispatch). Reading the
                 // live context PC pinpoints an intra-function (no-call) spin exactly.
                 const uint32_t livePc = m_cpuContext.pc;
-                const uint32_t wpc = m_debugPc.load(std::memory_order_relaxed);
+                const uint32_t wpc = dc2_crash::g_activeGuestPc.load(std::memory_order_relaxed);
                 if (livePc == s_lastPc) { ++s_freeze; } else { s_freeze = 0u; s_lastPc = livePc; }
                 std::cerr << "[F50.2:watch] tick=" << std::dec << tick
                           << " livePc=0x" << std::hex << livePc
                           << " dispPc=0x" << wpc
-                          << " ra=0x" << m_debugRa.load(std::memory_order_relaxed)
-                          << " sp=0x" << m_debugSp.load(std::memory_order_relaxed)
-                          << " gp=0x" << m_debugGp.load(std::memory_order_relaxed)
+                          << " ra=0x" << dc2_crash::g_activeGuestRa.load(std::memory_order_relaxed)
+                          << " sp=0x" << dc2_crash::g_activeGuestSp.load(std::memory_order_relaxed)
+                          << " gp=0x" << dc2_crash::g_activeGuestGp.load(std::memory_order_relaxed)
                           << std::dec << " freezeN=" << s_freeze << std::endl;
 
                 // F50.3: also sample every live guest worker thread's per-instruction PC.

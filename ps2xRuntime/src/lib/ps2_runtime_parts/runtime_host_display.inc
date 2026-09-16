@@ -58,11 +58,8 @@ struct ProgramHeader
 // as the out-of-line `pushDispatchPc`, or a crash report taken after G739 would print only the
 // dispatches that happened to miss the direct table.
 //
-// ⛔ NO INITIALISER, DELIBERATELY: a namespace-scope `thread_local` without one is
-// zero-initialised with no dynamic init, so MSVC emits a bare TLS access from every reader. Give
-// it `{}` or a constructor and every access in every generated TU grows an `_Init_thread_header`
-// epoch check -- G619's law, which G649 and G651 each had to apply to this very call chain.
-thread_local Ps2DispatchRing g_ps2DispatchRing;
+// The shared inline constinit definition lives in ps2_runtime_macros.h. A separate definition
+// here would hide the constant initializer from generated TUs and retain per-access TLS guards.
 
 namespace
 {

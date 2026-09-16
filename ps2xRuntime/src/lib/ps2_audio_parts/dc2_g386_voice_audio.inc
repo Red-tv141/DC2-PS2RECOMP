@@ -17,11 +17,19 @@ namespace
         bool soundLoaded = false;
         bool opened = false;
         bool playing = false;
+        // G750: set by the PAUSE command (family 0x60) while a clip is in progress.
+        // A paused port is still "playing" as far as the guest's state query is
+        // concerned - the clip has not completed, it is merely suspended.
+        bool paused = false;
         std::string filename;
         float volume = 1.0f;
         uint32_t sampleRate = 0u;
         uint32_t frameCount = 0u;
         std::chrono::steady_clock::time_point deadline{};
+        // G750: time left on `deadline` at the moment of the pause. The deadline is
+        // wall-clock, so it has to be re-based on resume or the clip would "complete"
+        // while suspended.
+        std::chrono::steady_clock::duration remaining{};
     };
 
     std::mutex g_g386VoiceMutex;
@@ -46,6 +54,15 @@ namespace
     bool g386VoiceDisabled()
     {
         static const bool disabled = g386EnvFlagEnabled("DC2_G386_NO_VOICE");
+        return disabled;
+    }
+
+    // G750: rollback to the pre-G750 behaviour, where the PAUSE command stopped the
+    // host sound outright and the following PLAY restarted the clip from its first
+    // sample. Retained so the change can be A/B'd against the shipped binary.
+    bool g386NoVoicePause()
+    {
+        static const bool disabled = g386EnvFlagEnabled("DC2_G750_NO_VOICE_PAUSE");
         return disabled;
     }
 
@@ -271,7 +288,9 @@ namespace
         (void)unload;
 #endif
         port.playing = false;
+        port.paused = false;
         port.deadline = {};
+        port.remaining = {};
         if (unload)
         {
             port.opened = false;
@@ -281,10 +300,78 @@ namespace
         }
     }
 
+    // G750: suspend a clip in place, keeping the host playback cursor. raylib's
+    // PauseSound stops the miniaudio node WITHOUT seeking, so ResumeSound continues
+    // from the same sample; StopSound (what the pause command used to call) rewinds
+    // to zero, which is what made every unpause replay the clip from its start.
+    void g386PausePortLocked(uint32_t portIndex)
+    {
+        G386VoicePort &port = g_g386VoicePorts[portIndex];
+        if (!port.playing || port.paused)
+        {
+            return;
+        }
+
+#if !defined(PLATFORM_VITA)
+        if (port.soundLoaded)
+        {
+            PauseSound(port.sound);
+        }
+#endif
+        const auto now = std::chrono::steady_clock::now();
+        port.remaining = (port.deadline > now)
+            ? (port.deadline - now)
+            : std::chrono::steady_clock::duration::zero();
+        port.paused = true;
+
+        if (g386VoiceTraceEnabled())
+        {
+            std::fprintf(
+                stderr,
+                "[G386:voice] pause port=%u file=\"%s\" remaining=%.3f\n",
+                portIndex, port.filename.c_str(),
+                std::chrono::duration<double>(port.remaining).count());
+        }
+    }
+
+    // G750: resume a suspended clip and re-base its wall-clock completion deadline by
+    // the time it spent paused. Returns false when the port was not paused, so the
+    // caller falls through to a normal play-from-the-start.
+    bool g386ResumePortLocked(uint32_t portIndex)
+    {
+        G386VoicePort &port = g_g386VoicePorts[portIndex];
+        if (!port.playing || !port.paused)
+        {
+            return false;
+        }
+
+#if !defined(PLATFORM_VITA)
+        if (port.soundLoaded)
+        {
+            SetSoundVolume(port.sound, port.volume);
+            ResumeSound(port.sound);
+        }
+#endif
+        port.deadline = std::chrono::steady_clock::now() + port.remaining;
+        port.paused = false;
+
+        if (g386VoiceTraceEnabled())
+        {
+            std::fprintf(
+                stderr,
+                "[G386:voice] resume port=%u file=\"%s\" remaining=%.3f\n",
+                portIndex, port.filename.c_str(),
+                std::chrono::duration<double>(port.remaining).count());
+        }
+        port.remaining = {};
+        return true;
+    }
+
     void g386RefreshPortLocked(uint32_t portIndex)
     {
         G386VoicePort &port = g_g386VoicePorts[portIndex];
-        if (!port.playing ||
+        // G750: a paused clip never expires - its deadline is frozen until resume.
+        if (!port.playing || port.paused ||
             std::chrono::steady_clock::now() < port.deadline)
         {
             return;
@@ -416,6 +503,8 @@ namespace
             std::chrono::microseconds(
                 static_cast<int64_t>(durationSeconds * 1000000.0));
         port.playing = true;
+        port.paused = false;
+        port.remaining = {};
 
         if (g386VoiceTraceEnabled())
         {
@@ -461,14 +550,37 @@ bool dc2G386HandleVoiceRpc(uint32_t rpcNum,
     case 0x0040u:
         // Standby commits the open stream on the IOP. Loading already completed
         // synchronously in the 0x8020 open command.
+        // G750: standby is the only command that re-arms a stream from its start
+        // (StreamStandBy is always issued after StreamOpenFast, never mid-clip), so
+        // it clears any suspended state - the 0x50 that follows must play from zero.
+        g386StopPortLocked(g_g386VoicePorts[portIndex], false);
         break;
 
     case 0x0050u:
-        g386PlayPortLocked(portIndex);
+        // StreamPlay and StreamRePlay are the SAME guest command (`ezBgm(port|0x50)`),
+        // so "start" and "resume after pause" are distinguished only by whether this
+        // port is currently suspended. Without that distinction an unpause replayed
+        // the clip from its first sample.
+        if (g386NoVoicePause() || !g386ResumePortLocked(portIndex))
+        {
+            g386PlayPortLocked(portIndex);
+        }
         break;
 
     case 0x0060u:
-        g386StopPortLocked(g_g386VoicePorts[portIndex], false);
+        // StreamPause and StreamStop are also the same guest command
+        // (`ezBgm(port|0x60)`). Treat it as a pause: it suspends output and keeps the
+        // playback position. Every path that genuinely restarts or discards the clip
+        // goes through standby (0x40), close (0x30/0x10) or a fresh open (0x8020),
+        // each of which resets the port explicitly.
+        if (g386NoVoicePause())
+        {
+            g386StopPortLocked(g_g386VoicePorts[portIndex], false);
+        }
+        else
+        {
+            g386PausePortLocked(portIndex);
+        }
         break;
 
     case 0x0080u:

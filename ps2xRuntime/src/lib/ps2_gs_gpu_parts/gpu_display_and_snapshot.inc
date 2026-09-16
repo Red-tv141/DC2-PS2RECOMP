@@ -1,8 +1,106 @@
+// ==============================================================================================
+// ⭐⭐⭐ G748 — THE PREFERRED DISPLAY SOURCE IS PARSE-THREAD STATE, AND THE LATCH READS IT LIVE.
+//
+// `m_hasPreferredDisplaySource` / `m_preferredDisplaySourceFrame` / `m_preferredDisplayDestFbp`
+// are written by the **G172 hoist at CAPTURE time** (`rasterizer_tilebin_capture.inc`, the
+// `looksLikeDisplayCopy144` block — its own comment says it "applies it to the LIVE gs
+// immediately … read later by latchHostPresentationFrame()"). Capture runs on the PARSE thread;
+// the latch runs on the EXEC thread.
+//
+// Before G740 that was safe by accident: the frame-boundary closure blocked the parse thread
+// (`g713CallOnExec`), so nothing could move the triple while the latch read it. G744 promoted
+// `DC2_G740_ASYNC_BOUNDARY` default-ON, and its safety argument — "everything else the closure
+// touches (`g_g144List`, `g_g260Graph`, guest VRAM, GL) is already exec-private under G721" —
+// does not cover this triple. With the boundary handed off, the parse thread is already inside
+// frame N+1 when the latch runs, so frame N gets presented through frame N+1's RTT source
+// (measured: `srcFbp=0x139` on a `dispFbp=0x0` latch) — a one-frame garbage present at every
+// scene/display-buffer switch.
+//
+// The fix is G412's, one field set on: SNAPSHOT the triple at the boundary's own FIFO position on
+// the parse thread (`g748_boundary_capture_pds`, called from ps2_gif_arbiter.cpp for BOTH the
+// async and the synchronous boundary, so the sync path is behaviour-identical) and let the latch
+// consume that snapshot instead of the live members. Three scalars, once per frame: the async
+// boundary keeps its measured win.
+//
+// Rollback: `DC2_G748_NO_PDS_SNAPSHOT=1` restores the live read.
+// ==============================================================================================
+namespace
+{
+    struct G748PdsSnapshot
+    {
+        GSFrameReg frame{};
+        uint32_t destFbp = 0u;
+        bool has = false;
+        bool active = false;
+        // ⭐⭐⭐ THE FIELD THAT ACTUALLY CARRIES THE DEFECT. See the all-black fallback in
+        // `copyDisplaySource`: when the display buffer reads entirely black it substitutes a
+        // DRAWING CONTEXT's FRAME register. Those live in `m_ctx[]`, which the PARSE thread owns.
+        GSFrameReg ctxFrame[2]{};
+    };
+
+    std::mutex g_g748PdsMutex;
+    G748PdsSnapshot g_g748Pds{};
+    GS *g_g748PdsGs = nullptr;
+
+    bool g748PdsSnapshotEnabled()
+    {
+        static const bool on = !envFlagEnabled("DC2_G748_NO_PDS_SNAPSHOT");
+        return on;
+    }
+}
+
+// Parse thread, at the frame-boundary marker's FIFO position — exactly where the synchronous
+// boundary used to run the closure. Declared at global scope for ps2_gif_arbiter.cpp.
+void g748_boundary_capture_pds()
+{
+    if (!g748PdsSnapshotEnabled())
+        return;
+    GS *const gs = g_g748PdsGs;
+    if (!gs)
+        return;
+    GSFrameReg frame{};
+    uint32_t destFbp = 0u;
+    const bool has = gs->getPreferredDisplaySource(frame, destFbp);
+    // `getContextFrame` is already a public accessor on GS — no header change needed.
+    const GSFrameReg ctx0 = gs->getContextFrame(0);
+    const GSFrameReg ctx1 = gs->getContextFrame(1);
+    std::lock_guard<std::mutex> lock(g_g748PdsMutex);
+    g_g748Pds.frame = frame;
+    g_g748Pds.destFbp = destFbp;
+    g_g748Pds.has = has;
+    g_g748Pds.ctxFrame[0] = ctx0;
+    g_g748Pds.ctxFrame[1] = ctx1;
+    g_g748Pds.active = true;
+}
+
+namespace
+{
+    // Exec thread, inside the latch: consume the boundary snapshot if one was published.
+    void g748ResolvePds(GSFrameReg &frame, uint32_t &destFbp, bool &has, GSFrameReg *ctxFrame)
+    {
+        if (!g748PdsSnapshotEnabled())
+            return;
+        std::lock_guard<std::mutex> lock(g_g748PdsMutex);
+        if (!g_g748Pds.active)
+            return;
+        frame = g_g748Pds.frame;
+        destFbp = g_g748Pds.destFbp;
+        has = g_g748Pds.has;
+        if (ctxFrame)
+        {
+            ctxFrame[0] = g_g748Pds.ctxFrame[0];
+            ctxFrame[1] = g_g748Pds.ctxFrame[1];
+        }
+        g_g748Pds.active = false;
+    }
+}
+
 void GS::init(uint8_t *vram, uint32_t vramSize, GSRegisters *privRegs)
 {
     m_vram = vram;
     m_vramSize = vramSize;
     m_privRegs = privRegs;
+    g_g748PdsGs = this; // G748: the one GS the arbiter's boundary snapshot reads
     reset();
 }
 
@@ -562,6 +660,73 @@ static void g599VramMap(const uint8_t *vram, uint32_t vramSize)
     }
 }
 
+// ==============================================================================================
+// G748 — per-latch presentation trace (DC2_G748_LATCH=1, default OFF).
+//
+// G748 found a one-frame GARBAGE present at every scene/display-buffer switch, armed by G744's
+// default-ON `DC2_G740_ASYNC_BOUNDARY`. This prints, for EVERY latch, the decoded PCRTC state the
+// latch used together with three band means of the frame it just published, so a bad latch can be
+// identified in the log and read against its registers. Diagnostic only: no behaviour change.
+// ==============================================================================================
+static bool g748LatchTraceOn()
+{
+    static const bool on = (std::getenv("DC2_G748_LATCH") != nullptr);
+    return on;
+}
+
+static double g748BandMean(const std::vector<uint8_t> &rgba, uint32_t width, uint32_t y0, uint32_t y1)
+{
+    if (rgba.empty() || width == 0u || y1 <= y0)
+        return -1.0;
+    uint64_t sum = 0;
+    uint64_t n = 0;
+    for (uint32_t y = y0; y < y1; ++y)
+    {
+        const size_t rowOff = static_cast<size_t>(y) * kHostFrameWidth * 4u;
+        if (rowOff + static_cast<size_t>(width) * 4u > rgba.size())
+            break;
+        const uint8_t *row = rgba.data() + rowOff;
+        for (uint32_t x = 0; x < width; ++x)
+        {
+            sum += static_cast<uint64_t>(row[x * 4u + 0u]) +
+                   static_cast<uint64_t>(row[x * 4u + 1u]) +
+                   static_cast<uint64_t>(row[x * 4u + 2u]);
+            n += 3u;
+        }
+    }
+    return n ? (static_cast<double>(sum) / static_cast<double>(n)) : -1.0;
+}
+
+// G748 §5: the SAME band, read straight out of guest VRAM through the display frame's own
+// addressing. Separates "VRAM already holds the junk" (upstream of the latch) from "the latch's
+// merge produced it". `frameBaseIsPages` matches copyFrameToHostRgbaUnlocked's display path.
+static double g748VramBandMean(const uint8_t *vram, uint32_t vramSize, const GSFrameReg &frame,
+                               uint32_t originX, uint32_t originY, uint32_t width,
+                               uint32_t y0, uint32_t y1)
+{
+    if (!vram || vramSize == 0u || width == 0u || y1 <= y0)
+        return -1.0;
+    const uint32_t basePtr = GSInternal::framePageBaseToBlock(frame.fbp);
+    const uint32_t fbwBlocks = frame.fbw ? frame.fbw : (kHostFrameWidth / 64u);
+    uint64_t sum = 0;
+    uint64_t n = 0;
+    for (uint32_t y = y0; y < y1; ++y)
+    {
+        for (uint32_t x = 0; x < width; x += 4u) // every 4th pixel: a mean, not a checksum
+        {
+            const uint32_t off =
+                GSPSMCT32::addrPSMCT32(basePtr, fbwBlocks, originX + x, originY + y);
+            if (off + 4u > vramSize)
+                continue;
+            uint32_t px = 0u;
+            std::memcpy(&px, vram + off, 4u);
+            sum += (px & 0xFFu) + ((px >> 8) & 0xFFu) + ((px >> 16) & 0xFFu);
+            n += 3u;
+        }
+    }
+    return n ? (static_cast<double>(sum) / static_cast<double>(n)) : -1.0;
+}
+
 void GS::latchHostPresentationFrame()
 {
     // G189: dedicated mutex, not m_stateMutex — see s_g189HostPresentMutex's comment above.
@@ -580,6 +745,16 @@ void GS::latchHostPresentationFrame()
     G440LatchScope g440Total(kG440SlotTotal);
     const GSRegisters *const presentationRegs =
         s_g412PresentationOverride.active ? &s_g412PresentationOverride.regs : m_privRegs;
+    // ⭐ G748: the preferred display source belongs to the frame this latch is publishing, not to
+    // whatever frame the parse thread has since walked into. Resolve it ONCE here, from the
+    // boundary snapshot when one exists, and use these three locals everywhere below — never the
+    // live members. Falls back to the live read when the snapshot is off or absent (boot, MTGS
+    // off, the very first boundary), which is exactly the pre-G748 behaviour.
+    GSFrameReg g748PdsFrame = m_preferredDisplaySourceFrame;
+    uint32_t g748PdsDest = m_preferredDisplayDestFbp;
+    bool g748PdsHas = m_hasPreferredDisplaySource;
+    GSFrameReg g748CtxFrame[2] = {m_ctx[0].frame, m_ctx[1].frame};
+    g748ResolvePds(g748PdsFrame, g748PdsDest, g748PdsHas, g748CtxFrame);
     // Bump on EVERY exit path (success, dual-merge, clear-on-invalid) — any call can
     // change the snapshot. Destructs before the lock_guard releases s_g189HostPresentMutex.
     struct G176LatchBump
@@ -837,11 +1012,11 @@ void GS::latchHostPresentationFrame()
                          displayOrigin2.x, displayOrigin2.y, width2, height2,
                          m_ctx[0].frame.fbp, m_ctx[0].frame.fbw, static_cast<uint32_t>(m_ctx[0].frame.psm),
                          m_ctx[1].frame.fbp, m_ctx[1].frame.fbw, static_cast<uint32_t>(m_ctx[1].frame.psm),
-                         m_hasPreferredDisplaySource ? 1u : 0u,
-                         m_preferredDisplaySourceFrame.fbp,
-                         m_preferredDisplaySourceFrame.fbw,
-                         static_cast<uint32_t>(m_preferredDisplaySourceFrame.psm),
-                         m_preferredDisplayDestFbp);
+                         g748PdsHas ? 1u : 0u,
+                         g748PdsFrame.fbp,
+                         g748PdsFrame.fbw,
+                         static_cast<uint32_t>(g748PdsFrame.psm),
+                         g748PdsDest);
         }
     }
 
@@ -860,11 +1035,11 @@ void GS::latchHostPresentationFrame()
         usedPreferred = false;
 
         if (allowPreferred &&
-            m_hasPreferredDisplaySource &&
-            m_preferredDisplayDestFbp == displayFrame.fbp &&
-            (m_preferredDisplaySourceFrame.fbw != 0u || m_preferredDisplaySourceFrame.fbp != displayFrame.fbp))
+            g748PdsHas &&
+            g748PdsDest == displayFrame.fbp &&
+            (g748PdsFrame.fbw != 0u || g748PdsFrame.fbp != displayFrame.fbp))
         {
-            if (copyFrameToHostRgbaUnlocked(m_preferredDisplaySourceFrame,
+            if (copyFrameToHostRgbaUnlocked(g748PdsFrame,
                                             width,
                                             height,
                                             scratch,
@@ -874,7 +1049,7 @@ void GS::latchHostPresentationFrame()
                                             0u,
                                             0u))
             {
-                selectedFrame = m_preferredDisplaySourceFrame;
+                selectedFrame = g748PdsFrame;
                 usedPreferred = true;
                 if (f50_12_trace_enabled() && f50_12_latch_should_log(f50_12_latch_n))
                 {
@@ -896,9 +1071,9 @@ void GS::latchHostPresentationFrame()
                              "[F512:latchcopy] n=%u stage=preferred-fail displayFbp=0x%x sourceFbp=0x%x fbw=%u psm=0x%x size=%ux%u\n",
                              f50_12_latch_n,
                              displayFrame.fbp,
-                             m_preferredDisplaySourceFrame.fbp,
-                             m_preferredDisplaySourceFrame.fbw,
-                             static_cast<uint32_t>(m_preferredDisplaySourceFrame.psm),
+                             g748PdsFrame.fbp,
+                             g748PdsFrame.fbw,
+                             static_cast<uint32_t>(g748PdsFrame.psm),
                              width,
                              height);
             }
@@ -963,7 +1138,53 @@ void GS::latchHostPresentationFrame()
                 // into bands" tear. Read the candidate BUFFER, but at the DISPLAY's stride.
                 // Rollback (restores the raw context fbw): DC2_G368_NO_DISPFBW=1.
                 static const bool s_g368DispFbw = !envFlagEnabled("DC2_G368_NO_DISPFBW");
-                GSFrameReg candidate = m_ctx[contextIndex].frame;
+                // ⭐⭐⭐ G748 — THIS IS THE LINE THAT PRESENTED THE GARBAGE FRAME.
+                //
+                // `m_ctx[]` is the DRAWING context, owned and advanced by the PARSE thread. Under
+                // G744's default-ON async frame boundary the latch runs on the EXEC thread while
+                // the parse thread is already inside frame N+1, so by the time an all-black frame
+                // N reaches this fallback, `m_ctx[i].frame` names frame N+1's render target — on
+                // `dragon` at a scene switch that is the 0x139 RTT surface, whose top 96 rows are
+                // uninitialised. The fallback then presents it: one garbage frame, byte-identical
+                // every time because the surface's content is fixed.
+                //
+                // ⚠️ Frame N going ALL BLACK is not an error here — it is exactly what a fade-out
+                // or a letterboxed load screen looks like — so this fallback fires on precisely
+                // the frames where the parse thread is most likely to have moved on.
+                //
+                // Read the BOUNDARY SNAPSHOT of the context instead (captured on the parse thread
+                // at the boundary marker's FIFO position, `g748_boundary_capture_pds`). On the
+                // synchronous path the snapshot equals the live value, so that arm is unchanged.
+                // Rollback DC2_G748_NO_PDS_SNAPSHOT=1 restores the live read.
+                GSFrameReg candidate = g748CtxFrame[contextIndex];
+                // ⭐⭐⭐ G748 — THE FALLBACK MAY ONLY REPAIR A STRIDE, NEVER SUBSTITUTE A SURFACE.
+                //
+                // What this fallback is FOR is written directly above by G368: DC2 keeps context 1
+                // at `{fbp=0x0, fbw=10}` while both display buffers are `fbw=8`, so a good 512-wide
+                // buffer got re-read at a 640-wide stride. That is a **same-fbp, wrong-fbw** repair
+                // — and `s_g368DispFbw` below already performs it by forcing the display's fbw.
+                //
+                // What it must NOT do is present a DIFFERENT SURFACE. Its trigger is "the display
+                // read came back entirely black", which was a reliable error signal when the latch
+                // could only observe a completed frame. Since G744 promoted the async frame
+                // boundary the latch also observes legitimately black frames — fades and
+                // letterboxed load screens — and on `dragon` the drawing context then names the
+                // 0x139 RTT scratch surface. The fallback dutifully presented it: one garbage
+                // frame per scene switch, byte-identical every time (G748 §1).
+                //
+                // So require the candidate to BE one of the two display circuits' buffers. That
+                // keeps the G368/MAP-160 repair intact to the letter (same fbp, corrected fbw) and
+                // makes the substitution of an unrelated render target impossible — on this route
+                // or any other. A genuinely black frame now presents as black, which is correct.
+                //
+                // Rollback: DC2_G748_NO_FBP_GUARD=1 restores the unguarded substitution.
+                static const bool s_g748FbpGuard = !envFlagEnabled("DC2_G748_NO_FBP_GUARD");
+                if (s_g748FbpGuard &&
+                    candidate.fbp != displayFrame1.fbp &&
+                    candidate.fbp != displayFrame2.fbp)
+                {
+                    continue;
+                }
                 if (s_g368DispFbw)
                     candidate.fbw = displayFrame.fbw;
                 if (candidate.fbp == selectedFrame.fbp &&
@@ -1097,7 +1318,7 @@ void GS::latchHostPresentationFrame()
         uint32_t nativeW = 0u, nativeH = 0u;
         std::vector<uint8_t> nativeRgba;
         const uint32_t targetFbp = validCrt1 ? displayFrame1.fbp : (validCrt2 ? displayFrame2.fbp : 0u);
-        const uint32_t fallbackFbp = (validCrt1 && validCrt2) ? displayFrame2.fbp : (m_preferredDisplaySourceFrame.fbp ? m_preferredDisplaySourceFrame.fbp : 0x139u);
+        const uint32_t fallbackFbp = (validCrt1 && validCrt2) ? displayFrame2.fbp : (g748PdsFrame.fbp ? g748PdsFrame.fbp : 0x139u);
         // ⭐ G675: hand the backend the PCRTC READ RECTANGLE the 1x VRAM path uses — the DISPFB
         // read origin and the DISPLAY DW/DH extent of whichever circuit is valid — so the
         // high-res read publishes the SAME logical region, only at S x density. Without it the
@@ -1439,6 +1660,44 @@ void GS::latchHostPresentationFrame()
             m_hostPresentationSourceFbp = selectedFrame1.fbp;
             m_hostPresentationUsedPreferred = false;
             m_hasHostPresentationFrame = true;
+            if (g748LatchTraceOn())
+            {
+                static std::atomic<uint32_t> s_g748n{0};
+                const uint32_t g748n = s_g748n.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                std::fprintf(stderr,
+                             "[G748:latch] n=%u mode=dual w=%u h=%u dispFbp=0x%x srcFbp=0x%x "
+                             "d1(fbp=0x%x fbw=%u psm=0x%x org=%u,%u %ux%u) "
+                             "d2(fbp=0x%x fbw=%u psm=0x%x org=%u,%u %ux%u) "
+                             "dispfb1=0x%llx display1=0x%llx dispfb2=0x%llx display2=0x%llx "
+                             "band0_96=%.2f band96_128=%.2f band128=%.2f "
+                             "vram1_0_96=%.2f vram2_0_96=%.2f vramSrc_0_96=%.2f "
+                             "en1=%u en2=%u slbg=%u mmod=%u alp=%u bg=0x%llx pref=%u "
+                             "sel1=0x%x sel2=0x%x cp1=%u cp2=%u up1=%u up2=%u pds=(has=%u dst=0x%x src=0x%x)\n",
+                             g748n, width, height,
+                             m_hostPresentationDisplayFbp, m_hostPresentationSourceFbp,
+                             displayFrame1.fbp, displayFrame1.fbw, (uint32_t)displayFrame1.psm,
+                             displayOrigin1.x, displayOrigin1.y, width1, height1,
+                             displayFrame2.fbp, displayFrame2.fbw, (uint32_t)displayFrame2.psm,
+                             displayOrigin2.x, displayOrigin2.y, width2, height2,
+                             (unsigned long long)presentationRegs->dispfb1,
+                             (unsigned long long)presentationRegs->display1,
+                             (unsigned long long)presentationRegs->dispfb2,
+                             (unsigned long long)presentationRegs->display2,
+                             g748BandMean(m_hostPresentationFrame, width, 0u, std::min<uint32_t>(96u, height)),
+                             g748BandMean(m_hostPresentationFrame, width, std::min<uint32_t>(96u, height), std::min<uint32_t>(128u, height)),
+                             g748BandMean(m_hostPresentationFrame, width, std::min<uint32_t>(128u, height), height),
+                             g748VramBandMean(m_vram, m_vramSize, displayFrame1, displayOrigin1.x, displayOrigin1.y, width1, 0u, std::min<uint32_t>(96u, height1)),
+                             g748VramBandMean(m_vram, m_vramSize, displayFrame2, displayOrigin2.x, displayOrigin2.y, width2, 0u, std::min<uint32_t>(96u, height2)),
+                             g748VramBandMean(m_vram, m_vramSize, selectedFrame1, displayOrigin1.x, displayOrigin1.y, width1, 0u, std::min<uint32_t>(96u, height1)),
+                             pmode.enableCrt1 ? 1u : 0u, pmode.enableCrt2 ? 1u : 0u, pmode.slbg ? 1u : 0u,
+                             pmode.mmod ? 1u : 0u, (uint32_t)pmode.alp,
+                             (unsigned long long)presentationRegs->bgcolor,
+                             usedPreferred1 ? 1u : 0u,
+                             selectedFrame1.fbp, selectedFrame2.fbp,
+                             copiedCrt1 ? 1u : 0u, copiedCrt2 ? 1u : 0u,
+                             usedPreferred1 ? 1u : 0u, usedPreferred2 ? 1u : 0u,
+                             g748PdsHas ? 1u : 0u, g748PdsDest, g748PdsFrame.fbp);
+            }
             if (f50_12_trace_enabled() && f50_12_latch_should_log(f50_12_latch_n))
             {
                 std::fprintf(stderr,
@@ -1492,6 +1751,31 @@ void GS::latchHostPresentationFrame()
     m_hostPresentationSourceFbp = selectedFrame.fbp;
     m_hostPresentationUsedPreferred = usedPreferred;
     m_hasHostPresentationFrame = true;
+    if (g748LatchTraceOn())
+    {
+        static std::atomic<uint32_t> s_g748nSingle{0};
+        const uint32_t g748n = s_g748nSingle.fetch_add(1u, std::memory_order_relaxed) + 1u;
+        std::fprintf(stderr,
+                     "[G748:latch] n=%u mode=single w=%u h=%u dispFbp=0x%x srcFbp=0x%x pref=%u "
+                     "d(fbp=0x%x fbw=%u psm=0x%x org=%u,%u) "
+                     "dispfb1=0x%llx display1=0x%llx dispfb2=0x%llx display2=0x%llx "
+                     "band0_96=%.2f band96_128=%.2f band128=%.2f "
+                     "vramDisp_0_96=%.2f vramSrc_0_96=%.2f\n",
+                     g748n, width, height,
+                     m_hostPresentationDisplayFbp, m_hostPresentationSourceFbp,
+                     m_hostPresentationUsedPreferred ? 1u : 0u,
+                     displayFrame.fbp, displayFrame.fbw, (uint32_t)displayFrame.psm,
+                     displayOrigin.x, displayOrigin.y,
+                     (unsigned long long)presentationRegs->dispfb1,
+                     (unsigned long long)presentationRegs->display1,
+                     (unsigned long long)presentationRegs->dispfb2,
+                     (unsigned long long)presentationRegs->display2,
+                     g748BandMean(m_hostPresentationFrame, width, 0u, std::min<uint32_t>(96u, height)),
+                     g748BandMean(m_hostPresentationFrame, width, std::min<uint32_t>(96u, height), std::min<uint32_t>(128u, height)),
+                     g748BandMean(m_hostPresentationFrame, width, std::min<uint32_t>(128u, height), height),
+                     g748VramBandMean(m_vram, m_vramSize, displayFrame, displayOrigin.x, displayOrigin.y, width, 0u, std::min<uint32_t>(96u, height)),
+                     g748VramBandMean(m_vram, m_vramSize, selectedFrame, displayOrigin.x, displayOrigin.y, width, 0u, std::min<uint32_t>(96u, height)));
+    }
     if (f50_12_trace_enabled() && f50_12_latch_should_log(f50_12_latch_n))
     {
         std::fprintf(stderr,

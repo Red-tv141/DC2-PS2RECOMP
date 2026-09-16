@@ -122,6 +122,10 @@ namespace
     constexpr int32_t G610_OFF_HHEAD = 256;  // G430HistBlock::head
 
     static_assert(sizeof(G430HistEntry) == (size_t)G610_OFF_HENT, "G610: hist entry stride");
+    // ⭐ G746 PART 4: the whole ring is exactly 256 bytes, which is what makes an 8-bit add the
+    // ring wrap. If either constant ever moves, this is a BUILD ERROR and not a silently wrong
+    // cursor.
+    static_assert(G430_HIST * G610_OFF_HENT == 256, "G746: ring byte-wrap needs a 256-byte ring");
     static_assert(offsetof(G430HistEntry, vec) == (size_t)G610_OFF_HVEC, "G610: hist vec");
     static_assert(offsetof(G430HistEntry, stamp) == (size_t)G610_OFF_HSTAMP, "G610: hist stamp");
     static_assert(offsetof(G430HistEntry, dest) == (size_t)G610_OFF_HDEST, "G610: hist dest");
@@ -254,19 +258,19 @@ namespace
 
     struct G610SlotRec
     {
-        G610Fn fn = nullptr;    // nullptr = no compiled body for this block start
-        uint16_t count = 0u;    // pairs this body executes; must equal the caller's `count`
-        uint8_t readsQ = 0u;    // 1 = some upper in this block reads st.q (desc src == 1)
-        uint8_t g611 = 0u;      // 1 = translation needed a G611 op form (the `vuops` arm gates it)
+        G610Fn fn;    // nullptr = no compiled body for this block start
+        uint16_t count;    // pairs this body executes; must equal the caller's `count`
+        uint8_t readsQ;    // 1 = some upper in this block reads st.q (desc src == 1)
+        uint8_t g611;      // 1 = translation needed a G611 op form (the `vuops` arm gates it)
         // G611: WHICH pairs read st.q, bit j = pair j (indices >= 63 fold into bit 63). A mid-block
         // publication at index k is observable only by a reader BEFORE k, so this turns a
         // whole-block veto into a prefix test.
-        uint64_t qMask = 0ull;
+        uint64_t qMask;
         // G611: the one-entry SPLIT memo. `qDelay` at a given block start is a property of where the
         // DIV sits relative to it, so it is stable per slot and a single entry hits.
-        G610Fn splitFn1 = nullptr;
-        G610Fn splitFn2 = nullptr;
-        uint16_t splitN1 = 0u;  // 0 = memo empty
+        G610Fn splitFn1;
+        G610Fn splitFn2;
+        uint16_t splitN1;  // 0 = memo empty
     };
 
     // -------------------------------------------------------------------------------------------
@@ -288,27 +292,29 @@ namespace
     constexpr size_t G610_CACHE_SLOTS = 16384u; // power of two, open addressed, kept under 50% load
     struct G610CacheEnt
     {
-        uint64_t key = 0u;   // 0 = empty
-        G610Fn fn = nullptr;
-        uint16_t count = 0u;
-        uint8_t readsQ = 0u;
-        uint8_t g611 = 0u;
-        uint64_t qMask = 0ull;
+        uint64_t key;   // 0 = empty
+        G610Fn fn;
+        uint16_t count;
+        uint8_t readsQ;
+        uint8_t g611;
+        uint64_t qMask;
     };
 
     struct G610Backend
     {
-        uint8_t *arena = nullptr;
-        size_t used = 0u;
-        bool arenaFull = false;
-        uint32_t dataSize = 0u;
+        uint8_t *arena;
+        size_t used;
+        bool arenaFull;
+        uint32_t dataSize;
         // 2,048 x 16 B, read ONCE PER BLOCK (~160 k/frame against ~1.6 M pairs), never per pair —
         // so this is not the per-pair L1D pressure G516 v1 was refuted on.
-        std::array<G610SlotRec, PS2_VU1_CODE_SIZE / 8u> slot{};
-        std::array<G610CacheEnt, G610_CACHE_SLOTS> cache{};
-        size_t cacheUsed = 0u;
+        G756DirectTable<G610SlotRec, PS2_VU1_CODE_SIZE / 8u> slot;
+        std::array<G610CacheEnt, G610_CACHE_SLOTS> cache;
+        size_t cacheUsed;
     };
-    thread_local G610Backend s_g610;
+    // This is entirely constant-initializable. State the guarantee so accesses do not need
+    // MSVC's on-demand TLS initialization guards in every native block entry.
+    constinit thread_local G610Backend s_g610{};
 
     uint64_t g610HashBlock(uint32_t firstIndex, uint32_t count)
     {
@@ -353,6 +359,47 @@ namespace
 
     const bool s_g674G610StatOn = f50_12_vu_env_flag("DC2_G610_STAT");
     const bool s_g674G610VerifyOn = f50_12_vu_env_flag("DC2_G610_VERIFY");
+    // G747: the successful-block counters also clock independent emitter reports and the
+    // oracle. Sample their union once; disabled diagnostics must not write TLS per block.
+    const bool s_g747KeepVuCounters = f50_12_vu_env_flag("DC2_G747_KEEP_VU_COUNTERS");
+    // Keep oracle snapshots and diagnostic-only spills out of every production native entry.
+    const bool s_g751ColdNative = f50_12_vu_env_flag("DC2_G751_COLD_NATIVE") &&
+        !f50_12_vu_env_flag("DC2_G751_NO_COLD_NATIVE");
+    const bool s_g747NativeTail = f50_12_vu_env_flag("DC2_G747_NATIVE_TAIL") &&
+        !f50_12_vu_env_flag("DC2_G747_NO_NATIVE_TAIL");
+    const bool s_g747TailStat = f50_12_vu_env_flag("DC2_G747_TAIL_STAT");
+    const bool s_g747TailSpecialized = !f50_12_vu_env_flag("DC2_G747_TAIL_GENERIC");
+    const bool s_g747RetainBindings = f50_12_vu_env_flag("DC2_G747_RETAIN_BINDINGS") &&
+        !f50_12_vu_env_flag("DC2_G747_NO_RETAIN_BINDINGS");
+    const bool s_g747BindStat = f50_12_vu_env_flag("DC2_G747_BIND_STAT");
+    constinit thread_local std::array<uint64_t, PS2_VU1_CODE_SIZE / 8u> s_g747BoundWords{};
+    constinit thread_local std::array<uint16_t, PS2_VU1_CODE_SIZE / 8u + 1u> s_g747ChangedPrefix{};
+    thread_local bool s_g747BoundValid = false;
+    thread_local uint32_t s_g747BoundDecode = 0u;
+    thread_local uint64_t s_g747BindingsKept = 0u, s_g747BindingsProbed = 0u;
+    struct G747BindingImage
+    {
+        bool valid;
+        uint32_t dataSize, decode, boundCount;
+        uint64_t arenaEpoch;
+        std::array<uint64_t, PS2_VU1_CODE_SIZE / 8u> words;
+        G756DirectTable<G610SlotRec, PS2_VU1_CODE_SIZE / 8u> slots;
+    };
+    constinit thread_local std::array<G747BindingImage, 4> s_g747BindImages{};
+    thread_local int s_g747ActiveImage = -1;
+    thread_local uint32_t s_g747NextImage = 0u;
+    thread_local uint64_t s_g747BindImageHits = 0u;
+    thread_local uint64_t s_g747TailRuns = 0u, s_g747TailPairs = 0u;
+    const bool s_g747G610Accounting = s_g674G610StatOn || s_g674G610VerifyOn ||
+        f50_12_vu_env_flag("DC2_G744_HIST_STAT") ||
+        f50_12_vu_env_flag("DC2_G746_DEST_STAT") || s_g747KeepVuCounters || s_g747TailStat;
+    void g747TailReport()
+    {
+        if (s_g747TailStat)
+            std::fprintf(stderr, "[G747:tail] enabled=%d runs=%llu pairs=%llu specialized=%d\n",
+                         s_g747NativeTail ? 1 : 0, (unsigned long long)s_g747TailRuns,
+                         (unsigned long long)s_g747TailPairs, s_g747TailSpecialized ? 1 : 0);
+    }
     DC2_G674_HOT_FLAG_INLINE bool g610StatOn() { return s_g674G610StatOn; }
     DC2_G674_HOT_FLAG_INLINE bool g610VerifyOn() { return s_g674G610VerifyOn; }
     // Is `DC2_G419_AB=vujit` the selected lever? Sampled once, the same way `g490BlockRequested`
@@ -447,6 +494,10 @@ namespace
         return s_on;
     }
 
+    // G746: SSE4.1 detection, the dest -> BLENDPS immediate table and the dest-shape census. Must
+    // precede the encoder, whose `storeDest` reads both.
+#include "vu1_g746_blend_dest.inc"
+
     // -------------------------------------------------------------------------------------------
     // §5 THE ENCODER. Deliberately tiny and total: one helper per instruction form, nothing
     // chooses an encoding at run time, so a wrong byte is a wrong CONSTANT in exactly one place.
@@ -493,6 +544,34 @@ namespace
         void modRR(unsigned reg, unsigned rm)
         { u8((uint8_t)(0xC0u | ((reg & 7u) << 3) | (rm & 7u))); }
 
+        // ---- G746 VEX PREFIX ----
+        // `reg` is the ModRM.reg operand, `vvvv` the non-destructive source (pass 0 for the forms
+        // that have none — VEX encodes vvvv INVERTED, so 0 becomes the required 1111), `idx`/`base`
+        // the ModRM/SIB registers. L is ALWAYS 0: this emitter never issues a 256-bit operation,
+        // which is precisely why a VEX body cannot leave a dirty upper YMM behind it.
+        void vex(unsigned mm, unsigned pp, unsigned reg, unsigned vvvv, unsigned idx, unsigned base)
+        {
+            const unsigned v = (~vvvv) & 0xFu;
+            if (mm == G746_M_0F && idx < 8u && base < 8u)
+            {
+                u8(0xC5);
+                u8((uint8_t)(((reg >= 8u) ? 0u : 0x80u) | (v << 3) | pp));
+                return;
+            }
+            u8(0xC4);
+            u8((uint8_t)(((reg >= 8u) ? 0u : 0x80u) | ((idx >= 8u) ? 0u : 0x40u) |
+                         ((base >= 8u) ? 0u : 0x20u) | mm));
+            u8((uint8_t)((v << 3) | pp));            // W = 0, L = 0
+        }
+        void vexRR(uint8_t op, unsigned mm, unsigned pp, unsigned xd, unsigned vvvv, unsigned rm)
+        { vex(mm, pp, xd, vvvv, 0u, rm); u8(op); modRR(xd, rm); }
+        void vexRM(uint8_t op, unsigned mm, unsigned pp, unsigned xd, unsigned vvvv,
+                   unsigned base, int32_t d)
+        { vex(mm, pp, xd, vvvv, 0u, base); u8(op); memD(xd, base, d); }
+        void vexRMX(uint8_t op, unsigned mm, unsigned pp, unsigned xd, unsigned vvvv,
+                    unsigned base, unsigned ix, unsigned sc, int32_t d)
+        { vex(mm, pp, xd, vvvv, ix, base); u8(op); memX(xd, base, ix, sc, d); }
+
         // ---- SSE (0F-mapped) ----
         void sseM(uint8_t op, unsigned xr, unsigned base, int32_t d)
         { rex(false, xr, 0u, base); u8(0x0F); u8(op); memD(xr, base, d); }
@@ -520,82 +599,276 @@ namespace
         void lea64Idx(unsigned rd, unsigned index, unsigned scale, int32_t disp)
         { rex(true, rd, index, 0u); u8(0x8D); memIdxNoBase(rd, index, scale, disp); }
 
-        void movupsLd(unsigned x, unsigned b, int32_t d) { sseM(0x10, x, b, d); }
+        // ⭐ G746: every XMM form below picks the VEX encoding when the host has AVX. The VEX and
+        // legacy encodings of a 128-bit op compute bit-for-bit the same thing; the only difference
+        // is that VEX zeroes bits 255:128 of the destination, which nothing here reads. Routing the
+        // NON-destructive `mov*` forms through VEX too is what keeps the emitted body 100 % VEX, so
+        // it can never leave a dirty upper half for the host's legacy-SSE code.
+        bool avx() const { return m_avx; }
+        bool m_avx = g746AvxOn();
+        // `m_fold` separates the two halves of this lever: `m_avx` alone re-encodes each existing
+        // instruction, `m_fold` also CHANGES THE SHAPE (drops a copy, folds a load). Under
+        // `DC2_G746_NO_FOLD=1` the body is VEX but has exactly the instruction COUNT the SSE emitter
+        // had, so a gate can price the prefix apart from the count.
+        bool m_fold = g746FoldOn();
+        // `m_opfold` is the third and last half: naming an operand's MEMORY location as the rm
+        // source instead of loading it first. Separately disarmable (`DC2_G746_NO_OPFOLD=1`).
+        bool m_opfold = g746OpFoldOn();
+
+        // ⭐⭐ G746 PART 5 — THE ACC CHAIN, WITHOUT A PROLOGUE.
+        //
+        // A VU1 vertex transform is a RUN of consecutive FMACs into the accumulator
+        // (`MULAx / MADDAy / MADDAz / MADDw`), and today each one emits
+        //
+        //     vaddps  X2, X3, [rcx + ACC]      <- a load that STORE-FORWARDS from the line below
+        //     vmovups [rcx + ACC], X2          <- the previous pair's store
+        //
+        // so consecutive accumulations are chained through the state image. G730 identified exactly
+        // this chain, built a whole-body register allocator for it, and measured −0.02 ns/pair —
+        // because a BOUND location costs four memory operations per BODY ENTRY (save, load,
+        // write-back, restore) and a block entry amortises over 8.4 pairs.
+        //
+        // ⭐ THIS COSTS NOTHING AT ALL, and that is the whole difference. After
+        // `g730StoreAcc(X2, 0xF)` the register X2 already holds bit-for-bit what memory holds, and
+        // nothing between that store and the next pair's accumulate touches X2 — `g610EmitLower`
+        // never names it, the G430 push writes through R9/R10, the VF0 re-pin uses X4 and the
+        // region's budget test uses RAX. So the next pair may simply READ X2 instead of reloading
+        // it. No prologue, no epilogue, no write-back set, and no exit is affected because ACC is
+        // still stored to the image on EVERY pair exactly as before.
+        //
+        // ⛔ THE THREE CONDITIONS, each checked and none assumed:
+        //   1. the previous ACC write must have been a FULL dest (`0xF`). A partial dest blends in
+        //      memory, so the register and the image differ and the reuse would be wrong.
+        //   2. ACC must NOT be bound by G730 (then the accessors already name a pool register).
+        //   3. the flag is cleared at the start of every basic block, because a BB has predecessors
+        //      and there is no phi rule here — the ONE thing G730's whole-body binding existed to
+        //      avoid. A straight-line G610 block starts from a fresh `G610Emit`, so it starts false.
+        //
+        // Rollback `DC2_G746_NO_ACCREG=1`.
+        bool m_accInX2 = false;
+        int m_vfInX2 = -1; // G747: full VF value, invalid across CFG entries or a write to that VF
+        int m_vfInX3 = -1; // lower-slot result/source, consumed before the next upper clobbers X3
+        // Translation-time debt only. No guest instruction inside an emitted straight-line
+        // span reads the ring head. Materialize before a live push and every control edge.
+        unsigned m_histAdvance = 0;
+
+        void flushHistAdvance()
+        {
+            const unsigned bytes = (m_histAdvance * G610_OFF_HENT) & 255u;
+            if (bytes != 0u)
+            {
+                addImm(G610_R10, (int32_t)bytes);
+                andImm(G610_R10, 255);
+            }
+            m_histAdvance = 0;
+        }
+
+        void movupsLd(unsigned x, unsigned b, int32_t d)
+        { if (m_avx) vexRM(0x10, G746_M_0F, G746_P_NP, x, 0u, b, d); else sseM(0x10, x, b, d); }
         void movupsStXS(unsigned x, unsigned b, unsigned ix, unsigned sc, int32_t d)
-        { sseMX(0x11, x, b, ix, sc, d); }
-        void movupsSt(unsigned x, unsigned b, int32_t d) { sseM(0x11, x, b, d); }
-        void movupsLdX(unsigned x, unsigned b, unsigned ix, int32_t d) { sseMX(0x10, x, b, ix, 1u, d); }
-        void movupsStX(unsigned x, unsigned b, unsigned ix, int32_t d) { sseMX(0x11, x, b, ix, 1u, d); }
-        void movapsLd(unsigned x, unsigned b, int32_t d) { sseM(0x28, x, b, d); }
+        { if (m_avx) vexRMX(0x11, G746_M_0F, G746_P_NP, x, 0u, b, ix, sc, d);
+          else sseMX(0x11, x, b, ix, sc, d); }
+        void movupsSt(unsigned x, unsigned b, int32_t d)
+        { if (m_avx) vexRM(0x11, G746_M_0F, G746_P_NP, x, 0u, b, d); else sseM(0x11, x, b, d); }
+        void movupsLdX(unsigned x, unsigned b, unsigned ix, int32_t d)
+        { if (m_avx) vexRMX(0x10, G746_M_0F, G746_P_NP, x, 0u, b, ix, 1u, d);
+          else sseMX(0x10, x, b, ix, 1u, d); }
+        void movupsStX(unsigned x, unsigned b, unsigned ix, int32_t d)
+        { if (m_avx) vexRMX(0x11, G746_M_0F, G746_P_NP, x, 0u, b, ix, 1u, d);
+          else sseMX(0x11, x, b, ix, 1u, d); }
+        void movapsLd(unsigned x, unsigned b, int32_t d)
+        { if (m_avx) vexRM(0x28, G746_M_0F, G746_P_NP, x, 0u, b, d); else sseM(0x28, x, b, d); }
         void movapsStX(unsigned x, unsigned b, unsigned ix, unsigned sc, int32_t d)
-        { sseMX(0x29, x, b, ix, sc, d); }
-        void movaps(unsigned xd, unsigned xs) { sseR(0x28, xd, xs); }
-        void movssLd(unsigned x, unsigned b, int32_t d) { sseF3M(0x10, x, b, d); }
-        void movssSt(unsigned x, unsigned b, int32_t d) { sseF3M(0x11, x, b, d); }
+        { if (m_avx) vexRMX(0x29, G746_M_0F, G746_P_NP, x, 0u, b, ix, sc, d);
+          else sseMX(0x29, x, b, ix, sc, d); }
+        void movaps(unsigned xd, unsigned xs)
+        { if (m_avx) vexRR(0x28, G746_M_0F, G746_P_NP, xd, 0u, xs); else sseR(0x28, xd, xs); }
+        void movssLd(unsigned x, unsigned b, int32_t d)
+        { if (m_avx) vexRM(0x10, G746_M_0F, G746_P_F3, x, 0u, b, d); else sseF3M(0x10, x, b, d); }
+        void movssSt(unsigned x, unsigned b, int32_t d)
+        { if (m_avx) vexRM(0x11, G746_M_0F, G746_P_F3, x, 0u, b, d); else sseF3M(0x11, x, b, d); }
         // ---- G730 additions ----
         // `movss xd, xs` in its REGISTER form (F3 0F 10 /r, mod = 11). Unlike the memory form it
         // MERGES: the low 32 bits come from `xs` and the upper 96 of `xd` survive — which is exactly
         // `applyDest` with dest == 0x8, in one uop and with no memory at all.
-        void movssR(unsigned xd, unsigned xs) { sseF3R(0x10, xd, xs); }
+        // ⚠️ THE VEX FORM OF THE REGISTER `movss` IS NDS, and its merge source is the FIRST source,
+        // not the destination: `vmovss xmm1, xmm2, xmm3` takes the low 32 from xmm3 and the upper 96
+        // from xmm2. Naming `xd` as both destination and first source reproduces the legacy merge
+        // exactly. (`vvvv = 0` here would silently take the upper 96 from xmm0.)
+        void movssR(unsigned xd, unsigned xs)
+        { if (m_avx) vexRR(0x10, G746_M_0F, G746_P_F3, xd, xd, xs); else sseF3R(0x10, xd, xs); }
         // `pextrw r32, xmm, imm8` (66 0F C5 /r ib). The reg field is the GPR and the rm field is the
         // XMM — the reverse of `movd`. Word index `2*lane` is the LOW half of lane `lane`, so this
         // plus `movsx r32, r16` is `(int32_t)(int16_t)(bits(vf[is][comp]) & 0xFFFF)` — MTIR's own
         // expression, read out of a RESIDENT register instead of a stale state image.
         void pextrw(unsigned r, unsigned x, uint8_t imm)
-        { u8(0x66); rex(false, r, 0u, x); u8(0x0F); u8(0xC5); modRR(r, x); u8(imm); }
+        { if (m_avx) { vexRR(0xC5, G746_M_0F, G746_P_66, r, 0u, x); u8(imm); return; }
+          u8(0x66); rex(false, r, 0u, x); u8(0x0F); u8(0xC5); modRR(r, x); u8(imm); }
         // movaps [rsp + disp32], xmm  /  movaps xmm, [rsp + disp32].
         // RSP's low three bits are 100, so ModRM rm = 100 means "a SIB byte follows" and `memD`
         // cannot express this base at all. The SIB is index = 100 (none), base = 100 (RSP) = 0x24.
-        void movapsStRsp(unsigned x, int32_t d)
+        void movapsRsp(uint8_t op, unsigned x, int32_t d)
         {
-            rex(false, x, 0u, 0u); u8(0x0F); u8(0x29);
+            if (m_avx)
+                vex(G746_M_0F, G746_P_NP, x, 0u, 0u, 0u);
+            else
+                rex(false, x, 0u, 0u);
+            if (!m_avx)
+                u8(0x0F);
+            u8(op);
             u8((uint8_t)(0x80u | ((x & 7u) << 3) | 4u)); u8(0x24); i32(d);
         }
-        void movapsLdRsp(unsigned x, int32_t d)
-        {
-            rex(false, x, 0u, 0u); u8(0x0F); u8(0x28);
-            u8((uint8_t)(0x80u | ((x & 7u) << 3) | 4u)); u8(0x24); i32(d);
-        }
+        void movapsStRsp(unsigned x, int32_t d) { movapsRsp(0x29, x, d); }
+        void movapsLdRsp(unsigned x, int32_t d) { movapsRsp(0x28, x, d); }
         // sub rsp, imm32 / add rsp, imm32 — REX.W 81 /5 and /0 with rm = RSP encoded directly
         // (mod = 11 needs no SIB). Emitted as constants so a wrong byte is a wrong constant here.
         void subImm64Rsp(int32_t v) { u8(0x48); u8(0x81); u8(0xEC); i32(v); }
         void addImm64Rsp(int32_t v) { u8(0x48); u8(0x81); u8(0xC4); i32(v); }
-        void movssLdX(unsigned x, unsigned b, unsigned ix, int32_t d) { sseF3MX(0x10, x, b, ix, d); }
-        void movssStX(unsigned x, unsigned b, unsigned ix, int32_t d) { sseF3MX(0x11, x, b, ix, d); }
-        void movdToX(unsigned x, unsigned r) { sse66R(0x6E, x, r); }
-        void shufps(unsigned xd, unsigned xs, uint8_t imm) { sseR(0xC6, xd, xs); u8(imm); }
-        void addps(unsigned xd, unsigned xs) { sseR(0x58, xd, xs); }
-        void mulps(unsigned xd, unsigned xs) { sseR(0x59, xd, xs); }
-        void subps(unsigned xd, unsigned xs) { sseR(0x5C, xd, xs); }
-        void minps(unsigned xd, unsigned xs) { sseR(0x5D, xd, xs); }
-        void maxps(unsigned xd, unsigned xs) { sseR(0x5F, xd, xs); }
-        void andps(unsigned xd, unsigned xs) { sseR(0x54, xd, xs); }
-        void andnps(unsigned xd, unsigned xs) { sseR(0x55, xd, xs); }
-        void orps(unsigned xd, unsigned xs) { sseR(0x56, xd, xs); }
-        void mulpsM(unsigned x, unsigned b, int32_t d) { sseM(0x59, x, b, d); }
-        void addpsM(unsigned x, unsigned b, int32_t d) { sseM(0x58, x, b, d); }
-        void andpsM(unsigned x, unsigned b, int32_t d) { sseM(0x54, x, b, d); }
-        void cvtdq2ps(unsigned xd, unsigned xs) { sseR(0x5B, xd, xs); }
-        void cvttps2dq(unsigned xd, unsigned xs) { sseF3R(0x5B, xd, xs); }
+        void movssLdX(unsigned x, unsigned b, unsigned ix, int32_t d)
+        { if (m_avx) vexRMX(0x10, G746_M_0F, G746_P_F3, x, 0u, b, ix, 1u, d);
+          else sseF3MX(0x10, x, b, ix, d); }
+        void movssStX(unsigned x, unsigned b, unsigned ix, int32_t d)
+        { if (m_avx) vexRMX(0x11, G746_M_0F, G746_P_F3, x, 0u, b, ix, 1u, d);
+          else sseF3MX(0x11, x, b, ix, d); }
+        void movdToX(unsigned x, unsigned r)
+        { if (m_avx) vexRR(0x6E, G746_M_0F, G746_P_66, x, 0u, r); else sse66R(0x6E, x, r); }
+
+        // ⭐ G746: THE THREE-OPERAND CORE. `ndsR`/`ndsM` emit one VEX instruction `op xd, xs1, src2`
+        // where SSE needed `movaps xd, xs1` followed by `op xd, src2`. The two-operand helpers below
+        // are exactly `ndsR(op, xd, xd, xs)`, so every existing call site keeps working unchanged and
+        // the ones that were emitting the copy can drop it one at a time.
+        //
+        // ⛔⛔ `xd == xs2` IS A REAL SHAPE AND IT MUST NOT BE REFUSED. The first revision of this
+        // helper set `bad` for it "because no call site has that shape" — and OPMULA/OPMSUB under
+        // `ord.mulDstIsB` have exactly that shape, so the SSE fallback refused **152 regions and 23
+        // blocks** (`[G612:why] encode=152`, `[G610:jit] refused=23`) while the VEX arm refused
+        // none. That silently made the ROLLBACK ARM slower than the thing it rolls back to, which
+        // is the one defect a rate gate cannot survive: it inflates every candidate reading.
+        //
+        // The correct SSE sequence keeps the operand ORDER by computing into `xs1` — the destination
+        // of a two-operand SSE op IS its first source — and copying down. ⚠️ IT CLOBBERS `xs1`,
+        // which is exactly what the two hand-written OPMSUB/OPMULA arms did before G746
+        // (`mulps X3, X2` / `movaps X2, X3`), so this is their behaviour generalised, not new.
+        void ndsR(uint8_t op, unsigned xd, unsigned xs1, unsigned xs2)
+        {
+            if (m_avx && (m_fold || xd == xs1))
+            { vexRR(op, G746_M_0F, G746_P_NP, xd, xs1, xs2); return; }
+            if (xd == xs2 && xd != xs1)
+            {
+                if (m_avx) { vexRR(op, G746_M_0F, G746_P_NP, xs1, xs1, xs2);
+                             vexRR(0x28, G746_M_0F, G746_P_NP, xd, 0u, xs1); }
+                else       { sseR(op, xs1, xs2); sseR(0x28, xd, xs1); }
+                return;
+            }
+            if (xd != xs1) { if (m_avx) vexRR(0x28, G746_M_0F, G746_P_NP, xd, 0u, xs1);
+                             else sseR(0x28, xd, xs1); }
+            if (m_avx) vexRR(op, G746_M_0F, G746_P_NP, xd, xd, xs2);
+            else sseR(op, xd, xs2);
+        }
+        void ndsM(uint8_t op, unsigned xd, unsigned xs1, unsigned b, int32_t d)
+        {
+            if (m_avx && (m_fold || xd == xs1))
+            { vexRM(op, G746_M_0F, G746_P_NP, xd, xs1, b, d); return; }
+            if (xd != xs1) { if (m_avx) vexRR(0x28, G746_M_0F, G746_P_NP, xd, 0u, xs1);
+                             else sseR(0x28, xd, xs1); }
+            if (m_avx) vexRM(op, G746_M_0F, G746_P_NP, xd, xd, b, d);
+            else sseM(op, xd, b, d);
+        }
+        void shufps(unsigned xd, unsigned xs, uint8_t imm)
+        { if (m_avx) vexRR(0xC6, G746_M_0F, G746_P_NP, xd, xd, xs); else sseR(0xC6, xd, xs); u8(imm); }
+        // ⛔ NO `shufps3`. `shufps`'s immediate takes lanes 0-1 from the DESTINATION and lanes 2-3
+        // from the source, so the `xd == xs2` recovery `ndsR` uses (compute into `xs1`, copy down)
+        // is NOT semantics-preserving here. The one call site that needs two sources is the
+        // two-operand `shufps(xd, xs, imm)` above, which VEX encodes as `vshufps xd, xd, xs, imm`.
+        void addps(unsigned xd, unsigned xs) { ndsR(0x58, xd, xd, xs); }
+        void mulps(unsigned xd, unsigned xs) { ndsR(0x59, xd, xd, xs); }
+        void subps(unsigned xd, unsigned xs) { ndsR(0x5C, xd, xd, xs); }
+        void minps(unsigned xd, unsigned xs) { ndsR(0x5D, xd, xd, xs); }
+        void maxps(unsigned xd, unsigned xs) { ndsR(0x5F, xd, xd, xs); }
+        void andps(unsigned xd, unsigned xs) { ndsR(0x54, xd, xd, xs); }
+        void andnps(unsigned xd, unsigned xs) { ndsR(0x55, xd, xd, xs); }
+        void orps(unsigned xd, unsigned xs) { ndsR(0x56, xd, xd, xs); }
+        void mulpsM(unsigned x, unsigned b, int32_t d) { ndsM(0x59, x, x, b, d); }
+        void addpsM(unsigned x, unsigned b, int32_t d) { ndsM(0x58, x, x, b, d); }
+        void andpsM(unsigned x, unsigned b, int32_t d) { ndsM(0x54, x, x, b, d); }
+        // Three-operand / memory-folded forms the translator names directly.
+        void addps3(unsigned xd, unsigned xs1, unsigned xs2) { ndsR(0x58, xd, xs1, xs2); }
+        void subps3(unsigned xd, unsigned xs1, unsigned xs2) { ndsR(0x5C, xd, xs1, xs2); }
+        void mulps3(unsigned xd, unsigned xs1, unsigned xs2) { ndsR(0x59, xd, xs1, xs2); }
+        void minps3(unsigned xd, unsigned xs1, unsigned xs2) { ndsR(0x5D, xd, xs1, xs2); }
+        void maxps3(unsigned xd, unsigned xs1, unsigned xs2) { ndsR(0x5F, xd, xs1, xs2); }
+        void andps3(unsigned xd, unsigned xs1, unsigned xs2) { ndsR(0x54, xd, xs1, xs2); }
+        void andnps3(unsigned xd, unsigned xs1, unsigned xs2) { ndsR(0x55, xd, xs1, xs2); }
+        void orps3(unsigned xd, unsigned xs1, unsigned xs2) { ndsR(0x56, xd, xs1, xs2); }
+        void addps3M(unsigned xd, unsigned xs1, unsigned b, int32_t d) { ndsM(0x58, xd, xs1, b, d); }
+        void subps3M(unsigned xd, unsigned xs1, unsigned b, int32_t d) { ndsM(0x5C, xd, xs1, b, d); }
+        void mulps3M(unsigned xd, unsigned xs1, unsigned b, int32_t d) { ndsM(0x59, xd, xs1, b, d); }
+        void andps3M(unsigned xd, unsigned xs1, unsigned b, int32_t d) { ndsM(0x54, xd, xs1, b, d); }
+        void cvtdq2ps(unsigned xd, unsigned xs)
+        { if (m_avx) vexRR(0x5B, G746_M_0F, G746_P_NP, xd, 0u, xs); else sseR(0x5B, xd, xs); }
+        void cvtdq2psM(unsigned xd, unsigned b, int32_t d)
+        { if (m_avx) vexRM(0x5B, G746_M_0F, G746_P_NP, xd, 0u, b, d); else sseM(0x5B, xd, b, d); }
+        void cvttps2dq(unsigned xd, unsigned xs)
+        { if (m_avx) vexRR(0x5B, G746_M_0F, G746_P_F3, xd, 0u, xs); else sseF3R(0x5B, xd, xs); }
 
         // ---- G611 SSE additions ----
-        void xorps(unsigned xd, unsigned xs) { sseR(0x57, xd, xs); }
-        void xorpsM(unsigned x, unsigned b, int32_t d) { sseM(0x57, x, b, d); }
-        void orpsM(unsigned x, unsigned b, int32_t d) { sseM(0x56, x, b, d); }
-        void unpckhps(unsigned xd, unsigned xs) { sseR(0x15, xd, xs); }
+        void xorps(unsigned xd, unsigned xs) { ndsR(0x57, xd, xd, xs); }
+        void xorpsM(unsigned x, unsigned b, int32_t d) { ndsM(0x57, x, x, b, d); }
+        void orpsM(unsigned x, unsigned b, int32_t d) { ndsM(0x56, x, x, b, d); }
+        void xorps3M(unsigned xd, unsigned xs1, unsigned b, int32_t d) { ndsM(0x57, xd, xs1, b, d); }
+        void unpckhps(unsigned xd, unsigned xs) { ndsR(0x15, xd, xd, xs); }
         // cmpps xd, xs, imm8. Predicate 1 = LT, ordered and signalling — the encoding MSVC emits
         // for `_mm_cmplt_ps`, and for `_mm_cmpgt_ps` with the operands exchanged.
-        void cmpltps(unsigned xd, unsigned xs) { sseR(0xC2, xd, xs); u8(0x01); }
-        // pcmpeqd xd, [base+disp]  (66 0F 76 /r)
+        void cmpltps(unsigned xd, unsigned xs)
+        { if (m_avx) vexRR(0xC2, G746_M_0F, G746_P_NP, xd, xd, xs); else sseR(0xC2, xd, xs); u8(0x01); }
+        // `cmpps`'s destination is its first source, so the `xd == xs2` recovery is the same one
+        // `ndsR` uses and it preserves the compare's operand order exactly.
+        void cmpltps3(unsigned xd, unsigned xs1, unsigned xs2)
+        { if (m_avx) { vexRR(0xC2, G746_M_0F, G746_P_NP, xd, xs1, xs2); u8(0x01); return; }
+          if (xd == xs2 && xd != xs1)
+          { sseR(0xC2, xs1, xs2); u8(0x01); sseR(0x28, xd, xs1); return; }
+          if (xd != xs1) sseR(0x28, xd, xs1);
+          sseR(0xC2, xd, xs2); u8(0x01); }
+        // pcmpeqd xd, [base+disp]  (66 0F 76 /r) — NDS under VEX.
         void pcmpeqdM(unsigned x, unsigned b, int32_t d)
-        { u8(0x66); rex(false, x, 0u, b); u8(0x0F); u8(0x76); memD(x, b, d); }
+        { if (m_avx) { vexRM(0x76, G746_M_0F, G746_P_66, x, x, b, d); return; }
+          u8(0x66); rex(false, x, 0u, b); u8(0x0F); u8(0x76); memD(x, b, d); }
         void porR(unsigned xd, unsigned xs)
-        { u8(0x66); rex(false, xd, 0u, xs); u8(0x0F); u8(0xEB); modRR(xd, xs); }
+        { if (m_avx) { vexRR(0xEB, G746_M_0F, G746_P_66, xd, xd, xs); return; }
+          u8(0x66); rex(false, xd, 0u, xs); u8(0x0F); u8(0xEB); modRR(xd, xs); }
         // movmskps r32, xmm  (0F 50 /r) — reg field is the GPR, rm is the XMM.
         void movmskps(unsigned r, unsigned x)
-        { rex(false, r, 0u, x); u8(0x0F); u8(0x50); modRR(r, x); }
-        void movdFromX(unsigned r, unsigned x) { u8(0x66); rex(false, x, 0u, r); u8(0x0F); u8(0x7E);
-                                                 modRR(x, r); }
+        { if (m_avx) { vexRR(0x50, G746_M_0F, G746_P_NP, r, 0u, x); return; }
+          rex(false, r, 0u, x); u8(0x0F); u8(0x50); modRR(r, x); }
+        void movdFromX(unsigned r, unsigned x)
+        { if (m_avx) { vexRR(0x7E, G746_M_0F, G746_P_66, x, 0u, r); return; }
+          u8(0x66); rex(false, x, 0u, r); u8(0x0F); u8(0x7E); modRR(x, r); }
+
+        // ---- G746 SSE4.1 additions ----
+        // `blendps xd, xs, imm8`  (66 0F 3A 0C /r ib) — DEST[i] = imm8[i] ? SRC[i] : DEST[i], lanes
+        // numbered from the LOW 32 bits up. One uop, no constant-pool load, no FP semantics at all.
+        void blendpsR(unsigned xd, unsigned xs, uint8_t imm)
+        { if (m_avx) { vexRR(0x0C, G746_M_0F3A, G746_P_66, xd, xd, xs); u8(imm); return; }
+          u8(0x66); rex(false, xd, 0u, xs); u8(0x0F); u8(0x3A); u8(0x0C); modRR(xd, xs); u8(imm); }
+        // `vblendps xd, xs1, [b+d], imm8` — AVX only, and the ONE form that folds the destination's
+        // old value into the select instead of loading it first.
+        void vblendpsM(unsigned xd, unsigned xs1, unsigned b, int32_t d, uint8_t imm)
+        { vex(G746_M_0F3A, G746_P_66, xd, xs1, 0u, b); u8(0x0C); memD(xd, b, d); u8(imm); }
+        void vblendpsMX(unsigned xd, unsigned xs1, unsigned b, unsigned ix, int32_t d, uint8_t imm)
+        { vex(G746_M_0F3A, G746_P_66, xd, xs1, ix, b); u8(0x0C); memX(xd, b, ix, 1u, d); u8(imm); }
+        // `vpermilps xd, src, imm8` (VEX.128.66.0F3A.W0 04 /r ib) — AVX only. For a SINGLE-source
+        // shuffle it is defined lane for lane exactly as `shufps xd, xd, imm8` with both sources
+        // equal, which is the only shape the translator ever emits; unlike `shufps` it takes a
+        // separate source, so the broadcast's `movaps`/`movups` disappears (and the memory form
+        // folds the load outright).
+        void vpermilpsR(unsigned xd, unsigned xs, uint8_t imm)
+        { vex(G746_M_0F3A, G746_P_66, xd, 0u, 0u, xs); u8(0x04); modRR(xd, xs); u8(imm); }
+        void vpermilpsM(unsigned xd, unsigned b, int32_t d, uint8_t imm)
+        { vex(G746_M_0F3A, G746_P_66, xd, 0u, 0u, b); u8(0x04); memD(xd, b, d); u8(imm); }
+        // `vbroadcastss xd, [b+d]` (VEX.128.66.0F38.W0 18 /r) — AVX only. Replaces the scalar Q/I
+        // operand's `movss` + `shufps` pair with one instruction.
+        void vbroadcastssM(unsigned xd, unsigned b, int32_t d)
+        { vex(G746_M_0F38, G746_P_66, xd, 0u, 0u, b); u8(0x18); memD(xd, b, d); }
 
         // ---- G611 integer additions ----
         // movzx r32, BYTE [base + index + disp32]
@@ -637,6 +910,19 @@ namespace
         // G726: `C1 /5 ib`. Needed because the ring cursor is now carried PRE-SCALED as a byte
         // offset and has to be converted back to a slot index before it is stored to `head`.
         void shrImm(unsigned r, uint8_t v) { rex(false, 0u, 0u, r); u8(0xC1); modRR(5u, r); u8(v); }
+        // ⭐ G746: `add r10b, imm8` (REX.B 80 /0 ib). The G430 ring cursor is carried PRE-SCALED as a
+        // byte offset `slot*32` over 8 slots = exactly 0..255, so an EIGHT-BIT add wraps the ring by
+        // construction and the separate `and` disappears. Four bytes replace fourteen (`add r32,
+        // imm32` + `and r32, imm32`), on every FMAC pair in the corpus.
+        //
+        // ⚠️ The upper 56 bits of R10 must stay zero, because the SIB index is the FULL register.
+        // They are: the prologue writes R10 through a 32-bit `shl`, which zero-extends, and an
+        // 8-bit add never carries out of bit 7. The epilogue's `shr r10d, 5` reads the full 32 bits
+        // and gets exactly the slot index it always did. There is no partial-register stall here —
+        // Intel does not rename the low byte separately since Sandy Bridge, and the instruction
+        // already depends on R10's previous value, so the merge is free.
+        void addImm8Low(unsigned r, uint8_t v)
+        { rex(false, 0u, 0u, r); u8(0x80); modRR(0u, r); u8(v); }
         void movImm32(unsigned r, uint32_t v)
         { rex(false, 0u, 0u, r); u8((uint8_t)(0xB8u + (r & 7u))); u32(v); }
         void movImm64(unsigned r, uint64_t v)
@@ -663,11 +949,54 @@ namespace
 
         // ---- composites the translator uses more than once ----
 
-        // Splat lane `l` of xs into all four lanes of xd.
-        void splat(unsigned xd, unsigned xs, unsigned l)
+        // ⭐ G746: a SINGLE-SOURCE lane permutation. `shufps xd, xd, imm` and `vpermilps xd, xs, imm`
+        // are defined identically when both of `shufps`'s sources are the same register, which is
+        // the only shape this translator emits — so the destructive copy is removable outright.
+        void shuf1(unsigned xd, unsigned xs, uint8_t imm)
         {
+            if (m_fold)
+            {
+                vpermilpsR(xd, xs, imm);
+                return;
+            }
             if (xd != xs)
                 movaps(xd, xs);
+            shufps(xd, xd, imm);
+        }
+        // Splat lane `l` of xs into all four lanes of xd.
+        void splat(unsigned xd, unsigned xs, unsigned l) { shuf1(xd, xs, (uint8_t)(l * 0x55u)); }
+        // ⭐ G746: splat the SCALAR at [b+d] into all four lanes — the Q and I operand shape.
+        void splatScalarM(unsigned xd, unsigned b, int32_t d)
+        {
+            if (m_fold)
+            {
+                vbroadcastssM(xd, b, d);
+                return;
+            }
+            movssLd(xd, b, d);
+            shufps(xd, xd, 0x00u);
+        }
+        // ⭐ G746: splat lane `l` of a VECTOR IN MEMORY. One instruction on AVX — it folds the load
+        // the SSE form had to issue separately. This is the dominant VU1 operand shape (`MULx`,
+        // `MADDy`, … broadcast one lane of `vt`), so it is the single highest-frequency site in the
+        // emitter.
+        void splatM(unsigned xd, unsigned b, int32_t d, unsigned l)
+        {
+            if (s_g752ScalarBc)
+            {
+                // Read exactly the consumed lane. A 128-bit read after any recent 32-bit VF
+                // store can fail forwarding, even when that store changed an unrelated lane.
+                // Scalar load+broadcast preserves every bit and has the same SSE instruction
+                // count; AVX uses the existing memory VBROADCASTSS form.
+                splatScalarM(xd, b, d + (int32_t)(4u * l));
+                return;
+            }
+            if (m_fold)
+            {
+                vpermilpsM(xd, b, d, (uint8_t)(l * 0x55u));
+                return;
+            }
+            movupsLd(xd, b, d);
             shufps(xd, xd, (uint8_t)(l * 0x55u));
         }
 
@@ -676,6 +1005,8 @@ namespace
         void storeDest(unsigned xv, unsigned base, int32_t disp, uint8_t dest,
                        unsigned xt1, unsigned xt2)
         {
+            if (g746DestStatOn())
+                ++s_g746DestMask[dest & 0xFu];
             if (dest == 0u)
                 return;                              // applyDest writes nothing
             if (dest == 0xFu)
@@ -683,8 +1014,14 @@ namespace
                 movupsSt(xv, base, disp);             // all four lanes assigned
                 return;
             }
-            // exactly one lane?
-            if ((dest & (uint8_t)(dest - 1u)) == 0u)
+            const bool singleLane = (dest & (uint8_t)(dest - 1u)) == 0u;
+            // A narrow store followed by a vector load can block store forwarding. The opt-in
+            // form merges unchanged bits before one full-width store. VU state is worker-owned;
+            // neither form publishes intermediate lane values to another thread.
+            const bool wideLane = singleLane && s_g751WideStore;
+            if (wideLane && s_g751StoreStat && ++s_g751WideStores == 1)
+                std::fprintf(stderr, "[G751:store] wide=1 emitted=1\n");
+            if (singleLane && !wideLane)
             {
                 const unsigned lane = (dest == 0x8u) ? 0u : (dest == 0x4u) ? 1u
                                     : (dest == 0x2u) ? 2u : 3u;
@@ -694,12 +1031,36 @@ namespace
                 }
                 else
                 {
-                    movaps(xt1, xv);
-                    shufps(xt1, xt1, (uint8_t)(lane * 0x55u));
+                    shuf1(xt1, xv, (uint8_t)(lane * 0x55u));
                     movssSt(xt1, base, disp + (int32_t)(4u * lane));
                 }
                 return;
             }
+            // ⭐ G746: genuinely partial. One `blendps` IS the bit-select, lane for lane, with the
+            // mask as an immediate instead of two constant-pool loads. Four instructions and two
+            // loads fewer than the SSE2 form below, which stays as the fallback for a host without
+            // SSE4.1 and as the `DC2_G746_NO_BLEND=1` rollback.
+            if (g746BlendOn() || (wideLane && g746HasSse41()))
+            {
+                if (g746DestStatOn())
+                    ++s_g746DestBlendMem;
+                if (m_fold)
+                {
+                    // ⭐ AVX: the old value is the SECOND source, so the load folds into the select
+                    // and the whole write is two instructions. The immediate is complemented because
+                    // the folded operand is now the "keep" side, not the "take" side.
+                    vblendpsM(xt1, xv, base, disp,
+                              (uint8_t)(~kG746BlendImm[dest & 0xFu] & 0xFu));
+                    movupsSt(xt1, base, disp);
+                    return;
+                }
+                movupsLd(xt1, base, disp);           // xt1 = old
+                blendpsR(xt1, xv, kG746BlendImm[dest & 0xFu]);
+                movupsSt(xt1, base, disp);
+                return;
+            }
+            if (g746DestStatOn())
+                ++s_g746DestLegacy;
             // genuinely partial: the same bit-select the interpreter performs.
             //   xt1 = mask ; xt2 = old ; xt1 = ~mask & old ; xt2 = mask & value ; store xt1|xt2
             movapsLd(xt1, G610_R11, G610_C_DEST + (int32_t)(16u * dest));
@@ -729,14 +1090,51 @@ namespace
 // translator) and it is shared verbatim by the G612 region backend, exactly as `g610EmitUpper` is.
 #include "vu1_g730_regalloc.inc"
 
+    // Translation-only diagnostic. Dump actual emitted bytes, never a reconstructed instruction
+    // list. The caller supplies an existing directory; timing runs leave this variable unset.
+    void g752DumpCode(const G610Emit &e, const char *kind)
+    {
+        static const char *dir = std::getenv("DC2_G752_DUMP_DIR");
+        static const unsigned limit = [] {
+            const char *v = std::getenv("DC2_G755_DUMP_LIMIT");
+            const long n = v ? std::strtol(v, nullptr, 10) : 64;
+            return (unsigned)(n > 0 && n <= 4096 ? n : 64);
+        }();
+        static thread_local unsigned serial = 0;
+        if (!dir || e.n <= 16 || serial >= limit) return;
+        char path[1024];
+        const unsigned id = serial++;
+        std::snprintf(path, sizeof(path), "%s/%s_%03u.bin", dir, kind, id);
+        if (FILE *f = std::fopen(path, "wb"))
+        {
+            std::fwrite(e.p, 1, e.n, f);
+            std::fclose(f);
+        }
+        std::snprintf(path, sizeof(path), "%s/address_map.tsv", dir);
+        if (FILE *f = std::fopen(path, "a"))
+        {
+            std::fprintf(f, "%p\t%zu\t%s_%03u.bin\n", (void *)e.p, e.n, kind, id);
+            std::fclose(f);
+        }
+    }
+
+// ⭐ G744 — DEAD G430 HISTORY-STORE ELISION. Included here for the same reason G730 is: it is a
+// translate-time decision consulted at the push site below and it is shared verbatim by the G612
+// region backend. It reads `g421DescTableConst` (available since vu1_g421_fast_upper.inc) and
+// `G479FusedPair` / `G430_HIST` (vu1_helpers_and_tables.inc), both already included by this TU.
+#include "vu1_g744_hist_elide.inc"
+
     // -------------------------------------------------------------------------------------------
     // §6 THE TRANSLATOR
     // -------------------------------------------------------------------------------------------
 
     // `addr = ((uint32_t)(uint16_t)st.vi[r]) * 16u & (dataSize - 1)` into EAX.
-    void g610EmitAddrU16(G610Emit &e, unsigned r, uint32_t dataSize)
+    void g610EmitAddrU16(G610Emit &e, unsigned r, uint32_t dataSize, bool viInEax = false)
     {
-        e.movzx16(G610_RAX, G610_RCX, G610_OFF_VI + (int32_t)(4u * r));
+        if (!viInEax)
+            e.movzx16(G610_RAX, G610_RCX, G610_OFF_VI + (int32_t)(4u * r));
+        else if (dataSize > 0x100000u)
+            e.andImm(G610_RAX, 0xffff); // Larger RAM masks could retain sign-extension bits.
         e.shlImm(G610_RAX, 4u);
         e.andImm(G610_RAX, (int32_t)(dataSize - 1u));
     }
@@ -780,12 +1178,31 @@ namespace
             }
             else
             {
-                e.movaps(G610_X4, xv);
-                e.shufps(G610_X4, G610_X4, (uint8_t)(lane * 0x55u));
+                e.shuf1(G610_X4, xv, (uint8_t)(lane * 0x55u));
                 e.movssStX(G610_X4, G610_RDX, G610_RAX, (int32_t)(4u * lane));
             }
             return;
         }
+        // ⭐ G746: the SAME seven-instruction bit-select the register path had, on the VU-RAM store
+        // path. Same fix, same immediate table — a family is not fixed until every member is.
+        if (g746BlendOn())
+        {
+            if (g746DestStatOn())
+                ++s_g746DestBlendMem;
+            if (e.m_fold)
+            {
+                e.vblendpsMX(G610_X4, xv, G610_RDX, G610_RAX, 0,
+                             (uint8_t)(~kG746BlendImm[dest & 0xFu] & 0xFu));
+                e.movupsStX(G610_X4, G610_RDX, G610_RAX, 0);
+                return;
+            }
+            e.movupsLdX(G610_X4, G610_RDX, G610_RAX, 0);
+            e.blendpsR(G610_X4, xv, kG746BlendImm[dest & 0xFu]);
+            e.movupsStX(G610_X4, G610_RDX, G610_RAX, 0);
+            return;
+        }
+        if (g746DestStatOn())
+            ++s_g746DestLegacy;
         e.movapsLd(G610_X4, G610_R11, G610_C_DEST + (int32_t)(16u * dest));
         e.movupsLdX(G610_X5, G610_RDX, G610_RAX, 0);
         e.andnps(G610_X4, G610_X5);                  // ~mask & old
@@ -958,15 +1375,12 @@ namespace
     // `_mm_or_si128`: same bits, different execution domain, and this comparison is on raw bits.
     void g611EmitFlushSubnormals(G610Emit &e, unsigned v, unsigned t1, unsigned t2)
     {
-        e.movaps(t1, v);
-        e.andpsM(t1, G610_R11, G610_C_ABS);            // absBits
-        e.movaps(t2, t1);
-        e.andpsM(t2, G610_R11, G610_C_EXP);            // expBits
+        e.andps3M(t1, v, G610_R11, G610_C_ABS);        // absBits
+        e.andps3M(t2, t1, G610_R11, G610_C_EXP);       // expBits
         e.pcmpeqdM(t2, G610_R11, G610_C_ZERO);         // expZero
         e.pcmpeqdM(t1, G610_R11, G610_C_ZERO);         // valueZero
         e.andnps(t1, t2);                              // subnormal = ~valueZero & expZero
-        e.movaps(t2, v);
-        e.andpsM(t2, G610_R11, G610_C_SIGN);           // signedZero
+        e.andps3M(t2, v, G610_R11, G610_C_SIGN);       // signedZero
         e.andps(t2, t1);                               // subnormal & signedZero
         e.andnps(t1, v);                               // ~subnormal & bits
         e.orps(t1, t2);
@@ -976,10 +1390,15 @@ namespace
     bool g610EmitUpper(G610Emit &e, uint32_t upper, uint8_t kind, uint32_t pairIndexInBlock,
                        bool &usesHist, bool &usedG611, int *why)
     {
+        // ⭐ G746 PART 5: a VNOP emits nothing at all, so it cannot disturb X2 and the ACC residency
+        // survives it. That is not an optimisation detail — VU1 pairs a VNOP upper with a great many
+        // lowers, so without this the flag would die on the first `NOP / IADDIU` between two FMACs.
         if (kind == 0x6fu)
             return true;                              // VNOP
         const G421UpperDesc d = g421DescTableConst.e[kind];
         if (d.cls == 0u) { *why = G610_RF_UPPER_CLS; return false; }
+        // ⚠️ `m_accInX2` is NOT cleared here — the arms below still have to READ it. Every `return`
+        // path sets it to what is true after that path's last emitted instruction.
         const bool g611Ops = g611OpsEmit();
         if (d.cls == 8u && !g611Ops) { *why = G610_RF_UPPER_CLS; return false; }
         if ((d.op == 7u || d.op == 8u) && !g611Ops) { *why = G610_RF_UPPER_OP; return false; }
@@ -987,11 +1406,34 @@ namespace
         const unsigned fs = FS(upper), ft = FT(upper), fd = FD(upper);
         const uint8_t dest = DEST(upper);
 
+        // Operand ORDER matches the intrinsics in g421FastUpper exactly — it is observable only for
+        // NaN inputs, and matching it is what makes this exact rather than equivalent.
+        // ⭐ G611: `mulDstIsB` / `outerDstIsMul` come from `g611ProbeOrder`, which MEASURED the
+        // shipped `g421FastUpper` for THIS kind. Reading the order off the intrinsic source is what
+        // put a wrong NaN payload in the G430 history for every commutative form (§5b).
+        // ⭐ G746 reads it HERE, before the operand loads, because the order decides WHICH operand
+        // sits in the rm position and therefore which one's load can be folded away.
+        const G611OpOrder ord = s_g611Ord[kind];
+
+        // ⭐ G746 PART 3 — the operand memory-fold. See vu1_g746_blend_dest.inc for why exactly one
+        // of `vs`/`b` is ever eligible and why MIN/MAX and CLIPw are excluded (both read an operand
+        // a second time, in the G611 canonicalisation arm and in the clip compare respectively).
+        const int32_t g746VsDisp = G610_OFF_VF + (int32_t)(16u * fs);
+        const int32_t g746VtDisp = G610_OFF_VF + (int32_t)(16u * ft);
+        const bool g746Arith = (d.cls == 1u || d.cls == 2u) &&
+                               (d.op == 0u || d.op == 1u || d.op == 2u || d.op == 3u || d.op == 4u);
+        const bool g746FoldVs = e.m_opfold && g746Arith && ord.mulDstIsB != 0u &&
+                                g730VfReg(fs) < 0 && g747ForwardedVfReg(e, fs) < 0;
+        const bool g746FoldB = e.m_opfold && g746Arith && ord.mulDstIsB == 0u &&
+                               d.src >= 3u && g730VfReg(ft) < 0 && g747ForwardedVfReg(e, ft) < 0;
+
         // ⭐ G730: `vs` is READ-ONLY for the whole of this function — every arithmetic form copies
         // it into X2/X3 before modifying anything — so when VF[fs] is resident the load disappears
         // and the arithmetic names the pool register directly. `xVs` is that register; it is X0
         // exactly when the location is not bound, which is the pre-G730 emission byte for byte.
-        const unsigned xVs = g730SrcVf(e, fs, G610_X0);
+        // ⚠️ When `g746FoldVs` holds, NOTHING reads `xVs` — the arithmetic names `[rcx+g746VsDisp]`
+        // directly — so the load is not emitted and the value of `xVs` is never observed.
+        const unsigned xVs = g746FoldVs ? G610_X0 : g730SrcVf(e, fs, G610_X0);
 
         if (d.cls == 8u)
         {
@@ -1008,15 +1450,26 @@ namespace
             // an XMM instead of a second GPR: park `lt << 3`, compute `gt`, `por`, read back.
             usedG611 = true;
             const unsigned xVt = g730SrcVf(e, ft, G610_X1);
-            e.movaps(G610_X2, xVt);
-            e.shufps(G610_X2, G610_X2, 0xFFu);          // vt.w splat
+            e.m_vfInX3 = -1;
+            e.splat(G610_X2, xVt, 3u);                  // vt.w splat
             e.andpsM(G610_X2, G610_R11, G610_C_ABS);    // aw = |vt.w|
-            e.movaps(G610_X3, G610_X2);
-            e.xorpsM(G610_X3, G610_R11, G610_C_SIGN);   // nw = -|vt.w|
-            e.movaps(G610_X4, G610_X2);
-            e.cmpltps(G610_X4, xVs);                    // aw < vs   == vs > aw  (ordered)
-            e.movaps(G610_X5, xVs);
-            e.cmpltps(G610_X5, G610_X3);                // vs < nw               (ordered)
+            e.xorps3M(G610_X3, G610_X2, G610_R11, G610_C_SIGN);   // nw = -|vt.w|
+            e.cmpltps3(G610_X4, G610_X2, xVs);          // aw < vs   == vs > aw  (ordered)
+            e.cmpltps3(G610_X5, xVs, G610_X3);          // vs < nw               (ordered)
+            if (s_g752ClipPack)
+            {
+                // Preserve ordered float comparisons (including NaNs/denormals), but interleave
+                // their booleans before crossing into GPRs. All inputs to signed packing are
+                // exactly zero or -1. Low six bytes become +x,-x,+y,-y,+z,-z.
+                e.sse66R(0x6B, G610_X4, G610_X4); // packssdw
+                e.sse66R(0x6B, G610_X5, G610_X5);
+                e.sse66R(0x61, G610_X4, G610_X5); // punpcklwd
+                e.sse66R(0x63, G610_X4, G610_X4); // packsswb
+                e.sse66R(0xD7, G610_RAX, G610_X4); // pmovmskb
+                e.andImm(G610_RAX, 0x3f);
+            }
+            else
+            {
             e.movmskps(G610_RAX, G610_X5);
             e.andImm(G610_RAX, 7);
             e.shlImm(G610_RAX, 3u);
@@ -1027,13 +1480,22 @@ namespace
             e.porR(G610_X2, G610_X3);
             e.movdFromX(G610_RAX, G610_X2);             // index = gt | (lt << 3)
             e.movzx8MX(G610_RAX, G610_R11, G610_RAX, G610_C_CLIPTAB);
+            }
             e.shlMemImm(G610_RCX, G610_OFF_CLIP, 6u);
             e.orMemReg(G610_RAX, G610_RCX, G610_OFF_CLIP);
+            e.m_accInX2 = false;                      // CLIPw clobbers X2
+            e.m_vfInX2 = -1;
             return true;
         }
 
         if (d.cls >= 3u)
         {
+            e.m_vfInX3 = -1;
+            // ⭐ G746: `xRes` names the register the result ends up in. MOVE now has NO instruction
+            // at all — the value is already in a register and `storeDest` preserves its source, so
+            // the copy into X2 was pure loss. Every other arm drops the `movaps` into the
+            // three-operand form.
+            unsigned xRes = G610_X2;
             switch (d.cls)
             {
             case 3u: // ITOF : (float)bits(vs) * scale     -> VF[ft]
@@ -1041,27 +1503,36 @@ namespace
                 e.mulpsM(G610_X2, G610_R11, G610_C_ITOF + (int32_t)(16u * d.bc));
                 break;
             case 4u: // FTOI : bits((int32_t)(vs * scale))  -> VF[ft]
-                e.movaps(G610_X2, xVs);
-                e.mulpsM(G610_X2, G610_R11, G610_C_FTOI + (int32_t)(16u * d.bc));
+                e.mulps3M(G610_X2, xVs, G610_R11, G610_C_FTOI + (int32_t)(16u * d.bc));
                 e.cvttps2dq(G610_X2, G610_X2);
                 break;
             case 5u: // ABS
-                e.movaps(G610_X2, xVs);
-                e.andpsM(G610_X2, G610_R11, G610_C_ABS);
+                e.andps3M(G610_X2, xVs, G610_R11, G610_C_ABS);
                 break;
-            case 6u: // MOVE
-                e.movaps(G610_X2, xVs);
+            case 6u: // MOVE — the value already IS the result.
+                xRes = xVs;
                 break;
             case 7u: // MR32 : {vs.y, vs.z, vs.w, vs.x}
-                e.movaps(G610_X2, xVs);
-                e.shufps(G610_X2, G610_X2, 0x39u);   // _MM_SHUFFLE(0,3,2,1)
+                e.shuf1(G610_X2, xVs, 0x39u);        // _MM_SHUFFLE(0,3,2,1)
                 break;
             default:
                 *why = G610_RF_UPPER_CLS;
                 return false;
             }
             // None of these five writes MAC/STATUS or the G430 history; all write VF[ft].
-            g730StoreVf(e, G610_X2, ft, dest, G610_X4, G610_X5);
+            // ⚠️ `xRes` may be `xVs` (a scratch or a POOL register). `g730StoreVf` preserves its
+            // value operand and clobbers only X4/X5, neither of which can be `xVs` — X0/X1 are the
+            // operand scratches and a bound location is x6..x15.
+            g730StoreVf(e, xRes, ft, dest, G610_X4, G610_X5);
+            // ⭐ G746 PART 5: MOVE is the one arm here that emitted NOTHING into X2, so an ACC left
+            // there by an earlier pair is still valid. Every other arm wrote X2.
+            if (d.cls != 6u)
+            {
+                e.m_accInX2 = false;
+                e.m_vfInX2 = ft != 0u && g730VfReg(ft) < 0 &&
+                    ((g747VfForwardOn() && dest == 0xFu) ||
+                     (s_g753PartialVf && dest != 0u && dest != 0xFu && e.m_vfInX2 == (int)ft)) ? (int)ft : -1;
+            }
             return true;
         }
 
@@ -1077,55 +1548,99 @@ namespace
         {
         case 0u: // broadcast lane bc of vt
         {
+            // ⭐ G746: the highest-frequency operand shape in the whole emitter. On AVX the load and
+            // the broadcast are ONE `vpermilps` against memory; on SSE this is the old
+            // load/copy + `shufps` pair, byte for byte.
             const int bvt = g730VfReg(ft);
             if (bvt >= 0)
-                e.movaps(G610_X1, (unsigned)bvt);
+                e.splat(G610_X1, (unsigned)bvt, d.bc);
+            else if (g747ForwardedVfReg(e, ft) >= 0)
+            {
+                e.splat(G610_X1, (unsigned)g747ForwardedVfReg(e, ft), d.bc);
+                ++s_g747VfForwards;
+            }
             else
-                e.movupsLd(G610_X1, G610_RCX, G610_OFF_VF + (int32_t)(16u * ft));
-            e.shufps(G610_X1, G610_X1, (uint8_t)(d.bc * 0x55u));
+                e.splatM(G610_X1, G610_RCX, G610_OFF_VF + (int32_t)(16u * ft), d.bc);
             break;
         }
         case 1u: // Q — never bound: the hook publishes it between the halves of a G611 Q-split
-            e.movssLd(G610_X1, G610_RCX, G610_OFF_Q);
-            e.shufps(G610_X1, G610_X1, 0x00u);
+            e.splatScalarM(G610_X1, G610_RCX, G610_OFF_Q);
             break;
         case 2u: // I — never bound: the G652 LOI path writes it straight into the state image
-            e.movssLd(G610_X1, G610_RCX, G610_OFF_I);
-            e.shufps(G610_X1, G610_X1, 0x00u);
+            e.splatScalarM(G610_X1, G610_RCX, G610_OFF_I);
             break;
         default: // full vt
-            xB = g730SrcVf(e, ft, G610_X1);
+            // ⚠️ When `g746FoldB` holds, nothing reads `xB` — the arithmetic names
+            // `[rcx+g746VtDisp]` directly.
+            xB = g746FoldB ? G610_X1 : g730SrcVf(e, ft, G610_X1);
             break;
         }
 
-        // Result. Operand ORDER matches the intrinsics in g421FastUpper exactly — it is observable
-        // only for NaN inputs, and matching it is what makes this exact rather than equivalent.
-        // ⭐ G611: `mulDstIsB` / `outerDstIsMul` come from `g611ProbeOrder`, which MEASURED the
-        // shipped `g421FastUpper` for THIS kind. Reading the order off the intrinsic source is what
-        // put a wrong NaN payload in the G430 history for every commutative form (§5b).
-        const G611OpOrder ord = s_g611Ord[kind];
+        // All VF sources now live in X0/X1 or the callee-saved pool. FMACs use X3 for
+        // their product; its lower-slot identity must not survive that overwrite.
+        e.m_vfInX3 = -1;
+        // Save architectural ACC before arithmetic overwrites X2. X4 is otherwise unused by
+        // ADD/SUB/MUL/MADD/MSUB until destination materialization. The result history must see
+        // the unmasked arithmetic value, so merge only after its history store below.
+        const bool g752MergeAcc = s_g752PartialAcc && d.cls == 2u && (d.op <= 4u || d.op == 8u) &&
+                                 dest != 0u && dest != 0xFu && g730AccReg() < 0;
+        if (g752MergeAcc)
+            g730LoadAccInto(e, G610_X4);
         switch (d.op)
         {
+        // ⭐ G746: every arm below used to open with a `movaps` that existed ONLY because SSE's
+        // arithmetic overwrites its destination. The three-operand form names the same two sources
+        // in the same order — `ord` still decides which is which, so the NaN payload G611 MEASURED
+        // is unchanged — and drops the copy. On a host without AVX `addps3` re-emits exactly the
+        // `movaps` + `addps` pair these lines used to spell.
         case 0u: // _mm_add_ps(vs, b)
-            if (ord.mulDstIsB) { e.movaps(G610_X2, xB);   e.addps(G610_X2, xVs); }
-            else               { e.movaps(G610_X2, xVs);  e.addps(G610_X2, xB); }
+            if (ord.mulDstIsB)
+            {
+                if (g746FoldVs) e.addps3M(G610_X2, xB, G610_RCX, g746VsDisp);
+                else            e.addps3(G610_X2, xB, xVs);
+            }
+            else
+            {
+                if (g746FoldB) e.addps3M(G610_X2, xVs, G610_RCX, g746VtDisp);
+                else           e.addps3(G610_X2, xVs, xB);
+            }
             break;
-        case 1u: e.movaps(G610_X2, xVs); e.subps(G610_X2, xB); break;          // _mm_sub_ps(vs,b)
+        case 1u: // _mm_sub_ps(vs,b) — never commuted, so only `b` can ever be the folded operand
+            if (g746FoldB) e.subps3M(G610_X2, xVs, G610_RCX, g746VtDisp);
+            else           e.subps3(G610_X2, xVs, xB);
+            break;
         case 4u: // _mm_mul_ps(vs, b)
-            if (ord.mulDstIsB) { e.movaps(G610_X2, xB);   e.mulps(G610_X2, xVs); }
-            else               { e.movaps(G610_X2, xVs);  e.mulps(G610_X2, xB); }
+            if (ord.mulDstIsB)
+            {
+                if (g746FoldVs) e.mulps3M(G610_X2, xB, G610_RCX, g746VsDisp);
+                else            e.mulps3(G610_X2, xB, xVs);
+            }
+            else
+            {
+                if (g746FoldB) e.mulps3M(G610_X2, xVs, G610_RCX, g746VtDisp);
+                else           e.mulps3(G610_X2, xVs, xB);
+            }
             break;
-        case 5u: e.movaps(G610_X2, xVs); e.maxps(G610_X2, xB); break;          // _mm_max_ps(vs,b)
-        case 6u: e.movaps(G610_X2, xVs); e.minps(G610_X2, xB); break;          // _mm_min_ps(vs,b)
+        case 5u: e.maxps3(G610_X2, xVs, xB); break;                            // _mm_max_ps(vs,b)
+        case 6u: e.minps3(G610_X2, xVs, xB); break;                            // _mm_min_ps(vs,b)
         case 2u: // _mm_add_ps(acc, _mm_mul_ps(vs, b))
-            if (ord.mulDstIsB) { e.movaps(G610_X3, xB);   e.mulps(G610_X3, xVs); }
-            else               { e.movaps(G610_X3, xVs);  e.mulps(G610_X3, xB); }
+            if (ord.mulDstIsB)
+            {
+                if (g746FoldVs) e.mulps3M(G610_X3, xB, G610_RCX, g746VsDisp);
+                else            e.mulps3(G610_X3, xB, xVs);
+            }
+            else
+            {
+                if (g746FoldB) e.mulps3M(G610_X3, xVs, G610_RCX, g746VtDisp);
+                else           e.mulps3(G610_X3, xVs, xB);
+            }
             // ⭐ G730: with ACC resident this is `addps X2, xmmACC` — the store-to-load forward that
             // chained consecutive FMACs through the state image is gone from the dependency chain.
             if (ord.outerDstIsMul)
             {
-                e.movaps(G610_X2, G610_X3);
-                g730AddAccInto(e, G610_X2);
+                // ⭐ G746: `product + ACC` with the product as the first source — on AVX this is one
+                // `vaddps X2, X3, [rcx+ACC]`, folding both the copy and the accumulator load.
+                g730AddAccInto3(e, G610_X2, G610_X3);
             }
             else
             {
@@ -1134,8 +1649,16 @@ namespace
             }
             break;
         case 3u: // _mm_sub_ps(acc, _mm_mul_ps(vs, b)) — the subtract cannot be commuted
-            if (ord.mulDstIsB) { e.movaps(G610_X3, xB);   e.mulps(G610_X3, xVs); }
-            else               { e.movaps(G610_X3, xVs);  e.mulps(G610_X3, xB); }
+            if (ord.mulDstIsB)
+            {
+                if (g746FoldVs) e.mulps3M(G610_X3, xB, G610_RCX, g746VsDisp);
+                else            e.mulps3(G610_X3, xB, xVs);
+            }
+            else
+            {
+                if (g746FoldB) e.mulps3M(G610_X3, xVs, G610_RCX, g746VtDisp);
+                else           e.mulps3(G610_X3, xVs, xB);
+            }
             g730LoadAccInto(e, G610_X2); e.subps(G610_X2, G610_X3);
             break;
         // G611 — the two CROSS-LANE outer-product forms. `d.src == 3` for both, so X1 already holds
@@ -1144,27 +1667,42 @@ namespace
         // (`_MM_SHUFFLE(3,0,2,1)` = 0xC9 and `_MM_SHUFFLE(3,1,0,2)` = 0xD2), which is execUpper's
         // operand pairing lane for lane.
         case 7u: // OPMSUB : ACC - (vs x vt), w lane forced to +0.0
-            e.movaps(G610_X2, xVs); e.shufps(G610_X2, G610_X2, 0xC9u);       // a
-            e.movaps(G610_X3, xB);  e.shufps(G610_X3, G610_X3, 0xD2u);       // bb
-            if (ord.mulDstIsB) { e.mulps(G610_X3, G610_X2); e.movaps(G610_X2, G610_X3); }
-            else               { e.mulps(G610_X2, G610_X3); }                // a * bb
-            g730LoadAccInto(e, G610_X3);
+            if (s_g752PartialAcc)
+                g730LoadAccInto(e, G610_X5);
+            // G747: both outer products reuse X2 for the product BEFORE loading ACC. The
+            // architectural store is current, but X2 stops being its cached copy right here.
+            e.m_accInX2 = false;
+            e.shuf1(G610_X2, xVs, 0xC9u);                                    // a
+            e.shuf1(G610_X3, xB, 0xD2u);                                     // bb
+            // `mulDstIsB` needs the product's FIRST source to be `bb`, which puts the destination
+            // and the second source in the same register — `ndsR` recovers that shape by computing
+            // into X3 and copying down, exactly as this arm used to spell by hand.
+            if (ord.mulDstIsB) { e.mulps3(G610_X2, G610_X3, G610_X2); }
+            else               { e.mulps3(G610_X2, G610_X2, G610_X3); }      // a * bb
+            if (s_g752PartialAcc) e.movaps(G610_X3, G610_X5);
+            else g730LoadAccInto(e, G610_X3);
             e.subps(G610_X3, G610_X2);                                       // acc - (a*bb)
             // `result[3] = 0.0f`: masking w to all-zero bits IS the +0.0f bit pattern for any value
             // the subtract left there, so the destination store sees exactly what execUpper wrote.
-            e.andpsM(G610_X3, G610_R11, G610_C_WMASK);
-            e.movaps(G610_X2, G610_X3);
+            e.andps3M(G610_X2, G610_X3, G610_R11, G610_C_WMASK);
             usedG611 = true;
             break;
         case 8u: // OPMULA : (vs x vt) -> ACC, w lane keeps the CURRENT ACC.w
-            e.movaps(G610_X2, xVs); e.shufps(G610_X2, G610_X2, 0xC9u);       // a
-            e.movaps(G610_X3, xB);  e.shufps(G610_X3, G610_X3, 0xD2u);       // bb
-            if (ord.mulDstIsB) { e.mulps(G610_X3, G610_X2); e.movaps(G610_X2, G610_X3); }
-            else               { e.mulps(G610_X2, G610_X3); }                // p = a * bb
-            g730LoadAccInto(e, G610_X3);                                     // acc, read BEFORE
-            e.movaps(G610_X4, G610_X2);
-            e.unpckhps(G610_X4, G610_X3);                // {p.z, acc.z, p.w, acc.w}
-            e.shufps(G610_X2, G610_X4, 0xC4u);           // {p.x, p.y, p.z, acc.w}
+            if (s_g752PartialAcc)
+                g730LoadAccInto(e, G610_X5);
+            e.m_accInX2 = false;
+            e.shuf1(G610_X2, xVs, 0xC9u);                                    // a
+            e.shuf1(G610_X3, xB, 0xD2u);                                     // bb
+            if (ord.mulDstIsB) { e.mulps3(G610_X2, G610_X3, G610_X2); }
+            else               { e.mulps3(G610_X2, G610_X2, G610_X3); }      // p = a * bb
+            if (s_g752PartialAcc)
+                e.blendpsR(G610_X2, G610_X5, 8u);
+            else
+            {
+                g730LoadAccInto(e, G610_X3);
+                e.ndsR(0x15, G610_X4, G610_X2, G610_X3);
+                e.shufps(G610_X2, G610_X4, 0xC4u);
+            }
             usedG611 = true;
             break;
         default:
@@ -1175,9 +1713,23 @@ namespace
         // G430 history push. `historyResult` differs from `r` only for MIN/MAX with a partial dest,
         // where G546 rewrites the MASKED-OFF lanes with NVIDIA's own subnormal-as-signed-zero
         // selection. The active lanes are `r` either way; only dead history lanes move.
+        // ⭐ G744: is this pair's push DEAD? See vu1_g744_hist_elide.inc. `true` means at least
+        // G430_HIST further pushes are guaranteed before any exit from this body, so every ring
+        // slot -- including the one this pair would write -- is overwritten before anything can
+        // read it, and the three stores below are pure loss.
+        const bool g744Elide = g744ElideAt(pairIndexInBlock);
+        if (g744HistStatOn())
+        {
+            ++s_g744HistPushes;
+            if (g744Elide)
+                ++s_g744HistElided;
+        }
         unsigned histReg = G610_X2;
         if ((d.op == 5u || d.op == 6u) && dest != 0xFu)
         {
+            // ⚠️ THE REFUSAL RUNS WHETHER OR NOT THE PUSH IS ELIDED. It decides whether the BODY
+            // COMPILES, and letting elision change admission would change `pairs/call` -- which a
+            // VU1 rate gate is only readable at MATCHED `pairs/call` (G711's rule).
             if (!g611Ops)
             {
                 *why = G610_RF_MINMAX_DEST;
@@ -1186,22 +1738,40 @@ namespace
             usedG611 = true;
             // flushA -> X3, flushB -> X4 (X5 is the shared second temporary). Both operands are
             // read-only here, so a resident `vs`/`vt` feeds the canonicalisation directly.
-            g611EmitFlushSubnormals(e, xVs, G610_X3, G610_X5);
-            g611EmitFlushSubnormals(e, xB, G610_X4, G610_X5);
-            if (d.op == 5u)                              // MAX: chooseA = flushA > flushB
-            { e.movaps(G610_X5, G610_X4); e.cmpltps(G610_X5, G610_X3); }
-            else                                         // MIN: chooseA = flushA < flushB
-            { e.movaps(G610_X5, G610_X3); e.cmpltps(G610_X5, G610_X4); }
-            e.movaps(G610_X3, G610_X5);
-            e.andps(G610_X3, xVs);                       // chooseA & a
-            e.andnps(G610_X5, xB);                       // ~chooseA & b
-            e.orps(G610_X3, G610_X5);                    // gpuResult
-            e.movapsLd(G610_X4, G610_R11, G610_C_DEST + (int32_t)(16u * dest));
-            e.movaps(G610_X5, G610_X4);
-            e.andps(G610_X5, G610_X2);                   // active & cpuResult
-            e.andnps(G610_X4, G610_X3);                  // ~active & gpuResult
-            e.orps(G610_X4, G610_X5);                    // historyResult
-            histReg = G610_X4;
+            // ⭐ G744: this whole arm exists ONLY to build the value the history push stores --
+            // ~12 SSE ops on X3/X4/X5, none of which touches X2 (the architectural result) or any
+            // architectural state. When the push is elided none of it is needed.
+            if (!g744Elide)
+            {
+                g611EmitFlushSubnormals(e, xVs, G610_X3, G610_X5);
+                g611EmitFlushSubnormals(e, xB, G610_X4, G610_X5);
+                if (d.op == 5u)                          // MAX: chooseA = flushA > flushB
+                    e.cmpltps3(G610_X5, G610_X4, G610_X3);
+                else                                     // MIN: chooseA = flushA < flushB
+                    e.cmpltps3(G610_X5, G610_X3, G610_X4);
+                e.andps3(G610_X3, G610_X5, xVs);         // chooseA & a
+                e.andnps(G610_X5, xB);                   // ~chooseA & b
+                e.orps(G610_X3, G610_X5);                // gpuResult
+                e.movapsLd(G610_X4, G610_R11, G610_C_DEST + (int32_t)(16u * dest));
+                e.andps3(G610_X5, G610_X4, G610_X2);     // active & cpuResult
+                e.andnps(G610_X4, G610_X3);              // ~active & gpuResult
+                e.orps(G610_X4, G610_X5);                // historyResult
+                histReg = G610_X4;
+            }
+        }
+        // Matched instruction-throughput control for a latency dose experiment. Both arms
+        // emit exactly the same copy and self-inverse shuffles. Only the shuffled register
+        // differs: X2 feeds architectural consumers; X5 is dead after this point. Two swaps
+        // restore every bit (including NaNs, signed zero and inactive lanes).
+        if (s_g753DelayPairs != 0u)
+        {
+            e.movaps(G610_X5, G610_X2);
+            const unsigned delayReg = s_g753DelayIndependent ? G610_X5 : G610_X2;
+            for (unsigned n = 0; n != s_g753DelayPairs; ++n)
+            {
+                e.shufps(delayReg, delayReg, 0xB1);
+                e.shufps(delayReg, delayReg, 0xB1);
+            }
         }
         usesHist = true;
         // ⭐ G711 measured this push at 0.525 ns/pair = 1.518 ms/f of VU1 busy on `dragon` (7.6% of
@@ -1231,21 +1801,75 @@ namespace
         // entirely, so all three stores are plain `[R9 + R10 + disp]` at scale 1 and RAX is free.
         // The prologue shifts left by 5 after loading `head`, the epilogue shifts right by 5 before
         // storing it back, and the wrap mask is 0xFF because 8 entries * 32 B = 256.
-        e.movupsStXS(histReg, G610_R9, G610_R10, 1u, G610_OFF_HVEC); // e[s].vec
-        e.lea64(G610_RAX, G610_R8, (int32_t)pairIndexInBlock);       // stampBase + j
-        e.movSt64X(G610_RAX, G610_R9, G610_R10, 1u, G610_OFF_HSTAMP);
-        e.movStImm16X(G610_R9, G610_R10, 1u, G610_OFF_HDEST,
-                      (uint16_t)((uint16_t)dest | ((uint16_t)G428_MK_PENDING << 8)));
-        e.addImm(G610_R10, G610_OFF_HENT);
-        e.andImm(G610_R10, (G430_HIST * G610_OFF_HENT) - 1);
+        // ⭐ G744: the three stores and the `lea` are what the elision removes. THE CURSOR ADVANCE
+        // BELOW IS NOT ELIDED -- keeping it is what makes the ring byte-identical at every exit
+        // (the later pushes land in exactly the slots they always did), which is why G612
+        // precondition 5 and the `DC2_G610_VERIFY` / `DC2_G612_VERIFY` ring comparison still hold
+        // verbatim. It is two ALU ops with no memory traffic.
+        if (!g744Elide)
+        {
+            e.flushHistAdvance();
+            e.movupsStXS(histReg, G610_R9, G610_R10, 1u, G610_OFF_HVEC); // e[s].vec
+            e.lea64(G610_RAX, G610_R8, (int32_t)pairIndexInBlock);       // stampBase + j
+            e.movSt64X(G610_RAX, G610_R9, G610_R10, 1u, G610_OFF_HSTAMP);
+            e.movStImm16X(G610_R9, G610_R10, 1u, G610_OFF_HDEST,
+                          (uint16_t)((uint16_t)dest | ((uint16_t)G428_MK_PENDING << 8)));
+        }
+        // ⭐ G746 PART 4: the ring wrap is free. `G430_HIST * G610_OFF_HENT == 256`, so the mask the
+        // old form spelled with a 7-byte `and r10d, 255` is exactly what an 8-bit add does for
+        // nothing. Two instructions and fourteen bytes become one instruction and four, on the pair
+        // form that dominates the corpus — and it is the ONE part of the push G744's elision keeps
+        // even when the three stores go, so it is paid by every FMAC whether elided or not.
+        if (s_g754DeferredCursor)
+        {
+            ++e.m_histAdvance;
+        }
+        else if (g746RingByteOn())
+        {
+            e.addImm8Low(G610_R10, (uint8_t)G610_OFF_HENT);
+        }
+        else
+        {
+            e.addImm(G610_R10, G610_OFF_HENT);
+            e.andImm(G610_R10, (G430_HIST * G610_OFF_HENT) - 1);
+        }
 
         // ⭐ G730: cls 1 writes VF[fd], cls 2 writes ACC. When the target is resident this is a
         // register move (full dest), a single `movss` (dest == 0x8) or a pure-ALU blend — the
         // load-modify-store round trip a partial dest costs in the memory form is gone.
-        if (d.cls == 1u)
+        if (g752MergeAcc)
+        {
+            e.blendpsR(G610_X4, G610_X2, kG746BlendImm[dest]);
+            e.movupsSt(G610_X4, G610_RCX, G610_OFF_ACC);
+            e.movaps(G610_X2, G610_X4);
+        }
+        else if (d.cls == 1u)
             g730StoreVf(e, G610_X2, fd, dest, G610_X4, G610_X5);
         else
             g730StoreAcc(e, G610_X2, dest, G610_X4, G610_X5);
+        // ⭐ G746 PART 5: X2 now holds the architectural ACC **iff** this pair wrote ACC with a full
+        // dest through the memory form. A partial dest blends in memory (register != image) and a
+        // bound ACC is already handled by the accessors, so both disqualify.
+        e.m_accInX2 = g746AccRegOn() && d.cls == 2u && (dest == 0xFu || g752MergeAcc) && g730AccReg() < 0;
+        e.m_vfInX2 = d.cls == 1u && fd != 0u && g730VfReg(fd) < 0 &&
+            ((g747VfForwardOn() && dest == 0xFu) ||
+             (s_g753PartialVf && dest != 0u && dest != 0xFu && e.m_vfInX2 == (int)fd)) ? (int)fd : -1;
+        // ⭐ G746 BALLAST — see vu1_g746_blend_dest.inc. Zero instructions unless `DC2_G746_BAL=N`.
+        // X4/X5 are the dest-store scratches and are dead here, so the copies cannot be observed.
+        for (uint32_t g746b = g746BallastN(); g746b-- > 0u;)
+            e.movaps(G610_X5, G610_X4);
+        // ⭐⭐ G746 STORE BALLAST — N extra copies of the destination store just emitted, to the SAME
+        // address with the SAME value, so the state is bit-identical and only store-port and
+        // store-buffer pressure change. Only the FULL-dest memory form is repeated: a partial dest
+        // is a read-modify-write and repeating it would re-read what it just wrote.
+        if (g746StoreBallastN() != 0u && dest == 0xFu && g730AccReg() < 0 && g730VfReg(fd) < 0)
+        {
+            const int32_t g746StDisp = (d.cls == 1u)
+                                           ? (G610_OFF_VF + (int32_t)(16u * fd))
+                                           : G610_OFF_ACC;
+            for (uint32_t g746s = g746StoreBallastN(); g746s-- > 0u;)
+                e.movupsSt(G610_X2, G610_RCX, g746StDisp);
+        }
         return true;
     }
 
@@ -1321,10 +1945,19 @@ namespace
         {
             const int bs = g730VfReg(is);
             if (bs >= 0)
-                e.movaps(G610_X3, (unsigned)bs);
+                e.shuf1(G610_X3, (unsigned)bs, 0x39u);   // {y,z,w,x}
+            else if (g747ForwardedVfReg(e, is) >= 0)
+            {
+                e.shuf1(G610_X3, (unsigned)g747ForwardedVfReg(e, is), 0x39u);
+                ++s_g747VfForwards;
+            }
+            else if (e.m_fold)
+                e.vpermilpsM(G610_X3, G610_RCX, G610_OFF_VF + (int32_t)(16u * is), 0x39u);
             else
+            {
                 e.movupsLd(G610_X3, G610_RCX, G610_OFF_VF + (int32_t)(16u * is));
-            e.shufps(G610_X3, G610_X3, 0x39u);       // {y,z,w,x}
+                e.shufps(G610_X3, G610_X3, 0x39u);       // {y,z,w,x}
+            }
             g730StoreVf(e, G610_X3, it, dest, G610_X4, G610_X5);
             return true;
         }
@@ -1352,8 +1985,13 @@ namespace
             return true;
         }
         case G422_LK_MFIR:   // splat the sign-extended low 16 bits of vi[is] as RAW BITS
-            e.movLd32(G610_RAX, G610_RCX, G610_OFF_VI + (int32_t)(4u * is));
-            e.movsx16R(G610_RAX, G610_RAX);
+            if (s_g755ViChain)
+                e.movsx16M(G610_RAX, G610_RCX, G610_OFF_VI + (int32_t)(4u * is));
+            else
+            {
+                e.movLd32(G610_RAX, G610_RCX, G610_OFF_VI + (int32_t)(4u * is));
+                e.movsx16R(G610_RAX, G610_RAX);
+            }
             e.movdToX(G610_X3, G610_RAX);
             e.shufps(G610_X3, G610_X3, 0x00u);
             g730StoreVf(e, G610_X3, it, dest, G610_X4, G610_X5);
@@ -1377,7 +2015,7 @@ namespace
             return true;
         case G422_LK_LQD:
             g610EmitViStep(e, is, -1);               // the decrement happens FIRST
-            g610EmitAddrU16(e, is, dataSize);
+            g610EmitAddrU16(e, is, dataSize, s_g755ViChain && is != 0u);
             e.movupsLdX(G610_X3, G610_RDX, G610_RAX, 0);
             g730StoreVf(e, G610_X3, it, dest, G610_X4, G610_X5);
             return true;
@@ -1399,7 +2037,7 @@ namespace
         case G422_LK_SQD:
         {
             g610EmitViStep(e, it, -1);
-            g610EmitAddrU16(e, it, dataSize);
+            g610EmitAddrU16(e, it, dataSize, s_g755ViChain && it != 0u);
             const unsigned xs = g730SrcVf(e, is, G610_X3);
             g610EmitStoreQuadMasked(e, xs, dest);
             return true;
@@ -1446,6 +2084,7 @@ namespace
         case G422_LK_ISWR:
         {
             if (dest == 0u) return true;             // no lane selected: the body stores nothing
+            e.m_vfInX3 = -1;                        // X3 now holds a VI scalar, not a full VF
             // The stored word is `(uint32_t)(uint16_t)(vi[it] & 0xFFFF)` — upper 16 bits ZERO, not
             // sign-extended. Parked in XMM3 so RAX is free for the address.
             e.movzx16(G610_RAX, G610_RCX, G610_OFF_VI + (int32_t)(4u * it));
@@ -1502,6 +2141,7 @@ namespace
     // each image translates once), and counted so "rare" is a measurement.
     void g610ArenaReset()
     {
+        s_g747BoundValid = false;
         s_g610.used = 0u;
         s_g610.cache.fill(G610CacheEnt{});
         s_g610.cacheUsed = 0u;
@@ -1581,6 +2221,15 @@ namespace
         }
         e.movImm64(G610_R11, (uint64_t)(uintptr_t)&g610Consts);
 
+        // ⭐ G744: a G610 block is straight-line with a single `ret`, so "pushes after j" is an
+        // exact backward count and the whole block is one planned run. The scope clears the plan on
+        // every exit path -- this function has a dozen refusal returns, and a leaked plan would let
+        // the NEXT body elide by an index that means something else there.
+        G744PlanScope g744Scope;
+        g744PlanRun(fused, firstIndex, count, true);
+        if (g744HistStatOn())
+            s_g744HistPairs += count;
+
         int why = G610_RF_ENCODE;
         bool usesHist = false;
         bool usedG611 = false;
@@ -1635,6 +2284,7 @@ namespace
         }
         if (anyHist && usesHist)
         {
+            e.flushHistAdvance();
             e.shrImm(G610_R10, 5); // G726: byte offset -> slot index, the form `head` stores
             e.movSt32(G610_R10, G610_R9, G610_OFF_HHEAD);
         }
@@ -1651,6 +2301,7 @@ namespace
         if (usedG611Out != nullptr)
             *usedG611Out = usedG611;
         G610Fn fn = (G610Fn)(void *)e.p;
+        g752DumpCode(e, "block");
         // 16-byte-align the next block so no two bodies share a hot cache line boundary.
         s_g610.used += (e.n + 15u) & ~(size_t)15u;
         s_g610CodeBytes += e.n;
@@ -1823,6 +2474,12 @@ namespace
     // -------------------------------------------------------------------------------------------
     void g610Report()
     {
+        // G744: its own flag, so the elision census can be read without arming [G610:jit] (and so
+        // an inert arm cannot be mistaken for a clean control -- `arm=` is printed).
+        // G745: `g744HistReport()` used to be called here, "so the elision census can be read
+        // without arming [G610:jit]" — which it could not be, because every caller of this function
+        // is already inside `if (g610StatOn())`. It is now called from the block counter's own
+        // cadence in vu1_g490_block_run.inc, outside that guard, which is what the comment meant.
         if (!g610StatOn())
             return;
         // ⚠️ THE DENOMINATOR IS `[G490:block] pairs` FROM THE SAME RUN, not anything printed here.

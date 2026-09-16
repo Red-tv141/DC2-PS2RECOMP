@@ -199,13 +199,63 @@ static inline GLenum g494FboStatus(int site, GLenum okValue, F &&query)
 }
 
 // The failsafe sentinel, called once per backend item at the worker's dispatch choke point. Runs a
-// real query every 64th item (~1.1 per frame) only while the elision is active; costs one predicted
-// branch otherwise.
+// real query every Nth item only while the elision is active; costs one predicted branch otherwise.
+//
+// ⛔⛔⛔ G743 — THE PERIOD WAS 64, AND THAT IS ~1.1 `glGetError()` PER FRAME ON THE POLE THREAD.
+//
+// `glGetError` is not a cheap query on this driver: it is a synchronisation point, and the G446
+// executor PC sampler with the G733 RtlVirtualUnwind caller (`DC2_G735_EXECPROF=1
+// DC2_G737_PAIRS=1 DC2_G733_UNWIND=1`, `dungeon1`) measured it directly —
+//
+//     [G737:execprofpair] 3.36% n=420 ZwWaitForSingleObject <= g494SentinelTick+0x35
+//
+// and the return address resolves, out of the shipped image's own import thunk, to
+// `__imp_glGetError`. 3.36 % of the G713 executor — the thread the frame is serialised on — is
+// **~0.6 ms/f**, larger than most levers this project has ever shipped, paid by a failsafe for an
+// elision that has never fired.
+//
+// FIX: keep the period at 64 for the first `kG494DenseItems` items, where a driver/entry-point
+// problem would actually show up, then back off to `kG494SparsePeriod`. Detection latency for a
+// steady-state error goes from ~20 ms to ~1 s — irrelevant for a failsafe whose only job is to
+// notice that the elision is unsafe on some unknown driver, and which restores every elided query
+// for the rest of the process the moment it does. `DC2_G494_SENTINEL_PERIOD=<n>` overrides the
+// sparse period (0 or 1 = check every item; 64 reproduces the pre-G743 behaviour exactly).
+// ⛔⛔⛔ GATED AND NULL — SO THE DEFAULT STAYS AT THE PRE-G743 RATE. `dungeon1`, ONE binary, the
+// only difference the period: `g708_abba_blocks.ps1 -Blocks 2 -TimingOnly`, control = `=64`,
+// candidate = `=4096`, pooled **-0.02 ms/f, t = -0.05**, blocks +0.356 / -0.396 (sign disagreement),
+// 0/2 Rule-16 admissible. The mechanism CONVERTED and the frame did not, and §2.4 of the plan says
+// why: the joint leaf x caller table splits this query's 3.80 % of executor samples into
+// **3.36 % `ZwWaitForSingleObject` (BLOCKED in the driver) + 0.44 % `NtQueryInformationThread`
+// (driver CPU)**. 88 % of it is a wait for the GPU to drain, and the next `glReadPixels` — 40.1 %
+// of this same thread — waits for exactly that work instead. G304 conservation.
+//
+// The backoff therefore ships REACHABLE but not ARMED: `kG494SparsePeriod` is 64, identical to the
+// pre-G743 constant, so current source reproduces the accepted behaviour byte for byte, and
+// `DC2_G494_SENTINEL_PERIOD=4096` arms the 60x reduction for anyone re-testing it on a route where
+// the executor is NOT blocked behind a readback.
+static constexpr uint64_t kG494DenseItems = 4096ull;  // ~55 frames of dense checking at startup
+static constexpr uint64_t kG494DensePeriod = 64ull;   // the pre-G743 rate
+static constexpr uint64_t kG494SparsePeriod = 64ull;  // == dense: NO default change (gated null)
+
+static uint64_t g494SparsePeriod()
+{
+    static const uint64_t p = [] () -> uint64_t {
+        const char *v = std::getenv("DC2_G494_SENTINEL_PERIOD");
+        if (v == nullptr || v[0] == '\0')
+            return kG494SparsePeriod;
+        const long long n = std::atoll(v);
+        return n <= 1 ? 1ull : static_cast<uint64_t>(n);
+    }();
+    return p;
+}
+
 static inline void g494SentinelTick()
 {
     if (!g494NoSyncActive() || g_g494Failsafe.load(std::memory_order_relaxed))
         return;
-    if ((g_g494SentinelN.fetch_add(1ull, std::memory_order_relaxed) % 64ull) != 0ull)
+    const uint64_t n = g_g494SentinelN.fetch_add(1ull, std::memory_order_relaxed);
+    const uint64_t period = (n < kG494DenseItems) ? kG494DensePeriod : g494SparsePeriod();
+    if ((n % period) != 0ull)
         return;
     const GLenum e = glGetError();
     if (e != GL_NO_ERROR)

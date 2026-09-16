@@ -68,6 +68,17 @@ namespace GSMem
     void WriteBlockRectZ32(uint8_t *data, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y,
                            const uint8_t *src, uint32_t srcPitch,
                            uint32_t blocksWide, uint32_t blocksHigh);
+    // G742: the PSMT4 sibling of the two above. `WriteBlockRectP4Available()` folds in both the
+    // `DC2_G742_NO_P4BLOCK` rollback AND the startup proof that `PageTableP4`'s in-block
+    // permutation really is block-invariant — if it is not, the fast stage never arms.
+    bool WriteBlockRectP4Available();
+    void WriteBlockRectP4(uint8_t *data, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y,
+                          const uint8_t *src, uint32_t srcPitch,
+                          uint32_t blocksWide, uint32_t blocksHigh);
+    bool WriteBlockRectP8Available();
+    void WriteBlockRectP8(uint8_t *data, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y,
+                          const uint8_t *src, uint32_t srcPitch,
+                          uint32_t blocksWide, uint32_t blocksHigh);
 }
 
 namespace
@@ -108,6 +119,10 @@ namespace
         return v;
     }
 
+    // ⚠️ G742: this census is now fed by FOUR destination formats, not two, so it is keyed by psm.
+    // Summing a PSMCT32 block share and a PSMT4 block share into one `share=` would be Rule G741-2's
+    // defect exactly — two populations in one field — and the whole point of this phase is that the
+    // per-format column is what reveals a format the fast stage never reached.
     struct G706BlockStat
     {
         uint64_t calls = 0u;
@@ -115,33 +130,46 @@ namespace
         uint64_t blockBytes = 0u;
         uint64_t rowBytes = 0u;
     };
-    G706BlockStat g_g706BlockStat;
+    G706BlockStat g_g706BlockStat[64];
+    uint64_t g_g706BlockReports = 0u;
 
-    inline void g706NoteBlock(uint32_t blocks, uint32_t bytes)
+    inline void g706ReportBlockStat()
     {
-        if (!g706BlockStatOn())
-            return;
-        ++g_g706BlockStat.calls;
-        g_g706BlockStat.blocks += blocks;
-        g_g706BlockStat.blockBytes += bytes;
-        if (g_g706BlockStat.calls <= 2u || (g_g706BlockStat.calls % 4096u) == 0u)
+        for (uint32_t psm = 0u; psm < 64u; ++psm)
         {
-            const uint64_t total = g_g706BlockStat.blockBytes + g_g706BlockStat.rowBytes;
+            const G706BlockStat &s = g_g706BlockStat[psm];
+            if (s.calls == 0u && s.rowBytes == 0u)
+                continue;
+            const uint64_t total = s.blockBytes + s.rowBytes;
             std::fprintf(stderr,
-                         "[G706:block] calls=%llu blocks=%llu blockMB=%.2f rowMB=%.2f share=%.2f%%\n",
-                         static_cast<unsigned long long>(g_g706BlockStat.calls),
-                         static_cast<unsigned long long>(g_g706BlockStat.blocks),
-                         static_cast<double>(g_g706BlockStat.blockBytes) / (1024.0 * 1024.0),
-                         static_cast<double>(g_g706BlockStat.rowBytes) / (1024.0 * 1024.0),
-                         total ? 100.0 * static_cast<double>(g_g706BlockStat.blockBytes) /
+                         "[G706:block] psm=0x%02x calls=%llu blocks=%llu blockMB=%.2f rowMB=%.2f "
+                         "share=%.2f%%\n",
+                         psm,
+                         static_cast<unsigned long long>(s.calls),
+                         static_cast<unsigned long long>(s.blocks),
+                         static_cast<double>(s.blockBytes) / (1024.0 * 1024.0),
+                         static_cast<double>(s.rowBytes) / (1024.0 * 1024.0),
+                         total ? 100.0 * static_cast<double>(s.blockBytes) /
                                      static_cast<double>(total) : 0.0);
         }
     }
 
-    inline void g706NoteRow(uint32_t bytes)
+    inline void g706NoteBlock(uint32_t psm, uint32_t blocks, uint32_t bytes)
+    {
+        if (!g706BlockStatOn())
+            return;
+        G706BlockStat &s = g_g706BlockStat[psm & 0x3fu];
+        ++s.calls;
+        s.blocks += blocks;
+        s.blockBytes += bytes;
+        if (++g_g706BlockReports <= 2u || (g_g706BlockReports % 4096u) == 0u)
+            g706ReportBlockStat();
+    }
+
+    inline void g706NoteRow(uint32_t psm, uint32_t bytes)
     {
         if (g706BlockStatOn())
-            g_g706BlockStat.rowBytes += bytes;
+            g_g706BlockStat[psm & 0x3fu].rowBytes += bytes;
     }
 
     uint32_t g424VerifyEvery()
@@ -183,9 +211,48 @@ namespace
 
         if (dpsm == GS_PSM_T4)
         {
+            // ⭐⭐⭐ G742: the complete-block stage G706 built for CT32/Z32 and never offered to
+            // PSMT4. Measured on `dungeon1` (`DC2_G313_CENSUS=1`, ship config, 5,821 frames):
+            // PSMT4 is **0.766 ms/f — 74 % of the whole IMAGE writer — at 1.37 ns/pixel against
+            // PSMCT32's 0.47**, and **100 % (16,372 of 16,372) of its transfers already satisfy
+            // this geometry.** It runs on the G713 executor, which has ~2.4 ms/f of idle, so the
+            // time removed here converts.
+            //
+            // The geometry test is the P4 block shape (32x16) exactly as the CT32 stage tests 8x8:
+            // cursor at column 0, destination x and rect width multiples of 32, destination y a
+            // multiple of 16, and at least one whole 16-row stripe left in BOTH the packet and the
+            // rectangle. Anything else falls through to the untouched row writer below, which also
+            // finishes any partial tail.
+            const bool g742BlockGeometry =
+                GSMem::WriteBlockRectP4Available() && c.rrw >= 32u && (c.rrw & 31u) == 0u &&
+                (c.dsax & 31u) == 0u;
             uint32_t offset = 0u;
             while (offset < c.sizeBytes && *c.hwY < c.rrh)
             {
+                if (g742BlockGeometry && *c.hwX == 0u &&
+                    ((c.dsay + *c.hwY) & 15u) == 0u && c.rrh - *c.hwY >= 16u)
+                {
+                    // rrw is even here, so a row is exactly rrw/2 source bytes with no padding and
+                    // a 16-row stripe is contiguous in the transfer stream.
+                    const uint32_t stripeBytes = c.rrw * 8u;
+                    const uint32_t stripesByData = (c.sizeBytes - offset) / stripeBytes;
+                    const uint32_t stripesByHeight = (c.rrh - *c.hwY) / 16u;
+                    const uint32_t stripes = (stripesByData < stripesByHeight)
+                                                 ? stripesByData : stripesByHeight;
+                    if (stripes != 0u)
+                    {
+                        const uint32_t blocksWide = c.rrw / 32u;
+                        const uint32_t bytes = stripeBytes * stripes;
+                        GSMem::WriteBlockRectP4(c.vram, c.dbp, pageBwHalf, c.dsax,
+                                                c.dsay + *c.hwY, c.data + offset,
+                                                c.rrw / 2u, blocksWide, stripes);
+                        offset += bytes;
+                        *c.hwY += stripes * 16u;
+                        g706NoteBlock(dpsm, blocksWide * stripes, bytes);
+                        continue;
+                    }
+                }
+
                 // The legacy loop consumed ONE source byte per iteration and emitted its low
                 // nibble, then its high nibble only when `xBefore + 1 < rrw`. So a row consumes
                 // ceil(rowLeft / 2) bytes and the byte that lands the low nibble on the final
@@ -202,6 +269,7 @@ namespace
 
                 GSMem::WriteRunP4(c.vram, c.dbp, pageBwHalf, c.dsax + *c.hwX, c.dsay + *c.hwY,
                                   c.data + offset, 0u, pixels);
+                g706NoteRow(dpsm, bytesUse); // G742: so `[G706:block] share=` covers PSMT4 too
 
                 offset += bytesUse;
                 *c.hwX += pixels;
@@ -216,9 +284,38 @@ namespace
 
         if (dpsm == GS_PSM_T8)
         {
+            // G742: the PSMT8 block stage. A PSMT8 block is 16x16 pixels = 256 bytes, so the
+            // destination write is a pure permutation of 256 source bytes. `WriteRunP8` has no G477
+            // fast path at all — it is `PixelStorageTraits<P8>::Write` per pixel — which is why the
+            // census reads it at 1.30 ns/pixel, 2.8x PSMCT32's 0.47.
+            const bool g742BlockGeometry8 =
+                GSMem::WriteBlockRectP8Available() && c.rrw >= 16u && (c.rrw & 15u) == 0u &&
+                (c.dsax & 15u) == 0u;
             uint32_t offset = 0u;
             while (offset < c.sizeBytes && *c.hwY < c.rrh)
             {
+                if (g742BlockGeometry8 && *c.hwX == 0u &&
+                    ((c.dsay + *c.hwY) & 15u) == 0u && c.rrh - *c.hwY >= 16u)
+                {
+                    const uint32_t stripeBytes = c.rrw * 16u;
+                    const uint32_t stripesByData = (c.sizeBytes - offset) / stripeBytes;
+                    const uint32_t stripesByHeight = (c.rrh - *c.hwY) / 16u;
+                    const uint32_t stripes = (stripesByData < stripesByHeight)
+                                                 ? stripesByData : stripesByHeight;
+                    if (stripes != 0u)
+                    {
+                        const uint32_t blocksWide = c.rrw / 16u;
+                        const uint32_t bytes = stripeBytes * stripes;
+                        GSMem::WriteBlockRectP8(c.vram, c.dbp, pageBwHalf, c.dsax,
+                                                c.dsay + *c.hwY, c.data + offset,
+                                                c.rrw, blocksWide, stripes);
+                        offset += bytes;
+                        *c.hwY += stripes * 16u;
+                        g706NoteBlock(dpsm, blocksWide * stripes, bytes);
+                        continue;
+                    }
+                }
+
                 const uint32_t pixelsLeft = c.rrw - *c.hwX;
                 const uint32_t bytesAvail = c.sizeBytes - offset;
                 const uint32_t pixelsToCopy = (pixelsLeft < bytesAvail) ? pixelsLeft : bytesAvail;
@@ -319,7 +416,7 @@ namespace
                                                  c.rrw * 4u, blocksWide, stripes);
                     offset += bytes;
                     *c.hwY += stripes * 8u;
-                    g706NoteBlock(blocks, bytes);
+                    g706NoteBlock(dpsm, blocks, bytes);
                     continue;
                 }
             }
@@ -363,7 +460,7 @@ namespace
                     break;
                 }
                 if (g706BlockFormat)
-                    g706NoteRow(bytesLeft);
+                    g706NoteRow(dpsm, bytesLeft);
             }
 
             // The legacy loop advanced the cursor by `pixelsCopied` and consumed `bytesLeft` even

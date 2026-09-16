@@ -603,12 +603,29 @@ void g730EmitEpilogue(G610Emit &e, const G730Ctx &ctx)
 
 // Return a register holding VF[r] for READ-ONLY use, loading into `scratch` when it is not bound.
 // ⚠️ The returned register may be a POOL register; the caller must not write it.
+inline int g747ForwardedVfReg(const G610Emit &e, unsigned r)
+{
+    if (e.m_vfInX2 == (int)r) return G610_X2;
+    if (e.m_vfInX3 == (int)r) return G610_X3;
+    return -1;
+}
+
 inline unsigned g730SrcVf(G610Emit &e, unsigned r, unsigned scratch)
 {
     const int b = g730VfReg(r);
     if (b >= 0)
         return (unsigned)b;
-    e.movupsLd(scratch, G610_RCX, G610_OFF_VF + (int32_t)(16u * r));
+    const int forwarded = g747ForwardedVfReg(e, r);
+    if (forwarded >= 0)
+    {
+        // Copy into the caller's scratch: later arithmetic may overwrite X2 before using vs.
+        if (scratch != (unsigned)forwarded) e.movaps(scratch, (unsigned)forwarded);
+        ++s_g747VfForwards;
+    }
+    else
+        e.movupsLd(scratch, G610_RCX, G610_OFF_VF + (int32_t)(16u * r));
+    if (scratch == G610_X3)
+        e.m_vfInX3 = g747VfForwardOn() && r != 0u ? (int)r : -1;
     return scratch;
 }
 
@@ -618,9 +635,20 @@ inline void g730LoadAccInto(G610Emit &e, unsigned scratch)
 {
     const int b = g730AccReg();
     if (b >= 0)
+    {
         e.movaps(scratch, (unsigned)b);
-    else
-        e.movupsLd(scratch, G610_RCX, G610_OFF_ACC);
+        return;
+    }
+    // ⭐ G746 PART 5: the previous pair left the architectural ACC in X2 and nothing since has
+    // written it. Either the caller already wants it there (no instruction at all) or a register
+    // move replaces the load.
+    if (e.m_accInX2)
+    {
+        if (scratch != G610_X2)
+            e.movaps(scratch, G610_X2);
+        return;
+    }
+    e.movupsLd(scratch, G610_RCX, G610_OFF_ACC);
 }
 
 // `xd = xd + ACC` — the MADD form where the PRODUCT is the destination operand (G611's measured
@@ -630,8 +658,25 @@ inline void g730AddAccInto(G610Emit &e, unsigned xd)
     const int b = g730AccReg();
     if (b >= 0)
         e.addps(xd, (unsigned)b);
+    else if (e.m_accInX2 && xd != G610_X2)
+        e.addps(xd, G610_X2);                     // ⭐ G746 PART 5
     else
         e.addpsM(xd, G610_RCX, G610_OFF_ACC);
+}
+
+// ⭐ G746: the same sum written non-destructively — `xd = xs1 + ACC`, with `xs1` (the product) as
+// the FIRST source so the operand order G611 measured is preserved exactly. On AVX this is one
+// instruction whether ACC is resident or not; on SSE it is the `movaps xd, xs1` the call site used
+// to spell, followed by the identical add.
+inline void g730AddAccInto3(G610Emit &e, unsigned xd, unsigned xs1)
+{
+    const int b = g730AccReg();
+    if (b >= 0)
+        e.addps3(xd, xs1, (unsigned)b);
+    else if (e.m_accInX2)
+        e.addps3(xd, xs1, G610_X2);               // ⭐ G746 PART 5 — `vaddps X2, X3, X2`
+    else
+        e.addps3M(xd, xs1, G610_RCX, G610_OFF_ACC);
 }
 
 // Write `xv` into location `loc` under `dest`, in a register when the location is bound and through
@@ -643,9 +688,34 @@ inline void g730AddAccInto(G610Emit &e, unsigned xd)
 void g730StoreLoc(G610Emit &e, unsigned xv, unsigned loc, uint8_t dest,
                   unsigned xt1, unsigned xt2)
 {
+    // Covers upper AND lower writes, including partial LQ/MOVE/MFIR writes to a cached VF.
+    // Full upper writes establish the new X2 identity only after this store has been emitted.
+    if (dest != 0u && e.m_vfInX2 == (int)loc)
+        e.m_vfInX2 = -1;
+    if (dest != 0u && e.m_vfInX3 == (int)loc)
+        e.m_vfInX3 = -1;
+    // LQ/LQI/LQD/MFIR/MR32 produce X3 even when their destination mask is partial.
+    // Only a full write establishes a VF identity; partial writes invalidate that scratch.
+    if (xv == G610_X3)
+        e.m_vfInX3 = (g747VfForwardOn() || s_g755LowerForward) && dest == 0xFu && loc > 0u && loc < 32u
+                        ? (int)loc : -1;
     const int b = g730RegOf(loc);
     if (b < 0)
     {
+        if (s_g753PartialVf && loc > 0u && loc < 32u && dest != 0u && dest != 0xFu &&
+            (xv == G610_X2 || xv == G610_X3))
+        {
+            // Arithmetic history has already consumed the raw result. Keep the merged VF
+            // value in its result scratch so the next consumer bypasses the store/load edge.
+            // Only partial producers establish this identity; full-register allocation remains off.
+            e.movupsLd(xt1, G610_RCX, g730LocDisp(loc));
+            e.blendpsR(xt1, xv, kG746BlendImm[dest]);
+            e.movupsSt(xt1, G610_RCX, g730LocDisp(loc));
+            e.movaps(xv, xt1);
+            if (xv == G610_X2) e.m_vfInX2 = (int)loc;
+            else e.m_vfInX3 = (int)loc;
+            return;
+        }
         e.storeDest(xv, G610_RCX, g730LocDisp(loc), dest, xt1, xt2);
         return;
     }
@@ -667,6 +737,16 @@ void g730StoreLoc(G610Emit &e, unsigned xv, unsigned loc, uint8_t dest,
         // Lane 0 only. `movss xmm_d, xmm_s` merges the low 32 bits and leaves the upper 96 — which
         // is exactly `applyDest` with dest == 0x8, in one uop.
         e.movssR(dr, xv);
+        return;
+    }
+    // ⭐ G746: with both operands in registers the select is ONE `blendps` — the pool register is
+    // the destination and survives in its non-`dest` lanes by definition of the instruction. Six
+    // instructions and one constant-pool load removed; `xv` and both scratches are untouched.
+    if (g746BlendOn())
+    {
+        if (g746DestStatOn())
+            ++s_g746DestBlendReg;
+        e.blendpsR(dr, xv, kG746BlendImm[dest & 0xFu]);
         return;
     }
     // The same bit-select the interpreter performs, with both operands already in registers.

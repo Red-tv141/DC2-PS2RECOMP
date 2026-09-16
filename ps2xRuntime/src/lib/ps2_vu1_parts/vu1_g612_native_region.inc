@@ -131,8 +131,17 @@ namespace
     // carries the residency prologue (up to `sub rsp` + 10 `movaps` saves + 10 `movups` loads ≈ 177
     // bytes). At the 48-block cap that is ~8.5 KB of thunk that did not exist before, and a region
     // that overflows is REFUSED — which would silently move pairs from L1 to the interpreter and
-    // make `pairs/call` incomparable across an A/B. The arena is unchanged, so the only cost is
-    // ~200 instead of ~340 regions between arena resets, and resets are counted.
+    // make `pairs/call` incomparable across an A/B.
+    //
+    // ⛔ G744 AUDITED THIS AS "A CONSTANT SIZED FOR A REFUTED, DEFAULT-OFF LEVER" AND IT IS NOT ONE.
+    // G730 residency IS refuted (v1 −0.0712 ns/pair, v2 −0.0219) and IS default OFF, so the obvious
+    // reading is that a shipped build pays a 64 KB budget for a prologue it never emits. It does
+    // not, and the old sentence here ("~200 instead of ~340 regions between arena resets") was
+    // wrong by ~70x: `s_g612.used` advances by the ACTUAL 16-aligned emitted size (line ~1396), not
+    // by the cap. The cap appears in exactly two places — `e.cap`, the per-region emit bound, and
+    // the reserve test at line ~1079 — so raising it 96 → 160 KB moved the arena reset threshold by
+    // 64 KB out of 32 MB (**0.2 %**) and otherwise only made region admission MORE permissive.
+    // ⇒ Reverting it would REMOVE admission, not cost. Left at 160 KB deliberately. Do not "fix".
     constexpr size_t G612_MAX_REGION_BYTES = 160u * 1024u;
     constexpr size_t G612_ARENA_BYTES = 32u * 1024u * 1024u;
     // ⚠️ SIZED FROM A MEASUREMENT, NOT A GUESS. The first bring-up run set this to 96 and
@@ -413,42 +422,42 @@ namespace
 
     struct G612SlotRec
     {
-        G612Fn fn = nullptr;
-        uint16_t pairs = 0u;      // the ENTRY block's pair count (the caller's budget precheck)
+        G612Fn fn;
+        uint16_t pairs;      // the ENTRY block's pair count (the caller's budget precheck)
         // ⭐ Does ANY pair anywhere in this region read `st.q` (an upper with descriptor
         // `src == 1`)? If none does, a pending Q publication is UNOBSERVABLE inside the region and
         // may be deferred to the exit — which is G611 §3's argument, generalised from "before the
         // publication index" to "anywhere in the body". Nothing G490 admits reads P at all (MFP
         // decodes to G422_LK_NONE), so P is always deferrable and needs no flag.
-        uint8_t readsQ = 0u;
+        uint8_t readsQ;
     };
 
     struct G612Region
     {
-        uint64_t key = 0ull;      // 0 = free
-        uint32_t nBb = 0u;
-        uint8_t readsQ = 0u;
-        uint32_t bbSlot[G612_MAX_BB] = {};
-        G612Fn bbFn[G612_MAX_BB] = {};
-        uint16_t bbPairs[G612_MAX_BB] = {};
+        uint64_t key;      // 0 = free
+        uint32_t nBb;
+        uint8_t readsQ;
+        uint32_t bbSlot[G612_MAX_BB];
+        G612Fn bbFn[G612_MAX_BB];
+        uint16_t bbPairs[G612_MAX_BB];
     };
 
     struct G612Backend
     {
-        uint8_t *arena = nullptr;
-        size_t used = 0u;
-        bool arenaFull = false;
-        uint32_t dataSize = 0u;
-        uint32_t codeSize = 0u;
-        std::array<G612SlotRec, G612_SLOTS> slot{};
-        std::array<G612Region, G612_MAX_REGIONS> region{};
-        uint32_t nRegion = 0u;
+        uint8_t *arena;
+        size_t used;
+        bool arenaFull;
+        uint32_t dataSize;
+        uint32_t codeSize;
+        G756DirectTable<G612SlotRec, G612_SLOTS> slot;
+        std::array<G612Region, G612_MAX_REGIONS> region;
+        uint32_t nRegion;
         // §7 whole-image memo
-        uint64_t imgKey[G612_IMAGE_RING] = {};
-        std::array<std::array<G612SlotRec, G612_SLOTS>, G612_IMAGE_RING> imgSlot{};
-        uint32_t imgNext = 0u;
+        uint64_t imgKey[G612_IMAGE_RING];
+        std::array<G756DirectTable<G612SlotRec, G612_SLOTS>, G612_IMAGE_RING> imgSlot;
+        uint32_t imgNext;
     };
-    thread_local G612Backend s_g612;
+    constinit thread_local G612Backend s_g612{};
 
     thread_local uint64_t s_g612Compiled = 0u, s_g612Bbs = 0u, s_g612CodeBytes = 0u;
     thread_local uint64_t s_g612Bound = 0u, s_g612Rebuilds = 0u;
@@ -469,6 +478,15 @@ namespace
 
     const bool s_g674G612StatOn = f50_12_vu_env_flag("DC2_G612_STAT");
     const bool s_g674G612VerifyOn = f50_12_vu_env_flag("DC2_G612_VERIFY");
+    const bool s_g747G612Accounting = [] {
+        const bool on = s_g674G612StatOn || s_g674G612VerifyOn ||
+            f50_12_vu_env_flag("DC2_G745_STAT") || s_g747KeepVuCounters;
+        // Cold, independent arm proof. Asking which guards are armed must not arm them.
+        if (f50_12_vu_env_flag("DC2_G747_COUNTER_STAT"))
+            std::fprintf(stderr, "[G747:counters] keep=%d blocks=%d regions=%d\n",
+                         s_g747KeepVuCounters ? 1 : 0, s_g747G610Accounting ? 1 : 0, on ? 1 : 0);
+        return on;
+    }();
     DC2_G674_HOT_FLAG_INLINE bool g612StatOn() { return s_g674G612StatOn; }
     DC2_G674_HOT_FLAG_INLINE bool g612VerifyOn() { return s_g674G612VerifyOn; }
     bool g652VuLoiOn()
@@ -906,6 +924,11 @@ namespace
         return -1;
     }
 
+// ⭐⭐⭐ G745: the cycle-budget test is hoisted out of every basic block that is not a loop header,
+// which is what lets the G744 dead-history analysis cross a basic-block boundary. It needs
+// `G612Plan`, `G612Bb`, `g612FindBb` and `g744KindPushesHist`, so it is included exactly here.
+#include "vu1_g745_region_budget.inc"
+
     // -------------------------------------------------------------------------------------------
     // §6 EMISSION
     // -------------------------------------------------------------------------------------------
@@ -1086,10 +1109,14 @@ namespace
         G612Emit x;
         x.e = &e;
 
-        G612Fix fixes[G612_MAX_BB * 4u];
+        // ⭐ G745: sized for the ballast's worst case (32 extra copies of one exit fix per block,
+        // `DC2_G745_BAL` is clamped to 32). A shipping build never adds one — `g745BalN()` is 0 —
+        // so this only widens a translate-time stack array in the cold rebuild pass.
+        constexpr uint32_t G612_MAX_FIX = G612_MAX_BB * 4u + G612_MAX_BB * 33u;
+        G612Fix fixes[G612_MAX_FIX];
         uint32_t nFix = 0u;
         auto addFix = [&](size_t at, int32_t bb, uint32_t pc) {
-            if (nFix < G612_MAX_BB * 4u)
+            if (nFix < G612_MAX_FIX)
             {
                 fixes[nFix].at = at;
                 fixes[nFix].bb = bb;
@@ -1107,33 +1134,84 @@ namespace
         g730PlanRegion(g730Ctx, p);
         G730Scope g730Scope(&g730Ctx);
 
+        // ⭐⭐⭐ G745: decide, once for the whole region, WHICH basic blocks keep a cycle-budget test
+        // and how far the G744 history analysis may count past each block's terminator. On `false`
+        // (rollback armed, or the analysis failed closed) every block below emits the G744 form
+        // verbatim, so the two arms differ in exactly this one decision.
+        const bool g745Ok = g745Analyse(p);
+
         // ---- the bodies ----
         for (uint32_t k = 0u; k < p.nBb && !e.bad; ++k)
         {
             G612Bb &bb = p.bb[k];
             bb.bodyOff = (uint32_t)e.n;
 
+            // ⛔⛔ G746 PART 5: a basic block has PREDECESSORS, and there is no phi rule for the
+            // ACC-in-X2 residency — which is precisely the merge problem G730's whole-body binding
+            // was designed around. Every BB therefore starts with the residency dead, so the first
+            // accumulate in a block always reloads from the image and only a STRAIGHT-LINE run of
+            // FMACs inside one block can chain through the register. A missing clear here would be
+            // a wrong ACC on any path that enters this block from a non-FMAC predecessor, and the
+            // whole-state oracle would see it on the first such region.
+            e.m_accInX2 = false;
+            e.m_vfInX2 = -1;
+            e.m_vfInX3 = -1;
+
             // Budget: `lea rax, [r8 + pairs]; cmp rax, rsi; ja <exit at this block's own pc>`.
             // R8 already carries stampBase + consumed and RSI carries stampBase + budget, so this
             // ONE comparison is the whole `cycle + n <= maxCycles` test with no second counter.
-            if (bb.pairs != 0u)
+            //
+            // ⭐ G745: emitted only when this block is a LOOP HEADER, and then against `worst[k]` —
+            // the pairs of the longest path from here to the next check point — so the region can
+            // still never overshoot `maxCycles` while every non-header block's entry stops being a
+            // reachable exit. The entry edge is covered by `g612RunRegion`'s caller precheck, which
+            // now carries `worst[entry]` (see the `bbPairs` publication below).
+            const bool g745Check = !g745Ok || s_g745.check[k];
+            if (bb.pairs != 0u && g745Check)
             {
-                e.lea64(G610_RAX, G610_R8, (int32_t)bb.pairs);
-                x.cmpR64(G610_RAX, G612_RSI);
-                addFix(x.jccRel32(G612_CC_A), -2, bb.start * 8u);
+                const int32_t g745Span = g745Ok ? (int32_t)s_g745.worst[k] : (int32_t)bb.pairs;
+                // ⭐⭐ G745 BALLAST (default 0). `n + 1` byte-identical copies of the same pure test,
+                // to the same exit stub — Rule 88's instrument for a lever below the route's floor.
+                // See vu1_g745_region_budget.inc for why the repetition is exact.
+                for (uint32_t bal = 0u; bal <= g745BalN(); ++bal)
+                {
+                    e.lea64(G610_RAX, G610_R8, g745Span);
+                    x.cmpR64(G610_RAX, G612_RSI);
+                    addFix(x.jccRel32(G612_CC_A), -2, bb.start * 8u);
+                }
             }
+
+            // ⭐ G744/G745: plan the dead-history elision for this basic block. G744 could only plan
+            // the block in isolation, because every BB began with the cycle-budget test above and a
+            // BB ENTRY WAS THEREFORE A REACHABLE EXIT. With the test hoisted, `s_g745.outMin[k]` is
+            // the minimum, over every path leaving this block's terminator, of the pushes that are
+            // guaranteed to execute before control can leave the region — so the backward count
+            // starts from it instead of from zero. The terminator pair and its delay slot are
+            // SCANNED (`bb.pairs`) but never MARKED (`bb.plain`): they execute and overwrite ring
+            // slots, but they reach the emitter through a different index path.
+            const uint32_t g745Seed = g745Ok ? (uint32_t)s_g745.outMin[k] : 0u;
+            g744PlanRunEx(s_g410Cache.fused.data(), bb.start,
+                          g745Ok ? (uint32_t)bb.pairs : (uint32_t)bb.plain,
+                          (uint32_t)bb.plain, g745Seed, false);
+            if (g744HistStatOn())
+                s_g744HistPairs += bb.plain;
 
             for (uint32_t j = 0u; j < bb.plain && !e.bad; ++j)
                 if (!g612EmitPair(e, bb.start + j, j, dataSize))
                 {
                     ++s_g612RfWhy[G612_RF_MISMATCH];
+                    g744PlanClear();
                     return false;
                 }
+            // The terminator pair and its delay slot are emitted below with indices >= `plain`,
+            // through a different path; they must never be elided.
+            g744PlanClear();
             if (e.bad)
                 break;
 
             if (bb.term == G612_T_EXIT || bb.term == G612_T_FALL)
             {
+                e.flushHistAdvance();
                 if (bb.plain != 0u)
                     x.addImm64(G610_R8, (int32_t)bb.plain);
                 if (bb.term == G612_T_EXIT)
@@ -1195,6 +1273,7 @@ namespace
                 ++s_g612RfWhy[G612_RF_MISMATCH];
                 return false;
             }
+            e.flushHistAdvance();
             x.addImm64(G610_R8, (int32_t)bb.pairs);
 
             if (bb.term == G612_T_JR)
@@ -1388,11 +1467,18 @@ namespace
         for (uint32_t k = 0u; k < p.nBb; ++k)
         {
             out->bbSlot[k] = p.bb[k].start;
-            out->bbPairs[k] = p.bb[k].pairs;
+            // ⭐ G745: this value becomes `G612SlotRec::pairs`, which is `g612RunRegion`'s ENTRY
+            // BUDGET PRECHECK (`if (budget < s.pairs) return 0`). With the per-block test hoisted,
+            // entering at block k runs check-free until the next loop header, so the precheck has to
+            // cover that whole span — `worst[k]` — not just this block's own pairs. Precondition 6
+            // (a region always makes progress, so the pair loop can never spin on a zero-pair
+            // return) holds unchanged: `worst[k] >= bb[k].pairs >= 1` for every entry block.
+            out->bbPairs[k] = g745Ok ? s_g745.worst[k] : p.bb[k].pairs;
             out->bbFn[k] = (p.bb[k].entryOff == 0xFFFFFFFFu)
                                ? nullptr
                                : (G612Fn)(void *)(e.p + p.bb[k].entryOff);
         }
+        g752DumpCode(e, "region");
         s_g612.used += (e.n + 15u) & ~(size_t)15u;
         s_g612CodeBytes += e.n;
         s_g612Bbs += p.nBb;
@@ -1568,7 +1654,7 @@ namespace
             // name a cleared entry at a stale index and the region would be published into the
             // wrong place. This is the same class of mistake as G611's `allowReset` note: never
             // hold a pointer into a table across a call that may rebuild it.
-            static thread_local G612Region s_tmp;
+            static constinit thread_local G612Region s_tmp{};
             s_tmp = G612Region{};
             if (!g612EmitRegion(s_plan, dataSize, codeSize, &s_tmp))
                 continue;
@@ -1594,6 +1680,10 @@ namespace
     // -------------------------------------------------------------------------------------------
     void g612Report()
     {
+        // ⭐ G745: `g745Report()` is NOT called here. Every caller of this function is already
+        // inside `if (g612StatOn())`, so a call here could not be reached by `DC2_G745_STAT=1`
+        // alone — which is exactly the defect this phase found in `[G744:hist]`. It is called from
+        // the region-run counter's cadence in vu1_g490_block_run.inc instead.
         if (!g612StatOn())
             return;
         std::fprintf(stderr,
