@@ -544,25 +544,58 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                 const double parseCpuMs = (double)(parseCpuNow - s_lastParseCpu) / 1e6 / w;
                 s_lastVu1Cpu = vu1CpuNow;
                 s_lastParseCpu = parseCpuNow;
+                // ⭐⭐⭐ G745: `parseCpu` IS NOT PARSE WORK — it contains the G726 kick spin, which is
+                // an idle wait burned as 100 % CPU on this very thread. Measured on `dragon`, same
+                // route and windows, default vs `DC2_G726_NO_KICK_SPIN=1`: parseCpuMs/f 25.0-26.0
+                // with the spin against 15.1-18.8 without, on a frame that gets 1.5-2.5 ms/f FASTER
+                // with it. `tools/g653_pole_table.py`'s `poleW` is `max(parseCpu, vu1Cpu, eeWork,
+                // gsExecCpu)`, so those ~8.5 ms/f of waiting are what put "GS parse" at the pole on
+                // 11 of the 23 G744 windows — against G744 §4e's own prose, which reads the same
+                // board's worst four windows as VU1-poled. Rank `parseWork` instead.
+                static uint64_t s_lastGsSpinNs = g297GsSpinNs();
+                const uint64_t gsSpinNs = g297GsSpinNs();
+                const double gsSpinMsPerF = (double)(gsSpinNs - s_lastGsSpinNs) / 1e6 / w;
+                s_lastGsSpinNs = gsSpinNs;
+                const double parseWorkMs = parseCpuMs - gsSpinMsPerF;
                 if (vuwKicks != 0ull)
                     std::fprintf(stderr,
                                  "[G303:vu1w] n=%u window=%u busyMs/f=%.1f kicks/f=%.0f gsStallMs/f=%.1f gsStalls/f=%.0f gsWorkerMs/f=%.1f "
                                  "| [G344:merge] collectMs/f=%.1f overheadMs/f=%.2f windows/f=%.0f "
-                                 "| [G735:cpu] vu1CpuMs/f=%.2f parseCpuMs/f=%.2f\n",
+                                 "| [G735:cpu] vu1CpuMs/f=%.2f parseCpuMs/f=%.2f "
+                                 "| [G745:spin] gsSpinMs/f=%.2f parseWorkMs/f=%.2f\n",
                                  n, s_perfWindow, vuwMsPerF, vuwKicksPerF, stallMsPerF, stallsPerF, gsBusyMsPerF,
                                  collectMsPerF, mergeOverheadMsPerF, collectCallsPerF,
-                                 vu1CpuMs, parseCpuMs);
+                                 vu1CpuMs, parseCpuMs, gsSpinMsPerF, parseWorkMs);
             }
             if (s_g182PerfOn)
             {
                 const double eeCpuMs = s_sumEeCpuMs / w;
                 const double eeWaitCpuMs = s_sumEeWaitCpuMs / w;
                 const double eeWorkCpuMs = std::max(0.0, eeCpuMs - eeWaitCpuMs);
+                // ⛔ G742: `waitCpuMs/f` IS A STRUCTURAL ZERO, AND THE LINE NOW SAYS SO.
+                //
+                // `ps2EeWaitScopeEnter()` / `ps2EeWaitScopeExit()` (ps2_runtime_cold.cpp), the only
+                // things that ever add to `g_eeWaitCpuNs`, have **zero callers anywhere in the
+                // tree**. So `waitCpuMs/f` is permanently 0.00 and `workCpuMs/f` is IDENTICALLY
+                // `cpuMs/f` — two columns printed side by side that cannot disagree.
+                //
+                // ⚠️ It is not currently WRONG: the EE thread's wait is a condition-variable park at
+                // `m_cvFrameSlot`, which burns no CPU, so total thread CPU really is work today. It
+                // is LATENT: the board's EE pole term is `workCpuMs/f` (g653_pole_table.py rule 7c),
+                // and any EE-side SPIN — `DC2_G726_KICK_SPIN`-class levers are an open direction —
+                // would be scored as EE work with no column able to say otherwise.
+                //
+                // Wiring the scope would put a `GetThreadTimes` syscall on the EE thread, which is
+                // the anti-pattern G740 §4d.1 priced at ~14 ms/f in its own class, so the repair is
+                // DISCLOSURE (G741's `avail=` law) rather than instrumentation: `waitSrc=` names the
+                // instrument, and any future EE spin must arm its own accounting and change it.
+                // Appended AFTER `workOnCPU`, so `tools/g653_pole_table.py`'s regex is unaffected.
                 std::fprintf(stderr,
-                             "[G182:ee] n=%u window=%u busyMs/f=%.2f cpuMs/f=%.2f waitCpuMs/f=%.2f workCpuMs/f=%.2f onCPU=%.0f%% workOnCPU=%.0f%%\n",
+                             "[G182:ee] n=%u window=%u busyMs/f=%.2f cpuMs/f=%.2f waitCpuMs/f=%.2f workCpuMs/f=%.2f onCPU=%.0f%% workOnCPU=%.0f%% waitSrc=%s\n",
                              n, s_perfWindow, avgFrameMs, eeCpuMs, eeWaitCpuMs, eeWorkCpuMs,
                              100.0 * eeCpuMs / std::max(0.001, avgFrameMs),
-                             100.0 * eeWorkCpuMs / std::max(0.001, avgFrameMs));
+                             100.0 * eeWorkCpuMs / std::max(0.001, avgFrameMs),
+                             "none(ps2EeWaitScope has 0 call sites => workCpu==cpu)");
                 // ⭐⭐⭐ G734: THE GS EXECUTOR THREAD — the board's missing column.
                 //
                 // `gsOwn` (the board's GS term) is `g303_gs_worker_busy_ns() - gsStall`, and
@@ -666,16 +699,49 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
                         s_lastParseCpu = parseCpu;
                         s_parsePrimed = true;
                     }
+                    // ⭐⭐⭐ G745: THE PARSE COLUMN THE BOARD JOINS MUST BE WORK, NOT WORK-PLUS-SPIN.
+                    // `parseCpu` is `GetThreadTimes` on the parse thread, and since the G744
+                    // promotion that thread runs the G726 kick spin — a `_mm_pause` loop waiting on
+                    // VU1, which is 100 % CPU and 0 % work. Measured on `dragon` (same route, same
+                    // windows, default vs `DC2_G726_NO_KICK_SPIN=1`): 25.0-26.0 vs 15.1-18.8 ms/f,
+                    // on a frame that is FASTER with the spin. `poleW` in
+                    // `tools/g653_pole_table.py` maxes over this column, which is how the G744 board
+                    // reported "GS parse is the pole on 11 of 23 windows by REAL CPU" while §4e of
+                    // the same document reads its worst four windows as VU1-poled. This is G735's
+                    // Rule 12 one costume on: that phase stopped the board ranking OCCUPANCY against
+                    // WORK, and the work column it introduced turned out to carry a wait.
+                    // `parseWorkMs/f` is the column to rank; `parseCpuMs/f` stays for continuity.
+                    //
+                    // ⚠️ `parseWork` IS AN UPPER BOUND, NOT THE WORK. It removes the spin and
+                    // nothing else, and the rest of the kick stall is a `m_cvDone` park whose
+                    // ENTER/WAKE kernel path is still charged to this thread. The arithmetic on
+                    // `dragon` says that residue is large: with the spin off the thread reads
+                    // `parseCpu = 16.8` while its own occupancy is `gsWorkerMs/f = 27.2` of which
+                    // `[G344:merge] collectMs/f = 20.2` is the VU1 wait -- so only ~7 ms/f of that
+                    // 16.8 can be parsing. Read `parseWork` as "at most this much", and do not open
+                    // a parse direction on it without a census that separates the park.
+                    static uint64_t s_lastGsSpin = 0ull;
+                    static bool s_gsSpinPrimed = false;
+                    const uint64_t gsSpin = g297GsSpinNs();
+                    if (!s_gsSpinPrimed)
+                    {
+                        s_lastGsSpin = gsSpin;
+                        s_gsSpinPrimed = true;
+                    }
                     if (vu1Cpu != 0ull || parseCpu != 0ull)
                     {
                         const double vu1CpuMs = (double)(vu1Cpu - s_lastVu1Cpu) / 1e6 / w;
                         const double parseCpuMs = (double)(parseCpu - s_lastParseCpu) / 1e6 / w;
+                        const double gsSpinMs = (double)(gsSpin - s_lastGsSpin) / 1e6 / w;
                         std::fprintf(stderr,
                                      "[G735:cpu] n=%u window=%u vu1CpuMs/f=%.2f parseCpuMs/f=%.2f "
-                                     "eeCpuMs/f=%.2f gsxCpuMs/f=%.2f\n",
-                                     n, s_perfWindow, vu1CpuMs, parseCpuMs, eeWorkCpuMs, gsxCpuMs);
+                                     "eeCpuMs/f=%.2f gsxCpuMs/f=%.2f gsSpinMs/f=%.2f "
+                                     "parseWorkMs/f=%.2f\n",
+                                     n, s_perfWindow, vu1CpuMs, parseCpuMs, eeWorkCpuMs, gsxCpuMs,
+                                     gsSpinMs, parseCpuMs - gsSpinMs);
                         s_lastVu1Cpu = vu1Cpu;
                         s_lastParseCpu = parseCpu;
+                        s_lastGsSpin = gsSpin;
                     }
                 }
             }

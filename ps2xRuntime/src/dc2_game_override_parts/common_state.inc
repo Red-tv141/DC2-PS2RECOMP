@@ -82,9 +82,23 @@ static bool dc2_env_flag_enabled_uncached(const char *name)
 // Slots publish `value` before `name` with a release store and are read with an acquire load, so a
 // racing reader that observes the name observes the value. Two threads computing the same slot is
 // benign: they compute the same answer from the same immutable environment.
+// ⭐ G743: DEFAULT-ON. G639 built this, proved it exact on a premise that still holds, and left it
+// behind a positive arm marked "bring-up DEFAULT OFF" — so the residual `getenv` it exists to
+// delete has been paid on every shipped frame since. The three conditions above are unchanged in
+// meaning; only the arm's polarity moved, and `DC2_G639_NO_ENVMEMO=1` remains the exact rollback.
+//
+// ⚠️ The exactness premise was RE-VERIFIED here rather than inherited: `putenv` / `_putenv` /
+// `SetEnvironmentVariable` appear nowhere in `ps2xRuntime`, `ps2xRecomp` or `runner/` (the only
+// hits in the tree are the two comments asserting it), so the environment really is constant for
+// the life of the process and a memo of it cannot go stale. `DC2_G619_LIVE_ENVREAD=1` still means
+// "every read is live" and therefore still disables this, exactly as G639 wrote it.
+//
+// ⛔ The key is the NAME POINTER, so every caller must pass a string LITERAL. Re-checked at this
+// promotion: of the ~165 call sites, the only one that does not pass a literal in place is
+// `g619EnvFlag`, which forwards a literal it was handed. Grep before adding another.
 static const bool g_g639EnvMemoOn =
     (std::getenv("DC2_G639_NO_ENVMEMO") == nullptr) &&
-    (std::getenv("DC2_G639_ENVMEMO") != nullptr) &&
+    (std::getenv("DC2_G639_LIVE") == nullptr) &&
     (std::getenv("DC2_G619_LIVE_ENVREAD") == nullptr);
 
 struct G639EnvSlot

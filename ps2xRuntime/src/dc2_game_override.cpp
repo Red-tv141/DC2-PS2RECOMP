@@ -531,6 +531,9 @@ extern uint64_t g297GsCollectStalls();
 // distinguishing removable per-window handoff cost from VU1-catch-up idle (the stall).
 extern uint64_t g297GsCollectTotalNs();
 extern uint64_t g297GsCollectCalls();
+// ⭐ G745: the G726 kick spin's own CPU on the PARSE thread. `parseWork = parseCpu - gsSpin`.
+extern uint64_t g297GsSpinNs();
+extern uint64_t g297GsSpins();
 extern uint64_t g303_gs_worker_busy_ns();
 extern uint64_t g332_gs_worker_total_ns();
 extern void g332_backend_snapshot(uint64_t nsOut[4], uint64_t cntOut[4]);
