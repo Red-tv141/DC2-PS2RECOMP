@@ -487,18 +487,32 @@ namespace ps2_syscalls
                 }
 
                 size_t bytesRead = 0;
-                std::vector<uint8_t> sectorBuf(kIsoSectorSize);
+                uint8_t sectorBuf[kIsoSectorSize];
                 const uint64_t physical = e.baseOffset + e.cursor;
                 uint32_t sector = e.lba + static_cast<uint32_t>(physical / kIsoSectorSize);
                 uint32_t secOff = static_cast<uint32_t>(physical % kIsoSectorSize);
 
                 while (bytesRead < toRead)
                 {
-                    if (!isoReadSectorForFio(sector, 1u, sectorBuf.data()))
+                    // G764: one bulk read for the aligned middle, scratch only
+                    // for the two boundary sectors. Same file cursor and bytes.
+                    static const bool legacy = [] {
+                        const char* p = std::getenv("DC2_G764_NO_BULK_CD");
+                        return p && std::strcmp(p, "1") == 0;
+                    }();
+                    const uint32_t whole = static_cast<uint32_t>((toRead - bytesRead) / kIsoSectorSize);
+                    if (!legacy && secOff == 0u && whole > 0u &&
+                        isoReadSectorForFio(sector, whole, hbuf + bytesRead))
+                    {
+                        bytesRead += static_cast<size_t>(whole) * kIsoSectorSize;
+                        sector += whole;
+                        continue;
+                    }
+                    if (!isoReadSectorForFio(sector, 1u, sectorBuf))
                         break;
                     const size_t avail = kIsoSectorSize - secOff;
                     const size_t chunk = std::min(avail, toRead - bytesRead);
-                    std::memcpy(hbuf + bytesRead, sectorBuf.data() + secOff, chunk);
+                    std::memcpy(hbuf + bytesRead, sectorBuf + secOff, chunk);
                     bytesRead += chunk;
                     ++sector;
                     secOff = 0u;

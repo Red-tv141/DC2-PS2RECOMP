@@ -18,7 +18,19 @@ namespace ps2_syscalls
     {
         constexpr uint32_t kIntcVblankStart = 2u;
         constexpr uint32_t kIntcVblankEnd = 3u;
-        constexpr auto kVblankPeriod = std::chrono::microseconds(16667);
+        // G769 (measurement only): DC2_G769_VBLANK_US=<us> shortens the guest vblank tick so a
+        // frame-indexed route runs uncapped (e.g. 8333 = 120 Hz); the per-frame workload is the
+        // game's own. Never set in a shipped configuration.
+        inline std::chrono::microseconds g769VblankPeriod()
+        {
+            static const std::chrono::microseconds p = []() {
+                const char *v = std::getenv("DC2_G769_VBLANK_US");
+                const long us = v != nullptr ? std::strtol(v, nullptr, 10) : 0L;
+                return std::chrono::microseconds((us >= 2000L && us <= 100000L) ? us : 16667L);
+            }();
+            return p;
+        }
+        const auto kVblankPeriod = g769VblankPeriod();
         constexpr int kMaxCatchupTicks = 4;
 
         std::mutex g_irq_handler_mutex;

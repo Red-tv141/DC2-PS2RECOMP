@@ -98,16 +98,30 @@ namespace ps2_stubs
                 return false;
             }
             const Ps2IsoMount &mount = getGlobalIsoMount();
-            std::vector<uint8_t> sectorBuf(kCdSectorSize);
+            // G764: whole-sector reads go directly into their final guest buffer.
+            // Preserve the bounded tail contract without per-sector seeks/copies.
+            if (byteCount > static_cast<uint64_t>(sectors) * kCdSectorSize) return false;
+            static const bool legacy = [] {
+                const char* p = std::getenv("DC2_G764_NO_BULK_CD");
+                return p && std::strcmp(p, "1") == 0;
+            }();
             size_t written = 0;
-            for (uint32_t i = 0; i < sectors && written < byteCount; ++i)
+            if (!legacy)
             {
-                if (!mount.readSector(lbn + i, 1u, sectorBuf.data()))
+                const uint32_t whole = static_cast<uint32_t>(byteCount / kCdSectorSize);
+                if (whole && !mount.readSector(lbn, whole, dst)) return false;
+                written = static_cast<size_t>(whole) * kCdSectorSize;
+            }
+            uint8_t sectorBuf[kCdSectorSize];
+            for (uint32_t i = static_cast<uint32_t>(written / kCdSectorSize);
+                 i < sectors && written < byteCount; ++i)
+            {
+                if (!mount.readSector(lbn + i, 1u, sectorBuf))
                 {
                     return false;
                 }
                 const size_t chunk = std::min<size_t>(kCdSectorSize, byteCount - written);
-                std::memcpy(dst + written, sectorBuf.data(), chunk);
+                std::memcpy(dst + written, sectorBuf, chunk);
                 written += chunk;
             }
             return written == byteCount;

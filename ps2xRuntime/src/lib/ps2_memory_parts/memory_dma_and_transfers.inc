@@ -141,6 +141,7 @@
                     const bool g503Pool = g503ChainPoolEnabled();
                     std::vector<uint8_t> chainBuf =
                         g503Pool ? g503AcquireChainBuf() : std::vector<uint8_t>();
+                    const size_t g770Cap0 = chainBuf.capacity(); // G770-B census
                     const bool g136Enabled = g136_trace_enabled() && channelBase == 0x10009000u;
                     const uint32_t g136Packet = g136_target_packet();
                     const uint32_t g136Bulk = g136_target_bulk();
@@ -573,6 +574,8 @@
 
                     if (!chainBuf.empty())
                     {
+                        g770NoteChain(chainBuf.size(), g770Cap0, chainBuf.capacity(),
+                                      channelBase == 0x10009000u); // G770-B census (inert by default)
                         if (g136ChainArmed && channelBase == 0x10009000u)
                         {
                             s_g136PendingChains.fetch_add(1u, std::memory_order_relaxed);

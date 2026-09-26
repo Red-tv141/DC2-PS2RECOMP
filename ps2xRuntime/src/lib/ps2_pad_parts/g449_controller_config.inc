@@ -192,6 +192,8 @@ namespace
         G449Binding bind[kG449ControlCount];
         float leftDead = 0.10f;
         float rightDead = 0.10f;
+        float leftCurve = 0.f;    // 0 = use global DC2_STICK_CURVE / DC2_LSTICK_CURVE
+        float rightCurve = 0.f;   // 0 = use global DC2_STICK_CURVE / DC2_RSTICK_CURVE
     };
 
     // Minimal targeted JSON reader. The file is written by exactly one producer
@@ -249,6 +251,21 @@ namespace
                 c.rightDead = static_cast<float>(dz / 100.0);
             if (c.leftDead < 0.f || c.leftDead > 0.9f) c.leftDead = 0.10f;
             if (c.rightDead < 0.f || c.rightDead > 0.9f) c.rightDead = 0.10f;
+
+            // Response curve (optional, launcher may or may not emit these).
+            // A single "responseCurve" applies to both sticks; per-stick overrides win.
+            double cv = 0.0;
+            float baseCurve = 0.f;
+            if (g449ExtractNumber(src, "responseCurve", cv) && cv > 0.0)
+                baseCurve = static_cast<float>(cv);
+            if (g449ExtractNumber(src, "leftStickResponseCurve", cv) && cv > 0.0)
+                c.leftCurve = static_cast<float>(cv);
+            else
+                c.leftCurve = baseCurve;
+            if (g449ExtractNumber(src, "rightStickResponseCurve", cv) && cv > 0.0)
+                c.rightCurve = static_cast<float>(cv);
+            else
+                c.rightCurve = baseCurve;
 
             int bound = 0, unresolved = 0;
             for (int i = 0; i < kG449ControlCount; ++i)
@@ -335,24 +352,26 @@ namespace
     }
 
     // Resolve one stick from its four direction bindings into 0x80-centred bytes.
+    // curve: from the launcher config (0 = use fallbackCurve from global env vars).
     void g449Stick(const G449ControllerConfig &c, int gamepad, int up, int down,
-                   int left, int right, float dead, uint8_t *outX, uint8_t *outY)
+                   int left, int right, float dead, float curve, float fallbackCurve,
+                   uint8_t *outX, uint8_t *outY)
     {
         float x = g449BindingAxis(c.bind[right], gamepad) -
                   g449BindingAxis(c.bind[left], gamepad);
         float y = g449BindingAxis(c.bind[down], gamepad) -
                   g449BindingAxis(c.bind[up], gamepad);
 
-        const float mag = std::sqrt(x * x + y * y);
-        if (mag < dead) { x = 0.f; y = 0.f; }
-
-        auto toByte = [](float v) -> uint8_t {
-            int b = 128 + static_cast<int>(v * 127.0f);
-            if (b < 0) b = 0; else if (b > 255) b = 255;
-            return static_cast<uint8_t>(b);
-        };
-        *outX = toByte(x);
-        *outY = toByte(y);
+        const auto &sp = getStickParams();
+        if (sp.linear) {
+            auto p = processStickLinear(x, y, dead);
+            *outX = p.first; *outY = p.second;
+        } else {
+            // Use launcher-config curve if set, else fall back to global env var.
+            const float effCurve = (curve > 0.f) ? curve : fallbackCurve;
+            auto p = processStick(x, y, dead, sp.outerDead, effCurve);
+            *outX = p.first; *outY = p.second;
+        }
     }
 
     // Full poll under a launcher config. Returns false when no config is active, so the
@@ -376,10 +395,13 @@ namespace
 
         uint8_t lx = kPadStickCenter, ly = kPadStickCenter;
         uint8_t rx = kPadStickCenter, ry = kPadStickCenter;
+        const auto &sp = getStickParams();
         g449Stick(c, gamepad, kG449LeftStickUp, kG449LeftStickDown,
-                  kG449LeftStickLeft, kG449LeftStickRight, c.leftDead, &lx, &ly);
+                  kG449LeftStickLeft, kG449LeftStickRight, c.leftDead, c.leftCurve,
+                  sp.leftCurve, &lx, &ly);
         g449Stick(c, gamepad, kG449RightStickUp, kG449RightStickDown,
-                  kG449RightStickLeft, kG449RightStickRight, c.rightDead, &rx, &ry);
+                  kG449RightStickLeft, kG449RightStickRight, c.rightDead, c.rightCurve,
+                  sp.rightCurve, &rx, &ry);
 
         if (outMask) *outMask = mask;
         if (outLX) *outLX = lx;

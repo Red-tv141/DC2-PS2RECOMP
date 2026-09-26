@@ -800,7 +800,9 @@ namespace
             if (slotIndex < 8u)
             {
                 // EE calls use eight integer argument registers (a0-a3, t0-t3 / r4-r11).
-                return GPR_U64(m_ctx, (4 + static_cast<int>(slotIndex)));
+                uint64_t value;
+                std::memcpy(&value, &m_ctx->r[4u + slotIndex], sizeof(value));
+                return value;
             }
 
             const uint32_t stackIndex = slotIndex - 8u;
