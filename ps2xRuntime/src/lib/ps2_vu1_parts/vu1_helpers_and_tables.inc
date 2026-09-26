@@ -384,12 +384,30 @@ namespace
     {
         G430HistEntry e[G430_HIST]; // @  0
         int head;                   // @256
+        // ⭐ G757: THE SCALAR (Q/P) PIPELINE RIDES HERE, and the reason is register pressure, not
+        // taste. An emitted body already holds this block's address in R9 (§2 of
+        // vu1_g610_native_jit.inc assigns all seven available registers), so a DIV/RSQRT/EFU op
+        // compiled INTO the body reaches its pending value and its deadline as a constant
+        // displacement and needs no register it cannot have. `g757QDead`/`g757PDead` are absolute
+        // PAIR STAMPS, not countdowns — see vu1_g757_scalar_pipe.inc for why that is what removes
+        // the per-pair advance. Written only by an emitted body and by `G757Sync`; the interpreter
+        // keeps using `s_vuQDelay` / `s_vuQPending` unchanged.
+        float g757QPend;            // @260
+        float g757PPend;            // @264
+        // Bit 0 = a Q producer armed inside this body, bit 1 = a P producer did. This is the one
+        // thing the deadline cannot encode: `s_vuQPending` must be written back only when a
+        // producer actually replaced it, and "nothing in flight" (G757_NEVER) is reachable both
+        // from a body that armed nothing and from one whose WAITQ emptied the pipe.
+        uint32_t g757Armed;         // @268
+        int64_t g757QDead;          // @272
+        int64_t g757PDead;          // @280
     };
 #define G430_HIST_INIT_ENTRY {{0.0f, 0.0f, 0.0f, 0.0f}, -1, 0u, 0u, 2u, 0u}
     constinit thread_local G430HistBlock s_g430HB = {
         {G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY,
          G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY, G430_HIST_INIT_ENTRY},
         0,
+        0.0f, 0.0f, 0u, 0, 0,
     };
 #undef G430_HIST_INIT_ENTRY
     static_assert(sizeof(G430HistEntry) == 32u, "G726: the emitter indexes entries with scale*8");

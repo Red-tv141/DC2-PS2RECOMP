@@ -984,14 +984,30 @@ namespace
     {
         if (pair.pairFlags != 0u)
             return false;                                   // E-bit or LOI
-        if (pair.lowerKind == G422_LK_NONE)
-            return false;                                   // needs the legacy execLower
+        // ⭐⭐⭐ G757. `dragon`'s hottest basic block (0x1850..0x19e0, 51 pairs, 32.4% of every VU1
+        // pair on the route) carries SEVEN of these — three RSQRT, two ERSQRT, two MFP — and each
+        // one used to end the native run here, cost an interpreted pair through the 42 KB
+        // `execLower` switch, and then make the next region entry refuse on `skipQp`. Admitting
+        // them is what collapses ~15 dispatch events per vertex loop to one.
+        // See vu1_g757_scalar_pipe.inc for the deadline discipline that makes it exact.
+        const bool g757Pipe = g757ScalarPipeOn() && g757PairIsScalarPipe(pair);
+        if (!g757Pipe)
+        {
+            if (pair.lowerKind == G422_LK_NONE)
+                return false;                               // needs the legacy execLower
+            if (pair.lowerKind >= G422_LK_FIRST_FLAG)
+                return false;                               // reads the MAC/STATUS line
+        }
         if (pair.lowerKind >= G422_LK_B && pair.lowerKind <= G422_LK_IBGEZ)
             return false;                                   // branch / jump: writes pc
-        if (pair.lowerKind >= G422_LK_FIRST_FLAG)
-            return false;                                   // reads the MAC/STATUS line
-        if ((pair.g425Flags &
-             (G426_PF_PRESTALL | G426_PF_HAZ | G427_PF_FLAGREAD)) != 0u)
+        // `G426_PF_PRESTALL` is the flag the G757 bodies now DISCHARGE themselves, so it is dropped
+        // from the mask for exactly those pairs. `G426_PF_HAZ` and `G427_PF_FLAGREAD` are not:
+        // a same-pair VF hazard still needs the loop's overlay, and nothing here reads the flag
+        // line.
+        const uint8_t g757Reject = g757Pipe
+            ? (uint8_t)(G426_PF_HAZ | G427_PF_FLAGREAD)
+            : (uint8_t)(G426_PF_PRESTALL | G426_PF_HAZ | G427_PF_FLAGREAD);
+        if ((pair.g425Flags & g757Reject) != 0u)
             return false;                                   // per-pair machinery is live
         if (pair.upperKind == 0x6fu)
             return true;                                    // VNOP: the loop skips the upper
@@ -2456,6 +2472,14 @@ namespace
             g499Qd = *qDelay;
             g499Pd = *pDelay;
         }
+        // ⭐⭐⭐ G757: does this run contain a scalar-pipe pair? Asked ONCE, here, and false for
+        // every pair the G756 backend admitted — so the shipped body's hot path is unchanged and
+        // every arm below folds away for a block that has none. `g757Qp`/`g757Pp` name whichever
+        // representation this instantiation is carrying, so the transcribed interpreter bodies do
+        // not have to know which.
+        const bool g757Any = g757RunHasScalarPipe(fused, firstIndex, pairCount);
+        int *const g757Qp = G506Local ? &g499Qd : qDelay;
+        int *const g757Pp = G506Local ? &g499Pd : pDelay;
         // G504: the G430 ring cursor, carried in a local for the whole block. `hb` is non-null
         // here by construction (`G501Pin` asserts it, and `g443Fixed` proves it for every caller of
         // this copy). See the exactness note at `g430PushPendingAt`.
@@ -2608,6 +2632,12 @@ namespace
                 g506Run = static_cast<uint32_t>(g499Pd - 1);
             // `g506Run >= 1` always: `j < count` gives at least one pair, and a counter above 1
             // contributes at least 1. Progress is therefore guaranteed and the loop terminates.
+            // ⭐ G757: the segmentation is a statement about counters NOTHING INSIDE CAN ARM.
+            // A scalar-pipe pair arms them by definition, so its block falls back to a one-pair
+            // segment — which is exactly the per-pair `if (qd > 0 && --qd == 0) publish` form, and
+            // the only form that can be right when a producer sits inside the run.
+            if (g757Any)
+                g506Run = 1u;
             g506SegEnd = j + g506Run;
             if (g499Qd > 1)
                 g499Qd -= static_cast<int>(g506Run);
@@ -2698,6 +2728,13 @@ namespace
                 if (*pDelay > 0 && --(*pDelay) == 0)
                     st.p = s_vuPPending;
             }
+
+            // ⭐ G757: the G239 scalar pre-stall. The pair loop performs it HERE — after both
+            // advances and before the upper — because an upper such as `MULq | WAITQ` must consume
+            // the value the lower's wait publishes. The block executor never needed it, because no
+            // pair that triggers it could be inside a block.
+            if (g757Any && g757PairIsScalarPipe(fp.pair))
+                g757GenericPrestall(st, fp.pair.lowerS2, g757Qp, g757Pp);
 
             // `g443Fixed` pins the four trailing arguments the pair loop passes: g428DeferPark
             // true, shadow false, g430Hist true, and the hoisted history block. Eligibility
@@ -2967,6 +3004,15 @@ namespace
                     // dense class. The fused byte is loaded here and only here — on the ~24% of
                     // block pairs that were going to pay an out-of-line call anyway, where one
                     // more L1 hit in front of a `call` is not on any critical path.
+                    // ⭐⭐⭐ G757: `g422FastLower` does NOTHING for `G422_LK_NONE` — that kind means
+                    // "the pair loop sends this to execLower instead". Admitting the scalar pipe
+                    // made that omission reachable and it silently skipped every RSQRT/MFP/EFU op
+                    // in a generic block, which is what `[G610:verify-BAD] vf` caught.
+                    if (g757Any && g757IsScalarPipeLower(lower))
+                    {
+                        g757GenericScalarLower(st, lower, g757Qp, g757Pp);
+                        break;
+                    }
                     if constexpr (G516Low)
                         g422FastLower(st, lower, fp.pair.lowerKind, vuData, dataSize);
                     else
@@ -2975,6 +3021,8 @@ namespace
                 }
                 } // G515: closes the NOP peel guard above.
             }
+            else if (g757Any && g757IsScalarPipeLower(lower))
+                g757GenericScalarLower(st, lower, g757Qp, g757Pp);
             else
                 g422FastLower(st, lower, fp.pair.lowerKind, vuData, dataSize);
 
@@ -3773,6 +3821,8 @@ namespace
             s_g610SnapPre.hb = *hb;
             s_g610SnapPre.qd = *qDelay;
             s_g610SnapPre.pd = *pDelay;
+            s_g610SnapPre.qPend = s_vuQPending;   // G757: see the note at G610Snap
+            s_g610SnapPre.pPend = s_vuPPending;
             s_g610SnapPre.ram.assign(vuData, vuData + dataSize);
         }
 
@@ -3786,7 +3836,17 @@ namespace
         {
             uint32_t g611N1 = 0u;
             bool g611Split = false;
-            if (g610QpSingleSegment(st, count, qDelay, pDelay, s.readsQ != 0u, s.qMask, &g611N1) != 0)
+            // ⭐⭐⭐ G757 — THE DEADLINE DISCIPLINE. A body carrying a scalar-pipe pair cannot use
+            // the single-segment argument at all: that argument rests on "nothing in this body can
+            // ARM either counter", and this body's whole point is that it does. It takes neither
+            // the entry publication nor the split; it converts both counters to absolute pair
+            // stamps, runs, and converts back. Every observation inside is guarded at its own pair
+            // (`g757EmitObserveQ` / `g757EmitObserveP`), which is exactly where the generic loop's
+            // per-pair advance would have published.
+            const bool g757Pipe = (s.usesPipe != 0u);
+            if (g757Pipe)
+                G757Sync::enter(hb, st, *qDelay, *pDelay, stampBase);
+            else if (g610QpSingleSegment(st, count, qDelay, pDelay, s.readsQ != 0u, s.qMask, &g611N1) != 0)
             {
                 // The publication is genuinely observed inside this block. G611 splits it in two;
                 // G610's behaviour (and the `vuqsplit` control arm) is to hand it to the generic body.
@@ -3828,6 +3888,10 @@ namespace
             {
                 s.fn(&st, vuData, stampBase, hb);
             }
+            // ⭐ G757: deadlines -> countdowns, and the publication the body had no reader for.
+            // BEFORE the tail: the tail is generic code and reads `*qDelay` / `s_vuQPending`.
+            if (g757Pipe)
+                G757Sync::leave(hb, st, qDelay, pDelay, stampBase, count);
             // The caller has already admitted and budgeted this branch/flag tail. Reuse the
             // authoritative tail executor with an empty prefix, then share the caller's normal
             // branch-delay/PC completion. Avoid re-entering the full pair loop for these pairs.
@@ -3855,11 +3919,15 @@ namespace
             s_g610SnapJit.hb = *hb;
             s_g610SnapJit.qd = *qDelay;
             s_g610SnapJit.pd = *pDelay;
+            s_g610SnapJit.qPend = s_vuQPending;   // G757
+            s_g610SnapJit.pPend = s_vuPPending;
             s_g610SnapJit.ram.assign(vuData, vuData + dataSize);
 
             // Restore the true pre-state and run the AUTHORITATIVE shipped generic executor.
             st = s_g610SnapPre.st;
             *hb = s_g610SnapPre.hb;
+            s_vuQPending = s_g610SnapPre.qPend;   // G757: the reference must not see the
+            s_vuPPending = s_g610SnapPre.pPend;   //        candidate's armed values
             *qDelay = s_g610SnapPre.qd;
             *pDelay = s_g610SnapPre.pd;
             std::memcpy(vuData, s_g610SnapPre.ram.data(), dataSize);
@@ -3875,6 +3943,25 @@ namespace
                 // field where "wrong" has several possible mechanisms (a wrong result, a wrong ring
                 // slot, or G546's canonicalisation of the masked-off lanes), and the RAW BITS
                 // separate them at a glance.
+                // ⭐ G757: the scalar pipe is the one area where "wrong" is almost always a TIMING
+                // question rather than a value one, and the raw bits plus both counters separate a
+                // wrong quotient from a publication on the wrong pair at a glance. Printed for `q`
+                // and `p` for the same reason `hist.vec` is printed above.
+                if (std::strcmp(what, "q") == 0 || std::strcmp(what, "p") == 0 ||
+                    std::strcmp(what, "qpDelay") == 0)
+                    std::fprintf(stderr,
+                                 "[G610:verify-BAD] %s jitQ=%08x genQ=%08x jitP=%08x genP=%08x "
+                                 "qd jit=%d gen=%d  pd jit=%d gen=%d | entry qd=%d pd=%d "
+                                 "pend q=%08x p=%08x\n",
+                                 what,
+                                 *(const uint32_t *)&s_g610SnapJit.st.q,
+                                 *(const uint32_t *)&st.q,
+                                 *(const uint32_t *)&s_g610SnapJit.st.p,
+                                 *(const uint32_t *)&st.p,
+                                 s_g610SnapJit.qd, *qDelay, s_g610SnapJit.pd, *pDelay,
+                                 s_g610SnapPre.qd, s_g610SnapPre.pd,
+                                 *(const uint32_t *)&s_vuQPending,
+                                 *(const uint32_t *)&s_vuPPending);
                 if (at >= 0 && at < G430_HIST &&
                     (std::strcmp(what, "hist.vec") == 0))
                     std::fprintf(stderr,
@@ -3895,6 +3982,12 @@ namespace
             }
             if (s_g610SnapJit.qd != *qDelay || s_g610SnapJit.pd != *pDelay)
                 g610VerifyFail("qpDelay", firstIndex, count, -1);
+            // G757: the pending values are architectural in every sense that matters — they are
+            // what the NEXT publication will store — so an arm that leaves a different one has
+            // changed the machine even when `st.q` still matches.
+            if (std::memcmp(&s_g610SnapJit.qPend, &s_vuQPending, 4) != 0 ||
+                std::memcmp(&s_g610SnapJit.pPend, &s_vuPPending, 4) != 0)
+                g610VerifyFail("qpPending", firstIndex, count, -1);
             g610VerifyPass();
         }
 
@@ -3917,6 +4010,10 @@ namespace
             // `DC2_G746_DEST_STAT=1` alone reaches it.
             g746DestReport();
             g747TailReport();
+            // G757: OUTSIDE `g610StatOn()`, exactly as G745 had to move `g744HistReport` — a census
+            // whose own flag cannot arm it is indistinguishable from one that measured nothing.
+            if (g757StatOn())
+                g757Report();
         }
         if (g610StatOn())
         {
@@ -4175,6 +4272,8 @@ namespace
             s_g612SnapPre.hb = *hb;
             s_g612SnapPre.qd = qEntry;
             s_g612SnapPre.pd = pEntry;
+            s_g612SnapPre.qPend = s_vuQPending;   // G757
+            s_g612SnapPre.pPend = s_vuPPending;
             s_g612SnapPre.ram.assign(vuData, vuData + dataSize);
         }
 
@@ -4186,6 +4285,23 @@ namespace
             if (n == 0u) return 0u;
             if (s_g612Verified == 0u)
                 std::fprintf(stderr, "[G751:oracle] region=1 production=1\n");
+            qd = *qDelay;
+            pd = *pDelay;
+        }
+        else if (s.usesPipe != 0u)
+        {
+            // ⭐⭐⭐ G757 — THE DEADLINE DISCIPLINE, region form. The deferral below rests on
+            // "nothing this region emits can ARM either counter"; a region that contains its own
+            // DIV/RSQRT/EFU producer breaks that premise by construction, so it converts the two
+            // countdowns to absolute pair stamps at entry and back at exit instead. Every
+            // observation inside is guarded at its own pair, which is where the generic loop's
+            // per-pair advance would have published. This is also what lets the ENTRY stop refusing
+            // on a pending Q — `[G612:why] skipQp` was 57% of all entry attempts.
+            G757Sync::enter(hb, st, qEntry, pEntry, stampBase);
+            n = s.fn(&st, vuData, stampBase, hb, budget);
+            if (n == 0u)
+                return 0u;                            // structurally impossible; fail closed anyway
+            G757Sync::leave(hb, st, qDelay, pDelay, stampBase, n);
             qd = *qDelay;
             pd = *pDelay;
         }
@@ -4225,10 +4341,14 @@ namespace
             s_g612SnapJit.hb = *hb;
             s_g612SnapJit.qd = qd;
             s_g612SnapJit.pd = pd;
+            s_g612SnapJit.qPend = s_vuQPending;   // G757
+            s_g612SnapJit.pPend = s_vuPPending;
             s_g612SnapJit.ram.assign(vuData, vuData + dataSize);
 
             st = s_g612SnapPre.st;
             *hb = s_g612SnapPre.hb;
+            s_vuQPending = s_g612SnapPre.qPend;   // G757
+            s_vuPPending = s_g612SnapPre.pPend;
             *qDelay = s_g612SnapPre.qd;
             *pDelay = s_g612SnapPre.pd;
             std::memcpy(vuData, s_g612SnapPre.ram.data(), dataSize);
@@ -4257,6 +4377,21 @@ namespace
             // pair by pair inside the shipped block body and published at the exact pair; the
             // region deferred both to the exit. If the deferral were ever observable the two would
             // disagree here — and this is also what proves no emitted pair re-armed either.
+            // G757: same addition as the block oracle's — the pending values are what the next
+            // publication will store, so an arm that leaves a different one has changed the machine.
+            if (std::memcmp(&s_g612SnapJit.qPend, &s_vuQPending, 4) != 0 ||
+                std::memcmp(&s_g612SnapJit.pPend, &s_vuPPending, 4) != 0)
+            {
+                std::fprintf(stderr,
+                             "[G612:verify-BAD] qpPending jit=(%08x,%08x) ref=(%08x,%08x) "
+                             "pc=0x%x pairs=%u\n",
+                             *(const uint32_t *)&s_g612SnapJit.qPend,
+                             *(const uint32_t *)&s_g612SnapJit.pPend,
+                             *(const uint32_t *)&s_vuQPending,
+                             *(const uint32_t *)&s_vuPPending,
+                             firstIndex * 8u, n);
+                g610VerifyFail("qpPending", firstIndex, n, -1);
+            }
             if (s_g612SnapJit.qd != *qDelay || s_g612SnapJit.pd != *pDelay)
             {
                 std::fprintf(stderr,
@@ -4358,6 +4493,15 @@ namespace
                              (unsigned long long)s_g747BindImageHits);
             if (g610StatOn() && (s_g610Rebuilds % 4096u) == 1u)
                 g610Report();
+            // ⭐ G757 reports from the COLD REBUILD PASS, which is where its translation happens
+            // and which runs on every microcode invalidation — so `DC2_G757_STAT=1` ALONE reaches
+            // it (Rule 69/70/71), and the ROLLBACK arm, which never enters the emitter at all,
+            // still prints a MEASURED `emitted=0` instead of nothing.
+            // Every rebuild: `g757Report` itself suppresses a line whose counters have not moved,
+            // so this is at most one line per NEW translated body and the first rebuild's
+            // (necessarily empty) state cannot be mistaken for the final census.
+            if (g757StatOn())
+                g757Report();
         };
         if (s_g747RetainBindings)
         {
@@ -4450,6 +4594,7 @@ namespace
                 s_g610.slot[i].count = ce->count;
                 s_g610.slot[i].readsQ = ce->readsQ;
                 s_g610.slot[i].g611 = ce->g611;
+                s_g610.slot[i].usesPipe = ce->usesPipe;   // G757
                 s_g610.slot[i].qMask = ce->qMask;
             }
         }

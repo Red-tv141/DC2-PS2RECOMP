@@ -142,6 +142,7 @@ void GS::reset()
     // site takes at most one of the two, so there is no lock-order-inversion risk).
     {
         std::lock_guard<std::mutex> presentLock(s_g189HostPresentMutex);
+        m_gpuPresentationFrame.reset();
         m_hostPresentationFrame.clear();
         m_hostPresentationWidth = 0u;
         m_hostPresentationHeight = 0u;
@@ -731,6 +732,8 @@ void GS::latchHostPresentationFrame()
 {
     // G189: dedicated mutex, not m_stateMutex — see s_g189HostPresentMutex's comment above.
     std::lock_guard<std::mutex> lock(s_g189HostPresentMutex);
+    // Every exit publishes a new generation, including CPU/invalid fallbacks.
+    m_gpuPresentationFrame.reset();
     g599VramMap(m_vram, m_vramSize); // G599 diagnostic, default OFF
     // G440 (diagnostic, DC2_G440_LATCH=1): this whole function is the frame-boundary closure the
     // GS worker runs after every window of the frame — measured at 5.4-5.8 ms/f, i.e. the entire
@@ -1331,8 +1334,8 @@ void GS::latchHostPresentationFrame()
                                            static_cast<int32_t>(nativeOrigin.x),
                                            static_cast<int32_t>(nativeOrigin.y),
                                            nativeRectW, nativeRectH,
-                                           nativeW, nativeH, nativeRgba) &&
-            !nativeRgba.empty() && nativeW > 0 && nativeH > 0)
+                                           nativeW, nativeH, nativeRgba, &m_gpuPresentationFrame) &&
+            (m_gpuPresentationFrame || !nativeRgba.empty()) && nativeW > 0 && nativeH > 0)
         {
             normalizePresentationAlpha(nativeRgba, nativeW, nativeH);
             m_hostPresentationFrame.swap(nativeRgba);
@@ -1790,6 +1793,12 @@ void GS::latchHostPresentationFrame()
     }
 }
 
+dc2::gpu_present::FramePtr GS::latchedGpuPresentationFrame() const
+{
+    std::lock_guard<std::mutex> lock(s_g189HostPresentMutex);
+    return m_gpuPresentationFrame;
+}
+
 bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -1798,7 +1807,24 @@ bool GS::copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           bool *outUsedPreferred) const
 {
     // G189: dedicated mutex, not m_stateMutex — see s_g189HostPresentMutex's comment above.
-    std::lock_guard<std::mutex> lock(s_g189HostPresentMutex);
+    std::unique_lock<std::mutex> lock(s_g189HostPresentMutex);
+    if (m_hasHostPresentationFrame && m_gpuPresentationFrame)
+    {
+        const auto frame = m_gpuPresentationFrame;
+        outWidth = m_hostPresentationWidth; outHeight = m_hostPresentationHeight;
+        if (outDisplayFbp) *outDisplayFbp = m_hostPresentationDisplayFbp;
+        if (outSourceFbp) *outSourceFbp = m_hostPresentationSourceFbp;
+        if (outUsedPreferred) *outUsedPreferred = m_hostPresentationUsedPreferred;
+        // Hold a lease, not the latch mutex, across driver calls. The producer
+        // can continue and cannot reuse this texture while the lease exists.
+        lock.unlock();
+        if (dc2::gpu_present::readPixels(frame, outPixels)) return true;
+        outPixels.clear(); outWidth = outHeight = 0;
+        if (outDisplayFbp) *outDisplayFbp = 0;
+        if (outSourceFbp) *outSourceFbp = 0;
+        if (outUsedPreferred) *outUsedPreferred = false;
+        return false;
+    }
     if (!m_hasHostPresentationFrame || m_hostPresentationFrame.empty())
     {
         outPixels.clear();

@@ -6,6 +6,8 @@
 extern bool g260NrEnabled();
 extern void g149BumpVramGen();
 extern void g144FlushPendingUpload();
+// G759: same call, tagged with the edge that asked (site column of [G759:flush]).
+extern void g144FlushPendingUploadFrom(int site);
 extern void g144FlushPendingUploadRange(uint32_t dbp,
                                         uint8_t dbw,
                                         uint8_t dpsm,
@@ -125,9 +127,12 @@ void GS::performLocalToLocalTransfer()
     // publication, or a VRAM-generation bump and fails closed on every unlike field.
     // Keep default-off: its lean MAP-0 3x3 regressed 2.96% despite reducing the
     // measured materialization slice (plans/phase-G414-fix-log.md).
-    static const bool s_g414SelfCopyOn =
-        envFlagEnabled("DC2_G414_L2L_SELF_COPY") &&
-        !envFlagEnabled("DC2_G414_NO_L2L_SELF_COPY");
+    // ⭐ G767: DEFAULT ON. G414's NO-GO was G304 conservation in the pre-fold architecture (the
+    // identity copy's barrier publication was cleaning 0x139 for later readers). Under G767 those
+    // readers are GPU-served and the identity copies are the LAST l2l publication class: dungeon1
+    // l2l 2,289 -> 0 and lavaboss 953 -> 0 per 60 s with tex publications unchanged
+    // (plans/phase-G767-ledger.md §6). Rollback DC2_G414_NO_L2L_SELF_COPY=1.
+    static const bool s_g414SelfCopyOn = !envFlagEnabled("DC2_G414_NO_L2L_SELF_COPY");
     static const bool s_g414StatOn = envFlagEnabled("DC2_G414_STAT");
     const bool g414ExactSelfCopy =
         m_vram != nullptr &&
@@ -168,11 +173,11 @@ void GS::performLocalToLocalTransfer()
         if (g432L2lArmed)
         {
             G432Scope sc(&s_g432LFlush, g432L2lPx);
-            g144FlushPendingUpload();
+            g144FlushPendingUploadFrom(1); // G759: local->local transfer edge
         }
         else
         {
-            g144FlushPendingUpload();
+            g144FlushPendingUploadFrom(1); // G759: local->local transfer edge
         }
     }
 
@@ -242,6 +247,20 @@ void GS::performLocalToLocalTransfer()
         return;
     }
     g714NoteEscape(rrw, rrh);
+    // ⭐ G767: the byte-map move on the GPU for a source that lives in resident FBOs. Same placement
+    // argument as G714: above g242PrepareVramReadRect, so an admitted move never materialises its
+    // source. Declining changes nothing, and the late pin below replays the skipped publication.
+    {
+        extern bool g767TryExecuteL2l(uint32_t, uint8_t, uint8_t, uint32_t, uint32_t, uint32_t,
+                                      uint8_t, uint8_t, uint32_t, uint32_t, uint32_t, uint32_t);
+        if (g145DirtyUpload &&
+            g767TryExecuteL2l(sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay, rrw, rrh))
+        {
+            g149BumpVramGen();            // logical content moved: drop the de-swizzle texture cache
+            g627DiscardPendingL2lPatch(); // no CPU copy ran, so there are no VRAM bytes to reconcile
+            return;
+        }
+    }
 
     // G242: the range/full G144 barrier above must run first so every deferred draw
     // that can feed this copy has reached its GPU depth surface before we read VRAM.
@@ -658,7 +677,7 @@ void GS::processImageData(const uint8_t *data, uint32_t sizeBytes)
                                       : s_g145EnvDirtyUpload) ||
                                  g260NrEnabled();
     if (!g145DirtyUpload)
-        g144FlushPendingUpload();
+        g144FlushPendingUploadFrom(2); // G759: host->local IMAGE upload edge
 
     // G145 opt-in: the deferred-triangle upload barrier is range-checked after host-to-local is confirmed.
     if (renderQualityTraceEnabled())
@@ -1677,7 +1696,7 @@ void GS::performLocalToHostToBuffer()
     // G242: establish GS submission order first, then publish any persistent depth aliased by the
     // source.  Keep the historical default-off path byte-for-byte unchanged.
     if (g242GuestDepthEnabled())
-        g144FlushPendingUpload();
+        g144FlushPendingUploadFrom(3); // G759: local->host read edge
     {
         // G432: the barrier is a blocking GPU->VRAM materialisation; time it apart from the gather.
         const uint64_t g432Px = static_cast<uint64_t>(rrw) * rrh;

@@ -785,7 +785,13 @@
                 // the paired admission census produces. Full evidence: plans/phase-G730-plan.md
                 // §12.2-§12.5. The `[G731:skipqd]` census below is retained because it is what
                 // priced the direction; the lever itself is gone.
-                if (*s_qDelayP == 0 || s_g612.slot[currentPc >> 3u].readsQ == 0u)
+                // ⭐⭐⭐ G757: a region under the DEADLINE discipline carries its own Q publication,
+                // so a pending Q is no longer a reason to refuse it. `skipQp` was 240,579,709
+                // refusals against 184,549,376 successful region runs on `dragon` — 57% of every
+                // entry attempt — and one per vertex, because the vertex loop's own RSQRT is what
+                // left Q in flight. See vu1_g757_scalar_pipe.inc.
+                if (*s_qDelayP == 0 || s_g612.slot[currentPc >> 3u].readsQ == 0u ||
+                    s_g612.slot[currentPc >> 3u].usesPipe != 0u)
                 {
                     const uint32_t g612N =
                         g612RunRegion(m_state, currentPc >> 3u, vuData, dataSize, codeSize,

@@ -56,7 +56,12 @@ bool PS2Runtime::initialize(const char *title)
         extern void g178StartPersistentBackend();
         g178StartPersistentBackend();
 
-        SetTargetFPS(60);
+        {
+            // G769 (measurement only): follow DC2_G769_VBLANK_US so the host present does not re-cap.
+            const char *v = std::getenv("DC2_G769_VBLANK_US");
+            const long us = v != nullptr ? std::strtol(v, nullptr, 10) : 0L;
+            SetTargetFPS((us >= 2000L && us <= 100000L) ? static_cast<int>(1000000L / us) : 60);
+        }
 
         return true;
     }

@@ -32,8 +32,14 @@ namespace
         kG440SlotAssign,      // its outPixels.assign() zero-fill
         kG440SlotNonBlack,    // countNonBlackPixels scans
         kG440SlotMerge,       // dual-CRT merge / blend pixel loops
-        kG440SlotAlpha,       // normalizePresentationAlpha + applyFieldPresentation
+        kG440SlotAlpha,       // normalizePresentationAlpha
         kG440SlotFlush,       // g144FlushPending inside the same frame-boundary closure
+        // ⛔ G760: `alpha` used to be BOTH normalizePresentationAlpha and applyFieldPresentation,
+        // and the two do completely different amounts of work: the first is one pass over the
+        // physical image, the second COPIES the whole physical image into a fresh vector first.
+        // One combined count of 1.0 per latch could mean either of them ran, so the slot could not
+        // say which. Split.
+        kG440SlotField,       // applyFieldPresentation (whole-image copy + row bob)
         kG440SlotCount
     };
 
@@ -96,7 +102,7 @@ namespace
         std::fprintf(stderr,
                      "[G440:latch] n=%llu path=%s size=%ux%u totalMs/f=%.2f | copy=%.2f/%.1f "
                      "(assign=%.2f) nonblack=%.2f/%.1f merge=%.2f/%.1f alpha=%.2f/%.1f "
-                     "g144flush=%.2f/%.1f\n",
+                     "field=%.2f/%.1f g144flush=%.2f/%.1f\n",
                      static_cast<unsigned long long>(s_n), path, w, h,
                      ms[kG440SlotTotal],
                      ms[kG440SlotCopy], per[kG440SlotCopy],
@@ -104,6 +110,7 @@ namespace
                      ms[kG440SlotNonBlack], per[kG440SlotNonBlack],
                      ms[kG440SlotMerge], per[kG440SlotMerge],
                      ms[kG440SlotAlpha], per[kG440SlotAlpha],
+                     ms[kG440SlotField], per[kG440SlotField],
                      ms[kG440SlotFlush], per[kG440SlotFlush]);
     }
 } // namespace

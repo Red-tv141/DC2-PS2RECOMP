@@ -663,8 +663,14 @@ static constexpr uint32_t kG310LogicalCt24Token = 0xfffffff4u;
 static constexpr uint32_t kG349Narrow139 = 0xfffffff3u;
 static bool g349DecolOn()
 {
-    static const bool on = g158EnvFlag("DC2_G349_DECOL") && !g158EnvDisabled("DC2_G349_DECOL") &&
-                           !g158EnvFlag("DC2_G349_NO_DECOL");
+    // G766: the front end's 0x139 narrow-view slot (default ON) needs the de-collided key; it is
+    // gated by the same environment the front end reads (DC2_G766_NO_NARROW139, and G351's split,
+    // which owns 0x139's keys itself).
+    static const bool g766 = !g158EnvFlag("DC2_G766_NO_NARROW139") &&
+                             !g158EnvDisabled("DC2_G766_NARROW139") &&
+                             !g158EnvFlag("DC2_G351_SPLIT");
+    static const bool on = (g158EnvFlag("DC2_G349_DECOL") && !g158EnvDisabled("DC2_G349_DECOL") &&
+                            !g158EnvFlag("DC2_G349_NO_DECOL")) || g766;
     return on;
 }
 
@@ -1013,6 +1019,10 @@ constexpr GLenum GL178_SRC1_ALPHA = 0x8589;
 constexpr GLenum GL178_RENDERBUFFER = 0x8D41;
 constexpr GLenum GL178_DEPTH_ATTACHMENT = 0x8D00;
 constexpr GLenum GL178_DEPTH_COMPONENT32F = 0x8CAC;
+// G759: the single-channel float staging format for the GPU guest-depth upscale. Core since
+// GL 3.0; this context is 3.3 core (every shader in this file is `#version 330 core`).
+constexpr GLenum GL759_R32F = 0x822E;
+constexpr GLenum GL759_RED = 0x1903;
 constexpr GLenum GL178_STREAM_DRAW = 0x88E0;
 constexpr GLenum GL178_READ_WRITE = 0x88BA;
 constexpr GLenum GL178_WRITE_ONLY = 0x88B9;

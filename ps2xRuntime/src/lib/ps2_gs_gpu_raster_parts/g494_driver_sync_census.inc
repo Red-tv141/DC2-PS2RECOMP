@@ -84,7 +84,7 @@
 // part sits inside. Do not re-declare it here.
 
 // Sites. Ordered by the bucket they belong to in [G447:edge] / [G453:other].
-static constexpr int kG494SyncSites = 13;
+static constexpr int kG494SyncSites = 18;
 static constexpr int kG494T8Drain = 0;    // prepareT8ViewOnWorker      stale-error drain
 static constexpr int kG494T8Fbo = 1;      //                            framebuffer status
 static constexpr int kG494T8Err = 2;      //                            post-draw error check
@@ -98,10 +98,16 @@ static constexpr int kG494CopyErr = 9;    // copyColorRectsOnWorker     post-cop
 static constexpr int kG494RenderFbo = 10; // renderBatch                depth-attach status
 static constexpr int kG494EnsureFbo = 11; // ensureFbo REVIVE path      status (create path excluded)
 static constexpr int kG494DepthFbo = 12;  // readDepthOnWorker          status
+static constexpr int kG494ZupErr = 13;    // G759 guest-depth GPU upscale  post-draw error check
+static constexpr int kG494ZrdFbo = 14;    // G760 guest-depth GPU resolve  framebuffer status
+static constexpr int kG494ZrdErr = 15;    //                               post-draw error check
+static constexpr int kG494FlipFbo = 16;   // G760 presentation Y flip       framebuffer status
+static constexpr int kG494FlipErr = 17;   //                               post-draw error check
 
 static const char *const kG494SyncName[kG494SyncSites] = {
     "t8drain", "t8fbo", "t8err", "ct24drain", "ct24fbo", "ct24err",
-    "compdrain", "comperr", "wcolerr", "copyerr", "rendfbo", "ensfbo", "dpthfbo"};
+    "compdrain", "comperr", "wcolerr", "copyerr", "rendfbo", "ensfbo", "dpthfbo", "zuperr",
+    "zrdfbo", "zrderr", "flipfbo", "fliperr"};
 
 static std::atomic<uint64_t> g_g494SyncNs[kG494SyncSites];
 static std::atomic<uint64_t> g_g494SyncN[kG494SyncSites];
@@ -235,7 +241,12 @@ static inline GLenum g494FboStatus(int site, GLenum okValue, F &&query)
 // the executor is NOT blocked behind a readback.
 static constexpr uint64_t kG494DenseItems = 4096ull;  // ~55 frames of dense checking at startup
 static constexpr uint64_t kG494DensePeriod = 64ull;   // the pre-G743 rate
-static constexpr uint64_t kG494SparsePeriod = 64ull;  // == dense: NO default change (gated null)
+// ⭐ G765: ARMED. G743 found the backoff null because the next glReadPixels waited for exactly the
+// work this query drained (G304 conservation). G765 removes the per-frame display readback and the
+// fill-forced materialisations, so the blocking glGetError (1.5 % of the executor's wall in G765's
+// profile, all of it ZwWaitForSingleObject in the driver) no longer has a readback to hide behind.
+// The dense start-up window is unchanged; DC2_G494_SENTINEL_PERIOD=64 restores the old rate.
+static constexpr uint64_t kG494SparsePeriod = 4096ull;
 
 static uint64_t g494SparsePeriod()
 {

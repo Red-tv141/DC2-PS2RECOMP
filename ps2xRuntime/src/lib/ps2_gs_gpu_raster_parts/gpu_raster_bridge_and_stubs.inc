@@ -205,8 +205,12 @@ bool g275_backend_submit_depth_readback(G178Batch &batch, uint64_t depthKey,
 bool g242_backend_read_depth(uint64_t depthKey, int width, int height,
                              int depthY, int depthRows, std::vector<float> &depthReadback)
 {
-    return G178Backend::instance().readDepth(depthKey, width, height,
-                                             depthY, depthRows, depthReadback);
+    const uint64_t g770T0 = g770XTraceActive() ? g770XTraceNow() : 0u; // G770 trace
+    const bool ok = G178Backend::instance().readDepth(depthKey, width, height,
+                                                      depthY, depthRows, depthReadback);
+    if (g770T0 != 0u)
+        g770XTrace('R', 1u, static_cast<uint32_t>(depthKey), static_cast<uint32_t>(depthRows), g770T0);
+    return ok;
 }
 
 bool g178_backend_has_tex(uint64_t key)
@@ -218,7 +222,11 @@ bool g178_backend_has_tex(uint64_t key)
 bool g178_backend_read_color(uint32_t fbp, int width, int height, int glY, int rows,
                              std::vector<uint32_t> &out)
 {
-    return G178Backend::instance().readColor(fbp, width, height, glY, rows, out);
+    const uint64_t g770T0 = g770XTraceActive() ? g770XTraceNow() : 0u; // G770 trace
+    const bool ok = G178Backend::instance().readColor(fbp, width, height, glY, rows, out);
+    if (g770T0 != 0u)
+        g770XTrace('R', 0u, fbp, static_cast<uint32_t>(rows), g770T0);
+    return ok;
 }
 
 // G264: upload-into-FBO mirror (front-end pushes guest upload bytes into the resident FBO).
@@ -250,11 +258,176 @@ bool g627_backend_write_color_rect_masked(uint32_t fbp, int texWidth, int texHei
                                                     glX, glY, width, rows, in, mask);
 }
 
+// G766: per-BIT masked VRAM->FBO patch: texel = (old & ~mask) | (in & mask). The general form of
+// G627's lane patch for every sub-word guest write (PSMT8/PSMT4/PSMT4HL/PSMT4HH/PSMCT16).
+bool g766_backend_write_color_rect_bits(uint32_t fbp, int texWidth, int texHeight,
+                                        int glX, int glY, int width, int rows,
+                                        const std::vector<uint32_t> &in,
+                                        const std::vector<uint32_t> &mask)
+{
+    return G178Backend::instance().writeColorBits(fbp, texWidth, texHeight,
+                                                  glX, glY, width, rows, in, mask);
+}
+
+// G769: fire-and-forget forms of the two patch writes above (the item owns the buffers; FIFO order
+// is the only ordering any consumer of the patched FBO needs).
+bool g769_backend_write_color_rect_async(uint32_t fbp, int texWidth, int texHeight, int glX,
+                                         int glY, int width, int rows, std::vector<uint32_t> &&in)
+{
+    return G178Backend::instance().writeColorAsync(fbp, texWidth, texHeight, glX, glY, width, rows,
+                                                   std::move(in), std::vector<uint32_t>{}, false);
+}
+bool g769_backend_write_color_rect_bits_async(uint32_t fbp, int texWidth, int texHeight, int glX,
+                                              int glY, int width, int rows,
+                                              std::vector<uint32_t> &&in,
+                                              std::vector<uint32_t> &&mask)
+{
+    return G178Backend::instance().writeColorAsync(fbp, texWidth, texHeight, glX, glY, width, rows,
+                                                   std::move(in), std::move(mask), true);
+}
+uint64_t g769_backend_async_write_fails()
+{
+    return G178Backend::instance().m_g769AsyncWriteFails.load(std::memory_order_relaxed);
+}
+
 // G280: physical-alias page view resolve (GPU->GPU CT32 page-tile copies between target FBOs).
 bool g280_backend_copy_color_rects(uint32_t srcFbp, uint32_t dstFbp,
                                    const std::vector<int32_t> &rects6)
 {
     return G178Backend::instance().copyColor(srcFbp, dstFbp, rects6);
+}
+
+// G766: arm post-upload page pulls for the NEXT synchronous batch whose FBO key is `dstKey`.
+// `rects7` packs {srcKey, srcX, srcGlY, dstX, dstGlY, w, h} per page run, logical coordinates.
+bool g766_backend_arm_pulls(uint32_t dstKey, const std::vector<int32_t> &rects7)
+{
+    if (rects7.empty() || (rects7.size() % 7u) != 0u)
+        return false;
+    std::lock_guard<std::mutex> lk(g_g766Post.mtx);
+    g_g766Post.armed = true;
+    g_g766Post.dstKey = dstKey;
+    g_g766Post.rects7 = rects7;
+    g_g766Post.lastApplied = false;
+    ++g_g766Post.armedN;
+    return true;
+}
+
+// True when the most recently armed pulls were applied by their batch.
+bool g766_backend_last_pulls_applied()
+{
+    std::lock_guard<std::mutex> lk(g_g766Post.mtx);
+    const bool ok = g_g766Post.lastApplied && !g_g766Post.armed;
+    g_g766Post.armed = false; // never let an unconsumed arm leak into a later batch
+    return ok;
+}
+
+void g766_backend_report()
+{
+    std::lock_guard<std::mutex> lk(g_g766Post.mtx);
+    std::fprintf(stderr,
+                 "[G766:post] armed=%llu applied=%llu rects=%llu mismatch=%llu fail=%llu\n",
+                 static_cast<unsigned long long>(g_g766Post.armedN),
+                 static_cast<unsigned long long>(g_g766Post.appliedN),
+                 static_cast<unsigned long long>(g_g766Post.rectsN),
+                 static_cast<unsigned long long>(g_g766Post.mismatchN),
+                 static_cast<unsigned long long>(g_g766Post.failN));
+}
+
+// G767: arm the post-draw fold for the NEXT synchronous batch whose FBO key is `srcKey`.
+// `rects7` packs {dstKey, sx, sy, dx, dy, w, h} per run, logical GL coordinates.
+bool g767_backend_arm_folds(uint32_t srcKey, const std::vector<int32_t> &rects7)
+{
+    if (rects7.empty() || (rects7.size() % 7u) != 0u)
+        return false;
+    std::lock_guard<std::mutex> lk(g_g767Fold.mtx);
+    g_g767Fold.armed = true;
+    g_g767Fold.srcKey = srcKey;
+    g_g767Fold.rects7 = rects7;
+    g_g767Fold.lastApplied = false;
+    ++g_g767Fold.armedN;
+    return true;
+}
+
+// True when the most recently armed fold was applied (all of it) by its batch.
+bool g767_backend_last_folds_applied()
+{
+    std::lock_guard<std::mutex> lk(g_g767Fold.mtx);
+    const bool ok = g_g767Fold.lastApplied && !g_g767Fold.armed;
+    g_g767Fold.armed = false; // never let an unconsumed arm leak into a later batch
+    g_g767Fold.lastApplied = false;
+    return ok;
+}
+
+// G767: CT32/CT24 page view — rects7 {srcKey, srcGsX, srcGsY, dstX, dstY, w, h}.
+bool g767_backend_prepare_ct32_view(uint64_t texKey, int texW, int texH, bool ct24, int ta0,
+                                    int aem, const std::vector<int32_t> &rects7,
+                                    const std::vector<uint32_t> &vramPixels)
+{
+    return G178Backend::instance().prepareCt32PageView(texKey, texW, texH, ct24, ta0, aem, rects7,
+                                                       vramPixels);
+}
+
+// G767: paletted page view — rects7 {srcKey|0, srcGsX|stageIdx, srcGsY, dstX, dstY, w, h}.
+bool g767_backend_prepare_t8_view(uint64_t texKey, int texW, int texH, int kind,
+                                  const std::vector<int32_t> &rects7,
+                                  const std::vector<uint32_t> &vramPages,
+                                  const std::vector<uint32_t> &clut256,
+                                  const std::vector<uint32_t> &lut)
+{
+    return G178Backend::instance().prepareT8PageView(texKey, texW, texH, kind, rects7, vramPages,
+                                                     clut256, lut);
+}
+
+// G767: fire-and-forget page views (inputs moved into a packet the worker owns).
+bool g767_backend_queue_view(uint64_t texKey, int texW, int texH, bool ct24, int ta0, int aem,
+                             int t8Kind, std::vector<int32_t> &&rects7,
+                             std::vector<uint32_t> &&pixels, std::vector<uint32_t> &&clut,
+                             const std::vector<uint32_t> *lut)
+{
+    return G178Backend::instance().prepareViewAsync(texKey, texW, texH, ct24, ta0, aem, t8Kind,
+                                                    std::move(rects7), std::move(pixels),
+                                                    std::move(clut), lut);
+}
+
+// G768: general page view (g768_page_view_members.inc) — fire-and-forget, FIFO-ordered.
+bool g768_backend_queue_view(std::shared_ptr<G768ViewPacket> pk)
+{
+    return G178Backend::instance().queueG768View(std::move(pk));
+}
+uint64_t g768_backend_mirror_epoch()
+{
+    return G178Backend::instance().g768MirrorEpoch();
+}
+uint64_t g768_backend_exec_serial()
+{
+    return G178Backend::instance().g768ExecSerial();
+}
+bool g768_backend_read_view(uint64_t key, int w, int h, std::vector<uint32_t> &out)
+{
+    return G178Backend::instance().g768ReadViewSync(key, w, h, out);
+}
+void g768_backend_report()
+{
+    G178Backend::instance().g768Report();
+}
+
+// G767: GPU local->local byte move (see g767_l2l_members.inc).
+bool g767_backend_l2l(const std::vector<int32_t> &gather, const std::vector<uint32_t> &map,
+                      const std::vector<int32_t> &destTiles, const std::vector<int32_t> &scatter)
+{
+    return G178Backend::instance().runL2lMove(gather, map, destTiles, scatter);
+}
+
+void g767_backend_report()
+{
+    std::lock_guard<std::mutex> lk(g_g767Fold.mtx);
+    std::fprintf(stderr,
+                 "[G767:post] armed=%llu applied=%llu rects=%llu mismatch=%llu fail=%llu\n",
+                 static_cast<unsigned long long>(g_g767Fold.armedN),
+                 static_cast<unsigned long long>(g_g767Fold.appliedN),
+                 static_cast<unsigned long long>(g_g767Fold.rectsN),
+                 static_cast<unsigned long long>(g_g767Fold.mismatchN),
+                 static_cast<unsigned long long>(g_g767Fold.failN));
 }
 
 // G675: the rect-aware form. `rect*` is the PCRTC read rectangle in LOGICAL GS coordinates
@@ -263,10 +436,11 @@ bool g280_backend_copy_color_rects(uint32_t srcFbp, uint32_t dstFbp,
 bool g675_backend_read_display_rect(uint32_t fbp, uint32_t fallbackFbp,
                                     int32_t rectX, int32_t rectY, int32_t rectW, int32_t rectH,
                                     uint32_t &outW, uint32_t &outH,
-                                    std::vector<uint8_t> &outRgba)
+                                    std::vector<uint8_t> &outRgba,
+                                    dc2::gpu_present::FramePtr* gpuFrame = nullptr)
 {
     return G178Backend::instance().readDisplayFbo(fbp, fallbackFbp, rectX, rectY, rectW, rectH,
-                                                  outW, outH, outRgba);
+                                                  outW, outH, outRgba, gpuFrame);
 }
 
 bool g178_backend_read_display_fbo(uint32_t fbp, uint32_t fallbackFbp, uint32_t &outW, uint32_t &outH,

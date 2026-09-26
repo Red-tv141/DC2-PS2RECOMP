@@ -70,12 +70,76 @@ enum G495Cls
     kG495ClsG630Upload = 11,
     kG495ClsG630T8 = 12,
     kG495ClsG630Read = 13,
-    kG495ClsCount = 14
+    // ⛔ G760: THE PRESENTATION READ HAD NO CLASS. `item.isDisplayFboRead` is not in this chain at
+    // all, so every `readDisplayFboOnWorker` — one per PRESENTED FRAME, a full physical-resolution
+    // glReadPixels plus a physical-sized CPU row flip — was filed under the initialiser value,
+    // `kG495ClsRenderSkip`. Every "rend=" figure in a `[G495:rb]` ahead() set therefore counted it
+    // as a queued render.
+    kG495ClsDisplayRead = 14,
+    kG495ClsCount = 15
 };
 
 static const char *const kG495ClsName[kG495ClsCount] = {
     "comp", "t8", "ct24", "copy", "rdcol", "wrcol", "rddep", "rend", "rendrb",
-    "630replay", "630view", "630upload", "630t8", "630read"};
+    "630replay", "630view", "630upload", "630t8", "630read", "dispread"};
+
+// ===== ⭐⭐⭐ G760: WHICH EXECUTOR ITEM SPENDS THE EXECUTOR'S CPU ==============================
+//
+// After G759 the GS executor is still the pole on 160 of 172 windows at `gsxCpuMs/f = 25.52`, and
+// only ~6.3 ms/f of that is attributed by anything in this tree: `[G415:stage]` prices the WHOLE of
+// `renderBatch` at 2.661 and `[G495:rb]` prices the colour readbacks at 3.571 (2.314 reads/frame at
+// 1.543 ms each). `[G141:perf]` calls the remaining ~19 ms/f `other` and stops there.
+//
+// There is a GPU-side per-class clock (`[G495:gpu]`, DC2_G495_GPU=1) and a per-class ITEM COUNT,
+// but no CPU-side per-class TIME — so "the executor is busy" has never been resolvable into which
+// of the fourteen item kinds it is busy in. This is that census: one wall-clock pair around the
+// dispatch body, bucketed by the class table above.
+//
+// Default OFF (`DC2_G760_ITEM=1`). Two clock reads per executor item (~40/frame) behind one cached
+// bool. Rule 63 holds trivially — no lever in this phase changes the item count — but it is a
+// DIAGNOSTIC and must never be armed in a timing arm.
+static bool g760ItemCensusOn()
+{
+    static const bool on = (std::getenv("DC2_G760_ITEM") != nullptr);
+    return on;
+}
+
+struct G760ItemStat
+{
+    uint64_t ns[kG495ClsCount] = {};
+    uint64_t n[kG495ClsCount] = {};
+    uint64_t items = 0;
+};
+static G760ItemStat g_g760Item;
+
+static inline void g760ItemReport()
+{
+    double total = 0.0;
+    for (int i = 0; i < kG495ClsCount; ++i)
+        total += static_cast<double>(g_g760Item.ns[i]) / 1.0e6;
+    char line[640];
+    int off = std::snprintf(line, sizeof(line), "[G760:item] items=%llu cpuMs=%.1f |",
+                            static_cast<unsigned long long>(g_g760Item.items), total);
+    for (int i = 0; i < kG495ClsCount && off > 0 && off < static_cast<int>(sizeof(line)); ++i)
+        if (g_g760Item.n[i] != 0ull)
+            off += std::snprintf(line + off, sizeof(line) - static_cast<size_t>(off),
+                                 " %s=%.1f/%llu", kG495ClsName[i],
+                                 static_cast<double>(g_g760Item.ns[i]) / 1.0e6,
+                                 static_cast<unsigned long long>(g_g760Item.n[i]));
+    std::fprintf(stderr, "%s\n", line);
+}
+
+// `cls` is the SAME value the G495 classifier produced, so the two censuses cannot disagree about
+// what an item is. Cumulative ms; the reader divides by `[G154:perf]`'s frame count.
+static inline void g760NoteItemCpu(int cls, uint64_t ns)
+{
+    if (cls < 0 || cls >= kG495ClsCount)
+        return;
+    g_g760Item.ns[cls] += ns;
+    ++g_g760Item.n[cls];
+    if ((++g_g760Item.items % 8192ull) == 0ull)
+        g760ItemReport();
+}
 
 // GL-worker thread only — single owner, like every other resource in this backend.
 struct G495Ahead

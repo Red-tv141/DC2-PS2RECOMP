@@ -93,7 +93,8 @@ bool g178_backend_read_display_fbo(uint32_t fbp, uint32_t fallbackFbp, uint32_t 
 bool g675_backend_read_display_rect(uint32_t fbp, uint32_t fallbackFbp,
                                     int32_t rectX, int32_t rectY, int32_t rectW, int32_t rectH,
                                     uint32_t &outW, uint32_t &outH,
-                                    std::vector<uint8_t> &outRgba);
+                                    std::vector<uint8_t> &outRgba,
+                                    dc2::gpu_present::FramePtr* gpuFrame = nullptr);
 
 // G675: the logical<->physical resolution mapping now has ONE definition for all four
 // TUs that need it. See that file for the integer-scale law it enforces.
@@ -850,8 +851,14 @@ namespace
         {
             return;
         }
-        G440LatchScope g440(kG440SlotAlpha);
+        G440LatchScope g440(kG440SlotField);
 
+        // ⚠️ G760: `const std::vector<uint8_t> source = pixels;` is a FULL COPY of the physical
+        // presented image — at S=3 a 7.6 MB allocation, copy and free on every call. Left as it is
+        // until `[G440:latch]`'s new `field=` column says whether this runs on a shipping route at
+        // all: the old census folded it into `alpha` with a single combined count, so "1.0 per
+        // latch" could have been either function. Do not rewrite an allocation nobody has shown
+        // happens.
         const std::vector<uint8_t> source = pixels;
         for (uint32_t y = 0; y < height; ++y)
         {
@@ -878,6 +885,31 @@ namespace
         // Use actual width for row stride: for native high-res GPU path the frame
         // is wider than kHostFrameWidth; the CRT merge fallback still uses kHostFrameWidth.
         const size_t rowStride = (width > kHostFrameWidth) ? (static_cast<size_t>(width) * 4u) : (static_cast<size_t>(kHostFrameWidth) * 4u);
+        // ⭐ G760: this was a BYTE-AT-A-TIME scattered store over the whole PHYSICAL presented
+        // image — at S=3 that is 1536 x 1245 = 1.91 M single-byte writes every presented frame, and
+        // `[G440:latch]` prices the slot at 0.63-0.65 ms/f on `dragon` at 1600x900. It is also
+        // S²-proportional by construction, which is what makes it worth touching at all.
+        //
+        // EXACT, and the reason is the byte order, not an approximation: the buffer is RGBA8 with
+        // alpha in byte 3, this port is little-endian x64 only, so byte 3 of a `uint32_t` IS its
+        // most significant byte and `w |= 0xFF000000u` writes 255 there and nothing anywhere else.
+        // Alignment holds because `rowStride` is a multiple of 4 and `std::vector<uint8_t>::data()`
+        // is max_align_t-aligned; the same reinterpret is used by the deswizzle loops in
+        // gpu_display_and_snapshot.inc. Rollback DC2_G760_NO_ALPHA32=1.
+        static const bool s_noAlpha32 = (std::getenv("DC2_G760_NO_ALPHA32") != nullptr);
+        if (!s_noAlpha32 && (rowStride & 3u) == 0u)
+        {
+            for (uint32_t y = 0; y < height; ++y)
+            {
+                uint32_t *row32 =
+                    reinterpret_cast<uint32_t *>(pixels.data() + (static_cast<size_t>(y) * rowStride));
+                for (uint32_t x = 0; x < width; ++x)
+                {
+                    row32[x] |= 0xFF000000u;
+                }
+            }
+            return;
+        }
         for (uint32_t y = 0; y < height; ++y)
         {
             uint8_t *row = pixels.data() + (y * rowStride);

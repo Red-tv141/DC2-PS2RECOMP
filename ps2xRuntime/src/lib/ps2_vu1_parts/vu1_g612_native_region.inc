@@ -125,8 +125,52 @@ namespace
     bool g652VuShortEntryOn();
     bool g652VuHazStoreOn();
 
-    constexpr uint32_t G612_MAX_BB = 48u;          // basic blocks per region
-    constexpr uint32_t G612_MAX_PAIRS = 512u;      // emitted pairs per region
+    // G758: storage can cover every microcode slot. Runtime limits retain an exact
+    // G757 control and permit independent BB/pair-cap experiments. A delay slot
+    // can also be a leader, so emitted pairs can exceed the unique image size.
+    constexpr uint32_t G612_MAX_BB = PS2_VU1_CODE_SIZE / 8u;
+    constexpr uint32_t G612_MAX_PAIRS = G612_MAX_BB * 2u;
+    bool g758LargeRegionOn()
+    {
+        static const bool on = f50_12_vu_env_flag("DC2_G758_LARGE_REGION") &&
+                               !f50_12_vu_env_flag("DC2_G758_NO_LARGE_REGION");
+        return on;
+    }
+    uint32_t g758RegionLimit(const char *name, uint32_t fallback, uint32_t maximum)
+    {
+        const char *value = std::getenv(name);
+        if (!value || !*value) return fallback;
+        char *end = nullptr;
+        const unsigned long parsed = std::strtoul(value, &end, 10);
+        return end != value && *end == '\0' && parsed >= 2u && parsed <= maximum
+                   ? static_cast<uint32_t>(parsed) : fallback;
+    }
+    uint32_t g758BbLimit()
+    {
+        static const uint32_t limit = g758LargeRegionOn()
+            ? g758RegionLimit("DC2_G758_MAX_BB", G612_MAX_BB, G612_MAX_BB) : 48u;
+        return limit;
+    }
+    uint32_t g758PairLimit()
+    {
+        static const uint32_t limit = g758LargeRegionOn()
+            ? g758RegionLimit("DC2_G758_MAX_PAIRS", G612_MAX_PAIRS, G612_MAX_PAIRS) : 512u;
+        return limit;
+    }
+    bool g758PlanStatOn()
+    {
+        static const bool on = f50_12_vu_env_flag("DC2_G758_PLAN_STAT");
+        return on;
+    }
+    thread_local uint64_t s_g758PlanImage = 0;
+    thread_local uint32_t s_g758PlanEntry = 0;
+    void g758Cap(const char *kind, uint32_t slot, uint32_t count)
+    {
+        if (g758PlanStatOn())
+            std::fprintf(stderr, "[G758:cap] image=%016llx entry=%u kind=%s slot=%u count=%u bbLimit=%u pairLimit=%u\n",
+                         (unsigned long long)s_g758PlanImage, s_g758PlanEntry, kind, slot,
+                         count, g758BbLimit(), g758PairLimit());
+    }
     // ⚠️ G730 RAISED THIS FROM 96 KB. A region's entry thunks are PER BASIC BLOCK, and each one now
     // carries the residency prologue (up to `sub rsp` + 10 `movaps` saves + 10 `movups` loads ≈ 177
     // bytes). At the 48-block cap that is ~8.5 KB of thunk that did not exist before, and a region
@@ -375,8 +419,14 @@ namespace
             !g652RegionHazStorePairOk(slot))
             return false;
         const G479FusedPair &fp = s_g410Cache.fused[slot];
+        // ⭐⭐⭐ G757: the scalar (Q/P) pipeline. These reach here as `G422_LK_NONE` (RSQRT, MFP,
+        // the EFU producers) or `G422_LK_DIV`, neither of which `g612LowerEmittable` names — and
+        // that omission is exactly why `dragon`'s 51-pair vertex loop could never be ONE region.
+        // `g490RunLen[slot] != 0` above has already re-checked every other clause, including the
+        // G139 pair hazard, so this only has to name the opcode set.
         return g612UpperEmittable(fp.pair.upperKind, (uint32_t)(fp.source >> 32)) &&
-               g612LowerEmittable(fp.pair.lowerKind);
+               (g612LowerEmittable(fp.pair.lowerKind) ||
+                (g757ScalarPipeOn() && g757PairIsScalarPipe(fp.pair)));
     }
 
     // A region BRANCH pair: the sidecar must already admit it as a G500 tail WITH its delay slot
@@ -430,6 +480,10 @@ namespace
         // publication index" to "anywhere in the body". Nothing G490 admits reads P at all (MFP
         // decodes to G422_LK_NONE), so P is always deferrable and needs no flag.
         uint8_t readsQ;
+        // ⭐ G757: 1 = this region contains a scalar-pipe pair, so it runs under the DEADLINE
+        // discipline — the entry stops refusing on a pending Q (`skipQp`, 57% of entry attempts
+        // before this phase) and the wrapper converts both counters instead of deferring them.
+        uint8_t usesPipe;
     };
 
     struct G612Region
@@ -437,6 +491,7 @@ namespace
         uint64_t key;      // 0 = free
         uint32_t nBb;
         uint8_t readsQ;
+        uint8_t usesPipe;  // G757
         uint32_t bbSlot[G612_MAX_BB];
         G612Fn bbFn[G612_MAX_BB];
         uint16_t bbPairs[G612_MAX_BB];
@@ -757,8 +812,11 @@ namespace
             return true;                              // out of image: not an error, just not added
         if (g612IsLeader(p, slot))
             return true;
-        if (p.nLeader >= G612_MAX_BB)
+        if (p.nLeader >= g758BbLimit())
+        {
+            g758Cap("leaders", slot, p.nLeader);
             return false;
+        }
         p.leader[p.nLeader++] = slot;
         return true;
     }
@@ -784,7 +842,7 @@ namespace
         uint32_t i = start;
         for (;;)
         {
-            if (i >= G612_SLOTS || out->plain >= G612_MAX_PAIRS - 2u)
+            if (i >= G612_SLOTS || out->plain >= g758PairLimit() - 2u)
             {
                 out->term = G612_T_EXIT;
                 out->pairs = out->plain;
@@ -902,12 +960,13 @@ namespace
             uint32_t a = 0xFFFFFFFFu, b = 0xFFFFFFFFu;
             G612Bb bb;
             g612WalkBb(p, p.leader[k], true, &bb, &a, &b);
-            if (p.totalPairs + bb.pairs > G612_MAX_PAIRS)
+            if (p.totalPairs + bb.pairs > g758PairLimit())
             {
                 // Out of budget for more blocks. Stop here: every edge into a block that was not
                 // emitted becomes an exit stub at that pc, which is exactly the right behaviour —
                 // the pair loop takes over there and re-enters at the next bound leader.
                 ++s_g612RfWhy[G612_RF_CAPS];
+                g758Cap("pairs", bb.start, p.totalPairs + bb.pairs);
                 break;
             }
             p.totalPairs += bb.pairs;
@@ -1056,8 +1115,11 @@ namespace
             e.movStImm32(G610_RCX, G610_OFF_I, lower);  // visible to this pair's upper
         // SQI must read the pre-upper VF. It cannot affect any upper input, so scheduling this
         // lower first is the exact same-cycle overlay without save/restore traffic.
-        if (hazardStore && !g610EmitLower(e, lower, fp.pair.lowerKind, dataSize, &why))
+        if (hazardStore && !g610EmitLower(e, lower, fp.pair.lowerKind, dataSize, j, &why))
             return false;
+        // G763: same reason as the G610 block translator — the G239 pre-stall precedes the upper
+        // on VU1. Silent unless this pair's lower is a Q/P publisher.
+        g763EmitPairPrestall(e, fp.pair.lowerKind, lower);
         if (!g610EmitUpper(e, upper, fp.pair.upperKind, j, usesHist, used, &why))
             return false;
         if (loi)
@@ -1085,7 +1147,7 @@ namespace
             }
             ++s_g651ClipEmitted;
         }
-        else if (!hazardStore && !g610EmitLower(e, lower, fp.pair.lowerKind, dataSize, &why))
+        else if (!hazardStore && !g610EmitLower(e, lower, fp.pair.lowerKind, dataSize, j, &why))
             return false;
         g612EmitRepin(e, fp);
         return true;
@@ -1099,12 +1161,13 @@ namespace
             ++s_g612RfWhy[G612_RF_ARENA];
             return false;
         }
-        if (s_g612.used + G612_MAX_REGION_BYTES > G612_ARENA_BYTES)
+        const size_t regionCapacity = g758LargeRegionOn() ? 2u * 1024u * 1024u : G612_MAX_REGION_BYTES;
+        if (s_g612.used + regionCapacity > G612_ARENA_BYTES)
             g612ArenaReset();
 
         G610Emit e;
         e.p = s_g612.arena + s_g612.used;
-        e.cap = G612_MAX_REGION_BYTES;
+        e.cap = regionCapacity;
         e.n = 0u;
         G612Emit x;
         x.e = &e;
@@ -1112,8 +1175,9 @@ namespace
         // ⭐ G745: sized for the ballast's worst case (32 extra copies of one exit fix per block,
         // `DC2_G745_BAL` is clamped to 32). A shipping build never adds one — `g745BalN()` is 0 —
         // so this only widens a translate-time stack array in the cold rebuild pass.
-        constexpr uint32_t G612_MAX_FIX = G612_MAX_BB * 4u + G612_MAX_BB * 33u;
-        G612Fix fixes[G612_MAX_FIX];
+        // Full-image CFGs must not put megabytes of fixups on the worker stack.
+        const uint32_t G612_MAX_FIX = p.nBb * 37u;
+        std::vector<G612Fix> fixes(G612_MAX_FIX);
         uint32_t nFix = 0u;
         auto addFix = [&](size_t at, int32_t bb, uint32_t pc) {
             if (nFix < G612_MAX_FIX)
@@ -1133,6 +1197,26 @@ namespace
         G730Ctx g730Ctx;
         g730PlanRegion(g730Ctx, p);
         G730Scope g730Scope(&g730Ctx);
+
+        // ⭐⭐⭐ G757: does this region carry a scalar-pipe pair? Decided over the WHOLE region,
+        // before a byte is emitted, for the reason the block translator gives: a Q reader's
+        // observation guard is only correct against a deadline the wrapper installed at entry, so
+        // the deadline discipline and the G611 single-segment discipline cannot be mixed inside one
+        // body. A region has several basic blocks and any of them can be the entry, which is why
+        // this is a property of the region and not of a block.
+        if (g757ScalarPipeOn())
+            for (uint32_t k = 0u; k < p.nBb && !e.m_g757Pipe; ++k)
+                for (uint32_t j = 0u; j < p.bb[k].pairs; ++j)
+                {
+                    const uint32_t sl = p.bb[k].start + j;
+                    if (sl >= G612_SLOTS)
+                        break;
+                    if (g757PairIsScalarPipe(s_g410Cache.uppers[sl]))
+                    {
+                        e.m_g757Pipe = true;
+                        break;
+                    }
+                }
 
         // ⭐⭐⭐ G745: decide, once for the whole region, WHICH basic blocks keep a cycle-budget test
         // and how far the G744 history analysis may count past each block's terminator. On `false`
@@ -1445,6 +1529,13 @@ namespace
 
         // ---- publish ----
         out->nBb = p.nBb;
+        // ⭐⭐⭐ G757: decided for the WHOLE region, exactly as the G610 block translator decides it
+        // for a whole block. It was already computed before emission (see `g757RegionUsesPipe`
+        // at the head of this function) and is republished here beside `readsQ`, the flag it
+        // supersedes at the entry gate.
+        out->usesPipe = e.m_g757Pipe ? 1u : 0u;
+        if (e.m_g757Pipe && g757StatOn())
+            ++s_g757Bodies;
         // Does any pair anywhere in this region read `st.q`? Same test the G610 translator uses
         // per block, taken over the WHOLE region because any block of it can be re-entered.
         out->readsQ = 0u;
@@ -1544,6 +1635,7 @@ namespace
             s.fn = r.bbFn[k];
             s.pairs = r.bbPairs[k];
             s.readsQ = r.readsQ;
+            s.usesPipe = r.usesPipe;      // G757
             ++s_g612Bound;
         }
     }
@@ -1571,6 +1663,7 @@ namespace
         s_g612.codeSize = codeSize;
 
         const uint64_t img = g612ImageKey();
+        s_g758PlanImage = img;
         for (uint32_t r = 0u; r < G612_IMAGE_RING; ++r)
             if (s_g612.imgKey[r] == img)
             {
@@ -1596,6 +1689,7 @@ namespace
                 continue;
             if (!g612PlainEmittable(i))
                 continue;
+            s_g758PlanEntry = i;
             if (!g612Discover(s_plan, i))
             {
                 ++s_g612RfWhy[G612_RF_CAPS];
@@ -1656,8 +1750,27 @@ namespace
             // hold a pointer into a table across a call that may rebuild it.
             static constinit thread_local G612Region s_tmp{};
             s_tmp = G612Region{};
+            const size_t beforeBytes = s_g612.used;
             if (!g612EmitRegion(s_plan, dataSize, codeSize, &s_tmp))
                 continue;
+            if (g758PlanStatOn())
+            {
+                uint32_t internal = 0, external = 0;
+                for (uint32_t b = 0; b < s_plan.nBb; ++b)
+                {
+                    const auto &bb = s_plan.bb[b];
+                    auto edge = [&](uint32_t slot) {
+                        if (g612FindBb(s_plan, slot) >= 0) ++internal; else ++external;
+                    };
+                    if (bb.term == G612_T_BR || bb.term == G612_T_JMP) edge(bb.takenSlot);
+                    if (bb.term == G612_T_BR || bb.term == G612_T_FALL) edge(bb.fallSlot);
+                    if (bb.term == G612_T_EXIT || bb.term == G612_T_JR) ++external;
+                }
+                std::fprintf(stderr, "[G758:plan] image=%016llx entry=%u bb=%u pairs=%u bytes=%zu internal=%u external=%u bbLimit=%u pairLimit=%u\n",
+                             (unsigned long long)img, i, s_plan.nBb, s_plan.totalPairs,
+                             s_g612.used >= beforeBytes ? s_g612.used - beforeBytes : s_g612.used,
+                             internal, external, g758BbLimit(), g758PairLimit());
+            }
             if (s_g612.nRegion < G612_MAX_REGIONS)
             {
                 s_tmp.key = key;

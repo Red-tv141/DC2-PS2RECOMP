@@ -60,6 +60,206 @@ inline bool g675NoResolveOn()
     return s_off;
 }
 
+// =================================================================================================
+// G759 — THE SCALE-DEPENDENT BACKEND, PRICED AT THE NEW CANONICAL PERFORMANCE RESOLUTION
+//
+// `DC2_RESOLUTION_WIDTH=1600` + `DC2_ASPECT=auto` derives **S = 3**, so a target's attachments
+// hold 9x the texels of the logical surface. On `dragon` that moves the pole:
+//
+//     [G735:cpu]  gsxCpuMs/f 26.08  |  vu1 12.88  |  ee 9.27  |  parseWork 7.64   (frame 38.16)
+//     [G734:gsx]  execMs/f 38.19  idleMs/f 0.00  occupancy 100 %
+//
+// i.e. the GS EXECUTOR's span IS the frame, and it is the pole on 30 of 30 tail windows. Ranking
+// `[G415:stage]` by TOTAL time (`tools/g758_stage.py` — the printed column is a per-BATCH mean,
+// which is Rule 45 in another costume) puts **`z` = 7.07 ms/f, 71 %** of all instrumented
+// renderBatch time at the top, over `tex` 0.76, `up` 0.75 and `fbo` 0.63.
+//
+// ⭐⭐⭐ The `z` stage is the GUEST-DEPTH UPLOAD, and at S > 1 it was still the CPU replicate loop
+// G675 replaced for COLOUR and never replaced for DEPTH. Per batch at S=3 it built a
+// 1920 x 1344 float image with **one hardware integer divide per pixel** (2.58 M of them), out of
+// a fresh 10.3 MB `std::vector` allocated inside the loop's own scope, and pushed all 10.3 MB
+// through `glTexSubImage2D` — nine times the bytes the front end supplied. Three targets do this
+// 2.3-2.5 times a frame each.
+//
+// The two flags below are the rollbacks for this phase's backend work. Both default OFF, i.e. the
+// new paths are ON, exactly like G675's.
+// =================================================================================================
+
+// Rollback: restore the CPU replicate loop for the guest-depth upload at S > 1.
+inline bool g759NoDepthUpscaleOn()
+{
+    static const bool s_off = (std::getenv("DC2_G759_NO_ZUP") != nullptr) || g675NoResolveOn();
+    return s_off;
+}
+
+// Verification arm: after the GPU depth upscale, read the physical depth attachment back and
+// compare it against the CPU expansion it replaced, texel for texel. Prints `[G759:zup-BAD]` on
+// the first disagreement. Never on in a timing arm.
+inline bool g759DepthUpscaleVerifyOn()
+{
+    static const bool s_on = g158EnvFlag("DC2_G759_ZUP_VERIFY");
+    return s_on;
+}
+
+// Rollback: restore the EXACT-SIZE (reallocate on every size change) resolve attachment.
+inline bool g759NoResolveGrowOn()
+{
+    static const bool s_off = (std::getenv("DC2_G759_NO_RESOLVE_GROW") != nullptr);
+    return s_off;
+}
+
+inline bool g759StatOn()
+{
+    static const bool s_on = g158EnvFlag("DC2_G759_STAT");
+    return s_on;
+}
+
+// Arm proof for the three mechanisms above (Rule: compiled, ARMED and EXERCISED). Cumulative;
+// the reader divides by the frame count from `[G154:perf]`.
+struct G759BackendStat
+{
+    std::atomic<uint64_t> resolveUse{0}, resolveAlloc{0};
+    std::atomic<uint64_t> zupGpu{0}, zupCpu{0}, zupPixels{0};
+    std::atomic<uint64_t> zupVerified{0}, zupBad{0};
+};
+inline G759BackendStat &g759Stat()
+{
+    static G759BackendStat s;
+    return s;
+}
+inline void g759NoteResolveUse()
+{
+    if (g759StatOn())
+        g759Stat().resolveUse.fetch_add(1ull, std::memory_order_relaxed);
+}
+inline void g759NoteResolveAlloc()
+{
+    if (g759StatOn())
+        g759Stat().resolveAlloc.fetch_add(1ull, std::memory_order_relaxed);
+}
+inline void g759BackendReport();
+inline void g759NoteZup(bool gpu, uint64_t pixels)
+{
+    if (!g759StatOn())
+        return;
+    G759BackendStat &s = g759Stat();
+    const uint64_t n =
+        (gpu ? s.zupGpu : s.zupCpu).fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+    s.zupPixels.fetch_add(pixels, std::memory_order_relaxed);
+    // Printed from the GL worker on a batch cadence rather than from the EE frame boundary: this
+    // is an ARM PROOF, and a cross-TU bridge to the frame reporter would be four more moving parts
+    // for a line nothing times.
+    // Graphics routes may upload depth only during their opening transition. Prove
+    // the first executed pass too; a 512-pass threshold hides those valid arms.
+    if (n == 1ull || (n % 512ull) == 0ull)
+        g759BackendReport();
+}
+inline void g759BackendReport()
+{
+    if (!g759StatOn())
+        return;
+    G759BackendStat &s = g759Stat();
+    std::fprintf(stderr,
+                 "[G759:gpu] resolveUse=%llu resolveAlloc=%llu zupGpu=%llu zupCpu=%llu "
+                 "zupMpx=%.1f zupVerified=%llu zupBad=%llu\n",
+                 (unsigned long long)s.resolveUse.load(std::memory_order_relaxed),
+                 (unsigned long long)s.resolveAlloc.load(std::memory_order_relaxed),
+                 (unsigned long long)s.zupGpu.load(std::memory_order_relaxed),
+                 (unsigned long long)s.zupCpu.load(std::memory_order_relaxed),
+                 s.zupPixels.load(std::memory_order_relaxed) / 1.0e6,
+                 (unsigned long long)s.zupVerified.load(std::memory_order_relaxed),
+                 (unsigned long long)s.zupBad.load(std::memory_order_relaxed));
+}
+
+// =================================================================================================
+// G760 — THE DEPTH *READ* SIBLING. G759 fixed the write direction and left the read on the CPU.
+//
+// G758's finding was a pair split in half: G675 moved the COLOUR replicate to the GPU and left the
+// DEPTH replicate on the CPU. G759 closed that on the UPLOAD side. The READBACK side has the same
+// split and nobody looked: `readColorOnWorker` has had `resolveColorToLogical` since G675, while
+// BOTH depth readbacks still do, at S > 1,
+//
+//     std::vector<float> physDepth(physW * physRows);                       // 10.3 MB at S=3
+//     glReadPixels(0, physY, physW, physRows, GL_DEPTH_COMPONENT, GL_FLOAT, ...);  // 9x the bytes
+//     for (r) for (x) dstRow[x] = srcRow[x * s + c];                        // CPU centre tap
+//
+// — `readDepthOnWorker` (a standalone executor item) and `renderBatch`'s fused depth readback
+// (which is AFTER the last `g415Note()` mark, so `[G415:stage]` cannot see it at all).
+//
+// The fix is `resolveColorToLogical` with two substitutions: the source is a DEPTH texture
+// (`ensureDepth` builds GL_TEXTURE_2D / DEPTH_COMPONENT32F / NEAREST, and never sets
+// GL_TEXTURE_COMPARE_MODE, so a plain sampler2D fetch returns the stored depth in `.r`), and the
+// destination is R32F instead of RGBA8. EXACT by the identical argument: the shader's
+// `texelFetch(src, p * S + C)` is the index the CPU loop computed, so only the transport changes.
+//
+// Rollback `DC2_G760_NO_ZRD=1` (and `DC2_G675_NO_RESOLVE=1`, which disables the whole family).
+// Verification arm `DC2_G760_ZRD_VERIFY=1` runs the CPU decimation as well and compares texel for
+// texel, no epsilon (Rule 55).
+// =================================================================================================
+inline bool g760NoDepthResolveOn()
+{
+    static const bool s_off = (std::getenv("DC2_G760_NO_ZRD") != nullptr) || g675NoResolveOn();
+    return s_off;
+}
+
+inline bool g760DepthResolveVerifyOn()
+{
+    static const bool s_on = g158EnvFlag("DC2_G760_ZRD_VERIFY");
+    return s_on;
+}
+
+// Rollback: restore the CPU row flip in the presentation read. `[G760:item]` prices `dispread` at
+// 3.88 ms per item — the most expensive item KIND on the executor — and at S=3 its CPU flip moves
+// 7.65 MB per presented frame. See flipPresentOnGpu() for the row algebra that makes the GPU pass
+// byte-identical.
+inline bool g760NoPresentFlipOn()
+{
+    static const bool s_off = (std::getenv("DC2_G760_NO_PRESENT_FLIP") != nullptr) ||
+                              g675NoResolveOn();
+    return s_off;
+}
+
+struct G760DepthReadStat
+{
+    std::atomic<uint64_t> zrdGpu{0}, zrdCpu{0}, zrdPixels{0}, zrdSavedPixels{0};
+    std::atomic<uint64_t> zrdVerified{0}, zrdBad{0};
+};
+inline G760DepthReadStat &g760Stat()
+{
+    static G760DepthReadStat s;
+    return s;
+}
+inline void g760DepthReadReport()
+{
+    if (!g759StatOn())
+        return;
+    G760DepthReadStat &s = g760Stat();
+    std::fprintf(stderr,
+                 "[G760:zrd] zrdGpu=%llu zrdCpu=%llu zrdMpx=%.1f zrdSavedMpx=%.1f "
+                 "zrdVerified=%llu zrdBad=%llu\n",
+                 (unsigned long long)s.zrdGpu.load(std::memory_order_relaxed),
+                 (unsigned long long)s.zrdCpu.load(std::memory_order_relaxed),
+                 s.zrdPixels.load(std::memory_order_relaxed) / 1.0e6,
+                 s.zrdSavedPixels.load(std::memory_order_relaxed) / 1.0e6,
+                 (unsigned long long)s.zrdVerified.load(std::memory_order_relaxed),
+                 (unsigned long long)s.zrdBad.load(std::memory_order_relaxed));
+}
+// `logicalPixels` is what the caller keeps; `savedPixels` is what the physical read would have
+// moved beyond it. A graphics route may read depth only during its opening transition, so the
+// first pass prints too (G657 law 10 / the G759 note above).
+inline void g760NoteZrd(bool gpu, uint64_t logicalPixels, uint64_t savedPixels)
+{
+    if (!g759StatOn())
+        return;
+    G760DepthReadStat &s = g760Stat();
+    const uint64_t n =
+        (gpu ? s.zrdGpu : s.zrdCpu).fetch_add(1ull, std::memory_order_relaxed) + 1ull;
+    s.zrdPixels.fetch_add(logicalPixels, std::memory_order_relaxed);
+    s.zrdSavedPixels.fetch_add(savedPixels, std::memory_order_relaxed);
+    if (n == 1ull || (n % 512ull) == 0ull)
+        g760DepthReadReport();
+}
+
 inline int dc2DrawLimit()
 {
     static const int s_limit = []() {

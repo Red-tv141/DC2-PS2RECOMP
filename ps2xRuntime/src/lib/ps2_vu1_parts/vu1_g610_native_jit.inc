@@ -177,6 +177,11 @@ namespace
         alignas(16) uint32_t expMask[4];   // 448 .. 463 : 0x7F800000
         alignas(16) uint32_t wmask[4];     // 464 .. 479 : {~0,~0,~0,0} — OPMSUB's `result[3]=0.0f`
         alignas(16) uint8_t clipTab[64];   // 480 .. 543 : g488ClipTableConst, byte for byte
+        // ---- G757 (the scalar-pipe bodies) ----
+        // DIV's `den == 0` arm is `±FLT_MAX` and RSQRT's is `+FLT_MAX`; both are built as
+        // `FLT_MAX ^ sign`, so one splat constant serves both. 1.0f (for the EFU reciprocals) and
+        // +0.0f (for every `== 0` compare) are already here as `itof[0]` and `zero`.
+        alignas(16) float fltMax[4];       // 544 .. 559
     };
     constexpr int32_t G610_C_DEST = 0;
     constexpr int32_t G610_C_ITOF = 256;
@@ -188,6 +193,7 @@ namespace
     constexpr int32_t G610_C_EXP = 448;
     constexpr int32_t G610_C_WMASK = 464;
     constexpr int32_t G610_C_CLIPTAB = 480;
+    constexpr int32_t G610_C_FLTMAX = 544;
 
     constexpr G610ConstTable g610BuildConsts()
     {
@@ -230,6 +236,11 @@ namespace
                 }
                 t.clipTab[gt | (lt << 3u)] = (uint8_t)f;
             }
+        // G757: `std::numeric_limits<float>::max()`, the value DIV and RSQRT substitute for a zero
+        // denominator. Spelled by its bit pattern because this function is `constexpr` and must
+        // produce the exact same word the interpreter's `numeric_limits` arm stores.
+        for (unsigned lane = 0u; lane < 4u; ++lane)
+            t.fltMax[lane] = 3.40282346638528859811704183484516925e+38f;
         return t;
     }
     // `constexpr`, so this is a link-time constant with no initialisation guard (G436's law).
@@ -245,6 +256,9 @@ namespace
     static_assert(offsetof(G610ConstTable, expMask) == (size_t)G610_C_EXP, "G611: const exp");
     static_assert(offsetof(G610ConstTable, wmask) == (size_t)G610_C_WMASK, "G611: const wmask");
     static_assert(offsetof(G610ConstTable, clipTab) == (size_t)G610_C_CLIPTAB, "G611: const clip");
+    static_assert(offsetof(G610ConstTable, fltMax) == (size_t)G610_C_FLTMAX, "G757: const fltMax");
+    static_assert(g610Consts.fltMax[0] == std::numeric_limits<float>::max(),
+                  "G757: the DIV/RSQRT zero-denominator arm must be numeric_limits<float>::max()");
 
     // -------------------------------------------------------------------------------------------
     // §4 CODE ARENA + SLOT TABLE
@@ -262,6 +276,11 @@ namespace
         uint16_t count;    // pairs this body executes; must equal the caller's `count`
         uint8_t readsQ;    // 1 = some upper in this block reads st.q (desc src == 1)
         uint8_t g611;      // 1 = translation needed a G611 op form (the `vuops` arm gates it)
+        // ⭐ G757: 1 = this body carries a scalar-pipe pair and therefore runs under the DEADLINE
+        // discipline. The two disciplines are mutually exclusive per body; see
+        // vu1_g757_scalar_pipe.inc. A pipe body is never Q-SPLIT — a split exists to put a
+        // publication between two sub-bodies, and a deadline already places it exactly.
+        uint8_t usesPipe;
         // G611: WHICH pairs read st.q, bit j = pair j (indices >= 63 fold into bit 63). A mid-block
         // publication at index k is observable only by a reader BEFORE k, so this turns a
         // whole-block veto into a prefix test.
@@ -297,6 +316,7 @@ namespace
         uint16_t count;
         uint8_t readsQ;
         uint8_t g611;
+        uint8_t usesPipe;   // G757
         uint64_t qMask;
     };
 
@@ -651,6 +671,12 @@ namespace
         // Translation-time debt only. No guest instruction inside an emitted straight-line
         // span reads the ring head. Materialize before a live push and every control edge.
         unsigned m_histAdvance = 0;
+        // ⭐ G757: this body carries at least one scalar-pipe pair, so it runs under the DEADLINE
+        // discipline — a Q-reading upper must emit an observation guard, and the wrapper converts
+        // the counters at entry and exit. Decided for the WHOLE body before the first byte is
+        // emitted (`g757BodyUsesPipe`), never per pair: the two disciplines cannot be mixed inside
+        // one body, because a guard is only correct against a deadline the wrapper installed.
+        bool m_g757Pipe = false;
 
         void flushHistAdvance()
         {
@@ -1089,6 +1115,13 @@ namespace
 // VF/ACC access site below routes through its four accessors. It must come BEFORE §6 (the
 // translator) and it is shared verbatim by the G612 region backend, exactly as `g610EmitUpper` is.
 #include "vu1_g730_regalloc.inc"
+
+// ⭐⭐⭐ G757 — THE SCALAR (Q/P) PIPELINE, COMPILED INTO THE BODIES. Must come AFTER
+// vu1_g730_regalloc.inc (MFP's destination write goes through `g730StoreVf`) and BEFORE §6, whose
+// `g610EmitLower` dispatches into it. Read that file's header before touching anything here: the
+// mechanism rests on one invariant (`qDelay == 0 ⟹ st.q == s_vuQPending`) and one representation
+// change (absolute pair-stamp deadlines instead of per-pair countdowns).
+#include "vu1_g757_scalar_pipe.inc"
 
     // Translation-only diagnostic. Dump actual emitted bytes, never a reconstructed instruction
     // list. The caller supplies an existing directory; timing runs leave this variable unset.
@@ -1564,6 +1597,13 @@ namespace
             break;
         }
         case 1u: // Q — never bound: the hook publishes it between the halves of a G611 Q-split
+            // ⭐ G757: under the deadline discipline the hook did NOT publish, because the body may
+            // contain the producer itself. This is the only site in the whole mechanism that pays
+            // for an observation, and it pays five branchless instructions. Under the G610/G611
+            // discipline (`m_g757Pipe == false`) nothing is emitted and the read is byte-for-byte
+            // the G756 one.
+            if (e.m_g757Pipe)
+                g757EmitObserveQ(e, pairIndexInBlock);
             e.splatScalarM(G610_X1, G610_RCX, G610_OFF_Q);
             break;
         case 2u: // I — never bound: the G652 LOI path writes it straight into the state image
@@ -1874,8 +1914,18 @@ namespace
     }
 
     // Emit the LOWER slot. Returns false to refuse the whole block.
-    bool g610EmitLower(G610Emit &e, uint32_t lower, uint8_t kind, uint32_t dataSize, int *why)
+    // ⭐ G757 added `pairIndexInBlock`: a scalar-pipe lower arms a deadline against the ABSOLUTE
+    // pair stamp `R8 + j`, so unlike every other lower here it needs to know where it sits.
+    bool g610EmitLower(G610Emit &e, uint32_t lower, uint8_t kind, uint32_t dataSize,
+                       uint32_t pairIndexInBlock, int *why)
     {
+        // The scalar (Q/P) pipeline. These reach the emitter as `G422_LK_NONE` (they have no G422
+        // fast-lower kind) or as `G422_LK_DIV`, and both are admitted only when
+        // `g490BlockPairEligible` saw `g757ScalarPipeOn()`.
+        if (e.m_g757Pipe && (kind == G422_LK_NONE || kind == G422_LK_DIV) &&
+            g757IsScalarPipeLower(lower))
+            return g757EmitScalarLower(e, lower, pairIndexInBlock, why);
+
         const unsigned it = LIT(lower), is = LIS(lower), id = LID(lower);
         const uint8_t dest = (uint8_t)((lower >> 21) & 0xFu);
         const int32_t imm11 = (int32_t)IMM11(lower);
@@ -2154,9 +2204,12 @@ namespace
     // the caller then marks the slot `tried` and never asks again until the next invalidation.
     G610Fn g610TranslateBlock(uint32_t firstIndex, uint32_t count, uint32_t dataSize,
                               bool *readsQ, uint64_t *qReadMask = nullptr,
-                              bool *usedG611Out = nullptr, bool allowReset = true)
+                              bool *usedG611Out = nullptr, bool allowReset = true,
+                              bool *usesPipeOut = nullptr)
     {
         *readsQ = false;
+        if (usesPipeOut != nullptr)
+            *usesPipeOut = false;
         if (qReadMask != nullptr)
             *qReadMask = 0ull;
         if (usedG611Out != nullptr)
@@ -2204,6 +2257,21 @@ namespace
                 anyHist = true;
                 break;
             }
+        // ⭐⭐⭐ G757: does this body carry a scalar-pipe pair? Decided in a pre-pass, for the WHOLE
+        // body, before a byte is emitted — the deadline discipline and the G610/G611 single-segment
+        // discipline are alternatives, never a per-pair choice, because a Q reader's observation
+        // guard is only correct against a deadline the wrapper installed at entry.
+        if (g757ScalarPipeOn())
+            for (uint32_t j = 0u; j < count; ++j)
+                if (g757PairIsScalarPipe(fused[firstIndex + j].pair))
+                {
+                    e.m_g757Pipe = true;
+                    break;
+                }
+        if (usesPipeOut != nullptr)
+            *usesPipeOut = e.m_g757Pipe;
+        if (e.m_g757Pipe && g757StatOn())
+            ++s_g757Bodies;
         // ⭐ G730: choose the host-register residency for this whole block BEFORE any byte is
         // emitted, and install it for the duration. `G730Scope` is RAII because this function has
         // a dozen refusal returns and a leaked context would let the NEXT body name pool registers
@@ -2258,6 +2326,10 @@ namespace
                     *qReadMask |= 1ull << ((j < 63u) ? j : 63u);
             }
 
+            // G763: the lower slot's G239 pre-stall resolves BEFORE either half of the pair on
+            // VU1, so it is emitted here and not from inside `g610EmitLower`. Silent unless this
+            // pair's lower is a Q/P publisher. See vu1_g757_scalar_pipe.inc §G763.
+            g763EmitPairPrestall(e, fp.pair.lowerKind, lower);
             if (!g610EmitUpper(e, upper, fp.pair.upperKind, j, usesHist, usedG611, &why))
             {
                 ++s_g610RfWhy[why];
@@ -2265,7 +2337,7 @@ namespace
                 s_g610RefusedPairs += count;
                 return nullptr;
             }
-            if (!g610EmitLower(e, lower, fp.pair.lowerKind, dataSize, &why))
+            if (!g610EmitLower(e, lower, fp.pair.lowerKind, dataSize, j, &why))
             {
                 ++s_g610RfWhy[why];
                 ++s_g610Refused;
@@ -2334,8 +2406,9 @@ namespace
                 ++s_g610CacheMiss;
                 bool readsQ = false, usedG611 = false;
                 uint64_t qMask = 0ull;
+                bool usesPipe = false;
                 G610Fn fn = g610TranslateBlock(firstIndex, count, dataSize, &readsQ, &qMask,
-                                               &usedG611, allowReset);
+                                               &usedG611, allowReset, &usesPipe);
                 // g610TranslateBlock may have reset the arena (and with it this cache), so the
                 // reference above can no longer be trusted — re-probe to insert.
                 const size_t p2 = (size_t)(h & (G610_CACHE_SLOTS - 1u));
@@ -2351,6 +2424,7 @@ namespace
                         ins.count = (uint16_t)count;
                         ins.readsQ = readsQ ? 1u : 0u;
                         ins.g611 = usedG611 ? 1u : 0u;
+                        ins.usesPipe = usesPipe ? 1u : 0u;
                         ins.qMask = qMask;
                         return &ins;
                     }
@@ -2381,6 +2455,15 @@ namespace
         VU1State st{};
         G430HistBlock hb{};
         int qd = 0, pd = 0;
+        // ⛔⛔⛔ G757 — THE ORACLE DID NOT SNAPSHOT THE SCALAR-PIPE PENDING VALUES, and its own
+        // reference run was reading the candidate's leftovers. It captured `st`, the ring, both
+        // COUNTERS and all of VU RAM, but `s_vuQPending` / `s_vuPPending` are thread_locals that
+        // were never restored — harmless while nothing inside a compiled body could write them,
+        // and exactly wrong the moment one could. G757's `G757Sync::leave` writes them, so the
+        // generic reference then executed its G239 pre-stall against the value the JIT arm had
+        // just armed: `jitQ=7f7fffff genQ=00000000` on a block where both arms were in fact
+        // computing the same thing. Captured, restored and COMPARED here.
+        float qPend = 0.0f, pPend = 0.0f;
         std::vector<uint8_t> ram;
     };
     thread_local G610Snap s_g610SnapPre, s_g610SnapJit;

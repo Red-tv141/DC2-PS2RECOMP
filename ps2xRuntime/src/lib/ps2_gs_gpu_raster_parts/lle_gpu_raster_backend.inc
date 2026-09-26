@@ -37,6 +37,7 @@ public:
                          static_cast<unsigned long>(GetLastError()));
             return;
         }
+        dc2::gpu_present::initialize(s_g158MainDC, s_g158MainRC);
         // G705: fused mode spawns NO backend thread. Create and share the context here, on the
         // main thread, but make it current nowhere; the GS front-end thread adopts it at its first
         // g178_backend_ready(). wglCreateContext/wglShareLists do not require either context to be
@@ -1495,6 +1496,97 @@ void main()
         return wait.wait();
     }
 
+    // G766: same synchronous contract as writeColorMasked, but `mask` is a per-BIT mask: the FBO
+    // texel becomes (old & ~mask) | (in & mask). Serves every sub-word guest write into a resident
+    // CT32 surface (PSMT8 byte lanes, PSMT4/4HL/4HH nibbles, PSMCT16 half-words) with one path.
+    bool writeColorBits(uint32_t fbp, int texWidth, int texHeight,
+                        int glX, int glY, int width, int rows,
+                        const std::vector<uint32_t> &in,
+                        const std::vector<uint32_t> &mask)
+    {
+        if (texWidth <= 0 || texHeight <= 0 || glX < 0 || glY < 0 ||
+            width <= 0 || rows <= 0 || glX > texWidth || width > texWidth - glX ||
+            glY > texHeight || rows > texHeight - glY ||
+            in.size() != static_cast<size_t>(width) * rows || mask.size() != in.size() ||
+            !m_ready.load(std::memory_order_acquire))
+            return false;
+        g492Note(kG492EdgeWriteColor, 0ull, false); // G492 invariant only — never skipped here
+        SyncWait wait;
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.colorFbp = fbp;
+            item.colorWrite = &in;
+            item.g627Mask = &mask;
+            item.g766Bits = true;
+            item.colorTexW = texWidth;
+            item.colorTexH = texHeight;
+            item.colorX = glX;
+            item.colorW = width;
+            item.colorY = glY;
+            item.colorRows = rows;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
+            m_queue.push_back(std::move(item));
+        }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
+        m_cvWork.notify_one();
+        G447WaitScope g447Scope(2);
+        return wait.wait();
+    }
+
+    // ⭐ G769: FIRE-AND-FORGET colour writes (G264 mirror patches, G766 bit patches, G769 tier-3
+    // seeds). The synchronous forms above make the flush-owner thread wait for the GL worker to
+    // reach the item — a CPU round trip through everything queued ahead of it, ~600 per second on
+    // s03 — although nothing on the front end reads the result: every consumer of the patched FBO
+    // is itself a later FIFO item. The item owns its pixels; a failure is counted and logged (the
+    // geometry is validated here, so the only worker-side failure is a missing FBO).
+    std::atomic<uint64_t> m_g769AsyncWrites{0u}, m_g769AsyncWriteFails{0u};
+    bool writeColorAsync(uint32_t fbp, int texWidth, int texHeight, int glX, int glY, int width,
+                         int rows, std::vector<uint32_t> &&in, std::vector<uint32_t> &&bits,
+                         bool useBits)
+    {
+        if (texWidth <= 0 || texHeight <= 0 || glX < 0 || glY < 0 || width <= 0 || rows <= 0 ||
+            glX > texWidth || width > texWidth - glX || glY > texHeight ||
+            rows > texHeight - glY || in.size() != static_cast<size_t>(width) * rows ||
+            (useBits && bits.size() != in.size()) || !m_ready.load(std::memory_order_acquire))
+            return false;
+        g492Note(kG492EdgeWriteColor, 0ull, false);
+        auto px = std::make_shared<std::vector<uint32_t>>(std::move(in));
+        std::shared_ptr<std::vector<uint32_t>> mk;
+        if (useBits)
+            mk = std::make_shared<std::vector<uint32_t>>(std::move(bits));
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.colorFbp = fbp;
+            item.colorWrite = px.get();
+            item.g769OwnedWrite = std::move(px);
+            if (useBits)
+            {
+                item.g627Mask = mk.get();
+                item.g769OwnedMask = std::move(mk);
+                item.g766Bits = true;
+            }
+            item.colorTexW = texWidth;
+            item.colorTexH = texHeight;
+            item.colorX = glX;
+            item.colorW = width;
+            item.colorY = glY;
+            item.colorRows = rows;
+            item.g769AsyncWrite = true;
+            m_queue.push_back(std::move(item));
+        }
+        m_g769AsyncWrites.fetch_add(1u, std::memory_order_relaxed);
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
+        m_cvWork.notify_one();
+        return true;
+    }
+
     // G280: synchronous GPU->GPU page-tile copies between two persistent target FBOs (alias
     // view resolve). Geometry is validated on the worker against both FBOs' live dimensions.
     bool copyColor(uint32_t srcFbp, uint32_t dstFbp, const std::vector<int32_t> &rects6)
@@ -1526,7 +1618,7 @@ void main()
     bool readDisplayFbo(uint32_t fbp, uint32_t fallbackFbp,
                         int32_t rectX, int32_t rectY, int32_t rectW, int32_t rectH,
                         uint32_t &outW, uint32_t &outH,
-                        std::vector<uint8_t> &out)
+                        std::vector<uint8_t> &out, dc2::gpu_present::FramePtr* gpuFrame = nullptr)
     {
         if (!m_ready.load(std::memory_order_acquire))
             return false;
@@ -1546,6 +1638,7 @@ void main()
             item.displayOutW = &outW;
             item.displayOutH = &outH;
             item.displayOutRgba = &out;
+            item.displayOutGpu = gpuFrame;
             item.promise = wait.promise;
             item.doneFlag = &wait.done;
             m_queue.push_back(std::move(item));
@@ -1640,6 +1733,150 @@ void main()
 
     // G338: build/update one resident CT24-alpha view texture from a resident CT32 target FBO.
     // Same worker-queue contract as prepareT8View; alpha is re-derived from TEXA (ta0/aem).
+    // G767: synchronously run a local->local byte move between resident FBO pages.
+    bool runL2lMove(const std::vector<int32_t> &gather, const std::vector<uint32_t> &map,
+                    const std::vector<int32_t> &destTiles, const std::vector<int32_t> &scatter)
+    {
+        if (gather.empty() || destTiles.empty() || !m_ready.load(std::memory_order_acquire))
+            return false;
+        SyncWait wait;
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.g767L2lGather = &gather;
+            item.g767L2lMap = &map;
+            item.g767L2lDest = &destTiles;
+            item.g767L2lScatter = &scatter;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
+            m_queue.push_back(std::move(item));
+        }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
+        m_cvWork.notify_one();
+        G447WaitScope g447Scope(3);
+        return wait.wait();
+    }
+
+    // G767: synchronously build a paletted page view (see g767_t8_view_members.inc).
+    bool prepareT8PageView(uint64_t texKey, int texW, int texH, int kind,
+                           const std::vector<int32_t> &rects7, const std::vector<uint32_t> &vramPages,
+                           const std::vector<uint32_t> &clut256, const std::vector<uint32_t> &lut)
+    {
+        if (texKey == 0u || texW <= 0 || texH <= 0 || rects7.empty() ||
+            !m_ready.load(std::memory_order_acquire))
+            return false;
+        SyncWait wait;
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.g767T8Rects = &rects7;
+            item.g767T8Vram = &vramPages;
+            item.g767T8Clut = &clut256;
+            item.g767T8Lut = &lut;
+            item.g767T8Kind = kind;
+            item.g281TexKey = texKey;
+            item.g281TexW = texW;
+            item.g281TexH = texH;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
+            m_queue.push_back(std::move(item));
+        }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
+        m_cvWork.notify_one();
+        G447WaitScope g447Scope(4);
+        return wait.wait();
+    }
+
+    // G767: queue a CT32/CT24 page view WITHOUT waiting. The single FIFO worker builds it before
+    // the batch that samples it; the packet owns its inputs.
+    struct G767ViewPacket
+    {
+        std::vector<int32_t> rects;
+        std::vector<uint32_t> pixels;
+        std::vector<uint32_t> clut;
+        const std::vector<uint32_t> *lut = nullptr;
+    };
+    bool prepareViewAsync(uint64_t texKey, int texW, int texH, bool ct24, int ta0, int aem,
+                          int t8Kind, std::vector<int32_t> &&rects7, std::vector<uint32_t> &&pixels,
+                          std::vector<uint32_t> &&clut, const std::vector<uint32_t> *lut)
+    {
+        if (texKey == 0u || texW <= 0 || texH <= 0 || rects7.empty() ||
+            !m_ready.load(std::memory_order_acquire))
+            return false;
+        auto pk = std::make_shared<G767ViewPacket>();
+        pk->rects = std::move(rects7);
+        pk->pixels = std::move(pixels);
+        pk->clut = std::move(clut);
+        pk->lut = lut;
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            if (t8Kind >= 0)
+            {
+                item.g767T8Rects = &pk->rects;
+                item.g767T8Vram = &pk->pixels;
+                item.g767T8Clut = &pk->clut;
+                item.g767T8Lut = lut;
+                item.g767T8Kind = t8Kind;
+            }
+            else
+            {
+                item.g767ViewRects = &pk->rects;
+                item.g767ViewPixels = &pk->pixels;
+                item.g767ViewCt24 = ct24;
+                item.g338Ta0 = ta0;
+                item.g338Aem = aem;
+            }
+            item.g281TexKey = texKey;
+            item.g281TexW = texW;
+            item.g281TexH = texH;
+            item.g767Hold = pk;
+            item.g767Async = true;
+            m_queue.push_back(std::move(item));
+        }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
+        m_cvWork.notify_one();
+        return true;
+    }
+
+    // G767: synchronously build a CT32/CT24 page view (see g767_page_view_members.inc).
+    bool prepareCt32PageView(uint64_t texKey, int texW, int texH, bool ct24, int ta0, int aem,
+                             const std::vector<int32_t> &rects7,
+                             const std::vector<uint32_t> &vramPixels)
+    {
+        if (texKey == 0u || texW <= 0 || texH <= 0 || rects7.empty() ||
+            !m_ready.load(std::memory_order_acquire))
+            return false;
+        SyncWait wait;
+        {
+            std::unique_lock<std::mutex> lk(m_mtx);
+            if (m_stop || !m_ready.load(std::memory_order_acquire))
+                return false;
+            QueueItem item;
+            item.g767ViewRects = &rects7;
+            item.g767ViewPixels = &vramPixels;
+            item.g767ViewCt24 = ct24;
+            item.g281TexKey = texKey;
+            item.g281TexW = texW;
+            item.g281TexH = texH;
+            item.g338Ta0 = ta0;
+            item.g338Aem = aem;
+            item.promise = wait.promise;
+            item.doneFlag = &wait.done;
+            m_queue.push_back(std::move(item));
+        }
+        m_submitSeq.fetch_add(1u, std::memory_order_release);
+        m_cvWork.notify_one();
+        G447WaitScope g447Scope(4);
+        return wait.wait();
+    }
+
     bool prepareCt24View(uint64_t texKey, uint32_t srcFbp, int srcFbW,
                          int texW, int texH, int ta0, int aem,
                          bool verify, uint64_t &verifyBad)
@@ -1960,6 +2197,9 @@ private:
         // G627 per-byte-lane write mask, parallel to colorWrite. Non-null selects the masked
         // patch draw instead of glTexSubImage2D; every other field keeps its colorWrite meaning.
         const std::vector<uint32_t> *g627Mask = nullptr;
+        // G766: g627Mask is a per-BIT mask (any subset of the 32 bits of a CT32 texel), applied
+        // with a two-pass AND/OR logic op instead of G627's per-byte-lane colour-mask draws.
+        bool g766Bits = false;
         int colorTexW = 0, colorTexH = 0;
         int colorX = 0, colorY = 0, colorW = 0, colorRows = 0;
         // G280 GPU->GPU alias-page copy job (batch == nullptr, copyRects != nullptr): copy CT32
@@ -1979,6 +2219,26 @@ private:
         // texKey/srcFbp/dims/verify; distinguished by g338Ct24View).
         bool g338Ct24View = false;
         int g338Ta0 = 0, g338Aem = 0;
+        const std::vector<int32_t> *g767ViewRects = nullptr; // G767 CT32/CT24 page view
+        const std::vector<uint32_t> *g767ViewPixels = nullptr; // its guest-VRAM-sourced pages
+        const std::vector<int32_t> *g767T8Rects = nullptr;   // G767 paletted page view
+        const std::vector<uint32_t> *g767T8Vram = nullptr;
+        const std::vector<uint32_t> *g767T8Clut = nullptr;
+        const std::vector<uint32_t> *g767T8Lut = nullptr;
+        int g767T8Kind = 0;
+        std::shared_ptr<void> g767Hold; // G767 async view: owns the vectors the pointers above name
+        std::shared_ptr<G768ViewPacket> g768View; // G768 general page view (g768_page_view_members.inc)
+        uint64_t g768ReadKey = 0u;                 // G768 oracle: read a view texture back
+        std::vector<uint32_t> *g768ReadOut = nullptr;
+        const std::vector<int32_t> *g767L2lGather = nullptr; // G767 GPU local->local byte move
+        const std::vector<uint32_t> *g767L2lMap = nullptr;
+        const std::vector<int32_t> *g767L2lDest = nullptr;
+        const std::vector<int32_t> *g767L2lScatter = nullptr;
+        bool g767Async = false;         // no waiter: a failed build drops its texture (loud miss)
+        // G769: async colour write (writeColorAsync) — the item owns its pixel / bit buffers.
+        std::shared_ptr<std::vector<uint32_t>> g769OwnedWrite, g769OwnedMask;
+        bool g769AsyncWrite = false;
+        bool g767ViewCt24 = false;
         // G309 one-pass resident-source authoritative CT32 atlas composite.
         const std::vector<uint32_t> *g309PageMap = nullptr;
         const std::vector<uint32_t> *g309BasePixels = nullptr;
@@ -2053,6 +2313,7 @@ private:
         uint32_t *displayOutW = nullptr;
         uint32_t *displayOutH = nullptr;
         std::vector<uint8_t> *displayOutRgba = nullptr;
+        dc2::gpu_present::FramePtr* displayOutGpu = nullptr;
         std::chrono::steady_clock::time_point g571Enqueue{};
     };
     struct TexEntry
@@ -2332,6 +2593,8 @@ private:
             glDeleteTextures(1, &m_g566OutputTex);
         if (m_g627Prog != 0)
             m_f.glDeleteProgram_(m_g627Prog);
+        if (m_g766BitsProg != 0)
+            m_f.glDeleteProgram_(m_g766BitsProg);
         if (m_g675ResolveProg != 0)
             m_f.glDeleteProgram_(m_g675ResolveProg);
         if (m_g675UpProg != 0)
@@ -2342,6 +2605,24 @@ private:
             m_f.glDeleteFramebuffers_(1, &m_g675ResolveFbo);
         if (m_g675ResolveTex != 0)
             glDeleteTextures(1, &m_g675ResolveTex);
+        if (m_g759ZupProg != 0)
+            m_f.glDeleteProgram_(m_g759ZupProg);
+        if (m_g759ZupFbo != 0)
+            m_f.glDeleteFramebuffers_(1, &m_g759ZupFbo);
+        if (m_g759ZupTex != 0)
+            glDeleteTextures(1, &m_g759ZupTex);
+        if (m_g760ZrdProg != 0)
+            m_f.glDeleteProgram_(m_g760ZrdProg);
+        if (m_g760ZrdFbo != 0)
+            m_f.glDeleteFramebuffers_(1, &m_g760ZrdFbo);
+        if (m_g760ZrdTex != 0)
+            glDeleteTextures(1, &m_g760ZrdTex);
+        if (m_g760FlipProg != 0)
+            m_f.glDeleteProgram_(m_g760FlipProg);
+        if (m_g760FlipFbo != 0)
+            m_f.glDeleteFramebuffers_(1, &m_g760FlipFbo);
+        if (m_g760FlipTex != 0)
+            glDeleteTextures(1, &m_g760FlipTex);
         if (m_g627ValTex != 0)
             glDeleteTextures(1, &m_g627ValTex);
         if (m_g627MaskTex != 0)
@@ -2737,7 +3018,8 @@ private:
             // whether it is a pipeline fence so the accumulator can be cleared after it.
             bool g495Fence = false;
             int g495Cls = kG495ClsRenderSkip;
-            if (g495RbCensusOn() || g495GpuCensusOn())
+            // G760: the CPU census below needs the SAME classification, so it arms the same block.
+            if (g495RbCensusOn() || g495GpuCensusOn() || g760ItemCensusOn())
             {
                 uint64_t g495Draws = 0ull, g495Verts = 0ull, g495TexN = 0ull;
                 uint64_t g495TexBytes = 0ull, g495FbBytes = 0ull;
@@ -2791,6 +3073,16 @@ private:
                     g495Y = item.colorY;
                     g495Rows = item.colorRows;
                 }
+                // ⛔ G760: this branch did not exist, so the PRESENTATION read — one per presented
+                // frame, a full physical glReadPixels plus a physical-sized CPU row flip — kept the
+                // initialiser class `kG495ClsRenderSkip` and was counted as a queued render in
+                // every `ahead(... rend=N ...)` set this census has ever printed.
+                else if (item.isDisplayFboRead)
+                {
+                    g495Cls = kG495ClsDisplayRead;
+                    g495Fence = true;
+                    g495Fbp = item.colorFbp;
+                }
                 else if (item.depthReadback != nullptr && !item.renderThenReadDepth)
                 {
                     g495Cls = kG495ClsReadDepth;
@@ -2804,7 +3096,7 @@ private:
                     g495Verts = item.batch->verts.size();
                     g495TexN = item.batch->texUploads.size();
                     for (const auto &u : item.batch->texUploads)
-                        g495TexBytes += static_cast<uint64_t>(u.px.size()) * 4ull;
+                        g495TexBytes += static_cast<uint64_t>(u.pixelCount()) * 4ull;
                     g495FbBytes = static_cast<uint64_t>(item.batch->fbPixels.size()) * 4ull;
                     g495Fbp = item.batch->fbp;
                 }
@@ -2814,6 +3106,11 @@ private:
             // G495b GPU-side clock (DC2_G495_GPU=1): GL_TIME_ELAPSED around this item's whole GL
             // body, so the per-class sum is GPU busy ms/f. Never quote a frame time from this run.
             g495GpuBegin(g495Cls);
+            // G760: wall-clock CPU for this item, bucketed by the class above. See the census in
+            // g495_readback_queue_census.inc for why this instrument had to exist.
+            const bool g760ItemOn = g760ItemCensusOn();
+            const auto g760T0 = g760ItemOn ? std::chrono::steady_clock::now()
+                                           : std::chrono::steady_clock::time_point{};
             try
             {
                 if (item.g629Recs != nullptr)
@@ -2871,6 +3168,23 @@ private:
                         item.g281TexKey, item.g281SrcFbp, item.g281SrcFbW,
                         item.g281TexW, item.g281TexH, *item.g281Map, *item.g281Clut,
                         item.g281Verify, *item.g281VerifyBad);
+                else if (item.g768View)
+                    ok = g768BuildViewOnWorker(*item.g768View);
+                else if (item.g768ReadOut != nullptr)
+                    ok = g768ReadViewOnWorker(item.g768ReadKey, item.g281TexW, item.g281TexH,
+                                              *item.g768ReadOut);
+                else if (item.g767L2lGather != nullptr)
+                    ok = g767L2lOnWorker(*item.g767L2lGather, *item.g767L2lMap, *item.g767L2lDest,
+                                         *item.g767L2lScatter);
+                else if (item.g767T8Rects != nullptr)
+                    ok = g767PrepareT8ViewOnWorker(item.g281TexKey, item.g281TexW, item.g281TexH,
+                                                   item.g767T8Kind, *item.g767T8Rects,
+                                                   *item.g767T8Vram, *item.g767T8Clut,
+                                                   *item.g767T8Lut);
+                else if (item.g767ViewRects != nullptr)
+                    ok = g767PrepareViewOnWorker(item.g281TexKey, item.g281TexW, item.g281TexH,
+                                                 item.g767ViewCt24, item.g338Ta0, item.g338Aem,
+                                                 *item.g767ViewRects, *item.g767ViewPixels);
                 else if (item.g338Ct24View)
                     ok = prepareCt24ViewOnWorker(
                         item.g281TexKey, item.g281SrcFbp, item.g281SrcFbW,
@@ -2893,6 +3207,11 @@ private:
                 else if (item.colorReadback != nullptr)
                     ok = readColorOnWorker(item.colorFbp, item.colorTexW, item.colorTexH,
                                            item.colorY, item.colorRows, *item.colorReadback);
+                else if (item.colorWrite != nullptr && item.g627Mask != nullptr && item.g766Bits)
+                    ok = writeColorBitsOnWorker(item.colorFbp, item.colorTexW, item.colorTexH,
+                                                item.colorX, item.colorY, item.colorW,
+                                                item.colorRows, *item.colorWrite,
+                                                *item.g627Mask);
                 else if (item.colorWrite != nullptr && item.g627Mask != nullptr)
                     ok = writeColorMaskedOnWorker(item.colorFbp, item.colorTexW, item.colorTexH,
                                                   item.colorX, item.colorY, item.colorW,
@@ -2907,7 +3226,7 @@ private:
                                                 item.displayRectX, item.displayRectY,
                                                 item.displayRectW, item.displayRectH,
                                                 *item.displayOutW, *item.displayOutH,
-                                                *item.displayOutRgba);
+                                                *item.displayOutRgba, item.displayOutGpu);
                 else if (item.depthReadback != nullptr && !item.renderThenReadDepth)
                     ok = readDepthOnWorker(item.depthKey, item.batch->fbW, item.batch->fbH,
                                            item.depthReadY, item.depthReadRows,
@@ -2923,6 +3242,11 @@ private:
             {
                 ok = false;
             }
+            if (g760ItemOn)
+                g760NoteItemCpu(g495Cls,
+                                static_cast<uint64_t>(
+                                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                        std::chrono::steady_clock::now() - g760T0).count()));
             // ⭐⭐⭐ G735 EARLY KICK — start the GPU instead of letting the driver bank the frame.
             //
             // `[G495:rb]` brackets each colour readback with `glFinish()`, so its `drain` column is
@@ -3121,7 +3445,7 @@ private:
                     static_cast<uint64_t>(b.verts.size()) * sizeof(G178Vtx) +
                     static_cast<uint64_t>(b.draws.size()) * sizeof(G178Draw);
                 for (const G178TexUpload &up : b.texUploads)
-                    packetBytes += static_cast<uint64_t>(up.px.size()) * sizeof(uint32_t);
+                    packetBytes += static_cast<uint64_t>(up.pixelCount()) * sizeof(uint32_t);
                 if (item.depthUpload != nullptr)
                     packetBytes += static_cast<uint64_t>(item.depthUpload->size()) *
                                    sizeof(float);
@@ -3179,6 +3503,20 @@ private:
                 m_g701InFlight.fetch_sub(1u, std::memory_order_relaxed);
                 continue;
             }
+            // G767: an async view that failed must not leave a stale texture behind under its key -
+            // the draw that samples it then misses loudly (batch failure -> CPU fallback).
+            if (item.g767Async && !ok)
+                g767DropTex(item.g281TexKey);
+            if (item.g769AsyncWrite && !ok)
+            {
+                const uint64_t n = m_g769AsyncWriteFails.fetch_add(1u, std::memory_order_relaxed) + 1u;
+                if (n <= 16u || (n % 1024u) == 0u)
+                    std::fprintf(stderr, "[G769:async-write-FAIL] n=%llu fbp=0x%x rect=%d,%d %dx%d\n",
+                                 (unsigned long long)n, item.colorFbp, item.colorX, item.colorY,
+                                 item.colorW, item.colorRows);
+            }
+            if (item.g768View)
+                m_g768ExecSerial.store(item.g768View->serial, std::memory_order_release);
             // G705: null in fused mode -- the caller reads `ok` from doneFlag above.
             if (item.promise)
                 item.promise->set_value(ok);
@@ -5326,6 +5664,8 @@ void main()
             "uniform sampler2D uG309PageMap;\n"
             "uniform sampler2D uG309Base;\n"
             "uniform int uMode;\n"
+            // G766: the general alpha test (ref code 3): bits 0..2 ATST, 3..10 AREF.
+            "uniform int uAtest;\n"
 #if defined(PS2X_G658_DIAG)
             "uniform int uG658Stage;\n"
 #endif
@@ -5649,6 +5989,23 @@ void main()
             "    }\n"
             "    return rgb;\n"
             "}\n"
+            // G766: GS alpha test on the fragment's integer alpha byte. Ref codes 0..2 are G265's
+            // GEQUAL {1,64,127}; code 3 is any ATST/AREF from uAtest (AFAIL=KEEP only).
+            "bool g766AlphaPass(int a, int refCode){\n"
+            "    if (refCode != 3) {\n"
+            "        int refA = (refCode == 0) ? 1 : ((refCode == 1) ? 64 : 127);\n"
+            "        return a >= refA;\n"
+            "    }\n"
+            "    int atst = uAtest & 7; int aref = (uAtest >> 3) & 255;\n"
+            "    if (atst == 0) return false;\n"
+            "    if (atst == 1) return true;\n"
+            "    if (atst == 2) return a < aref;\n"
+            "    if (atst == 3) return a <= aref;\n"
+            "    if (atst == 4) return a == aref;\n"
+            "    if (atst == 5) return a >= aref;\n"
+            "    if (atst == 6) return a > aref;\n"
+            "    return a != aref;\n"
+            "}\n"
             "void main(){\n"
             "    if ((uMode & 512) != 0) {\n"
             // G659 P19: bit 65536 asks for the CPU's TRUNCATING Gouraud cast instead of GL's
@@ -5666,9 +6023,7 @@ void main()
             "        if ((uMode & 1024) != 0) tc.a = 128;\n"
             "        ivec4 ec = combineExact(vc, tc);\n"
             "        if ((uMode & 64) != 0) {\n"
-            "            int refCode = (uMode >> 7) & 3;\n"
-            "            int refA = (refCode == 0) ? 1 : ((refCode == 1) ? 64 : 127);\n"
-            "            if (ec.a < refA) discard;\n"
+            "            if (!g766AlphaPass(ec.a, (uMode >> 7) & 3)) discard;\n"
             "        }\n"
             "        ec.rgb = fogExact(ec.rgb);\n"
             // G661 P9: the exact-sampler branch blends through the same fixed-function unit, so it
@@ -5733,9 +6088,7 @@ void main()
             "        c = vec4(rgb, a);\n"
             "    }\n"
             "    if (alphaTest) {\n"
-            "        int refCode = (uMode >> 7) & 3;\n"
-            "        int refA = (refCode == 0) ? 1 : ((refCode == 1) ? 64 : 127);\n"
-            "        if (alphaByte < refA) discard;\n"
+            "        if (!g766AlphaPass(alphaByte, (uMode >> 7) & 3)) discard;\n"
             "    }\n"
             "    float outA = ((uMode & 32) != 0) ? c.a : min(c.a * 1.9921875, 1.0);\n"
             "    if ((uMode & 8192) != 0)\n"
@@ -5763,12 +6116,389 @@ void main()
             "}\n";
         GLuint vs = 0, fs = 0;
         std::string log;
-        if (!g158CompileShader(m_f, GL158_VERTEX_SHADER, kVS, vs, log))
+        // ⭐⭐ G766: CONSERVATIVE DEPTH — EARLY-Z FOR EVERY DRAW, EXACT Z UNCHANGED.
+        // The fragment stage writes gl_FragDepth on every path (the GS Z, floored for PSMZ24) and
+        // the vertex stage wrote a constant 0.0, so the GPU could never test depth before running
+        // the shader: every occluded fragment of every GEQUAL/GREATER draw was fully shaded and
+        // then discarded by the late test. At 1600x900 (S=2) that fragment work is the pole —
+        // `[G765:gpufbp]` books ~490 GPU-ms/s to 0x139's draws on lavaboss, 3.0x its 1x cost, and
+        // combat's GPU is busy 18.6 of an 18.7 ms frame.
+        // The vertex stage now emits the GS Z (plus 512 units, i.e. above anything the written
+        // value can reach after the [-1,1] round-trip's ~128-unit quantisation near 0) and the
+        // fragment stage declares `depth_less` (ARB_conservative_depth): the written depth never
+        // exceeds the rasterised one. For the GS tests (GEQUAL / GREATER / ALWAYS) a fragment whose
+        // rasterised depth already fails can therefore be rejected before shading, and every
+        // fragment that is shaded is tested and stored with EXACTLY the old gl_FragDepth. Depth
+        // clamping keeps a far-plane Z from clipping geometry. Rollback DC2_G766_NO_CONSDEPTH=1;
+        // a driver without the extension falls back to the legacy program.
+        static const bool s_g766ConsDepth = std::getenv("DC2_G766_NO_CONSDEPTH") == nullptr;
+        std::string g766Vs = kVS, g766Fs = kFS;
+        m_g766ConsDepth = false;
+        // ⭐⭐ G767: DUAL-SOURCE RAW-ALPHA BLEND. A blended draw into a raw-alpha RTT (G255) used to be
+        // TWO full fragment passes: RGB blended with alpha masked, then the same coverage again with
+        // blending off writing only the raw source alpha. At render scale S that second pass is a
+        // whole extra shading pass over every blended RTT fragment. With a secondary output the
+        // blend factor travels in o1 (GL_SRC1_ALPHA) while o.a carries the raw alpha under an
+        // (ONE, ZERO) alpha equation: one pass, the same RGB arithmetic, the raw alpha stored with
+        // the colour as the GS stores it. uMode bit 22 selects it per draw; the transform applies
+        // to the conservative-depth program only (m_g767DualOk). Rollback DC2_G767_NO_DUALRTT=1.
+        bool g767DualEdited = false;
+        if (std::getenv("DC2_G767_NO_DUALRTT") == nullptr)
+        {
+            std::string f = g766Fs;
+            const auto rep = [&f](const std::string &a, const std::string &b) {
+                const size_t at = f.find(a);
+                if (at == std::string::npos || f.find(a, at + 1u) != std::string::npos)
+                    return false;
+                f.replace(at, a.size(), b);
+                return true;
+            };
+            const bool ok =
+                rep("noperspective in float vFog;\nout vec4 o;\n",
+                    "noperspective in float vFog;\nlayout(location = 0, index = 0) out vec4 o;\n"
+                    "layout(location = 0, index = 1) out vec4 o1;\n") &&
+                rep("void main(){\n    if ((uMode & 512) != 0) {\n",
+                    "void main(){\n    o1 = vec4(1.0);\n    if ((uMode & 512) != 0) {\n") &&
+                rep("        o = vec4(exRgb, exA);\n",
+                    "        o = vec4(exRgb, exA);\n"
+                    "        if ((uMode & 4194304) != 0) { o1 = vec4(exA); o.a = float(ec.a) * (1.0 / 255.0); }\n") &&
+                rep("    o = vec4(c.rgb, outA);\n",
+                    "    o = vec4(c.rgb, outA);\n"
+                    "    if ((uMode & 4194304) != 0) { o1 = vec4(outA); o.a = c.a; }\n");
+            if (ok)
+            {
+                g766Fs = f;
+                g767DualEdited = true;
+            }
+            else
+                std::fprintf(stderr, "[G767:dual] shader anchors not found; two-pass kept\n");
+        }
+        // ⭐⭐ G767: ZERO-WEIGHT TAP SKIP in the exact bilinear sampler (G407 / G256 / G286). The
+        // integer bilinear sums c00*(16-fx)(16-fy) + c10*fx(16-fy) + c01*(16-fx)fy + c11*fx*fy; when
+        // the 4-bit sub-texel fraction of an axis is 0 the taps across that axis carry weight 0, so
+        // fetching them changes nothing. A 1:1 screen composite at S > 1 snaps every sub-fragment of a
+        // logical pixel to the same texel-centred UV (G675), i.e. fx = fy = 0: one fetch instead of
+        // four. Bit-identical by construction (the omitted products are exactly 0).
+        // combat at 1600x900: these composites are ~70 % of sampled draw GPU time
+        // (`[G767:drawgpu]`, exact=1 bilin=1 spr=1).
+        // ⛔ MEASURED AND REFUTED (plans/phase-G767-ledger.md §7): combat A B B A, same binary,
+        // control = four taps: +0.600 ms/f, blocks +1.049 / +0.151. The branches serialise what the
+        // GPU otherwise issues as four independent fetches. Opt-in only: DC2_G767_TAPSKIP=1.
+        if (std::getenv("DC2_G767_TAPSKIP") != nullptr)
+        {
+            const std::string a =
+                "    ivec4 c00 = texel8(p0), c10 = texel8(p0 + ivec2(1,0));\n"
+                "    ivec4 c01 = texel8(p0 + ivec2(0,1)), c11 = texel8(p0 + ivec2(1,1));\n"
+                "    int wx0 = 16 - fr.x, wy0 = 16 - fr.y;\n"
+                "    ivec4 sum = c00 * (wx0 * wy0) + c10 * (fr.x * wy0) +\n"
+                "                c01 * (wx0 * fr.y) + c11 * (fr.x * fr.y);\n";
+            const std::string b =
+                "    ivec4 c00 = texel8(p0);\n"
+                "    int wx0 = 16 - fr.x, wy0 = 16 - fr.y;\n"
+                "    ivec4 sum = c00 * (wx0 * wy0);\n"
+                "    if (fr.x != 0) sum += texel8(p0 + ivec2(1,0)) * (fr.x * wy0);\n"
+                "    if (fr.y != 0) sum += texel8(p0 + ivec2(0,1)) * (wx0 * fr.y);\n"
+                "    if (fr.x != 0 && fr.y != 0) sum += texel8(p0 + ivec2(1,1)) * (fr.x * fr.y);\n";
+            const size_t at = g766Fs.find(a);
+            if (at != std::string::npos && g766Fs.find(a, at + 1u) == std::string::npos)
+                g766Fs.replace(at, a.size(), b);
+            else
+                std::fprintf(stderr, "[G767:taps] sampler anchor not found; four taps kept\n");
+        }
+        // ⭐ G768: THE EXACT SAMPLER'S INTEGER DIVISIONS -> SHIFTS AND MASKS (bit-identical).
+        // `[G767:drawgpu]` on combat: 70.6 % of sampled draw GPU time is the exact integer sampler
+        // at 1.6-1.7 ns/px against 0.6-0.77 for hardware-filtered draws, and combat is GPU-bound.
+        // Four of its operations are GPU integer DIVISIONS / MODULI that have exact cheap forms:
+        //   * REPEAT wrap `p % n` per tap and axis: every GS texture is 2^k wide/high, and for a
+        //     power of two ((p % n) + n) % n == p & (n - 1) for every p (also defines the negative
+        //     case, which GLSL leaves undefined for `%`); non-power-of-two n keeps the modulo;
+        //   * floorDiv16(v) == v >> 4 (GLSL `>>` sign-extends a signed int: floor division);
+        //   * f16 / 16 with f16 >= 0 == f16 >> 4; (sum + 128) / 256 with sum >= 0 == >> 8;
+        //   * fog (x) / 255 for 0 <= x <= 255*255+127 == (x + 1 + (x >> 8)) >> 8.
+        // All four identities were checked exhaustively over their ranges (plans/phase-G768-ledger.md).
+        // Rollback DC2_G768_NO_ALUSHIFT=1.
+        if (std::getenv("DC2_G768_NO_ALUSHIFT") == nullptr)
+        {
+            int applied = 0;
+            const auto repAll = [&](const std::string &a, const std::string &b) {
+                size_t at = 0u;
+                while ((at = g766Fs.find(a, at)) != std::string::npos)
+                {
+                    g766Fs.replace(at, a.size(), b);
+                    at += b.size();
+                    ++applied;
+                }
+            };
+            repAll("    if (mode != 0) return clamp(p, 0, n - 1);\n"
+                   "    int r = p % n; return r < 0 ? r + n : r;\n",
+                   "    if (mode != 0) return clamp(p, 0, n - 1);\n"
+                   "    if ((n & (n - 1)) == 0) return p & (n - 1);\n"
+                   "    int r = p % n; return r < 0 ? r + n : r;\n");
+            repAll("int floorDiv16(int v){ return v >= 0 ? v / 16 : -((-v + 15) / 16); }\n",
+                   "int floorDiv16(int v){ return v >> 4; }\n");
+            repAll("    if (uLinear == 0) return texel8(f16 / 16);\n",
+                   "    if (uLinear == 0) return texel8(f16 >> 4);\n");
+            repAll("    return clamp((sum + ivec4(128)) / 256, 0, 255);\n",
+                   "    return clamp((sum + ivec4(128)) >> 8, 0, 255);\n");
+            repAll("    return (c * f + fc * (255 - f) + ivec3(127)) / 255;\n",
+                   "    ivec3 fx = c * f + fc * (255 - f) + ivec3(127);\n"
+                   "    return (fx + ivec3(1) + (fx >> 8)) >> 8;\n");
+            // g406RoundAxis evaluated its lattice test — an integer MODULO by a uniform period —
+            // before the early return that most fragments take, and `exact` is only read after it.
+            // Test the boundary distance first; a unit period (every 1:1 sprite) needs no modulo.
+            repAll("    bool exact = (pixel == origin) ||\n"
+                   "                 (period != 0 && ((pixel - origin) % period) == 0);\n"
+                   "    bool legacy = (flags & 4) != 0;\n"
+                   "    bool halfBoundary = legacy || uLinear != 0;\n"
+                   "    float boundary = halfBoundary ? floor(value * 2.0 + 0.5) * 0.5\n"
+                   "                                  : floor(value + 0.5);\n"
+                   "    float threshold = legacy ? 0.25 : (1.0 / 64.0);\n"
+                   "    if (abs(value - boundary) > threshold) return value;\n",
+                   "    bool legacy = (flags & 4) != 0;\n"
+                   "    bool halfBoundary = legacy || uLinear != 0;\n"
+                   "    float boundary = halfBoundary ? floor(value * 2.0 + 0.5) * 0.5\n"
+                   "                                  : floor(value + 0.5);\n"
+                   "    float threshold = legacy ? 0.25 : (1.0 / 64.0);\n"
+                   "    if (abs(value - boundary) > threshold) return value;\n"
+                   "    bool exact = (pixel == origin) || period == 1 ||\n"
+                   "                 (period != 0 && ((pixel - origin) % period) == 0);\n");
+            std::fprintf(stderr, "[G768:alushift] %d exact-sampler rewrites applied\n", applied);
+        }
+        // ⭐ G769: THE EXACT SAMPLER IN FLOAT, BIT-IDENTICAL. `[G767:drawgpu]` at S=3 (g769j,
+        // uncapped): map15 spends 55 % of sampled draw GPU time in exact-sampler FBO-source quads at
+        // 1.80 ns per logical px against 0.61 for the hardware-filtered class; combat's GPU is busy
+        // 12.5-14.7 of a 15.7 ms frame. The integer form converts every one of its four taps to int
+        // (16 F2I, quarter rate on Pascal) and weights them with 16 integer multiplies (IMUL is a
+        // 3-instruction XMAD sequence on Pascal). Every value in that arithmetic is a small integer
+        // that fp32 represents EXACTLY: a texel byte 0..255, a weight 0..256, each product <= 65,280,
+        // the weighted sum <= 65,280 (weights sum to 256), and the final (sum + 128) / 256 is a
+        // division by a power of two followed by floor. So the float form below computes the SAME
+        // integers in any evaluation order (FMA contraction included): exact by construction.
+        //   DC2_G769_NO_EXACTF=1      rollback (integer taps)
+        //   DC2_G769_EXACTF_VERIFY=1  oracle: both forms run, any disagreement paints the fragment
+        //                             magenta (count it in a frame dump); never timed
+        if (std::getenv("DC2_G769_NO_EXACTF") == nullptr)
+        {
+            const bool verify = std::getenv("DC2_G769_EXACTF_VERIFY") != nullptr;
+            const std::string t8 =
+                "    return clamp(ivec4(floor(texelFetch(uTex, p, 0) * 255.0 + 0.5)), 0, 255);\n"
+                "}\n";
+            const std::string t8f =
+                "    return clamp(ivec4(floor(texelFetch(uTex, p, 0) * 255.0 + 0.5)), 0, 255);\n"
+                "}\n"
+                "vec4 texel8f(ivec2 p){\n"
+                "    ivec2 n = textureSize(uTex, 0);\n"
+                "    p.x = wrapCoord(p.x, n.x, uWrapU);\n"
+                "    p.y = wrapCoord(p.y, n.y, uWrapV);\n"
+                "    return clamp(floor(texelFetch(uTex, p, 0) * 255.0 + 0.5), 0.0, 255.0);\n"
+                "}\n";
+            const std::string taps =
+                "    ivec4 c00 = texel8(p0), c10 = texel8(p0 + ivec2(1,0));\n"
+                "    ivec4 c01 = texel8(p0 + ivec2(0,1)), c11 = texel8(p0 + ivec2(1,1));\n"
+                "    int wx0 = 16 - fr.x, wy0 = 16 - fr.y;\n"
+                "    ivec4 sum = c00 * (wx0 * wy0) + c10 * (fr.x * wy0) +\n"
+                "                c01 * (wx0 * fr.y) + c11 * (fr.x * fr.y);\n"
+                "    return clamp((sum + ivec4(128)) >> 8, 0, 255);\n";
+            const std::string floatTaps =
+                "    vec4 f00 = texel8f(p0), f10 = texel8f(p0 + ivec2(1,0));\n"
+                "    vec4 f01 = texel8f(p0 + ivec2(0,1)), f11 = texel8f(p0 + ivec2(1,1));\n"
+                "    vec2 frf = vec2(fr); vec2 w0 = vec2(16.0) - frf;\n"
+                "    vec4 fsum = f00 * (w0.x * w0.y) + f10 * (frf.x * w0.y) +\n"
+                "                f01 * (w0.x * frf.y) + f11 * (frf.x * frf.y);\n"
+                "    ivec4 fres = ivec4(clamp(floor((fsum + vec4(128.0)) * (1.0 / 256.0)), 0.0, 255.0));\n";
+            const std::string intTaps =
+                "    ivec4 c00 = texel8(p0), c10 = texel8(p0 + ivec2(1,0));\n"
+                "    ivec4 c01 = texel8(p0 + ivec2(0,1)), c11 = texel8(p0 + ivec2(1,1));\n"
+                "    int wx0 = 16 - fr.x, wy0 = 16 - fr.y;\n"
+                "    ivec4 sum = c00 * (wx0 * wy0) + c10 * (fr.x * wy0) +\n"
+                "                c01 * (wx0 * fr.y) + c11 * (fr.x * fr.y);\n"
+                "    ivec4 ires = clamp((sum + ivec4(128)) >> 8, 0, 255);\n";
+            const std::string repl =
+                verify ? floatTaps + intTaps +
+                             "    return any(notEqual(fres, ires)) ? ivec4(255, 0, 255, 255) : fres;\n"
+                       : floatTaps + "    return fres;\n";
+            const size_t a0 = g766Fs.find(t8);
+            const size_t a1 = g766Fs.find(taps);
+            if (a0 != std::string::npos && a1 != std::string::npos &&
+                g766Fs.find(t8, a0 + 1) == std::string::npos &&
+                g766Fs.find(taps, a1 + 1) == std::string::npos)
+            {
+                // Replace the later anchor first so the earlier offset stays valid.
+                if (a1 > a0)
+                {
+                    g766Fs.replace(a1, taps.size(), repl);
+                    g766Fs.replace(a0, t8.size(), t8f);
+                }
+                else
+                {
+                    g766Fs.replace(a0, t8.size(), t8f);
+                    g766Fs.replace(a1, taps.size(), repl);
+                }
+                std::fprintf(stderr, "[G769:exactf] PASS: float exact sampler%s\n",
+                             verify ? " (VERIFY: magenta on disagreement)" : "");
+                // ⭐ G769 G2: THE WHOLE EXACT BRANCH IN FLOAT. Same argument, one step wider: the
+                // vertex colour byte (0..255), the MODULATE product tc*vc <= 65,025 and its >> 7
+                // (a power-of-two division + floor), the HIGHLIGHT add, and the fog lerp
+                // c*f + fc*(255-f) + 127 <= 65,152 with G768's exact /255 identity
+                // (x + 1 + (x >> 8)) >> 8 are all integers fp32 carries exactly. Saves the vertex
+                // colour's four F2I, the texel's four, the combine/fog integer multiplies and the
+                // three I2F of the output. Rollback DC2_G769_NO_EXACTB=1.
+                if (std::getenv("DC2_G769_NO_EXACTB") == nullptr)
+                {
+                    const std::string helperAnchor = "ivec4 combineExact(ivec4 vc, ivec4 tc){\n";
+                    const std::string helpers =
+                        "vec4 sampleExactF(vec2 uvTex){\n"
+                        "    ivec2 f16 = clamp(ivec2(floor(uvTex * 16.0 + 0.5001)), ivec2(0), ivec2(65535));\n"
+                        "    if (uLinear == 0) return texel8f(f16 >> 4);\n"
+                        "    ivec2 shifted = f16 - ivec2(8);\n"
+                        "    ivec2 p0 = shifted >> 4;\n"
+                        "    ivec2 fr = shifted - p0 * 16;\n"
+                        "    vec4 f00 = texel8f(p0), f10 = texel8f(p0 + ivec2(1,0));\n"
+                        "    vec4 f01 = texel8f(p0 + ivec2(0,1)), f11 = texel8f(p0 + ivec2(1,1));\n"
+                        "    vec2 frf = vec2(fr); vec2 w0 = vec2(16.0) - frf;\n"
+                        "    vec4 fsum = f00 * (w0.x * w0.y) + f10 * (frf.x * w0.y) +\n"
+                        "                f01 * (w0.x * frf.y) + f11 * (frf.x * frf.y);\n"
+                        "    return clamp(floor((fsum + vec4(128.0)) * (1.0 / 256.0)), 0.0, 255.0);\n"
+                        "}\n"
+                        "vec4 combineExactF(vec4 vc, vec4 tc){\n"
+                        "    int tfx = (uMode >> 1) & 3; bool tcc = (uMode & 8) != 0;\n"
+                        "    vec4 c = tc;\n"
+                        "    if (tfx == 0) {\n"
+                        "        c.rgb = floor(tc.rgb * vc.rgb * (1.0 / 128.0));\n"
+                        "        c.a = tcc ? floor(tc.a * vc.a * (1.0 / 128.0)) : vc.a;\n"
+                        "    } else if (tfx == 1) { c.a = tcc ? tc.a : vc.a;\n"
+                        "    } else {\n"
+                        "        c.rgb = floor(tc.rgb * vc.rgb * (1.0 / 128.0)) + vec3(vc.a);\n"
+                        "        c.a = (tfx == 2) ? (tcc ? tc.a + vc.a : vc.a) : (tcc ? tc.a : vc.a);\n"
+                        "    }\n"
+                        "    return clamp(c, 0.0, 255.0);\n"
+                        "}\n"
+                        "vec3 fogExactF(vec3 c){\n"
+                        "    if ((uMode & 8192) == 0) return c;\n"
+                        "    float f = clamp(floor(vFog * 255.0 + 0.5), 0.0, 255.0);\n"
+                        "    vec3 fc = vec3(float(uFogCol & 255), float((uFogCol >> 8) & 255),\n"
+                        "                   float((uFogCol >> 16) & 255));\n"
+                        "    vec3 fx = c * f + fc * (255.0 - f) + vec3(127.0);\n"
+                        "    return floor((fx + vec3(1.0) + floor(fx * (1.0 / 256.0))) * (1.0 / 256.0));\n"
+                        "}\n"
+                        "float g584ExactAF(float a){\n"
+                        "    return ((uMode & 32768) != 0) ? min(a * (1.0 / 128.0), 1.0) : a * (1.0 / 255.0);\n"
+                        "}\n";
+                    const std::string branchOld =
+                        "        ivec4 vc = clamp(ivec4(floor(vColor * 255.0 + g659ShadeBias)), 0, 255);\n"
+                        "        vec2 uv = g675SnapUv(vSTQ.xy / max(vSTQ.z, 1e-8));\n"
+                        "        ivec4 tc = sampleExact(g406RoundUv(uv * vec2(textureSize(uTex, 0))));\n"
+                        "        if ((uMode & 1024) != 0) tc.a = 128;\n"
+                        "        ivec4 ec = combineExact(vc, tc);\n"
+                        "        if ((uMode & 64) != 0) {\n"
+                        "            if (!g766AlphaPass(ec.a, (uMode >> 7) & 3)) discard;\n"
+                        "        }\n"
+                        "        ec.rgb = fogExact(ec.rgb);\n"
+                        "        float exA = ((uMode & 32) != 0) ? float(ec.a) * (1.0 / 255.0)\n"
+                        "                                        : g584ExactA(ec.a);\n"
+                        "        vec3 exRgb = vec3(ec.rgb) * (1.0 / 255.0);\n";
+                    std::string branchNew =
+                        "        vec4 vcf = clamp(floor(vColor * 255.0 + g659ShadeBias), 0.0, 255.0);\n"
+                        "        vec2 uv = g675SnapUv(vSTQ.xy / max(vSTQ.z, 1e-8));\n"
+                        "        vec2 uvT = g406RoundUv(uv * vec2(textureSize(uTex, 0)));\n"
+                        "        vec4 tcf = sampleExactF(uvT);\n"
+                        "        if ((uMode & 1024) != 0) tcf.a = 128.0;\n"
+                        "        vec4 ecf = combineExactF(vcf, tcf);\n"
+                        "        if ((uMode & 64) != 0) {\n"
+                        "            if (!g766AlphaPass(int(ecf.a), (uMode >> 7) & 3)) discard;\n"
+                        "        }\n"
+                        "        ecf.rgb = fogExactF(ecf.rgb);\n"
+                        "        ivec4 ec = ivec4(0, 0, 0, int(ecf.a));\n"
+                        "        float exA = ((uMode & 32) != 0) ? ecf.a * (1.0 / 255.0)\n"
+                        "                                        : g584ExactAF(ecf.a);\n"
+                        "        vec3 exRgb = ecf.rgb * (1.0 / 255.0);\n";
+                    if (verify)
+                        branchNew +=
+                            "        {\n"
+                            "            ivec4 vci = clamp(ivec4(floor(vColor * 255.0 + g659ShadeBias)), 0, 255);\n"
+                            "            ivec4 tci = sampleExact(uvT);\n"
+                            "            if ((uMode & 1024) != 0) tci.a = 128;\n"
+                            "            ivec4 eci = combineExact(vci, tci);\n"
+                            "            eci.rgb = fogExact(eci.rgb);\n"
+                            "            if (any(notEqual(eci, ivec4(ecf)))) exRgb = vec3(1.0, 0.0, 1.0);\n"
+                            "        }\n";
+                    const std::string legacyOld =
+                        "            t = vec4(sampleExact(g406RoundUv(uv * vec2(textureSize(uTex, 0))))) * (1.0 / 255.0);\n";
+                    const std::string legacyNew =
+                        "            t = sampleExactF(g406RoundUv(uv * vec2(textureSize(uTex, 0)))) * (1.0 / 255.0);\n";
+                    const size_t h = g766Fs.find(helperAnchor);
+                    const size_t b0 = g766Fs.find(branchOld);
+                    const size_t l0 = g766Fs.find(legacyOld);
+                    if (h != std::string::npos && b0 != std::string::npos && l0 != std::string::npos &&
+                        g766Fs.find(branchOld, b0 + 1) == std::string::npos &&
+                        g766Fs.find(legacyOld, l0 + 1) == std::string::npos && h < b0 && h < l0)
+                    {
+                        // Later anchors first so earlier offsets stay valid.
+                        if (b0 > l0)
+                        {
+                            g766Fs.replace(b0, branchOld.size(), branchNew);
+                            g766Fs.replace(l0, legacyOld.size(), legacyNew);
+                        }
+                        else
+                        {
+                            g766Fs.replace(l0, legacyOld.size(), legacyNew);
+                            g766Fs.replace(b0, branchOld.size(), branchNew);
+                        }
+                        g766Fs.insert(h, helpers);
+                        std::fprintf(stderr, "[G769:exactb] PASS: float exact branch%s\n",
+                                     verify ? " (VERIFY)" : "");
+                    }
+                    else
+                        std::fprintf(stderr, "[G769:exactb] anchors not found (%d/%d/%d); kept\n",
+                                     h != std::string::npos ? 1 : 0, b0 != std::string::npos ? 1 : 0,
+                                     l0 != std::string::npos ? 1 : 0);
+                }
+            }
+            else
+                std::fprintf(stderr, "[G769:exactf] anchors not found (%d/%d); integer taps kept\n",
+                             a0 != std::string::npos ? 1 : 0, a1 != std::string::npos ? 1 : 0);
+        }
+        if (s_g766ConsDepth)
+        {
+            const std::string posOld = "    gl_Position = vec4(ndcX, ndcY, 0.0, 1.0);\n";
+            const std::string posNew =
+                "    gl_Position = vec4(ndcX, ndcY,\n"
+                "        (max(aPos.z, 0.0) + 512.0) * (2.0 / 4294967296.0) - 1.0, 1.0);\n";
+            const std::string verLine = "#version 330 core\n";
+            const size_t pp = g766Vs.find(posOld);
+            if (pp != std::string::npos && g766Fs.compare(0, verLine.size(), verLine) == 0)
+            {
+                g766Vs.replace(pp, posOld.size(), posNew);
+                g766Fs.insert(verLine.size(),
+                              "#extension GL_ARB_conservative_depth : require\n"
+                              "layout(depth_less) out float gl_FragDepth;\n");
+                GLuint cvs = 0, cfs = 0;
+                std::string clog;
+                if (g158CompileShader(m_f, GL158_VERTEX_SHADER, g766Vs.c_str(), cvs, clog) &&
+                    g158CompileShader(m_f, GL158_FRAGMENT_SHADER, g766Fs.c_str(), cfs, clog))
+                {
+                    vs = cvs;
+                    fs = cfs;
+                    m_g766ConsDepth = true;
+                    m_g767DualOk = g767DualEdited;
+                    std::fprintf(stderr, "[G766:backend] PASS: conservative-depth program\n");
+                }
+                else
+                {
+                    if (cvs != 0u)
+                        m_f.glDeleteShader_(cvs);
+                    std::fprintf(stderr,
+                                 "[G766:backend] conservative depth unavailable, legacy program: %s\n",
+                                 clog.c_str());
+                }
+            }
+        }
+        if (!m_g766ConsDepth && !g158CompileShader(m_f, GL158_VERTEX_SHADER, kVS, vs, log))
         {
             std::fprintf(stderr, "[G178:backend] FAIL: VS compile: %s\n", log.c_str());
             return false;
         }
-        if (!g158CompileShader(m_f, GL158_FRAGMENT_SHADER, kFS, fs, log))
+        if (!m_g766ConsDepth && !g158CompileShader(m_f, GL158_FRAGMENT_SHADER, kFS, fs, log))
         {
             std::fprintf(stderr, "[G178:backend] FAIL: FS compile: %s\n", log.c_str());
             m_f.glDeleteShader_(vs);
@@ -5788,6 +6518,10 @@ void main()
             return false;
         }
         m_f.glUseProgram_(m_prog);
+        // G766: depth clamping for the conservative-depth program (GL 3.2 core, GL_DEPTH_CLAMP =
+        // 0x864F). Every other program in this context emits z = 0, so the state is inert for them.
+        if (m_g766ConsDepth)
+            glEnable(static_cast<GLenum>(0x864Fu));
         m_locFbSize = m_f.glGetUniformLocation_(m_prog, "uFbSize");
         m_locFbScale = m_f.glGetUniformLocation_(m_prog, "uFbScale");
         // ⭐ G675: one vec2 shared by both stages — (uvSnap, vertexXScale). It MUST be seeded
@@ -5800,6 +6534,7 @@ void main()
         m_g675XScaleCur = 1.0f;
         m_locMode = m_f.glGetUniformLocation_(m_prog, "uMode");
         m_locFogCol = m_f.glGetUniformLocation_(m_prog, "uFogCol"); // G364
+        m_locAtest = m_f.glGetUniformLocation_(m_prog, "uAtest");   // G766
         m_locLinear = m_f.glGetUniformLocation_(m_prog, "uLinear");
         m_locWrapU = m_f.glGetUniformLocation_(m_prog, "uWrapU");
         m_locWrapV = m_f.glGetUniformLocation_(m_prog, "uWrapV");
@@ -7412,8 +8147,35 @@ void main()
             if (m_g675ResolveFbo == 0u)
                 return false;
         }
-        if (m_g675ResolveTex == 0u || m_g675ResolveW != logW || m_g675ResolveH != logH)
+        // ⭐⭐ G759: GROW-ONLY, which is what the member comment already claimed this was.
+        //
+        // ⛔ THE DEFECT. The test was `m_g675ResolveW != logW || m_g675ResolveH != logH` — an
+        // EXACT match, not a grow test — against ONE shared texture. `dragon` reads six distinct
+        // (fbp, window) pairs per frame and `renderBatch` resolves at its own `b.fbW x b.fbH`, so
+        // consecutive resolves almost never ask for the same size. Every size change ran
+        // `glTexImage2D` (a full reallocation), re-attached it, and called
+        // `glCheckFramebufferStatus` — a driver round trip — INSIDE the readback path, six-plus
+        // times per frame. `[G415:stage]` prices the `fbo` stage of `fbp=0x139` at **0.893 ms/f**
+        // over 1.93 batches/frame, the single largest stage row on the route.
+        //
+        // WHY GROWING IS EXACT. The resolve renders with `glViewport(0, 0, logW, logH)`, and GL's
+        // window origin is bottom-left, so logical pixel (x, y) lands at texel (x, y) of the
+        // attachment REGARDLESS of how large the attachment is. The caller reads
+        // `glReadPixels(0, glY, w, rows)` with `glY + rows <= logH` (asserted by readColorOnWorker's
+        // own entry guard), i.e. strictly inside the rendered rectangle. Texels outside it are
+        // never read. A larger attachment therefore returns byte-identical pixels.
+        //
+        // Bounded by construction: the largest logical target this port can ask for is one PS2
+        // display page, so the texture converges after a handful of reads and never reallocates
+        // again. Rollback `DC2_G759_NO_RESOLVE_GROW=1` restores the exact-match behaviour.
+        const bool grow = !g759NoResolveGrowOn();
+        const bool needAlloc = m_g675ResolveTex == 0u ||
+                               (grow ? (m_g675ResolveW < logW || m_g675ResolveH < logH)
+                                     : (m_g675ResolveW != logW || m_g675ResolveH != logH));
+        if (needAlloc)
         {
+            const int allocW = grow ? std::max(m_g675ResolveW, logW) : logW;
+            const int allocH = grow ? std::max(m_g675ResolveH, logH) : logH;
             if (m_g675ResolveTex == 0u)
                 glGenTextures(1, &m_g675ResolveTex);
             if (m_g675ResolveTex == 0u)
@@ -7421,22 +8183,25 @@ void main()
             glBindTexture(GL_TEXTURE_2D, m_g675ResolveTex);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, logW, logH, 0, GL_RGBA,
+            glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, allocW, allocH, 0, GL_RGBA,
                          GL_UNSIGNED_BYTE, nullptr);
             m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g675ResolveFbo);
             m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0,
                                         GL_TEXTURE_2D, m_g675ResolveTex, 0);
             if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) != GL158_FRAMEBUFFER_COMPLETE)
             {
-                std::fprintf(stderr, "[G675:resolve] FAIL: FBO incomplete at %dx%d\n", logW, logH);
+                std::fprintf(stderr, "[G675:resolve] FAIL: FBO incomplete at %dx%d\n",
+                             allocW, allocH);
                 m_g675ResolveW = 0;
                 m_g675ResolveH = 0;
                 m_g675ResolveFailed = true;
                 return false;
             }
-            m_g675ResolveW = logW;
-            m_g675ResolveH = logH;
+            m_g675ResolveW = allocW;
+            m_g675ResolveH = allocH;
+            g759NoteResolveAlloc();
         }
+        g759NoteResolveUse();
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g675ResolveFbo);
         glViewport(0, 0, logW, logH);
         glDisable(GL_SCISSOR_TEST);
@@ -7454,6 +8219,368 @@ void main()
         m_f.glBindVertexArray_(m_vao);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         return true;
+    }
+
+    // ===== ⭐⭐⭐ G760: the physical -> logical DEPTH resolve — the colour resolve's missing twin ===
+    //
+    // See the block comment beside `g760NoDepthResolveOn()` in gpu_raster_infrastructure.inc for
+    // what this replaces and why it is exact. Mechanically it is `resolveColorToLogical` with two
+    // substitutions: the source is a DEPTH texture (sampled with a plain `sampler2D`, which is
+    // legal because `ensureDepth` never sets GL_TEXTURE_COMPARE_MODE, so the default GL_NONE
+    // applies and `.r` is the stored depth), and the destination is R32F rather than RGBA8 — so the
+    // caller reads it back with `glReadPixels(..., GL759_RED, GL_FLOAT, ...)`.
+    bool setupG760DepthResolveProgram()
+    {
+        if (m_g760ZrdProg != 0u)
+            return true;
+        if (m_g760ZrdFailed)
+            return false;
+        static const char *kVS =
+            "#version 330 core\n"
+            "void main(){\n"
+            "    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+            "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+            "}\n";
+        static const char *kFS =
+            "#version 330 core\n"
+            "out float o;\n"
+            "uniform sampler2D uSrc;\n"
+            "uniform int uScale;\n"
+            "uniform int uCentre;\n"
+            "void main(){\n"
+            "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+            "    o = texelFetch(uSrc, p * uScale + ivec2(uCentre), 0).r;\n"
+            "}\n";
+        GLuint vs = 0u, fs = 0u;
+        std::string log;
+        if (!g158CompileShader(m_f, GL158_VERTEX_SHADER, kVS, vs, log))
+        {
+            std::fprintf(stderr, "[G760:zrd] FAIL: VS compile: %s\n", log.c_str());
+            m_g760ZrdFailed = true;
+            return false;
+        }
+        if (!g158CompileShader(m_f, GL158_FRAGMENT_SHADER, kFS, fs, log))
+        {
+            std::fprintf(stderr, "[G760:zrd] FAIL: FS compile: %s\n", log.c_str());
+            m_f.glDeleteShader_(vs);
+            m_g760ZrdFailed = true;
+            return false;
+        }
+        const GLuint prog = m_f.glCreateProgram_();
+        m_f.glAttachShader_(prog, vs);
+        m_f.glAttachShader_(prog, fs);
+        m_f.glLinkProgram_(prog);
+        m_f.glDeleteShader_(vs);
+        m_f.glDeleteShader_(fs);
+        GLint linked = 0;
+        m_f.glGetProgramiv_(prog, GL158_LINK_STATUS, &linked);
+        if (!linked)
+        {
+            m_f.glDeleteProgram_(prog);
+            std::fprintf(stderr, "[G760:zrd] FAIL: link\n");
+            m_g760ZrdFailed = true;
+            return false;
+        }
+        m_g760ZrdProg = prog;
+        m_f.glUseProgram_(m_g760ZrdProg);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g760ZrdProg, "uSrc"), 0);
+        m_locG760ZrdScale = m_f.glGetUniformLocation_(m_g760ZrdProg, "uScale");
+        m_locG760ZrdCentre = m_f.glGetUniformLocation_(m_g760ZrdProg, "uCentre");
+        std::fprintf(stderr, "[G760:zrd] PASS: physical->logical guest-depth resolve ready\n");
+        return true;
+    }
+
+    // Renders `srcDepthTex` (physical, logW*S x logH*S) into the logical-sized R32F resolve FBO and
+    // LEAVES that FBO bound, so the caller's glReadPixels(0, glY, w, rows, GL759_RED, GL_FLOAT)
+    // reads logical depth directly. Returns false if anything is unavailable — every caller keeps
+    // its CPU decimation, so this can never change a depth value, only where the tap happens.
+    //
+    // ⛔ THE CALLER MUST RESTORE ITS OWN FRAMEBUFFER BINDING AND VIEWPORT (Rule G759-2: a content
+    // oracle is blind to GL state, and the previous phase shipped exactly that bug). Both call
+    // sites below do so unconditionally, on the success and the failure path.
+    //
+    // ⚠️ `tap` IS THE CALLER'S OWN SUB-PIXEL OFFSET AND IS NOT ASSUMED. The two depth readbacks do
+    // not agree: `readDepthOnWorker` takes the block CENTRE (`x*S + C`, matching colour), while
+    // `renderBatch`'s fused readback takes the block's TOP-LEFT (`(x*physW)/logW == x*S`, offset 0)
+    // — a G675 site that was never brought in line. Each call site passes what it already used, so
+    // this change remains PURE TRANSPORT; the disagreement is recorded as its own finding rather
+    // than silently repaired inside a performance lever.
+    bool resolveDepthToLogical(GLuint srcDepthTex, int logW, int logH, int physW, int physH,
+                               int tap)
+    {
+        const int s = dc2GetNativeScale();
+        if (s <= 1 || srcDepthTex == 0u || logW <= 0 || logH <= 0 || tap < 0 || tap >= s)
+            return false;
+        if (g760NoDepthResolveOn())
+            return false;
+        // Fail closed unless the attachment is EXACTLY the integer multiple the exactness argument
+        // depends on. Anything else takes the CPU decimation, which handles the general case.
+        if (physW != logW * s || physH != logH * s)
+            return false;
+        if (!setupG760DepthResolveProgram())
+            return false;
+        if (m_g760ZrdFbo == 0u)
+        {
+            m_f.glGenFramebuffers_(1, &m_g760ZrdFbo);
+            if (m_g760ZrdFbo == 0u)
+                return false;
+        }
+        // Grow-only from the first allocation, which is G759's correction to G675's exact-size
+        // test: the resolve renders at glViewport(0, 0, logW, logH) and GL's origin is bottom-left,
+        // so logical texel (x, y) lands at attachment texel (x, y) whatever the attachment's size,
+        // and the caller reads strictly inside the rendered rectangle.
+        const bool needAlloc = m_g760ZrdTex == 0u || m_g760ZrdW < logW || m_g760ZrdH < logH;
+        if (needAlloc)
+        {
+            const int allocW = std::max(m_g760ZrdW, logW);
+            const int allocH = std::max(m_g760ZrdH, logH);
+            if (m_g760ZrdTex == 0u)
+                glGenTextures(1, &m_g760ZrdTex);
+            if (m_g760ZrdTex == 0u)
+                return false;
+            glBindTexture(GL_TEXTURE_2D, m_g760ZrdTex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL759_R32F, allocW, allocH, 0, GL759_RED, GL_FLOAT,
+                         nullptr);
+            m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g760ZrdFbo);
+            m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0,
+                                        GL_TEXTURE_2D, m_g760ZrdTex, 0);
+            glDrawBuffer(GL158_COLOR_ATTACHMENT0);
+            glReadBuffer(GL158_COLOR_ATTACHMENT0);
+            if (g494FboStatus(kG494ZrdFbo, GL158_FRAMEBUFFER_COMPLETE, [&]() {
+                    return m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER);
+                }) != GL158_FRAMEBUFFER_COMPLETE)
+            {
+                std::fprintf(stderr, "[G760:zrd] FAIL: FBO incomplete at %dx%d\n", allocW, allocH);
+                m_g760ZrdW = 0;
+                m_g760ZrdH = 0;
+                m_g760ZrdFailed = true;
+                return false;
+            }
+            m_g760ZrdW = allocW;
+            m_g760ZrdH = allocH;
+        }
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g760ZrdFbo);
+        glViewport(0, 0, logW, logH);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_BLEND);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        m_f.glUseProgram_(m_g760ZrdProg);
+        m_f.glUniform1i_(m_locG760ZrdScale, s);
+        m_f.glUniform1i_(m_locG760ZrdCentre, tap);
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, srcDepthTex);
+        m_f.glBindVertexArray_(m_vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        return g494GetError(kG494ZrdErr) == GL_NO_ERROR;
+    }
+
+    // G760 verification arm (DC2_G760_ZRD_VERIFY=1, never in a timing arm). Runs the CPU path the
+    // resolve replaced — a full physical glReadPixels plus the centre-tap decimation — and compares
+    // it against what the GPU resolve produced, float for float and with NO epsilon (Rule 55).
+    // ⚠️ It reads from whatever framebuffer the CALLER had bound, so it must be invoked before the
+    // caller rebinds, and it leaves the resolve FBO bound exactly as the resolve did.
+    void g760VerifyDepthResolve(GLuint boundFbo, const std::vector<float> &got,
+                                int logW, int physW, int glY, int rows, int tap)
+    {
+        if (!g760DepthResolveVerifyOn())
+            return;
+        const int s = dc2GetNativeScale();
+        const int c = tap;
+        if (s <= 1 || physW != logW * s || rows <= 0 || tap < 0 || tap >= s)
+            return;
+        const int physRows = rows * s;
+        m_g760ZrdProbe.assign(static_cast<size_t>(physW) * physRows, -1.0f);
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, boundFbo);
+        glReadPixels(0, glY * s, physW, physRows, GL_DEPTH_COMPONENT, GL_FLOAT,
+                     m_g760ZrdProbe.data());
+        uint64_t bad = 0ull;
+        for (int r = 0; r < rows; ++r)
+        {
+            const float *srcRow =
+                m_g760ZrdProbe.data() + static_cast<size_t>(r * s + c) * physW;
+            const float *have = got.data() + static_cast<size_t>(r) * logW;
+            for (int x = 0; x < logW; ++x)
+                if (have[x] != srcRow[x * s + c])
+                {
+                    if (bad == 0ull)
+                        std::fprintf(stderr,
+                                     "[G760:zrd-BAD] first at (%d,%d) got=%.9g want=%.9g\n",
+                                     x, r, have[x], srcRow[x * s + c]);
+                    ++bad;
+                }
+        }
+        g760Stat().zrdVerified.fetch_add(1ull, std::memory_order_relaxed);
+        g760Stat().zrdBad.fetch_add(bad, std::memory_order_relaxed);
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g760ZrdFbo);
+    }
+
+    // ===== ⭐⭐ G760: THE PRESENTATION READ'S Y FLIP, ON THE GPU ==================================
+    //
+    // `readDisplayFboOnWorker` runs ONCE PER PRESENTED FRAME and is the most expensive single item
+    // kind on the executor — `[G760:item]` prices `dispread` at **3.88 ms per item**. It reads the
+    // physical display rectangle into a staging buffer and then flips it top-origin on the CPU:
+    //
+    //     glReadPixels(physX, physGlY, physW, physRows, ... , m_g759PresentStage.data());
+    //     for (y) memcpy(outRgba + y*physW*4, stage + (physRows-1-y)*physW, physW*4);
+    //
+    // At S=3 that memcpy moves **7.65 MB per presented frame** (1536 x 1245 x 4) and `memmove` is
+    // 7.6 % of the pole thread's whole wall time in the G720 PC sample. The bytes THEMSELVES are
+    // not removable — this is the high-resolution output image — but the second pass over them is.
+    //
+    // This renders the same rectangle into a grow-only scratch with the row order already inverted,
+    // so the caller's `glReadPixels` lands directly in `outRgba`.
+    //
+    // ⭐ EXACT, and the row algebra is the whole proof. `glReadPixels(x, y0, w, rows)` returns row
+    // r as GL row `y0 + r`; the CPU flip then writes `out[y] = stage[rows-1-y]`, i.e.
+    // `out[y] = GL row y0 + rows-1-y`. An FBO colour attachment's texel row v IS GL row v, and a
+    // fragment at `gl_FragCoord.y == y` writes output GL row y, so
+    // `texelFetch(src, ivec2(x0 + p.x, y0 + rows-1-p.y))` puts exactly that source row in exactly
+    // that output row. RGBA8 -> normalized float -> RGBA8 is the identity for the standard UNORM
+    // conversion, which is the same property `resolveColorToLogical` has relied on since G675.
+    //
+    // Rollback DC2_G760_NO_PRESENT_FLIP=1 (and DC2_G675_NO_RESOLVE=1, the family kill).
+    bool setupG760FlipProgram()
+    {
+        if (m_g760FlipProg != 0u)
+            return true;
+        if (m_g760FlipFailed)
+            return false;
+        static const char *kVS =
+            "#version 330 core\n"
+            "void main(){\n"
+            "    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+            "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+            "}\n";
+        static const char *kFS =
+            "#version 330 core\n"
+            "out vec4 o;\n"
+            "uniform sampler2D uSrc;\n"
+            "uniform int uOriginX;\n"
+            "uniform int uOriginY;\n"
+            "uniform int uRows;\n"
+            "void main(){\n"
+            "    ivec2 p = ivec2(gl_FragCoord.xy);\n"
+            "    o = texelFetch(uSrc, ivec2(uOriginX + p.x,\n"
+            "                               uOriginY + (uRows - 1 - p.y)), 0);\n"
+            "}\n";
+        GLuint vs = 0u, fs = 0u;
+        std::string log;
+        if (!g158CompileShader(m_f, GL158_VERTEX_SHADER, kVS, vs, log))
+        {
+            std::fprintf(stderr, "[G760:flip] FAIL: VS compile: %s\n", log.c_str());
+            m_g760FlipFailed = true;
+            return false;
+        }
+        if (!g158CompileShader(m_f, GL158_FRAGMENT_SHADER, kFS, fs, log))
+        {
+            std::fprintf(stderr, "[G760:flip] FAIL: FS compile: %s\n", log.c_str());
+            m_f.glDeleteShader_(vs);
+            m_g760FlipFailed = true;
+            return false;
+        }
+        const GLuint prog = m_f.glCreateProgram_();
+        m_f.glAttachShader_(prog, vs);
+        m_f.glAttachShader_(prog, fs);
+        m_f.glLinkProgram_(prog);
+        m_f.glDeleteShader_(vs);
+        m_f.glDeleteShader_(fs);
+        GLint linked = 0;
+        m_f.glGetProgramiv_(prog, GL158_LINK_STATUS, &linked);
+        if (!linked)
+        {
+            m_f.glDeleteProgram_(prog);
+            std::fprintf(stderr, "[G760:flip] FAIL: link\n");
+            m_g760FlipFailed = true;
+            return false;
+        }
+        m_g760FlipProg = prog;
+        m_f.glUseProgram_(m_g760FlipProg);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g760FlipProg, "uSrc"), 0);
+        m_locG760FlipOriginX = m_f.glGetUniformLocation_(m_g760FlipProg, "uOriginX");
+        m_locG760FlipOriginY = m_f.glGetUniformLocation_(m_g760FlipProg, "uOriginY");
+        m_locG760FlipRows = m_f.glGetUniformLocation_(m_g760FlipProg, "uRows");
+        std::fprintf(stderr, "[G760:flip] PASS: GPU presentation row flip ready\n");
+        return true;
+    }
+
+    // Leaves the flip FBO bound; the caller reads (0, 0, w, rows) out of it and MUST restore its
+    // own framebuffer binding and viewport afterwards (Rule G759-2).
+    bool flipPresentOnGpu(GLuint srcTex, int originX, int originY, int w, int rows,
+                          GLuint snapshotTexture = 0)
+    {
+        if (srcTex == 0u || w <= 0 || rows <= 0 || originX < 0 || originY < 0)
+            return false;
+        // ⚠️ Inert at S = 1, like every other mechanism in this family. At 1x the CPU flip moves
+        // 0.9 MB and an extra GPU pass plus a second readback would not pay for itself; the whole
+        // reason this exists is that the copy is S²-proportional. Keeping 1x byte-for-byte on its
+        // existing path also means no default-resolution gate can be perturbed by this change.
+        if (dc2GetNativeScale() <= 1)
+            return false;
+        if (g760NoPresentFlipOn())
+            return false;
+        if (!setupG760FlipProgram())
+            return false;
+        if (m_g760FlipFbo == 0u)
+        {
+            m_f.glGenFramebuffers_(1, &m_g760FlipFbo);
+            if (m_g760FlipFbo == 0u)
+                return false;
+        }
+        if (!snapshotTexture && (m_g760FlipTex == 0u || m_g760FlipW < w || m_g760FlipH < rows))
+        {
+            const int allocW = std::max(m_g760FlipW, w);
+            const int allocH = std::max(m_g760FlipH, rows);
+            if (m_g760FlipTex == 0u)
+                glGenTextures(1, &m_g760FlipTex);
+            if (m_g760FlipTex == 0u)
+                return false;
+            glBindTexture(GL_TEXTURE_2D, m_g760FlipTex);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, allocW, allocH, 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, nullptr);
+            m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g760FlipFbo);
+            m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0,
+                                        GL_TEXTURE_2D, m_g760FlipTex, 0);
+            if (g494FboStatus(kG494FlipFbo, GL158_FRAMEBUFFER_COMPLETE, [&]() {
+                    return m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER);
+                }) != GL158_FRAMEBUFFER_COMPLETE)
+            {
+                std::fprintf(stderr, "[G760:flip] FAIL: FBO incomplete at %dx%d\n", allocW, allocH);
+                m_g760FlipW = 0;
+                m_g760FlipH = 0;
+                m_g760FlipFailed = true;
+                return false;
+            }
+            m_g760FlipW = allocW;
+            m_g760FlipH = allocH;
+        }
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g760FlipFbo);
+        // Snapshot storage has an independent lease/fence lifetime. The scratch
+        // attachment must be restored on subsequent CPU-path calls as well.
+        m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0,
+                                    GL_TEXTURE_2D, snapshotTexture ? snapshotTexture : m_g760FlipTex, 0);
+        glViewport(0, 0, w, rows);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        glDisable(GL_BLEND);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        m_f.glUseProgram_(m_g760FlipProg);
+        m_f.glUniform1i_(m_locG760FlipOriginX, originX);
+        m_f.glUniform1i_(m_locG760FlipOriginY, originY);
+        m_f.glUniform1i_(m_locG760FlipRows, rows);
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, srcTex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        m_f.glBindVertexArray_(m_vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        return g494GetError(kG494FlipErr) == GL_NO_ERROR;
     }
 
     // ===== G675: the logical -> physical colour UPSCALE (the resolve's mirror) ===================
@@ -7532,6 +8659,259 @@ void main()
         return true;
     }
 
+    // ===== ⭐⭐⭐ G759: THE GUEST-DEPTH UPSCALE — the colour upscale's missing twin ===============
+    //
+    // WHAT IT REPLACES, AND WHY IT IS THE LARGEST SINGLE ITEM ON THE ROUTE. `renderBatch`'s
+    // guest-depth upload has, since G675, taken the S > 1 branch below at `z` (stage 3->4):
+    //
+    //     std::vector<float> scaledDepth(depth.physW * physDepthRows);   // 10.3 MB, per batch
+    //     for (py) { srcY = (py * depthRows) / physDepthRows;            // a divide per ROW
+    //         for (px) { srcX = (px * b.fbW) / depth.physW;              // A DIVIDE PER PIXEL
+    //                    dstRow[px] = srcRow[srcX]; } }                  // 2.58 M of them at S=3
+    //     glTexSubImage2D(..., GL_DEPTH_COMPONENT, GL_FLOAT, scaledDepth.data());  // 10.3 MB
+    //
+    // `tools/g758_stage.py` ranks `[G415:stage]` by TOTAL time rather than by the per-batch mean
+    // the line prints, and `z` is **7.07 ms/f — 71 %** of all instrumented renderBatch time on
+    // `dragon` at 1600x900, spread over three targets at 2.3-2.5 batches per frame each. It is
+    // also, by construction, S^2-proportional, and the route's frame time fits
+    // `14.23 + 2.537 * S^2` ms across a measured S = 1 / 2 / 3 sweep — so this term is 31 % of the
+    // whole scale-proportional budget.
+    //
+    // ⭐ EXACT, by the same argument G675 used for colour. `depth.physW == srcW * S` and
+    // `depth.physH == b.fbH * S` exactly (the one-integer-scale law, `ps2_native_res.inc`), so
+    // the CPU index `(px * srcW) / (srcW * S)` IS `px / S` in integer arithmetic, and
+    // `(py * rows) / (rows * S)` IS `py / S`. GLSL integer division truncates toward zero for
+    // non-negative operands exactly as C does, so `ivec2(gl_FragCoord.xy - origin) / uScale`
+    // computes the IDENTICAL source texel. Only the transport changes.
+    //
+    // ⭐ `gl_FragDepth` CLAMPING IS A NO-OP HERE, and that is a property of the producer, not an
+    // assumption: `rasterizer_vram_materialization.inc` builds every element as
+    // `float(z) * (1.0f / 4294967296.0f)` from a uint32 Z, so the whole image lies in [0, 1).
+    //
+    // ⚠️ The pass runs BEFORE `g415Note(); // 5`, and the G496 GL state cache is reset immediately
+    // after that mark — so the depth/colour-mask state this pass leaves cannot make the cache
+    // stale for the draw loop. It still restores the exact state vector the colour upscale leaves
+    // (colour mask on, depth test off, depth writes masked) so the two paths are interchangeable.
+    //
+    // Rollback `DC2_G759_NO_ZUP=1` (and `DC2_G675_NO_RESOLVE=1`, which disables the whole family).
+    // Verification arm `DC2_G759_ZUP_VERIFY=1` reads the physical attachment back and compares it
+    // against the CPU expansion texel for texel.
+    bool setupG759DepthUpscaleProgram()
+    {
+        if (m_g759ZupProg != 0u)
+            return true;
+        if (m_g759ZupFailed)
+            return false;
+        static const char *kVS =
+            "#version 330 core\n"
+            "void main(){\n"
+            "    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+            "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+            "}\n";
+        static const char *kFS =
+            "#version 330 core\n"
+            "uniform sampler2D uSrc;\n"
+            "uniform int uScale;\n"
+            "uniform int uOriginY;\n"
+            "void main(){\n"
+            "    ivec2 c = ivec2(gl_FragCoord.xy);\n"
+            "    gl_FragDepth = texelFetch(uSrc, ivec2(c.x / uScale,\n"
+            "                                          (c.y - uOriginY) / uScale), 0).r;\n"
+            "}\n";
+        GLuint vs = 0u, fs = 0u;
+        std::string log;
+        if (!g158CompileShader(m_f, GL158_VERTEX_SHADER, kVS, vs, log))
+        {
+            std::fprintf(stderr, "[G759:zup] FAIL: VS compile: %s\n", log.c_str());
+            m_g759ZupFailed = true;
+            return false;
+        }
+        if (!g158CompileShader(m_f, GL158_FRAGMENT_SHADER, kFS, fs, log))
+        {
+            std::fprintf(stderr, "[G759:zup] FAIL: FS compile: %s\n", log.c_str());
+            m_f.glDeleteShader_(vs);
+            m_g759ZupFailed = true;
+            return false;
+        }
+        const GLuint prog = m_f.glCreateProgram_();
+        m_f.glAttachShader_(prog, vs);
+        m_f.glAttachShader_(prog, fs);
+        m_f.glLinkProgram_(prog);
+        m_f.glDeleteShader_(vs);
+        m_f.glDeleteShader_(fs);
+        GLint linked = 0;
+        m_f.glGetProgramiv_(prog, GL158_LINK_STATUS, &linked);
+        if (!linked)
+        {
+            m_f.glDeleteProgram_(prog);
+            std::fprintf(stderr, "[G759:zup] FAIL: link\n");
+            m_g759ZupFailed = true;
+            return false;
+        }
+        m_g759ZupProg = prog;
+        m_f.glUseProgram_(m_g759ZupProg);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g759ZupProg, "uSrc"), 0);
+        m_locG759ZupScale = m_f.glGetUniformLocation_(m_g759ZupProg, "uScale");
+        m_locG759ZupOriginY = m_f.glGetUniformLocation_(m_g759ZupProg, "uOriginY");
+        std::fprintf(stderr, "[G759:zup] PASS: logical->physical guest-depth upscale ready\n");
+        return true;
+    }
+
+    // Replicates `src` (logical, srcW x srcRows, GL-space row window starting at logY) into
+    // `dstTex` (physical, dstPhysW x dstPhysH). Returns false when unavailable; the caller keeps
+    // its CPU path, so this can only change transport, never a depth value.
+    bool upscaleDepthLogicalToPhysical(GLuint dstTex, int dstPhysW, int dstPhysH,
+                                       const float *src, int srcW, int srcFullRows,
+                                       int srcRows, int logY)
+    {
+        const int s = dc2GetNativeScale();
+        if (s <= 1 || dstTex == 0u || src == nullptr || srcW <= 0 || srcRows <= 0 || logY < 0)
+            return false;
+        if (g759NoDepthUpscaleOn())
+            return false;
+        // Fail closed unless the attachment is EXACTLY the integer multiple the exactness argument
+        // above depends on. Anything else takes the CPU expansion, which handles the general case.
+        if (dstPhysW != srcW * s || dstPhysH != srcFullRows * s)
+            return false;
+        if (!setupG759DepthUpscaleProgram())
+            return false;
+        if (m_g759ZupFbo == 0u)
+        {
+            m_f.glGenFramebuffers_(1, &m_g759ZupFbo);
+            if (m_g759ZupFbo == 0u)
+                return false;
+        }
+        if (m_g759ZupTex == 0u)
+        {
+            glGenTextures(1, &m_g759ZupTex);
+            if (m_g759ZupTex == 0u)
+                return false;
+            m_g759ZupW = 0;
+            m_g759ZupH = 0;
+        }
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, m_g759ZupTex);
+        if (m_g759ZupW < srcW || m_g759ZupH < srcRows)
+        {
+            // Grow-only: the staging image converges after a couple of batches and is never
+            // reallocated again. Texels outside [0,srcW) x [0,srcRows) are never fetched.
+            const int aw = std::max(m_g759ZupW, srcW);
+            const int ah = std::max(m_g759ZupH, srcRows);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL759_R32F, aw, ah, 0, GL759_RED, GL_FLOAT, nullptr);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                            static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                            static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            if (g494GetError(kG494ZupErr) != GL_NO_ERROR)
+            {
+                m_g759ZupW = 0;
+                m_g759ZupH = 0;
+                m_g759ZupFailed = true;
+                return false;
+            }
+            m_g759ZupW = aw;
+            m_g759ZupH = ah;
+        }
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, srcW, srcRows, GL759_RED, GL_FLOAT, src);
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g759ZupFbo);
+        m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL178_DEPTH_ATTACHMENT,
+                                    GL_TEXTURE_2D, dstTex, 0);
+        // A depth-only FBO needs both colour buffers switched off to be complete. Re-check
+        // completeness only when the attached object or its geometry changes; `ensureDepth`
+        // deletes and recreates the texture on a size change and GL may hand back the same name,
+        // so the key carries the dimensions as well as the name.
+        const uint64_t zupKey = (static_cast<uint64_t>(dstTex) << 32) ^
+                                (static_cast<uint64_t>(dstPhysW) << 16) ^
+                                static_cast<uint64_t>(dstPhysH);
+        if (m_g759ZupKey != zupKey)
+        {
+            glDrawBuffer(GL_NONE);
+            glReadBuffer(GL_NONE);
+            if (m_f.glCheckFramebufferStatus_(GL158_FRAMEBUFFER) != GL158_FRAMEBUFFER_COMPLETE)
+            {
+                std::fprintf(stderr, "[G759:zup] FAIL: depth FBO incomplete at %dx%d\n",
+                             dstPhysW, dstPhysH);
+                m_g759ZupFailed = true;
+                m_g759ZupKey = 0ull;
+                return false;
+            }
+            m_g759ZupKey = zupKey;
+        }
+        const int physY = logY * s;
+        glViewport(0, physY, srcW * s, srcRows * s);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_BLEND);
+        glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_FALSE);
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_ALWAYS);
+        glDepthMask(GL_TRUE);
+        m_f.glUseProgram_(m_g759ZupProg);
+        m_f.glUniform1i_(m_locG759ZupScale, s);
+        m_f.glUniform1i_(m_locG759ZupOriginY, physY);
+        m_f.glBindVertexArray_(m_vao);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        // Leave the exact state vector `upscaleLogicalToPhysical` leaves, so the two are
+        // interchangeable for everything downstream.
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        glDisable(GL_DEPTH_TEST);
+        glDepthMask(GL_FALSE);
+        return g494GetError(kG494ZupErr) == GL_NO_ERROR;
+    }
+
+    // G759 verification arm (DC2_G759_ZUP_VERIFY=1, never in a timing arm). Reads the physical
+    // depth attachment back and compares the rows the pass just wrote against the CPU expansion it
+    // replaced, texel for texel. `gl_FragDepth` is written and read as 32-bit float on both sides,
+    // and the source values are exact float products, so the comparison is EXACT — not epsilon'd.
+    // (G679's Rule 55: a float epsilon is not a test for exactness.)
+    void g759VerifyDepthUpscale(const DepthEntry &depth, const std::vector<float> &src,
+                                int srcW, int srcRows, int logY)
+    {
+        if (!g759DepthUpscaleVerifyOn() || depth.tex == 0u)
+            return;
+        const int s = dc2GetNativeScale();
+        if (s <= 1 || depth.physW != srcW * s)
+            return;
+        m_g759ZupProbe.assign(static_cast<size_t>(depth.physW) *
+                                  static_cast<size_t>(depth.physH), -1.0f);
+        glBindTexture(GL_TEXTURE_2D, depth.tex);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT, GL_FLOAT, m_g759ZupProbe.data());
+        const int physY = logY * s, physRows = srcRows * s;
+        uint64_t bad = 0ull;
+        int badPx = -1, badPy = -1;
+        float got = 0.0f, want = 0.0f;
+        for (int py = 0; py < physRows; ++py)
+        {
+            const float *ref = src.data() + static_cast<size_t>(py / s) * srcW;
+            const float *have = m_g759ZupProbe.data() +
+                                static_cast<size_t>(physY + py) * depth.physW;
+            for (int px = 0; px < depth.physW; ++px)
+                if (have[px] != ref[px / s])
+                {
+                    if (bad == 0ull)
+                    {
+                        badPx = px;
+                        badPy = py;
+                        got = have[px];
+                        want = ref[px / s];
+                    }
+                    ++bad;
+                }
+        }
+        G759BackendStat &st = g759Stat();
+        st.zupVerified.fetch_add(1ull, std::memory_order_relaxed);
+        if (bad != 0ull)
+        {
+            st.zupBad.fetch_add(bad, std::memory_order_relaxed);
+            std::fprintf(stderr,
+                         "[G759:zup-BAD] s=%d phys=%dx%d logY=%d rows=%d bad=%llu "
+                         "first=(%d,%d) got=%.9g want=%.9g\n",
+                         s, depth.physW, depth.physH, logY, srcRows,
+                         (unsigned long long)bad, badPx, badPy, got, want);
+        }
+    }
+
     // Replicates `src` (logical, srcW x srcRows) into the already-bound physical FBO at logical
     // GL-space offset (logX, logY). Returns false when unavailable; every caller keeps its CPU
     // path, so this can only change transport, never a pixel.
@@ -7555,21 +8935,30 @@ void main()
         }
         m_f.glActiveTexture_(GL158_TEXTURE0);
         glBindTexture(GL_TEXTURE_2D, m_g675UpTex);
-        if (m_g675UpW != srcW || m_g675UpH != srcRows)
+        // G765: GROW-ONLY, the rule G759 gave the depth sibling (upscaleDepthLogicalToPhysical) and
+        // the colour resolve. This staging texture was reallocated with glTexImage2D whenever the
+        // row window changed size — every row-windowed renderBatch/writeColor upload at S > 1 —
+        // and G765's executor profile booked that glTexImage2D at ~3 % of the pole thread. The
+        // shader reads it with texelFetch at (frag - origin) / S, which never leaves the
+        // [0,srcW) x [0,srcRows) corner, so a larger texture is exact. Rollback DC2_G765_NO_UPGROW=1.
+        static const bool s_g765NoUpGrow = std::getenv("DC2_G765_NO_UPGROW") != nullptr;
+        const bool g765Realloc = s_g765NoUpGrow
+                                     ? (m_g675UpW != srcW || m_g675UpH != srcRows)
+                                     : (m_g675UpW < srcW || m_g675UpH < srcRows);
+        if (g765Realloc)
         {
-            glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, srcW, srcRows, 0, GL_RGBA,
-                         GL_UNSIGNED_BYTE, src);
+            const int aw = s_g765NoUpGrow ? srcW : std::max(m_g675UpW, srcW);
+            const int ah = s_g765NoUpGrow ? srcRows : std::max(m_g675UpH, srcRows);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, aw, ah, 0, GL_RGBA,
+                         GL_UNSIGNED_BYTE, nullptr);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, static_cast<GLint>(GL158_CLAMP_TO_EDGE));
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, static_cast<GLint>(GL158_CLAMP_TO_EDGE));
-            m_g675UpW = srcW;
-            m_g675UpH = srcRows;
+            m_g675UpW = aw;
+            m_g675UpH = ah;
         }
-        else
-        {
-            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, srcW, srcRows, GL_RGBA, GL_UNSIGNED_BYTE, src);
-        }
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, srcW, srcRows, GL_RGBA, GL_UNSIGNED_BYTE, src);
         glViewport(logX * s, logY * s, srcW * s, srcRows * s);
         glDisable(GL_SCISSOR_TEST);
         glDisable(GL_DEPTH_TEST);
@@ -7704,13 +9093,22 @@ void main()
             glGenTextures(1, &m_g627MaskTex);
         if (m_g627ValTex == 0u || m_g627MaskTex == 0u)
             return false;
-        const bool fresh = (m_g627TexW != w || m_g627TexH != rows);
+        // G765: grow-only (see upscaleLogicalToPhysical). The lane shader texelFetches
+        // floor((frag - origin) / scale), which stays inside [0,w) x [0,rows), so storage larger
+        // than the patch is exact; only a patch that outgrows it reallocates.
+        static const bool s_g765NoLaneGrow = std::getenv("DC2_G765_NO_UPGROW") != nullptr;
+        const bool fresh = s_g765NoLaneGrow ? (m_g627TexW != w || m_g627TexH != rows)
+                                            : (m_g627TexW < w || m_g627TexH < rows);
+        const int allocW = s_g765NoLaneGrow ? w : std::max(m_g627TexW, w);
+        const int allocH = s_g765NoLaneGrow ? rows : std::max(m_g627TexH, rows);
         const auto upload = [&](GLuint tex, const std::vector<uint32_t> &px) {
             glBindTexture(GL_TEXTURE_2D, tex);
             if (fresh)
             {
-                glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, w, rows, 0,
-                             GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+                glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, allocW, allocH, 0,
+                             GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, rows,
+                                GL_RGBA, GL_UNSIGNED_BYTE, px.data());
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
                 glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
@@ -7728,8 +9126,11 @@ void main()
         upload(m_g627ValTex, in);
         m_f.glActiveTexture_(GL158_TEXTURE0 + 1u);
         upload(m_g627MaskTex, mask);
-        m_g627TexW = w;
-        m_g627TexH = rows;
+        if (fresh)
+        {
+            m_g627TexW = allocW;
+            m_g627TexH = allocH;
+        }
 
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, dst.fbo);
         glViewport(physX, physY, physW, physRows);
@@ -7757,11 +9158,191 @@ void main()
         return g494GetError(kG494WColErr) == GL_NO_ERROR;
     }
 
+    // ===== G766: per-BIT masked patch of a resident CT32 target FBO =====
+    // G627's lane draws can only replace whole BYTES. A PSMT4 / PSMT4HL / PSMT4HH guest write lands
+    // in a NIBBLE of a CT32 word and a PSMCT16 write in a half-word, so the general form is a bit
+    // mask. The colour attachment is RGBA8 UNORM, where the fixed-function logic op applies to the
+    // stored bits: pass 0 draws ~mask with GL_AND (clears exactly the written bits), pass 1 draws
+    // (value & mask) with GL_OR (sets them). Texels whose mask is 0 are the identity under both
+    // passes, so no discard and no destination read are needed, and the high-resolution replicas
+    // of a logical texel keep their own values in every bit the guest did not write.
+    bool setupG766BitsProgram()
+    {
+        if (m_g766BitsProg != 0u)
+            return true;
+        if (m_g766BitsProgFailed)
+            return false;
+        static const char *kVS =
+            "#version 330 core\n"
+            "void main(){\n"
+            "    vec2 p = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);\n"
+            "    gl_Position = vec4(p * 2.0 - 1.0, 0.0, 1.0);\n"
+            "}\n";
+        static const char *kFS =
+            "#version 330 core\n"
+            "out vec4 o;\n"
+            "uniform sampler2D uVal;\n"
+            "uniform sampler2D uMask;\n"
+            "uniform vec2 uOrigin;\n"
+            "uniform vec2 uScale;\n"
+            "uniform int uMode;\n"
+            "void main(){\n"
+            "    ivec2 p = ivec2(floor((gl_FragCoord.xy - uOrigin) / uScale));\n"
+            "    ivec4 m = clamp(ivec4(floor(texelFetch(uMask,p,0)*255.0+0.5)),0,255);\n"
+            "    if (uMode == 0) {\n"
+            "        o = vec4(ivec4(255) - m) / 255.0;\n"
+            "    } else {\n"
+            "        ivec4 v = clamp(ivec4(floor(texelFetch(uVal,p,0)*255.0+0.5)),0,255);\n"
+            "        o = vec4(v & m) / 255.0;\n"
+            "    }\n"
+            "}\n";
+        GLuint vs = 0, fs = 0;
+        std::string log;
+        if (!g158CompileShader(m_f, GL158_VERTEX_SHADER, kVS, vs, log))
+        {
+            std::fprintf(stderr, "[G766:backend] FAIL: VS compile: %s\n", log.c_str());
+            m_g766BitsProgFailed = true;
+            return false;
+        }
+        if (!g158CompileShader(m_f, GL158_FRAGMENT_SHADER, kFS, fs, log))
+        {
+            std::fprintf(stderr, "[G766:backend] FAIL: FS compile: %s\n", log.c_str());
+            m_f.glDeleteShader_(vs);
+            m_g766BitsProgFailed = true;
+            return false;
+        }
+        const GLuint prog = m_f.glCreateProgram_();
+        m_f.glAttachShader_(prog, vs);
+        m_f.glAttachShader_(prog, fs);
+        m_f.glLinkProgram_(prog);
+        GLint linked = 0;
+        m_f.glGetProgramiv_(prog, GL158_LINK_STATUS, &linked);
+        m_f.glDeleteShader_(vs);
+        m_f.glDeleteShader_(fs);
+        if (!linked)
+        {
+            GLint len = 0;
+            m_f.glGetProgramiv_(prog, GL158_INFO_LOG_LENGTH, &len);
+            std::vector<char> buf(len > 0 ? static_cast<size_t>(len) : 1u);
+            m_f.glGetProgramInfoLog_(prog, static_cast<GLsizei>(buf.size()), nullptr, buf.data());
+            std::fprintf(stderr, "[G766:backend] FAIL: program link: %s\n", buf.data());
+            m_f.glDeleteProgram_(prog);
+            m_g766BitsProgFailed = true;
+            return false;
+        }
+        m_g766BitsProg = prog;
+        m_f.glUseProgram_(m_g766BitsProg);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g766BitsProg, "uVal"), 0);
+        m_f.glUniform1i_(m_f.glGetUniformLocation_(m_g766BitsProg, "uMask"), 1);
+        m_locG766Origin = m_f.glGetUniformLocation_(m_g766BitsProg, "uOrigin");
+        m_locG766Scale = m_f.glGetUniformLocation_(m_g766BitsProg, "uScale");
+        m_locG766Mode = m_f.glGetUniformLocation_(m_g766BitsProg, "uMode");
+        std::fprintf(stderr, "[G766:backend] PASS: bit-masked FBO patch program ready\n");
+        return true;
+    }
+
+    bool writeColorBitsOnWorker(uint32_t fbp, int texW, int texH,
+                                int glX, int glY, int w, int rows,
+                                const std::vector<uint32_t> &in,
+                                const std::vector<uint32_t> &mask)
+    {
+        if (!dc2ShouldExecuteRenderEvent("g766BitPatch", fbp, 0, 0, static_cast<float>(glX),
+                                         static_cast<float>(glY), static_cast<float>(glX + w),
+                                         static_cast<float>(glY + rows), 0, 0, 0, 0, 0))
+            return true;
+        if (texW <= 0 || texH <= 0 || glX < 0 || glY < 0 || w <= 0 || rows <= 0 ||
+            glX > texW || w > texW - glX || glY > texH || rows > texH - glY ||
+            in.size() != static_cast<size_t>(w) * rows || mask.size() != in.size())
+            return false;
+        auto it = m_fbos.find(g349FboKey(fbp, texW)); // G349 de-collide, same key writeColor uses
+        if (it == m_fbos.end() || it->second.fbo == 0 || it->second.colorTex == 0 ||
+            it->second.w != texW || it->second.h != texH)
+            return false;
+        if (!setupG766BitsProgram())
+            return false;
+        const FboEntry &dst = it->second;
+        const float sx = (dst.physW > 0 && dst.w > 0)
+                             ? static_cast<float>(dst.physW) / static_cast<float>(dst.w)
+                             : 1.0f;
+        const float sy = (dst.physH > 0 && dst.h > 0)
+                             ? static_cast<float>(dst.physH) / static_cast<float>(dst.h)
+                             : 1.0f;
+        const int physX = static_cast<int>(std::round(glX * sx));
+        const int physY = static_cast<int>(std::round(glY * sy));
+        const int physW = std::max(1, static_cast<int>(std::round(w * sx)));
+        const int physRows = std::max(1, static_cast<int>(std::round(rows * sy)));
+
+        g494DrainErrors(kG494WColErr);
+        if (m_g627ValTex == 0u)
+            glGenTextures(1, &m_g627ValTex);
+        if (m_g627MaskTex == 0u)
+            glGenTextures(1, &m_g627MaskTex);
+        if (m_g627ValTex == 0u || m_g627MaskTex == 0u)
+            return false;
+        // Grow-only, shared with G627 (both run on this thread, synchronously).
+        const bool fresh = m_g627TexW < w || m_g627TexH < rows;
+        const int allocW = std::max(m_g627TexW, w);
+        const int allocH = std::max(m_g627TexH, rows);
+        const auto upload = [&](GLuint tex, const std::vector<uint32_t> &px) {
+            glBindTexture(GL_TEXTURE_2D, tex);
+            if (fresh)
+            {
+                glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, allocW, allocH, 0,
+                             GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S,
+                                static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
+                                static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            }
+            glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, w, rows,
+                            GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        };
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        upload(m_g627ValTex, in);
+        m_f.glActiveTexture_(GL158_TEXTURE0 + 1u);
+        upload(m_g627MaskTex, mask);
+        if (fresh)
+        {
+            m_g627TexW = allocW;
+            m_g627TexH = allocH;
+        }
+
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, dst.fbo);
+        glViewport(physX, physY, physW, physRows);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_BLEND);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        m_f.glUseProgram_(m_g766BitsProg);
+        if (m_locG766Origin >= 0)
+            m_e.glUniform2f_(m_locG766Origin, static_cast<float>(physX),
+                             static_cast<float>(physY));
+        if (m_locG766Scale >= 0)
+            m_e.glUniform2f_(m_locG766Scale,
+                             static_cast<float>(physW) / static_cast<float>(w),
+                             static_cast<float>(physRows) / static_cast<float>(rows));
+        m_f.glBindVertexArray_(m_vao);
+        glEnable(GL_COLOR_LOGIC_OP);
+        glLogicOp(GL_AND);
+        m_f.glUniform1i_(m_locG766Mode, 0);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glLogicOp(GL_OR);
+        m_f.glUniform1i_(m_locG766Mode, 1);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        glLogicOp(GL_COPY);
+        glDisable(GL_COLOR_LOGIC_OP);
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        return g494GetError(kG494WColErr) == GL_NO_ERROR;
+    }
+
     // Native High-Res Presentation Read: read active display FBO directly at its native physical resolution.
     bool readDisplayFboOnWorker(uint32_t fbp, uint32_t fallbackFbp,
                                 int32_t rectX, int32_t rectY, int32_t rectW, int32_t rectH,
                                 uint32_t &outW, uint32_t &outH,
-                                std::vector<uint8_t> &outRgba)
+                                std::vector<uint8_t> &outRgba,
+                                dc2::gpu_present::FramePtr* gpuFrame)
     {
         dc2RenderEventCounter().store(0u, std::memory_order_relaxed);
         auto it = m_fbos.find(g349FboKey(fbp, 512));
@@ -7822,17 +9403,73 @@ void main()
 
         outW = static_cast<uint32_t>(physW);
         outH = static_cast<uint32_t>(physRows);
+        if (gpuFrame && dc2::gpu_present::enabled())
+        {
+            gpuFrame->reset();
+            auto snapshot = dc2::gpu_present::begin(outW, outH);
+            if (snapshot && fbo.colorTex &&
+                flipPresentOnGpu(fbo.colorTex, physX, physGlY, physW, physRows, snapshot->texture) &&
+                dc2::gpu_present::publish(snapshot))
+            {
+                m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, fbo.fbo);
+                static const bool verify = g158EnvFlag("DC2_G764_SHARED_VERIFY");
+                static uint64_t calls = 0, checks = 0, badTotal = 0;
+                bool exact = true;
+                if (verify && (++calls <= 4 || calls % 128 == 0))
+                {
+                    std::vector<uint32_t> original(size_t(physW) * physRows);
+                    std::vector<uint8_t> actual;
+                    glReadPixels(physX, physGlY, physW, physRows, GL_RGBA,
+                                 GL_UNSIGNED_BYTE, original.data());
+                    uint64_t bad = 0;
+                    if (!dc2::gpu_present::readPixels(snapshot, actual)) bad = original.size();
+                    else
+                    {
+                        const auto* pixels = reinterpret_cast<const uint32_t*>(actual.data());
+                        for (int y = 0; y < physRows; ++y) for (int x = 0; x < physW; ++x)
+                            bad += pixels[size_t(y)*physW+x] !=
+                                (original[size_t(physRows-1-y)*physW+x] | 0xff000000u);
+                    }
+                    ++checks; badTotal += bad; exact = bad == 0;
+                    std::fprintf(stderr, "[G764:shared-verify] checks=%llu bad=%llu last=%llu\n",
+                        (unsigned long long)checks, (unsigned long long)badTotal, (unsigned long long)bad);
+                }
+                if (exact)
+                {
+                *gpuFrame = std::move(snapshot);
+                outRgba.clear();
+                return true;
+                }
+            }
+        }
         outRgba.resize(static_cast<size_t>(physW) * physRows * 4u);
 
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, fbo.fbo);
         glDisable(GL_SCISSOR_TEST);
-        std::vector<uint32_t> glPixels(static_cast<size_t>(physW) * physRows);
-        glReadPixels(physX, physGlY, physW, physRows, GL_RGBA, GL_UNSIGNED_BYTE, glPixels.data());
+        // ⭐⭐ G760: do the top-origin flip on the GPU and read straight into `outRgba`, so the
+        // 7.65 MB second pass below (and the staging image it needs) does not happen at all. Falls
+        // back to the CPU form on ANY refusal, so this can only change transport.
+        if (fbo.colorTex != 0u &&
+            flipPresentOnGpu(fbo.colorTex, physX, physGlY, physW, physRows))
+        {
+            glReadPixels(0, 0, physW, physRows, GL_RGBA, GL_UNSIGNED_BYTE, outRgba.data());
+            // ⛔ Rule G759-2: the flip left ITS framebuffer bound.
+            m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, fbo.fbo);
+            return true;
+        }
+        // ⭐ G759: the staging image is a MEMBER. It was a `std::vector<uint32_t>` CONSTRUCTED
+        // HERE — and therefore value-initialised (a full zero fill) and then freed — once per
+        // presented frame, at PHYSICAL size: 1536 x 1245 x 4 B = 7.6 MB at S=3 on this route. The
+        // read overwrites every byte it zeroes, so the fill was pure loss; `resize` on a member
+        // keeps the capacity and, once it has grown, writes nothing.
+        m_g759PresentStage.resize(static_cast<size_t>(physW) * physRows);
+        uint32_t *const glPixels = m_g759PresentStage.data();
+        glReadPixels(physX, physGlY, physW, physRows, GL_RGBA, GL_UNSIGNED_BYTE, glPixels);
 
         // GL is bottom-origin, convert to top-origin presentation scanlines
         for (int y = 0; y < physRows; ++y)
         {
-            const uint32_t *srcRow = glPixels.data() + static_cast<size_t>(physRows - 1 - y) * physW;
+            const uint32_t *srcRow = glPixels + static_cast<size_t>(physRows - 1 - y) * physW;
             uint32_t *dstRow = reinterpret_cast<uint32_t *>(outRgba.data() + static_cast<size_t>(y) * physW * 4u);
             std::memcpy(dstRow, srcRow, static_cast<size_t>(physW) * 4u);
         }
@@ -8389,14 +10026,33 @@ void main()
             const int physDepthY = depthY * s;
             const int physDepthRows = depthRows * s;
             const int physW = it->second.physW;
-            std::vector<float> physDepth(static_cast<size_t>(physW) * physDepthRows);
-            glReadPixels(0, physDepthY, physW, physDepthRows, GL_DEPTH_COMPONENT, GL_FLOAT, physDepth.data());
-            for (int r = 0; r < depthRows; ++r)
+            // ⭐ G760: take that identical tap on the GPU and read back a LOGICAL-sized image, so
+            // the bus moves 1x the bytes instead of S^2 and the decimation leaves the pole thread.
+            if (resolveDepthToLogical(it->second.tex, w, h, physW, it->second.physH, c))
             {
-                const float *srcRow = physDepth.data() + static_cast<size_t>(r * s + c) * physW;
-                float *dstRow = out.data() + static_cast<size_t>(r) * w;
-                for (int x = 0; x < w; ++x)
-                    dstRow[x] = srcRow[x * s + c];
+                glReadPixels(0, depthY, w, depthRows, GL759_RED, GL_FLOAT, out.data());
+                g760VerifyDepthResolve(scratch.fbo, out, w, physW, depthY, depthRows, c);
+                g760NoteZrd(true, static_cast<uint64_t>(w) * depthRows,
+                            static_cast<uint64_t>(physW) * physDepthRows -
+                                static_cast<uint64_t>(w) * depthRows);
+                // ⛔ Rule G759-2: the resolve left ITS framebuffer bound. Everything below — and
+                // the caller — assumes this function's scratch FBO.
+                m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, scratch.fbo);
+            }
+            else
+            {
+                std::vector<float> physDepth(static_cast<size_t>(physW) * physDepthRows);
+                glReadPixels(0, physDepthY, physW, physDepthRows, GL_DEPTH_COMPONENT, GL_FLOAT, physDepth.data());
+                for (int r = 0; r < depthRows; ++r)
+                {
+                    const float *srcRow = physDepth.data() + static_cast<size_t>(r * s + c) * physW;
+                    float *dstRow = out.data() + static_cast<size_t>(r) * w;
+                    for (int x = 0; x < w; ++x)
+                        dstRow[x] = srcRow[x * s + c];
+                }
+                g760NoteZrd(false, static_cast<uint64_t>(w) * depthRows,
+                            static_cast<uint64_t>(physW) * physDepthRows -
+                                static_cast<uint64_t>(w) * depthRows);
             }
         }
         else
@@ -8713,7 +10369,7 @@ void main()
         for (const G178TexUpload &up : b.texUploads)
         {
             if (up.key == 0u || up.w <= 0 || up.h <= 0 ||
-                static_cast<uint64_t>(up.px.size()) !=
+                static_cast<uint64_t>(up.pixelCount()) !=
                     static_cast<uint64_t>(up.w) * static_cast<uint64_t>(up.h))
                 return false;
             uploadedKeys.insert(up.key);
@@ -8741,7 +10397,11 @@ void main()
                 // G261 FBO-texture source: no texKey, never the batch's own target (feedback),
                 // and the source FBO must already exist (a wave rendered into it).
                 const uint32_t srcFbp = g289RealSourceFbp(d.srcFbp);
-                if (d.texKey != 0u || srcFbp == b.fbp)
+                // G766: feedback is a sample of THIS batch's FBO — compare the de-collided key
+                // (0x139's narrow view is a different surface from its wide one).
+                const uint32_t g766Own = g349FboKey(b.fboKey != 0u ? b.fboKey : b.fbp, b.fbW);
+                if (d.texKey != 0u || srcFbp == g766Own ||
+                    (b.fboKey == 0u && srcFbp == b.fbp && g766Own == b.fbp))
                     return false;
                 const auto it = m_fbos.find(srcFbp);
                 if (it == m_fbos.end() || it->second.fbo == 0 || it->second.colorTex == 0)
@@ -8927,6 +10587,7 @@ void main()
         const auto g415Note = [&] {
             if (g415Census && g415Mark < kG415Marks)
                 g415Marks[g415Mark] = std::chrono::steady_clock::now();
+            g765GpuStamp(g415Mark, b.fbp, static_cast<uint32_t>(b.draws.size())); // G765 GPU stage clock (diag)
             ++g415Mark;
         };
         g415Note(); // 0: entry
@@ -8937,6 +10598,12 @@ void main()
              depthReadY > b.fbH || depthReadRows > b.fbH - depthReadY))
             return false;
         ++m_batchCounter;
+        // G761 (default-off): start a fresh seam trace for each 0x139 batch.
+        if (b.fbp == 0x139u)
+            g761SeamReset(m_batchCounter);
+        // G762 (default-off): one-pixel per-draw history, armed only for the shadow accumulation.
+        if (b.fbp == 0x139u)
+            g762PixReset(m_batchCounter, b.fbp, b.draws.size());
 
         // Texture (re)uploads: replace-in-place keyed by the front-end's descriptor hash.
         for (G178TexUpload &up : b.texUploads)
@@ -8968,10 +10635,10 @@ void main()
             static const bool s_g620NoSubImage = g158EnvFlag("DC2_G620_NO_SUBIMAGE");
             if (!s_g620NoSubImage && !fresh && t.w == up.w && t.h == up.h && up.w > 0 && up.h > 0)
                 glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, up.w, up.h, GL_RGBA, GL_UNSIGNED_BYTE,
-                                up.px.data());
+                                up.pixelData());
             else
                 glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, up.w, up.h, 0, GL_RGBA,
-                             GL_UNSIGNED_BYTE, up.px.data());
+                             GL_UNSIGNED_BYTE, up.pixelData());
             t.w = up.w;
             t.h = up.h;
             t.lastUse = m_batchCounter;
@@ -9277,32 +10944,89 @@ void main()
                     actual[first], b.g716SeedExpected[first], b.fbPixels[first]);
         }
         g716TraceSurface(b, fbo.colorTex, 0);
+        // G766: GPU page pulls from other resident FBOs that hold newer bytes for pages of this
+        // window (armed by the front end instead of publishing those FBOs to guest VRAM).
+        const bool g767PullsOk = g766ApplyPostUpload(b, fbo, viewportW, viewportH);
         g415Note(); // 3: framebuffer upload
 
         // G242: the real guest Z target owns one persistent texture keyed by ZBP/ZBW/ZPSM, not by
         // the alternating color FBP. The front-end uploads only when guest VRAM changed and reads
         // back only at a CPU/transfer/frame boundary.
         const bool guestDepth = depthKey != 0u;
+        // G760: the fused depth READBACK at the end of this function needs the guest-Z texture the
+        // block below attaches, and `depth` is scoped to that block. The readback path is the only
+        // consumer; these stay 0 when there is no guest depth, which is exactly when it is skipped.
+        GLuint g760DepthTex = 0u;
+        int g760DepthPhysW = 0, g760DepthPhysH = 0;
         if (guestDepth)
         {
             DepthEntry &depth = ensureDepth(depthKey, b.fbW, b.fbH);
             if (depth.tex == 0 || depth.w != b.fbW || depth.h != b.fbH)
                 return false;
+            g760DepthTex = depth.tex;
+            g760DepthPhysW = depth.physW;
+            g760DepthPhysH = depth.physH;
             if (depthUpload != nullptr)
             {
+                const bool physScaled = (depth.physW != b.fbW || depth.physH != b.fbH);
+                // ⭐⭐⭐ G759: run the replication on the GPU. `[G415:stage]`'s `z` mark — the CPU
+                // expansion below plus its S^2-sized glTexSubImage2D — is 7.07 ms/f, 71 % of all
+                // instrumented renderBatch time on `dragon` at 1600x900. Exact by construction
+                // (see upscaleDepthLogicalToPhysical); falls through to the CPU path on ANY
+                // refusal, so this can only change transport.
+                const bool zupOk =
+                    physScaled &&
+                    upscaleDepthLogicalToPhysical(depth.tex, depth.physW, depth.physH,
+                                                  depthUpload->data(), b.fbW, b.fbH,
+                                                  depthRows, depthY);
+                if (zupOk)
+                {
+                    g759NoteZup(true, static_cast<uint64_t>(depth.physW) *
+                                          static_cast<uint64_t>(depthRows) *
+                                          static_cast<uint64_t>(dc2GetNativeScale()));
+                    g759VerifyDepthUpscale(depth, *depthUpload, b.fbW, depthRows, depthY);
+                    // ⛔⛔⛔ RESTORE THE VIEWPORT. THIS IS THE DEFECT A CONTENT ORACLE CANNOT SEE.
+                    //
+                    // `renderBatch` sets `glViewport(0, 0, viewportW, viewportH)` ONCE, at
+                    // `g415Note(); // 2`, and every draw in the batch inherits it — the draw loop
+                    // never sets it again on the normal path (the only other `glViewport` calls in
+                    // this function are inside the G256/G257 exact/image-load-store path). The
+                    // colour upscale one stage earlier knows this and restores it explicitly, with
+                    // the comment "the upscale left the viewport at the full physical target".
+                    // The first revision of this depth pass set `glViewport(0, physY, w*S, rows*S)`
+                    // and returned without restoring, so EVERY draw in a batch that uploaded guest
+                    // depth rendered through the depth row-window instead of the whole target.
+                    //
+                    // ⚠️ `DC2_G759_ZUP_VERIFY` passed 511/511 with ZERO bad texels while this was
+                    // live: it reads the depth attachment back and compares it to the CPU
+                    // expansion, so it proves the CONTENT and is blind to the STATE. A pixel gate
+                    // on a graphics route is what catches this class, and it is why one is
+                    // mandatory for a backend change no matter how exact the content proof is.
+                }
+                // A failed helper may also have bound its FBO or changed the viewport
+                // before rejecting the pass. Restore on both success and CPU fallback.
+                if (physScaled)
+                {
+                    m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, fbo.fbo);
+                    glViewport(0, 0, viewportW, viewportH);
+                }
                 glBindTexture(GL_TEXTURE_2D, depth.tex);
-                if (depth.physW != b.fbW || depth.physH != b.fbH)
+                if (!zupOk && physScaled)
                 {
                     const float sy = static_cast<float>(depth.physH) / static_cast<float>(b.fbH);
                     const int physDepthY = static_cast<int>(std::round(depthY * sy));
                     const int physDepthRows = std::max(1, static_cast<int>(std::round(depthRows * sy)));
-                    std::vector<float> scaledDepth(static_cast<size_t>(depth.physW) * physDepthRows);
+                    g759NoteZup(false, static_cast<uint64_t>(depth.physW) * physDepthRows);
+                    // G759: the expansion buffer is a MEMBER, not a fresh 10.3 MB `std::vector`
+                    // allocated inside this branch on every batch. `resize` keeps its capacity.
+                    m_g759ZupRef.resize(static_cast<size_t>(depth.physW) * physDepthRows);
+                    float *const scaled = m_g759ZupRef.data();
                     for (int py = 0; py < physDepthRows; ++py)
                     {
                         int srcY = (py * depthRows) / physDepthRows;
                         if (srcY >= depthRows) srcY = depthRows - 1;
                         const float *srcRow = depthUpload->data() + static_cast<size_t>(srcY) * b.fbW;
-                        float *dstRow = scaledDepth.data() + static_cast<size_t>(py) * depth.physW;
+                        float *dstRow = scaled + static_cast<size_t>(py) * depth.physW;
                         for (int px = 0; px < depth.physW; ++px)
                         {
                             int srcX = (px * b.fbW) / depth.physW;
@@ -9311,9 +11035,9 @@ void main()
                         }
                     }
                     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, physDepthY, depth.physW, physDepthRows,
-                                    GL_DEPTH_COMPONENT, GL_FLOAT, scaledDepth.data());
+                                    GL_DEPTH_COMPONENT, GL_FLOAT, scaled);
                 }
-                else
+                else if (!zupOk)
                 {
                     glTexSubImage2D(GL_TEXTURE_2D, 0, 0, depthY, b.fbW, depthRows,
                                     GL_DEPTH_COMPONENT, GL_FLOAT, depthUpload->data());
@@ -9413,7 +11137,7 @@ void main()
                 {
                     if (d.srcFbp == kG309CompositeToken)
                         mode |= 2048;
-                    mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
+                    mode |= 1 | ((d.tfx & 3) << 1) | ((d.tcc & 1u) != 0u ? 8 : 0);
                     if (g289SourceIsCt24(d.srcFbp))
                         mode |= 1024;
                     if (pointGuard && (mode & 2048) == 0)
@@ -9421,13 +11145,13 @@ void main()
                 }
                 if (g286Exact)
                 {
-                    mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0) | 512;
+                    mode |= 1 | ((d.tfx & 3) << 1) | ((d.tcc & 1u) != 0u ? 8 : 0) | 512;
                     if (g584ExactBlendAOn())
                         mode |= 32768; // G584: encode o.a / the SRC1 factor as As/128.
                 }
                 else if (d.texKey != 0u)
                 {
-                    mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
+                    mode |= 1 | ((d.tfx & 3) << 1) | ((d.tcc & 1u) != 0u ? 8 : 0);
                     if (pointGuard)
                         mode |= 4096;
                 }
@@ -9436,7 +11160,7 @@ void main()
                     mode |= 4096;
                 // (G604's exact-tap routing for mode 6 measured null and was not kept; see the
                 // refutation note at the matching site in the legacy loop below.)
-                if (d.fge != 0u)
+                if ((d.fge & 1u) != 0u)
                     mode |= 8192;
                 if (d.uvRoundU != 0u || d.uvRoundV != 0u)
                     mode |= 16384;
@@ -9474,6 +11198,9 @@ void main()
         m_f.glUseProgram_(g560MultiDraw ? m_progG560 : m_prog);
         m_f.glBindVertexArray_(m_vao);
         m_f.glBindBuffer_(GL158_ARRAY_BUFFER, m_vbo);
+        // G762 (default-off, DC2_G762_ZBIAS): move the shadow volume's Z before the upload, so the
+        // sweep measures the GEQUAL margin without touching the shader or the clear.
+        g762ApplyZBias(b);
         m_f.glBufferData_(GL158_ARRAY_BUFFER,
                           static_cast<GLsizeiptrLocal>(b.verts.size() * sizeof(G178Vtx)),
                           b.verts.data(), GL178_STREAM_DRAW);
@@ -9743,7 +11470,13 @@ void main()
             {
                 g496Scissor(d.scX0, b.fbH - 1 - d.scY1, d.scX1 - d.scX0 + 1, scH, g496GlCache);
             }
-            const uint8_t depthFunc = d.depthFunc & 0x0Fu;
+            uint8_t depthFunc = d.depthFunc & 0x0Fu;
+            // G762 (default-off, DC2_G762_NOZ=1): the shadow accumulation with the comparison
+            // removed. Its winding MUST come out identically zero — the front and back face sets
+            // cover every pixel equally often — so any residue is a coverage defect, not a depth one.
+            if (depthFunc != 0 && g762NozOn() && (d.blend == 3u || d.blend == 4u) &&
+                g762SelBatch(b.fbp, b.draws.size()))
+                depthFunc = 1u;
             if (depthFunc == 0)
             {
                 g496DepthOff(g496GlCache);
@@ -9757,7 +11490,7 @@ void main()
 #if defined(PS2X_G658_DIAG)
             const bool g658ImageMode6 =
                 g658Mode6StageGpu() == 7 && d.blend == 6u && d.texKey != 0u &&
-                d.srcFbp == 0u && d.fge == 0u && m_progExact != 0u;
+                d.srcFbp == 0u && (d.fge & 1u) == 0u && m_progExact != 0u;
             if (g658ImageMode6)
             {
                 // Exact destination-input and blend prototype. The scratch FBO supplies legal
@@ -9788,7 +11521,7 @@ void main()
                 g496BindTex(texture->id, g496GlCache);
                 g496TexFilter(texture->g496MinF, texture->g496MagF,
                               GL_NEAREST, GL_NEAREST, g496GlCache);
-                int exactMode = 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0) | 2048 | 4096;
+                int exactMode = 1 | ((d.tfx & 3) << 1) | ((d.tcc & 1u) != 0u ? 8 : 0) | 2048 | 4096;
                 if ((d.depthFunc & 0x10u) != 0u)
                     exactMode |= 16;
                 m_f.glUniform1i_(m_locExactMode, exactMode);
@@ -9825,7 +11558,7 @@ void main()
                     // point/bilinear taps, so NEAREST here only completes the sampler object.
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
                     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-                    mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
+                    mode |= 1 | ((d.tfx & 3) << 1) | ((d.tcc & 1u) != 0u ? 8 : 0);
                 }
                 m_f.glUniform1i_(m_locExactMode, mode);
                 m_f.glUniform1i_(m_locExactLinear, d.bilinear ? 1 : 0);
@@ -9889,6 +11622,9 @@ void main()
             // legacy (shipped) program: the G560 dual-source build masks uMode to 16 bits and
             // supplies its own per-primitive factors, so bit 20 would be invisible there and its
             // run splitter keys on g603RevSubBlend(), which this lever must not move.
+            // G767: this blended raw-alpha RTT draw runs as ONE dual-source pass.
+            const bool g767DualDraw = m_g767DualOk && !g560MultiDraw && g255RttAlpha &&
+                                      d.blend != 0u && !g658Overwrite;
             const bool g661FloorDraw = s_g661BlendFloor && !g560MultiDraw && !g658Overwrite &&
                                        (d.blend == 2u ||
                                         (s_g661FloorBias && (d.blend == 1u || d.blend == 5u)));
@@ -9920,6 +11656,16 @@ void main()
             }
             else
             {
+                // G767: a raw-alpha RTT blend takes its factor from the secondary output.
+                const auto g767F = [g767DualDraw](GLenum f) -> GLenum {
+                    if (!g767DualDraw)
+                        return f;
+                    if (f == GL_SRC_ALPHA)
+                        return GL178_SRC1_ALPHA;
+                    if (f == GL_ONE_MINUS_SRC_ALPHA)
+                        return static_cast<GLenum>(0x88FBu); // GL_ONE_MINUS_SRC1_ALPHA
+                    return f;
+                };
                 // Alpha channel: keep dest alpha = written src value (CPU writePixel stores the
                 // source alpha unblended). blend==3 (G262): (Cs-0)*(FIX=128)>>7 + Cd == Cs + Cd
                 // additive; blend==4 (G262): (0-Cs)*(FIX=128)>>7 + Cd == Cd - Cs subtractive
@@ -9945,16 +11691,22 @@ void main()
                             { m_e.glBlendEquationSeparate_(eqRgb, eqA); },
                             [&](GLenum sRgb, GLenum dRgb, GLenum sA, GLenum dA)
                             { m_e.glBlendFuncSeparate_(sRgb, dRgb, sA, dA); },
-                            (g603RevSubBlend(d.blend) || (g661FloorDraw && d.blend == 5))
+                            // G762 (default-off, DC2_G762_SUBADD=1): make the shadow's SUB draws
+                            // ADD, so `DC2_G762_ONLY=4` can report the BACK-face pass count. A
+                            // reverse subtract out of a zero-cleared target clamps to 0 and
+                            // measures nothing.
+                            ((g603RevSubBlend(d.blend) || (g661FloorDraw && d.blend == 5)) &&
+                             !(d.blend == 4u && g762SubAsAdd() &&
+                               g762SelBatch(b.fbp, b.draws.size())))
                                 ? GL178_FUNC_REVERSE_SUBTRACT
                                 : GL178_FUNC_ADD,
                             GL178_FUNC_ADD,
-                            d.blend == 5 ? (g661FloorDraw ? GL_ONE : GL_ZERO)
+                            g767F(d.blend == 5 ? (g661FloorDraw ? GL_ONE : GL_ZERO)
                                          : ((d.blend == 3 || g603RevSubBlend(d.blend) ||
                                              (g661FloorDraw && d.blend == 2))
                                                 ? GL_ONE
-                                                : GL_SRC_ALPHA),
-                            (d.blend == 1 || d.blend == 5) ? GL_ONE_MINUS_SRC_ALPHA : GL_ONE,
+                                                : GL_SRC_ALPHA)),
+                            g767F((d.blend == 1 || d.blend == 5) ? GL_ONE_MINUS_SRC_ALPHA : GL_ONE),
                             GL_ONE, GL_ZERO, g496GlCache);
             }
             int mode = 0;
@@ -9997,6 +11749,10 @@ void main()
             if ((d.depthFunc & 0x20u) != 0u)
                 mode |= 64;
             mode |= (static_cast<int>((d.depthFunc >> 6u) & 3u) << 7u);
+            // G766: ref code 3 = a general alpha test carried in the spare tcc/fge bits.
+            if ((d.depthFunc & 0x20u) != 0u && ((d.depthFunc >> 6u) & 3u) == 3u && m_locAtest >= 0)
+                m_f.glUniform1i_(m_locAtest, static_cast<GLint>(((d.tcc >> 1u) & 0x7Fu) |
+                                                                (((d.fge >> 1u) & 0xFu) << 7u)));
             if (d.srcFbp != 0u)
             {
                 // G261: sample the producer target's persistent FBO color texture directly. The
@@ -10102,7 +11858,7 @@ void main()
                         g496GlNoteN(kG738GlRawParam, issued, 4ull - issued);
                     }
                 }
-                mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
+                mode |= 1 | ((d.tfx & 3) << 1) | ((d.tcc & 1u) != 0u ? 8 : 0);
                 if (g289SourceIsCt24(d.srcFbp))
                     mode |= 1024;
                 // G362: the G309 composite branch (bit 11) does its own page-mapped fetch.
@@ -10128,7 +11884,7 @@ void main()
                 // object must still be complete from first use.
                 g496TexFilter(texture->g496MinF, texture->g496MagF, GL_NEAREST, GL_NEAREST,
                               g496GlCache);
-                mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
+                mode |= 1 | ((d.tfx & 3) << 1) | ((d.tcc & 1u) != 0u ? 8 : 0);
                 mode |= 512;
                 if (g584ExactBlendAOn())
                     mode |= 32768; // G584: encode o.a as the As/128 blend factor.
@@ -10148,7 +11904,7 @@ void main()
                             d.wrapU == 0 ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE),
                             d.wrapV == 0 ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE),
                             g496GlCache);
-                mode |= 1 | ((d.tfx & 3) << 1) | (d.tcc ? 8 : 0);
+                mode |= 1 | ((d.tfx & 3) << 1) | ((d.tcc & 1u) != 0u ? 8 : 0);
                 if (g362PointGuard)
                     mode |= 4096;
             }
@@ -10228,7 +11984,7 @@ void main()
             // G364: GS per-pixel fog. Bit 13 + the packed FOGCOL travel per draw (FOGCOL is global
             // GS state; the front-end snapshots it into each G178Draw so a mid-frame change splits
             // the batch through g178StateEqual).
-            if (d.fge != 0u)
+            if ((d.fge & 1u) != 0u)
             {
                 mode |= 8192;
                 g496Uniform1i(g496Uni, kG496UFogCol, locFogCol,
@@ -10291,9 +12047,36 @@ void main()
             // by construction, because the vertex shader maps LOGICAL coordinates onto a
             // PHYSICAL viewport. The clear was a symptom patch for the scale mismatches this
             // phase removed at the source (PS2_PROJECT_STATE.md rule 1: no per-screen fixes).
+            // G762 (default-off, DC2_G762_ONLY=3|4): render one side of the volume alone.
+            if (execDraw && g762SkipDraw(b, d))
+                execDraw = false;
+            // G767 (diagnostic): GPU time of this draw by state class, every N-th batch.
+            const bool g767Dg = execDraw && g767DrawGpuEvery() > 0 &&
+                                (m_batchCounter % static_cast<uint64_t>(g767DrawGpuEvery())) == 0u;
+            uint32_t g767DgCls = 0u;
+            float g767DgPx = 0.0f;
+            if (g767Dg)
+            {
+                for (int vi = 0; vi + 2 < d.vtxCount; vi += 3)
+                {
+                    const G178Vtx &a = b.verts[static_cast<size_t>(d.firstVtx + vi)];
+                    const G178Vtx &bb = b.verts[static_cast<size_t>(d.firstVtx + vi + 1)];
+                    const G178Vtx &c = b.verts[static_cast<size_t>(d.firstVtx + vi + 2)];
+                    g767DgPx += 0.5f * std::fabs((bb.x - a.x) * (c.y - a.y) - (c.x - a.x) * (bb.y - a.y));
+                }
+                g767DgCls = (b.fbp & 511u) | ((d.texKey != 0u || d.srcFbp != 0u) ? 1u << 9 : 0u) |
+                            (static_cast<uint32_t>(d.blend & 7u) << 10) |
+                            (static_cast<uint32_t>(depthFunc & 3u) << 13) |
+                            (d.depthWrite ? 1u << 15 : 0u) | ((mode & 64) != 0 ? 1u << 16 : 0u) |
+                            ((mode & 8192) != 0 ? 1u << 17 : 0u) |
+                            ((mode & (512 | 4096)) != 0 ? 1u << 18 : 0u) |
+                            (d.bilinear ? 1u << 19 : 0u) | (g767DualDraw ? 1u << 20 : 0u) |
+                            (d.screenSprite != 0u ? 1u << 21 : 0u) | (d.srcFbp != 0u ? 1u << 22 : 0u);
+                g767DrawGpuStamp(false, g767DgCls, g767DgPx);
+            }
             if (execDraw)
             {
-                if (!g560MultiDraw && g255RttAlpha && d.blend != 0u)
+                if (!g560MultiDraw && g255RttAlpha && d.blend != 0u && !g767DualDraw)
                 {
                     // Fixed-function blending needs As/128 in the shader alpha channel, while PS2
                     // framebuffer alpha stores the unblended source A byte. Preserve RGB blending in
@@ -10320,12 +12103,23 @@ void main()
                 }
                 else
                 {
-                    if (g255RttAlpha)
+                    if (g767DualDraw)
+                        mode |= (1 << 22); // G767: factor in o1, raw alpha in o.a, one pass
+                    else if (g255RttAlpha)
                         mode |= 32;
                     g496Uniform1i(g496Uni, kG496UMode, locMode, mode, g496GlCache);
                     glDrawArrays(GL_TRIANGLES, d.firstVtx, g560VtxCount);
                     g496GlNoteN(kG738GlDraw, 1ull, 0ull);
                     g738DrawBallastIssue();
+                }
+                if (g767Dg)
+                    g767DrawGpuStamp(true, g767DgCls, g767DgPx);
+                // G761 (default-off, DC2_G761_SEAM=1): name the draw that erases the 1-2 px seam.
+                if (b.fbp == 0x139u)
+                {
+                    g761SeamAfterDraw(b.fbH, d.blend, d.vtxCount, static_cast<int>(b.draws.size()));
+                    // G762 (default-off, DC2_G762_PIX=x,y): one pixel, one draw at a time.
+                    g762PixAfterDraw(b.fbH, d.blend);
                 }
                 g738StateBallastIssue();
                 // G738: the non-elidable price of a `uniform` call — the largest class in the
@@ -10449,7 +12243,78 @@ void main()
             }
         }
         g716TraceSurface(b, fbo.colorTex, 1);
+        // G761 (default-off, DC2_G761_GPU_ZDUMP=<n>): the Map-125 shadow is a Z-pass stencil volume
+        // accumulated into fbp 0x139, and its silhouette is 100 % the depth comparison. This is the
+        // only place both operands exist — the batch's own FBO is still bound, so the colour
+        // attachment IS the winding buffer and the depth attachment IS what carved it.
+        // G762 (default-off): the RAW winding + the depth attachment in GUEST Z UNITS, for the
+        // shadow accumulation ONLY (selected by SHAPE — G761 dumped all three 0x139 batch shapes
+        // and thresholded the count away). One batch in three is the accumulation.
+        if (g762SelBatch(b.fbp, b.draws.size()) && g762DumpEvery() != 0u && b.fbW > 0 && b.fbH > 0)
+        {
+            static uint64_t s_g762N = 0ull, s_g762Written = 0ull;
+            const uint64_t k = ++s_g762N;
+            // 1 MB of float depth per dump: cap the sweep rather than fill the disk.
+            if ((k % g762DumpEvery()) == 0u && s_g762Written < 10ull)
+            {
+                ++s_g762Written;
+                g762Dump(k, b.fbW, b.fbH, b.draws.size());
+                if (g762GeoOn())
+                    g762DumpGeo(k, b);
+            }
+        }
+        g762PixFlush();
+        if (b.fbp == 0x139u && g761GpuZDumpEvery() != 0u)
+        {
+            static uint64_t s_g761GpuN = 0ull;
+            const uint64_t k = ++s_g761GpuN;
+            if ((k % g761GpuZDumpEvery()) == 0u && b.fbW > 0 && b.fbH > 0)
+            {
+                g761DumpDrawSeq(k, b);
+                const int w = b.fbW, h = b.fbH;
+                const size_t n = static_cast<size_t>(w) * h;
+                std::vector<uint8_t> rgba(n * 4u);
+                glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+                std::vector<float> z(n, 0.0f);
+                glReadPixels(0, 0, w, h, G761_DEPTH_COMPONENT, GL_FLOAT, z.data());
+                uint64_t lit = 0ull, hist[9]{};
+                std::vector<uint8_t> cimg(n), zimg(n);
+                float zmin = 1e30f, zmax = -1e30f;
+                for (size_t i = 0; i < n; ++i)
+                {
+                    const uint32_t r = rgba[i * 4u + 0u];
+                    const bool on = (rgba[i * 4u + 0u] | rgba[i * 4u + 1u] | rgba[i * 4u + 2u]) != 0u;
+                    if (on) ++lit;
+                    hist[r < 8u ? r : 8u] += 1ull;
+                    cimg[i] = on ? 255u : 0u;
+                    if (z[i] < zmin) zmin = z[i];
+                    if (z[i] > zmax) zmax = z[i];
+                }
+                const float span = (zmax > zmin) ? (zmax - zmin) : 1.0f;
+                for (size_t i = 0; i < n; ++i)
+                    zimg[i] = static_cast<uint8_t>(255.0f * (z[i] - zmin) / span);
+                g761WriteGpuPgm("gpuc", k, w, h, cimg);
+                g761WriteGpuPgm("gpuz", k, w, h, zimg);
+                std::fprintf(stderr,
+                             "[G761:gpuz] k=%llu %dx%d draws=%zu lit=%llu zmin=%.9f zmax=%.9f "
+                             "h1=%llu h2=%llu h3=%llu h4=%llu h5=%llu h6=%llu h7=%llu h8+=%llu\n",
+                             static_cast<unsigned long long>(k), w, h, b.draws.size(),
+                             static_cast<unsigned long long>(lit),
+                             static_cast<double>(zmin), static_cast<double>(zmax),
+                             static_cast<unsigned long long>(hist[1]),
+                             static_cast<unsigned long long>(hist[2]),
+                             static_cast<unsigned long long>(hist[3]),
+                             static_cast<unsigned long long>(hist[4]),
+                             static_cast<unsigned long long>(hist[5]),
+                             static_cast<unsigned long long>(hist[6]),
+                             static_cast<unsigned long long>(hist[7]),
+                             static_cast<unsigned long long>(hist[8]));
+            }
+        }
         g415Note(); // 6: draw loop (+ exact-path epilogue)
+        // G767: fold this batch's rendered pages GPU->GPU into the resident FBOs that hold them
+        // (armed by the front end INSTEAD of a colour readback; see g767_post_draw_fold.inc).
+        g767ApplyPostDraw(b, fbo, viewportW, viewportH, g767PullsOk);
         // G418 early kick: this batch leaves its GL work queued and never fences, so without a kick
         // the frame's one readback batch pays the whole backlog as drain. glFlush only guarantees
         // that already-issued commands finish in finite time - it changes no result, no GL state,
@@ -10681,21 +12546,49 @@ void main()
                 const float sy = static_cast<float>(fbo.physH) / static_cast<float>(b.fbH);
                 const int physReadY = static_cast<int>(std::round(depthReadY * sy));
                 const int physReadRows = std::max(1, static_cast<int>(std::round(depthReadRows * sy)));
-                std::vector<float> physDepth(static_cast<size_t>(fbo.physW) * physReadRows);
-                glReadPixels(0, physReadY, fbo.physW, physReadRows,
-                             GL_DEPTH_COMPONENT, GL_FLOAT, physDepth.data());
-                for (int r = 0; r < depthReadRows; ++r)
+                // ⭐ G760: the second, invisible copy of the CPU depth decimation. It sits AFTER
+                // the last `g415Note()` mark, so `[G415:stage]` never priced it at all. Same GPU
+                // resolve as readDepthOnWorker's, at THIS site's own tap (offset 0 — see the note
+                // on resolveDepthToLogical). The source is the guest-Z TEXTURE this function
+                // attached; `fusedDepthReadback` is only ever non-null when depthKey != 0.
+                const bool zrdOk =
+                    resolveDepthToLogical(g760DepthTex, b.fbW, b.fbH,
+                                          g760DepthPhysW, g760DepthPhysH, 0);
+                if (zrdOk)
                 {
-                    int pr = (r * physReadRows) / depthReadRows;
-                    if (pr >= physReadRows) pr = physReadRows - 1;
-                    const float *srcRow = physDepth.data() + static_cast<size_t>(pr) * fbo.physW;
-                    float *dstRow = fusedDepthReadback->data() + static_cast<size_t>(r) * b.fbW;
-                    for (int x = 0; x < b.fbW; ++x)
+                    glReadPixels(0, depthReadY, b.fbW, depthReadRows, GL759_RED, GL_FLOAT,
+                                 fusedDepthReadback->data());
+                    g760NoteZrd(true, static_cast<uint64_t>(b.fbW) * depthReadRows,
+                                static_cast<uint64_t>(fbo.physW) * physReadRows -
+                                    static_cast<uint64_t>(b.fbW) * depthReadRows);
+                    // ⛔⛔⛔ Rule G759-2 again, and this one is LOAD-BEARING: the `if (guestDepth)`
+                    // block below calls glFramebufferRenderbuffer_ on the BOUND framebuffer. Leave
+                    // the resolve FBO bound and it re-attaches this target's depth renderbuffer to
+                    // the RESOLVE FBO — a state corruption no content oracle can see.
+                    m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, fbo.fbo);
+                    glViewport(0, 0, viewportW, viewportH);
+                }
+                else
+                {
+                    std::vector<float> physDepth(static_cast<size_t>(fbo.physW) * physReadRows);
+                    glReadPixels(0, physReadY, fbo.physW, physReadRows,
+                                 GL_DEPTH_COMPONENT, GL_FLOAT, physDepth.data());
+                    for (int r = 0; r < depthReadRows; ++r)
                     {
-                        int px = (x * fbo.physW) / b.fbW;
-                        if (px >= fbo.physW) px = fbo.physW - 1;
-                        dstRow[x] = srcRow[px];
+                        int pr = (r * physReadRows) / depthReadRows;
+                        if (pr >= physReadRows) pr = physReadRows - 1;
+                        const float *srcRow = physDepth.data() + static_cast<size_t>(pr) * fbo.physW;
+                        float *dstRow = fusedDepthReadback->data() + static_cast<size_t>(r) * b.fbW;
+                        for (int x = 0; x < b.fbW; ++x)
+                        {
+                            int px = (x * fbo.physW) / b.fbW;
+                            if (px >= fbo.physW) px = fbo.physW - 1;
+                            dstRow[x] = srcRow[px];
+                        }
                     }
+                    g760NoteZrd(false, static_cast<uint64_t>(b.fbW) * depthReadRows,
+                                static_cast<uint64_t>(fbo.physW) * physReadRows -
+                                    static_cast<uint64_t>(b.fbW) * depthReadRows);
                 }
             }
             else
@@ -10857,6 +12750,13 @@ void main()
     GLint m_locG627Origin = -1, m_locG627Scale = -1, m_locG627Lane = -1;
     int m_g627TexW = -1, m_g627TexH = -1;
     bool m_g627ProgFailed = false;
+    // G766: the main program was built with conservative depth (see setupProgram); renderBatch
+    // enables depth clamping for its draws when it was.
+    bool m_g766ConsDepth = false;
+    // G766: per-bit masked FBO patch (logic-op AND/OR); shares G627's value/mask textures.
+    GLuint m_g766BitsProg = 0;
+    GLint m_locG766Origin = -1, m_locG766Scale = -1, m_locG766Mode = -1;
+    bool m_g766BitsProgFailed = false;
     // G675: the physical->logical colour RESOLVE. One grow-only logical-sized FBO plus a shader
     // that performs EXACTLY the centre tap the CPU decimation performs, so glReadPixels moves
     // S^2 fewer bytes across the bus for a bit-identical result. See resolveColorToLogical().
@@ -10870,8 +12770,36 @@ void main()
     GLint m_locG675UpScale = -1, m_locG675UpOrigin = -1, m_locG675UpOriginY = -1;
     int m_g675UpW = 0, m_g675UpH = 0;
     bool m_g675UpFailed = false;
+    // G759: the logical->physical GUEST-DEPTH upscale — the twin G675 built for colour and never
+    // built for depth. One grow-only R32F staging image at LOGICAL size, one depth-only FBO, and a
+    // shader that writes `gl_FragDepth`. See upscaleDepthLogicalToPhysical().
+    GLuint m_g759ZupProg = 0, m_g759ZupFbo = 0, m_g759ZupTex = 0;
+    GLint m_locG759ZupScale = -1, m_locG759ZupOriginY = -1;
+    int m_g759ZupW = 0, m_g759ZupH = 0;
+    uint64_t m_g759ZupKey = 0ull;
+    bool m_g759ZupFailed = false;
+    // G759 verification arm only (DC2_G759_ZUP_VERIFY=1): the physical readback and the CPU
+    // expansion it is compared against. Never allocated in a default run.
+    std::vector<float> m_g759ZupProbe, m_g759ZupRef;
+    // G760: the physical->logical GUEST-DEPTH resolve — the read-direction sibling G675 built for
+    // colour and never built for depth. One grow-only R32F attachment at LOGICAL size plus the
+    // centre-tap shader. See resolveDepthToLogical().
+    GLuint m_g760ZrdProg = 0, m_g760ZrdFbo = 0, m_g760ZrdTex = 0;
+    GLint m_locG760ZrdScale = -1, m_locG760ZrdCentre = -1;
+    int m_g760ZrdW = 0, m_g760ZrdH = 0;
+    bool m_g760ZrdFailed = false;
+    // G760 verification arm only (DC2_G760_ZRD_VERIFY=1). Never allocated in a default run.
+    std::vector<float> m_g760ZrdProbe;
+    // G760: the presentation read's Y flip, done on the GPU. See flipPresentOnGpu().
+    GLuint m_g760FlipProg = 0, m_g760FlipFbo = 0, m_g760FlipTex = 0;
+    GLint m_locG760FlipOriginX = -1, m_locG760FlipOriginY = -1, m_locG760FlipRows = -1;
+    int m_g760FlipW = 0, m_g760FlipH = 0;
+    bool m_g760FlipFailed = false;
+    // G759: the presentation read's staging image (was a per-frame 7.6 MB zero-filled temporary).
+    std::vector<uint32_t> m_g759PresentStage;
     GLuint m_g309MapTex = 0, m_g309BaseTex = 0;
     GLint m_locFbSize = -1, m_locFbScale = -1, m_locMode = -1, m_locLinear = -1, m_locFogCol = -1;
+    GLint m_locAtest = -1; // G766 general alpha test
     // G675: the screen-space-sprite pair — logical-pixel-centre UV snap (FS) and the widescreen
     // centre X scale (VS). Both are 1.0/off on every draw that is not a screen-space sprite.
     GLint m_locG675Sprite = -1;
@@ -11020,6 +12948,17 @@ void main()
     // only, allocated only when DC2_G419_AB=narrowtouch is armed).
     std::vector<uint32_t> m_g420TouchScratch;
 
+// G766: post-upload page pulls (see g766_post_upload.inc).
+#include "g766_post_upload_members.inc"
+// G767: post-draw transient -> resident fold (see g767_post_draw_fold.inc).
+#include "g767_post_draw_fold_members.inc"
+// G767: CT32/CT24 page view assembled from resident FBO pages.
+#include "g767_page_view_members.inc"
+// G767: paletted (PSMT8 / T8H / T4HL / T4HH) page view.
+#include "g767_t8_view_members.inc"
+// G767: GPU local->local byte move between resident FBO pages.
+#include "g767_l2l_members.inc"
+#include "g768_page_view_members.inc"
 // G714: the batched GPU-resident raw-VRAM local->local executor. Its members close with an
 // explicit `private:`, so nothing below this include changes access.
 #include "g714_raw_l2l_members.inc"

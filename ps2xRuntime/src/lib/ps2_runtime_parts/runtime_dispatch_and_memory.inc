@@ -787,6 +787,10 @@ void PS2Runtime::run()
             dstWidth,
             dstHeight};
         DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
+        {
+            extern std::atomic<uint32_t> g_dc2ScriptFrame;
+            g764_present::capture(g_dc2ScriptFrame.load(std::memory_order_relaxed));
+        }
 
         static bool s_diagPrinted = false;
         if (!s_diagPrinted)
@@ -1447,6 +1451,7 @@ void PS2Runtime::run()
         ps2_syscalls::detachAllGuestHostThreads();
     }
 
+    g764_present::shutdown();
     UnloadTexture(frameTex);
     CloseWindow();
 

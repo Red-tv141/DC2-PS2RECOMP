@@ -569,6 +569,8 @@ namespace
     }
 }
 
+#include "g764_gpu_present_scale.inc"
+
 static bool UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
@@ -655,7 +657,22 @@ static bool UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     }
     ++s_g176Uploads;
 
-    std::vector<uint8_t> scratch;
+    // A leased immutable GPU snapshot replaces the physical-size readback,
+    // latch copy, alpha walk and re-upload. CPU callers retain a lazy exact API.
+    if (const auto frame = rt->gs().latchedGpuPresentationFrame())
+    {
+        const int w = dc2GetNativePhysicalDisplayWidth(), h = dc2GetNativePhysicalDisplayHeight();
+        if (g764_present::uploadShared(tex, frame, w, h))
+        {
+            outWidth = uint32_t(w); outHeight = uint32_t(h);
+            s_g176LastUploadedGen = g176Gen;
+            s_g176LastOutWidth = outWidth; s_g176LastOutHeight = outHeight;
+            return true;
+        }
+    }
+
+    // G764: retain snapshot capacity; no physical-resolution heap churn per present.
+    static std::vector<uint8_t> scratch;
     uint32_t width = 0u;
     uint32_t height = 0u;
     uint32_t displayFbp = 0u;
@@ -735,16 +752,32 @@ static bool UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     // PS2 display geometry at physical density; the resample below only ever reconciles a
     // display SURFACE whose logical width differs from 640 (DC2's is 512), exactly as it did
     // at 1x — it is not, and must not become, the thing that produces the resolution increase.
-    const uint32_t texW = static_cast<uint32_t>(tex.width > 0 ? tex.width : dc2GetNativePhysicalDisplayWidth());
-    const uint32_t texH = static_cast<uint32_t>(tex.height > 0 ? tex.height : dc2GetNativePhysicalDisplayHeight());
+    const uint32_t texW = static_cast<uint32_t>(dc2GetNativePhysicalDisplayWidth());
+    const uint32_t texH = static_cast<uint32_t>(dc2GetNativePhysicalDisplayHeight());
+    if (g764_present::upload(tex, scratch, width, height, int(texW), int(texH)))
+    {
+        outWidth = texW; outHeight = texH;
+        s_g176LastUploadedGen = g176Gen;
+        s_g176LastOutWidth = outWidth; s_g176LastOutHeight = outHeight;
+        return true;
+    }
+    if (tex.width != int(texW) || tex.height != int(texH))
+    {
+        Image blank = GenImageColor(int(texW), int(texH), MAGENTA);
+        Texture2D replacement = LoadTextureFromImage(blank);
+        UnloadImage(blank);
+        if (replacement.id) { UnloadTexture(tex); tex = replacement; }
+    }
     const size_t uploadSize = static_cast<size_t>(texW) * texH * 4u;
-    std::vector<uint8_t> uploadBuffer(uploadSize, 0u);
+    static std::vector<uint8_t> uploadBuffer;
+    uploadBuffer.resize(uploadSize);
     if (!scratch.empty() && width != 0u && height != 0u)
     {
         if (texW == width && texH == height)
         {
             const size_t copyBytes = std::min(scratch.size(), uploadBuffer.size());
             std::memcpy(uploadBuffer.data(), scratch.data(), copyBytes);
+            std::fill(uploadBuffer.begin() + copyBytes, uploadBuffer.end(), uint8_t(0));
         }
         else
         {
