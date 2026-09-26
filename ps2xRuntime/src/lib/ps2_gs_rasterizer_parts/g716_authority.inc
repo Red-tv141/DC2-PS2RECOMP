@@ -210,7 +210,7 @@ static bool g716RetireTarget(int ti, int cause)
                      0u, lo, r.fbW, hi - lo + 1,
                      1u | (static_cast<uint32_t>(cause & 255) << 8u));
     g_g716LogicalWrite = false;
-    G178FbSnap &snap = g_g178FbSnap[kG261Fbp[ti]];
+    G178FbSnap &snap = g_g178FbSnap[g766SlotSnapKey(static_cast<uint32_t>(ti))];
     snap.valid = true;
     snap.rowLo = std::min(snap.rowLo, r.covLo);
     snap.rowHi = std::max(snap.rowHi, r.covHi);
@@ -371,7 +371,10 @@ static uint64_t g716TryTexture(const G144Entry &e, const G178EntryState &st)
     g_g716GpuObserver = true;
     for (uint32_t t = 0; t < kG248TargetCount; ++t)
         if (g_g261Res[t].dirty && g144RangeOverlaps(g_g261Res[t].range, tex))
+        {
+            G766MatSite g766s(kG766SiteG716);
             g261Materialize(t, kG261MatTexAlias);
+        }
     g_g716GpuObserver = prior;
     if (s_g716CpuView)
     {

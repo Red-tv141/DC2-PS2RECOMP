@@ -90,8 +90,16 @@ static bool g591PrivZSelected()
 }
 static bool g591ColSelected()
 {
-    static const bool on = (envFlagEnabled("DC2_G591_COL") || g591CVerifyOn() || g591ColPaired()) &&
-                           !envFlagEnabled("DC2_G591_NO_COL");
+    // ⭐ G765: DEFAULT ON. Slice B was refuted at G591 (`CLEAN=0` on s05, S = 1) because colour
+    // invalidations landed INSIDE the batch's window — and the dominant mover there was the frame
+    // boundary's own display publication (G276 + G600's generation bump). G765 carries that
+    // publication across the boundary, and a whole-512-row display snapshot now moves only through
+    // the OTHER display buffer's pages (0x0's rows 416..511 are 0x68's pages): on g765c dragon
+    // `movedOut 61,502` vs `movedIn 7,386`. Without this, every carried display record reclaimed by
+    // the next frame hit `uploadFb` and was read back first (the `[G277:upload-publish]` site).
+    // The same-run oracle DC2_G591_CVERIFY=1 is unchanged. Rollback DC2_G591_NO_COL=1.
+    static const bool on = !envFlagEnabled("DC2_G591_NO_COL") &&
+                           !envFlagDisabled("DC2_G591_COL");
     return on;
 }
 

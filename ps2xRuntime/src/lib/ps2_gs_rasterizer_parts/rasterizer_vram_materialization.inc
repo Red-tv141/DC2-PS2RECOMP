@@ -1,4 +1,5 @@
 #include "g720_cpu_stages.inc"
+#include "g764_asset_texcache.inc"
 
 static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t vramSize)
 {
@@ -107,7 +108,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         color.first, color.last, tex.first, tex.last,
                         clut.first, clut.last);
                 }
-                (void)g289MaterializeOwner(10);
+                g769FoldOrMaterializeOwners(10); // G769 E: fold the owner into residents
             }
         }
     }
@@ -117,6 +118,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // G288: a G284-deferred display owner must be published before this native batch can read
     // overlapping guest-VRAM bytes through framebuffer upload, depth, texture, or CLUT paths.
     // G289's one exact display-grab sprite consumes that same owner directly from its FBO.
+    // G765: carried display records (previous frames' display surfaces) are consumed or reclaimed
+    // here, before any framebuffer upload, texture/CLUT decode or depth setup of this batch.
+    if (g765AnyCarry())
+        g765AuditCarriesForGpuBatch(g289DirectDisplaySrc);
     if (g289DirectDisplaySrc == 0u)
         g288PublishDisplayForGpuBatch();
     // ⭐ G700 consumer edge: this batch is about to decode textures and CLUTs out of guest VRAM.
@@ -194,12 +199,20 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // `ps2_gs_rasterizer_parts/g710_flush_ceiling.inc`; its findings are in
     // plans/phase-G710-fix-log.md and its removal gate in plans/phase-G711-fix-log.md §8.
     const uint32_t fbp = g_g144List[0].ctx.frame.fbp;
+    g766TransientReset(); // G766: a GPU-seeded transient is decided per flush, below
     const bool g286Transient = g286TransientTarget(fbp);
     const bool g570Transient13d = g570Transient13dTarget(fbp);
     const bool g586Transient141 = g586Transient141Target(fbp);
     const bool g587Transient15d = g587Transient15dTarget(fbp);
     // G604: the same non-persistent contract, selected by PROPERTY (see rasterizer_command_graph).
     const bool g604DiscovTrn = g604DiscovTransientTarget(fbp);
+    if (g766SeqWindow())
+        g766SeqBatch(g_g144List,
+                     g286Transient ? "trn13b" : g604DiscovTrn ? "trnDiscov"
+                     : g570Transient13d ? "trn13d" : g586Transient141 ? "trn141"
+                     : g587Transient15d ? "trn15d" : g248TargetIndex(fbp) >= 0 ? "resident"
+                     : (fbp == 0u || fbp == 0x68u) ? "display"
+                     : g527DiscoveredTarget(fbp) ? "discov" : "other");
     g720Stages.lap(G720CpuStages::ResidB); // G724: contracts decided; G700 candidacy begins
     // ⭐⭐⭐ G700: is this target a candidate for PERSISTENT residency? The four transient
     // contracts above (`g286`/`g570`/`g586`/`g587`) and the two display buffers keep their own
@@ -272,7 +285,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // [G279:mat] c0 = 1.031 ms per materialize x ~1.0/frame = 1.03 ms/f, and [G523:fit]
         // pro0trn = 0.0323 ms/flush x 33.4 = 1.08 ms/f: the same number from two instruments.
         static const bool s_g524NoTrnMat = envFlagEnabled("DC2_G524_NO_TRNMAT");
-        if (!s_g524NoTrnMat)
+        // ⭐ G766: a batch whose only contact with dirty residents is its own surface is seeded by
+        // GPU page pulls instead (g766_mask_mirror.inc). Rollback DC2_G766_NO_TRNSEED=1.
+        if (!s_g524NoTrnMat && !g766TransientSeedAdmit(fbp))
             g735TrnPub(0u);
     }
     // ⭐ G718 TRNPUB probe (default OFF). The takeover deletes the sibling publication these four
@@ -289,21 +304,24 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // 0x13d overlaps 0x139 physically. Publish every resident sibling before framebuffer
         // upload, then keep this target transient so the reverse edge can never find it dirty.
         g_g570TransientAttempts.fetch_add(1u, std::memory_order_relaxed);
-        g735TrnPub(2u);
+        if (!g766TransientSeedAdmit(fbp))
+            g735TrnPub(2u);
     }
     if (g586Transient141 && !g700TrnTakeover)
     {
         // 0x141 is another physical sibling of the resident 0x139 family.  Publish every sibling
         // before upload, then keep both colour and Z under the non-persistent per-flush contract.
         g_g586TransientAttempts.fetch_add(1u, std::memory_order_relaxed);
-        g735TrnPub(3u);
+        if (!g766TransientSeedAdmit(fbp))
+            g735TrnPub(3u);
     }
     if (g587Transient15d && !g700TrnTakeover)
     {
         // 0x15d is tested under the same command-local ownership contract, but its gate and
         // oracle are independent from the rejected 0x141 experiment.
         g_g587TransientAttempts.fetch_add(1u, std::memory_order_relaxed);
-        g735TrnPub(4u);
+        if (!g766TransientSeedAdmit(fbp))
+            g735TrnPub(4u);
     }
     if (g604DiscovTrn && !g700Cand)
     {
@@ -319,7 +337,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // upload (`g700NeedUpload` below), the ranged publication runs there instead — scoped to
         // the pages actually read rather than to every resident sibling. `[G523:fit]` books this
         // one call as `pro0trn` = 0.0323 ms per flush x 33.4 flushes = 1.08 ms/f.
-        g735TrnPub(5u);
+        if (!g766TransientSeedAdmit(fbp))
+            g735TrnPub(5u);
     }
     // G523 prologue lap P0: transient-target admission (and its g261PrepareCpuReplay).
     const auto g523P0 = s_g298Profile ? std::chrono::steady_clock::now()
@@ -343,14 +362,22 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g_g261VramSize = vramSize; // materialize needs the size; GS::m_vramSize is private
         // G264: bring resident FBOs current with any deferred upload mirrors before the
         // invariant/uploadFb/FBO-bind logic below reasons about them.
-        g264FlushMirrorsAtFlush();
+        // ⭐ G766: only THIS batch's own surface here; every other FBO reader flushes the target
+        // it actually observes (g766LazyMirOn, g766_page_owner.inc).
+        if (g766LazyMirOn())
+            g766MirrorFlushOrDrop(g766SlotForBatch(fbp, g_g144List[0].ctx.frame.fbw));
+        else
+            g264FlushMirrorsAtFlush();
         // G553/G557 oracle boundary: publish any earlier resident wave before this one batch
         // switches to G255's immediate readback + CPU replay comparison contract.
         if (g255HeavyVerifyThis)
         {
             const int ti = g248TargetIndex(fbp);
             if (ti >= 0 && g_g261Res[ti].dirty)
+            {
+                G766MatSite g766s(kG766SiteRsyncOracle);
                 g261Materialize(ti, kG261MatResync);
+            }
         }
     }
     // G523 prologue lap P1: the G261 wave setup, i.e. g264FlushMirrorsAtFlush's deferred
@@ -384,6 +411,9 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const uint32_t fbw = g_g144List[0].ctx.frame.fbw;
     const int fbW = static_cast<int>(fbw) * 64;
     constexpr int kFbH = 512;
+    // ⭐ G766: the residency slot this batch renders (0x139's width is part of its identity).
+    const int g766BatchTi = g766SlotForBatch(fbp, fbw);
+    const uint32_t g766SnapKey = g766SnapKeyFor(fbp, fbw);
     // ⭐⭐⭐ G700: acquire the persistent surface for this target. The slot survives every flush,
     // every target switch and every frame; a switch back to it is an FBO bind, not a reconstruction
     // of guest-VRAM authority. -1 keeps whatever path this target had before.
@@ -407,24 +437,28 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // VRAM-authoritative by construction and the redefined FBO re-uploads from VRAM anyway.
     if (g261Wave)
     {
-        const int g266Ti = g248TargetIndex(fbp);
+        const int g266Ti = g766BatchTi;
         G261Res &g266R = g_g261Res[g266Ti];
         if (g266R.fbW > 0 && g266R.fbw != fbw && (g266R.dirty || g266R.covHi >= g266R.covLo))
         {
             if (g266R.dirty)
+            {
+                G766MatSite g766s(kG766SiteRsyncWidth);
                 g261Materialize(g266Ti, kG261MatResync); // flushes the mirror itself first
+            }
             else if (g266R.mirPending)
                 g264FlushMirror(g266Ti);
             g266R.mirPending = false;
             g266R.mirLo = 512;
             g266R.mirHi = -1;
             g266R.mirBits = {};
+            g766DropMaskMirror(g266R);
             g266R.covLo = 512;
             g266R.covHi = -1;
             g266R.fbw = fbw;
             g266R.fbW = fbW;
             g261UpdateWindow(g266Ti);
-            G178FbSnap &g266Snap = g_g178FbSnap[fbp];
+            G178FbSnap &g266Snap = g_g178FbSnap[g766SnapKey];
             g266Snap.valid = false;
             g266Snap.genSum = 0;
             g266Snap.rowLo = 1 << 30;
@@ -536,7 +570,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // G658 P5-P7/P16: dungeon1's dominant discovered targets are narrow FBW=2 surfaces.
         // Admit them only in the diagnostic build so the same-run oracle can rank and reject or
         // validate the population; the shipped FBW=8 contract remains unchanged.
-        (fbw == 8u || fbw == 2u) &&
+        ((fbw == 8u || fbw == 2u) ||
+         (g767NarrowTransientOn() && g766TransientArmed(fbp) && fbw >= 1u && fbw <= 8u)) &&
 #else
         // G660 P28: the same widening as a DEFAULT-OFF runtime arm, so the FBW=2 population is
         // reachable from a shippable binary for gating. Unarmed this reads `fbw == 8u`, i.e. the
@@ -545,8 +580,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // test with `fbw == 2` instead of adding to it, because the FBW=8 half is the half that
         // regressed (`ridepod:boss` +0.828 ms/f) while the FBW=2 half converted (`dungeon1`
         // -0.219 / -0.389). See its definition in rasterizer_command_graph.inc.
-        (g662DiscovNarrowOn() ? (fbw == 2u)
-                              : (fbw == 8u || (fbw == 2u && g660DiscovFbw2On()))) &&
+        ((g662DiscovNarrowOn() ? (fbw == 2u)
+                               : (fbw == 8u || (fbw == 2u && g660DiscovFbw2On()))) ||
+         // ⭐ G767: a GPU-seeded transient whose result FOLDS into the residents pays no upload /
+         // readback pair, which is what the width contract priced. Every width 1..8 is admitted
+         // (lavaboss's 0x141 is FBW=1: 0.72 CPU replays/f, each publishing 0x139 + 0x13c + narrow
+         // 0x139). Rollback DC2_G767_NO_NARROWTRN=1.
+         (g767NarrowTransientOn() && g766TransientArmed(fbp) && fbw >= 1u && fbw <= 8u)) &&
 #endif
         g_g144List[0].ctx.frame.psm == GS_PSM_CT32 &&
         (g712Prepared ? g712Shape : // G712: same predicate, already answered (see G586 above)
@@ -1890,7 +1930,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     g600Seq("gpuBatch", static_cast<int>(g_g144List.size()), fbp, rowHi);
     if (g276Coalesce && s_g276Pend.active &&
         (s_g276Pend.fbp != fbp || s_g276Pend.fbw != fbw))
-        g276FlushPendingDisplay(0);
+        g765SwitchDisplayTarget(0); // G765: carry the old live record instead of reading it back
     // G261: waves leave the result in the FBO (no readPixels, no swizzle-writeback); the raw-
     // alpha RTT store rides the batch flag so the backend does not depend on the G255 env var.
     // ⭐⭐⭐ G700: a persistent surface NEVER reads back at the flush. The rendered rows stay in
@@ -1943,8 +1983,22 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g630MaterializeForRanges(g636Fb, G144BlockRange{}, !g636Fb.valid, false, kG261MatUpload);
         if (s_g636Stat) g_g636FbSeed.fetch_add(1u, std::memory_order_relaxed);
     }
+    // ⭐ G766: pages of this wave's window whose newest bytes live in ANOTHER resident FBO are
+    // pulled on the GPU after the seed upload (armed just before submit). Only when pulls cannot
+    // be armed for this batch are those owners published here, BEFORE the upload decision reads
+    // the generation sums — the legacy contract, kept as the fail-closed fallback.
+    int g766Ti = -1;
+    if (g261Wave)
+    {
+        g766Ti = g766BatchTi;
+        const G261Res &g766R = g_g261Res[g766Ti];
+        const bool g766Cov = g766R.covHi >= g766R.covLo;
+        g766PrepareWave(g766Ti, g766Cov ? std::min(rowLo, g766R.covLo) : rowLo,
+                        g766Cov ? std::max(rowHi, g766R.covHi) : rowHi);
+    }
+    int g766UpLo = 512, g766UpHi = -1; // G766: the rows this batch's VRAM seed defines
     // G351: the Owner-B sprite tracks FBO↔VRAM equality for ITS sibling FBO, not the scene's.
-    G178FbSnap &snap = g_g178FbSnap[g351RouteB ? kG351Sprite139 : fbp];
+    G178FbSnap &snap = g_g178FbSnap[g351RouteB ? kG351Sprite139 : g766SnapKey];
     // G277-R exact snapshot gen window: for the G273-measured display tuple, color rows 0..415 map
     // to pages 104..207, provably disjoint from zbp 0xd0's Z pages 208+ (which the full 512-row
     // window falsely included — every Z-wave writeback bump then clobbered G276-deferred FBO rows
@@ -1973,7 +2027,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     bool g261ForceNoUpload = false;
     if (g261Wave)
     {
-        G261Res &r = g_g261Res[g248TargetIndex(fbp)];
+        G261Res &r = g_g261Res[g766BatchTi];
         if (r.dirty)
         {
             const uint64_t g261WinNow = g261WindowGenNow(r, fbp);
@@ -1994,11 +2048,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                              "[G261:invariant] escaped writer fbp=0x%x genAtSkip=%llu genNow=%llu n=%llu\n",
                              fbp, (unsigned long long)r.genAtSkip,
                              (unsigned long long)g261WinNow, (unsigned long long)n);
+                g768InlEscAtInvariant(g766BatchTi, r, fbp, fbw, rowLo, rowHi);
                 uint64_t g570TargetInvariant = 0u;
                 if (g570BumpTraceOn())
                 {
                     static std::array<uint64_t, kG248TargetCount> s_g570InvariantsByTarget{};
-                    g570TargetInvariant = ++s_g570InvariantsByTarget[g248TargetIndex(fbp)];
+                    g570TargetInvariant = ++s_g570InvariantsByTarget[g766BatchTi];
                 }
                 if (g570BumpTraceOn() &&
                     (g570TargetInvariant <= 4u || (n % 512u) == 0u) &&
@@ -2030,7 +2085,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         }
                     }
                 }
-                g280DropOverlays(g248TargetIndex(fbp)); // residency dies; nothing publishes them
+                g280DropOverlays(g766BatchTi); // residency dies; nothing publishes them
                 r.dirty = false;
                 r.dirtyLo = 512;
                 r.dirtyHi = -1;
@@ -2055,13 +2110,14 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     snap.rowHi = r.covHi;
                     // G591: this snapshot was just (re)founded, so the per-page array must describe
                     // THIS instant or the fail-closed guard will reject it.
-                    g591ColStamp(g351RouteB ? kG351Sprite139 : fbp, fbBlock, fbw, snap.genSum,
+                    g591ColStamp(g351RouteB ? kG351Sprite139 : g766SnapKey, fbBlock, fbw, snap.genSum,
                                  snap.rowLo, snap.rowHi);
                 }
             }
             else
             {
-                g261Materialize(g248TargetIndex(fbp), kG261MatResync);
+                G766MatSite g766s(kG766SiteRsyncWindow);
+                g261Materialize(g766BatchTi, kG261MatResync);
                 fbGenNow = g178GenSumRect(fbBlock, fbw, GS_PSM_CT32, 0, 0,
                                           static_cast<uint32_t>(fbW), kFbH);
             }
@@ -2099,7 +2155,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     bool g591CVerifyPend = false;
     if (g591ColTracked())
     {
-        const uint32_t g591CKey = g351RouteB ? kG351Sprite139 : fbp;
+        const uint32_t g591CKey = g351RouteB ? kG351Sprite139 : g766SnapKey;
         const bool g591CClean =
             g591CDecide(g591CKey, fbBlock, fbw, s_batch.uploadFb, g591CForced, snap.valid,
                         g591CGenSame, snap.genSum, snap.rowLo, snap.rowHi, rowLo, rowHi);
@@ -2342,6 +2398,15 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                       : std::chrono::steady_clock::time_point{};
     const auto g576C = (s_g576FbzSplit || s_g581ClsSplit)
         ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // ⭐ G767: a GPU-seeded transient view whose every rendered page is owned by a resident FBO is
+    // seeded ENTIRELY by the owner pulls armed at submit — the VRAM upload would be overwritten
+    // byte for byte inside the rendered page rows. No pack, no upload. Rollback DC2_G767_NO_GPUSEED=1.
+    if (s_batch.uploadFb && !g290Seeded && g767GpuSeedCovers(fbp, fbw, rowLo, rowHi))
+        s_batch.uploadFb = false;
+    if (g766SeqWindow())
+        g766SeqDecision(fbp, s_batch.uploadFb, s_batch.skipReadback, rowLo, rowHi,
+                        snap.valid ? std::min(rowLo, snap.rowLo) : rowLo,
+                        snap.valid ? std::max(rowHi, snap.rowHi) : rowHi);
     if (s_batch.uploadFb)
     {
         // G741: per FLUSH (this `if` runs once per g178TryFlushGpu), and its `else` sibling at the
@@ -2356,6 +2421,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // covered-row invariant stays true after a single upload.
         const int upLo = snap.valid ? std::min(rowLo, snap.rowLo) : rowLo;
         const int upHi = snap.valid ? std::max(rowHi, snap.rowHi) : rowHi;
+        g766UpLo = upLo;
+        g766UpHi = upHi;
         // G290: the structurally-proven leading 512x416 opaque clear (fbmsk=0, no blend)
         // overwrites every FBO pixel in rows 0..415 before any draw reads destination color,
         // so uploading those rows from VRAM is pure churn — only rows the clear does not cover
@@ -2588,7 +2655,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             // low cov ⇒ genuinely non-resident (needs new residency).
             bool g261Cover = false;
             {
-                const int ti = g248TargetIndex(fbp);
+                const int ti = g766BatchTi;
                 if (ti >= 0 && ti < static_cast<int>(kG248TargetCount))
                 {
                     const G261Res &rr = g_g261Res[ti];
@@ -3568,8 +3635,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     const auto g324BackendT0 = g_g324ActiveDiag != nullptr
                         ? std::chrono::steady_clock::now()
                         : std::chrono::steady_clock::time_point{};
+                    if (g766LazyMirOn())
+                        g766MirrorFlushOrDrop(srcTi); // G766: the view reads srcTi's FBO now
                     ok = g281_backend_prepare_t8_view(
-                        viewKey, kG261Fbp[static_cast<uint32_t>(srcTi)],
+                        viewKey, g766SlotKey(static_cast<uint32_t>(srcTi)),
                         g_g261Res[srcTi].fbW, st.texW, st.texH,
                         s_g310Map, s_g310Clut, g281VerifyOn(), bad);
                     if (g_g324ActiveDiag != nullptr)
@@ -3663,6 +3732,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             for (size_t i = 0; g704AtlasScan && i < g_g144List.size(); ++i)
                 if (g310EntryShape(fbp, g_g144List[i], s_states[i]))
                 {
+                    if (g766LazyMirOn())
+                        g766MirrorFlushKey(0x139u); // G766: the logical atlas reads 0x139's FBOs
                     (void)g310PrepareLogical(g310Ready);
                     if (g310Ready)
                         g310Freeze.begin();
@@ -3966,6 +4037,21 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 }
             }
 
+            // G767: a paletted read (PSMT8 / T8H / T4HL / T4HH) of FBO-owned pages is decoded on
+            // the GPU from the pages' holders (g767_transient_fold.inc) - every tuple, no CPU map.
+            // Rollback DC2_G767_NO_T8VIEW=1.
+            {
+                // ⭐ G768: the general paletted view first (GPU CLUT, VRAM mirror, partial rebuild).
+                uint64_t g767T8Key = g768TryView(e, st.texW, st.texH, s_g310BuiltViews);
+                if (g767T8Key == 0u)
+                    g767T8Key = g767TryT8View(e, st.texW, st.texH, s_g310BuiltViews);
+                if (g767T8Key != 0u)
+                {
+                    s_g281ViewKey[i] = g767T8Key;
+                    s_g281ViewSrc[i] = -2; // built on the GPU; no CPU build follows
+                    continue;
+                }
+            }
             // G281/G570: close the two measured format-crossing consumers before the generic
             // overlap loop materializes their CT32 source. Admission proves the exact PSMT8 byte
             // map belongs solely to that dirty FBO and the CLUT remains VRAM-authoritative. The
@@ -4066,7 +4152,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     // G267-verified prototype, now re-armed to measure net on the current stack.
                     if (footprintOk && aliasMask == 0u && g342Ct32BindOn())
                     {
-                        s_g261FboSrc[i] = kG261Fbp[srcTi];
+                        s_g261FboSrc[i] = g766SlotKey(static_cast<uint32_t>(srcTi));
                         g261AnyBind = true;
                         g_g261FboBinds.fetch_add(1u, std::memory_order_relaxed);
                         const uint64_t nb =
@@ -4216,6 +4302,150 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             G144BlockRange g704TexRange{};
             G144BlockRange g704ClutRange{};
             bool g704RangesReady = false;
+            // ⭐⭐ G766: BIND FIRST. The loop below used to decide the FBO-direct bind and the overlap
+            // publication in ONE pass over the targets in slot order, so a dirty alias at a LOWER
+            // slot than the bound target was published (a blocking readback) before the loop even
+            // reached the target the entry binds — although a bound entry never reads guest VRAM.
+            // The bind predicate is unchanged; it is evaluated once per dirty target here and cached.
+            auto g766BindPred = [&](uint32_t t) -> bool {
+                G261Res &r = g_g261Res[t];
+                const uint32_t tBlock = framePageBaseToBlock(kG261Fbp[t]);
+                    bool bind = false;
+                    if (e.ctx.tex0.psm == GS_PSM_CT32 && e.ctx.tex0.tbp0 == tBlock &&
+                        e.ctx.tex0.tbw == r.fbw && e.prim.fst &&
+                        (e.prim.type == GS_PRIM_SPRITE || e.prim.type == GS_PRIM_TRIANGLE ||
+                         e.prim.type == GS_PRIM_TRISTRIP || e.prim.type == GS_PRIM_TRIFAN))
+                    {
+                        if (!st.bilinear)
+                        {
+                        // FST texel extent across the primitive's vertices must lie inside the
+                        // FBO-defined row/column window (NEAREST taps only touch [u0..u1) texels).
+                        const int nv = (e.prim.type == GS_PRIM_SPRITE) ? 2 : 3;
+                        int u0 = INT32_MAX, u1 = INT32_MIN, v0 = INT32_MAX, v1 = INT32_MIN;
+                        for (int k = 0; k < nv; ++k)
+                        {
+                            const int uu = static_cast<int>(e.v[k].u >> 4);
+                            const int vv = static_cast<int>(e.v[k].v >> 4);
+                            u0 = std::min(u0, uu); u1 = std::max(u1, uu);
+                            v0 = std::min(v0, vv); v1 = std::max(v1, vv);
+                        }
+                        if (e.prim.type == GS_PRIM_SPRITE)
+                        {
+                            // Sprite endpoints are exclusive right/bottom (max tap = v1-1 texels).
+                            bind = u0 >= 0 && u1 <= r.fbW && v0 >= r.covLo && v1 <= r.covHi + 1;
+                        }
+                        else
+                        {
+                            // Triangle interpolation can reach the vertex texel itself — require it
+                            // to be inside the defined window outright.
+                            bind = u0 >= 0 && u1 <= r.fbW - 1 && v0 >= r.covLo && v1 <= r.covHi;
+                        }
+                        }
+                        else if (e.prim.type == GS_PRIM_SPRITE && g248TargetIndex(fbp) < 0)
+                        {
+                            // G263: the display composite sprite samples the character RTT with
+                            // bilinear filtering — G262 measured it as the ONLY bind rejector
+                            // (2728 mat(tex)/run, solely on bilin=1). Admit it when the exact tap
+                            // footprint stays FBO-defined; the backend already selects GL_LINEAR
+                            // from d.bilinear on the srcFbp path. RTT-family consumers keep the
+                            // NEAREST-only rule until a census shape demands more.
+                            static const bool s_g263Off = envFlagEnabled("DC2_G263_NO_BILIN_BIND");
+                            if (!s_g263Off)
+                            {
+                                bind = g263BilinearSpriteBind(e, st, r, nullptr, kG261Fbp[t]);
+                                if (bind)
+                                    g_g263FboBindBi.fetch_add(1u, std::memory_order_relaxed);
+                            }
+                        }
+                        else if (e.prim.type != GS_PRIM_SPRITE && g248TargetIndex(fbp) < 0)
+                        {
+                            // ⭐ G766: the same display-composite bind for a BILINEAR FST
+                            // triangle / strip / fan. Every interpolated texel coordinate is a
+                            // convex combination of the vertices', and a bilinear tap reaches at
+                            // most one texel beyond it, so taps stay inside
+                            // [u0-1, u1+1] x [v0-1, v1+1]. When that footprint is inside the
+                            // FBO-defined window no tap can reach an undefined texel or trigger
+                            // the wrap/clamp mode — the sample equals the decode of the same
+                            // bytes. Rollback DC2_G766_NO_BILIN_TRI_BIND=1.
+                            static const bool s_g766BilinTri =
+                                !envFlagEnabled("DC2_G766_NO_BILIN_TRI_BIND");
+                            if (s_g766BilinTri)
+                            {
+                                int u0 = INT32_MAX, u1 = INT32_MIN, v0 = INT32_MAX, v1 = INT32_MIN;
+                                for (int k = 0; k < 3; ++k)
+                                {
+                                    const int uu = static_cast<int>(e.v[k].u >> 4);
+                                    const int vv = static_cast<int>(e.v[k].v >> 4);
+                                    u0 = std::min(u0, uu); u1 = std::max(u1, uu);
+                                    v0 = std::min(v0, vv); v1 = std::max(v1, vv);
+                                }
+                                bind = u0 - 1 >= 0 && u1 + 1 <= r.fbW - 1 &&
+                                       v0 - 1 >= r.covLo && v1 + 1 <= r.covHi;
+                                if (!bind && g766StatOn())
+                                {
+                                    static uint32_t s_g766TriRej = 0u;
+                                    if (s_g766TriRej++ < 16u)
+                                        std::fprintf(stderr,
+                                                     "[G766:trirej] tgt=0x%03x fbW=%d cov=%d..%d "
+                                                     "uv=%d..%d,%d..%d tw=%u th=%u wrap=%u%u\n",
+                                                     kG261Fbp[t], r.fbW, r.covLo, r.covHi, u0, u1,
+                                                     v0, v1, 1u << e.ctx.tex0.tw,
+                                                     1u << e.ctx.tex0.th,
+                                                     static_cast<unsigned>(st.wrapU),
+                                                     static_cast<unsigned>(st.wrapV));
+                                }
+                            }
+                        }
+                    }
+                return bind;
+            };
+            std::array<int8_t, kG248TargetCount> g766BindRes;
+            g766BindRes.fill(-1);
+            int g766BindTi = -1;
+            bool g766BindCurrent = false;
+            if (g766OwnerOn())
+            {
+                for (uint32_t t = 0; t < kG248TargetCount; ++t)
+                {
+                    if (!g_g261Res[t].dirty)
+                        continue;
+                    const bool b = g766BindPred(t);
+                    g766BindRes[t] = b ? 1 : 0;
+                    if (b && g766BindTi < 0)
+                        g766BindTi = static_cast<int>(t);
+                }
+                if (g766BindTi >= 0)
+                {
+                    // Rows the entry samples in the bound FBO (FST texel rows; +/-1 for bilinear).
+                    const int nv = (e.prim.type == GS_PRIM_SPRITE) ? 2 : 3;
+                    int v0 = INT32_MAX, v1 = INT32_MIN;
+                    for (int k = 0; k < nv; ++k)
+                    {
+                        const int vv = static_cast<int>(e.v[k].v >> 4);
+                        v0 = std::min(v0, vv);
+                        v1 = std::max(v1, vv);
+                    }
+                    g766BindCurrent = g766PullForBind(static_cast<uint32_t>(g766BindTi),
+                                                      std::max(0, v0 - 1), std::min(511, v1 + 1));
+                }
+            }
+            // ⭐⭐ G767: a CT32/CT24 read whose pages are held by resident FBOs is assembled on the
+            // GPU from those pages (g767_transient_fold.inc) instead of publishing every overlapping
+            // resident and decoding guest VRAM. Direct binds keep priority. Rollback
+            // DC2_G767_NO_PAGEVIEW=1.
+            if (g766BindTi < 0 && !s_g281ViewKey.empty())
+            {
+                // ⭐ G768: the general view first (per-page partial rebuild, GPU VRAM mirror).
+                uint64_t g767Vk = g768TryDirectView(e, st.texW, st.texH, s_g310BuiltViews);
+                if (g767Vk == 0u)
+                    g767Vk = g767TryPageView(e, st.texW, st.texH, s_g310BuiltViews);
+                if (g767Vk != 0u)
+                {
+                    s_g281ViewKey[i] = g767Vk;
+                    s_g281ViewSrc[i] = -2; // built on the GPU above; no CPU build follows
+                    continue;
+                }
+            }
             for (uint32_t t = 0; t < kG248TargetCount; ++t)
             {
                 G261Res &r = g_g261Res[t];
@@ -4262,59 +4492,21 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 }
                 if (!r.dirty)
                     continue;
-                bool bind = false;
-                if (e.ctx.tex0.psm == GS_PSM_CT32 && e.ctx.tex0.tbp0 == tBlock &&
-                    e.ctx.tex0.tbw == r.fbw && e.prim.fst &&
-                    (e.prim.type == GS_PRIM_SPRITE || e.prim.type == GS_PRIM_TRIANGLE ||
-                     e.prim.type == GS_PRIM_TRISTRIP || e.prim.type == GS_PRIM_TRIFAN))
-                {
-                    if (!st.bilinear)
-                    {
-                    // FST texel extent across the primitive's vertices must lie inside the
-                    // FBO-defined row/column window (NEAREST taps only touch [u0..u1) texels).
-                    const int nv = (e.prim.type == GS_PRIM_SPRITE) ? 2 : 3;
-                    int u0 = INT32_MAX, u1 = INT32_MIN, v0 = INT32_MAX, v1 = INT32_MIN;
-                    for (int k = 0; k < nv; ++k)
-                    {
-                        const int uu = static_cast<int>(e.v[k].u >> 4);
-                        const int vv = static_cast<int>(e.v[k].v >> 4);
-                        u0 = std::min(u0, uu); u1 = std::max(u1, uu);
-                        v0 = std::min(v0, vv); v1 = std::max(v1, vv);
-                    }
-                    if (e.prim.type == GS_PRIM_SPRITE)
-                    {
-                        // Sprite endpoints are exclusive right/bottom (max tap = v1-1 texels).
-                        bind = u0 >= 0 && u1 <= r.fbW && v0 >= r.covLo && v1 <= r.covHi + 1;
-                    }
-                    else
-                    {
-                        // Triangle interpolation can reach the vertex texel itself — require it
-                        // to be inside the defined window outright.
-                        bind = u0 >= 0 && u1 <= r.fbW - 1 && v0 >= r.covLo && v1 <= r.covHi;
-                    }
-                    }
-                    else if (e.prim.type == GS_PRIM_SPRITE && g248TargetIndex(fbp) < 0)
-                    {
-                        // G263: the display composite sprite samples the character RTT with
-                        // bilinear filtering — G262 measured it as the ONLY bind rejector
-                        // (2728 mat(tex)/run, solely on bilin=1). Admit it when the exact tap
-                        // footprint stays FBO-defined; the backend already selects GL_LINEAR
-                        // from d.bilinear on the srcFbp path. RTT-family consumers keep the
-                        // NEAREST-only rule until a census shape demands more.
-                        static const bool s_g263Off = envFlagEnabled("DC2_G263_NO_BILIN_BIND");
-                        if (!s_g263Off)
-                        {
-                            bind = g263BilinearSpriteBind(e, st, r, nullptr, kG261Fbp[t]);
-                            if (bind)
-                                g_g263FboBindBi.fetch_add(1u, std::memory_order_relaxed);
-                        }
-                    }
-                }
+                const bool bind = g766BindRes[t] >= 0 ? (g766BindRes[t] != 0) : g766BindPred(t);
                 if (bind)
                 {
-                    s_g261FboSrc[i] = kG261Fbp[t];
+                    s_g261FboSrc[i] = g766SlotKey(t);
                     g261AnyBind = true;
                     g_g261FboBinds.fetch_add(1u, std::memory_order_relaxed);
+                }
+                else if (g766BindTi >= 0 && g766BindCurrent &&
+                         static_cast<uint32_t>(g766BindTi) != t)
+                {
+                    // ⭐ G766: this entry samples ONLY the bound FBO, and every page it reads there
+                    // is current (pulled above if another alias rendered it later). An overlapping
+                    // dirty alias is therefore not a consumer edge for this entry — publishing it
+                    // was a GPU->CPU round trip whose bytes nothing read.
+                    ++g_g766BindSkips;
                 }
                 else
                 {
@@ -4323,7 +4515,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     // G704: computed once per ENTRY (see the declaration above the target loop).
                     if (!g704RangesReady || !g704TexRangeOn)
                     {
-                        g704TexRange = g144TextureRange(e);
+                        // ⭐ G766: the read's texel FOOTPRINT when it is exactly bounded (FST),
+                        // else TEX0's declared rectangle (g766_page_owner.inc).
+                        if (!g766TexFootprint(e, g704TexRange))
+                            g704TexRange = g144TextureRange(e);
                         g704ClutRange = g144IsPalettedPsm(e.ctx.tex0.psm)
                                             ? g144ClutRange(e)
                                             : G144BlockRange{};
@@ -4418,6 +4613,26 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                                 }
                             }
                         }
+                        // ⭐⭐ G769: PAGE AUTHORITY, not window overlap. A resident's claimed window
+                        // is not its authority: a page of it that no FBO owns has its newest bytes
+                        // in guest VRAM (the G766/G767 owner invariant g768ResolvePage and the CPU
+                        // replay prologue already rely on). When every page this read touches
+                        // inside t's dirty interval is such a page (or G291-covered), the legacy
+                        // decode reads guest VRAM exactly and publishing t is a GPU->CPU round trip
+                        // whose bytes nothing reads (`fight` 1,899 / `georama` 2,194 publications
+                        // of 0x139 per 60 s, each a ~430-row blocking readback). Rollback
+                        // DC2_G769_NO_TEXAUTH=1.
+                        if (!g704Pages && g769TexAuthOn() && tex.valid &&
+                            g766SrcPagesCurrent(t, tex) &&
+                            (!clut.valid || g766SrcPagesCurrent(t, clut)))
+                        {
+                            ++g_g769TexAuthSkips;
+                            g769VerifyPagesEqual(t, tex, "tex");
+                            if (clut.valid)
+                                g769VerifyPagesEqual(t, clut, "clut");
+                            g769Report(false);
+                            continue;
+                        }
                         if (g704Pages)
                         {
                             if (g291StatOn())
@@ -4469,8 +4684,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         {
                             const uint64_t viewKey = g338ViewKey(st.texKey);
                             uint64_t bad = 0u;
+                            if (g766LazyMirOn())
+                                g766MirrorFlushOrDrop(static_cast<int>(t)); // G766: view source
                             const bool ok = g338_backend_prepare_ct24_view(
-                                viewKey, kG261Fbp[t], r.fbW, st.texW, st.texH,
+                                viewKey, g766SlotKey(t), r.fbW, st.texW, st.texH,
                                 static_cast<int>(e.texa.ta0), e.texa.aem ? 1 : 0,
                                 g338VerifyOn(), bad);
                             if (bad != 0u)
@@ -4598,6 +4815,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         // dirty flag alone — belt and braces, one store on a path that already
                         // does a full publication.
                         s_g704PagesMemo[t].valid = false;
+                        G766MatSite g766s(kG766SiteTexBind);
                         g261Materialize(static_cast<int>(t), kG261MatTexAlias);
                         if (g342On)
                             g342NoteTexAlias(
@@ -4818,6 +5036,29 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     g_g717TexturePhase = false;
     g633FinalizeTexturePass();
     const bool g261HaveFboSrc = g261AnyBind; // s_g261FboSrc sized to the list only when true
+    // ⭐ G766: lazy mirrors — every resident FBO this batch now samples (direct bind or view) is
+    // brought current before the texture pass queues a view build or the batch is submitted.
+    if (g766LazyMirOn())
+    {
+        uint32_t g766Seen = 0u;
+        if (g261AnyBind && !s_g261FboSrc.empty())
+            for (const uint32_t key : s_g261FboSrc)
+                if (key != 0u)
+                    for (uint32_t t = 0u; t < kG248TargetCount; ++t)
+                        if ((g766Seen & (1u << t)) == 0u &&
+                            (g766SlotKey(t) == key || kG261Fbp[t] == key))
+                        {
+                            g766Seen |= 1u << t;
+                            g766MirrorFlushOrDrop(static_cast<int>(t));
+                        }
+        for (const int8_t src : s_g281ViewSrc)
+            if (src >= 0 && static_cast<uint32_t>(src) < kG248TargetCount &&
+                (g766Seen & (1u << static_cast<uint32_t>(src))) == 0u)
+            {
+                g766Seen |= 1u << static_cast<uint32_t>(src);
+                g766MirrorFlushOrDrop(src);
+            }
+    }
 
     g720Stages.lap(G720CpuStages::Tex);
     const auto g298T3 = s_g298Profile ? std::chrono::steady_clock::now()
@@ -5102,7 +5343,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                         ctx.tex0.psm);
                 uint64_t bad = 0u;
                 ok = g281_backend_prepare_t8_view(
-                    s_g281ViewKey[i], kG261Fbp[static_cast<uint32_t>(srcTi)],
+                    s_g281ViewKey[i], g766SlotKey(static_cast<uint32_t>(srcTi)),
                     g_g261Res[srcTi].fbW, st.texW, st.texH, s_map, s_clut,
                     g281VerifyOn(), bad);
                 if (bad != 0u)
@@ -5131,7 +5372,10 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                              srcOk ? g_g261Res[srcTi].covLo : -1,
                              srcOk ? g_g261Res[srcTi].covHi : -1);
             if (srcTi >= 0)
+            {
+                G766MatSite g766s(kG766SiteT8ViewFail);
                 g261Materialize(srcTi, kG261MatTexAlias);
+            }
             const uint64_t failedKey = s_g281ViewKey[i];
             for (size_t j = 0; j < s_g281ViewKey.size(); ++j)
                 if (s_g281ViewKey[j] == failedKey)
@@ -5306,6 +5550,43 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             const auto texRange = g144TextureRange(e);
             g716MaterializeForRanges(texRange, g144ClutRange(e), !texRange.valid, false,
                                      kG261MatTexAlias);
+        }
+        // G764: compare immutable asset witnesses BEFORE the generic page hash.
+        // Admission follows all producer/materialization checks. A relocated asset
+        // reuses the same GPU object; it does not create a new descriptor-key image.
+        const bool g764Dynamic =
+            (g261HaveFboSrc && !s_g261FboSrc.empty() && s_g261FboSrc[i] != 0u) ||
+            (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u) ||
+            ctx.tex0.tbp0 == 0x2720u;
+        const auto g764Image = g764FindAssetTexture(self, gs, vram, vramSize, e,
+                                                   st.texW, st.texH, g764Dynamic);
+        if (g764Image)
+        {
+            const uint64_t key = g764Image.residentKey;
+            bool resident = g178_backend_has_tex(key);
+            // An earlier entry in this batch may have queued the same asset before
+            // the executor publishes residency. Reuse that upload too.
+            if (!resident)
+                for (const auto& queued : s_batch.texUploads)
+                    if (queued.key == key) { resident = true; break; }
+            if (!resident)
+            {
+                G178TexUpload up;
+                up.key = key; up.w = int(g764Image.width); up.h = int(g764Image.height);
+                up.compiledPixels = g764Image.pixels;
+                s_batch.texUploads.push_back(std::move(up));
+            }
+            dc2::assetcache::noteUpload(resident, uint64_t(g764Image.width) * g764Image.height * 4);
+            // Classification always uses ORIGINAL dimensions/pixels. A replacement
+            // may be smaller or larger and cannot safely stand in for this input.
+            dc2_noscale::noteDecodedTexture(st.texKey, g764Image.originalPixels, st.texW, st.texH);
+            dc2_noscale::noteDecodedKeyDump(g764Image.originalPixels, st.texW, st.texH);
+            dc2_noscale::dumpDecodedTexture(g764Image.originalPixels, st.texW, st.texH);
+            // 0xff denotes no generic content hash. A later miss must calculate
+            // and compare its own hash body, never interpret this as a hash match.
+            g_g178TexReg[st.texKey] = G178TexReg{genNow, 0, st.texW, st.texH, 0xffu, key};
+            g622NoteFlushKey(st.texKey, key);
+            continue;
         }
         const auto g511HashT0 = g511Split ? std::chrono::steady_clock::now()
                                           : std::chrono::steady_clock::time_point{};
@@ -6264,6 +6545,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             d.tfx = st.tfx;
             d.tcc = st.tcc;
             d.fge = st.fge;       // G364
+            // G766: a general alpha test rides the spare high bits of tcc (AREF/ATST low 7) and
+            // fge (high 4); the backend masks both flags to bit 0 and feeds uAtest.
+            if ((st.g766Atest & 0x8000u) != 0u)
+            {
+                d.tcc = static_cast<uint8_t>(d.tcc | ((st.g766Atest & 0x7Fu) << 1u));
+                d.fge = static_cast<uint8_t>(d.fge | (((st.g766Atest >> 7u) & 0xFu) << 1u));
+            }
             d.fogCol = st.fogCol; // G364
             d.depthFunc = st.depthFunc;
             d.depthWrite = st.depthWrite;
@@ -6777,6 +7065,67 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // Legacy site. The set collected here is "pages raw at SUBMIT time", which is not the set
     // whose packed bytes are stale; see the pack-time capture above.
     if (!s_g716SeedAtPack) g716PrepareSeed(s_batch, fbw);
+    // ⭐ G766: arm the GPU page pulls this wave needs (see g766_page_owner.inc). Synchronous path
+    // only; the fire-and-forget arms never reach here with pulls pending (g766PrepareWave published
+    // their owners instead).
+    static std::vector<uint32_t> s_g766Pulled; // flush-owner thread only
+    s_g766Pulled.clear();
+    if (g766Ti >= 0 && g261Wave && !g305Async && g766PullsAllowed() && !g305DrainRequired())
+    {
+        const G261Res &g766R = g_g261Res[g766Ti];
+        const bool g766Cov = g766R.covHi >= g766R.covLo;
+        const int g766WLo = s_batch.uploadFb ? g766UpLo
+                                             : (g766Cov ? std::min(rowLo, g766R.covLo) : rowLo);
+        const int g766WHi = s_batch.uploadFb ? g766UpHi
+                                             : (g766Cov ? std::max(rowHi, g766R.covHi) : rowHi);
+        (void)g766ArmWavePulls(g766Ti, s_batch.fboKey != 0u ? s_batch.fboKey : fbp, g766WLo,
+                               g766WHi, s_batch.uploadFb, 0, 511, s_g766Pulled);
+    }
+    // ⭐ G766: a GPU-seeded transient takes its owned pages from the resident FBOs. It must be a
+    // synchronous submit (its readback follows); anything else abandons the GPU path, and the CPU
+    // fallback's own g261PrepareCpuReplay publishes the residents the prologue skipped.
+    if (g766TransientArmed(fbp) &&
+        (g305Async || g305DrainRequired() ||
+         !g766TransientArmPulls(fbp, s_batch.fboKey != 0u ? s_batch.fboKey : fbp, rowLo,
+                                rowHi)))
+    {
+        g766TransientReset();
+        g_g266FlushRej = kG266FrSubmit;
+        g741ShipAdd(g_g178Fallbacks, 1u);
+        g581InvalidateCpuFallbackSnapshots();
+        return false;
+    }
+    // ⭐⭐⭐ G767: THE TRANSIENT -> RESIDENT FOLD (g767_transient_fold.inc). A GPU-seeded transient
+    // whose every written page has a dirty resident home does not read its result back: the render
+    // item copies the written page bands GPU->GPU into those residents and the residents carry the
+    // obligation like a wave. Guest depth, the G289 owner consume, readback oracles and every
+    // fire-and-forget path keep the legacy readback.
+    // G767 v2: a transient WITH guest depth folds too, unless its colour pages alias Z storage
+    // (its own or a pending Z owner's): the legacy colour readback is ordered after the Z
+    // publication for exactly that alias, and a folded result would publish from the residents
+    // at a different point. Rollback of this half: DC2_G767_NO_FOLDZ=1.
+    bool g767DepthOk = !guestDepth;
+    if (guestDepth && g767FoldDepthOn() && g278ColorWrite.valid)
+    {
+        const G144BlockRange g767Z = g144RangeForRect(guestZbpPage << 5u, GS_PSM_Z24, fbw, 0u, 0u,
+                                                      static_cast<uint32_t>(fbW), 512u);
+        g767DepthOk = g767Z.valid && (g411PrivateDepth || !g144RangeOverlaps(g767Z, g278ColorWrite));
+        for (int s = 0; g767DepthOk && s < kG278PendSlots; ++s)
+        {
+            const G278PendDepth &p = s_g278PendTab[s];
+            if (!p.active || p.privateMirror)
+                continue;
+            const G144BlockRange other = g278PendingDepthWholeRangeP(p);
+            if (!other.valid || g144RangeOverlaps(other, g278ColorWrite))
+                g767DepthOk = false;
+        }
+    }
+    const bool g767Fold =
+        g766TransientArmed(fbp) && !g305Async && !g305DrainRequired() && g767DepthOk &&
+        !g275FuseReadback && !g289ConsumeOwner && !g621RbOracleArmed &&
+        g767FoldArm(fbp, fbw, s_batch.fboKey != 0u ? s_batch.fboKey : fbp, g621PubLo, g621PubHi);
+    if (g767Fold)
+        s_batch.skipReadback = true;
     bool submitted;
     if (g305Async)
     {
@@ -6831,6 +7180,29 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                        ? g242_backend_submit_depth(s_batch, depthKey, depthUpload,
                                                    depthGlY, depthRows)
                        : g178_backend_submit(s_batch));
+    }
+    g766ConfirmWavePulls(g766Ti, s_g766Pulled); // G766: forget pulls that did not land
+    if (submitted && !g766TransientConfirm())
+    {
+        g766TransientReset();
+        submitted = false; // the transient rendered over a stale seed: CPU fallback, legacy prologue
+    }
+    // G767: the fold landed (all of it) or nothing landed — in which case the render is abandoned
+    // exactly like a failed pull (the backend refuses the fold when the batch's pulls failed).
+    bool g767Committed = false;
+    if (g767Fold)
+    {
+        if (submitted)
+        {
+            g767Committed = g767FoldConfirmCommit();
+            if (!g767Committed)
+            {
+                g766TransientReset();
+                submitted = false;
+            }
+        }
+        else
+            g767FoldReset();
     }
     // ⭐⭐⭐ G700: the GPU now holds rows [rowLo, rowHi] of this surface and guest VRAM does not.
     // Claim their pages and anchor them at the current write generation, so (a) the next batch to
@@ -6940,6 +7312,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     !done[static_cast<uint8_t>(srcTi)])
                 {
                     done[static_cast<uint8_t>(srcTi)] = true;
+                    G766MatSite g766s(kG766SiteTexOther);
                     g261Materialize(srcTi, kG261MatTexAlias);
                 }
         }
@@ -7263,10 +7636,19 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         {
             // Unlike display color, this work target is consumed later as ordinary VRAM. Publish
             // the same page generations an inline draw would advance, after bytes really changed.
-            g178BumpRectImpl(fbBlock, fbw, GS_PSM_CT32, 0u,
-                             static_cast<uint32_t>(rowLo), static_cast<uint32_t>(fbW),
-                             static_cast<uint32_t>(rowHi - rowLo + 1),
-                             24u); // G582 source 24: materialize color readback (A)
+            // ⭐ G766: a GPU-seeded transient bumps exactly the rows its readback wrote (every one
+            // of them is then mirrored into the dirty residents, which re-anchors them); a bumped
+            // row that was not written would read to a resident as an escaped guest writer.
+            const bool g766Trn = g766TransientArmed(fbp);
+            const int g766BumpLo = g766Trn ? g621PubLo : rowLo;
+            const int g766BumpHi = g766Trn ? g621PubHi : rowHi;
+            if (g766BumpHi >= g766BumpLo)
+                g178BumpRectImpl(fbBlock, fbw, GS_PSM_CT32, 0u,
+                                 static_cast<uint32_t>(g766BumpLo), static_cast<uint32_t>(fbW),
+                                 static_cast<uint32_t>(g766BumpHi - g766BumpLo + 1),
+                                 24u); // G582 source 24: materialize color readback (A)
+            if (g766Trn)
+                g766TransientWriteback(fbp, fbBlock, fbw, fbW, g621PubLo, g621PubHi);
             fbGenNow = g178GenSumRect(fbBlock, fbw, GS_PSM_CT32, 0u, 0u,
                                       static_cast<uint32_t>(fbW), kFbH);
             if (g286Transient)
@@ -7360,7 +7742,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     }
     if (g255Rtt)
     {
-        const int ti = g248TargetIndex(fbp);
+        const int ti = g766BatchTi;
         if (g261Wave)
         {
             // G261 wave: VRAM did NOT change (readback skipped), so the page generations stay
@@ -7382,6 +7764,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             r.fbw = fbw;
             r.fbW = fbW;
             g716MarkRows(r, rowLo, rowHi);
+            const bool g766WasDirty = r.dirty;
             r.dirty = true;
 #if defined(PS2X_G662_DIAG)
             if (g662NewEpoch)
@@ -7392,6 +7775,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
 #endif
             if (rowLo < r.dirtyLo) r.dirtyLo = rowLo;
             if (rowHi > r.dirtyHi) r.dirtyHi = rowHi;
+            // ⭐ G766: this wave's FBO now holds the newest bytes of every page in its rows.
+            g766NoteWaveRender(ti, rowLo, rowHi, g766WasDirty);
 #if defined(PS2X_G662_DIAG)
             // G662: union this wave's scissor COLUMN extent into the residency record, so the
             // publication can price its full-width readback against what the producers actually
@@ -7516,7 +7901,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // taken. Without a stamp here the array would still describe the PREVIOUS flush's genSum and
     // the fail-closed guard would reject it on every later batch — an inert lever wearing an exact
     // lever's clothes.
-    g591ColStamp(g351RouteB ? kG351Sprite139 : fbp, fbBlock, fbw, snap.genSum, snap.rowLo,
+    g591ColStamp(g351RouteB ? kG351Sprite139 : g766SnapKey, fbBlock, fbw, snap.genSum, snap.rowLo,
                  snap.rowHi);
     // G623: the ONE instant at which FBO(fbp) == VRAM(pages of fbp) is KNOWN for the rows this
     // flush just published. Only the TRANSIENT population is recorded (g623NotePublished refuses
@@ -7524,6 +7909,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // above tested — a coalesced or skipped readback leaves VRAM behind the FBO and must not stamp.
     g623NotePublished(fbp, fbBlock, fbw, fbW, kFbH, rowLo, rowHi,
                       s_batch.readback.size() == static_cast<size_t>(fbW) * kFbH);
+    // G767: a folded transient is a view, not an authority — its FBO is ahead of guest VRAM for the
+    // folded rows, so the next flush must re-seed it (upload + owner pulls), never trust it.
+    if (g767Committed)
+    {
+        g767RetireView(snap);
+        g766TransientReset();
+    }
     if (g277GenMoveOn() && fbp == 0x68u)
     {
         for (int i = 0; i < 13; ++i)
@@ -7534,7 +7926,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     }
     if (g261Wave)
     {
-        const int ti = g248TargetIndex(fbp);
+        const int ti = g766BatchTi;
         G261Res &r = g_g261Res[ti];
         r.covLo = snap.rowLo;
         r.covHi = snap.rowHi;

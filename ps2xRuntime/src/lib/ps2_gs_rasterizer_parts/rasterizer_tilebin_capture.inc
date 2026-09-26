@@ -563,7 +563,7 @@
                         s_rg.m_vram = rgs->m_vram;
                         s_rg.m_vramSize = rgs->m_vramSize;
                         s_rg.m_privRegs = rgs->m_privRegs;
-                        t_g144InReplay = true;
+                        t_g144InReplay = true; ++g_g770CpuReplays; // G770 trace label
                         t_g144Banded = true;
                         t_g144BandY0 = a;
                         t_g144BandY1 = b;
@@ -938,6 +938,7 @@
                 // G261: the wave arm disables the G260 pre-execution RTT generation bump (it
                 // would poison GPU-resident targets); publish the replay's RTT writes here,
                 // after the bytes actually changed.
+                g769PostReplayWriteNotes(); // G769: re-note mirrored writes after the bytes landed
                 g261NoteCpuRttWrites(g_g144LastGs->m_vram);
                 g286NoteCpuTransientWrites(g_g144LastGs->m_vram);
                 g255CompareCpuVerify(g_g144LastGs->m_vram, g_g144LastGs->m_vramSize);
@@ -1009,7 +1010,7 @@
                 // `DC2_G630_RESIDENT` it read pre-replay bytes and left the GPU depth mirror
                 // believing it was still current.
                 g630PrepareCpuReplay();
-                t_g144InReplay = true;
+                t_g144InReplay = true; ++g_g770CpuReplays; // G770 trace label
                 t_g144Banded = false; // full row range
                 for (const auto &e : g_g144List)
                 {
@@ -1048,6 +1049,7 @@
                 // G261: the wave arm disables the G260 pre-execution RTT generation bump (it
                 // would poison GPU-resident targets); publish the replay's RTT writes here,
                 // after the bytes actually changed.
+                g769PostReplayWriteNotes(); // G769: re-note mirrored writes after the bytes landed
                 g261NoteCpuRttWrites(g_g144LastGs->m_vram);
                 g286NoteCpuTransientWrites(g_g144LastGs->m_vram);
                 g255CompareCpuVerify(g_g144LastGs->m_vram, g_g144LastGs->m_vramSize);
@@ -1575,203 +1577,47 @@
         if (g_g713On && !t_g713ExecInline)
         {
             g713ParseFlushOpen(); // ordering: entries captured before this primitive go first
+            // ⭐ G770-A: POST, DO NOT WAIT. The primitive's register state is snapshotted exactly as
+            // a deferred G144 entry would carry it and the executor runs the inline tail on a
+            // scratch GS at this ring position (g770_async_inline.inc). The one shape kept on the
+            // blocking round trip is drawSprite's G172 display-copy hoist, which writes the REAL
+            // GS's preferred-display-source triple that the parse thread snapshots at the frame
+            // boundary. Rollback DC2_G770_NO_ASYNC_INLINE=1.
+            const bool g770HoistShape = gs->m_prim.type == GS_PRIM_SPRITE && gs->m_prim.tme &&
+                                        gs->m_prim.abe && gs->m_prim.fst && gs->m_prim.ctxt;
+            if (g770AsyncInlineOn() && !g770HoistShape && g_g770RunInlineJob != nullptr)
+            {
+                G770InlineJob *g770Job = g770AcquireJob();
+                g770Job->self = this;
+                g770Job->vram = gs->m_vram;
+                g770Job->vramSize = gs->m_vramSize;
+                g770Job->privRegs = gs->m_privRegs;
+                g770Job->ctx[0] = gs->m_ctx[0];
+                g770Job->ctx[1] = gs->m_ctx[1];
+                g770Job->prim = gs->m_prim;
+                for (int g770i = 0; g770i < 6; ++g770i)
+                    g770Job->vtx[g770i] = gs->m_vtxQueue[g770i];
+                g770Job->texa = gs->m_texa;
+                g770Job->texclut = gs->m_texclut;
+                g770Job->pabe = gs->m_pabe;
+                g770Job->fogcol = g_g364FogCol;
+                g770Job->titleRockScope = g_dc2TitleRockScope.load(std::memory_order_relaxed);
+                g770Job->townDepthScope = g_dc2TownDepthScope.load(std::memory_order_relaxed);
+                g_g770Posted.fetch_add(1u, std::memory_order_relaxed);
+                g713PostCall(&g770ExecInlineThunk, g770Job);
+                g770Report();
+                g526SetExit(kG526Defer);
+                return;
+            }
+            g_g770Blocking.fetch_add(1u, std::memory_order_relaxed);
             G713InlineArg g713Arg{this, gs};
             g713CallOnExec(&g713ExecInlineThunk, &g713Arg);
             g526SetExit(kG526Defer);
             return;
         }
-        if (g260NrOn())
-        {
-            // G260: an inline (non-recordable) primitive is about to read/write VRAM directly.
-            // Execute the whole pending graph first so it observes the same VRAM evolution
-            // order as the immediate-drain baseline. Covers both the open batch and any closed
-            // batches (the legacy branch below only ever has the open list).
-            if (g260HasPending())
-            {
-                if (!g_g144List.empty())
-                    g253NoteMidBarrier(false, g_g144List.front().ctx.frame.fbp,
-                                       ctx.frame.fbp, g_g144List.size(), pt144,
-                                       gs->m_prim.tme, gs->m_prim.abe);
-                g260ExecuteAll(kG260NonDef, true);
-            }
-        }
-        else if (!g_g144List.empty())
-        {
-            g253NoteMidBarrier(false, g_g144List.front().ctx.frame.fbp,
-                               ctx.frame.fbp, g_g144List.size(), pt144,
-                               gs->m_prim.tme, gs->m_prim.abe);
-            g144TimedMidFlush();
-        }
-        g526Lap(kG526Drain); // G526: inline path — pending-graph drain before this primitive
-        // This primitive will execute on the CPU (RTT/line/point/diagnostic path).  The preceding
-        // drain may have left guest Z resident on the GPU, so restore authoritative bytes before
-        // any CPU depth test, texture sample, or Z write.
-        // G261: same for GPU-resident RTT rows — materialize any resident target this
-        // primitive's frame/Z/texture/CLUT pages touch before the CPU reads or writes them.
-        // G278 range-exact edge: culled or disjoint inline primitives do not break a same-key Z
-        // run; real target/Z/texture/CLUT aliases publish before resident color materialization.
-        (void)g278FlushPendingDepthForInline(
-            gs->m_prim, gs->m_vtxQueue, ctx, gs->m_texclut);
-        (void)g278FlushPendingDepthForDisplayOwners(4);
-        const G289InlineAudit g289Inline =
-            g345AnyOwnerActive()
-                ? g289AuditInline(gs->m_prim, gs->m_vtxQueue, ctx, gs->m_texclut)
-                : G289InlineAudit{};
-        if (g345AnyOwnerActive() && g289StatOn())
-        {
-            static std::atomic<uint32_t> s_g289InlineLog{0};
-            const uint32_t n = s_g289InlineLog.fetch_add(1u, std::memory_order_relaxed);
-            if (n < 16u)
-                std::fprintf(
-                    stderr,
-                    "[G289:inline-edge] n=%u owner=%x..%x carry=%u empty=%u unknown=%u "
-                    "prim=%u tme=%u abe=%u fst=%u "
-                    "frame=%03x/%u/%x sc=%u,%u..%u,%u tex=%x/%u/%x/%u/%u "
-                    "zbuf=%llx test=%llx box=%d,%d..%d,%d "
-                    "ranges(c=%x..%x z=%x..%x t=%x..%x p=%x..%x) "
-                    "v=(%.1f,%.1f)(%.1f,%.1f)(%.1f,%.1f)\n",
-                    n + 1u, s_g289Owner.firstOwnedBlock, s_g289Owner.lastOwnedBlock,
-                    g289Inline.carry ? 1u : 0u, g289Inline.empty ? 1u : 0u,
-                    g289Inline.unknown ? 1u : 0u,
-                    static_cast<unsigned>(gs->m_prim.type), gs->m_prim.tme ? 1u : 0u,
-                    gs->m_prim.abe ? 1u : 0u, gs->m_prim.fst ? 1u : 0u,
-                    ctx.frame.fbp, static_cast<unsigned>(ctx.frame.fbw), ctx.frame.psm,
-                    ctx.scissor.x0, ctx.scissor.y0, ctx.scissor.x1, ctx.scissor.y1,
-                    ctx.tex0.tbp0, static_cast<unsigned>(ctx.tex0.tbw), ctx.tex0.psm,
-                    static_cast<unsigned>(ctx.tex0.tw), static_cast<unsigned>(ctx.tex0.th),
-                    static_cast<unsigned long long>(ctx.zbuf),
-                    static_cast<unsigned long long>(ctx.test),
-                    g289Inline.x0, g289Inline.y0, g289Inline.x1, g289Inline.y1,
-                    g289Inline.color.first, g289Inline.color.last,
-                    g289Inline.depth.first, g289Inline.depth.last,
-                    g289Inline.texture.first, g289Inline.texture.last,
-                    g289Inline.clut.first, g289Inline.clut.last,
-                    gs->m_vtxQueue[0].x, gs->m_vtxQueue[0].y,
-                    gs->m_vtxQueue[1].x, gs->m_vtxQueue[1].y,
-                    gs->m_vtxQueue[2].x, gs->m_vtxQueue[2].y);
-        }
-        if (g289Inline.carry)
-            g_g289InlineCarries.fetch_add(1u, std::memory_order_relaxed);
-        else
-            (void)g289MaterializeOwner(4);
-        g272MaterializeAll(4); // inline CPU primitive: conservative display-color consumer edge
-        g277CensusInlineEdge(gs->m_prim, gs->m_vtxQueue, ctx, gs->m_texclut);
-        g276FlushPendingDisplay(4); // G276: publish deferred display readbacks first
-        g261PrepareInline(ctx, gs->m_prim, gs->m_texclut);
-        g242PrepareVramReadAll(gs->m_vram);
-        g526Lap(kG526Edge); // G526: inline path — ownership/materialize/publish edge
+        s_g770InlineTail(this, gs, true); // G770-A: the inline edge + CPU raster (g770_inline_tail.inc)
+        return;
     }
 
-    switch (gs->m_prim.type)
-    {
-    case GS_PRIM_SPRITE:
-        drawSprite(gs);
-        break;
-    case GS_PRIM_TRIANGLE:
-    case GS_PRIM_TRISTRIP:
-    case GS_PRIM_TRIFAN:
-        // G156: time inline (non-deferred) tri raster on the calling thread. Under MTGS+G144 only
-        // NON-deferrable tris reach here (deferrable ones returned early), so inlineMs pairs with
-        // g_g156InlineTri. Replay calls drawTriangle directly (never this switch) → no double count.
-        if (g_g156Stat && !t_g144InReplay)
-        {
-            const auto g156T0 = std::chrono::steady_clock::now();
-            drawTriangle(gs);
-            g_g156InlineTriNs.fetch_add(
-                (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    std::chrono::steady_clock::now() - g156T0)
-                    .count(),
-                std::memory_order_relaxed);
-        }
-        else
-            drawTriangle(gs);
-        break;
-    case GS_PRIM_LINE:
-    case GS_PRIM_LINESTRIP:
-        drawLine(gs);
-        break;
-    case GS_PRIM_POINT:
-    {
-        const GSVertex &v = gs->m_vtxQueue[0];
-        const auto &ctx = gs->activeContext();
-        int px = static_cast<int>(v.x) - (ctx.xyoffset.ofx >> 4);
-        int py = static_cast<int>(v.y) - (ctx.xyoffset.ofy >> 4);
-        writePixel(gs, px, py, v.r, v.g, v.b, v.a);
-        break;
-    }
-    default:
-        break;
-    }
-    g526Lap(kG526Raster); // G526: inline path — the actual CPU rasterization of this primitive
-
-    // G178: an INLINE (non-deferred) draw just wrote guest VRAM directly (e.g. the costume RTT at
-    // fbp=0x139). Bump the write generations of the pages its scissored frame region can touch so
-    // any GPU-resident texture decoded from those pages (RTT-as-texture) is re-decoded, not stale.
-    // Conservative (scissor rect ⊇ written pixels); a no-op single boolean read when the lever is
-    // off, and skipped during replay (replay is the GPU path's own CPU fallback, whose target is
-    // the display fb the front-end re-uploads unconditionally anyway).
-    if (g178GpuOn() && !t_g144InReplay)
-    {
-        const auto &ctx178 = gs->activeContext();
-        // G277-R: bump the prim's CLAMPED bbox ∩ scissor, not the whole scissor rect. Writes are
-        // confined to that intersection by construction, so this stays conservative — but a fully
-        // scissored-out prim (e.g. the offscreen sceGsSwapDBuff sync linestrips at x≈1792..2303)
-        // rasterizes NOTHING and must bump NOTHING. The old whole-scissor bump invalidated the
-        // full display target ~1×/frame per buffer, forcing a spurious fb re-upload every batch
-        // (and, under G276 deferral, the stale-VRAM clobber behind the MAP-0 Max-body flicker).
-        // Kill (restores whole-scissor bump): DC2_G277_NO_INLINE_BBOX_BUMP=1.
-        static const bool s_g277BboxBump = !envFlagEnabled("DC2_G277_NO_INLINE_BBOX_BUMP");
-        int bx0 = ctx178.scissor.x0, bx1 = ctx178.scissor.x1;
-        int by0 = ctx178.scissor.y0, by1 = ctx178.scissor.y1;
-        bool bumpEmpty = !(bx1 >= bx0 && by1 >= by0);
-        if (s_g277BboxBump && !bumpEmpty)
-        {
-            int nv = 3;
-            switch (gs->m_prim.type)
-            {
-            case GS_PRIM_POINT: nv = 1; break;
-            case GS_PRIM_LINE:
-            case GS_PRIM_LINESTRIP:
-            case GS_PRIM_SPRITE: nv = 2; break;
-            default: nv = 3; break;
-            }
-            const int ofx178 = ctx178.xyoffset.ofx >> 4;
-            const int ofy178 = ctx178.xyoffset.ofy >> 4;
-            float mnx = gs->m_vtxQueue[0].x, mxx = gs->m_vtxQueue[0].x;
-            float mny = gs->m_vtxQueue[0].y, mxy = gs->m_vtxQueue[0].y;
-            for (int vi = 1; vi < nv; ++vi)
-            {
-                mnx = std::min(mnx, gs->m_vtxQueue[vi].x);
-                mxx = std::max(mxx, gs->m_vtxQueue[vi].x);
-                mny = std::min(mny, gs->m_vtxQueue[vi].y);
-                mxy = std::max(mxy, gs->m_vtxQueue[vi].y);
-            }
-            bx0 = std::max(bx0, static_cast<int>(std::floor(mnx)) - ofx178);
-            bx1 = std::min(bx1, static_cast<int>(std::ceil(mxx)) - ofx178);
-            by0 = std::max(by0, static_cast<int>(std::floor(mny)) - ofy178);
-            by1 = std::min(by1, static_cast<int>(std::ceil(mxy)) - ofy178);
-            bumpEmpty = !(bx1 >= bx0 && by1 >= by0);
-        }
-        if (!bumpEmpty)
-        {
-            g178NoteVramWriteRectTagged(gs->m_vram,
-                                  GSInternal::framePageBaseToBlock(ctx178.frame.fbp),
-                                  ctx178.frame.fbw, ctx178.frame.psm,
-                                  static_cast<uint32_t>(std::max(bx0, 0)),
-                                  static_cast<uint32_t>(std::max(by0, 0)),
-                                  static_cast<uint32_t>(bx1 - std::max(bx0, 0) + 1),
-                                  static_cast<uint32_t>(by1 - std::max(by0, 0) + 1),
-                                  6u); // G582 source 6: inline-draw bbox color bump
-            if (((ctx178.zbuf >> 32u) & 1u) == 0u)
-                g178NoteVramWriteRectTagged(gs->m_vram,
-                                      static_cast<uint32_t>(ctx178.zbuf & 0x1FFu) << 5u,
-                                      ctx178.frame.fbw,
-                                      static_cast<uint32_t>((ctx178.zbuf >> 24u) & 0xFu),
-                                      static_cast<uint32_t>(std::max(bx0, 0)),
-                                      static_cast<uint32_t>(std::max(by0, 0)),
-                                      static_cast<uint32_t>(bx1 - std::max(bx0, 0) + 1),
-                                      static_cast<uint32_t>(by1 - std::max(by0, 0) + 1),
-                                      7u); // G582 source 7: inline-draw bbox depth bump
-        }
-    }
+    s_g770InlineTail(this, gs, false); // G770-A: CPU raster only (no tile-bin edge on this path)
 }

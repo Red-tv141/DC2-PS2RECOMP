@@ -208,6 +208,9 @@ static void g713ExecThreadInit()
     // distribution. Default OFF (DC2_G735_EXECPROF=1); singleton, so never arm it together with
     // DC2_G446_GSPROF / DC2_G478_VU1PROF / DC2_G503_EEPROF.
     ::g735RegisterExecThread();
+    // G769 (diagnostic, DC2_G769_EXECWAIT=1): the G447 blocking-edge census on THIS thread.
+    if (std::getenv("DC2_G769_EXECWAIT") != nullptr)
+        ::g447MarkGsWorkerThread();
 }
 
 // ---------------------------------------------------------------------------------------------

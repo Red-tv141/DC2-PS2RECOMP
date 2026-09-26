@@ -2423,7 +2423,9 @@ void g144FlushPending()
         }
         g474Lap(3); // remaining resident colour owners
         g277CensusHardEdge(5);
-        g276FlushPendingDisplay(5); // G276: publish the frame's coalesced display readback here
+        // G276: publish the frame's coalesced display readback here — or, under G765, carry it to
+        // the next real consumer (presentation and dumps no longer read guest VRAM at S > 1).
+        g765CarryOrPublishAtBoundary();
         g474Lap(4); // display publication
         g242PrepareVramReadAll(g_g144LastVram);
         g474Lap(5); // private/persistent depth read preparation
@@ -2538,6 +2540,16 @@ bool g260NrEnabled()
 
 void g144FlushPendingUpload()
 {
+    // G759: cumulative flush counter and per-component split. Off by default; see the long note
+    // beside `G759Scope` in rasterizer_headers_and_diagnostics.inc for why the split is required
+    // before any lever here (G429: an inclusive timer around a flush measures what it DRAINS).
+    if (g759ProfOn())
+    {
+        g_g759Flushes.fetch_add(1ull, std::memory_order_relaxed);
+        if (t_g759Site >= 0 && t_g759Site < kG759Sites)
+            g_g759Site[t_g759Site].fetch_add(1ull, std::memory_order_relaxed);
+        g759Report();
+    }
     // G260: callers of this no-range entry point (local→host reads, any path that did not
     // range-test) get the conservative treatment — execute the entire pending graph.
     if (g260NrOn())
@@ -2546,17 +2558,19 @@ void g144FlushPendingUpload()
         {
             g178CensusScan();
             G146PerfScope g146FlushScope(g_g146G144FlushUploadNs, g_g146G144FlushUploadCount);
+            G759Scope g759Exec(kG759Exec);
             static const bool s_seqUpload260 = (std::getenv("DC2_G144_SEQUPLOAD") != nullptr);
             g260ExecuteAll(kG260LocalHost, !s_seqUpload260);
         }
         // G261: an un-range-tested VRAM read/write follows — every GPU-resident RTT row must be
         // in guest VRAM first (conservative, like the execute above).
-        (void)g278FlushPendingDepth(6);
-        (void)g289MaterializeOwner(6);
-        g272MaterializeAll(6);
-        g277CensusHardEdge(6);
-        g276FlushPendingDisplay(6); // G276: publish deferred display readbacks first
-        g261MaterializeAllDirty(kG261MatL2H);
+        { G759Scope s(kG759Depth);    (void)g278FlushPendingDepth(6); }
+        { G759Scope s(kG759Owner);    (void)g289MaterializeOwner(6); }
+        { G759Scope s(kG759Disp272);  g272MaterializeAll(6); }
+        { G759Scope s(kG759Hard);     g277CensusHardEdge(6); }
+        // G276: publish deferred display readbacks first
+        { G759Scope s(kG759Disp276);  g276FlushPendingDisplay(6); }
+        { G759Scope s(kG759Mat261);   g261MaterializeAllDirty(kG261MatL2H); }
         return;
     }
     if (g_g144List.empty())
@@ -2573,6 +2587,28 @@ void g144FlushPendingUpload()
     {
         g_g144FlushFn();
     }
+}
+
+// G759: the same call, tagged with WHICH EDGE asked for it. `[G260:stat]` already splits the
+// graph executes by CAUSE, but the five entry points into the no-range flush are not the same as
+// the causes — three of them are in `gpu_transfers_and_kick.inc` (a local->local transfer, a
+// host->local IMAGE upload, a local->host read) and two are the range-tested sprite edges, and a
+// lever that removes an EDGE needs to know which edge pays.
+//
+// ⚠️ Rule 71: `t_g759Site` was declared with no writer in this file's first revision, which makes
+// `site0` a bucket that means "everything" and the column a knob nobody reads. Either the writers
+// exist or the column should not.
+void g144FlushPendingUploadFrom(int site)
+{
+    if (!g759ProfOn())
+    {
+        g144FlushPendingUpload();
+        return;
+    }
+    const int prev = t_g759Site;
+    t_g759Site = site;
+    g144FlushPendingUpload();
+    t_g759Site = prev;
 }
 
 struct G314EdgeScope
@@ -2808,6 +2844,7 @@ void g144FlushPendingUploadRange(uint32_t dbp,
                                  uint32_t rrw,
                                  uint32_t rrh)
 {
+    g766SeqXfer("UP", 0u, 0u, 0u, 0u, 0u, dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
     // G260: a host→local upload is a WAR/WAW edge only when its destination intersects a
     // pending batch's read set (texture/CLUT the recorded draws will sample at execution) or
     // write set (target/Z alias). Real edges execute the whole graph in order; independent
@@ -2846,7 +2883,7 @@ void g144FlushPendingUploadRange(uint32_t dbp,
             }
         }
         if (!g289UploadOverwrite)
-            g289MaterializeForRanges(G144BlockRange{}, dst, false, dstUnknown, 7);
+            g769FoldOrMaterializeOwnersForRanges(G144BlockRange{}, dst, false, dstUnknown, 7); // G769 E
         G656_UP_LAP(kG656UpG289Mat);
         G314EdgeScope g314Edge;
         if (g260HasPending())
@@ -2893,9 +2930,15 @@ void g144FlushPendingUploadRange(uint32_t dbp,
         std::chrono::steady_clock::time_point g327T0;
         if (g327CensusOn())
             g327T0 = std::chrono::steady_clock::now();
-        const uint32_t g264Mask = dstUnknown
+        const uint32_t g264Mask = (dstUnknown || g766MaskMirActive())
             ? 0u
             : g264NoteUploadForMirror(dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+        // ⭐ G766: every OTHER dirty target this write lands in (a PSMT8 / PSMT4 / PSMCT16 write, a
+        // CT32 shape G264 refused) is reconciled by a deferred bit-exact FBO patch instead of a
+        // whole-surface publication. Rollback DC2_G766_NO_MASKMIR=1.
+        const uint32_t g766MaskMir = dstUnknown
+            ? 0u
+            : g766NoteUploadMaskMirror(dbp, dbw, dpsm, dsax, dsay, rrw, rrh, g264Mask);
         // G632: census the declining conjuncts here (and only here — the hook inside
         // g630UploadCompleteInternal re-tests the same predicate and would double-count).
         // G634b: `g634CanIngestUpload` is the SAME predicate the upload-complete hook consults, so
@@ -2920,7 +2963,7 @@ void g144FlushPendingUploadRange(uint32_t dbp,
         const bool g716PreviousObserver = g_g716GpuObserver;
         if (g716UploadPatch) g_g716GpuObserver = true;
         g261MaterializeForRanges(G144BlockRange{}, dst, false, dstUnknown, kG261MatUpload,
-                                 g264Mask, g630UploadPatch);
+                                 g264Mask | g766MaskMir, g630UploadPatch);
         g_g716GpuObserver = g716PreviousObserver;
         G656_UP_LAP(kG656UpG261Mat);
         const uint64_t g327MatNs = g327CensusOn()
@@ -2961,7 +3004,7 @@ void g144FlushPendingUploadRange(uint32_t dbp,
     }
 
     g144DirtyStat("upload", true);
-    g144FlushPendingUpload();
+    g144FlushPendingUploadFrom(4); // G759: range-tested host->local sprite edge
 }
 
 // ===== G432: local->local flush-edge split (behaviour-pure, DC2_G432_CENSUS=1) =====
@@ -3086,6 +3129,7 @@ void g715LatePinPart(int which)
 void g627ApplyPendingL2lPatch(uint8_t *vram, uint32_t vramSize)
 {
     g627ApplyPendingL2lPatchImpl(vram, vramSize);
+    g766ApplyL2lPin(); // G766: note the deferred destination patch now that VRAM holds the bytes
 }
 
 // G714 global-linkage wrappers, same reason. `CanTake` is the pure predicate the publication skip
@@ -3109,6 +3153,14 @@ bool g714TryExecuteL2l(uint8_t *vram, uint32_t vramSize,
                                  dbp, dbw, dpsm, dsax, dsay, rrw, rrh, revX, revY);
 }
 
+// G767 global-linkage wrappers (g767_gpu_l2l.inc), the same shape as G714's.
+bool g767TryExecuteL2l(uint32_t sbp, uint8_t sbw, uint8_t spsm, uint32_t ssax, uint32_t ssay,
+                       uint32_t dbp, uint8_t dbw, uint8_t dpsm, uint32_t dsax, uint32_t dsay,
+                       uint32_t rrw, uint32_t rrh)
+{
+    return g767TryExecuteL2lImpl(sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
+}
+
 // Pixel-only bookkeeping for an escaping transfer. It must NOT re-run the predicate: by the time
 // performLocalToLocalTransfer reaches the escape, this edge's barrier has already published and
 // cleared `r.dirty`, so a second evaluation reads a state that no longer explains the decision.
@@ -3125,6 +3177,7 @@ void g714NoteEscape(uint32_t rrw, uint32_t rrh)
 void g627DiscardPendingL2lPatch()
 {
     g627DisarmPin();
+    g766DisarmL2lPin(); // G766: an FBO->FBO blit (or G714) took the copy; VRAM was not written
 }
 
 void g144FlushPendingLocalTransferRange(uint32_t sbp,
@@ -3142,6 +3195,8 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
 {
     t_g522Pin.armed = false; // G522: every path below either re-arms it or leaves it disarmed
     g627DisarmPin();         // G627: same contract — only g627TryTakeL2lDest below may re-arm it
+    g766DisarmL2lPin();      // G766: same contract — only g766TryTakeL2lDest below may re-arm it
+    g766SeqXfer("L2L", sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay, rrw, rrh);
     // G434 workload invariant: count every l2l edge on BOTH arms of the deletion probe below.
     {
         extern std::atomic<uint64_t> g_g434L2lEdges;
@@ -3191,7 +3246,7 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
         std::chrono::steady_clock::time_point g432T0;
         if (g432On)
             g432T0 = std::chrono::steady_clock::now();
-        g289MaterializeForRanges(src, dst, srcUnknown, dstUnknown, 8);
+        g769FoldOrMaterializeOwnersForRanges(src, dst, srcUnknown, dstUnknown, 8); // G769 E
         if (g432On)
         {
             g_g432EdgeMatNs += static_cast<uint64_t>(
@@ -3275,7 +3330,13 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
         const bool g714Skip = g714CanTakeL2lImpl(sbp, sbw, spsm, ssax, ssay,
                                                  dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
                                                  g714StatOn());
-        const bool g522Skip = g714Skip ||
+        // G767: a transfer whose source pages live in resident FBOs runs on the GPU
+        // (g767_gpu_l2l.inc), so its source publication is moot - it rides the same G522 pin, and
+        // g144L2lLatePin() replays the publication verbatim if the GPU path declines after all.
+        const bool g767Skip =
+            !g714Skip && g767CanTakeL2lImpl(sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax,
+                                            dsay, rrw, rrh);
+        const bool g522Skip = g714Skip || g767Skip ||
                               (g522L2lSkipActive() &&
                                g289CanDeferLocalCopy(sbp, sbw, spsm, ssax, ssay,
                                                      dbp, dbw, dpsm, dsax, dsay, rrw, rrh));
@@ -3313,10 +3374,19 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
                      : g285PrepareL2lConsume(
                            sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay, rrw, rrh,
                            src, dst, srcUnknown, dstUnknown);
+        // ⭐ G766: the general form of G627's destination take — any same-format copy whose source
+        // is current in guest VRAM reconciles its destination targets with a deferred bit-exact FBO
+        // patch noted after the CPU body. Evaluated after G285, whose consumption publishes (and so
+        // cleans) the targets it takes. Rollback DC2_G766_NO_MASKMIR_L2L=1.
+        const uint32_t g766L2lMask =
+            (g522Skip || g627Mask != 0u)
+                ? 0u
+                : g766TryTakeL2lDest(sbp, sbw, spsm, ssax, ssay, dbp, dbw, dpsm, dsax, dsay,
+                                     rrw, rrh, src, dst, srcUnknown, dstUnknown);
         g432s.lap(g_g432EdgeStageNs[2]);
         if (!g522Skip)
             g261MaterializeForRanges(src, dst, srcUnknown, dstUnknown, kG261MatLocal,
-                                     g285Consumed | g627Mask);
+                                     g285Consumed | g627Mask | g766L2lMask);
         g432s.lap(g_g432EdgeStageNs[3]);
         if (g343On)
         {
@@ -3363,5 +3433,5 @@ void g144FlushPendingLocalTransferRange(uint32_t sbp,
     }
 
     g144DirtyStat("local", true);
-    g144FlushPendingUpload();
+    g144FlushPendingUploadFrom(5); // G759: range-tested local->local sprite edge
 }

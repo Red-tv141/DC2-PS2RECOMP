@@ -737,6 +737,8 @@ void GSRasterizer::drawTriangle(GS *gs)
     };
     bool g408Tl[3] = {};
     if (g408ShadowVolume)
+        g761NoteTri(g408AlphaMode == 0x68u);
+    if (g408ShadowVolume)
     {
         g408Fx[0] = static_cast<int64_t>(std::llround(fx0 * 16.0f));
         g408Fx[1] = static_cast<int64_t>(std::llround(fx1 * 16.0f));
@@ -1254,7 +1256,11 @@ void GSRasterizer::drawTriangle(GS *gs)
     // G203: universal-Z honors guest ZBUF/TEST for ALL targets against real VRAM Z; the legacy path
     // kept the per-screen whitelist (costume 0x139, title-rock, town state-scope).
     const bool zScope = g203Uni || (ctx.frame.fbp == 0x139u) || g106TitleZ || g202TownZ;
-    const bool zEnabled = !s_zTestDisabled && zScope && zte != 0u && gs->m_vram != nullptr;
+    // G761 ceiling probe (default-off, DC2_G761_SHADOW_NOZ=1): drop the GREATER depth test for the
+    // Map-125 shadow-volume class only. NOT a fix — it answers whether the depth comparison against
+    // the near-coplanar ground is what eats the winding number's coverage.
+    const bool zEnabled = !s_zTestDisabled && zScope && zte != 0u && gs->m_vram != nullptr &&
+                          !(g408ShadowVolume && g761ShadowNoZ());
     const bool z16 = (zpsm == 0x2u || zpsm == 0xAu || zpsm == 0xBu); // PSMZ16 / PSMZ16S
     const bool z24 = (zpsm == 0x1u); // PSMZ24
     // G357 (default-off): Sindain menu circle-viewport diagnosis. The HW Inventory.gs blits the
@@ -2453,6 +2459,10 @@ void GSRasterizer::drawTriangle(GS *gs)
                     }
                 }
             }
+            // G761 (default-off): the Map-125 winding oracle's REAL sample point — `zi`, `zdst` and
+            // `zPass` here are the ones the shipped path used, unlike the front door's.
+            if (g408ShadowVolume)
+                g761NoteSample(g408AlphaMode == 0x68u, x, y, zi, zdst, zPass);
             // G219 (default-off, DC2_G219_SKYPX=1): MAP-4 zoom top-right black region. Trace the
             // sky-dome pixels (display fbp, tbp=0x2820) inside the black rectangle (x>=417,
             // y<=140) — zi vs zdst discriminates "sky fails Z" from "sky never rasterized here".

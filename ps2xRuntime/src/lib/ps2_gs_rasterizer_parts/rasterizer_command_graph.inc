@@ -1931,6 +1931,7 @@ namespace
         if (prefixCount == 0u)
             return;
         ++g_g260ExecByCause[cause & 7];
+        g770XTrace('E', static_cast<uint32_t>(cause) | 0x100u, static_cast<uint32_t>(prefixCount), 0u, 0u);
         static const bool s_seqEnv = (std::getenv("DC2_G144_SEQ") != nullptr);
         const std::function<void()> &fn =
             (allowParallel && !s_seqEnv && g_g144FlushFn) ? g_g144FlushFn : g_g144FlushSeqFn;
@@ -2001,10 +2002,19 @@ namespace
                     }
                 }
             }
-            if (fn)
-                fn(); // drains + clears g_g144List
-            else
-                g_g144List.clear(); // cannot happen (entries imply assigned closures); fail safe
+            {
+                const bool g770X = g770XTraceActive();
+                const uint64_t g770T0 = g770X ? g770XTraceNow() : 0u;
+                const uint32_t g770Cpu0 = g_g770CpuReplays;
+                const uint32_t g770Fbp = b.fbp;
+                const uint32_t g770N = static_cast<uint32_t>(g_g144List.size());
+                if (fn)
+                    fn(); // drains + clears g_g144List
+                else
+                    g_g144List.clear(); // cannot happen (entries imply assigned closures); fail safe
+                if (g770X)
+                    g770XTrace('B', g770Fbp, g770N, g_g770CpuReplays != g770Cpu0 ? 1u : 0u, g770T0);
+            }
             g272SetDisplayBatch(0xFFFFFFFFu, 0u);
             g_g528Wr = nullptr; // G528: the batch is no longer executing — fail closed again
             g_g528Rd = nullptr;
@@ -2030,6 +2040,7 @@ namespace
         if (g_g260Graph.empty())
             return;
         ++g_g260ExecByCause[cause & 7];
+        g770XTrace('E', static_cast<uint32_t>(cause), static_cast<uint32_t>(g_g260Graph.size()), 0u, 0u);
         g523NoteMergeHeadroom(); // G523: read-only, before any batch is consumed
         static const bool s_seqEnv = (std::getenv("DC2_G144_SEQ") != nullptr);
         const std::function<void()> &fn =
@@ -2092,10 +2103,41 @@ namespace
                     }
                 }
             }
-            if (fn)
-                fn();
-            else
-                g_g144List.clear();
+            {
+                const bool g770X = g770XTraceActive();
+                const uint64_t g770T0 = g770X ? g770XTraceNow() : 0u;
+                const uint32_t g770Cpu0 = g_g770CpuReplays;
+                const uint32_t g770Fbp = b.fbp;
+                const uint32_t g770N = static_cast<uint32_t>(g_g144List.size());
+                if (g770X)
+                {
+                    // G770 replay-shape census (trace window only): Z consumer entries (sprite and
+                    // triangle predicates of rasterizer_draw_sprite/triangle), FBMSK, ATE, TME, ABE.
+                    uint32_t zRead = 0u, zWrite = 0u, fbmsk = 0u, ate = 0u, tme = 0u, abe = 0u, spr = 0u;
+                    for (const G144Entry &ce : g_g144List)
+                    {
+                        const uint32_t zte = static_cast<uint32_t>((ce.ctx.test >> 16) & 1u);
+                        const uint32_t ztst = static_cast<uint32_t>((ce.ctx.test >> 17) & 3u);
+                        const bool zmsk = ((ce.ctx.zbuf >> 32) & 1u) != 0u;
+                        zRead += (zte && (ztst == 2u || ztst == 3u)) ? 1u : 0u;
+                        zWrite += (zte && !zmsk && ztst != 0u) ? 1u : 0u;
+                        fbmsk += (ce.ctx.frame.fbmsk != 0u) ? 1u : 0u;
+                        ate += (ce.ctx.test & 1u) ? 1u : 0u;
+                        tme += ce.prim.tme ? 1u : 0u;
+                        abe += ce.prim.abe ? 1u : 0u;
+                        spr += (ce.prim.type == GS_PRIM_SPRITE) ? 1u : 0u;
+                    }
+                    g770XTrace('S', g770Fbp, zRead, zWrite, 0u);
+                    g770XTrace('T', fbmsk, ate, tme, 0u);
+                    g770XTrace('U', abe, spr, g770N, 0u);
+                }
+                if (fn)
+                    fn();
+                else
+                    g_g144List.clear();
+                if (g770X)
+                    g770XTrace('B', g770Fbp, g770N, g_g770CpuReplays != g770Cpu0 ? 1u : 0u, g770T0);
+            }
             g272SetDisplayBatch(0xFFFFFFFFu, 0u);
             g_g528Wr = nullptr; // G528: the batch is no longer executing — fail closed again
             g_g528Rd = nullptr;
@@ -3403,6 +3445,8 @@ struct G178EntryState
     uint8_t zpsm = 0;
     bool guestDepth = false;
     bool skip = false; // valid but draws nothing (e.g. ZTST=NEVER)
+    // G766: a general alpha test (AFAIL=KEEP). Bit 15 valid, bits 0..2 ATST, bits 3..10 AREF.
+    uint16_t g766Atest = 0;
     // G633 immutable texture-state plan. G510 copies these fields with the rest of the classified
     // state, so identical GS state does not recompile ranges or admission conjuncts per draw.
     uint32_t residencyPlan = 0;

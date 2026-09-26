@@ -99,6 +99,8 @@ bool g630_backend_read_depth(std::vector<uint32_t> &out);
 namespace GSMem
 {
 std::uint32_t AddressP8(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+// G768: exact texel BIT address of any page-periodic PSM (ps2_gs_memory.cpp), for GPU page views.
+std::uint32_t G768BitAddress(std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
 
 // G512: ROW-BATCHED swizzled readers for g178DecodeWhole's inner loop (implemented in
 // ps2_gs_memory_parts/g512_texdecode_row_readers.inc, likewise absent from the public header — a
@@ -111,6 +113,16 @@ void G512ReadRowP8(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, 
 void G512ReadRowP4(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint8_t *);
 void G512ReadRowP4HL(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint8_t *);
 void G512ReadRowP4HH(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint8_t *);
+// G766: the SHIPPED IMAGE-transfer writers (ps2_gs_memory.cpp), used to probe exactly which bits
+// of guest VRAM an upload shape writes. Same true-global-gap rule as the readers above.
+void WriteCT32(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+void WriteCT16(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+void WriteCT16S(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+void WriteP8(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+void WriteP8H(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+void WriteP4(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+void WriteP4HL(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
+void WriteP4HH(std::uint8_t *, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t, std::uint32_t);
 // G620: the PSMCT32 group reader's exactness-oracle counters (DC2_G620_VERIFY=1). Defined beside
 // the reader in g512_texdecode_row_readers.inc; declared here for the same reason as the readers.
 extern std::atomic<std::uint64_t> g_g620RowVerifyN;
@@ -149,6 +161,20 @@ bool g627_backend_write_color_rect_masked(uint32_t fbp, int texWidth, int texHei
                                           int glX, int glY, int width, int rows,
                                           const std::vector<uint32_t> &in,
                                           const std::vector<uint32_t> &mask);
+// G766 private .cpp-to-.cpp bridge: per-BIT masked FBO patch (texel = (old & ~mask) | (in & mask)),
+// the sub-word upload mirror's backend. Declared here for the same anonymous-namespace reason.
+bool g766_backend_write_color_rect_bits(uint32_t fbp, int texWidth, int texHeight,
+                                        int glX, int glY, int width, int rows,
+                                        const std::vector<uint32_t> &in,
+                                        const std::vector<uint32_t> &mask);
+// G769: fire-and-forget forms of the two patch writes above (FIFO-ordered, no waiter).
+bool g769_backend_write_color_rect_async(uint32_t fbp, int texWidth, int texHeight, int glX,
+                                         int glY, int width, int rows, std::vector<uint32_t> &&in);
+bool g769_backend_write_color_rect_bits_async(uint32_t fbp, int texWidth, int texHeight, int glX,
+                                              int glY, int width, int rows,
+                                              std::vector<uint32_t> &&in,
+                                              std::vector<uint32_t> &&mask);
+uint64_t g769_backend_async_write_fails();
 // G281 private .cpp-to-.cpp bridge: build one decoded RGBA texture view directly from a
 // resident CT32 target FBO. `mapRgba` encodes {srcX,srcGlY,byteLane} per PSMT8 texel; the
 // backend combines those bytes with `clutRgba` on-GPU and installs the result under `texKey`.
@@ -431,6 +457,10 @@ std::atomic<int> g_g34_in_divsprite{0};
 // tile-bin band (FOGCOL is global GS state and can change between capture and replay).
 extern uint32_t g_g364FogCol;
 thread_local uint32_t t_g364FogCol = 0u;
+// G770-A: true while the EXEC thread runs an ASYNCHRONOUSLY posted inline (non-deferrable) primitive
+// tail on its scratch GS. Like a band replay, the live FOGCOL register has moved on by then, so
+// g364FogColNow() reads the value snapshotted with the primitive (t_g364FogCol) instead.
+thread_local bool t_g770AsyncTail = false;
 
 // G419: shared arm register for the within-process randomized A/B instrument (defined in
 // ps2_gs_gpu_parts/gpu_bridge_and_latch_helpers.inc; see g419_ab_instrument.inc for the contract).
@@ -671,3 +701,124 @@ namespace
     };
     std::mutex g_g50Mutex;
     std::map<uint32_t, G50PartStat> g_g50Parts;
+
+    // =============================================================================================
+    // G759 — WHAT IS INSIDE `g144FlushPendingUpload`, AND WHO ASKS FOR IT
+    //
+    // THE MEASUREMENT THAT MADE THIS NECESSARY. At the new canonical performance resolution
+    // (1600x900) the `dragon` tail reads, from ONE diagnostic run of the G757 image:
+    //
+    //     [G141:perf] avgFrameMs=44.27 | GSraster=3.5 (8%) VU1proper=9.4 (21%) other=31.4 (71%)
+    //     [G146:g144] flush: mid=0.0ms/0.00x  upload=31.5ms/9.00x  frame=0.2ms/1.00x
+    //
+    // `other` (the EE frame minus VU1 minus GS-raster) and the g144 UPLOAD flush are the same
+    // 31.4 ms/f to one decimal. Nine flushes per frame, ~3.5 ms each, on the EE thread's critical
+    // path. Every previous phase that priced this family did so at the OLD resolution, where the
+    // same term is ~8.8 ms/f -- G685 ("readback is sync-bound"), G700 ("the whole GPU backend is
+    // 3.7 ms/f"), G735 ("colour readback 4.60 ms/f over 7 reads"). Those numbers are not controls
+    // for this one.
+    //
+    // WHY A SPLIT IS REQUIRED BEFORE ANY LEVER. `g144FlushPendingUpload`'s G260 branch is SEVEN
+    // independent publications in a row, and G429's law applies to each of them: an inclusive timer
+    // around a flush measures the work it DRAINS, not the work it performs. Ranking them is the
+    // only way to know whether the cost is the GPU round trip (`readColor` is synchronous -- it
+    // queues to the executor and blocks on a future), the per-pixel PSMCT32 swizzle that follows
+    // it, or one publication that has no business running at this edge at all.
+    //
+    // THE SITE COLUMN. The same call is reached from five places; they mean different things
+    // (a guest local->local copy, a host->local upload, a local->host read, and two range-tested
+    // sprite edges). A lever that removes an EDGE needs to know which edge pays.
+    //
+    // COST WHEN OFF: one `static const bool` load and a predictable branch per scope, on a path
+    // that runs nine times per frame. Nothing is accumulated.
+    // =============================================================================================
+    enum : int
+    {
+        kG759Exec = 0,   // g260ExecuteAll(kG260LocalHost)
+        kG759Depth,      // g278FlushPendingDepth
+        kG759Owner,      // g289MaterializeOwner
+        kG759Disp272,    // g272MaterializeAll            (display-colour wave)
+        kG759Hard,       // g277CensusHardEdge
+        kG759Disp276,    // g276FlushPendingDisplay
+        kG759Mat261,     // g261MaterializeAllDirty       (G716 + G700 + the 14 RTT slots)
+        kG759Read272,    // ... of which: the blocking g178_backend_read_color
+        kG759Swz272,     // ... of which: the per-pixel addrPSMCT32 write-back loop
+        kG759G700,       // ... of which: g700MaterializeAll
+        kG759G716,       // ... of which: g716MaterializeForRanges
+        kG759Count
+    };
+    const char *const kG759Names[kG759Count] = {
+        "exec", "depth", "owner", "disp272", "hard", "disp276", "mat261",
+        "read272", "swz272", "g700", "g716"};
+    std::atomic<uint64_t> g_g759Ns[kG759Count];
+    std::atomic<uint64_t> g_g759Calls[kG759Count];
+    std::atomic<uint64_t> g_g759Rows[kG759Count]; // optional pixel/row denominator
+    enum : int { kG759Sites = 8 };
+    std::atomic<uint64_t> g_g759Site[kG759Sites];
+    std::atomic<uint64_t> g_g759Flushes{0};
+    // Set by `g144FlushPendingUploadFrom`; 0 means "an entry point that does not tag itself".
+    thread_local int t_g759Site = 0;
+
+    bool g759ProfOn()
+    {
+        static const bool on = envFlagEnabled("DC2_G759_FLUSHPROF");
+        return on;
+    }
+
+    struct G759Scope
+    {
+        int idx;
+        bool on;
+        uint64_t rows;
+        std::chrono::steady_clock::time_point t0;
+        explicit G759Scope(int i, uint64_t rows_ = 0ull)
+            : idx(i), on(g759ProfOn()), rows(rows_)
+        {
+            if (on)
+                t0 = std::chrono::steady_clock::now();
+        }
+        ~G759Scope()
+        {
+            if (!on)
+                return;
+            const uint64_t ns = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - t0).count());
+            g_g759Ns[idx].fetch_add(ns, std::memory_order_relaxed);
+            g_g759Calls[idx].fetch_add(1ull, std::memory_order_relaxed);
+            if (rows)
+                g_g759Rows[idx].fetch_add(rows, std::memory_order_relaxed);
+        }
+    };
+
+    // Cumulative, printed on a flush cadence. The reader divides by the frame count from
+    // `[G154:perf]`, so this line never has to know what a frame is (G738-4).
+    void g759Report()
+    {
+        if (!g759ProfOn())
+            return;
+        const uint64_t flushes = g_g759Flushes.load(std::memory_order_relaxed);
+        if (flushes == 0ull || (flushes % 512ull) != 0ull)
+            return;
+        char line[1024];
+        int off = std::snprintf(line, sizeof(line), "[G759:flush] flushes=%llu",
+                                static_cast<unsigned long long>(flushes));
+        for (int s = 0; s < kG759Sites && off > 0 && off < (int)sizeof(line); ++s)
+        {
+            const uint64_t v = g_g759Site[s].load(std::memory_order_relaxed);
+            if (v)
+                off += std::snprintf(line + off, sizeof(line) - off, " site%d=%llu", s,
+                                     static_cast<unsigned long long>(v));
+        }
+        for (int i = 0; i < kG759Count && off > 0 && off < (int)sizeof(line); ++i)
+        {
+            const uint64_t c = g_g759Calls[i].load(std::memory_order_relaxed);
+            if (!c)
+                continue;
+            off += std::snprintf(line + off, sizeof(line) - off, " %s=%.1fms/%llu",
+                                 kG759Names[i],
+                                 g_g759Ns[i].load(std::memory_order_relaxed) / 1.0e6,
+                                 static_cast<unsigned long long>(c));
+        }
+        std::fprintf(stderr, "%s\n", line);
+    }

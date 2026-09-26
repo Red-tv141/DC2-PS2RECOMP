@@ -180,7 +180,7 @@ static uint32_t g712StateDiff(const G178EntryState &a, const G178EntryState &b)
     if (a.texH != b.texH)                           m |= 1u << 2;
     if (a.blend != b.blend)                         m |= 1u << 3;
     if (a.tfx != b.tfx)                             m |= 1u << 4;
-    if (a.tcc != b.tcc)                             m |= 1u << 5;
+    if (a.tcc != b.tcc || a.g766Atest != b.g766Atest) m |= 1u << 5;
     if (a.fge != b.fge)                             m |= 1u << 6;
     if (a.fogCol != b.fogCol)                       m |= 1u << 7;
     if (a.depthFunc != b.depthFunc)                 m |= 1u << 8;

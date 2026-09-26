@@ -557,6 +557,7 @@ static thread_local bool t_g597InMatPrePub = false;
 static std::atomic<uint64_t> g_g597AnchorTotal{0}, g_g597AnchorPrePub{0},
     g_g597MirrorAnchor{0}, g_g597MirrorScoped{0};
 
+static uint64_t g_g768AnchorSeq = 0u; // G768 diagnostic: window re-anchor serial
 static void g261UpdateWindow(int ti)
 {
     if (g597OwnChkOn())
@@ -586,6 +587,7 @@ static void g261UpdateWindow(int ti)
                                      static_cast<uint32_t>(r.fbW),
                                      static_cast<uint32_t>(hi - lo + 1));
         g536SnapshotPageGens(r, kG261Fbp[ti]); // G536: per-page twin of genAtSkip
+        r.g768AnchorSeq = ++g_g768AnchorSeq;
     }
     else
     {
@@ -863,6 +865,49 @@ static bool g264On()
 // Push pending mirror rows VRAM→FBO. Returns false on backend failure, in which case the FBO
 // no longer matches guest intent for those rows — the CALLER must drop the residency WITHOUT a
 // readback (a readback would clobber the newer VRAM upload bytes with stale FBO content).
+// G765: CT32 in-page inverse swizzle (word index -> texel), built from addrPSMCT32 itself, for the
+// whole-page mirror gather below. `valid` also asserts the page's (0,0) texel is word 0.
+struct G765InvPage
+{
+    std::array<uint8_t, 2048> x{};
+    std::array<uint8_t, 2048> y{};
+    bool valid = false;
+};
+static const G765InvPage &g765InvPage()
+{
+    static const G765InvPage s_inv = []() {
+        G765InvPage out;
+        std::array<bool, 2048> seen{};
+        bool ok = true;
+        for (uint32_t ty = 0; ty < 32u; ++ty)
+            for (uint32_t tx = 0; tx < 64u; ++tx)
+            {
+                const uint32_t off = GSPSMCT32::addrPSMCT32(0u, 1u, tx, ty);
+                if ((off & 3u) != 0u || off >= 8192u || seen[off >> 2u])
+                {
+                    ok = false;
+                    continue;
+                }
+                seen[off >> 2u] = true;
+                out.x[off >> 2u] = static_cast<uint8_t>(tx);
+                out.y[off >> 2u] = static_cast<uint8_t>(ty);
+            }
+        for (bool b : seen)
+            ok = ok && b;
+        out.valid = ok && GSPSMCT32::addrPSMCT32(0u, 1u, 0u, 0u) == 0u;
+        return out;
+    }();
+    return s_inv;
+}
+
+// ⭐ G769: the mirror patch is FIFO-ordered before every consumer of the FBO it patches, so the
+// flush-owner thread need not wait for the GL worker to reach it (a CPU round trip through all
+// queued work, ~600 / s on s03). Rollback DC2_G769_NO_ASYNCMIR=1 (synchronous writes).
+static bool g769AsyncMirOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G769_NO_ASYNCMIR");
+    return on;
+}
 static bool g264FlushMirror(int ti)
 {
     G261Res &r = g_g261Res[ti];
@@ -894,6 +939,17 @@ static bool g264FlushMirror(int ti)
             for (int y = std::max(0, lo); y <= std::min(511, hi); ++y)
                 r.mirBits[static_cast<size_t>(y)].fill(0u);
     };
+    // G766: every failure return below abandons the sub-word list too (the caller drops residency).
+    struct G766MaskGuard
+    {
+        G261Res &r;
+        bool keep = false;
+        ~G766MaskGuard()
+        {
+            if (!keep)
+                g766DropMaskMirror(r);
+        }
+    } g766Guard{r};
     if (vram == nullptr || hi < lo || lo < 0 || hi >= 512 ||
         r.fbW <= 0 || r.fbW > 512 || g_g261VramSize == 0u)
     {
@@ -944,7 +1000,43 @@ static bool g264FlushMirror(int ti)
             const size_t pixelCount = static_cast<size_t>(width) * rows;
             s_g264Px.assign(pixelCount, 0u);
             bool packed = true;
-            for (int gy = y; gy <= groupHi && packed; ++gy)
+            // ⭐ G765: WHOLE-PAGE GATHER. A patch made of whole 64x32 CT32 pages (every G765 fill
+            // consumption, and full-page upload aliases) is deswizzled one 8 KiB page at a time
+            // through the fixed in-page inverse table instead of one addrPSMCT32 + 4-byte memcpy
+            // per pixel — the per-pixel form was the self time of g264FlushMirror (5.3 % of the GS
+            // executor's wall in G765's profile). Same bytes, same bottom-first row order; the
+            // page base is addrPSMCT32 of the page's (0,0) texel, which is in-page offset 0.
+            // Rollback DC2_G765_NO_PAGE_GATHER=1.
+            static const bool s_g765NoPageGather =
+                std::getenv("DC2_G765_NO_PAGE_GATHER") != nullptr;
+            const G765InvPage &g765Inv = g765InvPage();
+            const bool g765Pages = !s_g765NoPageGather && g765Inv.valid &&
+                                   (x0 & 63) == 0 && (width & 63) == 0 &&
+                                   (y & 31) == 0 && (rows & 31) == 0;
+            if (g765Pages)
+            {
+                for (int py = y; py <= groupHi && packed; py += 32)
+                    for (int px = x0; px < x0 + width && packed; px += 64)
+                    {
+                        const uint32_t pageOff = GSPSMCT32::addrPSMCT32(
+                            fbBlock, r.fbw, static_cast<uint32_t>(px), static_cast<uint32_t>(py));
+                        if ((pageOff & 8191u) != 0u || pageOff + 8192u > g_g261VramSize)
+                        {
+                            packed = false;
+                            break;
+                        }
+                        const uint8_t *src = vram + pageOff;
+                        for (uint32_t w = 0u; w < 2048u; ++w)
+                        {
+                            const int gx = px + g765Inv.x[w];
+                            const int gy = py + g765Inv.y[w];
+                            std::memcpy(&s_g264Px[static_cast<size_t>(groupHi - gy) * width +
+                                                  static_cast<size_t>(gx - x0)],
+                                        src + static_cast<size_t>(w) * 4u, 4);
+                        }
+                    }
+            }
+            for (int gy = y; !g765Pages && gy <= groupHi && packed; ++gy)
             {
                 // GL input rows are bottom-first: highest GS y is the first buffer row.
                 const size_t dstRow = static_cast<size_t>(groupHi - gy) * width;
@@ -964,12 +1056,16 @@ static bool g264FlushMirror(int ti)
             // G351: a mirror patch carries VRAM-authoritative bytes — under the surface split
             // the sibling FBO may be the one a later materialize reads, so patch it too
             // (writing newest-VRAM bytes into both FBOs is always coherent).
+            const bool g769Async = g769AsyncMirOn() && !g351MirDup;
             if (!packed ||
-                     !g264_backend_write_color_rect(fbp, r.fbW, 512, x0, glY,
-                                                     width, rows, s_g264Px) ||
-                     (g351MirDup &&
-                      !g264_backend_write_color_rect(kG351Sprite139, r.fbW, 512, x0, glY,
-                                                     width, rows, s_g264Px)))
+                (g769Async
+                     ? !g769_backend_write_color_rect_async(fbp, r.fbW, 512, x0, glY, width, rows,
+                                                            std::vector<uint32_t>(s_g264Px))
+                     : (!g264_backend_write_color_rect(fbp, r.fbW, 512, x0, glY,
+                                                       width, rows, s_g264Px) ||
+                        (g351MirDup &&
+                         !g264_backend_write_color_rect(kG351Sprite139, r.fbW, 512, x0, glY,
+                                                        width, rows, s_g264Px)))))
             {
                 clearBits();
                 g_g264MirFail.fetch_add(1u, std::memory_order_relaxed);
@@ -986,8 +1082,27 @@ static bool g264FlushMirror(int ti)
         y = groupHi + 1;
     }
     clearBits();
+    // ⭐ G766: the sub-word half of the mirror (texels a PSMT8/PSMT4/PSMCT16 write replaced only in
+    // part), patched bit-exactly from the same guest VRAM. A failure takes the same loud path.
+    {
+        bool mmAny = false;
+        int mmLo = 512, mmHi = -1;
+        if (!g766FlushMaskMirror(ti, mmAny, mmLo, mmHi))
+        {
+            g_g264MirFail.fetch_add(1u, std::memory_order_relaxed);
+            return false;
+        }
+        if (mmAny)
+        {
+            anyPatch = true;
+            ++patchRects;
+            patchLo = std::min(patchLo, mmLo);
+            patchHi = std::max(patchHi, mmHi);
+        }
+    }
     if (!anyPatch)
         return false;
+    g766Guard.keep = true;
     if (patchLo < r.covLo) r.covLo = patchLo;
     if (patchHi > r.covHi) r.covHi = patchHi;
     // ===== G597 FIX: re-anchor the PER-PAGE baseline only for the rows this mirror PATCHED =====
@@ -1030,7 +1145,7 @@ static bool g264FlushMirror(int ti)
         g261UpdateWindow(ti); // re-anchor claimed rows + gen baseline past the upload's own bumps
     }
     // FBO == VRAM again for the mirrored rows; keep the snapshot coherent if one is live.
-    G178FbSnap &snap = g_g178FbSnap[fbp];
+    G178FbSnap &snap = g_g178FbSnap[g766SlotSnapKey(static_cast<uint32_t>(ti))];
     if (snap.valid)
     {
         if (lo < snap.rowLo) snap.rowLo = lo;
@@ -1072,7 +1187,7 @@ static void g264FlushMirrorsAtFlush()
             r.dirtyLo = 512;
             r.dirtyHi = -1;
             g261UpdateWindow(static_cast<int>(i));
-            G178FbSnap &snap = g_g178FbSnap[kG261Fbp[i]];
+            G178FbSnap &snap = g_g178FbSnap[g766SlotSnapKey(static_cast<uint32_t>(i))];
             snap.valid = false;
             snap.genSum = 0;
             snap.rowLo = 1 << 30;
@@ -1460,6 +1575,7 @@ static void g261Materialize(int ti, int cause)
             g264FlushMirror(ti);
         return;
     }
+    g766NoteMat(ti, cause, r); // G766 ledger: site x target x cause (DC2_G766_STAT only)
     if (s_g716Authority)
     {
         // Native source selection has first refusal. Its fallback can retire row debt to raw;
@@ -1503,6 +1619,64 @@ static void g261Materialize(int ti, int cause)
     // guard" — a re-anchor landing in this span destroys the evidence the guard reads.
     t_g597InMatPrePub = true;
     g536NoteMaterialize(r, fbp, cause); // G536 probe: has guest VRAM moved since the GPU render?
+    // ⭐⭐ G766: A PUBLICATION IS NOT NEEDED FOR PAGE ROWS THE GUEST HAS SINCE REWRITTEN IN FULL.
+    // G291 keeps, per pixel, "a guest upload wrote this pixel after the last wave render of its row"
+    // (and G264 mirrors exactly those pixels into the FBO). A page row whose every pixel carries that
+    // bit holds, in guest VRAM, bytes at least as new as the FBO's — publishing it is the identity on
+    // guest VRAM, a readback whose bytes are immediately overwritten by the same bytes. Trim such
+    // page rows off both ends of the dirty window; when nothing FBO-only remains, the whole
+    // publication (and its blocking glReadPixels) disappears. On `dragon` this is the 0x139 fbw=2
+    // width flip: its 128x128 render is fully re-uploaded by the guest texture stream before the flip.
+    if (g766TrimOn() && r.g291CovFbw == r.fbw && r.fbw != 0u && r.fbw <= 8u &&
+        r.fbW == static_cast<int>(r.fbw) * 64 && r.dirtyHi >= r.dirtyLo)
+    {
+        auto pageRowCovered = [&r](int pr) -> bool {
+            for (uint32_t pc = 0u; pc < r.fbw; ++pc)
+                for (int y = pr * 32; y < pr * 32 + 32; ++y)
+                    if (r.g291Cov[static_cast<size_t>(y)][pc] != ~uint64_t{0})
+                        return false;
+            return true;
+        };
+        int lo = r.dirtyLo, hi = r.dirtyHi;
+        while (lo <= hi && pageRowCovered(lo / 32))
+            lo = (lo / 32 + 1) * 32;
+        while (hi >= lo && pageRowCovered(hi / 32))
+            hi = (hi / 32) * 32 - 1;
+        if (lo != r.dirtyLo || hi != r.dirtyHi)
+        {
+            // The trimmed rows' FBO pixels must equal guest VRAM before the target can go clean:
+            // apply the pending mirror first. A mirror failure keeps the legacy full publication.
+            if (!r.mirPending || g264FlushMirror(ti))
+            {
+                g766NoteTrim(ti, r.dirtyLo, r.dirtyHi, lo, hi);
+                if (hi < lo)
+                {
+                    // Nothing FBO-only remains. Depth debt over the same pages is still published.
+                    const uint32_t trimBlock = framePageBaseToBlock(fbp);
+                    const G144BlockRange trimRange = g144RangeForRect(
+                        trimBlock, GS_PSM_CT32, r.fbw, 0u, static_cast<uint32_t>(r.dirtyLo),
+                        static_cast<uint32_t>(r.fbW),
+                        static_cast<uint32_t>(r.dirtyHi - r.dirtyLo + 1));
+                    (void)g278FlushPendingDepthForRanges(1, G144BlockRange{}, trimRange, false,
+                                                         !trimRange.valid);
+                    t_g597InMatPrePub = false;
+                    r.dirty = false;
+                    r.dirtyLo = 512;
+                    r.dirtyHi = -1;
+                    g261UpdateWindow(ti);
+                    g310NoteTargetClean(true);
+                    return;
+                }
+                if (s_g716Authority)
+                {
+                    g716ClearRows(r, r.dirtyLo, lo - 1);
+                    g716ClearRows(r, hi + 1, r.dirtyHi);
+                }
+                r.dirtyLo = lo;
+                r.dirtyHi = hi;
+            }
+        }
+    }
     const int rows = r.dirtyHi - r.dirtyLo + 1;
 #if defined(PS2X_G662_DIAG)
     // G662 P6: the roadmap asks for "per-row Local publication work" to be replaced by batched
@@ -1548,6 +1722,14 @@ static void g261Materialize(int ti, int cause)
     const bool depthPublished = g278FlushPendingDepthForRanges(
         1, G144BlockRange{}, dirtyRange, false,
         rows > 0 && r.fbW > 0 && !dirtyRange.valid);
+    // ⭐ G766: the newest bytes of some pages in these rows may live in ANOTHER resident FBO (a later
+    // alias render). Pull them into this FBO first, so the publication writes the newest bytes
+    // whichever alias produced them — publication order no longer decides which alias wins.
+    g766PullBeforePublish(ti);
+    // ⭐ G766: every OTHER dirty alias covering these pages is brought current on the GPU now, and
+    // its baselines are re-anchored past this publication's bump below (g766ApplyExcuses), so an
+    // overlapping alias no longer has to be published together with this one.
+    g766CoherePublish(ti);
     static std::vector<uint32_t> s_g261Px; // single-threaded (flush-owner threads only)
     // G264: bring the FBO current with any pending upload mirror FIRST — the readback below
     // must not clobber newer VRAM upload bytes with pre-upload FBO content. Mirror failure ⇒
@@ -1726,7 +1908,10 @@ static void g261Materialize(int ti, int cause)
             // single FBO equal to VRAM, so both surface snapshots go conservative-invalid.
             if (g351ReadKey != 0u)
             {
-                G178FbSnap &snap = g_g178FbSnap[g351ReadKey];
+                // G766: the snapshot of the surface actually read (0x139's narrow view has its own).
+                G178FbSnap &snap = g_g178FbSnap[g351ReadKey == fbp
+                                                     ? g766SlotSnapKey(static_cast<uint32_t>(ti))
+                                                     : g351ReadKey];
                 snap.valid = true;
                 if (r.covLo < snap.rowLo) snap.rowLo = r.covLo;
                 if (r.covHi > snap.rowHi) snap.rowHi = r.covHi;
@@ -1743,7 +1928,7 @@ static void g261Materialize(int ti, int cause)
             }
             else
             {
-                for (const uint32_t k : {fbp, kG351Sprite139})
+                for (const uint32_t k : {g766SlotSnapKey(static_cast<uint32_t>(ti)), kG351Sprite139})
                 {
                     G178FbSnap &sn = g_g178FbSnap[k];
                     sn.valid = false;
@@ -1778,7 +1963,7 @@ static void g261Materialize(int ti, int cause)
         // FBO↔VRAM equality is unknown now — force a fresh upload. Reset in place (callers may
         // hold live references into g_g178FbSnap; erase would invalidate them). G351: both
         // surface snapshots (the split routes 0x139 across two FBO keys).
-        for (const uint32_t k : {fbp, kG351Sprite139})
+        for (const uint32_t k : {g766SlotSnapKey(static_cast<uint32_t>(ti)), kG351Sprite139})
         {
             G178FbSnap &failSnap = g_g178FbSnap[k];
             failSnap.valid = false;
@@ -1790,6 +1975,7 @@ static void g261Materialize(int ti, int cause)
         }
     }
     t_g597InMatPrePub = false; // G597: also clear on the !ok / early-return paths
+    g766ApplyExcuses(); // G766: re-anchor the aliases this publication kept coherent
     r.dirty = false;
     r.dirtyLo = 512;
     r.dirtyHi = -1;
@@ -1938,7 +2124,7 @@ static bool g600DisplayPubGenOn()
 }
 static std::atomic<uint64_t> g_g600PubGenBumps{0};
 
-static void g276FlushPendingDisplay(int cause)
+static void g276FlushPendingDisplayCore(int cause)
 {
     g600Seq("flush.enter", cause, 0u, 0);
     if (!s_g276Pend.active)
@@ -2060,6 +2246,16 @@ static void g276FlushPendingDisplay(int cause)
     }
 }
 
+// G765: the public flush publishes the live record AND every carried one (an unconditional edge
+// has no range to prove disjointness with). See g765_display_carry.inc.
+static void g276FlushPendingDisplay(int cause);
+#include "g765_display_carry.inc"
+static void g276FlushPendingDisplay(int cause)
+{
+    g276FlushPendingDisplayCore(cause);
+    g765PublishAllCarries(cause);
+}
+
 // ---- G277 census helpers (counters only, DC2_G277_CENSUS=1; state by s_g276Pend) ---------------
 // Block range of the CURRENT pending coalesced display readback (invalid when none).
 static G144BlockRange g277PendingDisplayRange()
@@ -2081,6 +2277,11 @@ static void g276FlushPendingDisplayForRanges(int cause, const G144BlockRange &sr
                                              const G144BlockRange &dst, bool srcUnknown,
                                              bool dstUnknown)
 {
+    // G765: carried records are range-tested at every ranged edge, independently of the live one
+    // (and even when the G284 range lever is off, an unknown range still publishes all of them).
+    if (g765AnyCarry())
+        g765PublishCarriesForRanges(cause, src, dst, srcUnknown || !g284UploadCoalesceOn(),
+                                    dstUnknown);
     if (!s_g276Pend.active)
         return;
     if (g284UploadCoalesceOn() && !srcUnknown && !dstUnknown)
@@ -2097,7 +2298,7 @@ static void g276FlushPendingDisplayForRanges(int cause, const G144BlockRange &sr
     }
     if (g284StatOn())
         g_g284UploadFlushed.fetch_add(1u, std::memory_order_relaxed);
-    g276FlushPendingDisplay(cause);
+    g276FlushPendingDisplayCore(cause); // G765: carries were range-tested above
 }
 
 // G288: consumer-complete bridge for a G284-deferred display owner into the next native GPU
@@ -2215,7 +2416,7 @@ static void g288PublishDisplayForGpuBatch()
                      pending.first, pending.last, e.ctx.frame.fbp, e.ctx.frame.fbw,
                      e.prim.tme ? 1u : 0u, e.ctx.tex0.tbp0, e.ctx.tex0.psm, e.ctx.tex0.cbp);
     }
-    g276FlushPendingDisplay(0);
+    g276FlushPendingDisplayCore(0); // G765: carries have their own batch audit
 }
 
 // Private .cpp-to-.cpp bridge; keeping G289 out of the shared LLE header avoids widening the
@@ -2439,6 +2640,10 @@ static void g572BumpOwnedBlockRange(uint32_t firstBlock, uint32_t lastBlock)
     }
 }
 
+// ⭐ G768 (g768_owner_mirror.inc): a G289 owner publication is a guest write into every dirty
+// resident whose window holds its pages; register it with the upload mirror so that resident is
+// patched and re-anchored instead of reading the bump as an escaped writer.
+static void g768NoteOwnerPublishMirror(uint32_t firstBlock, uint32_t lastBlock);
 static bool g345MaterializeSlot(G289CopyOwner &slot, int cause)
 {
     if (!slot.active)
@@ -2465,6 +2670,13 @@ static bool g345MaterializeSlot(G289CopyOwner &slot, int cause)
         else
             g178BumpRectImpl(dstBlock, 8u, GS_PSM_CT32, 0u, 0u, 512u, 416u,
                              18u); // G582 source 18: full 512x416 owner materialize
+        {
+            const G144BlockRange pubRows =
+                g144RangeForRect(dstBlock, GS_PSM_CT32, 8u, 0u, 0u, 512u, 416u);
+            if (pubRows.valid)
+                g768NoteOwnerPublishMirror(std::max(owner.firstOwnedBlock, pubRows.first),
+                                           std::min(owner.lastOwnedBlock, pubRows.last));
+        }
         g_g289Materializes.fetch_add(1u, std::memory_order_relaxed);
     }
     else
@@ -2542,9 +2754,31 @@ static bool g289PrepareUploadOverwrite(uint32_t dbp, uint8_t dbw, uint8_t dpsm,
     const bool exactCt32Tail =
         dbw == 1u && dpsm == GS_PSM_CT32 &&
         dsax == 0u && dsay == 0u && rrw == 64u && rrh == 64u;
+    // ⭐ G765: ANY whole-page, full-buffer-width IMAGE upload replaces every byte of the contiguous
+    // block range it names, exactly like the three measured shapes above. The allowlist missed the
+    // fourth member of dragon's per-frame sequence (CT32 256x256 at dbw=4 over 0x2b20..0x2f1f), and
+    // that one upload forced a whole 416-row readback of the 0x14a copy owner — 8.3 % of the GS
+    // executor's wall in the g765c profile. Page geometry per PSM: CT32/CT24 64x32, CT16 64x64,
+    // T8 128x64, T4 128x128; a full-width rect starting page-aligned at (0,0) whose height is a whole
+    // number of pages covers a contiguous run of complete pages. Rollback DC2_G765_NO_G289_ANYPAGE=1.
+    static const bool s_g765AnyPage = !envFlagEnabled("DC2_G765_NO_G289_ANYPAGE");
+    uint32_t pgW = 0u, pgH = 0u;
+    switch (dpsm)
+    {
+    case GS_PSM_CT32: case GS_PSM_CT24: pgW = 64u; pgH = 32u; break;
+    case GS_PSM_CT16: pgW = 64u; pgH = 64u; break;
+    case GS_PSM_T8: pgW = 128u; pgH = 64u; break;
+    case GS_PSM_T4: pgW = 128u; pgH = 128u; break;
+    default: break;
+    }
+    const bool anyPage = s_g765AnyPage && pgW != 0u && dbw != 0u && (dbp & 31u) == 0u &&
+                         dsax == 0u && dsay == 0u && rrw == static_cast<uint32_t>(dbw) * 64u &&
+                         (rrw % pgW) == 0u && rrh != 0u && (rrh % pgH) == 0u &&
+                         dst.valid && dst.first == dbp &&
+                         dst.last == dbp + (rrw / pgW) * (rrh / pgH) * 32u - 1u;
     G289CopyOwner *o14a = g345OwnerFor(0x14au);
     if (o14a == nullptr ||
-        (!exactT4 && !exactCt32 && !exactCt32Tail) ||
+        (!exactT4 && !exactCt32 && !exactCt32Tail && !anyPage) ||
         !dst.valid || dst.first > o14a->firstOwnedBlock ||
         dst.last < o14a->firstOwnedBlock ||
         o14a->lastOwnedBlock != 0x363fu)
@@ -2663,6 +2897,13 @@ static bool g289Resolve14aBeforeDirect()
     // g418UnpackColorRows already uses, so the same (fbH, rowLo, rowHi) triple reproduces it.
     g498PublishOwnedRows(1, owner.vram, owner.vramSize, s_px, dstBlock, 8u, 512, 416,
                          320, 415, owner.firstOwnedBlock, owner.lastOwnedBlock);
+    {
+        const G144BlockRange pubRows =
+            g144RangeForRect(dstBlock, GS_PSM_CT32, 8u, 0u, 320u, 512u, 96u);
+        if (pubRows.valid)
+            g768NoteOwnerPublishMirror(std::max(owner.firstOwnedBlock, pubRows.first),
+                                       std::min(owner.lastOwnedBlock, pubRows.last));
+    }
     if (g572ExactOwnerGenOn())
     {
         const G144BlockRange rows =
@@ -2770,6 +3011,17 @@ void g289_prepare_presentation_read(uint8_t *vram,
 {
     g310NotePresentationRead(
         fbp, fbw, psm, x, y, w, h, useLocalMemoryLayout, frameBaseIsPages);
+    // G765: a guest-VRAM presentation read is a consumer of any carried display record it overlaps.
+    if (g765AnyCarry())
+    {
+        const uint32_t g765Base = frameBaseIsPages ? framePageBaseToBlock(fbp) : fbp;
+        const G144BlockRange g765Read =
+            (useLocalMemoryLayout && w != 0u && h != 0u)
+                ? g144RangeForRect(g765Base, static_cast<uint8_t>(psm), fbw != 0u ? fbw : 1u,
+                                   x, y, w, h)
+                : G144BlockRange{};
+        g765PublishCarriesForPresentationRead(g765Read, !useLocalMemoryLayout || !g765Read.valid);
+    }
     if (!g345AnyOwnerActive() || w == 0u || h == 0u)
         return;
     bool vramMismatch = !useLocalMemoryLayout;

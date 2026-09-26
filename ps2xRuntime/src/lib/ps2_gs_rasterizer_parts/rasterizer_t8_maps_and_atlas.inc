@@ -314,6 +314,23 @@ static int g310LegacyPageWinner(uint32_t pageBlock,
                                 uint32_t *pageRow = nullptr,
                                 uint32_t *pageCol = nullptr)
 {
+    // ⭐ G766: the page's valid owner (the alias that rendered it LAST) is the winner, not the
+    // lowest slot index — publications pull into every alias before writing (g766PullBeforePublish),
+    // so the owner's bytes are exactly what guest VRAM would hold.
+    if (g766OwnerOn())
+    {
+        const int o = g766ValidOwner(pageBlock >> 5u);
+        uint32_t row = 0u, col = 0u;
+        if (o >= 0 && g280DirtyTargetOwnsPage(o, pageBlock, &row, &col))
+        {
+            if (g536GuestOwnsTargetPage(g_g261Res[o], kG261Fbp[o], row, col))
+                return -1;
+            if (pageRow) *pageRow = row;
+            if (pageCol) *pageCol = col;
+            ++g_g766G310Owner;
+            return o;
+        }
+    }
     for (uint32_t t = 0u; t < kG248TargetCount; ++t)
     {
         uint32_t row = 0u, col = 0u;
@@ -454,7 +471,10 @@ static void g309VerifyAgainstLegacy(const std::vector<uint32_t> &composite)
         }
     for (uint32_t t = 0u; t < kG248TargetCount; ++t)
         if (g_g261Res[t].dirty)
-            g261Materialize(static_cast<int>(t), kG261MatTexAlias);
+            {
+                G766MatSite g766s(kG766SiteT8Atlas);
+                g261Materialize(static_cast<int>(t), kG261MatTexAlias);
+            }
 
     uint64_t bad = 0u;
     std::array<uint32_t, 128> pageBad{};
@@ -1061,7 +1081,7 @@ static bool g310ApplyDesired(
         }
         if (s_rects.empty())
             continue;
-        if (!g310_backend_copy_logical_pages(kG261Fbp[t], s_rects))
+        if (!g310_backend_copy_logical_pages(g766SlotKey(t), s_rects))
         {
             g310Invalidate("gpu-copy", true);
             return false;
@@ -1452,13 +1472,14 @@ static bool g310RetireSeededAliases()
         r.mirLo = 512;
         r.mirHi = -1;
         r.mirBits = {};
+        g766DropMaskMirror(r);
         if (r.g291CovFbw != 0u)
         {
             r.g291Cov = {};
             r.g291CovFbw = 0u;
             g_g291LayoutResets.fetch_add(1u, std::memory_order_relaxed);
         }
-        G178FbSnap &snap = g_g178FbSnap[kG261Fbp[t]];
+        G178FbSnap &snap = g_g178FbSnap[g766SlotSnapKey(static_cast<uint32_t>(t))];
         snap.valid = false;
         snap.genSum = 0u;
         snap.rowLo = 1 << 30;
@@ -1793,7 +1814,10 @@ static void g310VerifyAgainstLegacy(const std::vector<uint32_t> &logical)
     g_g310Verifying = true;
     for (uint32_t t = 0u; t < kG248TargetCount; ++t)
         if (g_g261Res[t].dirty)
-            g261Materialize(static_cast<int>(t), kG261MatTexAlias);
+            {
+                G766MatSite g766s(kG766SiteT8Map);
+                g261Materialize(static_cast<int>(t), kG261MatTexAlias);
+            }
     g_g310Verifying = false;
     g_g310Initialized = false; // verifier consumed the frozen pre-publication snapshot
 

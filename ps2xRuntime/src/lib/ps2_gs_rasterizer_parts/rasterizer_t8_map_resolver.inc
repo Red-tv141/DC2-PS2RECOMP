@@ -78,8 +78,10 @@ static bool g281BuildT8MapCold(const G144Entry &e, int srcTi, int texW, int texH
                 {
                     if (static_cast<int>(t) == srcTi || !g_g261Res[t].dirty)
                         continue;
-                    if (!g_g261Res[t].range.valid ||
-                        g280DirtyTargetOwnsPage(static_cast<int>(t), pageBlock))
+                    if (!g_g261Res[t].range.valid)
+                        return false;
+                    if (g280DirtyTargetOwnsPage(static_cast<int>(t), pageBlock) &&
+                        !g766SourceCurrentOrPulled(static_cast<uint32_t>(srcTi), pageBlock >> 5u))
                         return false;
                 }
                 if (memoIdx < kG599PageMemo)
@@ -211,8 +213,10 @@ static bool g737BuildT8MapRect(const G144Entry &e, int srcTi, int texW, int texH
                 {
                     if (static_cast<int>(t) == srcTi || !g_g261Res[t].dirty)
                         continue;
-                    if (!g_g261Res[t].range.valid ||
-                        g280DirtyTargetOwnsPage(static_cast<int>(t), pageBlock))
+                    if (!g_g261Res[t].range.valid)
+                        return false;
+                    if (g280DirtyTargetOwnsPage(static_cast<int>(t), pageBlock) &&
+                        !g766SourceCurrentOrPulled(static_cast<uint32_t>(srcTi), pageBlock >> 5u))
                         return false;
                 }
                 if (memoIdx < kG599PageMemo)
@@ -480,8 +484,17 @@ static bool g618BuildT8MapFast(const G144Entry &e, int srcTi, int texW, int texH
                 {
                     if (static_cast<int>(t) == srcTi || !g_g261Res[t].dirty)
                         continue;
+                    // ⭐ G766: the SAME conjunct as the cold builder (g281BuildT8MapCold) — a page a
+                    // dirty ALIAS owns is made current in the source FBO by a GPU page pull instead
+                    // of refusing the view. This default-ON fast sibling kept the pre-G766 form,
+                    // so the pull never ran on a shipping binary and every aliased T8 read fell
+                    // back to publishing the whole producer. Rollback DC2_G766_NO_T8PULL=1.
+                    static const bool s_g766NoT8Pull = envFlagEnabled("DC2_G766_NO_T8PULL");
                     if (!g_g261Res[t].range.valid ||
-                        g280DirtyTargetOwnsPage(static_cast<int>(t), pageBlock))
+                        (g280DirtyTargetOwnsPage(static_cast<int>(t), pageBlock) &&
+                         (s_g766NoT8Pull ||
+                          !g766SourceCurrentOrPulled(static_cast<uint32_t>(srcTi),
+                                                     pageBlock >> 5u))))
                     {
                         rej = kG618RejPage;
                         visited = static_cast<uint64_t>(vv) * texW + uu;
@@ -767,15 +780,96 @@ static void g618NegInsert(const G326G281Key &key, uint64_t h)
     slot.used = true;
 }
 
+// ===== G765: ONE-ENTRY REFUSAL MEMO IN FRONT OF THE KEY =====
+// `[G310:t8]` on dragon: ~1,470 T8 candidates a frame, 99.8 % refused on the page conjunct, and the
+// refusal is the SAME view re-asked for consecutive entries. Each ask built a 14-target
+// G326G281Key (~500 bytes), scanned the 16-plan accept cache, then FNV-hashed ~130 fields for the
+// G618 refusal ring — `g618KeyHash` + key construction were 4.3 % of the GS executor's wall in
+// G765's profile. The memo compares the entry fields and the live residency state DIRECTLY against
+// the last refused ask, with no copy and no hash. It stores exactly the fields G326G281Key holds,
+// so it answers exactly when the G618 refusal ring would (same premise: the key captures every input
+// the builder reads). Only refusals are memoised. Rollback DC2_G765_NO_T8MEMO=1; the G618 oracle
+// (DC2_G618_VERIFY=1) bypasses the memo so it keeps checking every negative answer.
+struct G765T8Memo
+{
+    bool valid = false;
+    uint32_t tbp0 = 0u;
+    int32_t srcTi = -1, texW = 0, texH = 0;
+    uint8_t tbw = 0u, psm = 0u;
+    std::array<G326G281TargetKey, kG248TargetCount> targets{};
+};
+static G765T8Memo s_g765T8Memo; // flush-owner thread only
+static std::atomic<uint64_t> g_g765T8MemoHits{0};
+
+static bool g765T8MemoOn()
+{
+    static const bool on = !envFlagEnabled("DC2_G765_NO_T8MEMO") && !g618T8MapVerifyOn();
+    return on;
+}
+
+static bool g765T8MemoRefuses(const G144Entry &e, int srcTi, int texW, int texH)
+{
+    const G765T8Memo &m = s_g765T8Memo;
+    if (!m.valid || m.tbp0 != e.ctx.tex0.tbp0 || m.srcTi != srcTi || m.texW != texW ||
+        m.texH != texH || m.tbw != e.ctx.tex0.tbw || m.psm != e.ctx.tex0.psm)
+        return false;
+    for (uint32_t t = 0u; t < kG248TargetCount; ++t)
+    {
+        const G261Res &r = g_g261Res[t];
+        const G326G281TargetKey &x = m.targets[t];
+        if (x.fbW != r.fbW || x.dirtyLo != r.dirtyLo || x.dirtyHi != r.dirtyHi ||
+            x.covLo != r.covLo || x.covHi != r.covHi || x.rangeFirst != r.range.first ||
+            x.rangeLast != r.range.last || x.fbw != static_cast<uint8_t>(r.fbw) ||
+            x.dirty != r.dirty || x.rangeValid != r.range.valid)
+            return false;
+    }
+    return true;
+}
+
+static void g765T8MemoStore(const G326G281Key &key)
+{
+    G765T8Memo &m = s_g765T8Memo;
+    m.valid = true;
+    m.tbp0 = key.tbp0;
+    m.srcTi = key.srcTi;
+    m.texW = key.texW;
+    m.texH = key.texH;
+    m.tbw = key.tbw;
+    m.psm = key.psm;
+    m.targets = key.targets;
+}
+
+static bool g281BuildT8MapKeyed(const G144Entry &e, int srcTi, int texW, int texH,
+                                std::vector<uint32_t> &out, G326G281Key &key);
+
 static bool g281BuildT8Map(const G144Entry &e, int srcTi, int texW, int texH,
                             std::vector<uint32_t> &out)
 {
     if (!g326G281On())
         return g618T8Map(e, srcTi, texW, texH, out);
+    const bool memo = g765T8MemoOn();
+    if (memo && g765T8MemoRefuses(e, srcTi, texW, texH))
+    {
+        g_g765T8MemoHits.fetch_add(1u, std::memory_order_relaxed);
+        return false;
+    }
+    G326G281Key key = g326G281Key(e, srcTi, texW, texH);
+    const bool ok = g281BuildT8MapKeyed(e, srcTi, texW, texH, out, key);
+    if (memo)
+    {
+        if (ok)
+            s_g765T8Memo.valid = false;
+        else
+            g765T8MemoStore(key);
+    }
+    return ok;
+}
 
+static bool g281BuildT8MapKeyed(const G144Entry &e, int srcTi, int texW, int texH,
+                                std::vector<uint32_t> &out, G326G281Key &key)
+{
     static std::vector<G326G281Plan> s_cache;
     static uint64_t s_stamp = 0u;
-    const G326G281Key key = g326G281Key(e, srcTi, texW, texH);
     G326G281Plan *hit = nullptr;
     if (!g326ForceColdOn())
         for (G326G281Plan &plan : s_cache)
@@ -950,9 +1044,7 @@ static int g310TryT8Entry(uint32_t batchFbp, const G144Entry &e,
         return -1;
     }
     for (uint32_t t = 0; t < kG248TargetCount; ++t)
-        if (g_g261Res[t].dirty &&
-            (!g_g261Res[t].range.valid ||
-             g144RangeOverlaps(clut, g_g261Res[t].range)))
+        if (g767ClutBlockedBy(t, clut)) // G767: page-current CLUT test (was: window overlap)
         {
             g_g310T8RejClut.fetch_add(1u, std::memory_order_relaxed);
             return -1;
@@ -1006,9 +1098,7 @@ static int g281TryEntry(uint32_t batchFbp, const G144Entry &e,
         return -1;
     }
     for (uint32_t t = 0; t < kG248TargetCount; ++t)
-        if (g_g261Res[t].dirty &&
-            (!g_g261Res[t].range.valid ||
-             g144RangeOverlaps(clut, g_g261Res[t].range)))
+        if (g767ClutBlockedBy(t, clut)) // G767: page-current CLUT test (was: window overlap)
         {
             g_g281RejClut.fetch_add(1u, std::memory_order_relaxed);
             return -1;
@@ -1110,8 +1200,15 @@ static std::atomic<uint64_t> g_g598T8Seen{0}, g_g598T8Src{0}, g_g598T8Admit{0},
 // `framePageBaseToBlock(0x139)`), otherwise containment must be UNIQUE. Two dirty targets claiming
 // the same base is exactly the multi-owner case G304 has refuted six skip levers on, so it fails
 // closed to the materialize path rather than guessing an owner.
-static int g598FindT8Source(uint32_t tbp0)
+// ⭐ G766: 0x139's wide (slot 0) and narrow (slot 15) views share one base by construction, and
+// both are routinely dirty at once, so "two dirty targets share a base" is no longer an ambiguous
+// owner: the page-owner protocol keeps them coherent and the map builders pull any page the chosen
+// source lacks. The second exact candidate is returned through `alt` (the page's valid owner first)
+// and the admission tries both. Without G766 ownership the old fail-closed rule stands.
+static int g598FindT8Source(uint32_t tbp0, int *alt = nullptr)
 {
+    if (alt != nullptr)
+        *alt = -1;
     int exact = -1, contain = -1, containN = 0;
     for (uint32_t t = 0; t < kG248TargetCount; ++t)
     {
@@ -1122,7 +1219,23 @@ static int g598FindT8Source(uint32_t tbp0)
         if (tbp0 == base)
         {
             if (exact >= 0)
-                return -1; // two dirty targets share a base: fail closed
+            {
+                static const bool s_g766Shared = !envFlagEnabled("DC2_G766_NO_T8SHARED");
+                if (!s_g766Shared || !g766OwnerOn() || alt == nullptr || *alt >= 0)
+                    return -1; // two dirty targets share a base: fail closed
+                // Order the pair: the valid owner of the base page first.
+                const int owner = g766ValidOwner(tbp0 >> 5u);
+                if (owner == static_cast<int>(t))
+                {
+                    *alt = exact;
+                    exact = static_cast<int>(t);
+                }
+                else
+                {
+                    *alt = static_cast<int>(t);
+                }
+                continue;
+            }
             exact = static_cast<int>(t);
             continue;
         }
@@ -1224,7 +1337,8 @@ static int g598TryT8EntryAny(const G144Entry &e, const G178EntryState &st,
     }
     if (why)
         g_g598T8Seen.fetch_add(1u, std::memory_order_relaxed);
-    const int srcTi = g598FindT8Source(e.ctx.tex0.tbp0);
+    int srcAlt = -1;
+    int srcTi = g598FindT8Source(e.ctx.tex0.tbp0, &srcAlt);
     if (srcTi < 0)
     {
         if (why)
@@ -1248,9 +1362,7 @@ static int g598TryT8EntryAny(const G144Entry &e, const G178EntryState &st,
         return -1;
     }
     for (uint32_t t = 0; t < kG248TargetCount; ++t)
-        if (g_g261Res[t].dirty &&
-            (!g_g261Res[t].range.valid ||
-             g144RangeOverlaps(clut, g_g261Res[t].range)))
+        if (g767ClutBlockedBy(t, clut)) // G767: page-current CLUT test (was: window overlap)
         {
             if (why)
                 g_g598T8RejClut.fetch_add(1u, std::memory_order_relaxed);
@@ -1279,6 +1391,21 @@ static int g598TryT8EntryAny(const G144Entry &e, const G178EntryState &st,
         probeOk = true;
         if (usedRect != nullptr)
             *usedRect = true;
+    }
+    // G766: the other view of a shared base (0x139 wide/narrow) may hold every page the draw reads.
+    if (!probeOk && srcAlt >= 0)
+    {
+        probeOk = g281BuildT8Map(e, srcAlt, st.texW, st.texH, s_probeMap);
+        if (!probeOk && uvRect &&
+            g737BuildT8MapRect(e, srcAlt, st.texW, st.texH, uLo, uHi, vLo, vHi, s_probeMap,
+                               /*proveOnly=*/true))
+        {
+            probeOk = true;
+            if (usedRect != nullptr)
+                *usedRect = true;
+        }
+        if (probeOk)
+            srcTi = srcAlt;
     }
     if (!probeOk)
     {
@@ -1821,6 +1948,8 @@ static bool g309PrepareComposite(bool &useComposite)
         }
     const bool verify = g309VerifyOn();
     s_composite.clear();
+    if (g766LazyMirOn())
+        g766MirrorFlushAll(); // G766: the composite samples every owner's FBO
     if (!g309_backend_build_authoritative_composite(
             s_pageMap, s_basePixels, verify, s_composite))
     {
@@ -2274,6 +2403,8 @@ static bool g282PrepareFanout(const std::vector<G178EntryState> &states,
 static bool g282ExecuteFanout(const std::vector<G282Fanout> &plan)
 {
     static std::vector<int32_t> s_rects;
+    if (g766LazyMirOn())
+        g766MirrorFlushAll(); // G766: the fan-out reads 0x139's FBO and writes sibling views
     for (uint32_t t = 0; t < kG248TargetCount; ++t)
     {
         s_rects.clear();
@@ -2352,6 +2483,8 @@ static void g282CommitFanout(const std::vector<G282Fanout> &plan)
         G261Res &r = g_g261Res[ti];
         const int y0 = static_cast<int>(f.dstRow) * 32;
         g716MarkRows(r, y0, y0 + 31);
+        if (!r.dirty)
+            ++g_g766Epoch[ti]; // G766: a clean -> dirty transition opens a new ownership epoch
         r.dirty = true;
         r.dirtyLo = std::min(r.dirtyLo, y0);
         r.dirtyHi = std::max(r.dirtyHi, y0 + 31);
@@ -2445,10 +2578,11 @@ static void g282DropResidencyAfterFanoutFailure()
         r.mirLo = 512;
         r.mirHi = -1;
         r.mirBits = {};
+        g766DropMaskMirror(r);
         r.g291Cov = {};
         r.g291CovFbw = 0u;
         g261UpdateWindow(static_cast<int>(t));
-        G178FbSnap &snap = g_g178FbSnap[kG261Fbp[t]];
+        G178FbSnap &snap = g_g178FbSnap[g766SlotSnapKey(static_cast<uint32_t>(t))];
         snap.valid = false;
         snap.genSum = 0u;
         snap.rowLo = 1 << 30;

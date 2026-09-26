@@ -558,7 +558,9 @@ static uint32_t g627TryTakeL2lDest(uint32_t sbp, uint8_t sbw, uint8_t spsm,
         if (!r.dirty)
             continue;
         // Conjunct 3: any dirty target the SOURCE reads makes VRAM's source bytes stale.
-        if (!r.range.valid || (src.valid && g144RangeOverlaps(r.range, src)))
+        // G766: unless every source page it holds is already current in guest VRAM.
+        if (!r.range.valid ||
+            (src.valid && g144RangeOverlaps(r.range, src) && !g766SrcPagesCurrent(i, src)))
         {
             g_g627RejSrc.fetch_add(1u, std::memory_order_relaxed);
             return 0u;
@@ -608,7 +610,7 @@ static void g627DropResidency(uint32_t ti)
     r.dirtyLo = 512;
     r.dirtyHi = -1;
     g261UpdateWindow(static_cast<int>(ti));
-    G178FbSnap &snap = g_g178FbSnap[kG261Fbp[ti]];
+    G178FbSnap &snap = g_g178FbSnap[g766SlotSnapKey(static_cast<uint32_t>(ti))];
     snap.valid = false;
     snap.genSum = 0;
     snap.rowLo = 1 << 30;
@@ -826,7 +828,7 @@ static void g627ApplyPendingL2lPatchImpl(uint8_t *vram, uint32_t vramSize)
         {
             g261UpdateWindow(static_cast<int>(i));
         }
-        G178FbSnap &snap = g_g178FbSnap[kG261Fbp[i]];
+        G178FbSnap &snap = g_g178FbSnap[g766SlotSnapKey(static_cast<uint32_t>(i))];
         if (snap.valid)
         {
             if (tp.tyLo < snap.rowLo) snap.rowLo = tp.tyLo;

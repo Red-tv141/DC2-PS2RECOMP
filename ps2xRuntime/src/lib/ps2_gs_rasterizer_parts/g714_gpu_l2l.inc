@@ -668,6 +668,8 @@ static bool g714TryExecuteL2lImpl(uint8_t *vram, uint32_t vramSize,
             if (s_g715HoldSave[t].dirty)
             {
                 G261Res &rr = g_g261Res[t];
+                if (!rr.dirty)
+                    ++g_g766Epoch[t]; // G766: new ownership epoch
                 rr.dirty = true;
                 rr.dirtyLo = std::min(rr.dirtyLo, s_g715HoldSave[t].lo);
                 rr.dirtyHi = std::max(rr.dirtyHi, s_g715HoldSave[t].hi);
@@ -807,7 +809,7 @@ static bool g714TryExecuteL2lImpl(uint8_t *vram, uint32_t vramSize,
             if (ti >= 0 && (done & (1u << ti)) == 0u)
             {
                 done |= 1u << ti;
-                g261Materialize(ti, kG261MatLocal);
+                { G766MatSite g766s(kG766SiteG714); g261Materialize(ti, kG261MatLocal); }
             }
         }
         for (uint32_t t = 0; t < kG248TargetCount; ++t)
@@ -957,7 +959,7 @@ static bool g714TryExecuteL2lImpl(uint8_t *vram, uint32_t vramSize,
                 if (ti >= 0 && (done & (1u << ti)) == 0u)
                 {
                     done |= 1u << ti;
-                    g261Materialize(ti, kG261MatLocal);
+                    { G766MatSite g766s(kG766SiteG714); g261Materialize(ti, kG261MatLocal); }
                 }
             }
             for (uint32_t t = 0; t < kG248TargetCount; ++t)
@@ -1146,7 +1148,7 @@ static bool g714TryExecuteL2lImpl(uint8_t *vram, uint32_t vramSize,
                 if (g291AtlasOn() && r.g291CovFbw != 0u)
                     for (int y = lo; y <= hi && y < 512; ++y)
                         r.g291Cov[static_cast<size_t>(y)].fill(0u);
-                G178FbSnap &snap = g_g178FbSnap[kG261Fbp[t]];
+                G178FbSnap &snap = g_g178FbSnap[g766SlotSnapKey(static_cast<uint32_t>(t))];
                 snap.valid = false;
                 snap.genSum = 0u;
                 snap.rowLo = 1 << 30;
@@ -1227,7 +1229,7 @@ static bool g714TryExecuteL2lImpl(uint8_t *vram, uint32_t vramSize,
             for (int y = lo; y <= hi && y < 512; ++y)
                 r.g291Cov[static_cast<size_t>(y)].fill(0u);
         // The FBO no longer equals the bytes the snapshot recorded for these rows.
-        G178FbSnap &snap = g_g178FbSnap[kG261Fbp[t]];
+        G178FbSnap &snap = g_g178FbSnap[g766SlotSnapKey(static_cast<uint32_t>(t))];
         snap.valid = false;
         snap.genSum = 0u;
         snap.rowLo = 1 << 30;
@@ -1307,7 +1309,7 @@ static bool g714TryExecuteL2lImpl(uint8_t *vram, uint32_t vramSize,
             if (s_g715MatDst && !s_g715Mat && (writtenTargets & (1u << ti)) == 0u)
                 continue;
             published |= 1u << ti;
-            g261Materialize(ti, kG261MatLocal);
+            { G766MatSite g766s(kG766SiteG714); g261Materialize(ti, kG261MatLocal); }
         }
         if (s_g715KeepDirty)
             for (uint32_t t = 0; t < kG248TargetCount; ++t)

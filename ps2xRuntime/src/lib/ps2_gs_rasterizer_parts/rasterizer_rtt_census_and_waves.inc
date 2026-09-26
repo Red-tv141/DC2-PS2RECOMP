@@ -88,6 +88,19 @@ static bool g662Blend139On()
 // Every site that asks "may this target take the destination-dependent display blend combos?".
 // The `fbp == 0x139u` compare is FIRST so the default build pays exactly one extra integer test on
 // the hot classifier path and never touches either magic-static guard (rule 12b).
+// ⭐ G767: modes 5 and 6 on ANY target outside the G256 exact family. Both are expressed by the
+// ordinary program (mode 6's exact ceil(Cs*As/128) fold is G604's, in the shader; mode 5 is a plain
+// GL_ZERO / ONE_MINUS_SRC_ALPHA pair), and neither depends on the target being a display buffer — the
+// display scope was G603's bring-up caution plus the G256 program's `d.blend & 3` packing, which
+// cannot encode 5 or 6 (hence that family stays excluded). s05's fbp 0x147 T8 sprites use mode 6
+// and were CPU-replayed ~1.2x/frame, each replay publishing 0x139 (448 + 128 rows) and 0x13a
+// (plans/phase-G767-ledger.md §8). Rollback DC2_G767_NO_DESTBLEND_ANY=1.
+static inline bool g767DestBlendAnyTarget(uint32_t fbp)
+{
+    static const bool on = !envFlagEnabled("DC2_G767_NO_DESTBLEND_ANY");
+    return on && fbp != 0x139u && fbp != 0x13cu && fbp != 0x143u && fbp != 0x146u &&
+           fbp != 0x155u;
+}
 static inline bool g662DestBlendTarget(uint32_t fbp)
 {
     if (g265DisplayTarget(fbp))
@@ -627,14 +640,43 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         const bool g265Keep = date == 0u && g265DisplayZWaveOn() &&
                               g265DisplayTarget(ctx.frame.fbp) && ate != 0u && atst == 5u &&
                               (aref == 1u || aref == 64u || aref == 127u) && afail == 0u;
-        if (!g265Keep)
+        // ⭐ G766: ANY alpha test whose failure action is KEEP is exactly a fragment discard —
+        // KEEP suppresses the framebuffer AND the depth write together, which is what `discard`
+        // does — whatever the comparison and reference. The G265 whitelist (display targets,
+        // GEQUAL, AREF in {1,64,127}) admitted three shapes of this one rule and sent every other
+        // KEEP test to the CPU band replay; on `dragon` that is the first 0x15b batch of every
+        // frame, whose CPU replay then publishes 0x139, 0x159 and 0x15b. The shader compares the
+        // same integer alpha byte the CPU tests (uAtest, ref code 3). FB_ONLY / ZB_ONLY /
+        // RGB_ONLY and DATE keep the CPU path. The G256 exact program has no alpha test, so its
+        // five targets keep the old rule. Rollback DC2_G766_NO_ATEST=1.
+        static const bool s_g766Atest = !envFlagEnabled("DC2_G766_NO_ATEST") &&
+                                        !envFlagDisabled("DC2_G766_ATEST");
+        const uint32_t g766Fbp = ctx.frame.fbp;
+        const bool g766G256Family = g766Fbp == 0x139u || g766Fbp == 0x13cu ||
+                                    g766Fbp == 0x143u || g766Fbp == 0x146u || g766Fbp == 0x155u;
+        const bool g766Keep = !g265Keep && s_g766Atest && date == 0u && ate != 0u &&
+                              afail == 0u && !g766G256Family;
+        if (!g265Keep && !g766Keep)
         {
             g262NoteReject(kG262RejATest, e);
             g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
             return false;
         }
-        const uint8_t refCode = aref == 1u ? 0u : (aref == 64u ? 1u : 2u);
-        g265AlphaMode = static_cast<uint8_t>(0x20u | (refCode << 6u));
+        if (g766Keep)
+        {
+            if (atst == 0u)
+            {
+                st.skip = true; // NEVER with KEEP: neither colour nor depth is ever written
+                return true;
+            }
+            st.g766Atest = static_cast<uint16_t>(0x8000u | atst | (aref << 3u));
+            g265AlphaMode = static_cast<uint8_t>(0x20u | (3u << 6u));
+        }
+        else
+        {
+            const uint8_t refCode = aref == 1u ? 0u : (aref == 64u ? 1u : 2u);
+            g265AlphaMode = static_cast<uint8_t>(0x20u | (refCode << 6u));
+        }
     }
     // Scissor (inclusive) sanity; FBO rows capped at 512.
     if (ctx.scissor.x1 < ctx.scissor.x0 || ctx.scissor.y1 < ctx.scissor.y0 ||
@@ -668,10 +710,12 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
                  g262WideOn() && g583WaveEligibleTarget(ctx.frame.fbp))
             st.blend = 4; // (0-Cs)*(FIX=128)>>7 + Cd == Cd - Cs (G262 census shape, RTT waves only)
         else if (a == 2u && b == 1u && c == 0u && d == 1u &&
-                 g265DisplayZWaveOn() && g662DestBlendTarget(ctx.frame.fbp))
+                 ((g265DisplayZWaveOn() && g662DestBlendTarget(ctx.frame.fbp)) ||
+                  g767DestBlendAnyTarget(ctx.frame.fbp)))
             st.blend = 5; // G265 census: (0-Cd)*As>>7 + Cd == Cd*(1-As)
         else if (a == 2u && b == 0u && c == 0u && d == 1u && g603SubBlendOn() &&
-                 g265DisplayZWaveOn() && g662DestBlendTarget(ctx.frame.fbp))
+                 ((g265DisplayZWaveOn() && g662DestBlendTarget(ctx.frame.fbp)) ||
+                  g767DestBlendAnyTarget(ctx.frame.fbp)))
             st.blend = 6; // G603 census: (0-Cs)*As>>7 + Cd == Cd - Cs*As/128 (see the header above)
         else if (t_g603RelaxBlend)
         {
@@ -679,6 +723,24 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         }
         else
         {
+            // G767 (diagnostic, DC2_G767_BLENDWHY=1): name the refused combo, bounded.
+            static const bool s_g767BlendWhy = envFlagEnabled("DC2_G767_BLENDWHY");
+            if (s_g767BlendWhy)
+            {
+                static std::map<uint32_t, uint64_t> s_combos; // flush-owner thread only
+                const uint32_t key = (a | (b << 2) | (c << 4) | (d << 6)) |
+                                     (static_cast<uint32_t>((al >> 32) & 0xFFull) << 8) |
+                                     ((ctx.frame.fbp & 0x1FFu) << 16);
+                const uint64_t n = ++s_combos[key];
+                if (n == 1u || (n % 4096u) == 0u)
+                    std::fprintf(stderr,
+                                 "[G767:blendwhy] fbp=0x%03x A=%u B=%u C=%u D=%u FIX=%u n=%llu "
+                                 "tme=%u tpsm=0x%x\n",
+                                 ctx.frame.fbp, a, b, c, d,
+                                 static_cast<unsigned>((al >> 32) & 0xFFull),
+                                 static_cast<unsigned long long>(n), e.prim.tme ? 1u : 0u,
+                                 e.prim.tme ? ctx.tex0.psm : 0u);
+            }
             g262NoteReject(kG262RejBlend, e);
             g_g178RejectBlend.fetch_add(1u, std::memory_order_relaxed);
             return false;
@@ -891,6 +953,7 @@ bool g178StateEqual(const G178EntryState &x, const G178EntryState &y)
 {
     return x.texKey == y.texKey && x.blend == y.blend && x.tfx == y.tfx && x.tcc == y.tcc &&
            x.fge == y.fge && x.fogCol == y.fogCol && // G364
+           x.g766Atest == y.g766Atest &&             // G766
 
            x.depthFunc == y.depthFunc && x.depthWrite == y.depthWrite &&
            x.bilinear == y.bilinear && x.wrapU == y.wrapU && x.wrapV == y.wrapV &&
@@ -1501,6 +1564,14 @@ void g709NoteImageWritePages(const uint8_t *vram, uint32_t vramSize, uint32_t bp
 // real consumer edges (CPU band replay, inline primitive, VRAM transfers, local→host reads).
 // All state is touched only on the threads that already own the G144 flush machinery (GS worker
 // under MTGS / EE thread at the frame barrier — never concurrently), same as g_g178FbSnap.
+// G766: one CT32 texel of a resident target that a guest write replaced only PARTIALLY, with the
+// exact bits it wrote (see g766_mask_mirror.inc).
+struct G766MaskTexel
+{
+    uint16_t tx = 0u;
+    uint16_t ty = 0u;
+    uint32_t mask = 0u;
+};
 struct G261Res
 {
     std::array<uint64_t, 8> g716Rows{}; // exact pending GPU render rows
@@ -1531,6 +1602,13 @@ struct G261Res
     bool mirPending = false;
     int mirLo = 512, mirHi = -1;
     std::array<std::array<uint64_t, 8>, 512> mirBits{}; // max target width = 512 pixels
+    // ⭐ G766: the SUB-WORD half of the same deferred mirror. A guest write whose pixel format is
+    // narrower than CT32 (PSMT8 / PSMT4 / PSMT4HL / PSMT4HH / PSMCT16) replaces only some bits of
+    // a CT32 texel; those texels are listed here with their exact bit masks and patched
+    // (old & ~mask) | (vram & mask) at the same flush edge as mirBits. `mirPending`, `mirLo`,
+    // `mirHi` cover both halves, so every existing flush point reconciles both.
+    std::vector<G766MaskTexel> g766Mask;
+    uint64_t g766LastPlanId = 0u; // de-duplicates the re-note of a chunked IMAGE transfer
     // G291: cumulative per-pixel "upload re-covered since the last wave write to this row" map
     // (same tx/ty geometry as mirBits, but NOT cleared by the mirror flush). A 64x32 CT32 page
     // tile whose every pixel bit is set has been fully re-written in guest VRAM by noted
@@ -1550,13 +1628,21 @@ struct G261Res
     // Index: p = pageRow * fbw + pageCol, matching g291PagesCurrent's page walk.
     std::array<uint64_t, 16 * 8> g536PageGen{};
     uint32_t g536PageGenFbw = 0;
+    // G768 (diagnostic, DC2_G768_INLESC=1): the serial of the last window re-anchor.
+    uint64_t g768AnchorSeq = 0;
 };
 static constexpr uint32_t kG261Fbp[kG248TargetCount] = {
     // 0..4 legacy five (G248) | 5 G553 | 6 G556 | 7 G557
     0x139u, 0x13cu, 0x143u, 0x146u, 0x155u, 0x159u, 0x181u, 0x13au,
     // 8..13 G569 route3 targets, ordered by CPU-replayed ENTRY weight (the ranking that matters —
     // see g568_rank_fallback_by_entries_not_events), so DC2_G569_RTTWIDE_MASK bisects usefully.
-    0x13du, 0x157u, 0x14bu, 0x151u, 0x13fu, 0x141u
+    0x13du, 0x157u, 0x14bu, 0x151u, 0x13fu, 0x141u,
+    // 14 G766 (dragon's per-object scratch, aliases 0x159/0x139)
+    0x15bu,
+    // 15 G766: 0x139's NARROW view (fbw 1/2/4 character work). Same address base as slot 0; its
+    // FBO is G349's de-collided sibling key, so the wide 0x139 surface is never torn down (and
+    // never published) by a width flip. Selected by g766SlotForBatch, never by g248TargetIndex.
+    0x139u
 };
 static G261Res g_g261Res[kG248TargetCount];
 static uint32_t g_g261VramSize = 0; // set beside the wave flush (GS::m_vramSize is private)

@@ -380,7 +380,12 @@ static void g528FlushPrologue(int cause, uint8_t *vram, uint32_t fbp)
         lap(kG528Pend276, mark);
     }
 
-    g261PrepareCpuReplay();
+    {
+        // G769: this prologue IS the CPU band replay's edge (the replay runs next and writes guest
+        // VRAM), so a colour write may be mirrored instead of published (g769_authority.inc).
+        G769ReplayEdgeScope g769Edge;
+        g261PrepareCpuReplay();
+    }
     lap(kG528Rtt261, mark);
     g242PrepareVramReadAll(vram);
     lap(kG528Vram242, mark);

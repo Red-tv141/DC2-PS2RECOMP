@@ -131,6 +131,8 @@ static bool g459TriScissorStatOn()
 
 void GSRasterizer::drawPrimitive(GS *gs)
 {
+    // G770-A: the inline tail as a lambda (+ the async-inline exec runner). See the file header.
+#include "g770_inline_tail.inc"
     // G687: one normal deferred triangle primes a fixed-state ST/RGBAQ/XYZF2 tag. Later strip
     // triangles take the compact capture path. Every diagnostic mode makes begin() decline.
     if (g_g687PackedCaptureRunActive &&
@@ -150,6 +152,22 @@ void GSRasterizer::drawPrimitive(GS *gs)
     g595ProBegin();
     g401NoteFrontDoor(this, gs, gs->m_vram, gs->m_vtxQueue[0],
                       gs->m_prim, gs->activeContext());
+    // G761 (default-off): the Map-125 shadow-volume winding oracle. It has to sit HERE, at the
+    // front door, because after this point a draw can be deferred (G144) or handed to the GPU
+    // backend (G178) and never reach drawTriangle/drawSprite on this thread — revision 1 hooked
+    // drawSprite and printed nothing at all on the shipping path.
+    if (g761ShadowOn())
+    {
+        const GSContext &g761ctx = gs->activeContext();
+        g761FrontDoor(static_cast<uint32_t>(gs->m_prim.type), gs->m_prim.tme != 0u,
+                      g761ctx.frame.fbp, g761ctx.alpha, g761ctx.tex0.tbp0, g761ctx.tex0.psm,
+                      gs->m_vram, gs->m_vramSize,
+                      gs->m_vtxQueue[0], gs->m_vtxQueue[1], gs->m_vtxQueue[2],
+                      static_cast<int>(g761ctx.xyoffset.ofx >> 4),
+                      static_cast<int>(g761ctx.xyoffset.ofy >> 4),
+                      static_cast<int>(g761ctx.scissor.x0), static_cast<int>(g761ctx.scissor.y0),
+                      static_cast<int>(g761ctx.scissor.x1), static_cast<int>(g761ctx.scissor.y1));
+    }
     static const bool s_g141PerfOn = (std::getenv("DC2_PERF") != nullptr);
     static double s_g141Sum = 0.0;
     static uint32_t s_g141Win = 0u;

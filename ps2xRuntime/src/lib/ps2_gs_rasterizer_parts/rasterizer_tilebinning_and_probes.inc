@@ -233,7 +233,7 @@ static bool g364FogEnabled()
 // value snapshotted into the G144 entry instead.
 static inline uint32_t g364FogColNow()
 {
-    return t_g144InReplay ? t_g364FogCol : g_g364FogCol;
+    return (t_g144InReplay || t_g770AsyncTail) ? t_g364FogCol : g_g364FogCol; // G770-A
 }
 static inline uint8_t g364FogLerp(uint8_t c, uint32_t f, uint32_t fc)
 {
@@ -317,7 +317,7 @@ static const bool g_g248Stat = (std::getenv("DC2_G248_STAT") != nullptr);
 // resolver), so raising the constant resizes all of them with no per-array edit, and indices 0..7
 // keep their exact meaning — including G557's compositor slot 6. The ONE hand-written table that
 // must grow in the same edit is kG261Fbp (rasterizer_rtt_census_and_waves.inc).
-static constexpr uint32_t kG248TargetCount = 14u;
+static constexpr uint32_t kG248TargetCount = 16u;
 static constexpr uint32_t kG248StateCount = 4u; // bit0=tme, bit1=abe
 static constexpr uint32_t kG248BucketCount = kG248TargetCount * kG248StateCount;
 static std::atomic<uint64_t> g_g248SpriteCalls[kG248BucketCount]{};
@@ -480,6 +480,17 @@ static int g248TargetIndex(uint32_t fbp)
     case 0x151u: return g569WideSlot(3u, 11);
     case 0x13fu: return g569WideSlot(4u, 12);
     case 0x141u: return g569WideSlot(5u, 13);
+    // G766: dragon's per-object scratch surface. It aliases 0x159 two pages over (and 0x139), and as
+    // a DISCOVERED target it was a depth-carrying batch G660's policy sends to the CPU band replay:
+    // nine CPU-rasterised batches a frame, each publishing 0x139 and 0x159 first. Resident, it is
+    // exactly 0x159's shape (CT32 fbw=8, T8 triangles, shared Z 0x0d0), and G766's page-owner
+    // protocol keeps the three aliases coherent on the GPU. Rollback DC2_G766_NO_RTT15B=1.
+    case 0x15bu:
+    {
+        static const bool g766On = !envFlagEnabled("DC2_G766_NO_RTT15B") &&
+                                   !envFlagDisabled("DC2_G766_RTT15B");
+        return g766On ? 14 : -1;
+    }
     default:     return -1;
     }
 }

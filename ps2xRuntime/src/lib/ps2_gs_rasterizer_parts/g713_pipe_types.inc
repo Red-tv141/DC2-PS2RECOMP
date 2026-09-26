@@ -42,6 +42,10 @@ static bool g_g713On = false;
 // parse thread) — the address registries it mutates (g527NoteTargetDraw) must never be re-noted.
 static thread_local bool t_g713ExecInline = false;
 
+// G770: CPU band replays started (both flush closures), exec/flush-owner thread. Read by the
+// G770 exec trace to label a graph batch GPU vs CPU; one increment per replayed batch.
+static uint32_t g_g770CpuReplays = 0u;
+
 // Defined in g713_pipe_parse.inc; forward-declared here for the capture site and the graph.
 static void g713ParseFlushOpen();
 static void g713ArmIfRequested(GSRasterizer *self);

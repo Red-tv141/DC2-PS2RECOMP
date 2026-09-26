@@ -83,7 +83,10 @@ static void g261MaterializeAllDirty(int cause)
         return;
     for (uint32_t i = 0; i < kG248TargetCount; ++i)
         if (g_g261Res[i].dirty)
+        {
+            G766MatSite g766s(kG766SiteAllDirty);
             g261Materialize(static_cast<int>(i), cause);
+        }
     // Bring-up observability: this route rarely reaches the 512-materialize / 1024-wave report
     // triggers in a short capture, so emit a periodic report at a drain-boundary cadence when a
     // stat lever is on. Default runs never call this branch (gate returns false).
@@ -131,7 +134,15 @@ static void g261MaterializeForRanges(const G144BlockRange &src, const G144BlockR
             (src.valid && g144RangeOverlaps(r.range, src)) ||
             (dst.valid && g144RangeOverlaps(r.range, dst)))
         {
+            // ⭐ G766: read-only overlap whose pages guest VRAM already holds newest: no publication.
+            if (r.range.valid && !(dst.valid && g144RangeOverlaps(r.range, dst)) &&
+                g766SrcPagesCurrent(i, src))
+            {
+                ++g_g766SrcSkips;
+                continue;
+            }
             g340CensusMaterialize(i, r, cause, src, dst); // census before materialize clears r.dirty
+            G766MatSite g766s(kG766SiteRanges);
             g261Materialize(static_cast<int>(i), cause);
         }
     }
@@ -235,10 +246,13 @@ static uint32_t g285PrepareL2lConsume(uint32_t sbp, uint8_t sbw, uint8_t spsm,
         // removed; the [G345:escape] defer counters remain (read 0) as the census record.
         if (s_g716Authority) g716ClearRows(r, r.dirtyLo + pubRows, 511);
         r.dirtyHi = r.dirtyLo + pubRows - 1;
-        g261Materialize(static_cast<int>(i), kG261MatLocal);
+        {
+            G766MatSite g766s(kG766SiteL2lConsume);
+            g261Materialize(static_cast<int>(i), kG261MatLocal);
+        }
         // Remaining FBO rows are deliberately stale until the caller copies. Never let the
         // partial publication masquerade as a whole-target upload snapshot.
-        G178FbSnap &snap = g_g178FbSnap[kG261Fbp[i]];
+        G178FbSnap &snap = g_g178FbSnap[g766SlotSnapKey(static_cast<uint32_t>(i))];
         const bool prefixPublished = snap.valid;
         snap.valid = false;
         snap.genSum = 0u;
@@ -998,7 +1012,11 @@ static void g735PubGateVerify()
         const G144BlockRange color = g144TargetRange(e);
         const G254Surface depth = g254DepthSurface(e);
         const bool tme = e.prim.tme;
-        const G144BlockRange tex = tme ? g144TextureRange(e) : G144BlockRange{};
+        // ⭐ G766: the read's texel footprint when exactly bounded (g766TexFootprint). The G735
+        // oracle below this decision replays the same expression.
+        G144BlockRange tex{};
+        if (tme && !g766TexFootprint(e, tex))
+            tex = g144TextureRange(e);
         const G144BlockRange clut =
             (tme && g144IsPalettedPsm(e.ctx.tex0.psm)) ? g144ClutRange(e) : G144BlockRange{};
         const bool anyUnknown = !color.valid || (depth.active && !depth.range.valid) ||
@@ -1047,6 +1065,7 @@ static void g735PubStatReport()
 // ⭐ G735: price `g261PrepareCpuReplay` DIRECTLY at its five transient-contract call sites, so the
 // `residb` stage stops being attributed by subtraction (see g735NoteTrnPub). Behaviour-pure: when
 // `DC2_G735_STAT` is absent this is one predicted branch and a tail call.
+#include "g765_fill_consume.inc"
 static void g261PrepareCpuReplay();
 static inline void g735TrnPub(uint32_t site)
 {
@@ -1092,6 +1111,22 @@ static void g261PrepareCpuReplay()
         if (g735Stat)
             g735PubStatReport();
     }
+    // G769: colour-write decisions are deferred per target and resolved after the entry loop.
+    const bool g769On = s_g769ReplayEdge && g769CpuWriteMirOn();
+    if (g769On)
+    {
+        g769WriteReset();
+        s_g769PostNotes.clear();
+    }
+    struct G769Resolve
+    {
+        bool on;
+        ~G769Resolve()
+        {
+            if (on)
+                g769ResolveWrites();
+        }
+    } g769Resolve{g769On};
     for (const G144Entry &e : g_g144List)
     {
 #if defined(PS2X_G661_DIAG)
@@ -1105,11 +1140,22 @@ static void g261PrepareCpuReplay()
         const G144BlockRange color = g144TargetRange(e);
         const G254Surface depth = g254DepthSurface(e);
         const bool tme = e.prim.tme;
-        const G144BlockRange tex = tme ? g144TextureRange(e) : G144BlockRange{};
+        // ⭐ G766: the read's texel footprint when exactly bounded (g766TexFootprint). The G735
+        // oracle below this decision replays the same expression.
+        G144BlockRange tex{};
+        if (tme && !g766TexFootprint(e, tex))
+            tex = g144TextureRange(e);
         const G144BlockRange clut =
             (tme && g144IsPalettedPsm(e.ctx.tex0.psm)) ? g144ClutRange(e) : G144BlockRange{};
         const bool anyUnknown = !color.valid || (depth.active && !depth.range.valid) ||
                                 (tme && !tex.valid);
+        // G765: a write-only opaque fill consumes the resident pages it fully covers instead of
+        // forcing their readback (see g765_fill_consume.inc).
+        int g765x0 = 0, g765y0 = 0, g765x1 = -1, g765y1 = -1;
+        const bool g765Fill = !anyUnknown && g765FillConsumeOn() &&
+                              g765PureFillRect(e, g765x0, g765y0, g765x1, g765y1);
+        if (g765Fill)
+            g_g765FillEntries.fetch_add(1u, std::memory_order_relaxed);
         for (uint32_t i = 0; i < kG248TargetCount; ++i)
         {
             G261Res &r = g_g261Res[i];
@@ -1120,6 +1166,32 @@ static void g261PrepareCpuReplay()
             const bool hitDepth = depth.active && g144RangeOverlaps(r.range, depth.range);
             const bool hitTex = tme && g144RangeOverlaps(r.range, tex);
             const bool hitClut = clut.valid && g144RangeOverlaps(r.range, clut);
+            if (g765Fill && hitColor && !hitUnknown && !hitDepth && !hitTex && !hitClut)
+            {
+                if (g765TryConsumeTargetByFill(e, g765x0, g765y0, g765x1, g765y1, i))
+                {
+                    g_g765FillConsumed.fetch_add(1u, std::memory_order_relaxed);
+                    g765FillReport();
+                    continue;
+                }
+                g_g765FillDeclined.fetch_add(1u, std::memory_order_relaxed);
+            }
+            // ⭐ G766: the replay only READS this target's pages (texture/CLUT) and guest VRAM
+            // already holds their newest bytes -> no publication for this entry.
+            if (!hitUnknown && !hitColor && !hitDepth && (hitTex || hitClut) &&
+                (!hitTex || g766SrcPagesCurrent(i, tex)) &&
+                (!hitClut || g766SrcPagesCurrent(i, clut)))
+            {
+                ++g_g766SrcSkips;
+                continue;
+            }
+            // ⭐ G769: a colour WRITE into this target's pages (reads current) is decided per target
+            // after the loop: mirrored into the FBO when guest VRAM holds every page it writes,
+            // published otherwise (g769_authority.inc).
+            if (g769On && !hitUnknown && hitColor && !hitDepth &&
+                (!hitTex || g766SrcPagesCurrent(i, tex)) &&
+                (!hitClut || g766SrcPagesCurrent(i, clut)) && g769DeferWrite(i, e))
+                continue;
             if (hitUnknown || hitColor || hitDepth || hitTex || hitClut)
             {
                 g266NoteCpuMat(e, i, (hitColor ? 1u : 0u) | (hitDepth ? 2u : 0u) |
@@ -1184,6 +1256,7 @@ static void g261PrepareCpuReplay()
                     g737NoteCpuScope(framePageBaseToBlock(kG261Fbp[i]), r.fbw, r.dirtyLo,
                                      r.dirtyHi, bandLo, bandHi, bandValid && bandHi >= bandLo);
                 }
+                G766MatSite g766s(kG766SiteCpuReplay);
                 g261Materialize(static_cast<int>(i), kG261MatCpuReplay);
             }
         }
@@ -1595,6 +1668,15 @@ static void g261PrepareInline(const GSContext &ctx, const GSPrimReg &prim,
     if (clut.valid)
         g630MaterializeForRanges(clut, G144BlockRange{}, false, false, kG261MatInline);
     g630MaterializeDepth();
+    const bool g768Trace = g768InlEscOn();
+    if (g768Trace)
+    {
+        t_g768Inl = G768InlTrace{};
+        t_g768Inl.ran = true;
+        t_g768Inl.serial = ++g_g768InlSerial;
+        t_g768Inl.color = color;
+        t_g768Inl.unknown = unknown;
+    }
     if (!g261WaveOn() || !g261AnyDirty())
         return;
     for (uint32_t i = 0; i < kG248TargetCount; ++i)
@@ -1602,12 +1684,34 @@ static void g261PrepareInline(const GSContext &ctx, const GSPrimReg &prim,
         G261Res &r = g_g261Res[i];
         if (!r.dirty)
             continue;
+        if (g768Trace)
+            t_g768Inl.dirtyMask |= 1u << i;
         if (unknown || !r.range.valid ||
             (color.valid && g144RangeOverlaps(r.range, color)) ||
             (depth.active && depth.range.valid && g144RangeOverlaps(r.range, depth.range)) ||
             (tex.valid && g144RangeOverlaps(r.range, tex)) ||
             (clut.valid && g144RangeOverlaps(r.range, clut)))
+        {
+            // ⭐ G766: read-only (texture/CLUT) overlap whose pages guest VRAM already holds.
+            const bool g766Write = unknown || !r.range.valid ||
+                (color.valid && g144RangeOverlaps(r.range, color)) ||
+                (depth.active && depth.range.valid && g144RangeOverlaps(r.range, depth.range));
+            if (!g766Write &&
+                (!(tex.valid && g144RangeOverlaps(r.range, tex)) ||
+                 g766SrcPagesCurrent(i, tex)) &&
+                (!(clut.valid && g144RangeOverlaps(r.range, clut)) ||
+                 g766SrcPagesCurrent(i, clut)))
+            {
+                ++g_g766SrcSkips;
+                if (g768Trace)
+                    t_g768Inl.skipMask |= 1u << i;
+                continue;
+            }
+            if (g768Trace)
+                t_g768Inl.matMask |= 1u << i;
+            G766MatSite g766s(kG766SiteInline);
             g261Materialize(static_cast<int>(i), kG261MatInline);
+        }
     }
 }
 
