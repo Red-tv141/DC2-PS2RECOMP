@@ -388,6 +388,37 @@ namespace GSMem
         return PixelStorageTraits<P4HH>::Read(PageTableC32, data, bp, bw, x, y);
     }
 
+    // G768: the exact BIT address Read() reads a texel of `psm` from — PixelStorageTraits<psm>::
+    // Address times UnpackedBitWidth plus BitOffset, the same arithmetic as Read(), before its 4 MB
+    // wrap — so the GPU page views can map any page-periodic format onto CT32 page words without
+    // re-deriving a single swizzle. ~0u for a format Read() does not serve.
+    u32 G768BitAddress(u32 psm, u32 bp, u32 bw, u32 x, u32 y)
+    {
+        switch (psm)
+        {
+        case 0x00: // PSMCT32
+        case 0x01: // PSMCT24
+            return PixelStorageTraits<C32>::Address(PageTableC32, bp, bw, x, y) * 32u;
+        case 0x02: // PSMCT16
+            return PixelStorageTraits<C16>::Address(PageTableC16, bp, bw, x, y) * 16u;
+        case 0x0A: // PSMCT16S
+            return PixelStorageTraits<C16S>::Address(PageTableC16S, bp, bw, x, y) * 16u;
+        case 0x13: // PSMT8
+            return PixelStorageTraits<P8>::Address(PageTableP8, bp, bw, x, y) * 8u;
+        case 0x14: // PSMT4
+            return PixelStorageTraits<P4>::Address(PageTableP4, bp, bw, x, y) * 4u;
+        case 0x1B: // PSMT8H
+            return PixelStorageTraits<P8H>::Address(PageTableC32, bp, bw, x, y) * 32u + 24u;
+        case 0x24: // PSMT4HL
+            return PixelStorageTraits<P4HL>::Address(PageTableC32, bp, bw, x, y) * 32u + 24u;
+        case 0x2C: // PSMT4HH
+            return PixelStorageTraits<P4HH>::Address(PageTableC32, bp, bw, x, y) * 32u + 28u;
+        default:
+            break;
+        }
+        return ~0u;
+    }
+
 #include "ps2_gs_memory_parts/g424_image_run_writers.inc"
 #include "ps2_gs_memory_parts/g512_texdecode_row_readers.inc"
 }

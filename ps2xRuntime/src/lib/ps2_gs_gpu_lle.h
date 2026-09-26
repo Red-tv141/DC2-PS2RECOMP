@@ -91,6 +91,11 @@ struct G178TexUpload
     uint64_t key = 0;
     int w = 0, h = 0;
     std::vector<uint32_t> px;
+    // Process-lifetime read-only asset-cache mapping. Ownership stays with the
+    // cache across queued batches; ordinary/dynamic uploads continue owning px.
+    const uint32_t* compiledPixels = nullptr;
+    const uint32_t* pixelData() const { return compiledPixels ? compiledPixels : px.data(); }
+    size_t pixelCount() const { return compiledPixels ? static_cast<size_t>(w) * h : px.size(); }
 };
 
 // One flush's worth of work. Submitted synchronously; on return `readback` holds the FBO color

@@ -1406,7 +1406,10 @@ namespace
             g446RegisterGsWorkerThread(&g_g189WorkerStage);
             // G447: mark this thread so the blocking-edge census pools ONLY the GS worker (the EE
             // thread reaches several of the same backend entry points at the frame barrier).
-            g447MarkGsWorkerThread();
+            // G769: DC2_G769_EXECWAIT=1 points the census at the EXECUTOR instead (its backend
+            // round trips are the ones no census has timed since G721 split the front end).
+            if (std::getenv("DC2_G769_EXECWAIT") == nullptr)
+                g447MarkGsWorkerThread();
             // ⭐ G735: real-CPU slot for the PARSE thread. The board's `gsOwn` is
             // `g303_gs_worker_busy_ns()` minus the stall — an OCCUPANCY figure from this thread's
             // window branch — so it has the same defect G735 found in `[G734:gsx] execMs/f`.
@@ -1975,6 +1978,7 @@ namespace
     void g740BoundaryThunk(void *p)
     {
         G740BoundaryJob *job = static_cast<G740BoundaryJob *>(p);
+        g770XTraceFrame(); // G770 diagnostic (inert unless DC2_G770_XTRACE)
         // G336: the publish-capture window belongs around the CLOSURE, which is here now.
         g336_boundary_begin();
         try

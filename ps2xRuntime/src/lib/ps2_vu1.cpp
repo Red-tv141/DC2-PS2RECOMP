@@ -26,7 +26,7 @@
 // included here — it is included from inside vu1_g610_native_jit.inc's anonymous namespace, right
 // after the encoder it emits through, because both compiled backends must see the same allocator.
 // This comment is also the MSBuild rebuild trigger (G359): a .inc edit alone does not make MSBuild
-// consume the TU. revision: 31 (G745 hoisted G612 cycle-budget test + cross-BB history elision)
+// consume the TU. revision: 32 (G763 moved the G239 scalar pre-stall ABOVE the emitted upper slot)
 // G610: the NATIVE VU1 BLOCK COMPILATION BACKEND — x86-64 emitter + translator. Must come AFTER
 // vu1_g421_fast_upper.inc (it reads `g421DescTableConst` and `g421MaskTableConst`) and BEFORE
 // vu1_g490_block_run.inc, which holds the compiled-block ENTRY and calls `g610CompileAll` from the

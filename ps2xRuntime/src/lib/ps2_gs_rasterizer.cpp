@@ -1,3 +1,5 @@
+#include "ps2_asset_texcache.h"
+// G764 offline asset-cache integration, revision 4 (pre-hash, stable residency).
 #include "ps2_g674_hot_flag.inc"
 // G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
 #include "ps2_g736_ab_arm_stubs.inc"
@@ -256,6 +258,7 @@ bool g589MemoEnsureAtlas(bool (*real)());
 
 #include <deque>
 #include "ps2_gs_g630_packet.inc"
+#include "g768_view_packet.inc" // G768: general page-view packet (shared with the backend TU)
 
 // G630: installed by the internal residency domain and called after a complete CT32 IMAGE upload.
 void (*g_g630UploadCompleteHook)(uint8_t *, uint32_t, uint32_t, uint32_t,
@@ -347,6 +350,7 @@ extern void g650PinThread(int role);
 // outside the anonymous namespace this file opens below — the same G568 linkage trap the comment
 // above records for g650PinThread.
 extern void g735RegisterExecThread();
+void g447MarkGsWorkerThread(); // G769: DC2_G769_EXECWAIT marks the executor for the G447 census
 
 // rasterizer_draw_prim_probe.inc below opens an anonymous namespace that stays open until
 // rasterizer_rtt_census_and_waves.inc closes it, so an include placed between the two would put
@@ -412,6 +416,10 @@ extern void g735RegisterExecThread();
 // G260Batch / g_g260Graph / g260RangeSetsConflict from the graph above, and g144RangeForRect from
 // rasterizer_draw_prim_probe.inc.
 #include "ps2_gs_rasterizer_parts/g713_pipe_parse.inc"
+
+// G770-A: asynchronous inline primitives (the parse -> exec blocking round trip removed). Needs
+// g713ParseFlushOpen from part 2 above; its runner is installed by drawPrimitive.
+#include "ps2_gs_rasterizer_parts/g770_async_inline.inc"
 
 #if defined(PS2X_G655_LEGACY_DIAG)
 #include "ps2_gs_rasterizer_parts/rasterizer_g336_runway.inc"
@@ -486,6 +494,8 @@ extern void g735RegisterExecThread();
 // rasterizer_gpu_alias_page_view.inc (5,116 lines) so the functions that use them are not preceded
 // by 1,000 lines of declarations. MUST be included IMMEDIATELY BEFORE its parent: one translation
 // unit, byte-identical preprocessor output (rule 12b).
+#include "ps2_gs_rasterizer_parts/g766_mat_ledger.inc"
+#include "ps2_gs_rasterizer_parts/g766_page_owner.inc"
 #include "ps2_gs_rasterizer_parts/rasterizer_alias_state.inc"
 #include "ps2_gs_rasterizer_parts/rasterizer_gpu_alias_page_view.inc"
 
@@ -635,6 +645,10 @@ extern void g735RegisterExecThread();
 // rasterizer_vram_materialization.inc (7,737 lines) whose remaining body is essentially the single
 // 6,280-line `g178TryFlushGpu`. MUST be included IMMEDIATELY BEFORE its parent: one translation
 // unit, byte-identical preprocessor output (rule 12b).
+// G768: inline-escape tracer (diagnostic, DC2_G768_INLESC=1); used by g261PrepareInline below.
+#include "ps2_gs_rasterizer_parts/g768_inline_escape_diag.inc"
+// G769: page-authority rules for the CPU-side read (texture bind) and write (CPU replay) edges.
+#include "ps2_gs_rasterizer_parts/g769_authority.inc"
 #include "ps2_gs_rasterizer_parts/rasterizer_mat_support.inc"
 // ⛔ G710's flush ceiling probe is UNWIRED (Rule 31, G711). Its `#else` stubs were all `constexpr`,
 // so every use folded — but the source text still perturbed this TU's layout, and a cross-binary
@@ -657,6 +671,18 @@ extern void g735RegisterExecThread();
 // rasterizer_draw_sprite.inc, which holds its only call site inside
 // g144FlushPendingLocalTransferRange. Content edit here forces MSBuild to consume the .inc (G359).
 #include "ps2_gs_rasterizer_parts/g627_psmt8_lane_mirror.inc"
+// G766: the sub-word write mirror (any-format guest write into a resident CT32 target -> deferred
+// bit-masked FBO patch). Uses g264InvPage (rasterizer_mat_support.inc) and G264's mirror state; its
+// flush half is forward-declared in g766_page_owner.inc for g264FlushMirror.
+#include "ps2_gs_rasterizer_parts/g766_mask_mirror.inc"
+// G767: the transient -> resident FOLD (a transient's rendered pages go GPU->GPU into the resident
+// FBOs that hold them; no colour readback). Uses G766's page-owner and transient-seed state; its
+// entry points are forward-declared in g766_page_owner.inc for g178TryFlushGpu.
+#include "ps2_gs_rasterizer_parts/g767_transient_fold.inc"
+// G768: general GPU page views (paletted + GPU CLUT + VRAM mirror) and the G289 owner-publication
+// upload mirror. Entry points forward-declared in g766_page_owner.inc / rasterizer_gpu_alias_page_view.inc.
+#include "ps2_gs_rasterizer_parts/g768_page_view.inc"
+#include "ps2_gs_rasterizer_parts/g768_owner_mirror.inc"
 
 // G714 revision: 1 — same-format local->local executed against GPU-resident raw GS VRAM, so the
 // edge's `g261MaterializeForRanges` (99.7% of its blocking time, `[G432:l2ledge]`) never runs.
@@ -665,6 +691,8 @@ extern void g735RegisterExecThread();
 // and MUST precede rasterizer_draw_sprite.inc, which holds both call sites. Content edit here
 // forces MSBuild to consume the .inc (G359).
 #include "ps2_gs_rasterizer_parts/g714_gpu_l2l.inc"
+// G767: local->local on the GPU when the source pages live in resident FBOs (byte-map move).
+#include "ps2_gs_rasterizer_parts/g767_gpu_l2l.inc"
 #include "ps2_gs_rasterizer_parts/g716_authority.inc"
 
 
@@ -744,6 +772,14 @@ static void g687PrimePackedCapture(
     GSRasterizer *self, GS *gs, uint8_t *vram, const GSContext &ctx,
     const GSPrimReg &prim, const GSTexaReg &texa, const GSTexClutReg &texclut,
     bool pabe, bool g286Transient, bool g573Tri13b);
+
+// G761 revision: 2 — the Map-125 ground-shadow winding-buffer oracle. Default-off. It owns
+// `g761FrontDoor` (called from rasterizer_setup_and_perf_census.inc, which is a FRAGMENT of
+// drawPrimitive's BODY) and `g761ShadowNoZ` (rasterizer_draw_triangle.inc), so it MUST precede
+// both, and it MUST follow rasterizer_clipping_and_tex_checks.inc for `g403DisplayZRead` — the
+// shared display-Z mirror the shadow's GREATER test actually reads.
+// Content edit here forces MSBuild to consume the .inc files (G359).
+#include "ps2_gs_rasterizer_parts/g761_shadow_probe.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_setup_and_perf_census.inc"
 

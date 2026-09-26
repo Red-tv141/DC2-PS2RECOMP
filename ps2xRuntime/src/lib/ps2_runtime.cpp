@@ -1,3 +1,4 @@
+// G764 leased GPU presentation snapshots, revision 3.
 // G739: the inlined call-site dispatch probe + back-edge preempt fast path (force rebuild v1).
 //       G652's generated-side fast dispatch had ZERO call sites; see ps2_runtime_macros.h.
 // G652: cross-thread critical-path hooks + fast dispatch helpers (force rebuild v1).
@@ -18,6 +19,7 @@
 extern void g650PinThread(int role);
 #include "ps2_critical_trace_api.inc"
 #include "ps2_runtime_parts/runtime_mtvu_and_env.inc"
+#include "rlgl.h" // raylib's Matrix declaration must precede rlgl's fallback type.
 #include "ps2_runtime_parts/runtime_host_display.inc"
 #include "ps2_runtime_parts/runtime_init_and_signals.inc"
 #include "ps2_runtime_parts/runtime_guest_heap.inc"

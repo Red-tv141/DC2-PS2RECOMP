@@ -353,6 +353,12 @@ void g713Consume(G713Ring &r, uint64_t head, bool threaded)
                         std::chrono::steady_clock::now() - k0).count()),
                     std::memory_order_relaxed);
         }
+        else if (g770XTraceActive())
+        {
+            const uint64_t g770T0 = g770XTraceNow();
+            g713RunNode(r, n);
+            g770XTrace('N', n.kind, n.payLen, 0u, g770T0);
+        }
         else
             g713RunNode(r, n);
         if (n.kind == kNodeImage)
@@ -1045,4 +1051,80 @@ void g713PipeStop()
     r.space.notify();
     if (r.thread.joinable())
         r.thread.join();
+}
+
+// ==============================================================================================
+// G770 — EXEC-THREAD EVENT TRACE (diagnostic, DC2_G770_XTRACE=<first frame>, default OFF).
+//
+// Purpose: see the exact order of ring nodes, graph executions, per-batch GPU/CPU path and every
+// GPU->CPU readback (with its blocking time) on the executor, for three frames, so the deferred
+// CPU-replay design (G770-C) is built against the real sequence instead of an argument. Events are
+// buffered in memory and printed once at the end of the window, so the trace perturbs only the
+// frames it records by a clock read per event. Never a timing arm.
+// ==============================================================================================
+namespace
+{
+struct G770XEvent
+{
+    uint64_t ns;
+    uint32_t a, b, c;
+    uint32_t dur;
+    char kind;
+};
+std::vector<G770XEvent> s_g770X;
+uint32_t s_g770XFrame = 0u;
+bool s_g770XDone = false;
+uint64_t s_g770XT0 = 0u;
+
+uint32_t g770XStart()
+{
+    static const uint32_t v = [] {
+        const char *e = std::getenv("DC2_G770_XTRACE");
+        return e ? static_cast<uint32_t>(std::strtoul(e, nullptr, 0)) : 0u;
+    }();
+    return v;
+}
+uint64_t g770XNow()
+{
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+} // namespace
+
+bool g770XTraceActive()
+{
+    const uint32_t s = g770XStart();
+    return s != 0u && !s_g770XDone && s_g770XFrame >= s && s_g770XFrame < s + 3u;
+}
+
+uint64_t g770XTraceNow() { return g770XNow(); }
+
+// kind: 'N' node (a=kind), 'E' graph exec (a=cause, b=batches), 'B' batch (a=fbp, b=entries,
+// c=cpuReplay?1:0, dur=us), 'R' readback (a=0 colour/1 depth, b=key, c=rows, dur=us),
+// 'I' inline prim (a=prim type, b=fbp, dur=us), 'F' frame boundary.
+void g770XTrace(char kind, uint32_t a, uint32_t b, uint32_t c, uint64_t t0)
+{
+    if (!g770XTraceActive())
+        return;
+    const uint64_t now = g770XNow();
+    if (s_g770XT0 == 0u)
+        s_g770XT0 = now;
+    const uint64_t d = (t0 != 0u && now > t0) ? (now - t0) / 1000u : 0u;
+    s_g770X.push_back(G770XEvent{t0 != 0u ? t0 : now, a, b, c, static_cast<uint32_t>(d), kind});
+}
+
+void g770XTraceFrame()
+{
+    const uint32_t s = g770XStart();
+    if (s == 0u || s_g770XDone)
+        return;
+    g770XTrace('F', s_g770XFrame, 0u, 0u, 0u);
+    ++s_g770XFrame;
+    if (s_g770XFrame < s + 3u)
+        return;
+    s_g770XDone = true;
+    for (const G770XEvent &e : s_g770X)
+        std::fprintf(stderr, "[G770:x] t=%9.3f %c a=0x%x b=%u c=%u dur=%u\n",
+                     static_cast<double>(e.ns - s_g770XT0) / 1.0e6, e.kind, e.a, e.b, e.c, e.dur);
+    std::fflush(stderr);
 }

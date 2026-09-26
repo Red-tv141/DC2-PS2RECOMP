@@ -134,4 +134,10 @@ bool g713RasterCloseForLocalCopy(uint32_t sbp, uint32_t sbw, uint32_t spsm, uint
                                  uint32_t dsax, uint32_t dsay, uint32_t rrw, uint32_t rrh);
 void g713RasterFlushOpen();
 
+// G770: exec-thread event trace (diagnostic, DC2_G770_XTRACE=<first frame>; ps2_g713_pipeline.cpp).
+bool g770XTraceActive();
+uint64_t g770XTraceNow();
+void g770XTrace(char kind, uint32_t a, uint32_t b, uint32_t c, uint64_t t0);
+void g770XTraceFrame();
+
 #endif // DC2_G713_PIPELINE_API_INC

@@ -94,3 +94,4 @@ extern std::atomic<uint32_t> g_dc2ScriptFrame;
 #include "ps2_gs_gpu_parts/gpu_transfers_and_kick.inc"
 // G446: env-read census hook in envFlagEnabled (force recompile v1).
 // G446: cache DC2_DUMP_FONT at the T4HH upload site (force recompile v2).
+// G764 leased GPU snapshots; demand-driven exact CPU readback (revision 3).

@@ -1,3 +1,4 @@
+// G764 mapped asset upload ownership, revision 1.
 #include <cstdint>
 #include "ps2_g674_hot_flag.inc"
 // G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
@@ -15,6 +16,10 @@
 // (DC2_G433_NO_RB=1 skips only glReadPixels; DC2_G433_RBSTAT=1 times it). Content edit here
 // forces MSBuild to consume the .inc.
 #include "ps2_critical_trace_api.inc"
+// G770: exec-thread event trace (defined in ps2_g713_pipeline.cpp; inert unless DC2_G770_XTRACE).
+bool g770XTraceActive();
+uint64_t g770XTraceNow();
+void g770XTrace(char kind, uint32_t a, uint32_t b, uint32_t c, uint64_t t0);
 // G652 P10: within-process arm for the three-segment SSBO upload ring.
 int g652SsboRingArm();
 // G546: CPU dead-history MAX/MIN + image-resident live VU code/RAM workspace (v31).
@@ -60,7 +65,9 @@ int g652SsboRingArm();
 // The instrument contract lives in ps2_gs_rasterizer_parts/g419_ab_instrument.inc.
 
 #include "ps2_gs_gpu_lle.h" // G178: private front-end<->backend interface (both build branches)
+#include "ps2_gpu_presentation.h"
 #include "ps2_gs_g630_packet.inc"
+#include "g768_view_packet.inc" // G768: general page-view packet (shared with the rasterizer TU)
 
 #if defined(_WIN32) && !defined(PLATFORM_VITA)
 
@@ -135,6 +142,9 @@ extern std::atomic<uint32_t> g_dc2RenderedFrame;
 #include "ps2_gs_gpu_raster_parts/g433_pbo_readback.inc"
 #include "ps2_gs_gpu_raster_parts/g494_driver_sync_census.inc"
 #include "ps2_gs_gpu_raster_parts/g495_readback_queue_census.inc"
+#include "ps2_gs_gpu_raster_parts/g765_gpu_stage.inc"
+// G767: GPU time per draw class (diagnostic, DC2_G767_DRAWGPU=<N>).
+#include "ps2_gs_gpu_raster_parts/g767_draw_gpu.inc"
 #include "ps2_gs_gpu_raster_parts/g496_gpu_ballast.inc"
 #include "ps2_gs_gpu_raster_parts/g496_gl_state_cache.inc"
 #include "ps2_gs_gpu_raster_parts/g621_readback_span_census.inc"
@@ -145,6 +155,18 @@ extern std::atomic<uint32_t> g_dc2RenderedFrame;
 // parent and in this order: the two halves are one translation unit and the preprocessor output is
 // byte-identical to the unsplit file, which is what makes this safe in a hot TU (rule 12b).
 #include "ps2_gs_gpu_raster_parts/lle_gpu_raster_prelude.inc"
+// G761 revision: 1 - the Map-125 shadow winding/depth dump. Default-off. Owns
+// `g761GpuZDumpEvery` / `g761WriteGpuPgm`, called from renderBatch inside
+// lle_gpu_raster_backend.inc, so it MUST precede it.
+#include "ps2_gs_gpu_raster_parts/g761_gpu_shadow_dump.inc"
+// G762 revision: 1 - the five shadow arms (raw winding + guest-Z dump, NOZ, ONLY, ZBIAS, PIX).
+// Uses G761_DEPTH_COMPONENT from the file above, so it must follow it and precede the backend.
+#include "ps2_gs_gpu_raster_parts/g762_shadow_probe.inc"
+// G766: post-upload page-pull slot (state only; the applying member lives in the class).
+#include "ps2_gs_gpu_raster_parts/g766_post_upload.inc"
+// G767: post-draw transient -> resident fold slot (state only; member in the class).
+#include "ps2_gs_gpu_raster_parts/g767_post_draw_fold.inc"
+
 #include "ps2_gs_gpu_raster_parts/lle_gpu_raster_backend.inc"
 #include "ps2_gs_gpu_raster_parts/gpu_raster_bridge_and_stubs.inc"
 // G425: readback-redundancy ceiling census added in lle_gpu_raster_backend.inc (force recompile v1).
@@ -237,7 +259,38 @@ bool g264_backend_write_color_rect(uint32_t, int, int, int, int, int, int,
 bool g627_backend_write_color_rect_masked(uint32_t, int, int, int, int, int, int,
                                           const std::vector<uint32_t> &,
                                           const std::vector<uint32_t> &) { return false; }
+bool g766_backend_write_color_rect_bits(uint32_t, int, int, int, int, int, int,
+                                        const std::vector<uint32_t> &,
+                                        const std::vector<uint32_t> &) { return false; }
 bool g280_backend_copy_color_rects(uint32_t, uint32_t, const std::vector<int32_t> &) { return false; }
+bool g769_backend_write_color_rect_async(uint32_t, int, int, int, int, int, int,
+                                         std::vector<uint32_t> &&) { return false; }
+bool g769_backend_write_color_rect_bits_async(uint32_t, int, int, int, int, int, int,
+                                              std::vector<uint32_t> &&, std::vector<uint32_t> &&)
+{ return false; }
+uint64_t g769_backend_async_write_fails() { return 0u; }
+bool g766_backend_arm_pulls(uint32_t, const std::vector<int32_t> &) { return false; }
+bool g766_backend_last_pulls_applied() { return false; }
+void g766_backend_report() {}
+bool g767_backend_arm_folds(uint32_t, const std::vector<int32_t> &) { return false; }
+bool g767_backend_last_folds_applied() { return false; }
+void g767_backend_report() {}
+bool g767_backend_l2l(const std::vector<int32_t> &, const std::vector<uint32_t> &,
+                      const std::vector<int32_t> &, const std::vector<int32_t> &) { return false; }
+bool g767_backend_queue_view(uint64_t, int, int, bool, int, int, int, std::vector<int32_t> &&,
+                             std::vector<uint32_t> &&, std::vector<uint32_t> &&,
+                             const std::vector<uint32_t> *) { return false; }
+bool g767_backend_prepare_t8_view(uint64_t, int, int, int, const std::vector<int32_t> &,
+                                  const std::vector<uint32_t> &, const std::vector<uint32_t> &,
+                                  const std::vector<uint32_t> &) { return false; }
+bool g767_backend_prepare_ct32_view(uint64_t, int, int, bool, int, int,
+                                    const std::vector<int32_t> &,
+                                    const std::vector<uint32_t> &) { return false; }
+bool g768_backend_queue_view(std::shared_ptr<G768ViewPacket>) { return false; }
+uint64_t g768_backend_mirror_epoch() { return 0u; }
+uint64_t g768_backend_exec_serial() { return 0u; }
+void g768_backend_report() {}
+bool g768_backend_read_view(uint64_t, int, int, std::vector<uint32_t> &) { return false; }
 bool g309_backend_build_authoritative_composite(
     const std::vector<uint32_t> &, const std::vector<uint32_t> &,
     bool, std::vector<uint32_t> &) { return false; }

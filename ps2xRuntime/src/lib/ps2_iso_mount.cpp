@@ -50,12 +50,17 @@ bool Ps2IsoMount::isOpen() const { return m_open; }
 bool Ps2IsoMount::readSector(uint32_t lba, uint32_t count, void* dst) const
 {
     if (!m_open) return false;
+    if (count == 0) return true;
+    if (!dst) return false;
+    if (uint64_t(lba) + count > (1ull << 32)) return false;
     if (m_folderMode) return readSectorFolder(lba, count, dst);
+    // A failed/short speculative bulk read must not poison subsequent reads.
+    m_file.clear();
     m_file.seekg(static_cast<std::streamoff>(lba) * SECTOR_SIZE, std::ios::beg);
     if (!m_file) return false;
     m_file.read(static_cast<char*>(dst),
                 static_cast<std::streamsize>(count) * SECTOR_SIZE);
-    return m_file.good() || m_file.eof();
+    return m_file.gcount() == static_cast<std::streamsize>(count) * SECTOR_SIZE;
 }
 
 bool Ps2IsoMount::open(const std::string& iso_path)
@@ -628,13 +633,21 @@ bool Ps2IsoMount::readSectorFolder(uint32_t lba, uint32_t count, void* dst) cons
     std::lock_guard<std::mutex> lk(m_folderMutex);
 
     uint8_t* out = static_cast<uint8_t*>(dst);
-    for (uint32_t i = 0; i < count; ++i, out += SECTOR_SIZE)
+    // G764: retain the sector API, but perform I/O per contiguous file extent.
+    // One lookup, seek and read replaces every sector operation in that extent.
+    for (uint32_t i = 0; i < count;)
     {
         const FolderExtent* ex = extentForSector(lba + i);
         if (ex == nullptr)
         {
             // Gap or out-of-range sector: the real medium would return padding here.
-            std::memset(out, 0, SECTOR_SIZE);
+            const auto next = std::upper_bound(m_extents.begin(), m_extents.end(), lba + i,
+                [](uint32_t v, const FolderExtent& e) { return v < e.lba; });
+            const uint32_t gap = next == m_extents.end() ? count - i
+                : std::min(count - i, next->lba - (lba + i));
+            const size_t bytes = size_t(gap) * SECTOR_SIZE;
+            std::memset(out, 0, bytes);
+            out += bytes; i += gap;
             continue;
         }
         std::ifstream* s = streamFor(*ex);
@@ -642,19 +655,20 @@ bool Ps2IsoMount::readSectorFolder(uint32_t lba, uint32_t count, void* dst) cons
             return false;
 
         const uint64_t off = static_cast<uint64_t>(lba + i - ex->lba) * SECTOR_SIZE;
+        const uint32_t sectors = std::min(count - i, ex->sectors - (lba + i - ex->lba));
+        const size_t bytes = size_t(sectors) * SECTOR_SIZE;
         uint64_t avail = (off < ex->size) ? (ex->size - off) : 0ull;
-        if (avail > SECTOR_SIZE) avail = SECTOR_SIZE;
+        if (avail > bytes) avail = bytes;
 
-        if (avail < SECTOR_SIZE)
-            std::memset(out + avail, 0, SECTOR_SIZE - static_cast<size_t>(avail));
-        if (avail == 0)
-            continue;
+        if (avail < bytes)
+            std::memset(out + avail, 0, bytes - static_cast<size_t>(avail));
 
         s->clear();
         s->seekg(static_cast<std::streamoff>(off), std::ios::beg);
         if (!*s) return false;
         s->read(reinterpret_cast<char*>(out), static_cast<std::streamsize>(avail));
-        if (!(s->good() || s->eof())) return false;
+        if (s->gcount() != static_cast<std::streamsize>(avail)) return false;
+        out += bytes; i += sectors;
     }
     return true;
 }
