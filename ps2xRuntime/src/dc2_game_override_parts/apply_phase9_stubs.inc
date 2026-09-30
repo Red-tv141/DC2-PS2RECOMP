@@ -692,4 +692,21 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
 
     // PHASE G385: trace the MSIN messages after the Phase-9 auto-stub bindings.
     applyDC2G385AudioTrace(runtime);
+#if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
+    if(dc2_g775_capture::tracking())
+    {
+        runtime.registerFunction(0x0013f4e0u,g775_mesh_draw_probe);
+        runtime.registerFunction(0x001404d0u,g775_render_info_probe);
+        runtime.registerFunction(0x0013f290u,g775_mdt_load_probe);
+        runtime.registerFunction(0x0013f360u,g775_fix_load_probe);
+        if(dc2_g775_capture::instanceContext())
+        {
+            runtime.registerFunction(0x001359d0u,g776_add_packet_probe);
+            runtime.registerFunction(0x00135720u,g776_draw_manager_probe);
+            runtime.registerFunction(0x00145e80u,g776_send_program_probe);
+            runtime.registerFunction(0x0013f010u,g776_create_face_probe);
+            runtime.registerFunction(0x0013ff60u,g776_face_packet_probe);
+        }
+    }
+#endif
 }

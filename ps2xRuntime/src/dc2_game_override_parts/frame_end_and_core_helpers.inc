@@ -108,6 +108,10 @@ static void g598_capture_on_script_frame(uint32_t n, PS2Runtime *runtime)
 
 static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime)
 {
+    // The frame snapshot observes every preceding VIF epoch. Consume its DMA
+    // dependencies before placing the boundary behind their GIF windows. This
+    // does not wait for GS execution or GPU completion.
+    if (runtime) runtime->memory().processPendingTransfers();
     if (g652CriticalTraceOn)
     {
         // G653 P4: bracket the EE command-generation span. mgEndFrame is the only guest-side frame

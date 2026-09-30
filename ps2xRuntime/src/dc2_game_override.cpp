@@ -7,6 +7,11 @@
 // ps2_stubs:: function at runtime, affecting only dc2.elf.
 
 #include "game_overrides.h"
+#include "runtime/dc2_g775_capture.h"
+#if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
+#include "runtime/dc2_native_draw.h"
+#include "runtime/dc2_g778_native.h"
+#endif
 #include "ps2_runtime.h"
 // G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
 #include "lib/ps2_g736_ab_arm_stubs.inc"
@@ -228,6 +233,11 @@ bool f66_drive_dungeon_pad(uint32_t);
 // PHASE F25: forward-decl for delegation when path is not the empty-stem map pattern.
 // Defined in recomp/LoadFile2__FPcPvPii_0x149370.cpp.
 extern void LoadFile2__FPcPvPii_0x149370(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+#if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
+extern void CreateRenderInfoPacket__12mgCVisualMDTFPUiPA4_fP13mgRENDER_INFO_0x1404d0(uint8_t*,R5900Context*,PS2Runtime*);
+extern void DataAssignMDT__12mgCVisualMDTFP10MDT_HEADERP9mgCMemoryP17mgCTextureManager_0x13f290(uint8_t*,R5900Context*,PS2Runtime*);
+extern void DataAssignMDT__15mgCVisualFixMDTFP10MDT_HEADERP9mgCMemoryP17mgCTextureManager_0x13f360(uint8_t*,R5900Context*,PS2Runtime*);
+#endif
 extern void EditDraw__Fv_0x1ae3d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void EditLoop__Fv_0x1abcf0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern bool g_g186SpBalArmed; // ps2_runtime.cpp — G186 sp-balance logging armed while inside EditDraw
@@ -400,6 +410,7 @@ extern void test1__FPA4_fPA4_fPA4_fPfPf_0x135c70(uint8_t* rdram, R5900Context* c
 extern void mgSendVuProg__FPUii_0x145e80(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void Draw__12mgCVisualMDTFPUiPA4_fP14mgCDrawManager_0x13f4e0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void AddPacket__14mgCDrawManagerFiP1P1i_0x1359d0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
+extern void CreateFace__12mgCVisualMDTFP8FACES_IDP9mgCMemoryP9mgCMemoryPP7mgCFace_0x13f010(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void CreateFacePacket__12mgCVisualMDTFPUiP7mgCFace_0x13ff60(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void CreatePacket__12mgCVisualMDTFP14mgCDrawManager_0x13f6a0(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
 extern void CreatePacket__15mgCVisualFixMDTFP14mgCDrawManager_0x13f920(uint8_t* rdram, R5900Context* ctx, PS2Runtime* runtime);
@@ -596,6 +607,18 @@ extern void PlayEnvBgm__6CSceneFv_0x2a6840(uint8_t *rdram, R5900Context *ctx, PS
 extern void SearchSndDataID__6CSceneFi_0x2a6c30(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 namespace
 {
+#if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
+static void g775_mesh_draw_probe(uint8_t*,R5900Context*,PS2Runtime*);
+static void g775_render_info_probe(uint8_t*,R5900Context*,PS2Runtime*);
+static void g775_mdt_load_probe(uint8_t*,R5900Context*,PS2Runtime*);
+static void g775_fix_load_probe(uint8_t*,R5900Context*,PS2Runtime*);
+static void g776_add_packet_probe(uint8_t*,R5900Context*,PS2Runtime*);
+static void g776_draw_manager_probe(uint8_t*,R5900Context*,PS2Runtime*);
+static void g776_send_program_probe(uint8_t*,R5900Context*,PS2Runtime*);
+static void g776_create_face_probe(uint8_t*,R5900Context*,PS2Runtime*);
+static void g776_face_packet_probe(uint8_t*,R5900Context*,PS2Runtime*);
+static void g776_native_shadow(dc2_g775_capture::Draw,const uint8_t*);
+#endif
 #include "dc2_game_override_parts/common_state.inc"
 // G619: must follow common_state.inc (it uses dc2_env_flag_enabled) and precede every probe file
 // that reads one of the cached flags. See the file header for why `getenv` was 20.7% of the EE
@@ -631,6 +654,11 @@ namespace
 // G390: MODMSIN key-on with velocity 0 is a key-off (DC2_G390_LEGACY_SFX=1).
 #include "dc2_game_override_parts/object_init_and_pad.inc"
 
+namespace {
+#include "dc2_game_override_parts/g776_native_shadow.inc"
+#include "dc2_game_override_parts/g778_native_capture.inc"
+#include "dc2_game_override_parts/g775_native_capture.inc"
+}
 #include "dc2_game_override_parts/live_input_and_stubs.inc"
 
 // PHASE9: DC2 ג€” Register the Phase 9.3 stub override.
