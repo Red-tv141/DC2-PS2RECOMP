@@ -21,6 +21,19 @@
 
             uint32_t totalBytes = sourceVectorCount * bytesPerVector;
             totalBytes = (totalBytes + 3) & ~3u;
+#if defined(PS2X_G777_NATIVE_GL)
+            if(g778Scope.active && !g778Scope.active->g782Group &&
+               g778Scope.active->nativeCommitted.load(std::memory_order_acquire)){
+                if(opcode!=0x6c || pos>g778Scope.active->transportEnd || totalBytes>g778Scope.active->transportEnd-pos){
+                    ++dc2_g778::counters.transportFailures;std::abort();
+                }
+                // Consume the original command/payload without writing VU geometry.
+                // Original MSCAL/MSCNT handlers still maintain TOP, DBF and fences;
+                // their actual queued core entries apply only the proven side effects.
+                dc2_g778::counters.unpackBytes+=totalBytes;
+                pos+=totalBytes;ps2_dma::consumeThrough(data,pos);continue;
+            }
+#endif
             const bool g22IsV432 = (opcode == 0x6Cu);
             const bool g22IsLargeUnpack = (writeVectorCount >= 64u);
             if (g22IsV432)
@@ -41,13 +54,13 @@
                     uint32_t firstKickOff = 0xFFFFFFFFu, firstKickWord = 0u;
                     for (uint32_t q = 4u; q + 4u <= totalBytes && pos + q + 4u <= sizeBytes; q += 4u)
                     {
-                        uint32_t kw = 0u; std::memcpy(&kw, data + pos + q, 4);
+                        uint32_t kw = 0u; ps2_dma::read(&kw, data + pos + q, 4);
                         const uint8_t kop = static_cast<uint8_t>((kw >> 24) & 0x7Fu);
                         if ((kop == 0x14u || kop == 0x15u || kop == 0x17u) && (kw & 0x00FFFFFFu) == 0u)
                         { firstKickOff = q; firstKickWord = kw; break; }
                     }
                     uint32_t nextW = 0u;
-                    if (pos + totalBytes + 4u <= sizeBytes) std::memcpy(&nextW, data + pos + totalBytes, 4);
+                    if (pos + totalBytes + 4u <= sizeBytes) ps2_dma::read(&nextW, data + pos + totalBytes, 4);
                     std::fprintf(stderr,
                                  "[G17:unpk] cmdPos=0x%x op=0x%02x num=%u cl=%u wl=%u srcVec=%u totalBytes=%u nextWord=0x%08x kickInSpan@%d=0x%08x\n",
                                  pos - 4u, static_cast<uint32_t>(opcode), writeVectorCount,
@@ -72,7 +85,7 @@
                     for (uint32_t q = 0u; q + 4u <= totalBytes && pos + q + 4u <= sizeBytes; q += 4u)
                     {
                         float fv;
-                        std::memcpy(&fv, data + pos + q, 4);
+                        ps2_dma::read(&fv, data + pos + q, 4);
                         if (!std::isfinite(fv))
                         {
                             static std::atomic<uint32_t> s_n{0};
@@ -119,8 +132,8 @@
                         for (uint32_t v = 0; v < nv; ++v)
                         {
                             const uint32_t o = pos + v * bytesPerVector;
-                            if (vl == 0u) { float f[4]; std::memcpy(f, data+o, 16); std::fprintf(stderr, " (%.0f,%.0f,%.0f,%.0f)", f[0],f[1],f[2],f[3]); }
-                            else if (vl == 1u) { int16_t s[4]; std::memcpy(s, data+o, 8); std::fprintf(stderr, " (%d,%d,%d,%d)", s[0],s[1],s[2],s[3]); }
+                            if (vl == 0u) { float f[4]; ps2_dma::read(f, data+o, 16); std::fprintf(stderr, " (%.0f,%.0f,%.0f,%.0f)", f[0],f[1],f[2],f[3]); }
+                            else if (vl == 1u) { int16_t s[4]; ps2_dma::read(s, data+o, 8); std::fprintf(stderr, " (%d,%d,%d,%d)", s[0],s[1],s[2],s[3]); }
                             else { std::fprintf(stderr, " (%u,%u,%u,%u)", data[o],data[o+1],data[o+2],data[o+3]); }
                         }
                         std::fprintf(stderr, "\n"); std::fflush(stderr);
@@ -139,9 +152,7 @@
                              static_cast<uint32_t>(vn), static_cast<uint32_t>(vl),
                              bytesPerVector, cl, wl, vif1_regs.mode & 3u,
                              vif1_regs.tops & 0x3FFu);
-                g136_log_qwords("unpacksrc", g136Seq, pos, data + pos,
-                                (sizeBytes > pos) ? (sizeBytes - pos) : 0u,
-                                totalBytes / 16u);
+                g136_log_qwords("unpacksrc", g136Seq, pos, ps2_dma::borrow(data + pos, (sizeBytes > pos) ? (sizeBytes - pos) : 0u), (sizeBytes > pos) ? (sizeBytes - pos) : 0u, totalBytes / 16u);
             }
             // G62: localize EE-vs-VIF for the title-map wrong-prim bug. Scan the SOURCE qwords of
             // each UNPACK for triangle-class GIFtag templates (PRE=1, prim type in {3 tri,4 tristrip,
@@ -156,8 +167,8 @@
                 for (uint32_t q = 0u; q < scanQw && pos + (q + 1u) * 16u <= sizeBytes; ++q)
                 {
                     uint64_t tagLo = 0u, tagHi = 0u;
-                    std::memcpy(&tagLo, data + pos + q * 16u, 8);
-                    std::memcpy(&tagHi, data + pos + q * 16u + 8u, 8);
+                    ps2_dma::read(&tagLo, data + pos + q * 16u, 8);
+                    ps2_dma::read(&tagHi, data + pos + q * 16u + 8u, 8);
                     const bool pre = ((tagLo >> 46) & 1u) != 0u;
                     const uint32_t prim = static_cast<uint32_t>((tagLo >> 47) & 0x7FFu);
                     const uint32_t ptype = prim & 7u;
@@ -186,7 +197,7 @@
                     for (uint32_t q = 0u; q < 8u && pos + (q + 1u) * 16u <= sizeBytes; ++q)
                     {
                         float f[4] = {0, 0, 0, 0};
-                        std::memcpy(f, data + pos + q * 16u, 16);
+                        ps2_dma::read(f, data + pos + q * 16u, 16);
                         std::fprintf(stderr, "[G39:palsrc] +qw%u = % .4g % .4g % .4g % .4g\n",
                                      q, f[0], f[1], f[2], f[3]);
                     }
@@ -236,7 +247,7 @@
                     {
                         float f[4] = {0,0,0,0};
                         for (uint32_t k = 0; k < 4u && pos + (w + k + 1u) * 4u <= sizeBytes; ++k)
-                            std::memcpy(&f[k], data + pos + (w + k) * 4u, 4);
+                            ps2_dma::read(&f[k], data + pos + (w + k) * 4u, 4);
                         std::fprintf(stderr, "[G29:matsrc] +%u = % .4g % .4g % .4g % .4g\n",
                                      w, f[0], f[1], f[2], f[3]);
                     }
@@ -280,13 +291,13 @@
                         static std::atomic<uint32_t> s_g70vn{0};
                         if (s_g70vn.fetch_add(1u, std::memory_order_relaxed) < 120u)
                         {
-                            const uint32_t eeSrc = m_rdram ? (uint32_t)(((data + pos) - m_rdram) & 0x1FFFFFFFu) : 0u;
+                            const uint32_t eeSrc = ps2_dma::guestAddress(data + pos, m_rdram);
                             float s59[4] = {0, 0, 0, 0};
                             if (covers59 && m_rdram && bytesPerVector == 16u)
                             {
                                 const uint32_t srcOff = pos + (59u - vuAddr) * 16u;
                                 for (uint32_t k = 0; k < 4u && srcOff + (k + 1u) * 4u <= sizeBytes; ++k)
-                                    std::memcpy(&s59[k], data + srcOff + k * 4u, 4);
+                                    ps2_dma::read(&s59[k], data + srcOff + k * 4u, 4);
                             }
                             std::fprintf(stderr,
                                          "[G70:unpk] dest=0x%x..0x%x covers59=%u abs=%u eeSrc=0x%x num=%u cl=%u wl=%u bpv=%u tops=0x%x src59=% .6g % .6g % .6g % .6g\n",
@@ -302,7 +313,7 @@
             const bool g137Active = g136Active && g137_trace_enabled();
             if (m_vu1Data && totalBytes > 0 && pos + totalBytes <= sizeBytes)
             {
-                const uint8_t *srcBase = data + pos;
+                const uint8_t *srcBase = nullptr;
                 uint32_t srcIndex = 0u;
                 // ===== G645: strength-reduce the UNPACK cycle arithmetic =====================
                 // `writeIndex % wl` and `writeIndex / wl` are TWO hardware integer divisions per
@@ -405,7 +416,7 @@
                         // identical bytes. The comparison is after the loop.
                         g650Verifying = true;
                         const std::vector<uint8_t> g650Before(g650Dst, g650Dst + g650RunBytes);
-                        g650RunUnpackKernel(g650Kind, g650Dst, srcBase, writeVectorCount,
+                        g772RunScatterUnpack(g650Kind, g650Dst, data, pos, writeVectorCount,
                                             bytesPerVector, static_cast<uint32_t>(components),
                                             zeroExtend);
                         g650KernelResult.assign(g650Dst, g650Dst + g650RunBytes);
@@ -413,12 +424,13 @@
                     }
                     else
                     {
-                        g650RunUnpackKernel(g650Kind, g650Dst, srcBase, writeVectorCount,
+                        g772RunScatterUnpack(g650Kind, g650Dst, data, pos, writeVectorCount,
                                             bytesPerVector, static_cast<uint32_t>(components),
                                             zeroExtend);
                         // G301 MTVU ordered event. The run is contiguous, so ONE record carries
                         // exactly the bytes the per-vector records used to — which is what G482's
                         // coalescer would have merged them into anyway.
+                        ps2_dma::release(data);
                         g297NoteVuWrite(false, vuAddr * 16u, g650Dst, g650RunBytes);
                         g650Handled = true;
                     }
@@ -472,7 +484,7 @@
                     if (sourceAvailable && srcIndex < sourceVectorCount)
                     {
                         srcVecIndex = srcIndex;
-                        srcVec = srcBase + srcIndex * bytesPerVector;
+                        srcVec = ps2_dma::borrow(data + pos + srcIndex * bytesPerVector, bytesPerVector);
                         ++srcIndex;
                         decoded = true;
                     }
@@ -580,13 +592,14 @@
                     {
                         uint32_t copyBytes = (bytesPerVector < 16u) ? bytesPerVector : 16u;
                         std::memcpy(m_vu1Data + destOff, srcVec, copyBytes);
-                        g297NoteVuWrite(false, destOff, srcVec, copyBytes); // G301 MTVU ordered event
+                        ps2_dma::release(data);
+                        g297NoteVuWrite(false, destOff, m_vu1Data + destOff, copyBytes); // G301 MTVU ordered event
                         if (g137Active)
                         {
                             uint32_t rawCopy[4] = {};
                             std::memcpy(rawCopy, m_vu1Data + destOff, sizeof(rawCopy));
                             g137_record_origin(g136Seq, destVec, pos - 4u,
-                                                srcVec ? static_cast<uint32_t>(pos + (srcVec - srcBase)) : 0xFFFFFFFFu,
+                                                srcVec ? static_cast<uint32_t>(pos + (srcVecIndex * bytesPerVector)) : 0xFFFFFFFFu,
                                                 static_cast<uint32_t>(opcode), imm, writeIndex, srcVecIndex,
                                                 cl, wl, vif1_regs.mode & 3u,
                                                 vif1_regs.tops & 0x3FFu, vif1_regs.top & 0x3FFu,
@@ -645,6 +658,7 @@
                     std::memcpy(m_vu1Data + destOff + 12u, &g649L3, 4);
                     // G301 MTVU ordered event. The destination now holds exactly what `lanes` used
                     // to, so the recorded bytes are identical.
+                    ps2_dma::release(data);
                     g297NoteVuWrite(false, destOff, m_vu1Data + destOff,
                                     sizeof(lanes)); // G301 MTVU ordered event
                     if (g137Active)
@@ -652,7 +666,7 @@
                         lanes[0] = g649L0; lanes[1] = g649L1;
                         lanes[2] = g649L2; lanes[3] = g649L3;
                         g137_record_origin(g136Seq, destVec, pos - 4u,
-                                            srcVec ? static_cast<uint32_t>(pos + (srcVec - srcBase)) : 0xFFFFFFFFu,
+                                            srcVec ? static_cast<uint32_t>(pos + (srcVecIndex * bytesPerVector)) : 0xFFFFFFFFu,
                                             static_cast<uint32_t>(opcode), imm, writeIndex, srcVecIndex,
                                             cl, wl, vif1_regs.mode & 3u,
                                             vif1_regs.tops & 0x3FFu, vif1_regs.top & 0x3FFu,
