@@ -3252,11 +3252,17 @@ void g178DecodeWhole(GSRasterizer *self, GS *gs, uint8_t *vram, const GSContext 
             {
             case GS_PSM_CT32:
             case GS_PSM_CT24:
-                c = applyTexa(texa, psm, self->readTexelPSMCT32(gs, ctx.tex0.tbp0, ctx.tex0.tbw, uu, vv));
+                c = applyTexa(texa, psm, gs
+                    ? self->readTexelPSMCT32(gs, ctx.tex0.tbp0, ctx.tex0.tbw, uu, vv)
+                    : GSMem::ReadCT32(vram, ctx.tex0.tbp0, ctx.tex0.tbw, uu, vv));
                 break;
             case GS_PSM_CT16:
             case GS_PSM_CT16S:
-                c = applyTexa(texa, psm, self->readTexelPSMCT16(gs, ctx.tex0.tbp0, ctx.tex0.tbw, uu, vv));
+                c = applyTexa(texa, psm, gs
+                    ? self->readTexelPSMCT16(gs, ctx.tex0.tbp0, ctx.tex0.tbw, uu, vv)
+                    : decodePSMCT16(static_cast<uint16_t>(psm == GS_PSM_CT16S
+                        ? GSMem::ReadCT16S(vram, ctx.tex0.tbp0, ctx.tex0.tbw, uu, vv)
+                        : GSMem::ReadCT16(vram, ctx.tex0.tbp0, ctx.tex0.tbw, uu, vv))));
                 break;
             case GS_PSM_T8:
             {

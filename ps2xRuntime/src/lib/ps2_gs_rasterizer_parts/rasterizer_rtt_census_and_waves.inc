@@ -606,10 +606,9 @@ static void g262NoteReject(int site, const G144Entry &e)
         g262Report();
 }
 
-bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
+bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st, bool dryRun = false)
 {
-    g265NoteSeen(e);
-    g262NoteSeen(e);
+    if (!dryRun) { g265NoteSeen(e); g262NoteSeen(e); }
     const GSContext &ctx = e.ctx;
     // G364: GS per-pixel fog is exact on the GPU (interpolated F, RGB lerp towards FOGCOL before
     // blending), so a fogged entry stays GPU-eligible rather than falling back to CPU.
@@ -619,8 +618,8 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
     if (ctx.frame.psm != GS_PSM_CT32 || ctx.frame.fbmsk != 0u || ctx.frame.fbw == 0u ||
         (ctx.fba & 1ull) != 0ull || e.pabe)
     {
-        g262NoteReject(kG262RejFrame, e);
-        g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+        if (!dryRun) { g262NoteReject(kG262RejFrame, e);
+            g_g178RejectState.fetch_add(1u, std::memory_order_relaxed); }
         return false;
     }
     const uint64_t ts = ctx.test;
@@ -658,8 +657,8 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
                               afail == 0u && !g766G256Family;
         if (!g265Keep && !g766Keep)
         {
-            g262NoteReject(kG262RejATest, e);
-            g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+            if (!dryRun) { g262NoteReject(kG262RejATest, e);
+                g_g178RejectState.fetch_add(1u, std::memory_order_relaxed); }
             return false;
         }
         if (g766Keep)
@@ -682,8 +681,8 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
     if (ctx.scissor.x1 < ctx.scissor.x0 || ctx.scissor.y1 < ctx.scissor.y0 ||
         ctx.scissor.y1 >= 512u || ctx.scissor.x1 >= 1024u)
     {
-        g262NoteReject(kG262RejScissor, e);
-        g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+        if (!dryRun) { g262NoteReject(kG262RejScissor, e);
+            g_g178RejectState.fetch_add(1u, std::memory_order_relaxed); }
         return false;
     }
     st.scX0 = ctx.scissor.x0; st.scY0 = ctx.scissor.y0;
@@ -717,7 +716,7 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
                  ((g265DisplayZWaveOn() && g662DestBlendTarget(ctx.frame.fbp)) ||
                   g767DestBlendAnyTarget(ctx.frame.fbp)))
             st.blend = 6; // G603 census: (0-Cs)*As>>7 + Cd == Cd - Cs*As/128 (see the header above)
-        else if (t_g603RelaxBlend)
+        else if (!dryRun && t_g603RelaxBlend)
         {
             st.blend = 0; // G603 census pass 2 only — never reachable on a shipped path.
         }
@@ -725,7 +724,7 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         {
             // G767 (diagnostic, DC2_G767_BLENDWHY=1): name the refused combo, bounded.
             static const bool s_g767BlendWhy = envFlagEnabled("DC2_G767_BLENDWHY");
-            if (s_g767BlendWhy)
+            if (!dryRun && s_g767BlendWhy)
             {
                 static std::map<uint32_t, uint64_t> s_combos; // flush-owner thread only
                 const uint32_t key = (a | (b << 2) | (c << 4) | (d << 6)) |
@@ -741,8 +740,8 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
                                  static_cast<unsigned long long>(n), e.prim.tme ? 1u : 0u,
                                  e.prim.tme ? ctx.tex0.psm : 0u);
             }
-            g262NoteReject(kG262RejBlend, e);
-            g_g178RejectBlend.fetch_add(1u, std::memory_order_relaxed);
+            if (!dryRun) { g262NoteReject(kG262RejBlend, e);
+                g_g178RejectBlend.fetch_add(1u, std::memory_order_relaxed); }
             return false;
         }
     }
@@ -761,8 +760,8 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         if (!okPsm || ctx.tex0.tbw == 0u || wu > 1u || wv > 1u ||
             st.texW > 1024 || st.texH > 1024)
         {
-            g262NoteReject(kG262RejTex, e);
-            g_g178RejectTex.fetch_add(1u, std::memory_order_relaxed);
+            if (!dryRun) { g262NoteReject(kG262RejTex, e);
+                g_g178RejectTex.fetch_add(1u, std::memory_order_relaxed); }
             return false;
         }
         st.texKey = g178TexKey(ctx, e.texa, e.texclut);
@@ -797,7 +796,7 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
                                   g587ExactEntry;
         st.wrapU = exactSampler ? wu : (st.bilinear ? wu : 1u);
         st.wrapV = exactSampler ? wv : (st.bilinear ? wv : 1u);
-        if (g_g633AttachTextureHook != nullptr) g_g633AttachTextureHook(e, st);
+        if (!dryRun && g_g633AttachTextureHook != nullptr) g_g633AttachTextureHook(e, st);
     }
 
     // G270 line entries deliberately retain drawLine's semantics: no texture and no depth
@@ -811,7 +810,7 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         if (!g270LineWaveActive() || e.prim.tme ||
             (ctx.frame.fbp != 0x0u && ctx.frame.fbp != 0x68u))
         {
-            g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+            if (!dryRun) g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
             return false;
         }
         st.depthFunc = g265AlphaMode;
@@ -851,7 +850,7 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
                 // aliased physical Z page. Control remains whole-flush CPU replay.
                 if (!g411SharedGpuDepthOn())
                 {
-                    g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+                    if (!dryRun) g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
                     return false;
                 }
             }
@@ -871,7 +870,7 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
             // t_g604RelaxDepth is the census-only arm (see its declaration): it grants this entry
             // the guest-depth contract it does not yet have, purely so the dry run can report the
             // NEXT rejecting conjunct instead of stopping at this one.
-            if (g242GpuDepthOn() || g262Rtt || g265Display || t_g604RelaxDepth)
+            if (g242GpuDepthOn() || g262Rtt || g265Display || (!dryRun && t_g604RelaxDepth))
             {
                 const uint32_t zbpPage = static_cast<uint32_t>(ctx.zbuf & 0x1FFu);
                 const uint32_t zpsm = static_cast<uint32_t>((ctx.zbuf >> 24) & 0xFu);
@@ -879,8 +878,8 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
                 // replay until they have their own exact float/packing verification.
                 if (zpsm != 0x1u)
                 {
-                    g262NoteReject(kG262RejZPsm, e);
-                    g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+                    if (!dryRun) { g262NoteReject(kG262RejZPsm, e);
+                        g_g178RejectState.fetch_add(1u, std::memory_order_relaxed); }
                     return false;
                 }
                 if (ztst == 0u)
@@ -900,18 +899,18 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
                 // arms actually diverged (g538_null_ab_needs_a_path_counter). This entry reached
                 // guest-depth admission ONLY because of this phase's widening, so it counts
                 // exactly the entries the lever moved off the scalar band replay.
-                if (g583Trn13bWaveTarget(ctx.frame.fbp))
+                if (!dryRun && g583Trn13bWaveTarget(ctx.frame.fbp))
                     g583NoteTrn13bZAdmission();
-                else if (g586Transient141Target(ctx.frame.fbp))
+                else if (!dryRun && g586Transient141Target(ctx.frame.fbp))
                     g586NoteTransient141Admission(static_cast<uint32_t>(e.prim.type));
-                else if (g587Transient15dTarget(ctx.frame.fbp))
+                else if (!dryRun && g587Transient15dTarget(ctx.frame.fbp))
                     g587NoteTransient15dAdmission(static_cast<uint32_t>(e.prim.type));
-                else if (g604DiscovTransientTarget(ctx.frame.fbp))
+                else if (!dryRun && g604DiscovTransientTarget(ctx.frame.fbp))
                     g604NoteDiscovAdmission(static_cast<uint32_t>(e.prim.type)); // g538 path counter
                 return true;
             }
-            g262NoteReject(kG262RejDepth, e);
-            g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+            if (!dryRun) { g262NoteReject(kG262RejDepth, e);
+                g_g178RejectState.fetch_add(1u, std::memory_order_relaxed); }
             return false;
         }
         return true;
@@ -925,7 +924,7 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         const uint32_t zpsm = static_cast<uint32_t>((ctx.zbuf >> 24) & 0xFu);
         if (zte != 0u && g202TownZScope(ctx.frame.fbp, zbpPage, zpsm))
         {
-            g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+            if (!dryRun) g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
             return false; // G202 town Z needs real VRAM Z read/write; GPU path readbacks color only.
         }
         const bool zEnabled = !s_zTestDisabled && g106TitleZEnabled() && rockScope && zte != 0u;
@@ -933,7 +932,7 @@ bool g178ClassifyEntry(const G144Entry &e, G178EntryState &st)
         {
             if (zpsm != 0u)
             {
-                g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
+                if (!dryRun) g_g178RejectState.fetch_add(1u, std::memory_order_relaxed);
                 return false; // title is PSMZ32; other Z formats untested on this path
             }
             if (ztst == 0u)

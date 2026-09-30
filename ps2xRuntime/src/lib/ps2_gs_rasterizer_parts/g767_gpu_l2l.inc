@@ -74,6 +74,7 @@ static uint32_t g767L2lBytesPerTexel(uint8_t psm)
 // 0x3420 landed in page 0x1a3 instead of 0x1a2 - a missing mouth and a clobbered collar texture).
 // The G767 oracle replays the move through this same function, so it could not see the error.
 // PSMT8 now uses GSPSMT8::addrPSMT8, the CPU body's own function.
+// G772: verification below now calls the canonical CPU pixel transfer independently.
 static uint32_t g767L2lAddr(uint8_t psm, uint32_t bp, uint32_t bw, uint32_t x, uint32_t y)
 {
     switch (psm)
@@ -94,6 +95,15 @@ struct G767L2lHome
     uint8_t row, col;
     bool primary;
 };
+
+static uint32_t g767L2lTexelWidth(uint8_t psm, uint32_t bw)
+{
+    // Odd PSMT8 BW values have floor(BW/2) page columns. Coordinates in the
+    // extra nominal half page alias the next row, so logical rectangle
+    // disjointness alone cannot prove non-overlapping physical storage.
+    const uint32_t nominal = bw * 64u;
+    return psm == GS_PSM_T8 ? std::min(nominal, std::max(1u, bw >> 1u) * 128u) : nominal;
+}
 struct G767L2lPlan
 {
     std::vector<uint32_t> tilePage;   // atlas tile -> GS page
@@ -130,7 +140,7 @@ static bool g767L2lPlanBuild(uint32_t sbp, uint8_t sbw, uint8_t spsm, uint32_t s
     const uint32_t bpt = g767L2lBytesPerTexel(spsm);
     if (!g767L2lOn() || !g261AnyDirty() || spsm != dpsm || bpt == 0u || rrw == 0u || rrh == 0u ||
         rrw * rrh > 128u * 128u || sbw == 0u || dbw == 0u ||
-        ssax + rrw > static_cast<uint32_t>(sbw) * 64u || dsax + rrw > static_cast<uint32_t>(dbw) * 64u ||
+        ssax + rrw > g767L2lTexelWidth(spsm, sbw) || dsax + rrw > g767L2lTexelWidth(dpsm, dbw) ||
         g280AliasOn() || g351SplitOn() || !g766PullsAllowed())
     {
         ++g_g767L2lRefShape;
@@ -398,25 +408,26 @@ static bool g767TryExecuteL2lImpl(uint32_t sbp, uint8_t sbw, uint8_t spsm, uint3
         vfyDest.resize(s_p.destPage.size());
         for (size_t d = 0u; d < s_p.destPage.size(); ++d)
             vfyDest[d] = vfyPages[static_cast<size_t>(s_p.destTiles[d])];
-        const uint32_t bpt = g767L2lBytesPerTexel(spsm);
+        // Independent canonical CPU pixel transfer. Neither g767L2lAddr nor the
+        // GPU byte-map/bytes-per-texel helper participates in expected output.
+        constexpr uint32_t referenceSize = 4u * 1024u * 1024u;
+        std::vector<uint8_t> referenceSource(referenceSize, 0xCD);
+        for (size_t k = 0; k < s_p.tilePage.size(); ++k)
+            std::memcpy(referenceSource.data() + s_p.tilePage[k] * 8192u,
+                        vfyPages[k].data(), 8192u);
+        auto referenceDest = referenceSource;
         for (uint32_t j = 0u; j < rrh; ++j)
             for (uint32_t i = 0u; i < rrw; ++i)
             {
-                const uint32_t sa0 = g767L2lAddr(spsm, sbp, sbw, ssax + i, ssay + j);
-                const uint32_t da0 = g767L2lAddr(dpsm, dbp, dbw, dsax + i, dsay + j);
-                for (uint32_t b = 0u; b < bpt; ++b)
-                {
-                    const uint32_t sa = sa0 + b, da = da0 + b;
-                    size_t st = 0u, dt = 0u;
-                    for (size_t k = 0u; k < s_p.tilePage.size(); ++k)
-                        if (s_p.tilePage[k] == (sa >> 13))
-                            st = k;
-                    for (size_t k = 0u; k < s_p.destPage.size(); ++k)
-                        if (s_p.destPage[k] == (da >> 13))
-                            dt = k;
-                    vfyDest[dt][da & 8191u] = vfyPages[st][sa & 8191u];
-                }
+                // Match the existing CPU body's in-place, forward pixel order.
+                // Assuming an immutable source snapshot would mask overlap bugs.
+                const uint32_t value = ps2GsTransferReadReference(referenceDest.data(), referenceSize,
+                    sbp, sbw, spsm, ssax + i, ssay + j);
+                ps2GsTransferWriteReference(referenceDest.data(), referenceSize,
+                    dbp, dbw, dpsm, dsax + i, dsay + j, value);
             }
+        for (size_t d = 0; d < s_p.destPage.size(); ++d)
+            std::memcpy(vfyDest[d].data(), referenceDest.data() + s_p.destPage[d] * 8192u, 8192u);
     }
     if (!g767_backend_l2l(s_p.gather, s_p.map, s_p.destTiles, s_p.scatter))
     {

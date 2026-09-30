@@ -242,6 +242,8 @@
                 // rejected flush must find every surface's debt published. Under the late-prepare
                 // arm the top-of-flush publication no longer runs, so this is the edge that
                 // guarantees it. Inert unless DC2_G718_LATEPREP=1.
+                if (!g654FlushOk && g772ReplayResourceRuns(false))
+                    return;
                 if (!g654FlushOk)
                     g718PublishBeforeCpuReplay();
                 if (g654FlushOk)
@@ -978,6 +980,8 @@
                     g_g144List.clear();
                     return;
                 }
+                if (g772ReplayResourceRuns(true))
+                    return;
                 // ⭐ G718: same CPU-replay edge as the parallel closure above.
                 g718PublishBeforeCpuReplay();
                 G654LayerScope g654SeqReplay(kG654LayerCpuReplay);

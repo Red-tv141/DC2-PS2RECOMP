@@ -1386,6 +1386,11 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
          (g700DepthOn() && depthRowHi >= depthRowLo) ||
          (guestZbpPage == 0x0d0u && guestZpsm == 1u && depthRowHi >= depthRowLo &&
           g411SharedGpuDepthOn() && g404SharedZScope(fbp, fbw, guestZbpPage, guestZpsm)));
+    // G700 can admit a color surface whose earlier transient gate declined the batch. The
+    // backend still needs its raw PS2-alpha contract before that surface can be sampled natively.
+    if (g700Exact && !g604ExactDiscov)
+        g_g604RawAlphaFbpBits[(fbp >> 6) & 7u].fetch_or(1ull << (fbp & 63u),
+                                                     std::memory_order_relaxed);
     // Rule 12c compliance: this is inside the ALREADY-COMPUTED `g700Cand` branch (a flush that is
     // not a candidate never evaluates it), the arming test is a cached `static const bool`, and
     // the printing lives at the cold frame boundary. What remains in the hot path when unarmed is
@@ -1906,6 +1911,23 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     for (auto &g620Up : s_batch.texUploads)
         g620RecyclePx(std::move(g620Up.px));
     s_batch.texUploads.clear();
+#if defined(PS2X_G777_NATIVE_GL)
+    G777NativeProbe g778NativeProbe;
+    const bool g778Synchronous=bool(dc2_g778::g780NativeDraw);
+    s_batch.g777Native=nullptr;
+    if(g778Synchronous){
+        g778NativeProbe.draw=dc2_g778::g780NativeDraw.get();
+        g778NativeProbe.bucket=dc2_g778::g780NativeBucket;
+        g778NativeProbe.offsetX=g_g144List[0].ctx.xyoffset.ofx>>4;
+        g778NativeProbe.offsetY=g_g144List[0].ctx.xyoffset.ofy>>4;
+        g778NativeProbe.live=true;s_batch.g777Native=&g778NativeProbe;
+    }
+    s_batch.g778Shadow=dc2_g778::shadowRequested()?dc2_g778::shadowCommand:nullptr;
+    s_batch.g778OffsetX=g_g144List[0].ctx.xyoffset.ofx>>4;
+    s_batch.g778OffsetY=g_g144List[0].ctx.xyoffset.ofy>>4;
+#else
+    const bool g778Synchronous=false;
+#endif
     s_batch.verts.clear();
     s_batch.draws.clear();
     // G276: coalesce consecutive same-target display-color readbacks. A display batch (0x0/0x68)
@@ -7127,7 +7149,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     if (g767Fold)
         s_batch.skipReadback = true;
     bool submitted;
-    if (g305Async)
+    if (g305Async && !g778Synchronous)
     {
         submitted = g178_backend_submit_async(s_batch);
         if (submitted)
@@ -7158,7 +7180,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // without a promise round trip. Falls through to the blocking path when the ring is full
         // or the lever is not armed — which also drains it, since the queue is one FIFO.
         submitted = false;
-        if (!g275FuseReadback && s_batch.skipReadback)
+        if (!g275FuseReadback && s_batch.skipReadback && !g778Synchronous)
             // ⛔⛔⛔ G704: THE DEPTH EXTENSION WAS BUILT HERE AND REVERTED, AND THE REASON IS THE
             // RESULT. G700 §2.4 refused depth batches because the first draft COPIED the caller's
             // 850 KB `s_depthUpload` static per flush, and attributed its +3.3 ms/f to that copy.
@@ -7182,6 +7204,15 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                        : g178_backend_submit(s_batch));
     }
     g766ConfirmWavePulls(g766Ti, s_g766Pulled); // G766: forget pulls that did not land
+#if defined(PS2X_G777_NATIVE_GL)
+    if(g778Synchronous && submitted){
+        dc2_g778::counters.sourceUploadBytes+=g778NativeProbe.sourceUploadBytes;
+        if(g778NativeProbe.sourceUploadBytes)++dc2_g778::counters.cacheMisses;else ++dc2_g778::counters.cacheHits;
+        dc2_g778::counters.gpuDraws+=g778NativeProbe.gpuDraws;
+        dc2_g778::counters.cacheReplacements+=g778NativeProbe.cacheReplacements;
+        dc2_g778::counters.nativePrimitives+=g778NativeProbe.vertexCount/3;
+    }
+#endif
     if (submitted && !g766TransientConfirm())
     {
         g766TransientReset();

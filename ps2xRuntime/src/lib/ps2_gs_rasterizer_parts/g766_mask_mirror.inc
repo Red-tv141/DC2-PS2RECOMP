@@ -847,7 +847,12 @@ static bool g766TransientSeedAdmit(uint32_t fbp)
     s_g766Trn = G766TrnSeed{};
     if (!g766TrnSeedOn() || !g766OwnerOn() || !g766PullsAllowed() || !g766MaskMirOn() ||
         !g264On() || !g261WaveOn() || !g261AnyDirty() || g_g144List.empty() ||
-        s_g716Authority || g700On() || g280AliasOn() || g351SplitOn())
+        s_g716Authority ||
+        // G700 cannot conflict before its first acquisition. Preserve the accepted seed/fold
+        // path while its surface table is empty; clean live surfaces still own pages, and
+        // transient takeover can acquire later in this flush, so both remain excluded.
+        (g700On() && (g700TransientTakeoverOn() || g700AnyLive())) ||
+        g280AliasOn() || g351SplitOn())
         return false;
     const GSContext &c0 = g_g144List[0].ctx;
     const uint32_t fbw = c0.frame.fbw;

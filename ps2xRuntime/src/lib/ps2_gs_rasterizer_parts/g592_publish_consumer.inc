@@ -162,6 +162,15 @@ static G592Verdict g592ClassifyBatch()
     {
         if (tracked)
             ++g_g592.entriesSeen;
+        // A depth attachment binding does not itself observe depth. ALWAYS or
+        // disabled tests with ZMSK set leave its GPU generation authoritative.
+        const uint32_t zte = static_cast<uint32_t>((e.ctx.test >> 16) & 1u);
+        const uint32_t ztst = static_cast<uint32_t>((e.ctx.test >> 17) & 3u);
+        const bool masked = ((e.ctx.zbuf >> 32) & 1u) != 0;
+        const bool noDepth = !zte || (ztst == 1u && masked) || ztst == 0u;
+        static const bool precise = envFlagEnabled("DC2_G772_DEPTH_CONSUMER") &&
+                                    !envFlagEnabled("DC2_G772_NO_DEPTH_CONSUMER");
+        if (precise && noDepth) continue;
         if (g404SharedZScope(e.ctx.frame.fbp, e.ctx.frame.fbw,
                              static_cast<uint32_t>(e.ctx.zbuf & 0x1FFu),
                              static_cast<uint32_t>((e.ctx.zbuf >> 24) & 0xFu)))

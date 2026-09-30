@@ -2611,6 +2611,35 @@ void g144FlushPendingUploadFrom(int site)
     t_g759Site = prev;
 }
 
+// A local-to-host transfer reads only its source rectangle. Keep disjoint resident surfaces
+// deferred while establishing submission order and publishing every authority for those bytes.
+void g144PrepareLocalHostReadRange(uint32_t bp, uint8_t bw, uint8_t psm,
+                                  uint32_t x, uint32_t y, uint32_t w, uint32_t h)
+{
+    if (w == 0u || h == 0u)
+        return;
+    const G144BlockRange src = g144RangeForRect(bp, psm, bw, x, y, w, h);
+    if (!g260NrOn() || !src.valid)
+    {
+        g144FlushPendingUploadFrom(3);
+        return;
+    }
+    const G144BlockRange none{};
+    g769FoldOrMaterializeOwnersForRanges(src, none, false, false, 6);
+    if (g260HasPending() && g260VramEventNeedsExecute(src, none, false, false))
+    {
+        g178CensusScan();
+        G146PerfScope scope(g_g146G144FlushUploadNs, g_g146G144FlushUploadCount);
+        static const bool sequential = (std::getenv("DC2_G144_SEQUPLOAD") != nullptr);
+        g260ExecuteAll(kG260LocalHost, !sequential);
+    }
+    (void)g278FlushPendingDepthForRanges(6, src, none, false, false);
+    g289MaterializeForRanges(src, none, false, false, 6);
+    g272MaterializeForRanges(src, none, false, false, 6);
+    g276FlushPendingDisplayForRanges(6, src, none, false, false);
+    g261MaterializeForRanges(src, none, false, false, kG261MatL2H);
+}
+
 struct G314EdgeScope
 {
     bool active = false;

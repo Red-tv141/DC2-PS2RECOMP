@@ -131,6 +131,9 @@ static bool g459TriScissorStatOn()
 
 void GSRasterizer::drawPrimitive(GS *gs)
 {
+#if defined(PS2X_G777_NATIVE_GL)
+    if(dc2_g778::gsCommand && dc2_g778::statsRequested())++dc2_g778::counters.legacyPrimitives;
+#endif
     // G770-A: the inline tail as a lambda (+ the async-inline exec runner). See the file header.
 #include "g770_inline_tail.inc"
     // G687: one normal deferred triangle primes a fixed-state ST/RGBAQ/XYZF2 tag. Later strip

@@ -86,15 +86,12 @@ static constexpr uint32_t kG700BumpSource = 26u;
 static bool g700On()
 {
     static const bool on = (envFlagEnabled("DC2_G700") ||
-                            !envFlagDisabled("DC2_G700_DEFAULT_OFF")) &&
+                            !envFlagEnabled("DC2_G700_DEFAULT_OFF")) &&
                            !envFlagEnabled("DC2_G700_NO_RESIDENT") &&
                            !envFlagDisabled("DC2_G700");
-    // Bring-up: opt-in only. The `DC2_G700_DEFAULT_OFF` spelling exists so the promotion edit is
-    // one line here and the rollback flag is already registered in every harness clear-list.
-    static const bool armed = envFlagEnabled("DC2_G700") &&
-                              !envFlagEnabled("DC2_G700_NO_RESIDENT");
-    (void)on;
-    return armed;
+    // G774 candidate: native color authority must survive until its texture consumer at every
+    // scale. Rollbacks retain the prior transient readback path for same-binary controls.
+    return on;
 }
 
 // ⭐ THE TRANSIENT TAKEOVER. `g286` (0x13b), `g570` (0x13d), `g586` (0x141) and `g587` (0x15d) are
@@ -194,7 +191,7 @@ static bool g718WriteSpanOn()
 // Rollback: DC2_G718_NO_ARB=1.
 static bool g718ArbOn()
 {
-    static const bool on = envFlagEnabled("DC2_G718_ARB") && !envFlagEnabled("DC2_G718_NO_ARB");
+    static const bool on = !envFlagDisabled("DC2_G718_ARB") && !envFlagEnabled("DC2_G718_NO_ARB");
     return on;
 }
 static std::atomic<uint64_t> g_g718Steals{0}, g_g718ArbRejects{0};
@@ -233,7 +230,7 @@ static bool g718IsTakeoverFbp(uint32_t fbp)
 static bool g718LatePrepOn()
 {
     static const bool on =
-        envFlagEnabled("DC2_G718_LATEPREP") && !envFlagEnabled("DC2_G718_NO_LATEPREP");
+        !envFlagDisabled("DC2_G718_LATEPREP") && !envFlagEnabled("DC2_G718_NO_LATEPREP");
     return on;
 }
 
@@ -724,14 +721,15 @@ static bool g700AnyLive()
     return false;
 }
 
+// The maintained union also answers the frequent empty-debt query. In particular, native
+// residency being enabled must not cost 48 surface probes at every ordinary VRAM read.
+// New debt is installed by g700NoteRender, which recomputes these bounds before returning;
+// invalid geometry expands them to the whole VRAM range, so this remains fail-closed.
+static uint32_t g_g700DebtLo = 0xFFFFFFFFu, g_g700DebtHi = 0u;
+
 static bool g700AnyDirty()
 {
-    if (!g700On())
-        return false;
-    for (uint32_t i = 0; i < kG700Slots; ++i)
-        if (g_g700Surf[i].live && g_g700Surf[i].dirtyHi >= g_g700Surf[i].dirtyLo)
-            return true;
-    return false;
+    return g_g700DebtLo <= g_g700DebtHi && g700On();
 }
 
 // The block range guest VRAM would see for this surface's outstanding debt.
@@ -751,7 +749,7 @@ static G144BlockRange g700DirtyRange(const G700Surface &s)
 static void g700MaterializeForRanges(const G144BlockRange &src, const G144BlockRange &dst,
                                      bool srcUnknown, bool dstUnknown, int cause)
 {
-    if (!g700On() || !g700AnyDirty())
+    if (!g700AnyDirty())
         return;
     for (uint32_t i = 0; i < kG700Slots; ++i)
     {
@@ -782,8 +780,6 @@ static void g700MaterializeForRanges(const G144BlockRange &src, const G144BlockR
 // instead of a walk over 48 slots x N entries. Recomputed whenever a claim or a publication moves
 // it; conservative (a superset), so a false positive costs an unnecessary range walk and a false
 // negative is impossible.
-static uint32_t g_g700DebtLo = 0xFFFFFFFFu, g_g700DebtHi = 0u;
-
 static void g700RecomputeDebtBounds()
 {
     uint32_t lo = 0xFFFFFFFFu, hi = 0u;
@@ -822,8 +818,6 @@ static void g700PrepareForBatch(const std::vector<G144Entry> &entries)
     // ⭐ G718: under the late-prepare arm this pass is replaced wholesale by `g718PrepareUnbound`,
     // which runs after the bind pre-pass and therefore knows which readers already have a GPU
     // source. Publishing here — before any bind decision exists — is what made `mats == renders`.
-    if (g718LatePrepOn())
-        return;
     if (!g700On() || g_g700DebtLo > g_g700DebtHi || entries.empty())
         return;
     // ==========================================================================================
@@ -990,6 +984,10 @@ static void g700PrepareForBatch(const std::vector<G144Entry> &entries)
                 return; // everything published
         }
     }
+    // Late texture preparation does not defer framebuffer uploads. An overlapping
+    // producer's color must be published before this target reads its initial bytes.
+    if (g718LatePrepOn())
+        return;
     for (const G144Entry &e : entries)
     {
         if (!e.prim.tme)
@@ -1053,7 +1051,9 @@ static void g700DropAllClaims()
 
 static void g700MaterializeAll(int cause)
 {
-    if (!g700On())
+    // Unknown-source observers still fail closed when debt exists. With an empty union
+    // the original loop has no publication to perform; avoid its 48-slot negative walk.
+    if (!g700AnyDirty())
         return;
     for (uint32_t i = 0; i < kG700Slots; ++i)
     {
@@ -1230,7 +1230,9 @@ static inline uint32_t g700DirectSampleSrc(const G144Entry &e, uint32_t dstFbp)
     // pole thread to answer "no" almost every time (G502: never let a gate cost more than the
     // thing it gates). `g_g700BaseToSlot` is the complete key space — a FRAME base is a 9-bit page
     // number — so the answer is one indexed byte load.
-    if (!g700On() || !e.prim.tme)
+    // Direct FBO coordinates currently implement FST only. STQ needs TEX0-size rescaling
+    // and a Q-aware V flip; publish/decode it through the canonical texture path instead.
+    if (!e.prim.tme || !e.prim.fst || !g700On())
         return 0u;
     const uint32_t tbp = e.ctx.tex0.tbp0;
     if ((tbp & 31u) != 0u) // a surface base is page-aligned by construction
@@ -1264,6 +1266,10 @@ static inline uint32_t g700DirectSampleSrc(const G144Entry &e, uint32_t dstFbp)
     }
     // The FBO holds the surface's own pixel layout, so only a same-format read is exact.
     const uint32_t tpsm = e.ctx.tex0.psm;
+    // CT24 has TEXA-derived alpha, not the CT32 framebuffer's stored alpha. A raw FBO bind
+    // cannot implement that substitution; leave alpha-consuming CT24 reads to the view/decode path.
+    if (tpsm == GS_PSM_CT24 && e.ctx.tex0.tcc)
+        return 0u;
     if (s.psm != tpsm && !(s.psm == GS_PSM_CT32 && tpsm == GS_PSM_CT24))
     {
         if (g700StatOn())
@@ -1289,6 +1295,11 @@ static inline uint32_t g700DirectSampleSrc(const G144Entry &e, uint32_t dstFbp)
             g_g700BindRej[5].fetch_add(1u, std::memory_order_relaxed);
         return 0u;
     }
+    // Coverage records initialized rows, not authority. A CPU write or an overlapping
+    // producer can invalidate pages while leaving that coverage unchanged. Bind only
+    // when every sampled page still belongs to this surface at its current generation.
+    if (g700NeedUpload(static_cast<int>(slot1) - 1, 0, maxV - 1))
+        return 0u;
     s.lastUse = ++g_g700Clock;
     return s.fbp;
 }
