@@ -1,10 +1,15 @@
-﻿// G520: `macscan` — g430ResolveAt (vu1_g421_fast_upper.inc) resolves the architectural MAC with a
+#include "runtime/dc2_g778_native.h"
+#if defined(PS2X_G777_NATIVE_GL)
+extern thread_local uint64_t g_g483LastRunCycles;
+#endif
+// G520: `macscan` — g430ResolveAt (vu1_g421_fast_upper.inc) resolves the architectural MAC with a
 // branchless tree reduction instead of a serial branchy scan of the 8-slot history ring. Content
 // edit here forces MSBuild to consume the .inc (G359). revision: 28 (G612 native region backend)
 // G652: native-region LOI admission + flag-materialization census (force rebuild v1).
 // G746: `__cpuid` for the one-time SSE4.1 probe the G610/G612 emitters use to pick the partial-dest
 // write shape (vu1_g746_blend_dest.inc). Included HERE, at global scope, because that file is
 // consumed from inside vu1_g610_native_jit.inc's anonymous namespace. revision: 32 (G746)
+#include "runtime/dc2_g775_diagnostic.h"
 #if defined(_MSC_VER)
 #include <intrin.h>
 #endif
@@ -52,6 +57,22 @@
 // precondition G607 parked program-point GPU batching behind. Observer only, same DIAG-copy
 // discipline as G607, and likewise must precede vu1_upper_opcodes.inc which arms it at run() entry.
 #include "ps2_vu1_parts/vu1_g608_mem_profile.inc"
+void dc2_g777_memory_observer(void (*observer)(uint32_t,uint32_t,uint32_t,bool,int32_t))
+{
+#if defined(PS2X_G775_DIAG)
+    s_g777MemoryObserver=observer;
+#else
+    (void)observer;
+#endif
+}
+void dc2_g777_pair_observer(void (*observer)(uint32_t,uint32_t,uint32_t,const VU1State&,uint32_t,uint32_t))
+{
+#if defined(PS2X_G775_DIAG)
+    s_g777PairObserver=observer;
+#else
+    (void)observer;
+#endif
+}
 #include "ps2_vu1_parts/vu1_upper_opcodes.inc"
 #include "ps2_vu1_parts/vu1_lower_opcodes.inc"
 #include "ps2_vu1_parts/vu1_dispatch_and_sync.inc"
@@ -63,6 +84,7 @@
 #include "ps2_vu1_parts/vu1_g665_backend_migration.inc"
 // G360: item-slot UV-loss XGKICK probe added in vu1_dispatch_and_sync.inc (force recompile v2).
 // G541: stable hidden-pipeline snapshots + ordered XGKICK addresses for the VU1 GPU corpus (v1).
+// G776: diagnostic shared-state replay reuses the existing G665 import (no new executor).
 // G370: VU1 store-watch probe added (force recompile).
 // G410: default-on cached compiled VU1 execution (force recompile v16).
 // G413: default-on G328 circular MAC delay + G330 fused MAC classifier (force recompile).

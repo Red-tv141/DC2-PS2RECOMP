@@ -1,4 +1,7 @@
+#include "runtime/dc2_g778_native.h"
 #include <chrono>
+#include "ps2_dma_view.h"
+#include "runtime/dc2_g775_capture.h"
 #include "ps2_g674_hot_flag.inc"
 // G654 P16/P17: exclusive, thread-keyed layer timer (empty unless -DPS2X_G654_DIAG=ON).
 #include "ps2_g654_layer_api.inc"
@@ -9,6 +12,7 @@
 // G650 (ROADMAP P4): compiled UNPACK kernels. File scope, and it must precede the parser —
 // vif1_unpack_engine.inc is a textual continuation of processVIF1Data and calls into it.
 #include "ps2_vif1_interpreter_parts/vif1_g650_fast_unpack.inc"
+#include "ps2_vif1_interpreter_parts/vif1_g772_scatter_unpack.inc"
 #include "ps2_vif1_interpreter_parts/vif1_dma_and_parser.inc"
 #include "ps2_vif1_interpreter_parts/vif1_command_handlers.inc"
 #include "ps2_vif1_interpreter_parts/vif1_unpack_engine.inc"

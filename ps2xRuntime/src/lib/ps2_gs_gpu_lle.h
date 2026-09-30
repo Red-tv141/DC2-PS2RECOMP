@@ -13,6 +13,11 @@
 
 #include <cstdint>
 #include <vector>
+#if defined(PS2X_G777_NATIVE_GL)
+#include "runtime/dc2_native_draw.h"
+#include "runtime/dc2_g778_native.h"
+struct G777NativeProbe;
+#endif
 
 // One translated vertex. x/y are screen pixels (GS window coords minus XYOFFSET, pixel centers at
 // +0.5 like the CPU rasterizer); z is the raw GS Z value (uint bits, normalized on the GPU).
@@ -102,6 +107,11 @@ struct G178TexUpload
 // contents (RGBA8, GL row order = BOTTOM row first — the front-end owns all row flipping).
 struct G178Batch
 {
+#if defined(PS2X_G777_NATIVE_GL)
+    std::shared_ptr<dc2_g778::Command> g778Shadow;
+    int g778OffsetX=2048,g778OffsetY=2048;
+    G777NativeProbe* g777Native=nullptr;
+#endif
     uint32_t fbp = 0;
     // G351 surface-key FBO override (0 = key by fbp). Routes ONLY the backend FBO selection —
     // every fbp-gated semantic (g256 exact-depth family, RTT self-reference) stays on fbp.
@@ -122,10 +132,25 @@ struct G178Batch
     std::vector<G178Draw> draws;
     std::vector<uint32_t> readback;     // out (resized by the backend; empty under skipReadback)
 };
+#if defined(PS2X_G777_NATIVE_GL)
+struct G777NativeProbe
+{
+    const dc2_native::DC2NativeDraw* draw=nullptr;
+    uint32_t bucket=0;
+    int offsetX=2048,offsetY=2048;
+    std::vector<std::array<uint32_t,4>> metadata;
+    uint64_t sourceUploadBytes=0;
+    uint32_t gpuDraws=0,error=0;
+    bool live=false;
+    uint32_t vertexCount=0,capacity=0,cacheReplacements=0;
+    bool readGeometry=true;
+};
+#endif
 
 // Backend (ps2_gs_gpu_raster.cpp). submit() blocks the calling thread until rendering+readback
 // are complete; returns false if the backend never started / failed (caller must CPU-fallback).
 bool g178_backend_ready();
+bool g782_backend_ready_no_adopt(); // parse-side read only; never takes GL context
 bool g178_backend_submit(G178Batch &batch);
 bool g178_backend_has_tex(uint64_t key); // still resident (not evicted)?
 // G261: synchronous row-window color readback from a target's persistent FBO (the deferred

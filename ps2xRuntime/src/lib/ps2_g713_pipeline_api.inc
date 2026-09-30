@@ -18,6 +18,7 @@
 #define DC2_G713_PIPELINE_API_INC 1
 
 #include <cstdint>
+#include "runtime/dc2_g782_commit.h"
 
 // The GS transfer registers, snapshotted at POST time on the parse thread and applied by exec
 // immediately before the operation runs. These are the ONLY GS registers whose owner moves:
@@ -110,6 +111,12 @@ void g713PipeAdaptTick();
 void g713PostXfer(const G713XferSnap &s);
 void g713PostImage(const G713XferSnap &s, const uint8_t *data, uint32_t bytes);
 void g713PostBatch(void *closedBatch);
+// G780: ordered immutable native draw. Executor owns and deletes payload.
+void g713PostNative(void (*fn)(void *), void *immutableItem);
+// Reserve ordered node first, then atomically choose native, then publish.
+// Even a losing node is published so the ring reservation cannot leave a hole.
+bool g713PostNativeCommit(void (*fn)(void *), void *immutableItem,
+                          dc2_g782::CommitToken *token);
 
 // ⭐ THE BYPASS. Run `fn(arg)` on the EXEC thread, in ring order, and block until it has returned.
 // Every operation this phase has NOT moved — the non-deferrable inline primitive, the frame

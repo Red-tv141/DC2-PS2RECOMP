@@ -166,8 +166,9 @@ enum
     kNodeXfer = 0,  // TRXDIR edge: apply the register snapshot, run local->local / local->host
     kNodeImage = 1, // host->local IMAGE payload (register snapshot + bytes)
     kNodeBatch = 2, // one closed, immutable G260Batch; ownership transfers to exec
-    kNodeCall = 3,  // fn(arg) on exec, in ring order (the poster then blocks in g713Sync)
-    kNodeKindN = 4
+    kNodeCall = 3,  // fn(arg) on exec, in ring order
+    kNodeNative = 4, // G780 immutable E91F00 draw, ordered with parsed batches
+    kNodeKindN = 5
 };
 
 constexpr uint32_t kNodeCap = 8192u; // power of two
@@ -177,7 +178,7 @@ struct G713Node
     uint32_t kind;
     uint32_t payLen;
     void *ptr;              // G260Batch* | call argument
-    void (*call)(void *);   // kNodeCall only
+    void (*call)(void *);   // kNodeCall or kNodeNative
     uint64_t payOff;        // byte-ring offset of an IMAGE payload
     G713XferSnap snap;
 };
@@ -287,6 +288,7 @@ void g713RunNode(G713Ring &r, G713Node &n)
             r.raster.execBatch(n.ptr);
         break;
     case kNodeCall:
+    case kNodeNative:
         if (n.call)
             n.call(n.ptr);
         break;
@@ -775,6 +777,48 @@ void g713PostBatch(void *closedBatch)
     g713Publish(r, kNodeBatch);
 }
 
+void g713PostNative(void (*fn)(void *), void *immutableItem)
+{
+    if (!fn || !immutableItem)
+        return;
+    G713Ring &r = ring();
+    if (t_onExec)
+    {
+        fn(immutableItem);
+        return;
+    }
+    G713Node &n = g713Acquire(r);
+    n.kind = kNodeNative;
+    n.ptr = immutableItem;
+    n.call = fn;
+    n.payLen = 0;
+    g713Publish(r, kNodeNative);
+}
+
+bool g713PostNativeCommit(void (*fn)(void *), void *immutableItem,
+                          dc2_g782::CommitToken *token)
+{
+    if (!fn || !immutableItem || !token)
+        return false;
+    G713Ring &r = ring();
+    if (t_onExec)
+    {
+        const bool won = token->tryNative();
+        fn(immutableItem);
+        return won;
+    }
+    G713Node &n = g713Acquire(r);
+    n.kind = kNodeNative;
+    n.ptr = immutableItem;
+    n.call = fn;
+    n.payLen = 0;
+    // Payload is complete and this unpublished ring slot is reserved. A release
+    // CAS lets MTVU observe NativeCommitted only with a guaranteed ordered node.
+    const bool won = token->tryNative();
+    g713Publish(r, kNodeNative); // release publishes slot, including a losing no-op
+    return won;
+}
+
 void g713CallOnExec(void (*fn)(void *), void *arg)
 {
     if (fn == nullptr)
@@ -905,7 +949,7 @@ void g713PipeReport()
     const double f = 240.0;
     std::fprintf(stderr,
                  "[G713:pipe] frames=%llu mode=%s posted/f=%.0f (xfer=%.1f img=%.1f batch=%.1f "
-                 "call=%.1f) payMB/f=%.2f | syncWaits/f=%.2f syncMs/f=%.3f maxDepth=%llu "
+                 "call=%.1f native=%.1f) payMB/f=%.2f | syncWaits/f=%.2f syncMs/f=%.3f maxDepth=%llu "
                  "blockedPost=%llu blockedPay=%llu execMs/f=%.3f\n",
                  static_cast<unsigned long long>(s_n), s_serial ? "SERIAL" : "THREADED",
                  r.posted.exchange(0, std::memory_order_relaxed) / f,
@@ -913,6 +957,7 @@ void g713PipeReport()
                  r.byKind[kNodeImage].exchange(0, std::memory_order_relaxed) / f,
                  r.byKind[kNodeBatch].exchange(0, std::memory_order_relaxed) / f,
                  r.byKind[kNodeCall].exchange(0, std::memory_order_relaxed) / f,
+                 r.byKind[kNodeNative].exchange(0, std::memory_order_relaxed) / f,
                  r.payBytes.exchange(0, std::memory_order_relaxed) / (f * 1048576.0),
                  r.syncWaits.exchange(0, std::memory_order_relaxed) / f,
                  r.syncNs.exchange(0, std::memory_order_relaxed) / (1.0e6 * f),
@@ -934,11 +979,12 @@ void g713PipeReport()
                  g713PipeStatOn() ? "armed" : "DISARMED-structural-zero");
     // G724: the same window, split by node kind. These four sum to `execMs/f` by construction.
     std::fprintf(stderr,
-                 "[G713:kind] xferMs/f=%.3f imgMs/f=%.3f batchMs/f=%.3f callMs/f=%.3f\n",
+                 "[G713:kind] xferMs/f=%.3f imgMs/f=%.3f batchMs/f=%.3f callMs/f=%.3f nativeMs/f=%.3f\n",
                  r.nsByKind[kNodeXfer].exchange(0, std::memory_order_relaxed) / (1.0e6 * f),
                  r.nsByKind[kNodeImage].exchange(0, std::memory_order_relaxed) / (1.0e6 * f),
                  r.nsByKind[kNodeBatch].exchange(0, std::memory_order_relaxed) / (1.0e6 * f),
-                 r.nsByKind[kNodeCall].exchange(0, std::memory_order_relaxed) / (1.0e6 * f));
+                 r.nsByKind[kNodeCall].exchange(0, std::memory_order_relaxed) / (1.0e6 * f),
+                 r.nsByKind[kNodeNative].exchange(0, std::memory_order_relaxed) / (1.0e6 * f));
     std::fflush(stderr);
 }
 

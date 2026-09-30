@@ -1,3 +1,4 @@
+// G774 rejected integer-combine trial removed; native backend unchanged, revision 2.
 // G764 mapped asset upload ownership, revision 1.
 #include <cstdint>
 #include "ps2_g674_hot_flag.inc"
@@ -143,6 +144,7 @@ extern std::atomic<uint32_t> g_dc2RenderedFrame;
 #include "ps2_gs_gpu_raster_parts/g494_driver_sync_census.inc"
 #include "ps2_gs_gpu_raster_parts/g495_readback_queue_census.inc"
 #include "ps2_gs_gpu_raster_parts/g765_gpu_stage.inc"
+#include "ps2_gs_gpu_raster_parts/g780_gpu_profile.inc"
 // G767: GPU time per draw class (diagnostic, DC2_G767_DRAWGPU=<N>).
 #include "ps2_gs_gpu_raster_parts/g767_draw_gpu.inc"
 #include "ps2_gs_gpu_raster_parts/g496_gpu_ballast.inc"
@@ -209,6 +211,7 @@ bool g162DecodeT8ToRgba(uint32_t, uint32_t, int, int, const uint32_t *, const ui
 bool g162DecodeT8Batch(int, const uint32_t *, const uint32_t *, const int *, const int *,
                        const uint32_t *, const uint8_t *, size_t, uint32_t **) { return false; }
 bool g178_backend_ready() { return false; }
+bool g782_backend_ready_no_adopt() { return false; }
 bool g178_backend_submit(G178Batch &) { return false; }
 bool g570_backend_shadow139(const std::vector<uint32_t> &, const std::vector<uint32_t> &,
                             const std::vector<uint32_t> &, const std::vector<uint32_t> &,

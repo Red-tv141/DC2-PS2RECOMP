@@ -1,4 +1,5 @@
 #include "ps2_iso_mount.h"
+#include "ps2_dma_view.h"
 #include <iostream>
 #include <cstring>
 #include <cstdlib>
@@ -53,6 +54,7 @@ bool Ps2IsoMount::readSector(uint32_t lba, uint32_t count, void* dst) const
     if (count == 0) return true;
     if (!dst) return false;
     if (uint64_t(lba) + count > (1ull << 32)) return false;
+    ps2_dma::prepareWrite(dst, size_t(count) * SECTOR_SIZE);
     if (m_folderMode) return readSectorFolder(lba, count, dst);
     // A failed/short speculative bulk read must not poison subsequent reads.
     m_file.clear();

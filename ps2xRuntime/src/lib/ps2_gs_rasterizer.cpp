@@ -1,4 +1,7 @@
+#include "runtime/dc2_g778_native.h"
+// G774 native color handoff, alpha contract, ranged host observer and empty-debt guards, revision 10.
 #include "ps2_asset_texcache.h"
+#include "ps2_gs_transfer_reference.h"
 // G764 offline asset-cache integration, revision 4 (pre-hash, stable residency).
 #include "ps2_g674_hot_flag.inc"
 // G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
@@ -664,6 +667,8 @@ void g447MarkGsWorkerThread(); // G769: DC2_G769_EXECWAIT marks the executor for
 #include "ps2_gs_rasterizer_parts/g712_prep_body.inc"
 
 #include "ps2_gs_rasterizer_parts/rasterizer_vram_materialization.inc"
+#include "ps2_gs_rasterizer_parts/g778_ordered_shadow.inc"
+#include "ps2_gs_rasterizer_parts/g778_ordered_native.inc"
 
 // G627 revision: 1 — PSMT8-in-CT32 local-transfer destinations without the destination-triggered
 // readback. MUST follow rasterizer_vram_materialization.inc (it uses g264InvPage's probed CT32 page
@@ -760,6 +765,8 @@ void g447MarkGsWorkerThread(); // G769: DC2_G769_EXECWAIT marks the executor for
 #else
 #include "ps2_gs_rasterizer_parts/g654_stub_g629.inc"
 #endif
+
+#include "ps2_gs_rasterizer_parts/g772_resource_replay.inc"
 
 // G687's tag markers are called by the GIF TU. This TLS bit lets the overwhelmingly common
 // inactive drawPrimitive path reject the helper with one load/branch and no function call.
@@ -1016,3 +1023,145 @@ void g713_raster_arm()
 {
     g713ArmIfRequested(nullptr);
 }
+
+#if defined(PS2X_G777_NATIVE_GL)
+extern bool g150_enqueue_apply(std::function<void()>);
+extern bool g297MtvuActive();
+bool dc2_g778::nonblockingAvailable()
+{
+    return g297MtvuActive() && g713PipeArmed() && !g713PipeSerialMode() &&
+           !g713OnExecThread();
+}
+void dc2_g778::orderedShadow(GS* gs,std::shared_ptr<Command> command,bool begin)
+{
+    if(!gs || !command)return;
+    auto apply=[command=std::move(command),begin](){
+        dc2_g778::gsCommand=begin?command:std::shared_ptr<Command>{};
+        if(g713PipeArmed() && !g713OnExecThread()){
+            g713ParseFlushOpen();g713PostCall(&g778ExecShadow,new G778ShadowJob{command,begin});
+        }else g778ExecShadow(new G778ShadowJob{command,begin});
+    };
+    if(!g150_enqueue_apply(apply))apply();
+}
+bool dc2_g778::orderedNative(GS* gs,std::shared_ptr<Command> command)
+{
+    if(!gs || !command)return false;
+    auto job=std::make_shared<G780AdmissionJob>();job->gs=gs;job->command=std::move(command);
+    auto apply=[job](){
+#if defined(PS2X_G684_HOT_DIAG)
+        const bool profile=g780ProfileOn();
+        const auto parseStart=profile?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+        if(profile)g780CpuStats.parseQueueNs.fetch_add(g780Ns(job->enqueued,parseStart),std::memory_order_relaxed);
+#endif
+        std::shared_ptr<const G780NativeItem> item;
+        bool admitted=job->gs->captureNativeE91F00(job->command,item);
+#if defined(PS2X_G684_HOT_DIAG)
+        const auto captured=profile?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+#endif
+        if(admitted){
+            if(g713PipeArmed() && !g713OnExecThread()){
+                g713ParseFlushOpen();
+#if defined(PS2X_G684_HOT_DIAG)
+                const auto flushed=profile?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+                auto* payload=new G780ExecPayload{item};
+                if(profile)payload->posted=flushed;
+                g713PostNative(&g780ExecNative,payload);
+                if(profile){
+                    const auto posted=std::chrono::steady_clock::now();
+                    g780CpuStats.parseFlushNs.fetch_add(g780Ns(captured,flushed),std::memory_order_relaxed);
+                    g780CpuStats.postNs.fetch_add(g780Ns(flushed,posted),std::memory_order_relaxed);
+                }
+#else
+                g713PostNative(&g780ExecNative,new G780ExecPayload{item});
+#endif
+            }else{
+                admitted=item->rasterizer->nativeE91F00(*item);
+                if(!admitted)job->gs->rollbackNativeE91F00(*item);
+            }
+            if(admitted)gsDirty.store(31u,std::memory_order_release);
+        }
+#if defined(PS2X_G684_HOT_DIAG)
+        if(profile)g780CpuStats.parseWorkNs.fetch_add(g780Ns(parseStart,captured),std::memory_order_relaxed);
+#endif
+        {std::lock_guard<std::mutex> lock(job->mutex);job->result=admitted;job->done=true;}
+        job->ready.notify_one();
+    };
+#if defined(PS2X_G684_HOT_DIAG)
+    const bool profile=g780ProfileOn();
+    const auto waitStart=profile?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+    if(profile)job->enqueued=waitStart;
+#endif
+    if(!g150_enqueue_apply(apply))apply();
+    std::unique_lock<std::mutex> lock(job->mutex);job->ready.wait(lock,[&](){return job->done;});
+#if defined(PS2X_G684_HOT_DIAG)
+    if(profile){g780CpuStats.eeWaitNs.fetch_add(g780Ns(waitStart,std::chrono::steady_clock::now()),std::memory_order_relaxed);
+        g780CpuStats.eeCalls.fetch_add(1,std::memory_order_relaxed);}
+#endif
+    return job->result;
+}
+
+bool dc2_g778::orderedNativeNonblocking(GS* gs,std::shared_ptr<Command> command)
+{
+    if(!gs || !command || !nonblockingAvailable())return false;
+    command->g782Commit=std::make_shared<dc2_g782::CommitToken>(command->association.id);
+    command->g782Group=true;
+    auto apply=[gs,command](){
+#if defined(PS2X_G684_HOT_DIAG)
+        static const int delayUs=[](){const char* v=std::getenv("DC2_G782_PARSE_DELAY_US");return v?std::atoi(v):0;}();
+        static const unsigned every=[](){const char* v=std::getenv("DC2_G782_PARSE_DELAY_EVERY");return v?unsigned(std::strtoul(v,nullptr,0)):1u;}();
+        static std::atomic<unsigned> seen{0};
+        if(delayUs>0 && every && ((seen.fetch_add(1u,std::memory_order_relaxed)+1u)%every)==0u)
+            std::this_thread::sleep_for(std::chrono::microseconds(delayUs));
+#endif
+        auto& token=*command->g782Commit;
+        if(token.decision()!=dc2_g782::Decision::Pending){
+            ++dc2_g778::counters.g782LostRace;
+            return;
+        }
+#if defined(PS2X_G684_HOT_DIAG)
+        static const unsigned rejectEvery=[](){const char* v=std::getenv("DC2_G782_FORCE_REJECT_EVERY");return v?unsigned(std::strtoul(v,nullptr,0)):0u;}();
+        static std::atomic<unsigned> rejectSeen{0};
+        if(rejectEvery && ((rejectSeen.fetch_add(1u,std::memory_order_relaxed)+1u)%rejectEvery)==0u){
+            if(token.reject())++dc2_g778::counters.g782ParseReject;
+            return;
+        }
+#endif
+        std::shared_ptr<const G780NativeItem> item;
+        try{
+            if(!gs->captureNativeE91F00(command,item,true)){
+                if(token.reject())++dc2_g778::counters.g782ParseReject;
+                return;
+            }
+            // All earlier parse batches enter G713 ahead of this reserved node.
+            g713ParseFlushOpen();
+            auto payload=std::make_unique<G780ExecPayload>();
+            payload->item=item;payload->g782Command=command;
+#if defined(PS2X_G684_HOT_DIAG)
+            if(g780ProfileOn())payload->posted=std::chrono::steady_clock::now();
+#endif
+            const bool won=g713PostNativeCommit(&g780ExecNative,payload.release(),&token);
+            if(!won){++dc2_g778::counters.g782LostRace;return;}
+            // CAS succeeded only after the immutable node was reserved. Later GIF
+            // parse sees the same PRIM mutation as G780; losing legacy sees none.
+            gs->commitNativeE91F00();
+            gsDirty.store(31u,std::memory_order_release);
+            ++dc2_g778::counters.g782NativeCommit;
+            ++dc2_g778::counters.nativeCommands;
+        }catch(...){
+            if(token.decision()==dc2_g782::Decision::NativeCommitted)std::abort();
+            if(token.reject())++dc2_g778::counters.g782ParseReject;
+        }
+    };
+    if(!g150_enqueue_apply(apply)){
+        command->g782Commit->reject();
+        command->g782Group=false;
+        return false;
+    }
+#if defined(PS2X_G684_HOT_DIAG)
+    static const int eeLeadUs=[](){const char* v=std::getenv("DC2_G782_EE_AFTER_ENQUEUE_US");return v?std::atoi(v):0;}();
+    if(eeLeadUs>0)std::this_thread::sleep_for(std::chrono::microseconds(eeLeadUs));
+#endif
+    return true;
+}
+
+#endif

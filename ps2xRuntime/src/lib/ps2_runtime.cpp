@@ -1,4 +1,8 @@
+#include "runtime/dc2_g778_native.h"
 // G764 leased GPU presentation snapshots, revision 3.
+// G776: bounded dependency capture retains unowned producers between logical draws.
+#include "ps2_dma_view.h"
+#include "runtime/dc2_g775_capture.h"
 // G739: the inlined call-site dispatch probe + back-edge preempt fast path (force rebuild v1).
 //       G652's generated-side fast dispatch had ZERO call sites; see ps2_runtime_macros.h.
 // G652: cross-thread critical-path hooks + fast dispatch helpers (force rebuild v1).
