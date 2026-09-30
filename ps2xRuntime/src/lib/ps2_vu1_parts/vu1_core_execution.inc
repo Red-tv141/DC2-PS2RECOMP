@@ -334,6 +334,12 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
                              uint32_t startPC, uint32_t itop,
                              uint32_t maxCycles)
 {
+    if (dc2_g775_diag::beforeExecution(false, startPC))
+        return;
+#if defined(PS2X_G777_NATIVE_GL)
+    if(dc2_g778::bypassCore(m_state,false,startPC,itop)){g_g483LastRunCycles=0;return;}
+    dc2_g778::observeCore(false);
+#endif
     s_g65CurStartPC = startPC;
     s_g502Resume = false;   // G502: geometry kick (MSCAL)
     if (s_g215batch || s_g216clip || s_g216ForceGate || s_g217TagVu)
@@ -836,6 +842,12 @@ void VU1Interpreter::resume(uint8_t *vuCode, uint32_t codeSize,
                             GS &gs, PS2Memory *memory,
                             uint32_t itop, uint32_t maxCycles)
 {
+    if (dc2_g775_diag::beforeExecution(true, m_state.pc))
+        return;
+#if defined(PS2X_G777_NATIVE_GL)
+    if(dc2_g778::bypassCore(m_state,true,m_state.pc,itop)){g_g483LastRunCycles=0;return;}
+    dc2_g778::observeCore(true);
+#endif
     m_state.ebit = false;
     m_state.itop = itop;
     s_g502Resume = true;    // G502: resume kick (MSCNT) — 29% of kicks, 58% of all pairs

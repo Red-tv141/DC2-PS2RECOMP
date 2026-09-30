@@ -14,6 +14,23 @@ void PS2Memory::processVIF1Data(uint32_t srcPhys, uint32_t sizeBytes)
 
 void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 {
+#if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
+    dc2_g775_capture::InputScope g775Input(data);
+#endif
+
+    processVIF1Input(data, sizeBytes);
+}
+
+void PS2Memory::processVIF1Data(const ps2_dma::Stream& stream)
+{
+    stream.verifyReference();
+    ps2_dma::Input data(stream);
+    processVIF1Input(data, static_cast<uint32_t>(stream.size()));
+}
+
+template<class Input>
+void PS2Memory::processVIF1Input(Input& data, uint32_t sizeBytes)
+{
     G146PerfScope g146Scope(g_g146Vif1Ns);
     // G654 P17: the EXCLUSIVE, thread-keyed companion. `G146PerfScope` has no nesting guard, and
     // submitGifPacket - which opens the GIFsubmit scope - is reached from inside this body, so
@@ -34,7 +51,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
     if (g136Active)
     {
         std::fprintf(stderr, "[G136:vifstart] seq=%u size=%u\n", g136Seq, sizeBytes);
-        g136_log_qwords("vifhead", g136Seq, 0u, data, sizeBytes, g136_qword_limit());
+        g136_log_qwords("vifhead", g136Seq, 0u, ps2_dma::borrow(data, sizeBytes), sizeBytes, g136_qword_limit());
         if (g137_trace_enabled())
             g137_clear_origins();
     }
@@ -53,6 +70,13 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         m_gifArbiter->drain();
     };
 
+#if defined(PS2X_G777_NATIVE_GL)
+    dc2_g778::VifScope g778Scope([&](std::shared_ptr<dc2_g778::Command> command,bool begin){
+        g95DrainDeferredGif(begin?"G778-shadow-begin":"G778-shadow-end");
+        dc2_g778::orderedShadow(dc2_g778::liveGs,std::move(command),begin);
+    });
+#endif
+
     // G17: first clean-MSCNT offset in this stream (filled by the trace scan, used to log the
     // parser's command boundaries around the kick so we can see what consumes it).
     uint32_t g17FirstMscntOff = 0xFFFFFFFFu;
@@ -67,7 +91,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         for (uint32_t p = 0; p + 4u <= sizeBytes; p += 4u)
         {
             uint32_t w = 0u;
-            std::memcpy(&w, data + p, 4);
+            ps2_dma::read(&w, data + p, 4);
             const uint8_t op = static_cast<uint8_t>((w >> 24) & 0x7Fu);
             if (op == 0x14u || op == 0x15u)
             {
@@ -88,8 +112,8 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
                 if (r < 24u)
                 {
                     uint32_t prev = 0u, prev2 = 0u;
-                    if (p >= 4u) std::memcpy(&prev, data + p - 4u, 4);
-                    if (p >= 8u) std::memcpy(&prev2, data + p - 8u, 4);
+                    if (p >= 4u) ps2_dma::read(&prev, data + p - 4u, 4);
+                    if (p >= 8u) ps2_dma::read(&prev2, data + p - 8u, 4);
                     std::fprintf(stderr, "[G17:rawmscnt] call=%u off=0x%x word=0x%08x prev=0x%08x prev2=0x%08x size=%u\n",
                                  n, p, w, prev, prev2, sizeBytes);
                 }
@@ -102,7 +126,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             static std::atomic<uint32_t> s_g25found{0};
             if (s_g25found.fetch_add(1u, std::memory_order_relaxed) < 8u)
             {
-                uint32_t mw = 0u; std::memcpy(&mw, data + g17FirstMscalOff, 4);
+                uint32_t mw = 0u; ps2_dma::read(&mw, data + g17FirstMscalOff, 4);
                 std::fprintf(stderr, "[G25:mscalfound] call=%u mscalOff=0x%x word=0x%08x size=%u\n",
                              n, g17FirstMscalOff, mw, sizeBytes);
             }
@@ -111,7 +135,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         {
             uint64_t firstQw = 0u;
             if (sizeBytes >= 8u)
-                std::memcpy(&firstQw, data, sizeof(firstQw));
+                ps2_dma::read(&firstQw, data, sizeof(firstQw));
             std::fprintf(stderr, "[F51.7:vif1] n=%u size=%u firstQw=0x%016llx\n",
                          n, sizeBytes, static_cast<unsigned long long>(firstQw));
         }
@@ -126,7 +150,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         {
             uint64_t firstQw = 0u;
             if (sizeBytes >= 8u)
-                std::memcpy(&firstQw, data, sizeof(firstQw));
+                ps2_dma::read(&firstQw, data, sizeof(firstQw));
             std::fprintf(stderr,
                          "[F30:vif1cmd] n=%u size=%u firstQw=0x%016llx\n",
                          n, sizeBytes, static_cast<unsigned long long>(firstQw));
@@ -224,14 +248,15 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
 
     while (pos + 4 <= sizeBytes)
     {
+        ps2_dma::consumeThrough(data, pos);
         if (m_vif1PendingPath2ImageQwc != 0u)
         {
             uint32_t nextCmd = 0u;
-            std::memcpy(&nextCmd, data + pos, sizeof(nextCmd));
+            ps2_dma::read(&nextCmd, data + pos, sizeof(nextCmd));
             const uint8_t nextOpcode = static_cast<uint8_t>((nextCmd >> 24) & 0x7Fu);
             uint32_t nextCmd2 = 0u;
             if (pos + 8u <= sizeBytes)
-                std::memcpy(&nextCmd2, data + pos + 4u, sizeof(nextCmd2));
+                ps2_dma::read(&nextCmd2, data + pos + 4u, sizeof(nextCmd2));
             const uint8_t nextOpcode2 = static_cast<uint8_t>((nextCmd2 >> 24) & 0x7Fu);
             const bool nextLooksLikeDirectWrapper =
                 nextOpcode == VIF_DIRECT ||
@@ -259,7 +284,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
             }
 
             const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, availableQw);
-            submitPath2ImageChunk(data + pos, chunkQw, m_vif1PendingPath2DirectHl);
+            submitPath2ImageChunk(ps2_dma::borrow(data + pos, (chunkQw) * 16u), chunkQw, m_vif1PendingPath2DirectHl);
 
             pos += chunkQw * 16u;
             m_vif1PendingPath2ImageQwc -= chunkQw;
@@ -272,10 +297,75 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
 
         uint32_t cmd;
-        memcpy(&cmd, data + pos, 4);
+#if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
+        dc2_g775_capture::command(pos);
+#endif
+        ps2_dma::read(&cmd, data + pos, 4);
         pos += 4;
 
+#if defined(PS2X_G777_NATIVE_GL)
+        if(cmd==0x6c010027u && dc2_g778::nativeRequested() && !g778Scope.active &&
+           dc2_g775_capture::vifDraw.self==0xe8b940 && dc2_g775_capture::vifDraw.bucket==0xe91f00){
+            auto command=dc2_g778::find(dc2_g775_capture::vifDraw);
+            const auto contract=(vif1_regs.cycle==0x404u && vif1_regs.mode==0u)
+                ?dc2_g778::transportContract(sizeBytes,pos-4,dc2_g775_capture::vifDraw,
+                    [&](uint32_t offset,void* out,uint32_t bytes){ps2_dma::read(out,data+offset,bytes);})
+                :dc2_g778::TransportContract{};
+            bool committed=false;
+            const bool g782=dc2_g778::nonblockingRequested();
+            if(command && command->clipKnown && contract.end && m_vu1MscalCallback && m_vu1MscntCallback){
+                ps2_dma::release(data);g95DrainDeferredGif("G778-native-order");
+                committed=g782
+                    ?dc2_g778::orderedNativeNonblocking(dc2_g778::liveGs,command)
+                    :dc2_g778::orderedNative(dc2_g778::liveGs,command);
+            }
+            if(committed){
+                command->transportEnd=contract.end;command->transportBytes=contract.unpackBytes;
+                command->vifBefore={(vif1_regs.stat>>7)&1u,vif1_regs.base,vif1_regs.ofst,
+                    vif1_regs.tops,vif1_regs.itop,vif1_regs.cycle,vif1_regs.mode};
+                if(!g782){
+                    command->nativeCommitted.store(true,std::memory_order_release);
+                    ++dc2_g778::counters.nativeCommands;
+                }
+                g778Scope.active=command;
+            }else{
+                ++dc2_g778::counters.fallbackCommands;
+                if(dc2_g778::statsRequested())std::fprintf(stderr,"[G778:fallback] draw=%llu sf=%u captured=%u contract=%u cycle=%x mode=%u\n",
+                    (unsigned long long)dc2_g775_capture::vifDraw.id,dc2_g775_capture::vifDraw.sf,
+                    unsigned(bool(command)),unsigned(bool(contract.end)),vif1_regs.cycle,vif1_regs.mode);
+            }
+        }
+        if(dc2_g778::vifScope)dc2_g778::vifScope->command(cmd,dc2_g775_capture::vifDraw);
+#endif
         uint8_t opcode = (cmd >> 24) & 0x7F;
+#if defined(PS2X_G775_DIAG)
+        // Transport proof is independent of the candidate geometry. Include all
+        // commands in the existing dependency window, including unowned state.
+        struct G777TransportScope
+        {
+            std::function<void()> finish;
+            ~G777TransportScope(){if(finish)finish();}
+        } g777Transport;
+        static const bool g777TransportOn=std::getenv("DC2_G777_TRANSPORT")!=nullptr;
+        if(g777TransportOn && dc2_g775_capture::dependencyWindow.load(std::memory_order_acquire))
+        {
+            auto snapshot=[&](){return std::array<uint32_t,9>{(vif1_regs.stat>>7)&1u,vif1_regs.base,vif1_regs.ofst,
+                vif1_regs.top,vif1_regs.tops,vif1_regs.itop,vif1_regs.itops,vif1_regs.cycle,vif1_regs.mode};};
+            const auto before=snapshot();const auto draw=dc2_g775_capture::vifDraw;const auto command=cmd;const auto start=pos-4u;
+            g777Transport.finish=[&,snapshot,before,draw,command,start]()
+            {
+                static FILE* file=[](){FILE* f=std::fopen("logs/g775/vif_transport.csv","wb");if(f)std::fprintf(f,"sequence,draw,sf,self,geometry,node,command,bytes,dbf0,base0,offset0,top0,tops0,itop0,itops0,cycle0,mode0,dbf1,base1,offset1,top1,tops1,itop1,itops1,cycle1,mode1,bucket\n");return f;}();
+                static uint64_t sequence=0;
+                if(file)
+                {
+                    const auto after=snapshot();std::fprintf(file,"%llu,%llu,%u,%x,%x,%x,%u,%u",static_cast<unsigned long long>(sequence++),
+                        static_cast<unsigned long long>(draw.id),draw.sf,draw.self,draw.geometry,draw.listNode,command,pos-start);
+                    for(const auto v:before)std::fprintf(file,",%u",v);for(const auto v:after)std::fprintf(file,",%u",v);
+                    std::fprintf(file,",%x\n",draw.bucket);std::fflush(file);
+                }
+            };
+        }
+#endif
         g17LastOpcode = opcode;
         g17LastOpcodePos = pos - 4u;
         if (vu1_trace_enabled())
@@ -425,6 +515,7 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_MSKPATH3)
         {
+            ps2_dma::release(data);
             // VIF command docs: MSKPATH3 uses IMMEDIATE bit 15.
             const bool wasMasked = m_path3Masked;
             m_path3Masked = (imm & 0x8000u) != 0u;
@@ -440,11 +531,26 @@ void PS2Memory::processVIF1Data(const uint8_t *data, uint32_t sizeBytes)
         }
         else if (opcode == VIF_FLUSHE || opcode == VIF_FLUSH || opcode == VIF_FLUSHA)
         {
+            ps2_dma::release(data);
             if (opcode == VIF_FLUSH || opcode == VIF_FLUSHA)
             {
                 g317_note_gif_fence((opcode == VIF_FLUSH) ? kG317VifFlush : kG317VifFlusha);
                 g95DrainDeferredGif((opcode == VIF_FLUSH) ? "FLUSH" : "FLUSHA");
             }
+#if defined(PS2X_G777_NATIVE_GL)
+            if(opcode==VIF_FLUSHA && g778Scope.active &&
+               (g778Scope.active->g782Group || g778Scope.active->nativeCommitted.load())){
+                const auto& before=g778Scope.active->vifBefore;
+                const uint32_t dbf=before[0]^1u;
+                if(((vif1_regs.stat>>7)&1u)!=dbf || vif1_regs.base!=before[1] || vif1_regs.ofst!=before[2] ||
+                   vif1_regs.top!=(before[3]&0x3ffu) || vif1_regs.tops!=((before[1]+(dbf?before[2]:0u))&0x3ffu) ||
+                   vif1_regs.itop!=before[4] || vif1_regs.itops!=(before[4]&0x3ffu) ||
+                   vif1_regs.cycle!=before[5] || vif1_regs.mode!=before[6]){
+                    ++dc2_g778::counters.transportFailures;
+                    std::fprintf(stderr,"[G778:transport] final VIF state disagrees with preserved 13 core transitions\n");std::abort();
+                }
+            }
+#endif
             continue;
         }
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)

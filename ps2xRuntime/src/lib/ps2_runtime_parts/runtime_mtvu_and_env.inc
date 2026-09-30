@@ -151,6 +151,12 @@ struct G297VuWrite
 
 struct G297KickItem
 {
+#if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
+    dc2_g775_capture::Draw g775Draw{};
+#endif
+#if defined(PS2X_G777_NATIVE_GL)
+    std::shared_ptr<dc2_g778::Command> g782Command;
+#endif
     std::vector<G297VuWrite> writes;               // ordered VU-RAM writes preceding this kick
     std::vector<uint8_t> writeBytes;               // concatenated payloads, in `writes` order
     uint32_t startPC = 0u;
@@ -310,6 +316,9 @@ inline G297KickPtr g478AcquireKickItem()
         raw->ready.store(false, std::memory_order_relaxed);
     }
     return G297KickPtr(raw, [](G297KickItem *p) {
+#if defined(PS2X_G777_NATIVE_GL)
+        p->g782Command.reset(); // pooled item must not retain the logical draw
+#endif
         G478KickPool &p2 = g478KickPool();
         std::lock_guard<std::mutex> lk(p2.mtx);
         if (p2.free.size() < 8192u)
@@ -504,6 +513,14 @@ public:
         // zero capacity, so the next kick's noteVuWrite run re-grows it from scratch; the swap hands
         // the EE back the item's previous buffer instead. Both accumulators end EMPTY either way.
         auto item = g478AcquireKickItem();
+#if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
+        item->g775Draw=dc2_g775_capture::vifDraw;
+#endif
+#if defined(PS2X_G777_NATIVE_GL)
+        item->g782Command=(dc2_g778::vifScope && dc2_g778::vifScope->active &&
+                           dc2_g778::vifScope->active->g782Group)
+            ?dc2_g778::vifScope->active:std::shared_ptr<dc2_g778::Command>{};
+#endif
         item->writes.swap(m_pendWrites);               // EE-local until pushed: swap, never copy
         item->writeBytes.swap(m_pendWriteBytes);
         m_pendWrites.clear();                          // swapped-in buffers → empty + capacity kept
@@ -967,6 +984,9 @@ private:
                     m_g441WriteBytes += run;
                 }
             }
+#if defined(PS2X_G775_DIAG)
+            const uint32_t g775Entry=item->isResume?m_vu1->state().pc:item->startPC*8u;
+#endif
             const bool g566AuthorityKick = item->g566Authority &&
                 m_g566Authority.submit(*item, m_vu1->state(), m_workerVuCode, m_workerVuData,
                                        item->g566Authority);
@@ -999,6 +1019,11 @@ private:
             //     timer and an intra-frame table, to read the TRUE full-identity hit rate and the
             //     execute time those hits carry. Perturbs the pole (three extra clock reads and a
             //     second 16 KB hash per kick) and is therefore never a timing arm.
+#if defined(PS2X_G777_NATIVE_GL)
+            const auto g778PreviousCore=dc2_g778::coreCommand;
+            dc2_g778::coreCommand=item->g782Command?item->g782Command:dc2_g778::find(item->g775Draw);
+            struct G778CoreRestore {std::shared_ptr<dc2_g778::Command> previous;~G778CoreRestore(){dc2_g778::coreCommand=std::move(previous);}} g778Restore{g778PreviousCore};
+#endif
             const bool g482Census = g482CensusOn();
             const int g482Arm = g482MemoHashArm();
             uint64_t g482PreKey = 0ull, g482PreNs = 0ull;
@@ -1050,6 +1075,15 @@ private:
             }
             if (g652CriticalTraceOn)
                 g652CriticalTrace(12u, static_cast<uint64_t>(item->budget));
+#if defined(PS2X_G777_NATIVE_GL)
+            if(dc2_g778::coreCommand && !dc2_g778::coreCommand->nativeCommitted.load() && dc2_g778::statsRequested()){
+                const auto pairs=dc2_g483_last_run_cycles();
+                dc2_g778::coreCommand->corePairs+=pairs;dc2_g778::counters.legacyPairs+=pairs;
+                if(item->isResume)++dc2_g778::counters.legacyResumes;else ++dc2_g778::counters.legacyStarts;
+                dc2_g778::counters.legacyKicks+=item->packets.size();
+                for(const auto& packet:item->packets)dc2_g778::counters.legacyGifBytes+=packet.size();
+            }
+#endif
             // G438: when DC2_G419_AB=vu1slow is armed the spin runs on CANDIDATE frames only, so the
             // probe becomes a within-process paired measurement instead of a difference of two run
             // means (whose run-level spread is ~4.5 ms here — larger than the effect). The spin
@@ -1081,6 +1115,16 @@ private:
             if (g545ShadowKick)
                 m_g545Shadow.finish(*item, m_vu1->state(), m_workerVuData,
                                     dc2_g483_last_run_cycles(), dc2_g483_last_stop_reason());
+#if defined(PS2X_G775_DIAG)
+            if(dc2_g775_capture::enabled())
+            {
+                static uint64_t g775Image=0;
+                if(!g775Image || std::any_of(item->writes.begin(),item->writes.end(),[](const G297VuWrite& w){return w.isCode!=0;}))
+                    g775Image=dc2_g775_capture::hash(m_workerVuCode,PS2_VU1_CODE_SIZE);
+                size_t bytes=0;for(const auto& packet:item->packets)bytes+=packet.size();
+                dc2_g775_capture::vuResult(item->g775Draw,g775Image,g775Entry,item->isResume,dc2_g483_last_run_cycles(),item->packets.size(),bytes);
+            }
+#endif
             // G541 transport prototype. Submit one logical command before `ready`; the backend
             // coalesces all still-queued commands into one sequential compute dispatch. The queued
             // batch stays ahead of the GS work these packets unlock. No per-kick wait/fence/readback;

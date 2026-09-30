@@ -1,3 +1,24 @@
+namespace
+{
+static bool g772DepthStat()
+{
+    static const bool on = [] { const char* v = std::getenv("DC2_G772_DEPTH_STAT");
+        return v && std::atoi(v); }();
+    return on;
+}
+static std::atomic<uint64_t> g772DepthReads{0}, g772DepthBytes{0}, g772DepthWaitUs{0}, g772ResidentDepthUses{0};
+static void g772NoteDepthRead(uint64_t bytes, uint64_t waitUs)
+{
+    g772DepthBytes.fetch_add(bytes, std::memory_order_relaxed);
+    g772DepthWaitUs.fetch_add(waitUs, std::memory_order_relaxed);
+    const auto count = g772DepthReads.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (count % 64 == 0)
+        std::fprintf(stderr, "[G772:depth] readbacks=%llu bytes=%llu waitUs=%llu gpuViewUses=%llu\n",
+            (unsigned long long)count, (unsigned long long)g772DepthBytes.load(),
+            (unsigned long long)g772DepthWaitUs.load(), (unsigned long long)g772ResidentDepthUses.load());
+}
+}
+
 bool g178_backend_ready()
 {
     if (!g178EnvEnabled())
@@ -9,6 +30,11 @@ bool g178_backend_ready()
     if (backend.fusedNeedsAdopt())
         backend.adoptFusedContext();
     return backend.ready();
+}
+bool g782_backend_ready_no_adopt()
+{
+    return g178EnvEnabled() && G178Backend::instance().ready() &&
+           G178Backend::instance().g782NativeReady();
 }
 
 // G705: fused-transport arm report, printed from the [G154:perf] window under DC2_G705_STAT=1.
@@ -149,7 +175,10 @@ bool g566_backend_authority_submit(
 bool g701_backend_submit_nowait(G178Batch &batch, uint64_t depthKey,
                                 const std::vector<float> *depthUpload, int depthY, int depthRows)
 {
-    return G178Backend::instance().submitNoWait(batch, depthKey, depthUpload, depthY, depthRows);
+    const bool ok = G178Backend::instance().submitNoWait(batch, depthKey, depthUpload, depthY, depthRows);
+    if (ok && depthKey && !depthUpload && g772DepthStat())
+        g772ResidentDepthUses.fetch_add(1, std::memory_order_relaxed);
+    return ok;
 }
 
 // Latched failure from any earlier fire-and-forget submit; consumed and cleared.
@@ -197,17 +226,26 @@ bool g275_backend_submit_depth_readback(G178Batch &batch, uint64_t depthKey,
                                         int readY, int readRows,
                                         std::vector<float> &depthReadback)
 {
-    return G178Backend::instance().submitDepthReadback(
+    const bool stat = g772DepthStat();
+    const auto start = stat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool ok = G178Backend::instance().submitDepthReadback(
         batch, depthKey, depthUpload, depthY, depthRows,
         readY, readRows, depthReadback);
+    if (stat && ok && !depthReadback.empty()) g772NoteDepthRead(depthReadback.size() * sizeof(float),
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+    return ok;
 }
 
 bool g242_backend_read_depth(uint64_t depthKey, int width, int height,
                              int depthY, int depthRows, std::vector<float> &depthReadback)
 {
     const uint64_t g770T0 = g770XTraceActive() ? g770XTraceNow() : 0u; // G770 trace
+    const bool stat = g772DepthStat();
+    const auto start = stat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool ok = G178Backend::instance().readDepth(depthKey, width, height,
                                                       depthY, depthRows, depthReadback);
+    if (stat && ok) g772NoteDepthRead(depthReadback.size() * sizeof(float),
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
     if (g770T0 != 0u)
         g770XTrace('R', 1u, static_cast<uint32_t>(depthKey), static_cast<uint32_t>(depthRows), g770T0);
     return ok;

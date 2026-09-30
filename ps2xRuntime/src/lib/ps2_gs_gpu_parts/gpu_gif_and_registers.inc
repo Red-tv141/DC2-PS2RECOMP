@@ -682,6 +682,9 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     {
     case GS_REG_PRIM:
     {
+#if defined(PS2X_G777_NATIVE_GL)
+        dc2_g778::gsOverwrite(24u);
+#endif
         m_prim.type = static_cast<GSPrimType>(value & 0x7);
         if (m_prmodecont)
         {
@@ -711,6 +714,9 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
             m_ctx[m_prim.ctxt & 1u].frame.fbp == 0x139u)
             break;
         m_curR = static_cast<uint8_t>(value & 0xFF);
+#if defined(PS2X_G777_NATIVE_GL)
+        dc2_g778::gsOverwrite(5u);
+#endif
         m_curG = static_cast<uint8_t>((value >> 8) & 0xFF);
         m_curB = static_cast<uint8_t>((value >> 16) & 0xFF);
         m_curA = static_cast<uint8_t>((value >> 24) & 0xFF);
@@ -722,6 +728,9 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     }
     case GS_REG_ST:
     {
+#if defined(PS2X_G777_NATIVE_GL)
+        dc2_g778::gsOverwrite(2u);
+#endif
         uint32_t sBits = static_cast<uint32_t>(value & 0xFFFFFFFF);
         uint32_t tBits = static_cast<uint32_t>((value >> 32) & 0xFFFFFFFF);
         std::memcpy(&m_curS, &sBits, 4);
@@ -899,6 +908,10 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_ctx[ci].frame.fbw = static_cast<uint32_t>((value >> 16) & 0x3F);
         m_ctx[ci].frame.psm = static_cast<uint8_t>((value >> 24) & 0x3F);
         m_ctx[ci].frame.fbmsk = static_cast<uint32_t>((value >> 32) & 0xFFFFFFFF);
+#if defined(PS2X_G684_HOT_DIAG)
+        if(m_ctx[ci].frame.fbp==0x139u && m_ctx[ci].frame.fbw==8u)
+            dc2_g778::g780Future139Writes.fetch_add(1u,std::memory_order_release);
+#endif
         // G602: [F49:frame] moved out of line (g602_gif_cold_outline.inc).
         if (G602_GATE_RG_FRAME)
             g602ColdRegFrame(regAddr, ci, value, prev, m_ctx[ci].frame, m_prim.ctxt, m_bitbltbuf);

@@ -13,15 +13,22 @@ public:
         m_enabled = enabled != nullptr && enabled[0] != '\0' &&
                     std::strcmp(enabled, "0") != 0 && std::strcmp(enabled, "false") != 0 &&
                     std::strcmp(enabled, "off") != 0;
+#if defined(PS2X_G775_DIAG)
+        m_enabled = m_enabled || dc2_g775_capture::shadow();
+#endif
         m_limit = envU32("DC2_G541_VU_CORPUS_KICKS", 256u, 1u, 4096u);
         m_skip = envU32("DC2_G541_VU_CORPUS_SKIP", 0u, 0u, 10000000u);
     }
 
-    bool begin(const G297KickItem &, const VU1State &state,
+    bool begin(const G297KickItem &item, const VU1State &state,
                const uint8_t *code, const uint8_t *data)
     {
         if (!m_enabled || m_records >= m_limit || m_inFlight)
             return false;
+#if defined(PS2X_G775_DIAG)
+        if(dc2_g775_capture::shadow() && !dc2_g775_capture::isCaptured(item.g775Draw.id) &&
+           !(dc2_g775_capture::completeStateCapture() && dc2_g775_capture::dependencyWindow.load(std::memory_order_acquire)))return false;
+#endif
         if (m_seen++ < m_skip)
             return false;
         if (!openOnce())
@@ -110,6 +117,14 @@ public:
                     static_cast<std::streamsize>(header.size()));
         m_out.write(reinterpret_cast<const char *>(m_payload.data()),
                     static_cast<std::streamsize>(m_payload.size()));
+#if defined(PS2X_G775_DIAG)
+        if(dc2_g775_capture::shadow())
+        {
+            m_out.flush();
+            if(!m_out.good())throw std::runtime_error("G775 original-output fixture write failed");
+            dc2_g775_capture::fixtureLink(item.g775Draw,m_records);
+        }
+#endif
         ++m_records;
         if (!m_out.good())
         {

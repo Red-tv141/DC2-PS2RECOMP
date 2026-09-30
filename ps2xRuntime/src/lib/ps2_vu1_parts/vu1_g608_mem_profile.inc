@@ -211,6 +211,10 @@ struct G608MemProfiler
 };
 
 static G608MemProfiler s_g608Mem;
+#if defined(PS2X_G775_DIAG)
+static thread_local void (*s_g777MemoryObserver)(uint32_t,uint32_t,uint32_t,bool,int32_t)=nullptr;
+static thread_local void (*s_g777PairObserver)(uint32_t,uint32_t,uint32_t,const VU1State&,uint32_t,uint32_t)=nullptr;
+#endif
 
 #if defined(_MSC_VER)
 #define G608_NOINLINE __declspec(noinline)
@@ -335,6 +339,9 @@ static inline void g608MemProfPair(uint32_t pc, uint32_t lower, const int32_t *v
     if (mode == 0)
         return;
     addr &= (PS2_VU1_DATA_SIZE - 1u);
+#if defined(PS2X_G775_DIAG)
+    if(s_g777MemoryObserver)s_g777MemoryObserver(pc,addr,(lower>>21u)&15u,mode==2,vi[11]);
+#endif
     const uint32_t qw = addr >> 4u; // 0..1023
     const uint32_t w = qw >> 6u;
     const uint64_t bit = 1ull << (qw & 63u);
@@ -391,3 +398,76 @@ static inline void g608MemEndKick()
 }
 
 } // namespace
+
+#if defined(PS2X_G775_DIAG)
+// Passive transport observer: no diagnostic executor or flag-policy change.
+static void g777ObserveMemory(uint32_t pc,uint32_t lower,const int32_t* vi)
+{
+    if(((lower>>25u)&0x7fu)==0x40u && (lower&0x3fu)<0x3cu)return;
+    const uint32_t opHi = (lower >> 25u) & 0x7Fu;
+    // The shipped bodies index `vi` with the raw 5-bit field; VU1State.vi is int32_t[16] and the
+    // microprogram only ever names VI0..VI15, so the mask is defensive only — it can differ from
+    // the shipped address exclusively where the shipped body would already be reading out of
+    // bounds, which is not a case this observer should follow.
+    const uint8_t is = static_cast<uint8_t>(LIS(lower) & 0xFu);
+    const uint8_t it = static_cast<uint8_t>(LIT(lower) & 0xFu);
+    uint32_t addr = 0u;
+    int mode = 0; // 0 none, 1 read, 2 write
+    switch (opHi)
+    {
+    case 0x00u: // LQ
+        addr = static_cast<uint32_t>(static_cast<int32_t>(vi[is] + IMM11(lower))) * 16u;
+        mode = 1;
+        break;
+    case 0x04u: // ILW
+        addr = static_cast<uint32_t>(static_cast<int32_t>(vi[is] + IMM11(lower))) * 16u;
+        mode = 1;
+        break;
+    case 0x01u: // SQ
+        addr = static_cast<uint32_t>(static_cast<int32_t>(vi[it] + IMM11(lower))) * 16u;
+        mode = 2;
+        break;
+    case 0x05u: // ISW — address from `is`, value from `it`
+        addr = static_cast<uint32_t>(static_cast<int32_t>(vi[is] + IMM11(lower))) * 16u;
+        mode = 2;
+        break;
+    case 0x40u:
+        switch (S2_FUNC(lower))
+        {
+        case 0x34u: // LQI
+            addr = static_cast<uint32_t>(static_cast<uint16_t>(vi[is])) * 16u;
+            mode = 1;
+            break;
+        case 0x36u: // LQD (pre-decrement)
+            addr = static_cast<uint32_t>(static_cast<uint16_t>(vi[is] - 1)) * 16u;
+            mode = 1;
+            break;
+        case 0x3Eu: // ILWR
+            addr = static_cast<uint32_t>(static_cast<uint16_t>(vi[is])) * 16u;
+            mode = 1;
+            break;
+        case 0x35u: // SQI
+            addr = static_cast<uint32_t>(static_cast<uint16_t>(vi[it])) * 16u;
+            mode = 2;
+            break;
+        case 0x37u: // SQD (pre-decrement)
+            addr = static_cast<uint32_t>(static_cast<uint16_t>(vi[it] - 1)) * 16u;
+            mode = 2;
+            break;
+        case 0x3Fu: // ISWR — address from `is`
+            addr = static_cast<uint32_t>(static_cast<uint16_t>(vi[is])) * 16u;
+            mode = 2;
+            break;
+        default:
+            break;
+        }
+        break;
+    default:
+        break;
+    }
+    if (mode == 0)
+        return;
+    addr &= (PS2_VU1_DATA_SIZE - 1u);
+    if(s_g777MemoryObserver)s_g777MemoryObserver(pc,addr,(lower>>21u)&15u,mode==2,vi[11]);
+}
+#endif

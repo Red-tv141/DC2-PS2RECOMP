@@ -52,7 +52,7 @@
 // At that point it is load-bearing rather than inert, and its +4,631 bytes get acknowledged with
 // `DC2_ACK_LAYOUT_GROWTH` against a measured frame gate - never assumed free.
 
-#if defined(PS2X_G665_DIAG)
+#if defined(PS2X_G665_DIAG) || defined(PS2X_G775_DIAG)
 
 constexpr uint32_t G665_PIPE_MAGIC = 0x31505556u; // little-endian "VUP1"
 constexpr uint32_t G665_PIPE_VERSION = 1u;

@@ -848,6 +848,7 @@ PS2Runtime::~PS2Runtime()
     {
         requestStop();
         ps2_syscalls::detachAllGuestHostThreads();
+        m_memory.stopVIF1();
 #if defined(PLATFORM_VITA)
         m_audioBackend.stopAll();
         m_audioBackend.setAudioReady(false);
@@ -896,6 +897,9 @@ bool PS2Runtime::syncCoreSubsystems()
     m_gifArbiter.setProcessPacketFn([this](const uint8_t *data, uint32_t size)
                                     { m_gs.processGIFPacket(data, size); });
     m_memory.setGifArbiter(&m_gifArbiter);
+#if defined(PS2X_G777_NATIVE_GL)
+    dc2_g778::liveGs=&m_gs;
+#endif
     m_memory.setVu1MscalCallback([this](uint32_t startPC, uint32_t itop)
                                  {
                                      // G297 MTVU: hand the kick to the VU1 worker (default-off).

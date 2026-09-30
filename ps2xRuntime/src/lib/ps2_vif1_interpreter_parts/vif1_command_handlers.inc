@@ -36,6 +36,8 @@
                              vif1_regs.top & 0x3FFu, vif1_regs.tops & 0x3FFu,
                              m_vu1MscalCallback ? 1u : 0u);
             }
+            ps2_dma::release(data);
+            ps2_dma::consumeThrough(data, pos); // VU queue waits do not own consumed source pages.
             if (m_vu1MscalCallback)
                 m_vu1MscalCallback(startPC, vif1_regs.itop);
             continue;
@@ -71,6 +73,7 @@
                              vif1_regs.top & 0x3FFu, vif1_regs.tops & 0x3FFu,
                              m_vu1MscntCallback ? 1u : 0u);
             }
+            ps2_dma::release(data);
             if (m_vu1MscntCallback)
                 m_vu1MscntCallback(vif1_regs.itop);
             continue;
@@ -80,7 +83,7 @@
             if (pos + 4 > sizeBytes)
                 break;
             uint32_t maskValue = 0;
-            std::memcpy(&maskValue, data + pos, sizeof(maskValue));
+            ps2_dma::read(&maskValue, data + pos, sizeof(maskValue));
             vif1_regs.mask = maskValue;
             pos += 4;
             continue;
@@ -89,7 +92,7 @@
         {
             if (pos + 16 > sizeBytes)
                 break;
-            std::memcpy(vif1_regs.row, data + pos, 16);
+            ps2_dma::read(vif1_regs.row, data + pos, 16);
             pos += 16;
             continue;
         }
@@ -97,7 +100,7 @@
         {
             if (pos + 16 > sizeBytes)
                 break;
-            std::memcpy(vif1_regs.col, data + pos, 16);
+            ps2_dma::read(vif1_regs.col, data + pos, 16);
             pos += 16;
             continue;
         }
@@ -113,7 +116,7 @@
             const uint32_t instructionCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
             const uint32_t mpgBytes = instructionCount * 8u;
             const uint32_t availableMpgBytes = (pos < sizeBytes) ? std::min<uint32_t>(mpgBytes, sizeBytes - pos) : 0u;
-            const G22XgkickScan xgkickScan = g22_scan_xgkick_ops(data + pos, availableMpgBytes, destAddr);
+            const G22XgkickScan xgkickScan = g22_scan_xgkick_ops(ps2_dma::borrow(data + pos, availableMpgBytes), availableMpgBytes, destAddr);
             if (vu1_trace_enabled() && (destAddr == kDc2ResidentVu1Pc || xgkickScan.count != 0u))
             {
                 const uint32_t traceIndex = s_g22MpgTraceCount.fetch_add(1u, std::memory_order_relaxed);
@@ -123,8 +126,8 @@
                     uint32_t firstUpper = 0u;
                     if (availableMpgBytes >= 8u)
                     {
-                        std::memcpy(&firstLower, data + pos, sizeof(firstLower));
-                        std::memcpy(&firstUpper, data + pos + 4u, sizeof(firstUpper));
+                        ps2_dma::read(&firstLower, data + pos, sizeof(firstLower));
+                        ps2_dma::read(&firstUpper, data + pos + 4u, sizeof(firstUpper));
                     }
                     std::fprintf(stderr,
                                  "[G22:mpg] n=%u streamSize=%u cmdPos=0x%x dest=0x%x num=%u instr=%u bytes=%u avail=%u xgkick=%u firstPc=0x%x firstIs=%u firstLower=0x%08x firstUpper=0x%08x headLower=0x%08x headUpper=0x%08x\n",
@@ -142,9 +145,10 @@
                     copyBytes = PS2_VU1_CODE_SIZE - destAddr;
                 if (pos + copyBytes <= sizeBytes)
                 {
-                    std::memcpy(m_vu1Code + destAddr, data + pos, copyBytes);
+                    ps2_dma::read(m_vu1Code + destAddr, data + pos, copyBytes);
                     dc2_g410_vu_code_written(m_vu1Code, destAddr, copyBytes);
-                    g297NoteVuWrite(true, destAddr, data + pos, copyBytes); // G301 MTVU ordered event
+                    ps2_dma::release(data);
+                    g297NoteVuWrite(true, destAddr, m_vu1Code + destAddr, copyBytes); // G301 MTVU ordered event
                 }
             }
             if (g22KickMode == G22Vu1KickMode::Upload &&
@@ -178,7 +182,7 @@
                                  pos - 4u, imm, m_vif1PendingPath2ImageQwc, pos);
                     for (uint32_t k = 0; k < 16u && pos + k * 4u + 4u <= sizeBytes; ++k)
                     {
-                        uint32_t dw = 0u; std::memcpy(&dw, data + pos + k * 4u, 4);
+                        uint32_t dw = 0u; ps2_dma::read(&dw, data + pos + k * 4u, 4);
                         std::fprintf(stderr, " %08x", dw);
                     }
                     std::fprintf(stderr, "\n");
@@ -194,9 +198,9 @@
                     uint64_t gifLo = 0u;
                     uint64_t gifHi = 0u;
                     if (pos + 8u <= sizeBytes)
-                        std::memcpy(&gifLo, data + pos, sizeof(gifLo));
+                        ps2_dma::read(&gifLo, data + pos, sizeof(gifLo));
                     if (pos + 16u <= sizeBytes)
-                        std::memcpy(&gifHi, data + pos + 8u, sizeof(gifHi));
+                        ps2_dma::read(&gifHi, data + pos + 8u, sizeof(gifHi));
                     const uint32_t nloop = static_cast<uint32_t>(gifLo & 0x7FFFu);
                     const uint32_t flg = static_cast<uint32_t>((gifLo >> 58u) & 0x3u);
                     const uint32_t nreg = static_cast<uint32_t>((gifLo >> 60u) & 0xFu);
@@ -208,8 +212,7 @@
                                  truncated ? 1u : 0u, m_vif1PendingPath2ImageQwc,
                                  nloop, flg, nreg, pre, prim,
                                  static_cast<unsigned long long>(gifHi));
-                    g136_log_qwords("directqw", g136Seq, pos, data + pos,
-                                    (sizeBytes > pos) ? (sizeBytes - pos) : 0u, qwCount);
+                    g136_log_qwords("directqw", g136Seq, pos, ps2_dma::borrow(data + pos, (sizeBytes > pos) ? (sizeBytes - pos) : 0u), (sizeBytes > pos) ? (sizeBytes - pos) : 0u, qwCount);
                 }
                 // PHASE F30: path2submit probe, retained only for explicit phase tracing.
                 if (phaseDiagnosticsEnabled())
@@ -219,7 +222,7 @@
                     if (n <= 12u || (n % 64u) == 0u)
                     {
                         uint64_t firstDw = 0u;
-                        std::memcpy(&firstDw, data + pos, sizeof(firstDw));
+                        ps2_dma::read(&firstDw, data + pos, sizeof(firstDw));
                         std::fprintf(stderr,
                                      "[F30:path2submit] n=%u qwc=%u hl=%u firstDw=0x%016llx\n",
                                      n, qwCount, directHl ? 1u : 0u,
@@ -235,9 +238,9 @@
                         uint64_t gifLo = 0u;
                         uint64_t gifHi = 0u;
                         if (pos + 8u <= sizeBytes)
-                            std::memcpy(&gifLo, data + pos, sizeof(gifLo));
+                            ps2_dma::read(&gifLo, data + pos, sizeof(gifLo));
                         if (pos + 16u <= sizeBytes)
-                            std::memcpy(&gifHi, data + pos + 8u, sizeof(gifHi));
+                            ps2_dma::read(&gifHi, data + pos + 8u, sizeof(gifHi));
                         std::fprintf(stderr,
                                      "[F512:vifdirect] n=%u streamSize=%u cmdOff=0x%x payloadOff=0x%x qwc=%u availQw=%u hl=%u truncated=%u pendingImage=%u gifLo=0x%016llx gifHi=0x%016llx\n",
                                      n, sizeBytes, pos - 4u, pos, qwCount, availableQw,
@@ -253,7 +256,7 @@
                 if (m_vif1PendingPath2ImageQwc != 0u)
                 {
                     const uint32_t chunkQw = std::min<uint32_t>(m_vif1PendingPath2ImageQwc, payloadQw);
-                    submitPath2ImageChunk(data + payloadPos, chunkQw, m_vif1PendingPath2DirectHl);
+                    submitPath2ImageChunk(ps2_dma::borrow(data + payloadPos, (chunkQw) * 16u), chunkQw, m_vif1PendingPath2DirectHl);
                     payloadPos += chunkQw * 16u;
                     payloadQw -= chunkQw;
                     m_vif1PendingPath2ImageQwc -= chunkQw;
@@ -265,9 +268,9 @@
 
                 if (payloadQw > 0u)
                 {
-                    submitGifPacket(GifPathId::Path2, data + payloadPos, payloadQw * 16u, !g95_defer_gif_enabled(), directHl);
+                    submitGifPacket(GifPathId::Path2, ps2_dma::borrow(data + payloadPos, payloadQw * 16u), payloadQw * 16u, !g95_defer_gif_enabled(), directHl);
 
-                    const uint32_t imageQw = gifImageQwcFromTag(data + payloadPos, payloadQw * 16u);
+                    const uint32_t imageQw = gifImageQwcFromTag(ps2_dma::borrow(data + payloadPos, payloadQw * 16u), payloadQw * 16u);
                     if (imageQw != 0u)
                     {
                         const uint32_t inlineImageQw = (payloadQw > 0u) ? (payloadQw - 1u) : 0u;
@@ -279,8 +282,8 @@
                                 if (s_g17setp.fetch_add(1u, std::memory_order_relaxed) < 8u)
                                 {
                                     uint64_t glo = 0u, ghi = 0u;
-                                    std::memcpy(&glo, data + payloadPos, 8);
-                                    if (payloadQw >= 1u) std::memcpy(&ghi, data + payloadPos + 8u, 8);
+                                    ps2_dma::read(&glo, data + payloadPos, 8);
+                                    if (payloadQw >= 1u) ps2_dma::read(&ghi, data + payloadPos + 8u, 8);
                                     const uint8_t flg = static_cast<uint8_t>((glo >> 58) & 0x3u);
                                     const uint8_t nreg = static_cast<uint8_t>((glo >> 60) & 0xFu);
                                     std::fprintf(stderr,
@@ -314,7 +317,7 @@
                     std::fprintf(stderr, "[G17:dump@cmd]");
                     for (uint32_t k = 0; k < 16u && g17LastOpcodePos + k * 4u + 4u <= sizeBytes; ++k)
                     {
-                        uint32_t dw = 0u; std::memcpy(&dw, data + g17LastOpcodePos + k * 4u, 4);
+                        uint32_t dw = 0u; ps2_dma::read(&dw, data + g17LastOpcodePos + k * 4u, 4);
                         std::fprintf(stderr, " %08x", dw);
                     }
                     std::fprintf(stderr, "\n");
@@ -323,7 +326,7 @@
                     std::fprintf(stderr, "[G17:dump@mscnt base=0x%x]", base);
                     for (uint32_t k = 0; k < 12u && base + k * 4u + 4u <= sizeBytes; ++k)
                     {
-                        uint32_t dw = 0u; std::memcpy(&dw, data + base + k * 4u, 4);
+                        uint32_t dw = 0u; ps2_dma::read(&dw, data + base + k * 4u, 4);
                         std::fprintf(stderr, " %08x", dw);
                     }
                     std::fprintf(stderr, "\n");
@@ -331,7 +334,7 @@
                     std::fprintf(stderr, "[G17:head]");
                     for (uint32_t k = 0; k < 48u && k * 4u + 4u <= sizeBytes; ++k)
                     {
-                        uint32_t dw = 0u; std::memcpy(&dw, data + k * 4u, 4);
+                        uint32_t dw = 0u; ps2_dma::read(&dw, data + k * 4u, 4);
                         std::fprintf(stderr, " %08x", dw);
                     }
                     std::fprintf(stderr, "\n");
@@ -354,7 +357,7 @@
                 static std::atomic<uint32_t> s_g25dir{0};
                 if (s_g25dir.fetch_add(1u, std::memory_order_relaxed) < 6u)
                 {
-                    uint32_t mw = 0u; std::memcpy(&mw, data + g17FirstMscalOff, 4);
+                    uint32_t mw = 0u; ps2_dma::read(&mw, data + g17FirstMscalOff, 4);
                     std::fprintf(stderr,
                                  "[G25:mscalswallow] DIRECT cmdPos=0x%x imm=0x%04x qwc=%u span=[0x%x,0x%x) mscalOff=0x%x mscalWord=0x%08x size=%u hl=%u\n",
                                  g17LastOpcodePos, imm, qwCount, g17LastOpcodePos, pos,
@@ -365,7 +368,7 @@
                     std::fprintf(stderr, "[G25:cmdctx base=0x%x]", base2);
                     for (uint32_t k = 0; k < 20u && base2 + k * 4u + 4u <= sizeBytes; ++k)
                     {
-                        uint32_t dw = 0u; std::memcpy(&dw, data + base2 + k * 4u, 4);
+                        uint32_t dw = 0u; ps2_dma::read(&dw, data + base2 + k * 4u, 4);
                         std::fprintf(stderr, " %08x", dw);
                     }
                     // The 16-command ring leading up to the swallow (oldest -> newest): the

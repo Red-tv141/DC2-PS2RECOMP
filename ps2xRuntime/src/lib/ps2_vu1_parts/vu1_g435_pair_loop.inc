@@ -2055,6 +2055,14 @@
             }
         }
 
+#if defined(PS2X_G775_DIAG)
+        // Observe after scalar readiness and lower flag visibility are prepared,
+        // before either slot executes. The accepted flag policy remains intact.
+        if(s_g777PairObserver)
+            s_g777PairObserver(currentPc,upper,lower,m_state,s_vuMacVisible,s_vuStatusVisible);
+        if(s_g777MemoryObserver && !iBit)
+            g777ObserveMemory(currentPc,lower,m_state.vi);
+#endif
         if (iBit)
         {
             std::memcpy(&m_state.i, &lower, 4);

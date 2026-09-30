@@ -60,7 +60,9 @@ bool PS2Runtime::initialize(const char *title)
             // G769 (measurement only): follow DC2_G769_VBLANK_US so the host present does not re-cap.
             const char *v = std::getenv("DC2_G769_VBLANK_US");
             const long us = v != nullptr ? std::strtol(v, nullptr, 10) : 0L;
-            SetTargetFPS((us >= 2000L && us <= 100000L) ? static_cast<int>(1000000L / us) : 60);
+            const char *uncapped = std::getenv("DC2_G775_UNCAPPED");
+            SetTargetFPS(uncapped && std::atoi(uncapped) == 1 ? 0 :
+                         ((us >= 2000L && us <= 100000L) ? static_cast<int>(1000000L / us) : 60));
         }
 
         return true;
@@ -220,6 +222,7 @@ bool PS2Runtime::loadELF(const std::string &elfPath)
         uint8_t *dest = destBase + physAddr;
         if (ph.filesz > 0u)
         {
+            ps2_dma::prepareWrite(dest, ph.filesz);
             file.seekg(static_cast<std::streamoff>(ph.offset), std::ios::beg);
             if (!file.read(reinterpret_cast<char *>(dest), ph.filesz))
             {

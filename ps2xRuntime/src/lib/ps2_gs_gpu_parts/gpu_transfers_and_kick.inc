@@ -60,6 +60,8 @@ extern void g242PrepareVramReadRect(uint8_t *vram,
                                     uint32_t w,
                                     uint32_t h);
 extern bool g242GuestDepthEnabled();
+extern void g144PrepareLocalHostReadRange(uint32_t bp, uint8_t bw, uint8_t psm,
+                                         uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 extern bool g289TryGpuLocalCopy(uint8_t *vram, uint32_t vramSize,
                                 uint32_t sbp, uint8_t sbw, uint8_t spsm,
                                 uint32_t ssax, uint32_t ssay,
@@ -513,6 +515,9 @@ void GS::performLocalToLocalTransfer()
 
 void GS::vertexKick(bool drawing)
 {
+#if defined(PS2X_G777_NATIVE_GL)
+    dc2_g778::gsConsume(m_prim.tme,m_prim.fst);
+#endif
     // G602: every default-off diagnostic that used to sit inline in this function now lives in
     // g602_gif_cold_outline.inc behind a `__declspec(noinline)` helper. Before that move MSVC gave
     // this function — called 24,569x per frame on `s05` — a prologue of 8 GPR pushes,
@@ -1693,10 +1698,14 @@ void GS::performLocalToHostToBuffer()
         }
     }
 
-    // G242: establish GS submission order first, then publish any persistent depth aliased by the
-    // source.  Keep the historical default-off path byte-for-byte unchanged.
-    if (g242GuestDepthEnabled())
-        g144FlushPendingUploadFrom(3); // G759: local->host read edge
+    // Local-to-host gathers guest bytes, including deferred display color. Submission and color
+    // publication must precede the gather independently of the optional G242 depth model.
+    // Without this edge a carried display can feed an old frame into a later host-to-local upload.
+    static const bool s_g774HostBarrier = !envFlagEnabled("DC2_G774_NO_HOST_BARRIER");
+    if (s_g774HostBarrier)
+        g144PrepareLocalHostReadRange(sbp, sbw, spsm, ssax, ssay, rrw, rrh);
+    else if (g242GuestDepthEnabled())
+        g144FlushPendingUploadFrom(3); // same-binary rollback of the color observer
     {
         // G432: the barrier is a blocking GPU->VRAM materialisation; time it apart from the gather.
         const uint64_t g432Px = static_cast<uint64_t>(rrw) * rrh;

@@ -1,3 +1,8 @@
+#if defined(PS2X_G777_NATIVE_GL)
+#define G778_GS_OVERWRITE(mask) dc2_g778::gsOverwrite(mask)
+#else
+#define G778_GS_OVERWRITE(mask) ((void)0)
+#endif
 // ============================================================================================
 // G650 (ROADMAP Priority 3) — COMPILED GIF/GS FRONT-END: the PACKED descriptor bodies, inlined
 // ============================================================================================
@@ -125,6 +130,7 @@ void g650GifReport()
               m_ctx[m_prim.ctxt & 1u].frame.fbp == 0x139u))                                         \
         {                                                                                          \
             m_curR = static_cast<uint8_t>((lo_) & 0xFF);                                            \
+            G778_GS_OVERWRITE(1u); \
             m_curG = static_cast<uint8_t>(((lo_) >> 32) & 0xFF);                                    \
             m_curB = static_cast<uint8_t>((hi_) & 0xFF);                                            \
             m_curA = static_cast<uint8_t>(((hi_) >> 32) & 0xFF);                                    \
@@ -145,6 +151,7 @@ void g650GifReport()
         std::memcpy(&m_curS, &g650sBits, 4);                                                        \
         std::memcpy(&m_curT, &g650tBits, 4);                                                        \
         std::memcpy(&m_curQ, &g650qBits, 4);                                                        \
+        G778_GS_OVERWRITE(6u); \
         if (m_curQ == 0.0f)                                                                         \
             m_curQ = 1.0f;                                                                          \
     } while (0)

@@ -91,6 +91,13 @@ public:
     }
 
     bool ready() const { return m_ready.load(std::memory_order_acquire); }
+    bool g782NativeReady() const {
+#if defined(PS2X_G777_NATIVE_GL)
+        return m_g782NativeReady.load(std::memory_order_acquire);
+#else
+        return false;
+#endif
+    }
 
     // G705: true only in fused mode, and only until the context has been adopted. One relaxed load
     // on the g178TryFlushGpu entry path once adoption has happened.
@@ -2004,6 +2011,8 @@ void main()
     }
 
 private:
+#include "g777_native_geometry_backend.inc"
+#include "g778_gpu_shadow.inc"
     // ===== G723: WHICH CALLER TAKES THE BLOCKING SUBMIT EDGE (default OFF, DC2_G723_SUB=1) =====
     //
     // WHY. `[G447:edge] backend-render` fires **44.3x/frame** on `dungeon1` while `[G415:stage]`
@@ -2498,6 +2507,10 @@ private:
         if (g665TranslatedBenchRequested())
             (void)g665RunTranslatedBench(m_f, m_e);
 #endif
+ #if defined(PS2X_G777_NATIVE_GL)
+        if(dc2_g778::nonblockingRequested() && !g782PrewarmNative())
+            std::fprintf(stderr,"[G782:prewarm] unavailable; native admissions disabled\n");
+ #endif
         glPixelStorei(GL_PACK_ALIGNMENT, 1);
         glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
         return true;
@@ -2520,6 +2533,9 @@ private:
     // the context; the caller releases and deletes the HGLRC itself.
     void destroyGlObjectsOnThisThread()
     {
+#if defined(PS2X_G777_NATIVE_GL)
+        g777Destroy();
+#endif
         for (auto &kv : m_fbos)
             destroyFbo(kv.second);
         m_fbos.clear();
@@ -10375,13 +10391,17 @@ void main()
             uploadedKeys.insert(up.key);
         }
 
+        size_t validatedVertexCount=b.verts.size();
+#if defined(PS2X_G777_NATIVE_GL)
+        if(b.g777Native && !b.g777Native->readGeometry)validatedVertexCount=b.g777Native->capacity;
+#endif
         for (const G178Draw &d : b.draws)
         {
             if (d.firstVtx < 0 || d.vtxCount <= 0 || (d.firstVtx % 3) != 0 ||
                 (d.vtxCount % 3) != 0 ||
-                static_cast<size_t>(d.firstVtx) > b.verts.size() ||
+                static_cast<size_t>(d.firstVtx) > validatedVertexCount ||
                 static_cast<size_t>(d.vtxCount) >
-                    b.verts.size() - static_cast<size_t>(d.firstVtx))
+                    validatedVertexCount - static_cast<size_t>(d.firstVtx))
                 return false;
             // G603: mode 6 is the display buffer's source-alpha subtractive combo
             // ((0-Cs)*As>>7 + Cd). It is admitted by the classifier only for fbp 0x0/0x68 under the
@@ -10576,6 +10596,10 @@ void main()
                      int depthReadY = 0, int depthReadRows = 0,
                      const G415ColorWindow &g415Window = G415ColorWindow{})
     {
+#if defined(PS2X_G777_NATIVE_GL)
+        if(b.g778Shadow)g778ShadowRaster(b,depthKey,depthUpload,depthY,depthRows);
+        if(b.g777Native && !g777Prepare(b))return false;
+#endif
         if (!validateBatchInputs(b, depthKey, depthUpload, depthY, depthRows))
             return false;
         // G415 stage census: attribute this batch's backend work to texture upload / FBO bind /
@@ -11196,6 +11220,14 @@ void main()
 #endif
 
         m_f.glUseProgram_(g560MultiDraw ? m_progG560 : m_prog);
+#if defined(PS2X_G777_NATIVE_GL)
+        std::vector<uint32_t> g778LiveBefore;std::vector<float> g778LiveBeforeZ;
+        const bool g778LiveProbe=g778LiveRasterSelected(b);
+        if(g778LiveProbe)g778ReadShadow(b.fboKey?b.fboKey:b.fbp,depthKey,b,g778LiveBefore,g778LiveBeforeZ);
+        if(b.g777Native){m_f.glBindVertexArray_(m_g777Vao);m_f.glBindBuffer_(GL158_ARRAY_BUFFER,m_g777Output);}
+        else
+#endif
+        {
         m_f.glBindVertexArray_(m_vao);
         m_f.glBindBuffer_(GL158_ARRAY_BUFFER, m_vbo);
         // G762 (default-off, DC2_G762_ZBIAS): move the shadow volume's Z before the upload, so the
@@ -11204,6 +11236,7 @@ void main()
         m_f.glBufferData_(GL158_ARRAY_BUFFER,
                           static_cast<GLsizeiptrLocal>(b.verts.size() * sizeof(G178Vtx)),
                           b.verts.data(), GL178_STREAM_DRAW);
+        }
         // G738: the per-batch prologue — four calls here plus the FBO bind, viewport,
         // glActiveTexture and glEnable(GL_SCISSOR_TEST) below, and the two/three uniform2f. At
         // 49.7 batches/frame this is ~500 calls/f that no census counted. One atomic per batch.
@@ -12108,7 +12141,31 @@ void main()
                     else if (g255RttAlpha)
                         mode |= 32;
                     g496Uniform1i(g496Uni, kG496UMode, locMode, mode, g496GlCache);
+#if defined(PS2X_G777_NATIVE_GL)
+                    if(b.g777Native && !b.g777Native->readGeometry){
+                        m_f.glBindBuffer_(0x8F3F,m_g779Indirect); // GL_DRAW_INDIRECT_BUFFER
+#if defined(PS2X_G684_HOT_DIAG)
+                        static const bool g780DrawCpu=std::getenv("DC2_G780_GLCPU")!=nullptr;
+                        const auto g780DrawStart=g780DrawCpu?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
+#endif
+                        g780GpuStamp(3);
+                        m_g779DrawArraysIndirect(GL_TRIANGLES,nullptr);
+                        g780GpuStamp(4);
+#if defined(PS2X_G684_HOT_DIAG)
+                        if(g780DrawCpu){
+                            static uint64_t n=0,ns=0;
+                            ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-g780DrawStart).count();
+                            if((++n%128u)==0u)std::fprintf(stderr,"[G780:drawcpu] n=%llu avgMs=%.3f\n",
+                                static_cast<unsigned long long>(n),double(ns)/1e6/n);
+                        }
+#endif
+                        m_f.glBindBuffer_(0x8F3F,0);
+                    }else
+#endif
                     glDrawArrays(GL_TRIANGLES, d.firstVtx, g560VtxCount);
+#if defined(PS2X_G777_NATIVE_GL)
+                    if(b.g777Native)++b.g777Native->gpuDraws;
+#endif
                     g496GlNoteN(kG738GlDraw, 1ull, 0ull);
                     g738DrawBallastIssue();
                 }
@@ -12243,6 +12300,14 @@ void main()
             }
         }
         g716TraceSurface(b, fbo.colorTex, 1);
+#if defined(PS2X_G777_NATIVE_GL)
+        if(g778LiveProbe){
+            std::vector<uint32_t> after;std::vector<float> afterZ;
+            g778ReadShadow(b.fboKey?b.fboKey:b.fbp,depthKey,b,after,afterZ);
+            if(after.size()==g778LiveBefore.size() && afterZ.size()==g778LiveBeforeZ.size())
+                g778LiveRasterFinish(b,g778LiveBefore,g778LiveBeforeZ,after,afterZ);
+        }
+#endif
         // G761 (default-off, DC2_G761_GPU_ZDUMP=<n>): the Map-125 shadow is a Z-pass stencil volume
         // accumulated into fbp 0x139, and its silhouette is 100 % the depth comparison. This is the
         // only place both operands exist — the batch's own FBO is still bound, so the colour
