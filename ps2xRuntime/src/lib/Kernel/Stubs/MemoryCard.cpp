@@ -1,5 +1,6 @@
 #include "Common.h"
 #include "MemoryCard.h"
+#include "ps2_dma_view.h"
 
 #include <cstdarg>
 
@@ -1366,6 +1367,7 @@ namespace ps2_stubs
             }
             else
             {
+                ps2_dma::prepareWrite(dst, static_cast<size_t>(size));
                 const size_t bytesRead = std::fread(dst, 1u, static_cast<size_t>(size), it->second.file);
                 result = std::ferror(it->second.file) ? kMcResultDeniedPermit : static_cast<int32_t>(bytesRead);
                 if (std::ferror(it->second.file))

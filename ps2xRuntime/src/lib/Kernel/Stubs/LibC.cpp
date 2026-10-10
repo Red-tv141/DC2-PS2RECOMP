@@ -1,6 +1,7 @@
 #include "Common.h"
 #include "LibC.h"
 #include "ps2_log.h"
+#include "ps2_dma_view.h"
 
 namespace ps2_stubs
 {
@@ -771,6 +772,7 @@ namespace ps2_stubs
 
         if (hostPtr && fp && size > 0 && count > 0)
         {
+            ps2_dma::prepareWrite(hostPtr, size_t(size) * count);
             items_read = ::fread(hostPtr, size, count, fp);
         }
         else

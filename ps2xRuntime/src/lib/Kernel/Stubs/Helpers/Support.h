@@ -1382,7 +1382,9 @@ namespace
         mem.writeIORegister(channelBase + 0x10u, madr);
         mem.writeIORegister(channelBase + 0x30u, tadr);
         mem.writeIORegister(channelBase + 0x00u, chcr);
-        mem.processPendingTransfers();
+        // VIF CHCR publishes a bounded immutable epoch. DMA send must not
+        // immediately fence the consumer it just posted.
+        if (channelBase == 0x1000A000u) mem.processPendingTransfers();
         if (s_f63)
         {
             const uint32_t n = s_f63Count.load(std::memory_order_relaxed);
@@ -1410,7 +1412,7 @@ namespace
                 if (it != kDmaChannelBases.end())
                 {
                     const uint32_t cause = static_cast<uint32_t>(std::distance(kDmaChannelBases.begin(), it));
-                    ps2_syscalls::queueDmacCompletionIrq(cause);
+                    if (cause != 1u) ps2_syscalls::queueDmacCompletionIrq(cause);
                 }
             }
         }
@@ -1489,6 +1491,8 @@ namespace
             }
         }
 
+        if (mode == 0 && channelBase == 0x10009000u)
+            runtime->memory().processPendingTransfers();
         const uint32_t chcr = runtime->memory().readIORegister(channelBase + 0x00u);
         const bool hwBusy = (chcr & 0x100u) != 0;
         return ((modelBusy || hwBusy) && mode != 0) ? 1 : 0;

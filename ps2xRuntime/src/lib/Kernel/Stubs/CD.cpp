@@ -3,6 +3,9 @@
 #include "ps2_iso_mount.h"
 #include "MPEG.h" // G375: notifyMpegCdStream{Start,Eof}
 
+// G793 mods (ps2_iso_mount.cpp): the data mount serves this disc path from the mods folder.
+bool dc2ModsOverridesDiscPath(const std::string &isoPath);
+
 namespace ps2_stubs
 {
     // F55: ISO9660-backed CD access. The guest InitCDFile@0x148F70 boot path
@@ -569,8 +572,26 @@ namespace ps2_stubs
         // (cheap existence check), then the mounted image (real LBN), and only
         // last the expensive registerCdFile fallbacks (its miss path walks the
         // ENTIRE cd-root tree recursively, which in this workspace stalls boot).
+        // G793 mods: a disc file the mods folder replaces -- and DATA.DAT itself once archive
+        // entries are replaced, which then live in sectors past its end -- must resolve through the
+        // data mount, never the host copy under the cd root.
+        static const bool s_modsEnabled = []() {
+            const char *v = std::getenv("DC2_MODS_ENABLED");
+            return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+        }();
+        bool modsOverride = false;
+        if (s_modsEnabled)
+        {
+            (void)dc2OpenGameDataSource();
+            std::string key = f55IsoMountKey(path);
+            std::transform(key.begin(), key.end(), key.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+            modsOverride = dc2ModsOverridesDiscPath(key);
+        }
+
         CdFileEntry entry;
         bool found = false;
+        if (!modsOverride)
         {
             std::error_code directEc;
             const std::filesystem::path direct = cdHostPath(path);

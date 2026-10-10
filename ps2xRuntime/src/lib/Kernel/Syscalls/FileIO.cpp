@@ -1,8 +1,12 @@
 #include "Common.h"
 #include "FileIO.h"
 #include "ps2_iso_mount.h"
+#include "ps2_dma_view.h"
 
 #include <cstdlib>
+
+// G793 mods (ps2_iso_mount.cpp): the data mount serves this disc path from the mods folder.
+bool dc2ModsOverridesDiscPath(const std::string &isoPath);
 
 namespace ps2_syscalls
 {
@@ -350,6 +354,26 @@ namespace ps2_syscalls
         const char *mode = translateFioMode(flags);
         RUNTIME_LOG("fioOpen: '" << hostPath << "' flags=0x" << std::hex << flags << std::dec << " mode='" << mode << "'");
 
+        // G793 mods: a disc file the mods folder replaces (or DATA.HD3/HD2, patched for replaced
+        // archive entries) is read through the data mount, not from the host copy under DATA/.
+        static const bool s_modsEnabled = []() {
+            const char *v = std::getenv("DC2_MODS_ENABLED");
+            return v != nullptr && *v != '\0' && std::strcmp(v, "0") != 0;
+        }();
+        if (s_modsEnabled && (flags & 3) == static_cast<int>(PS2_FIO_O_RDONLY))
+        {
+            const std::string isoPath = extractIsoPath(ps2Path);
+            uint32_t lba = 0, sz = 0;
+            if (!isoPath.empty() && isoFindFileForFio(isoPath.c_str(), &lba, &sz) &&
+                dc2ModsOverridesDiscPath(isoPath))
+            {
+                const int isoFd = allocateIsoFd(lba, sz);
+                std::cout << "[MODS] sceOpen(\"" << ps2Path << "\") served from the mods folder" << std::endl;
+                setReturnS32(ctx, isoFd);
+                return;
+            }
+        }
+
         FILE *fp = ::fopen(hostPath.c_str(), mode);
         if (!fp)
         {
@@ -554,6 +578,7 @@ namespace ps2_syscalls
         }
 
         size_t bytesRead = 0;
+        ps2_dma::prepareWrite(hostBuf, size);
         {
             std::lock_guard<std::mutex> lock(g_sys_fd_mutex);
             bytesRead = fread(hostBuf, 1, size, fp);
