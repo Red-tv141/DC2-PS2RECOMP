@@ -211,6 +211,12 @@ public:
     void reset();
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+#if defined(PS2X_G777_NATIVE_GL)
+    bool primeNativeWorldFace(uint32_t seq);
+    bool captureNativeE91F00(const std::shared_ptr<dc2_g778::Command>&,
+                             std::shared_ptr<const dc2_g778::G780NativeItem>&);
+    void rollbackNativeE91F00(const dc2_g778::G780NativeItem&);
+#endif
     void writeRegister(uint8_t regAddr, uint64_t value);
 
     const uint8_t *lockDisplaySnapshot(uint32_t &outSize);

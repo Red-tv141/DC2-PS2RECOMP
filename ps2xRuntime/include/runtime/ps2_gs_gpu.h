@@ -6,6 +6,7 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
+#include "ps2_gpu_presentation.h"
 
 enum GSPrimType : uint8_t
 {
@@ -225,6 +226,14 @@ public:
     void reset();
 
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
+#if defined(PS2X_G777_NATIVE_GL)
+    bool primeNativeWorldFace(uint32_t seq);
+    bool captureNativeE91F00(const std::shared_ptr<dc2_g778::Command>&,
+                             std::shared_ptr<const dc2_g778::G780NativeItem>&,
+                             bool deferPrim=false);
+    void commitNativeE91F00();
+    void rollbackNativeE91F00(const dc2_g778::G780NativeItem&);
+#endif
     void writeRegister(uint8_t regAddr, uint64_t value);
 
     const uint8_t *lockDisplaySnapshot(uint32_t &outSize);
@@ -236,6 +245,7 @@ public:
     }
     bool getPreferredDisplaySource(GSFrameReg &outSource, uint32_t &outDestFbp) const;
     void latchHostPresentationFrame();
+    dc2::gpu_present::FramePtr latchedGpuPresentationFrame() const;
     bool copyLatchedHostPresentationFrame(std::vector<uint8_t> &outPixels,
                                           uint32_t &outWidth,
                                           uint32_t &outHeight,
@@ -307,6 +317,7 @@ private:
     uint32_t m_preferredDisplayDestFbp = 0;
     bool m_hasPreferredDisplaySource = false;
     std::vector<uint8_t> m_hostPresentationFrame;
+    dc2::gpu_present::FramePtr m_gpuPresentationFrame;
     uint32_t m_hostPresentationWidth = 0;
     uint32_t m_hostPresentationHeight = 0;
     uint32_t m_hostPresentationDisplayFbp = 0;

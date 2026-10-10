@@ -89,19 +89,7 @@ inline constexpr uint32_t PS2_DIRECT_SPAN = PS2_DIRECT_HI - PS2_DIRECT_LO;
 // two rings would mean `formatDispatchHistory()` printed only the dispatches that happened to take
 // the slow path. `uint32_t wrapped` rather than `bool` so the struct is a trivially copyable POD
 // with no padding surprises.
-struct Ps2DispatchRing
-{
-    uint32_t pcs[64];
-    uint32_t next;
-    uint32_t wrapped;
-};
-
-// ⛔ NO INITIALISER, ON PURPOSE. A namespace-scope `thread_local` with no initialiser is
-// zero-initialised with NO dynamic init, so MSVC emits a plain TLS slot access. Give it a
-// constructor or a function-local `static` and MSVC inserts a per-ACCESS `_Init_thread_header`
-// epoch check instead -- the exact trap G619 measured and G649/G651 had to fix three times in this
-// same call chain (`g_g649HangTrace`, `s_g646DispatchOn`, `s_noPreempt`).
-extern thread_local Ps2DispatchRing g_ps2DispatchRing;
+#include "ps2_execution_tls.h"
 
 extern PS2Runtime::RecompiledFunction *g_ps2DirectTable; // nullptr until the first registration
 extern bool g_ps2DirectFast;                             // table live AND every observer dormant
@@ -270,7 +258,7 @@ inline PS2Runtime::RecompiledFunction ps2LookupDirect(PS2Runtime *runtime, uint3
 // exact "this function is never reached" shape rather than "reached 1 time in 100".
 //
 // Rollback: DC2_G739_NO_INLINE_PREEMPT=1.
-extern thread_local uint32_t g_ps2BackEdgeCounter;
+// g_ps2BackEdgeCounter is defined with the shared dispatch ring in ps2_execution_tls.h.
 extern bool g_ps2PreemptFast;
 // The interval the authority last computed. Relaxed atomic: on x86-64 a relaxed load is one `mov`,
 // so it costs what a plain global read costs while staying out of UB when several guest threads

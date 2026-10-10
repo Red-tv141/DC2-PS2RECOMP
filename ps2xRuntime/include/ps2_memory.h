@@ -1,5 +1,7 @@
 #ifndef PS2_MEMORY_H
 #define PS2_MEMORY_H
+#include <memory>
+namespace ps2_dma { class Arena; class Stream; class Transport; }
 
 #include <cstddef>
 #include <cstdint>
@@ -321,7 +323,11 @@ public:
     void processGIFPacket(const uint8_t *data, uint32_t sizeBytes);
     void processVIF1Data(uint32_t srcPhysAddr, uint32_t sizeBytes);
     void processVIF1Data(const uint8_t *data, uint32_t sizeBytes);
+    void processVIF1Data(const ps2_dma::Stream& stream);
+    template<class Input> void processVIF1Input(Input& data, uint32_t sizeBytes);
     void processPendingTransfers();
+    void waitVIF1();
+    void stopVIF1();
 
     int pollDmaRegisters();
 
@@ -338,6 +344,10 @@ public:
     const uint8_t *getGSVRAM() const { return m_gsVRAM; }
     bool hasSeenGifCopy() const { return m_seenGifCopy; }
     // Main RAM (32MB)
+    std::unique_ptr<ps2_dma::Arena> m_dmaRam;
+    std::unique_ptr<ps2_dma::Arena> m_dmaSpr;
+    std::unique_ptr<ps2_dma::Transport> m_vifTransport;
+    bool m_vifAsyncPending = false;
     uint8_t *m_rdram;
 
     // Scratchpad memory (16KB)
@@ -379,7 +389,7 @@ public:
 
     uint8_t *m_vu1Code = nullptr;
     uint8_t *m_vu1Data = nullptr;
-    bool m_path3Masked = false;
+    std::atomic<bool> m_path3Masked{false};
     std::vector<std::vector<uint8_t>> m_path3MaskedFifo;
 
     struct PendingTransfer
@@ -388,6 +398,7 @@ public:
         uint32_t srcAddr = 0;
         uint32_t qwc = 0;
         std::vector<uint8_t> chainData;
+        std::unique_ptr<ps2_dma::Stream> chainView;
     };
     std::vector<PendingTransfer> m_pendingGifTransfers;
     std::vector<PendingTransfer> m_pendingVif1Transfers;

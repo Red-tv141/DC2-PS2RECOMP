@@ -4,11 +4,19 @@
 #include <cstdint>
 
 class GS;
+#if defined(PS2X_G777_NATIVE_GL)
+#include <memory>
+namespace dc2_g778 {struct Command; struct G780NativeItem;}
+#endif
 
 class GSRasterizer
 {
 public:
     void drawPrimitive(GS *gs);
+#if defined(PS2X_G777_NATIVE_GL)
+    bool nativeE91F00(const dc2_g778::G780NativeItem&);
+    bool g782NativeEnvelopeEligible(const dc2_g778::G780NativeItem&);
+#endif
     void writePixel(GS *gs, int x, int y, uint8_t r, uint8_t g, uint8_t b, uint8_t a);
     uint32_t sampleTexture(GS *gs, float s, float t, float q, uint16_t u, uint16_t v);
     uint32_t readTexelPSMCT32(GS *gs, uint32_t tbp0, uint32_t tbw, int texU, int texV);
