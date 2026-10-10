@@ -145,6 +145,7 @@ static void f29_mgendframe_probe(uint8_t *rdram, R5900Context *ctx, PS2Runtime *
     // process, and the GL-worker censuses that needed a denominator had been counting readback
     // batches (8.12 real frames on `dungeon1`) instead. One more relaxed store per guest frame.
     g_dc2RenderedFrame.store(n, std::memory_order_relaxed);
+    dc2_g788_econ::report(n, g598_script_frame(n));
 
     // ===== G503: the fourth derivative probe, and the EE thread's first PC sampler =====
     //

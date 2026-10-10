@@ -693,7 +693,8 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
     // PHASE G385: trace the MSIN messages after the Phase-9 auto-stub bindings.
     applyDC2G385AudioTrace(runtime);
 #if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
-    if(dc2_g775_capture::tracking())
+    dc2_g783::startClock();
+    if(dc2_g775_capture::tracking() && !dc2_g783::off(dc2_g783::OffReg))
     {
         runtime.registerFunction(0x0013f4e0u,g775_mesh_draw_probe);
         runtime.registerFunction(0x001404d0u,g775_render_info_probe);
@@ -709,4 +710,21 @@ void applyDC2Phase9Stubs(PS2Runtime &runtime)
         }
     }
 #endif
+    // G785: draw-family census / ceiling harness. LAST registration: it chains to whatever is
+    // registered at each address by now (g785_family_ceiling.inc). Inert unless DC2_G785_* is set.
+    g785_register_families(runtime);
+    // G787: call-site (return-address) keyed outline probes; chains to G785 when both are armed.
+    g787_register_outline_probes(runtime);
+    // G788: whole-world native FixMDT seams (inert unless DC2_G788_WORLD is set); chains to all above.
+    g788_register(runtime);
+    g788_front_register(runtime);
+    g788_packet_register(runtime);
+    g788_ri_register(runtime);
+    g788_econ_register(runtime);
+    // G790: measurement-only RNG seed log/pin (inert unless DC2_G790_SEED / DC2_G790_SEED_LOG).
+    g790_seed_register(runtime);
+    // G791: native ShadowMDT (inert unless DC2_G791_SHADOW is set); chains to all above.
+    g791_register(runtime);
+    // G793: frame-rate modes (inert unless DC2_FRAMERATE=60|dynamic); chains to all above.
+    g793_register(runtime);
 }

@@ -1,3 +1,6 @@
+// G788 revision: 18 -- fail closed on zero-W draw state (force-recompile marker, G359 trap)
+#include "ps2_runtime_macros.h"
+#include "runtime/dc2_g788_economics.h"
 // G570 probe: force-recompile marker for spike-only per-frame thread/backend attribution.
 // G434 probe: force-recompile marker for [G434:inv] kick workload invariant.
 // PHASE9: DC2 ג€” Game override: binds all 173 missing stub addresses to their handlers.
@@ -7,6 +10,7 @@
 // ps2_stubs:: function at runtime, affecting only dc2.elf.
 
 #include "game_overrides.h"
+#include "runtime/dc2_g788_diagnostic.h"
 #include "runtime/dc2_g775_capture.h"
 #if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
 #include "runtime/dc2_native_draw.h"
@@ -39,6 +43,12 @@
 #include <thread>
 #include <mutex>
 #include <unordered_map>
+#include <unordered_set> // G788
+#include <map>           // G788
+#include <memory>        // G788
+#include <array>         // G788
+#include <limits>        // G791
+#include <xmmintrin.h>    // G791
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -605,8 +615,33 @@ extern void sndSqStop__Fii_0x18f6c0(uint8_t *rdram, R5900Context *ctx, PS2Runtim
 extern void sndSePlayV__FUiiii_0x18e080(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 extern void PlayEnvBgm__6CSceneFv_0x2a6840(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
 extern void SearchSndDataID__6CSceneFi_0x2a6c30(uint8_t *rdram, R5900Context *ctx, PS2Runtime *runtime);
+// G787: the native outline composite API at GLOBAL scope (shared with the GS / rasterizer TUs).
+#include "lib/ps2_g787_composite_api.inc"
+// G788: whole-world native FixMDT (markers, face jobs). GLOBAL scope, shared with the GS / rasterizer TUs.
+#include "lib/ps2_g788_world_api.inc"
+// G791: native ShadowMDT face ring + markers. GLOBAL scope, shared with the GS TU.
+#include "lib/ps2_g791_shadow_api.inc"
+#if defined(PS2X_G775_DIAG)
+void dc2_g791_expect(uint32_t seq, const uint8_t *bytes, size_t size); // G791 verify: lib/ps2_g791_shadow_oracle.inc
+#endif
+bool dc2_g788_econ_add_allowed(uint32_t bucket)
+{
+    return !(dc2_g778::requested() && dc2_g784::enabled(bucket));
+}
 namespace
 {
+static void g785_register_families(PS2Runtime &runtime); // G785: g785_family_ceiling.inc
+static void g787_register_outline_probes(PS2Runtime &runtime); // G787: g787_outline_composite.inc
+static void g788_register(PS2Runtime &runtime); // G788: g788_world_native.inc
+static void g788_packet_register(PS2Runtime &runtime);
+static void g788_packet_on_add(uint8_t*,R5900Context*);
+static void g788_front_register(PS2Runtime&);
+static void g788_front_on_add(uint8_t*,R5900Context*);
+static void g788_ri_register(PS2Runtime&);
+static void g788_econ_register(PS2Runtime &runtime);
+static void g790_seed_register(PS2Runtime &runtime); // G790: g790_seed_pin.inc
+static void g791_register(PS2Runtime &runtime);      // G791: g791_shadow_native.inc
+static void g793_register(PS2Runtime &runtime);      // G793: g793_dynamic_framerate.inc
 #if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
 static void g775_mesh_draw_probe(uint8_t*,R5900Context*,PS2Runtime*);
 static void g775_render_info_probe(uint8_t*,R5900Context*,PS2Runtime*);
@@ -658,7 +693,20 @@ namespace {
 #include "dc2_game_override_parts/g776_native_shadow.inc"
 #include "dc2_game_override_parts/g778_native_capture.inc"
 #include "dc2_game_override_parts/g775_native_capture.inc"
+#include "dc2_game_override_parts/g785_family_ceiling.inc"
+#include "dc2_game_override_parts/g787_outline_composite.inc"
+#include "dc2_game_override_parts/g788_world_native.inc"
+#include "dc2_game_override_parts/g788_packet_ceiling.inc"
+#include "dc2_game_override_parts/g788_front_stats.inc"
+#include "dc2_game_override_parts/g788_ri_ceiling.inc"
+#include "dc2_game_override_parts/g788_economics.inc"
+#include "dc2_game_override_parts/g790_seed_pin.inc"
+#include "dc2_game_override_parts/g791_shadow_native.inc"
+// g793_dynamic_framerate.inc revision: 9 (MSBuild misses .inc-only edits -- touch this line, G359)
+#include "dc2_game_override_parts/g793_dynamic_framerate.inc"
 }
+void dc2_g788_econ_memory(uint32_t n) { g788_econ::memory(n); }
+void dc2_g788_econ_front(uint32_t n,uint32_t sf) { g788_front::report(n,sf); }
 #include "dc2_game_override_parts/live_input_and_stubs.inc"
 
 // PHASE9: DC2 ג€” Register the Phase 9.3 stub override.

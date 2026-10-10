@@ -4,6 +4,8 @@ static void g778_capture_draw(dc2_g775_capture::Draw invocation,const uint8_t* r
     using namespace dc2_g775_capture;
     using namespace dc2_native;
     if(!dc2_g778::requested() || invocation.self!=0xe8b940 || invocation.vtable!=0x375140)return;
+    dc2_g778::G782CostScope g782Cost(dc2_g778::counters.g782CaptureNs,dc2_g778::counters.g782CaptureCalls,
+                                     dc2_g778::counters.g782CaptureMaxNs,dc2_g778::g782ReportRequested());
     DC2NativeDraw draw;draw.invocation=invocation.id;draw.frame=invocation.sf;draw.parent=invocation.parent;
     auto vectorAt=[&](uint32_t address){Vector value{};if(valid(address,16))std::memcpy(value.data(),ram+address,16);return value;};
     auto matrixAt=[&](uint32_t address){Matrix value{};for(uint32_t i=0;i<4;++i)value[i]=vectorAt(address+i*16);return value;};
@@ -28,12 +30,13 @@ static void g778_capture_draw(dc2_g775_capture::Draw invocation,const uint8_t* r
     static std::shared_ptr<const Mesh> cachedMesh;
     static uint64_t cachedVersion=0;
     uint64_t version=0;
-    {std::lock_guard<std::mutex> lock(mutex);auto source=meshSources.find(invocation.self);if(source==meshSources.end())return;version=source->second.version;}
+    {std::lock_guard<dc2_g783::ProfMutex> lock(mutex);auto source=meshSources.find(invocation.self);if(source==meshSources.end())return;version=source->second.version;}
     if(cachedMesh && cachedVersion==version)draw.geometry=cachedMesh;
     else {
+    ++dc2_g778::counters.g782MeshBuilds;
     auto mesh=std::make_shared<Mesh>();mesh->identity=invocation.self;
     {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::lock_guard<dc2_g783::ProfMutex> lock(mutex);
         const auto source=meshSources.find(invocation.self);
         const auto buckets=loadedBuckets.find(invocation.self);
         if(source==meshSources.end() || buckets==loadedBuckets.end())return;
@@ -78,22 +81,44 @@ static void g778_capture_draw(dc2_g775_capture::Draw invocation,const uint8_t* r
     for(const auto& face:mesh->faces){appendHash(&face.bucket,sizeof(face.bucket));appendHash(&face.batchCorners,sizeof(face.batchCorners));}
     cachedMesh=mesh;cachedVersion=version;draw.geometry=mesh;
     }
-    uint32_t corners=0;
-    for(const auto& face:draw.geometry->faces)if(face.bucket==0xe91f00){
-        if(face.topology!=3 || face.material!=4)return;corners+=uint32_t(face.indices.size());
-    }
     // Independently derived from all three authoritative G777 structured inputs.
-    // Reused heap addresses and unrelated FIX meshes never authorize this bucket.
-    if(corners!=534 || draw.materials.size()<=4 || draw.geometry->identity!=0xd0a5c285a3c92cb2ull)return;
-    auto command=std::make_shared<dc2_g778::Command>();
-    command->draw=std::make_shared<const DC2NativeDraw>(std::move(draw));
-    if(dc2_g778::nativeRequested())command->clipKnown=dc2_g778::finalClip(*command->draw,command->clip);
+    // Reused heap addresses and unrelated FIX meshes never authorize a bucket.
+    if(draw.geometry->identity!=0xd0a5c285a3c92cb2ull)return;
+    auto shared=std::make_shared<const DC2NativeDraw>(std::move(draw));
+    // G784: one Command per enabled FixMDT bucket, each checked against its contract row
+    // (material, source corners, topology). A bucket whose structured input disagrees stays legacy.
+    std::vector<std::shared_ptr<dc2_g778::Command>> created;
+    for(uint32_t index=0;index<dc2_g784::kBuckets.size();++index){
+        const auto* contract=dc2_g784::enabled(dc2_g784::kBuckets[index].bucket);
+        if(!contract)continue;
+        uint32_t corners=0,topology=0;bool ok=shared->materials.size()>contract->material;
+        for(const auto& face:shared->geometry->faces)if(face.bucket==contract->bucket){
+            if(face.material!=contract->material || (face.topology!=3 && face.topology!=4))ok=false;
+            topology|=1u<<face.topology;corners+=uint32_t(face.indices.size());
+        }
+        if(!ok || corners!=contract->corners || !topology || (topology&~contract->topologyMask)){
+            ++dc2_g784::counters[index].contractRefused;continue;
+        }
+        auto command=std::make_shared<dc2_g778::Command>();
+        command->draw=shared;command->bucket=contract->bucket;command->bucketIndex=index;
+        command->kicks=contract->kicks;command->deadline=dc2_g784::deadline(index);
+        if(dc2_g783::timelineOn()){command->g783Timeline=std::make_shared<dc2_g783::Timeline>();command->g783Timeline->capture=dc2_g783::ticks();
+            command->g783Timeline->bucket=command->bucket;command->g783Timeline->groupKicks=command->kicks;}
+        // CLIP authority is needed only when MTVU omits a suffix (deadline < kicks).
+        if(dc2_g778::nativeRequested())
+            command->clipKnown=command->deadline>=command->kicks ||
+                               dc2_g778::finalClip(*command->draw,command->bucket,command->clip) ||
+                               dc2_g784::vuCeiling(); // timing probe: CLIP exactness irrelevant
+        ++dc2_g784::counters[index].captures;
+        created.push_back(std::move(command));
+    }
+    if(created.empty())return;
     {
         std::lock_guard<std::mutex> lock(dc2_g778::commandsMutex);
         for(auto it=dc2_g778::commands.begin();it!=dc2_g778::commands.end();){
             if(it->second->finished || it->second->draw->frame+240<invocation.sf)it=dc2_g778::commands.erase(it);else ++it;
         }
-        dc2_g778::commands[invocation.id]=command;
+        for(auto& command:created)dc2_g778::commands[dc2_g778::commandKey(invocation.id,command->bucketIndex)]=std::move(command);
     }
     ++dc2_g778::counters.captures;
     dc2_g778::report(invocation.sf);

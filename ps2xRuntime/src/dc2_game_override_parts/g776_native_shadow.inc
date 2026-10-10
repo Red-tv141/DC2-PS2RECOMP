@@ -28,7 +28,7 @@ static void g776_native_shadow(dc2_g775_capture::Draw invocation,const uint8_t* 
     for(uint32_t i=0;i<materialCount;++i)draw.materials.push_back({vectorAt(materials+i*0x30),readWord(ram,materials+i*0x30+0x20)});
     auto mesh=std::make_shared<Mesh>();mesh->identity=invocation.self;
     {
-        std::lock_guard<std::mutex> lock(mutex);
+        std::lock_guard<dc2_g783::ProfMutex> lock(mutex);
         const auto source=meshSources.find(invocation.self);
         const auto buckets=loadedBuckets.find(invocation.self);
         if(source==meshSources.end() || buckets==loadedBuckets.end())return;

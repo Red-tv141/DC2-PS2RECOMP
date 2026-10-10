@@ -153,7 +153,9 @@ static bool dc2_phase_trace_enabled()
 // resets of the value, rather than a one-shot boot write.
 static void dc2_apply_60fps_patch(uint8_t *rdram)
 {
-    static const bool enabled = dc2_env_flag_enabled("DC2_PATCH_60FPS");
+    // G793: DC2_FRAMERATE (g793_dynamic_framerate.inc) owns mgFrameRate when it is set.
+    static const bool enabled = dc2_env_flag_enabled("DC2_PATCH_60FPS") &&
+                                std::getenv("DC2_FRAMERATE") == nullptr;
     if (!enabled)
         return;
     dc2_write_u32(rdram, 0x00376C50u, 0x00000001u);
@@ -368,6 +370,10 @@ static void g154_observe_frame(uint8_t *rdram,
                          frameMs / w,
                          static_cast<double>(frameCount - s_lastG144FrameCount) / w,
                          static_cast<unsigned>(s_watches.size()));
+#if defined(PS2X_G784_CENSUS)
+            if (dc2_g784::censusOn())
+                dc2_g784::censusReport(n);
+#endif
 
 #if defined(PS2X_G654_DIAG)
             // ⛔ G700: `[G654:layer]` — the instrument Rule 24 names as THE way to name the pole

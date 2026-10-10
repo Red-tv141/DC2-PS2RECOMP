@@ -318,6 +318,23 @@ static const std::vector<F40RStick> &f40_get_rstick_events()
             else if (*end == ':') { p = end + 1; }
             else break;
             uint8_t rx = 0x80u, ry = 0x80u;
+            // G793: raw recorded bytes "0xRX,0xRY" (replay_from_rec.py --raw-rstick), so a partial
+            // camera deflection replays as recorded instead of a full-speed turn.
+            if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X'))
+            {
+                const unsigned long rxv = std::strtoul(p, &end, 0);
+                if (end != p && *end == ',')
+                {
+                    const char *q = end + 1;
+                    const unsigned long ryv = std::strtoul(q, &end, 0);
+                    if (end != q)
+                    {
+                        rx = static_cast<uint8_t>(rxv & 0xFFu);
+                        ry = static_cast<uint8_t>(ryv & 0xFFu);
+                        p = end;
+                    }
+                }
+            }
             while (*p && *p != ';')
             {
                 while (*p == ' ' || *p == '\t') ++p;
