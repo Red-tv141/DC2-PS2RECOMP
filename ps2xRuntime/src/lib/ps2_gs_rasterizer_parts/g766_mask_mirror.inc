@@ -842,9 +842,11 @@ static bool g766TransientArmed(uint32_t fbp)
 }
 
 // Prologue: true = admitted, the caller skips g735TrnPub.
+// G786 diagnostic: g_g786TrnWhy (defined in g786_outline_graph.inc) = why the last admission returned false.
 static bool g766TransientSeedAdmit(uint32_t fbp)
 {
     s_g766Trn = G766TrnSeed{};
+    g_g786TrnWhy = 1u;
     if (!g766TrnSeedOn() || !g766OwnerOn() || !g766PullsAllowed() || !g766MaskMirOn() ||
         !g264On() || !g261WaveOn() || !g261AnyDirty() || g_g144List.empty() ||
         s_g716Authority ||
@@ -853,11 +855,17 @@ static bool g766TransientSeedAdmit(uint32_t fbp)
         // transient takeover can acquire later in this flush, so both remain excluded.
         (g700On() && (g700TransientTakeoverOn() || g700AnyLive())) ||
         g280AliasOn() || g351SplitOn())
+    {
+        g_g786TrnWhy = !g261AnyDirty() ? 2u : s_g716Authority ? 3u
+                     : (g700On() && (g700TransientTakeoverOn() || g700AnyLive())) ? 4u
+                     : (g280AliasOn() || g351SplitOn()) ? 5u : 1u;
         return false;
+    }
     const GSContext &c0 = g_g144List[0].ctx;
     const uint32_t fbw = c0.frame.fbw;
     if (c0.frame.fbp != fbp || fbw == 0u || fbw > 8u || c0.frame.psm != GS_PSM_CT32)
     {
+        g_g786TrnWhy = 6u;
         ++g_g766TrnRefuse;
         return false;
     }
@@ -869,6 +877,7 @@ static bool g766TransientSeedAdmit(uint32_t fbp)
     {
         if (e.ctx.frame.fbp != fbp || e.ctx.frame.fbw != fbw || e.ctx.frame.psm != GS_PSM_CT32)
         {
+            g_g786TrnWhy = 7u;
             ++g_g766TrnRefuse;
             return false;
         }
@@ -882,6 +891,7 @@ static bool g766TransientSeedAdmit(uint32_t fbp)
             (tme && g144IsPalettedPsm(e.ctx.tex0.psm)) ? g144ClutRange(e) : G144BlockRange{};
         if ((depth.active && !depth.range.valid) || (tme && !tex.valid))
         {
+            g_g786TrnWhy = 8u;
             ++g_g766TrnRefuse;
             return false;
         }
@@ -897,6 +907,8 @@ static bool g766TransientSeedAdmit(uint32_t fbp)
                 (depth.active && g144RangeOverlaps(r.range, depth.range)) ||
                 (clut.valid && g144RangeOverlaps(r.range, clut) && !g766SrcPagesCurrent(t, clut)))
             {
+                g_g786TrnWhy = (depth.active && r.range.valid && g144RangeOverlaps(r.range, depth.range))
+                                   ? 9u : 10u;
                 ++g_g766TrnRefuse;
                 return false;
             }
@@ -905,13 +917,17 @@ static bool g766TransientSeedAdmit(uint32_t fbp)
         }
     }
     if (!anyOverlap)
+    {
+        g_g786TrnWhy = 11u;
         return false;
+    }
     // Every dirty resident the transient surface overlaps must be able to take the write-back
     // mirror (whole CT32 texels only need the shape conjunct of g766TargetAdmits).
     const G144BlockRange win = g144RangeForRect(framePageBaseToBlock(fbp), GS_PSM_CT32, fbw, 0u,
                                                 0u, fbw * 64u, 512u);
     if (!win.valid)
     {
+        g_g786TrnWhy = 12u;
         ++g_g766TrnRefuse;
         return false;
     }
@@ -923,10 +939,12 @@ static bool g766TransientSeedAdmit(uint32_t fbp)
         if (r.fbw == 0u || r.fbw > 8u || r.fbW <= 0 || r.fbW > 512 ||
             r.fbW != static_cast<int>(r.fbw) * 64)
         {
+            g_g786TrnWhy = 13u;
             ++g_g766TrnRefuse;
             return false;
         }
     }
+    g_g786TrnWhy = 0u;
     s_g766Trn.armed = true;
     s_g766Trn.fbp = fbp;
     s_g766Trn.fbw = fbw;

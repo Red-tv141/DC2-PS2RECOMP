@@ -62,6 +62,12 @@ static void g713ParseFlushOpen()
         return;
     }
     G260Batch *b = g713TakeCarrier();
+    dc2_g788_econ::event(dc2_g788_econ::G144Entries,g_g713ParseList.size());
+    dc2_g788_econ::event(dc2_g788_econ::G144Batches);
+#if defined(PS2X_G784_CENSUS)
+    ++dc2_g784::parseBatchesPosted; // G784 census: flush edges on the parse thread
+    dc2_g784::parseEntriesPosted += g_g713ParseList.size();
+#endif
     b->entries.swap(g_g713ParseList);
     b->fbp = g_g713ParseFbp;
     b->wr = g_g260OpenWr;
@@ -176,8 +182,16 @@ static void g713ExecBatchImpl(void *p)
     if (g_g260Graph.size() > g_g260MaxGraph)
         g_g260MaxGraph = g_g260Graph.size();
     g713GiveCarrier(b);
-    if (g_g260Graph.size() > 96u)
-        g260ExecuteAll(kG260Runaway, true); // the shipped fail-safe cap, unchanged
+    // G785 GRAPH_CAP lever (timing probe, default = the shipped 96): execute the pending graph as soon
+    // as it holds more than K adopted batches -- a general, rendering-free form of the early execution
+    // point that explains the E91F00 native win (plans/phase-G785-ledger.md section 5).
+    static const size_t s_g785Cap = [] {
+        const char *v = std::getenv("DC2_G785_GRAPH_CAP");
+        const unsigned long k = v ? std::strtoul(v, nullptr, 0) : 96ul;
+        return size_t(k == 0ul ? 96ul : k);
+    }();
+    if (g_g260Graph.size() > s_g785Cap)
+        g260ExecuteAll(kG260Runaway, true); // the shipped fail-safe cap (96) unless G785 lowers it
 }
 
 // ---------------------------------------------------------------------------------------------

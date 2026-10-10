@@ -1903,6 +1903,49 @@ static bool g310PrepareLogical(bool &useLogical)
     return true;
 }
 
+// G786 verify (diagnostic, DC2_G786_VERIFY + a composite flush carrying a versioned-merge plan):
+// the G310 atlas page state over composite k's read rect, right after the consumer refresh — which
+// source each page was copied from (resident target / G700 slot / guest), its generation, and the
+// work RTT's own residency record. Explains a snapshot (= live W) that differs from the atlas.
+static void g786DiagAtlasPages(const G786Plan &p)
+{
+    static uint32_t s_printsW[2] = {0u, 0u};
+    uint32_t &s_prints = s_printsW[p.wfbp == 0x139u ? 0 : 1];
+    if (p.isS || p.n <= 0 || s_prints >= 24u)
+        return;
+    const G786Rect &r = p.rect[0];
+    if (!r.valid())
+        return;
+    ++s_prints;
+    const uint32_t P = p.wfbp - 0x139u;
+    std::array<G310DesiredPage, 128> desired{};
+    int seedTi = -1;
+    const bool okD = g310BuildDesired(desired, seedTi);
+    const int wti = g248TargetIndex(p.wfbp);
+    const G261Res *wr = wti >= 0 ? &g_g261Res[wti] : nullptr;
+    std::fprintf(stderr, "[G786:atlas] n=%u wfbp=%x wti=%d rect=(%d,%d)-(%d,%d) init=%d frozen=%d stale=%d desiredOk=%d "
+                         "wDirty=%d wDirty=%d..%d wCov=%d..%d wMir=%d pages:",
+                 s_prints, p.wfbp, wti, r.x0, r.y0, r.x1, r.y1, g_g310Initialized ? 1 : 0, g_g310Frozen ? 1 : 0,
+                 g_g310Stale ? 1 : 0, okD ? 1 : 0, wr ? (wr->dirty ? 1 : 0) : -1, wr ? wr->dirtyLo : 0,
+                 wr ? wr->dirtyHi : 0, wr ? wr->covLo : 0, wr ? wr->covHi : 0, wr ? (wr->mirPending ? 1 : 0) : -1);
+    for (int py = std::max(0, r.y0) / 32; py <= std::min(511, r.y1) / 32; ++py)
+        for (int px = std::max(0, r.x0) / 64; px <= std::min(511, r.x1) / 64; ++px)
+        {
+            const uint32_t idx = P + static_cast<uint32_t>(py) * 8u + static_cast<uint32_t>(px);
+            if (idx >= 128u)
+                continue;
+            const G310PageState &st = g_g310Pages[idx];
+            const G310DesiredPage &d = desired[idx];
+            const uint32_t blk = 0x2720u + idx * 32u;
+            std::fprintf(stderr, " %u:a%d/%d/g%llu,d%d/%d/g%llu,w%llu,o%d", idx, st.sourceTi, st.sourceSlot,
+                         (unsigned long long)st.sourceGen, d.sourceTi, d.sourceSlot,
+                         (unsigned long long)d.sourceGen,
+                         wti >= 0 ? (unsigned long long)g_g310TargetPageGen[wti][idx] : 0ull,
+                         g766ValidOwner(blk >> 5u));
+        }
+    std::fputc('\n', stderr);
+}
+
 // Invert one CT32 page's 2048 word positions once. PSMT8 bytes and CT32 pixels share physical
 // GS pages but NOT within-page geometry; the view therefore starts with the real AddressP8
 // result, then maps that byte through this exact CT32 inverse instead of assuming tile order.

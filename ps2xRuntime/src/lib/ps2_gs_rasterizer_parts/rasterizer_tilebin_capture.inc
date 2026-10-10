@@ -242,6 +242,11 @@
                 // rejected flush must find every surface's debt published. Under the late-prepare
                 // arm the top-of-flush publication no longer runs, so this is the edge that
                 // guarantees it. Inert unless DC2_G718_LATEPREP=1.
+                if (!g654FlushOk)
+                {
+                    g787ExpandListForCpu(); // G787: macro entries back to legacy sprites
+                    g788ExpandListForCpu(); // G788: native world faces back to legacy triangles
+                }
                 if (!g654FlushOk && g772ReplayResourceRuns(false))
                     return;
                 if (!g654FlushOk)
@@ -980,6 +985,8 @@
                     g_g144List.clear();
                     return;
                 }
+                g787ExpandListForCpu(); // G787: macro entries back to legacy sprites
+                g788ExpandListForCpu(); // G788: native world faces back to legacy triangles
                 if (g772ReplayResourceRuns(true))
                     return;
                 // ⭐ G718: same CPU-replay edge as the parallel closure above.
@@ -1228,6 +1235,8 @@
             G146PerfScope g146FlushScope(g_g146G144FlushMidNs, g_g146G144FlushMidCount);
             g144DoFlush();
         };
+        if (g_g788Push.mode == 3u && !deferrable144)
+            return; // G788 capture-only primer must never reach inline raster or an executor call.
         if (deferrable144)
         {
             if (g286Transient)
@@ -1507,6 +1516,12 @@
             // Rollback: DC2_G510_NO_CAPMOVE=1. Paired gate: DC2_G419_AB=capmove | g510both.
             g521ReportEntrySize(); // G521: one-shot layout report, inert unless DC2_G521_SIZE=1
 #if !DC2_G521_INPLACEARM
+            // G787: a regenerated composite sprite becomes the call's macro entry (or is verified).
+            if (g_g787Push.mode != 0u)
+                g787OnPush(e);
+            // G788: a native world face's first kicked triangle becomes the face's macro entry.
+            if (g_g788Push.mode != 0u)
+                g788OnPush(e);
             // G713: `g713Open` is `g_g144List` unless the pipeline is armed (see g713_pipe_types).
             if (g510CapMoveActive())
                 g713Open.push_back(std::move(e));
@@ -1623,5 +1638,6 @@
         return;
     }
 
+    if (g_g788Push.mode == 3u) return; // tile-bin capture disabled: reject the synthetic primer.
     s_g770InlineTail(this, gs, false); // G770-A: CPU raster only (no tile-bin edge on this path)
 }

@@ -131,6 +131,9 @@ static bool g459TriScissorStatOn()
 
 void GSRasterizer::drawPrimitive(GS *gs)
 {
+    // G788 oracle must precede G687's early return: compact capture is still a legacy kick.
+    if (g_g788Push.mode == 2u)
+        g788VerifyKick(gs->m_prim, gs->m_vtxQueue[0], gs->m_vtxQueue[1], gs->m_vtxQueue[2], gs->activeContext());
 #if defined(PS2X_G777_NATIVE_GL)
     if(dc2_g778::gsCommand && dc2_g778::statsRequested())++dc2_g778::counters.legacyPrimitives;
 #endif
@@ -138,7 +141,7 @@ void GSRasterizer::drawPrimitive(GS *gs)
 #include "g770_inline_tail.inc"
     // G687: one normal deferred triangle primes a fixed-state ST/RGBAQ/XYZF2 tag. Later strip
     // triangles take the compact capture path. Every diagnostic mode makes begin() decline.
-    if (g_g687PackedCaptureRunActive &&
+    if (g_g788Push.mode != 3u && g_g687PackedCaptureRunActive &&
         g687TryFastCapture(this, gs, gs->activeContext(), gs->m_prim, gs->m_texa,
                            gs->m_texclut, gs->m_pabe, gs->m_vtxQueue, gs->m_vram))
         return;

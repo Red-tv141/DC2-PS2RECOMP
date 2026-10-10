@@ -25,20 +25,37 @@ struct G720CpuStages
     Clock::time_point started{}, last{};
     uint64_t elapsed[Count]{};
     size_t entries;
+    // G785 (DIAGNOSTIC, DC2_G785_STAGE_CLASS=1): time EVERY flush and also book it into a batch
+    // class set by the flush (g785ClassifyBatch): 0 other, 1 a textured entry sampling the E91F00
+    // T8 page (tbp0 0x2820 inside the 0x141 RTT surface), 2 a native (G778/G784) batch, 3 a
+    // textured entry whose texture range lies in a page the GPU can own (RTT-aliased texture).
+    unsigned cls = 0;
+    static bool classOn()
+    {
+        static const bool value =
+            envFlagEnabled("DC2_G785_STAGE_CLASS") || envFlagEnabled("DC2_G786_OLCLASS");
+        return value;
+    }
 
-    explicit G720CpuStages(size_t count) : on(enabled()), entries(count)
+    explicit G720CpuStages(size_t count) : on(enabled() || classOn()), entries(count)
     {
         // Timestamp only a random 1/32 of flushes. Fixed-stride sampling would
         // alias the title's repeating target sequence. Keep all eight laps for
         // each selected flush so stage totals still conserve measured time.
-        if (on)
+        if (on && !classOn())
         {
             static uint32_t rng = 0x720a319du;
             rng ^= rng << 13; rng ^= rng >> 17; rng ^= rng << 5;
             on = (rng & 31u) == 0u;
         }
         if (on) started = last = Clock::now();
+        if (on && classOn())
+        {
+            rb0 = g_g786RbN.load(std::memory_order_relaxed);
+            rbUs0 = g_g786RbUs.load(std::memory_order_relaxed);
+        }
     }
+    uint64_t rb0 = 0, rbUs0 = 0; // G786: readbacks (colour + depth) issued inside this flush
     static bool enabled()
     {
         static const bool value = envFlagEnabled("DC2_G720_PROFILE");
@@ -65,6 +82,41 @@ struct G720CpuStages
         totalNs += static_cast<uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(last - started).count());
         for (unsigned i = 0; i != Count; ++i) totals[i] += elapsed[i];
+        if (classOn())
+        {
+            // G785: cumulative per-class totals, all flushes (sample rate 1). Executor thread only.
+            static uint64_t cN[4]{}, cEntries[4]{}, cTotal[4]{}, cStage[4][Count]{};
+            const unsigned c = cls < 4u ? cls : 0u;
+            ++cN[c];
+            cEntries[c] += entries;
+            static uint64_t cRb[4]{}, cRbUs[4]{};
+            cRb[c] += g_g786RbN.load(std::memory_order_relaxed) - rb0;
+            cRbUs[c] += g_g786RbUs.load(std::memory_order_relaxed) - rbUs0;
+            if (attempts % 512 == 0)
+                std::fprintf(stderr, "[G786:rb] rb0=%llu us0=%llu rb1=%llu us1=%llu rb2=%llu us2=%llu rb3=%llu us3=%llu\n",
+                             (unsigned long long)cRb[0], (unsigned long long)cRbUs[0],
+                             (unsigned long long)cRb[1], (unsigned long long)cRbUs[1],
+                             (unsigned long long)cRb[2], (unsigned long long)cRbUs[2],
+                             (unsigned long long)cRb[3], (unsigned long long)cRbUs[3]);
+            cTotal[c] += static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(last - started).count());
+            for (unsigned i = 0; i != Count; ++i) cStage[c][i] += elapsed[i];
+            if (attempts % 512 == 0)
+                for (unsigned k = 0; k != 4u; ++k)
+                    std::fprintf(stderr,
+                        "[G785:stage] cls%u n=%llu entries=%llu totalNs=%llu preflight=%llu "
+                        "resida=%llu residb=%llu resid=%llu clswin=%llu class=%llu fbz=%llu "
+                        "deps=%llu tex=%llu verts=%llu submit=%llu post=%llu\n",
+                        k, (unsigned long long)cN[k], (unsigned long long)cEntries[k],
+                        (unsigned long long)cTotal[k],
+                        (unsigned long long)cStage[k][Preflight], (unsigned long long)cStage[k][ResidA],
+                        (unsigned long long)cStage[k][ResidB], (unsigned long long)cStage[k][Resid],
+                        (unsigned long long)cStage[k][ClsWin], (unsigned long long)cStage[k][Class],
+                        (unsigned long long)cStage[k][Fbz], (unsigned long long)cStage[k][Deps],
+                        (unsigned long long)cStage[k][Tex], (unsigned long long)cStage[k][Verts],
+                        (unsigned long long)cStage[k][Submit], (unsigned long long)cStage[k][Post]);
+            return;
+        }
         if (attempts % 128 != 0) return;
         std::fprintf(stderr,
             "[G720:cpu] attempts=%llu accepted=%llu entries=%llu totalNs=%llu "

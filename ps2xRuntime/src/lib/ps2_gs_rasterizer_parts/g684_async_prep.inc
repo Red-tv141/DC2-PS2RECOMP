@@ -130,7 +130,8 @@ struct G684VertexChunk
 // before the single run crossing the two independently-built chunks can be fused again.
 static inline bool g684DrawStateEqual(const G178Draw &a, const G178Draw &b)
 {
-    return a.texKey == b.texKey && a.srcFbp == b.srcFbp &&
+    return a.g788Seq == 0u && b.g788Seq == 0u && // G788: a native world face never fuses
+           a.texKey == b.texKey && a.srcFbp == b.srcFbp &&
            a.blend == b.blend && a.tfx == b.tfx && a.tcc == b.tcc &&
            a.fge == b.fge && a.fogCol == b.fogCol &&
            a.depthFunc == b.depthFunc && a.depthWrite == b.depthWrite &&

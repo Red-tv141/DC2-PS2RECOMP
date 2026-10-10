@@ -45,6 +45,8 @@ int g476PageBumpArm();
 // in g419_ab_instrument.inc, which this TU includes 91 includes AFTER this file.
 int g595LineArm();
 int g595NoteMemoArm();
+// Existing initialized W rows, read only on the GS executor before a merge.
+static int g700VmergeInitializedRowHi(uint32_t fbp, uint32_t fbw, uint32_t psm);
 namespace
 {
 
@@ -2029,6 +2031,8 @@ namespace
         g260StatReport();
     }
 
+#include "g786_outline_graph.inc" // G786: outline pass-structure census / ceiling probes (diagnostic)
+
     // Execute the whole pending graph (closed batches then the open batch) strictly in
     // submission order. allowParallel selects the band-pool closure; callers pass false only
     // from contexts where the pool is not proven (non-pipelined frame boundary on the EE thread).
@@ -2042,6 +2046,7 @@ namespace
         ++g_g260ExecByCause[cause & 7];
         g770XTrace('E', static_cast<uint32_t>(cause), static_cast<uint32_t>(g_g260Graph.size()), 0u, 0u);
         g523NoteMergeHeadroom(); // G523: read-only, before any batch is consumed
+        g786OutlineGraphPass();  // G786: diagnostic census / probe rewrite (inert unless armed)
         static const bool s_seqEnv = (std::getenv("DC2_G144_SEQ") != nullptr);
         const std::function<void()> &fn =
             (allowParallel && !s_seqEnv && g_g144FlushFn) ? g_g144FlushFn : g_g144FlushSeqFn;
@@ -2070,6 +2075,7 @@ namespace
             g_g528Wr = &b.wr; // G528: scope the flush prologue to this batch (see the decls above)
             g_g528Rd = &b.rd;
             g_g712CurPrep = b.prep; // G712: this batch's prepared `class` pass, or nullptr
+            { const size_t g786I = static_cast<size_t>(&b - g_g260Graph.data()); g_g786Class = g786I < g_g786Tags.size() ? g_g786Tags[g786I] : 0u; g_g786CurPlan = (g786I < g_g786HasPlan.size() && g_g786HasPlan[g786I]) ? &g_g786Plans[g786I] : nullptr; }
             ++g_g260BatchesExecuted;
             g_g260EntriesExecuted += g_g144List.size();
             if (g178GpuOn() && !g261WaveOn())
@@ -2142,6 +2148,7 @@ namespace
             g_g528Wr = nullptr; // G528: the batch is no longer executing — fail closed again
             g_g528Rd = nullptr;
             g_g712CurPrep = nullptr;
+            g_g786CurPlan = nullptr; // G786: the plan belonged to this batch only
             g712PrepRelease(b.prep); // consumed (or bypassed) — recycle the record
             g_g144List.swap(b.entries);
             g_g260Pool.push_back(std::move(b.entries));

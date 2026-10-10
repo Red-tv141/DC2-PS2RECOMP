@@ -1223,6 +1223,30 @@ static int g700SurfaceFbW(uint32_t fbp)
 
 // Can this entry sample a G700 surface's FBO colour texture directly? Returns the surface's fbp
 // (a valid backend FBO key) or 0.
+// -2: existing resident/transient path, whose G786 snapshots are unchanged.
+// -1: a cold or layout-mismatched G700 candidate. Otherwise initialized coverage.
+static int g700VmergeInitializedRowHi(uint32_t fbp, uint32_t fbw, uint32_t psm)
+{
+    if (!g700On())
+        return -2;
+    const bool transient = g286TransientTarget(fbp) || g570Transient13dTarget(fbp) ||
+                           g586Transient141Target(fbp) || g587Transient15dTarget(fbp);
+    const bool candidate = fbp != 0u && fbp != 0x68u &&
+        ((g527DiscoveredTarget(fbp) && g248TargetIndex(fbp) < 0 && !transient) ||
+         (g700TransientTakeoverOn() && transient));
+    if (!candidate)
+        return -2;
+    if (fbp >= kG700VramPages)
+        return -1;
+    const uint8_t slot1 = g_g700BaseToSlot[fbp];
+    if (slot1 == 0u)
+        return -1;
+    const G700Surface &surface = g_g700Surf[slot1 - 1u];
+    return surface.live && surface.fbp == fbp && surface.fbw == fbw && surface.psm == psm &&
+                   surface.covLo == 0
+               ? surface.covHi : -1;
+}
+
 static inline uint32_t g700DirectSampleSrc(const G144Entry &e, uint32_t dstFbp)
 {
     // ⚠️ THIS RUNS PER ENTRY IN THE BIND LOOP — ~273 entries x 16.7 flushes = 4,560 calls/frame on
@@ -1291,6 +1315,10 @@ static inline uint32_t g700DirectSampleSrc(const G144Entry &e, uint32_t dstFbp)
     }
     if (s.covLo > 0 || s.covHi + 1 < maxV)
     {
+        static const bool rowTrace = envFlagEnabled("DC2_G786_SOURCE_TRACE");
+        if (rowTrace && g770XTraceActive())
+            std::fprintf(stderr, "[G786:row-refusal] w=%x rows=%d:%d neededHi=%d\n",
+                         s.fbp, s.covLo, s.covHi, maxV - 1);
         if (g700StatOn())
             g_g700BindRej[5].fetch_add(1u, std::memory_order_relaxed);
         return 0u;

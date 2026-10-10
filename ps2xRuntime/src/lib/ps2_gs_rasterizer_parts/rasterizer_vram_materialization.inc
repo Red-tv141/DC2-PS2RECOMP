@@ -1,9 +1,36 @@
 #include "g720_cpu_stages.inc"
 #include "g764_asset_texcache.inc"
 
+#if defined(PS2X_G777_NATIVE_GL)
+namespace { bool g782RangeMaybeGpuOwned(const G144BlockRange &r); } // g778_ordered_native.inc
+#endif
+// G785 (diagnostic, DC2_G785_STAGE_CLASS=1 only): which batch class this flush books into.
+static unsigned g785ClassifyBatch(const std::vector<G144Entry> &entries)
+{
+#if defined(PS2X_G777_NATIVE_GL)
+    if (dc2_g778::g780NativeDraw || !dc2_g778::g784RunEntries.empty())
+        return 2u;
+#endif
+    unsigned cls = 0u;
+    for (const G144Entry &e : entries)
+    {
+        if (!e.prim.tme)
+            continue;
+        if (e.ctx.tex0.tbp0 == 0x2820u && e.ctx.tex0.psm == GS_PSM_T8)
+            return 1u;
+#if defined(PS2X_G777_NATIVE_GL)
+        if (cls == 0u && g782RangeMaybeGpuOwned(g144TextureRange(e)))
+            cls = 3u;
+#endif
+    }
+    return cls;
+}
+
 static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t vramSize)
 {
     G720CpuStages g720Stages(g_g144List.size());
+    if (G720CpuStages::classOn())
+        g720Stages.cls = g786ClassOn() ? g_g786Class : g785ClassifyBatch(g_g144List);
     g324NoteObserver(0u); // next native flush is a G310/FBO state observer
     G324FlushDiag g324Diag{};
     const bool g324IsArmed = g324Armed();
@@ -201,6 +228,8 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const uint32_t fbp = g_g144List[0].ctx.frame.fbp;
     g766TransientReset(); // G766: a GPU-seeded transient is decided per flush, below
     const bool g286Transient = g286TransientTarget(fbp);
+    if (g720Stages.cls == 1u && g286Transient && g786ClassOn())
+        g720Stages.cls = 3u; // G786: silhouette on a G286 transient target
     const bool g570Transient13d = g570Transient13dTarget(fbp);
     const bool g586Transient141 = g586Transient141Target(fbp);
     const bool g587Transient15d = g587Transient15dTarget(fbp);
@@ -289,6 +318,24 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // GPU page pulls instead (g766_mask_mirror.inc). Rollback DC2_G766_NO_TRNSEED=1.
         if (!s_g524NoTrnMat && !g766TransientSeedAdmit(fbp))
             g735TrnPub(0u);
+        if (g786CensusOn())
+        {
+            ++g_g786TrnWhyN[g_g786TrnWhy & 15u];
+            const uint64_t g786N = g_g786TrnWhyN[0] + g_g786TrnWhyN[1] + g_g786TrnWhyN[2] + g_g786TrnWhyN[3] +
+                g_g786TrnWhyN[4] + g_g786TrnWhyN[5] + g_g786TrnWhyN[6] + g_g786TrnWhyN[7] + g_g786TrnWhyN[8] +
+                g_g786TrnWhyN[9] + g_g786TrnWhyN[10] + g_g786TrnWhyN[11] + g_g786TrnWhyN[12] + g_g786TrnWhyN[13];
+            if ((g786N % 2048u) == 0u)
+                std::fprintf(stderr, "[G786:trnwhy] n=%llu ok=%llu gate=%llu clean=%llu g716=%llu g700=%llu alias=%llu "
+                             "c0=%llu mixed=%llu range=%llu zres=%llu clut=%llu noov=%llu win=%llu geom=%llu\n",
+                             (unsigned long long)g786N, (unsigned long long)g_g786TrnWhyN[0],
+                             (unsigned long long)g_g786TrnWhyN[1], (unsigned long long)g_g786TrnWhyN[2],
+                             (unsigned long long)g_g786TrnWhyN[3], (unsigned long long)g_g786TrnWhyN[4],
+                             (unsigned long long)g_g786TrnWhyN[5], (unsigned long long)g_g786TrnWhyN[6],
+                             (unsigned long long)g_g786TrnWhyN[7], (unsigned long long)g_g786TrnWhyN[8],
+                             (unsigned long long)g_g786TrnWhyN[9], (unsigned long long)g_g786TrnWhyN[10],
+                             (unsigned long long)g_g786TrnWhyN[11], (unsigned long long)g_g786TrnWhyN[12],
+                             (unsigned long long)g_g786TrnWhyN[13]);
+        }
     }
     // ⭐ G718 TRNPUB probe (default OFF). The takeover deletes the sibling publication these four
     // contracts run before their framebuffer upload. Restore it, without restoring the contract,
@@ -1913,9 +1960,21 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     s_batch.texUploads.clear();
 #if defined(PS2X_G777_NATIVE_GL)
     G777NativeProbe g778NativeProbe;
-    const bool g778Synchronous=bool(dc2_g778::g780NativeDraw);
+    // G784: a native RUN (several committed buckets, one envelope each) chains one probe per entry.
+    std::array<G777NativeProbe,8> g784RunProbes;
+    const size_t g784RunCount=dc2_g778::g784RunEntries.size();
+    const bool g778Synchronous=bool(dc2_g778::g780NativeDraw) || g784RunCount!=0u;
     s_batch.g777Native=nullptr;
-    if(g778Synchronous){
+    if(g784RunCount!=0u){
+        if(g784RunCount!=g_g144List.size() || g784RunCount>g784RunProbes.size())return false;
+        for(size_t i=0;i<g784RunCount;++i){
+            auto& probe=g784RunProbes[i];
+            probe.draw=dc2_g778::g784RunEntries[i].draw.get();probe.bucket=dc2_g778::g784RunEntries[i].bucket;
+            probe.offsetX=g_g144List[i].ctx.xyoffset.ofx>>4;probe.offsetY=g_g144List[i].ctx.xyoffset.ofy>>4;
+            probe.live=true;probe.next=i+1<g784RunCount?&g784RunProbes[i+1]:nullptr;
+        }
+        s_batch.g777Native=&g784RunProbes[0];
+    }else if(g778Synchronous){
         g778NativeProbe.draw=dc2_g778::g780NativeDraw.get();
         g778NativeProbe.bucket=dc2_g778::g780NativeBucket;
         g778NativeProbe.offsetX=g_g144List[0].ctx.xyoffset.ofx>>4;
@@ -3756,7 +3815,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                 {
                     if (g766LazyMirOn())
                         g766MirrorFlushKey(0x139u); // G766: the logical atlas reads 0x139's FBOs
+                    // G786: a versioned-merge composite flush — the atlas refresh below also builds
+                    // each pending snapshot slot's atlas image (backend g786ReplicateAtlas).
+                    g_g786ReplReq = (g_g786CurPlan != nullptr && !g_g786CurPlan->isS) ? 1u : 0u;
                     (void)g310PrepareLogical(g310Ready);
+                    g_g786ReplReq = 0u;
+                    if (g_g786CurPlan != nullptr && !g_g786CurPlan->isS && g786VerifyRasterOn())
+                        g786DiagAtlasPages(*g_g786CurPlan); // G786 diagnostic
                     if (g310Ready)
                         g310Freeze.begin();
                     break;
@@ -6094,15 +6159,37 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     // Vertices + state-batched draw runs (submission order preserved — no sorting; blending
     // depends on order).
     const bool g684MergeDrawRuns = !g256ExactRttOn();
+    // G786: a versioned outline merge plan needs every entry's first vertex and no draw that
+    // spans two objects (ps2_g786_outline_api.inc); the build then runs serially.
+    const G786Plan *const g786Plan = g_g786CurPlan;
+    const bool g786RecVtx = g786Plan != nullptr;
+    static std::vector<int> s_g786EntryVtx;
+    static std::vector<uint8_t> s_g786Bound;
+    if (g786RecVtx)
+    {
+        s_g786EntryVtx.assign(g_g144List.size(), 0);
+        s_g786Bound.assign(g_g144List.size(), 0u);
+        for (int k = 0; k < g786Plan->n; ++k)
+        {
+            if (g786Plan->a[k] < g_g144List.size())
+                s_g786Bound[g786Plan->a[k]] = 1u;
+            if (!g786Plan->isS && g786Plan->b[k] < g_g144List.size())
+                s_g786Bound[g786Plan->b[k]] = 1u;
+        }
+    }
     const auto g684BuildVertexRange =
         [&](size_t begin, size_t end, std::vector<G178Vtx> &g684Verts,
             std::vector<G178Draw> &g684Draws, size_t &g684FirstEntry) {
-    for (size_t i = begin; i < end; ++i)
-    {
+    // G787 §9: the macro being expanded (draw-collapse lever + census), local to this build range.
+    G787MacroScratch g787Ms;
+    // G787: the per-entry body, run once per entry, or once per sprite of a native composite macro
+    // entry (`g787Cont` = a continuation sprite of the same entry: same state index, same draw run).
+    const auto g787BuildOne = [&](size_t i, const G144Entry &e, bool g787Cont) {
+        if (g786RecVtx && !g787Cont)
+            s_g786EntryVtx[i] = static_cast<int>(g684Verts.size());
         const G178EntryState &st = s_states[i];
         if (st.skip)
-            continue;
-        const G144Entry &e = g_g144List[i];
+            return;
         const int ofx = e.ctx.xyoffset.ofx >> 4;
         const int ofy = e.ctx.xyoffset.ofy >> 4;
         const int first = static_cast<int>(g684Verts.size());
@@ -6336,7 +6423,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
                     // sprite instead of letting the legacy `max(1,·)` expansion below force it to
                     // one pixel at the wrong place (that combination caused G366's page-row tear).
                     if (sx1 <= sx0 || sy1 <= sy0)
-                        continue;
+                        return;
                 }
                 else
                 {
@@ -6537,18 +6624,37 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             g624NoteBound(g406Round.flagsU, g406Round.flagsV,
                           g623SurfaceFbW(s_g261FboSrc[i]) > 0);
         }
-        if (g684MergeDrawRuns && !g684Draws.empty() &&
-            g178StateEqual(s_states[i], s_states[i - 1]) &&
-            (!g261HaveFboSrc || s_g261FboSrc[i] == s_g261FboSrc[i - 1]) &&
+        // G787 §9: a macro sprite's DEAD G406 fields (an axis without ROUND_DOWN never reads its
+        // origin or period in the shader) are canonicalised before the merge test; the census
+        // reads the raw record first. Mode 2 is the corrupting one-draw-per-macro ceiling.
+        if (g787Ms.in)
+        {
+            if (g787DrawCensusOn())
+                g787CensusSprite(g787Ms, g406Round);
+            if (g787CollapseMode() == 1)
+            {
+                const G406UvRoundInfo g787Raw = g406Round;
+                g787CanonG406(g406Round);
+                if (g787CVerifyOn())
+                    g787VerifyCanon(g787Ms, g787Raw, g406Round);
+            }
+        }
+        const bool g787IgnoreUv = g787Cont && g787CollapseMode() == 2;
+        // G787: a continuation sprite of the same macro entry has the same state and no G786 bound.
+        if (g684MergeDrawRuns && !g684Draws.empty() && g684Draws.back().g788Seq == 0u && // G788: never into a native face
+            !(g786RecVtx && s_g786Bound[i] != 0u && !g787Cont) &&
+            (g787Cont || g178StateEqual(s_states[i], s_states[i - 1])) &&
+            (g787Cont || !g261HaveFboSrc || s_g261FboSrc[i] == s_g261FboSrc[i - 1]) &&
             g684Draws.back().texKey == (g261Bound ? 0u : drawTexKey) &&
-            g684Draws.back().uvOriginX == g406Round.originX &&
-            g684Draws.back().uvOriginY == g406Round.originY &&
-            g684Draws.back().uvRoundU == g406Round.flagsU &&
-            g684Draws.back().uvRoundV == g406Round.flagsV &&
-            // G679: the exact-lattice period is per-sprite state the shader reads, so two sprites
-            // that disagree on it can no more merge than two that disagree on origin or flags.
-            g684Draws.back().uvPeriodU == g406Round.periodU &&
-            g684Draws.back().uvPeriodV == g406Round.periodV &&
+            (g787IgnoreUv ||
+             (g684Draws.back().uvOriginX == g406Round.originX &&
+              g684Draws.back().uvOriginY == g406Round.originY &&
+              g684Draws.back().uvRoundU == g406Round.flagsU &&
+              g684Draws.back().uvRoundV == g406Round.flagsV &&
+              // G679: the exact-lattice period is per-sprite state the shader reads, so two sprites
+              // that disagree on it can no more merge than two that disagree on origin or flags.
+              g684Draws.back().uvPeriodU == g406Round.periodU &&
+              g684Draws.back().uvPeriodV == g406Round.periodV)) &&
             // G675: a screen-space sprite and a triangle take different sampling and different
             // vertex X, so they must never merge into one draw record.
             g684Draws.back().screenSprite == (g675ScreenSprite ? 1u : 0u) &&
@@ -6558,6 +6664,35 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         }
         else
         {
+            // G787 §9 census: the first failing conjunct of the predicate above, for a draw started
+            // inside a macro (head = the macro's first sprite, cont = a continuation sprite).
+            if (g787Ms.in && g787DrawCensusOn())
+            {
+                int r = kG787SplitEmpty;
+                if (g684MergeDrawRuns && !g684Draws.empty())
+                {
+                    const G178Draw &pv = g684Draws.back();
+                    if (g786RecVtx && s_g786Bound[i] != 0u && !g787Cont)
+                        r = kG787SplitBound;
+                    else if (!g787Cont && !g178StateEqual(s_states[i], s_states[i - 1]))
+                        r = kG787SplitState;
+                    else if (!g787Cont && g261HaveFboSrc && s_g261FboSrc[i] != s_g261FboSrc[i - 1])
+                        r = kG787SplitSrc;
+                    else if (pv.texKey != (g261Bound ? 0u : drawTexKey))
+                        r = kG787SplitTex;
+                    else if (!g787IgnoreUv && (pv.uvRoundU != g406Round.flagsU || pv.uvRoundV != g406Round.flagsV))
+                        r = kG787SplitFlags;
+                    else if (!g787IgnoreUv && (pv.uvOriginX != g406Round.originX || pv.uvOriginY != g406Round.originY))
+                        r = kG787SplitOrigin;
+                    else if (!g787IgnoreUv && (pv.uvPeriodU != g406Round.periodU || pv.uvPeriodV != g406Round.periodV))
+                        r = kG787SplitPeriod;
+                    else if (pv.screenSprite != (g675ScreenSprite ? 1u : 0u))
+                        r = kG787SplitScreen;
+                    else
+                        r = kG787SplitAdj;
+                }
+                ++g787Ms.split[g787Cont ? 1 : 0][r];
+            }
             G178Draw d{};
             d.firstVtx = first;
             d.vtxCount = count;
@@ -6590,6 +6725,83 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
             d.scX0 = st.scX0; d.scY0 = st.scY0; d.scX1 = st.scX1; d.scY1 = st.scY1;
             g684Draws.push_back(d);
         }
+    };
+    // G788: a native world face macro. The GPU path takes it as ONE placeholder draw (3 zero vertices
+    // in the batch VBO + the job); an FBO-bound texture source or FST cannot use the native vertex
+    // format, so those (and the corrupting-probe-free CPU fallback) expand into the exact legacy
+    // triangles from the CPU reference and run the per-entry body unchanged.
+    const auto g788BuildOne = [&](size_t i, const G144Entry &e) {
+        const G178EntryState &st = s_states[i];
+        if (st.skip)
+        {
+            if (g786RecVtx)
+                s_g786EntryVtx[i] = static_cast<int>(g684Verts.size());
+            return;
+        }
+        const bool g261Bound = g261HaveFboSrc && s_g261FboSrc[i] != 0u;
+        if (g261Bound || e.prim.fst)
+        {
+            g_g788C.xBound.fetch_add(1u, std::memory_order_relaxed);
+            g788ExpandEntry(e, [&](const G144Entry &t, bool cont) { g787BuildOne(i, t, cont); });
+            return;
+        }
+        if (g786RecVtx)
+            s_g786EntryVtx[i] = static_cast<int>(g684Verts.size());
+        const uint64_t drawTexKey =
+            (!s_g281ViewKey.empty() && s_g281ViewKey[i] != 0u)
+                ? s_g281ViewKey[i] : g622DrawKey(st.texKey);
+        const int first = static_cast<int>(g684Verts.size());
+        g684Verts.resize(g684Verts.size() + 3u, G178Vtx{});
+        if (g684FirstEntry == static_cast<size_t>(-1))
+            g684FirstEntry = i;
+        G178Draw d{};
+        d.firstVtx = first;
+        d.vtxCount = 3;
+        d.texKey = drawTexKey;
+        d.srcFbp = 0u;
+        d.blend = st.blend;
+        d.tfx = st.tfx;
+        d.tcc = st.tcc;
+        d.fge = st.fge;
+        if ((st.g766Atest & 0x8000u) != 0u)
+        {
+            d.tcc = static_cast<uint8_t>(d.tcc | ((st.g766Atest & 0x7Fu) << 1u));
+            d.fge = static_cast<uint8_t>(d.fge | (((st.g766Atest >> 7u) & 0xFu) << 1u));
+        }
+        d.fogCol = st.fogCol;
+        d.depthFunc = st.depthFunc;
+        d.depthWrite = st.depthWrite;
+        d.bilinear = st.bilinear;
+        d.wrapU = st.wrapU;
+        d.wrapV = st.wrapV;
+        d.scX0 = st.scX0; d.scY0 = st.scY0; d.scX1 = st.scX1; d.scY1 = st.scY1;
+        d.g788Seq = g788MacroSeq(e);
+        d.g788Flags = static_cast<uint8_t>((e.prim.tme ? 1u : 0u) | (e.prim.iip ? 2u : 0u));
+        d.g788Ofx = static_cast<uint16_t>(e.ctx.xyoffset.ofx >> 4);
+        d.g788Ofy = static_cast<uint16_t>(e.ctx.xyoffset.ofy >> 4);
+        g684Draws.push_back(d);
+        g_g788C.xMacros.fetch_add(1u, std::memory_order_relaxed);
+    };
+    for (size_t i = begin; i < end; ++i)
+    {
+        const G144Entry &g787E = g_g144List[i];
+        if (g788IsMacro(g787E))
+        {
+            g788BuildOne(i, g787E);
+            continue;
+        }
+        if (g787IsMacro(g787E))
+        {
+            const size_t g787D0 = g684Draws.size();
+            g787Ms = G787MacroScratch{};
+            g787Ms.in = true;
+            g787ExpandEntry(g787E, [&](const G144Entry &t, bool cont) { g787BuildOne(i, t, cont); });
+            g787Ms.in = false;
+            if (g787DrawCensusOn())
+                g787CensusMacro(g787Ms, g684Draws.size() - g787D0);
+            continue;
+        }
+        g787BuildOne(i, g787E, false);
     }
     };
 
@@ -6641,8 +6853,12 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     const int g684DecodeChunks =
         g684Async ? static_cast<int>(s_g684DecodeJobs.size()) : 0;
     const int g684TotalChunks = g684DecodeChunks + g684VertChunks;
-    const bool g684CoopPrep = g684TotalChunks >= 2 && s_g684ParallelVertsCpu &&
-                              GSRowPool::instance().laneCap() > 1;
+    // G786: a versioned-merge plan needs every entry's first vertex. The parallel build records them
+    // chunk-locally and they are rebased below when the chunks are appended, so a plan no longer
+    // forces the serial build (DC2_G786_NO_PARPLAN=1 restores it).
+    static const bool s_g786NoParPlan = envFlagEnabled("DC2_G786_NO_PARPLAN");
+    const bool g684CoopPrep = (g786Plan == nullptr || !s_g786NoParPlan) && g684TotalChunks >= 2 &&
+                              s_g684ParallelVertsCpu && GSRowPool::instance().laneCap() > 1;
     const bool g684ParallelVerts = g684CoopPrep && g684VertChunks >= 1;
 
     const auto g684AppendVertexChunk = [&](G684VertexChunk &chunk) {
@@ -6651,6 +6867,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         const bool mergeBoundary =
             g684MergeDrawRuns && !s_batch.draws.empty() && !chunk.draws.empty() &&
             tailFirst > 0u && tailFirst < s_states.size() &&
+            !(g786RecVtx && s_g786Bound[tailFirst] != 0u) && // never across a G786 object boundary
             g178StateEqual(s_states[tailFirst], s_states[tailFirst - 1u]) &&
             (!g261HaveFboSrc ||
              s_g261FboSrc[tailFirst] == s_g261FboSrc[tailFirst - 1u]) &&
@@ -6729,7 +6946,19 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         if (g684VertChunks >= 1)
         {
             for (int c = 0; c < g684VertChunks; ++c)
+            {
+                const int g786Base = static_cast<int>(s_batch.verts.size());
                 g684AppendVertexChunk(s_g684VertexChunks[static_cast<size_t>(c)]);
+                if (g786RecVtx) // rebase this chunk's entries' first vertices onto the batch
+                {
+                    const size_t e0 = static_cast<size_t>(s_g684PrepBounds[static_cast<size_t>(g684DecodeChunks + c)] -
+                                                          g684DecodeChunks);
+                    const size_t e1 = static_cast<size_t>(s_g684PrepBounds[static_cast<size_t>(g684DecodeChunks + c + 1)] -
+                                                          g684DecodeChunks);
+                    for (size_t e = e0; e < e1 && e < s_g786EntryVtx.size(); ++e)
+                        s_g786EntryVtx[e] += g786Base;
+                }
+            }
             g684HeadFirstEntry = s_g684VertexChunks[0].firstEntry;
         }
         else
@@ -6805,6 +7034,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
 #endif
 
     g720Stages.lap(G720CpuStages::Submit);
+    G786DirGuard g786Guard{g786Plan != nullptr};
+    if (g786Plan != nullptr)
+        g786ArmDirectives(*g786Plan, s_g786EntryVtx, g_g144List.size(),
+                          static_cast<int>(s_batch.verts.size()));
+    if (g786ClassOn() && (g720Stages.cls == 2u || g720Stages.cls == 1u || g720Stages.cls == 3u))
+        g786NoteDraws(g720Stages.cls, fbp, s_batch.fboKey, s_batch.draws, s_batch.skipReadback,
+                      s_batch.uploadFb);
     const auto g298T5 = s_g298Profile ? std::chrono::steady_clock::now()
                                       : std::chrono::steady_clock::time_point{};
 #if defined(PS2X_G654_DIAG)
@@ -7148,8 +7384,42 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         g767FoldArm(fbp, fbw, s_batch.fboKey != 0u ? s_batch.fboKey : fbp, g621PubLo, g621PubHi);
     if (g767Fold)
         s_batch.skipReadback = true;
+#if defined(PS2X_G777_NATIVE_GL)
+    // G784: a native run's envelopes are 3 placeholder vertices each, in entry order; the builder
+    // may have merged equal-state neighbours into one draw. Re-split to exactly one draw per entry
+    // (probe i <-> draws[i]); anything else is refused before any GPU side effect.
+    if (g784RunCount > 1u)
+    {
+        std::vector<G178Draw> g784Split;
+        g784Split.reserve(g784RunCount);
+        int g784Next = 0;
+        for (const G178Draw &d : s_batch.draws)
+        {
+            if (d.firstVtx != g784Next || d.vtxCount <= 0 || (d.vtxCount % 3) != 0)
+                return false;
+            for (int v = 0; v < d.vtxCount; v += 3)
+            {
+                G178Draw one = d;
+                one.firstVtx = d.firstVtx + v;
+                one.vtxCount = 3;
+                g784Split.push_back(one);
+            }
+            g784Next = d.firstVtx + d.vtxCount;
+        }
+        if (g784Split.size() != g784RunCount || s_batch.verts.size() != g784RunCount * 3u)
+            return false;
+        s_batch.draws.swap(g784Split);
+    }
+#endif
+    // G788: the native faces' job table (output ranges in draw order), after every draw-list rewrite.
+    // A batch carrying a native face is submitted synchronously (it never enters an async ring whose
+    // CPU-fallback record would hold macro entries).
+    g788BuildJobs(s_batch);
+    bool g788Batch = false;
+    for (const G178Draw &g788D : s_batch.draws)
+        if (g788D.g788Seq != 0u) { g788Batch = true; break; }
     bool submitted;
-    if (g305Async && !g778Synchronous)
+    if (g305Async && !g778Synchronous && !g788Batch)
     {
         submitted = g178_backend_submit_async(s_batch);
         if (submitted)
@@ -7180,7 +7450,7 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
         // without a promise round trip. Falls through to the blocking path when the ring is full
         // or the lever is not armed — which also drains it, since the queue is one FIFO.
         submitted = false;
-        if (!g275FuseReadback && s_batch.skipReadback && !g778Synchronous)
+        if (!g275FuseReadback && s_batch.skipReadback && !g778Synchronous && !g788Batch)
             // ⛔⛔⛔ G704: THE DEPTH EXTENSION WAS BUILT HERE AND REVERTED, AND THE REASON IS THE
             // RESULT. G700 §2.4 refused depth batches because the first draft COPIED the caller's
             // 850 KB `s_depthUpload` static per flush, and attributed its +3.3 ms/f to that copy.
@@ -7206,11 +7476,13 @@ static bool g178TryFlushGpu(GSRasterizer *self, GS *gs, uint8_t *vram, uint32_t 
     g766ConfirmWavePulls(g766Ti, s_g766Pulled); // G766: forget pulls that did not land
 #if defined(PS2X_G777_NATIVE_GL)
     if(g778Synchronous && submitted){
-        dc2_g778::counters.sourceUploadBytes+=g778NativeProbe.sourceUploadBytes;
-        if(g778NativeProbe.sourceUploadBytes)++dc2_g778::counters.cacheMisses;else ++dc2_g778::counters.cacheHits;
-        dc2_g778::counters.gpuDraws+=g778NativeProbe.gpuDraws;
-        dc2_g778::counters.cacheReplacements+=g778NativeProbe.cacheReplacements;
-        dc2_g778::counters.nativePrimitives+=g778NativeProbe.vertexCount/3;
+        for(const G777NativeProbe* p=s_batch.g777Native;p;p=p->next){
+            dc2_g778::counters.sourceUploadBytes+=p->sourceUploadBytes;
+            if(p->sourceUploadBytes)++dc2_g778::counters.cacheMisses;else ++dc2_g778::counters.cacheHits;
+            dc2_g778::counters.gpuDraws+=p->gpuDraws;
+            dc2_g778::counters.cacheReplacements+=p->cacheReplacements;
+            dc2_g778::counters.nativePrimitives+=p->vertexCount/3;
+        }
     }
 #endif
     if (submitted && !g766TransientConfirm())

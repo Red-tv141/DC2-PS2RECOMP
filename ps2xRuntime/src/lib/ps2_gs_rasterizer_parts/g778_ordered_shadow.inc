@@ -5,6 +5,8 @@ static void g778FlushExec()
     if(g260HasPending())g260ExecuteAll(kG260NonDef,true);
     if(!g_g144List.empty() && g_g144FlushFn)g_g144FlushFn();
 }
+// G785 EXECPOINT ablation: the native node's drain without a native draw (exec thread, G713 call node).
+static void g785ExecPoint(void*){g778FlushExec();}
 static void g778ExecShadow(void* value)
 {
     std::unique_ptr<G778ShadowJob> job(static_cast<G778ShadowJob*>(value));
