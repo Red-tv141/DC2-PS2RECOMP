@@ -1431,7 +1431,7 @@ namespace
         mem.writeIORegister(channelBase + 0x10u, madr);
         mem.writeIORegister(channelBase + 0x30u, tadr);
         mem.writeIORegister(channelBase + 0x00u, chcr);
-        mem.processPendingTransfers();
+        if (channelBase == 0x1000A000u) mem.processPendingTransfers();
 
         std::lock_guard<std::mutex> lock(g_dmaStubMutex);
         g_dmaPendingPolls[channelBase] = 1;
@@ -1486,6 +1486,8 @@ namespace
             }
         }
 
+        if (mode == 0 && channelBase == 0x10009000u)
+            runtime->memory().processPendingTransfers();
         const uint32_t chcr = runtime->memory().readIORegister(channelBase + 0x00u);
         const bool hwBusy = (chcr & 0x100u) != 0;
         return ((modelBusy || hwBusy) && mode != 0) ? 1 : 0;

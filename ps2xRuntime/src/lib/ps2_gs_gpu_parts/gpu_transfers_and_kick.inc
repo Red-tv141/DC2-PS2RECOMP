@@ -518,6 +518,9 @@ void GS::vertexKick(bool drawing)
 #if defined(PS2X_G777_NATIVE_GL)
     dc2_g778::gsConsume(m_prim.tme,m_prim.fst);
 #endif
+    // G788 VERIFY: drawing kicks vs ADC (XYZF3) vertices inside / between bracketed legacy faces.
+    if (const int g788Armed = g_g788VerifyArmed.load(std::memory_order_relaxed))
+        (drawing ? g_g788K.draw : g_g788K.noDraw)[g788Armed & 3].fetch_add(1u, std::memory_order_relaxed);
     // G602: every default-off diagnostic that used to sit inline in this function now lives in
     // g602_gif_cold_outline.inc behind a `__declspec(noinline)` helper. Before that move MSVC gave
     // this function — called 24,569x per frame on `s05` — a prologue of 8 GPR pushes,

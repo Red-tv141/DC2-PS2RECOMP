@@ -31,6 +31,7 @@ void PS2Memory::processVIF1Data(const ps2_dma::Stream& stream)
 template<class Input>
 void PS2Memory::processVIF1Input(Input& data, uint32_t sizeBytes)
 {
+    dc2_g788_econ::event(dc2_g788_econ::VifBytes,sizeBytes);
     G146PerfScope g146Scope(g_g146Vif1Ns);
     // G654 P17: the EXCLUSIVE, thread-keyed companion. `G146PerfScope` has no nesting guard, and
     // submitGifPacket - which opens the GIFsubmit scope - is reached from inside this body, so
@@ -304,17 +305,38 @@ void PS2Memory::processVIF1Input(Input& data, uint32_t sizeBytes)
         pos += 4;
 
 #if defined(PS2X_G777_NATIVE_GL)
-        if(cmd==0x6c010027u && dc2_g778::nativeRequested() && !g778Scope.active &&
-           dc2_g775_capture::vifDraw.self==0xe8b940 && dc2_g775_capture::vifDraw.bucket==0xe91f00){
+        if(cmd==0x6c010027u && !g778Scope.active && dc2_g775_capture::g783DiffOn() && dc2_g775_capture::narrowOn())
+            dc2_g775_capture::g783::noteHook(dc2_g775_capture::vifDraw);
+        // G784: the hook opens the FIRST face of any enabled E8B940 FixMDT bucket (contract row in
+        // dc2_g784_buckets.h). Later faces of the same group arrive while the scope is active.
+        const dc2_g784::NativeFixBucketContract* g784Row=
+            (cmd==0x6c010027u && dc2_g778::nativeRequested() && !g778Scope.active &&
+             dc2_g775_capture::vifDraw.self==dc2_g784::kMeshSelf && !dc2_g783::off(dc2_g783::OffHook))
+            ?dc2_g784::enabled(dc2_g775_capture::vifDraw.bucket):nullptr;
+        const bool g782=dc2_g778::nonblockingRequested();
+        if(g784Row && !g782 && g784Row->bucket!=0xe91f00u)g784Row=nullptr; // G778/G780 blocking path: E91F00 only
+        if(g784Row){
+            const uint32_t g784Index=uint32_t(dc2_g784::indexOf(g784Row->bucket));
+            auto& g784Count=dc2_g784::counters[g784Index];
+            ++g784Count.hooks;
+            dc2_g783::Scope g783(dc2_g783::VifHook);
+            dc2_g778::G782CostScope g782Hook(dc2_g778::counters.g782HookNs,dc2_g778::counters.g782HookCalls,
+                                             dc2_g778::counters.g782HookMaxNs,dc2_g778::g782ReportRequested());
             auto command=dc2_g778::find(dc2_g775_capture::vifDraw);
+            if(!command)++g784Count.noCommand;
+            dc2_g778::TransportShape g784Shape{};
             const auto contract=(vif1_regs.cycle==0x404u && vif1_regs.mode==0u)
-                ?dc2_g778::transportContract(sizeBytes,pos-4,dc2_g775_capture::vifDraw,
-                    [&](uint32_t offset,void* out,uint32_t bytes){ps2_dma::read(out,data+offset,bytes);})
+                ?dc2_g778::transportContract(sizeBytes,pos-4,dc2_g775_capture::vifDraw,g784Row->faces,g784Row->kicks,
+                    g784Row->internalDirect,
+                    [&](uint32_t offset,void* out,uint32_t bytes){ps2_dma::read(out,data+offset,bytes);},&g784Shape)
                 :dc2_g778::TransportContract{};
+            if(command && !contract.end)++g784Count.contractRefused;
             bool committed=false;
-            const bool g782=dc2_g778::nonblockingRequested();
             if(command && command->clipKnown && contract.end && m_vu1MscalCallback && m_vu1MscntCallback){
-                ps2_dma::release(data);g95DrainDeferredGif("G778-native-order");
+                command->interPrmode=g784Shape.prmodes!=0;command->prmode=g784Shape.prmode;
+                ps2_dma::release(data);
+                if(!g782 || (!dc2_g778::g782NoMarker() && !dc2_g778::g782NoDrain()))
+                    g95DrainDeferredGif("G778-native-order");
                 committed=g782
                     ?dc2_g778::orderedNativeNonblocking(dc2_g778::liveGs,command)
                     :dc2_g778::orderedNative(dc2_g778::liveGs,command);
@@ -323,6 +345,7 @@ void PS2Memory::processVIF1Input(Input& data, uint32_t sizeBytes)
                 command->transportEnd=contract.end;command->transportBytes=contract.unpackBytes;
                 command->vifBefore={(vif1_regs.stat>>7)&1u,vif1_regs.base,vif1_regs.ofst,
                     vif1_regs.tops,vif1_regs.itop,vif1_regs.cycle,vif1_regs.mode};
+                command->vifKicks=0;
                 if(!g782){
                     command->nativeCommitted.store(true,std::memory_order_release);
                     ++dc2_g778::counters.nativeCommands;
@@ -330,8 +353,8 @@ void PS2Memory::processVIF1Input(Input& data, uint32_t sizeBytes)
                 g778Scope.active=command;
             }else{
                 ++dc2_g778::counters.fallbackCommands;
-                if(dc2_g778::statsRequested())std::fprintf(stderr,"[G778:fallback] draw=%llu sf=%u captured=%u contract=%u cycle=%x mode=%u\n",
-                    (unsigned long long)dc2_g775_capture::vifDraw.id,dc2_g775_capture::vifDraw.sf,
+                if(dc2_g778::statsRequested())std::fprintf(stderr,"[G778:fallback] draw=%llu sf=%u bucket=%x captured=%u contract=%u cycle=%x mode=%u\n",
+                    (unsigned long long)dc2_g775_capture::vifDraw.id,dc2_g775_capture::vifDraw.sf,g784Row->bucket,
                     unsigned(bool(command)),unsigned(bool(contract.end)),vif1_regs.cycle,vif1_regs.mode);
             }
         }
@@ -540,14 +563,18 @@ void PS2Memory::processVIF1Input(Input& data, uint32_t sizeBytes)
 #if defined(PS2X_G777_NATIVE_GL)
             if(opcode==VIF_FLUSHA && g778Scope.active &&
                (g778Scope.active->g782Group || g778Scope.active->nativeCommitted.load())){
+                // G784: after m kicks of the group (MSCAL/MSCNT each latch TOP=TOPS, flip DBF, recompute
+                // TOPS) DBF = DBF0 ^ (m & 1) and TOP = the TOPS before the m-th kick. m = 13 is G778's form.
                 const auto& before=g778Scope.active->vifBefore;
-                const uint32_t dbf=before[0]^1u;
-                if(((vif1_regs.stat>>7)&1u)!=dbf || vif1_regs.base!=before[1] || vif1_regs.ofst!=before[2] ||
-                   vif1_regs.top!=(before[3]&0x3ffu) || vif1_regs.tops!=((before[1]+(dbf?before[2]:0u))&0x3ffu) ||
+                const uint32_t m=g778Scope.active->vifKicks;
+                const uint32_t dbf=before[0]^(m&1u);
+                const uint32_t topBefore=((m-1u)&1u)?((before[1]+((before[0]^1u)?before[2]:0u))&0x3ffu):(before[3]&0x3ffu);
+                if(!m || ((vif1_regs.stat>>7)&1u)!=dbf || vif1_regs.base!=before[1] || vif1_regs.ofst!=before[2] ||
+                   vif1_regs.top!=topBefore || vif1_regs.tops!=((before[1]+(dbf?before[2]:0u))&0x3ffu) ||
                    vif1_regs.itop!=before[4] || vif1_regs.itops!=(before[4]&0x3ffu) ||
                    vif1_regs.cycle!=before[5] || vif1_regs.mode!=before[6]){
                     ++dc2_g778::counters.transportFailures;
-                    std::fprintf(stderr,"[G778:transport] final VIF state disagrees with preserved 13 core transitions\n");std::abort();
+                    std::fprintf(stderr,"[G778:transport] VIF state disagrees with the preserved %u core transitions (bucket %x)\n",m,g778Scope.active->bucket);std::abort();
                 }
             }
 #endif
@@ -556,5 +583,9 @@ void PS2Memory::processVIF1Input(Input& data, uint32_t sizeBytes)
         else if (opcode == VIF_MSCAL || opcode == VIF_MSCALF)
         {
             g317_note_gif_fence((opcode == VIF_MSCAL) ? kG317VifMscal : kG317VifMscalf);
+#if defined(PS2X_G777_NATIVE_GL)
+            if (g778Scope.active)
+                ++g778Scope.active->vifKicks; // G784: kick parity for the FLUSHA transport check
+#endif
             if (opcode == VIF_MSCALF)
                 g95DrainDeferredGif("MSCALF-pre");

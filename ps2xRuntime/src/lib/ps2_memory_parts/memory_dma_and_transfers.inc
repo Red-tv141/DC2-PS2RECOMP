@@ -105,9 +105,9 @@
                     pt.srcAddr = srcAddr;
                     pt.qwc = qwCount;
                     if (channelBase == 0x1000A000)
-                        m_pendingGifTransfers.push_back(pt);
+                        m_pendingGifTransfers.push_back(std::move(pt));
                     else if (channelBase == 0x10009000)
-                        m_pendingVif1Transfers.push_back(pt);
+                        m_pendingVif1Transfers.push_back(std::move(pt));
                 };
 
                 uint32_t chcr = value;
@@ -141,6 +141,27 @@
                     const bool g503Pool = g503ChainPoolEnabled();
                     std::vector<uint8_t> chainBuf =
                         g503Pool ? g503AcquireChainBuf() : std::vector<uint8_t>();
+#if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
+                    dc2_g775_capture::Chain g775Chain;
+#endif
+                    static const bool g772Views = [] {
+#if defined(_WIN32)
+                        // G774: the G772 ownership experiment was rejected. Keep it opt-in.
+                        const char* v = std::getenv("DC2_G772_DMA_VIEW");
+                        const char* off = std::getenv("DC2_G772_NO_DMA_VIEW");
+                        return v && std::atoi(v) && !(off && std::atoi(off));
+#else
+                        return false;
+#endif
+                    }();
+                    // Diagnostic byte scanners retain their contiguous reference path.
+                    const bool g772UseView = g772Views && channelBase == 0x10009000u &&
+                        !g136_trace_enabled() && !g217TagVuEnabled() && g_g788Mode != 4;
+                    auto chainView = g772UseView ? std::make_unique<ps2_dma::Stream>() : nullptr;
+                    static const bool g772Verify = [] {
+                        const char* v = std::getenv("DC2_G772_DMA_VERIFY");
+                        return v && std::atoi(v);
+                    }();
                     const size_t g770Cap0 = chainBuf.capacity(); // G770-B census
                     const bool g136Enabled = g136_trace_enabled() && channelBase == 0x10009000u;
                     const uint32_t g136Packet = g136_target_packet();
@@ -194,7 +215,15 @@
                                 chunk = maxSz2 - src;
                             if (chunk == 0)
                                 break;
-                            chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
+                            if (chainView)
+                                chainView->append(scratch ? *m_dmaSpr : *m_dmaRam, src, chunk);
+                            if (!chainView || g772Verify)
+                            {
+#if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
+                                if(channelBase==0x10009000u)g775Chain.append(chainBuf.size(),src,chunk,scratch);
+#endif
+                                chainBuf.insert(chainBuf.end(), base2 + src, base2 + src + chunk);
+                            }
                             bytes -= chunk;
                             src += chunk;
                         }
@@ -217,7 +246,15 @@
                             return false;
 
                         // VIF1 packet helpers embed 8 bytes of VIF stream in the DMAtag's upper half.
-                        chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
+                        if (chainView)
+                            chainView->append(tagScratch ? *m_dmaSpr : *m_dmaRam, tagPhys + 8u, 8u);
+                        if (!chainView || g772Verify)
+                        {
+#if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
+                            if(channelBase==0x10009000u)g775Chain.append(chainBuf.size(),tagPhys+8u,8u,tagScratch);
+#endif
+                            chainBuf.insert(chainBuf.end(), localBase + tagPhys + 8u, localBase + tagPhys + 16u);
+                        }
                         if (phaseDiagnosticsEnabled())
                         {
                             static std::atomic<uint32_t> s_f31VifChainTagHi{0};
@@ -347,6 +384,9 @@
                         uint32_t id = static_cast<uint32_t>((tag >> 28) & 0x7);
                         const bool irq = ((tag >> 31) & 0x1ull) != 0ull;
                         uint32_t addr = static_cast<uint32_t>((tag >> 32) & 0x7FFFFFFF);
+#if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
+                        if(channelBase==0x10009000u)g775Chain.tag(physTag,id,tagQwc,addr,tagInSPR);
+#endif
                         ++tagsProcessed;
 
                         uint32_t dataAddr = 0;
@@ -523,6 +563,22 @@
                             }
                         }
 
+                        // G788 oracle: bracket the unmodified face REF in host staging only.
+                        // No guest packet allocation, CALL nesting, or DMA tag mutation. DIRECT
+                        // uses the existing ordered Path2 submission; the face's FLUSHA drains
+                        // its Path1 output before END. Non-verify arms do no map lookup.
+                        if(dc2_g788_econ::on() && g_g788Mode==3 && channelBase==0x10009000u && !tagInSPR && id==3u)
+                            dc2_g788_econ_observe_ref(physTag,tag);
+                        const uint32_t g788Face = g_g788Mode == 4 && channelBase == 0x10009000u &&
+                            !tagInSPR && id == 3u ? dc2_g788_takeRef(physTag, tag) : 0u;
+                        const auto g788Marker = [&](bool end) {
+                            const uint64_t words[4] = {0ull, 0x5000000100000000ull,
+                                0x8000ull | (1ull << 60), (0xC788ull << 48) | (1ull << 47) |
+                                (end ? 1ull << 46 : 0ull) | g788Face};
+                            const auto *bytes = reinterpret_cast<const uint8_t *>(words);
+                            chainBuf.insert(chainBuf.end(), bytes, bytes + sizeof(words));
+                        };
+                        if (g788Face) g788Marker(false);
                         if (hasPayload)
                         {
                             const bool vif1Chain = channelBase == 0x10009000u;
@@ -541,6 +597,7 @@
                         {
                             appendVif1TagHi(currentTagAddr, id, tagQwc, false);
                         }
+                        if (g788Face) g788Marker(true);
                         if (irq && tieEnabled)
                             endChain = true;
                         if (endChain)
@@ -572,7 +629,7 @@
                     chcr = (chcr & ~(0x3u << 4)) | ((asp & 0x3u) << 4);
                     m_ioRegisters[channelBase + 0x00] = chcr;
 
-                    if (!chainBuf.empty())
+                    if (!chainBuf.empty() || (chainView && !chainView->empty()))
                     {
                         g770NoteChain(chainBuf.size(), g770Cap0, chainBuf.capacity(),
                                       channelBase == 0x10009000u); // G770-B census (inert by default)
@@ -590,17 +647,45 @@
                                            "streamqw", g136Seq, 0u);
                         }
                         PendingTransfer pt;
+#if defined(PS2X_G775_DIAG) || defined(PS2X_G777_NATIVE_GL)
+                        if(channelBase==0x10009000u && !chainView)g775Chain.publish(chainBuf.data());
+#endif
                         pt.fromScratchpad = false;
                         pt.srcAddr = 0;
                         pt.qwc = 0;
                         pt.chainData = std::move(chainBuf);
+                        pt.chainView = std::move(chainView);
+                        if (pt.chainView && g772Verify)
+                            pt.chainView->setReference(std::move(pt.chainData));
                         if (channelBase == 0x1000A000)
                         {
                             m_pendingGifTransfers.push_back(std::move(pt));
                         }
                         else if (channelBase == 0x10009000)
                         {
-                            m_pendingVif1Transfers.push_back(std::move(pt));
+                            static const bool g772Async = [] {
+                                const char* v = std::getenv("DC2_G772_DMA_ASYNC");
+                                const char* off = std::getenv("DC2_G772_NO_DMA_ASYNC");
+                                return v && std::atoi(v) && !(off && std::atoi(off));
+                            }();
+                            if (pt.chainView && g772Async)
+                            {
+                                static const bool irq = [] { const char* v = std::getenv("DC2_G375_NO_DMAC_IRQ");
+                                    return !(v && v[0] && std::strcmp(v, "0")); }();
+                                if (irq && (chcr & 0x80u))
+                                    pt.chainView->setCompletion([] { ps2_syscalls::queueDmacCompletionIrq(1u); });
+                                // Older deferred submissions remain ordered before publication.
+                                if (!m_pendingGifTransfers.empty() || !m_pendingVif1Transfers.empty())
+                                    processPendingTransfers();
+                                if (!m_vifTransport)
+                                    m_vifTransport = std::make_unique<ps2_dma::Transport>(
+                                        [this](const ps2_dma::Stream& stream) { processVIF1Data(stream); });
+                                m_vifTransport->submit(std::move(pt.chainView));
+                                m_vifAsyncPending = true;
+                                if (g503Pool) g503ReleaseChainBuf(pt.chainData);
+                            }
+                            else
+                                m_pendingVif1Transfers.push_back(std::move(pt));
                         }
                         else if (g503Pool)
                         {

@@ -481,6 +481,11 @@ extern void g150_pipeline_wait_register_slot();
 
 bool PS2Memory::writeIORegister(uint32_t address, uint32_t value)
 {
+    if (m_vifAsyncPending && (address == 0x1000e010u ||
+        (address >= 0x10009000u && address < 0x10009080u)) &&
+        m_vifTransport && m_vifTransport->ready()) processPendingTransfers();
+    if ((address >= 0x10003000u && address < 0x10006000u) ||
+        (address >= 0x1000A000u && address < 0x1000A080u)) waitVIF1();
     if (isGsPrivReg(address))
     {
         m_ioRegisters[address] = value;

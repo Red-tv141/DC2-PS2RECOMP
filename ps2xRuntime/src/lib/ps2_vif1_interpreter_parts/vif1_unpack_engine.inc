@@ -1,3 +1,8 @@
+#if defined(PS2X_G775_DIAG)
+            // Producer UNPACK handler, including enqueue/copy work. This does
+            // not attribute later MTVU RAM replay to the producer.
+            dc2_g788_econ::Scope g788Unpack(dc2_g788_econ::VifUnpack);
+#endif
             // UNPACK semantics: NUM is 8-bit and NUM==0 means 256 vectors (writes).
             const uint32_t writeVectorCount = (num == 0u) ? 256u : static_cast<uint32_t>(num);
 

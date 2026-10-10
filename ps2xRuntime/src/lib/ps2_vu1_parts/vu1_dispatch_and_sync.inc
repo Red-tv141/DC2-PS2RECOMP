@@ -2123,6 +2123,9 @@ void VU1Interpreter::execLower(uint32_t instr, uint8_t *vuData, uint32_t dataSiz
 
             auto g96Submit = [&](const uint8_t *pkt, uint32_t bytes)
             {
+                // Count on the VU owner before MTVU capture/direct/memory routing.
+                // The memory submission seam misses the normal captured MTVU path.
+                dc2_g788_econ::event(dc2_g788_econ::Path1Bytes,bytes);
                 if (g_g541KickAddresses != nullptr)
                     g_g541KickAddresses->push_back(addr);
                 extern std::atomic<bool> g_dc2TitleRockScope;

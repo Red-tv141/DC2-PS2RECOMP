@@ -2,6 +2,7 @@ void VU1Interpreter::run(uint8_t *vuCode, uint32_t codeSize,
                          uint8_t *vuData, uint32_t dataSize,
                          GS &gs, PS2Memory *memory, uint32_t maxCycles)
 {
+    dc2_g775_diag::noteCoreRun();
     static const bool s_g141PerfOn = (std::getenv("DC2_PERF") != nullptr);
     static double s_g141Sum = 0.0;
     static uint32_t s_g141Win = 0u;

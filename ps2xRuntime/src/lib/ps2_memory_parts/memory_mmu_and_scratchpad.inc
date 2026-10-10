@@ -358,16 +358,19 @@ PS2Memory::PS2Memory()
 
 PS2Memory::~PS2Memory()
 {
+    m_vifTransport.reset();
+    m_pendingVif1Transfers.clear();
+    m_pendingGifTransfers.clear();
     if (m_rdram)
     {
-        delete[] m_rdram;
+        m_dmaRam.reset();
         m_rdram = nullptr;
     }
 
     if (m_scratchpad)
     {
         ps2SetScratchpadHostPtr(nullptr);
-        delete[] m_scratchpad;
+        m_dmaSpr.reset();
         m_scratchpad = nullptr;
     }
 
@@ -399,8 +402,8 @@ bool PS2Memory::initialize(size_t ramSize)
 {
     auto cleanup = [this]()
     {
-        delete[] m_rdram;
-        delete[] m_scratchpad;
+        m_dmaRam.reset();
+        m_dmaSpr.reset();
         delete[] iop_ram;
         delete[] m_gsVRAM;
         delete[] m_vu1Code;
@@ -414,8 +417,12 @@ bool PS2Memory::initialize(size_t ramSize)
         m_vu1Data = nullptr;
     };
 
+    m_vifTransport.reset();
+    m_pendingVif1Transfers.clear();
+    m_pendingGifTransfers.clear();
     cleanup();
     m_seenGifCopy = false;
+    m_vifAsyncPending = false;
     m_dmaStartCount.store(0, std::memory_order_relaxed);
     m_gifCopyCount.store(0, std::memory_order_relaxed);
     m_gsWriteCount.store(0, std::memory_order_relaxed);
@@ -429,11 +436,13 @@ bool PS2Memory::initialize(size_t ramSize)
     try
     {
         // Allocate main RAM
-        m_rdram = new uint8_t[ramSize];
+        m_dmaRam = std::make_unique<ps2_dma::Arena>(ramSize);
+        m_rdram = m_dmaRam->data();
         std::memset(m_rdram, 0, ramSize);
 
         // Allocate scratchpad
-        m_scratchpad = new uint8_t[PS2_SCRATCHPAD_SIZE];
+        m_dmaSpr = std::make_unique<ps2_dma::Arena>(PS2_SCRATCHPAD_SIZE);
+        m_scratchpad = m_dmaSpr->data();
         std::memset(m_scratchpad, 0, PS2_SCRATCHPAD_SIZE);
         ps2SetScratchpadHostPtr(m_scratchpad);
 

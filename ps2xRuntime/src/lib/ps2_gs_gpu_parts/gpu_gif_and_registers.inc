@@ -1,5 +1,10 @@
 void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
 {
+    dc2_g788_econ::event(dc2_g788_econ::GsPackets);
+#if defined(PS2X_G775_DIAG)
+    if (g791OracleCapturing()) // G791 verify: PATH1 bytes of an open shadow face
+        g791OracleCapture(data, sizeBytes);
+#endif
     // G654 P16: the GS-front tag walk, timed EXCLUSIVE of the image writer and the local->local
     // transfer nested inside it, so `[G147:gif] parserOther` can be split into work that is really
     // parsing and work that is a nested layer. Empty struct in the default build (rule 12c).
@@ -206,6 +211,7 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         uint32_t nreg = static_cast<uint32_t>((tagLo >> 60) & 0xF);
         if (nreg == 0)
             nreg = 16;
+        if(flg<=1u)dc2_g788_econ::event(dc2_g788_econ::GsRegisters,uint64_t(nloop)*nreg);
         ++g147Tags;
 
         bool pre = ((tagLo >> 46) & 1) != 0;
@@ -213,6 +219,18 @@ void GS::processGIFPacket(const uint8_t *data, uint32_t sizeBytes)
         {
             writeRegister(GS_REG_PRIM, (tagLo >> 47) & 0x7FF);
         }
+        // G787: a payload-less composite sprite tag whose (unused) REGS qword carries a native
+        // composite descriptor — every header register is applied, the payload is regenerated.
+        if (nloop == 0 && (tagHi >> 48) == kG787MarkerMagic)
+            g787OnTagMarker(this, tagHi);
+        // G788: a payload-less tag whose REGS carry a native world face job (the face geometry
+        // tag the EE replaced); every state DIRECT of the legacy node before it has been applied.
+        else if (nloop == 0 && (tagHi >> 48) == kG788MarkerMagic)
+            g788OnTagMarker(this, tagHi);
+        // G791: a payload-less tag whose REGS carry a native ShadowMDT face (its PATH1 bytes are parsed here)
+        // or, in a diagnostic build's verify mode, a face's begin / end oracle bracket.
+        else if (nloop == 0 && (tagHi >> 48) == kG791MarkerMagic)
+            g791OnTagMarker(this, tagHi);
 
         // G602: the descriptor list IS `tagHi`'s nibbles, so read them where they already are. The
         // old `uint8_t regs[16]` staging array cost 16 stores per tag AND was the only stack array
@@ -665,9 +683,37 @@ void GS::writeRegisterPacked(uint8_t regDesc, uint64_t lo, uint64_t hi)
 
 void GS::writeRegister(uint8_t regAddr, uint64_t value)
 {
+#if defined(PS2X_G775_DIAG) && defined(PS2X_G777_NATIVE_GL)
+    unsigned g788Stage=dc2_g788_econ::GsEnvParse;
+    bool g788State=false;
+    if(dc2_g788_econ::on()) {
+        switch(regAddr) {
+        case GS_REG_TEX0_1: case GS_REG_TEX0_2: case GS_REG_TEX1_1: case GS_REG_TEX1_2:
+        case GS_REG_CLAMP_1: case GS_REG_CLAMP_2:
+            g788Stage=dc2_g788_econ::GsMaterialParse;g788State=true;break;
+        case GS_REG_PRMODE: case GS_REG_PRMODECONT:
+            g788Stage=dc2_g788_econ::GsPmodeParse;g788State=true;break;
+        case GS_REG_TEXFLUSH:
+            g788Stage=dc2_g788_econ::GsFlushParse;g788State=true;break;
+        case GS_REG_FRAME_1: case GS_REG_FRAME_2: case GS_REG_ZBUF_1: case GS_REG_ZBUF_2:
+        case GS_REG_TEST_1: case GS_REG_TEST_2: case GS_REG_ALPHA_1: case GS_REG_ALPHA_2:
+        case GS_REG_FOGCOL: case GS_REG_XYOFFSET_1: case GS_REG_XYOFFSET_2:
+        case GS_REG_SCISSOR_1: case GS_REG_SCISSOR_2:
+            g788State=true;break;
+        }
+        if(g788State && g713OnExecThread())++g788Stage;
+    }
+    // Includes the ordinary state lock and any nested work. Global families;
+    // parser and executor spans remain separate, never summed as frame savings.
+    dc2_g788_econ::Scope g788Reg(g788Stage,true,g788State);
+#endif
     // G508: ~55.8k calls/frame, ~all of them nested inside processGIFPacket's own hold of this
     // same recursive mutex. See G508StateLock in gpu_bridge_and_latch_helpers.inc.
     G508StateLock lock(m_stateMutex);
+#if defined(PS2X_G777_NATIVE_GL)
+    if (dc2_g783::timelineOn() && !g713OnExecThread())
+        dc2_g783::noteRegWrite(regAddr);
+#endif
     // G602: the register census and the whole PHASE F30/F31 diagnostic preamble (three separate
     // tests of `phaseDiagnosticsEnabled()`, each a magic-static guard, on every one of ~55.8k calls
     // per frame) are now one gate plus one out-of-line call. The `interestingReg` /
@@ -915,6 +961,12 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         // G602: [F49:frame] moved out of line (g602_gif_cold_outline.inc).
         if (G602_GATE_RG_FRAME)
             g602ColdRegFrame(regAddr, ci, value, prev, m_ctx[ci].frame, m_prim.ctxt, m_bitbltbuf);
+#if defined(PS2X_G777_NATIVE_GL)
+        // G782: the G150 page set the nonblocking native contract tests texture authority against.
+        if (dc2_g778::nonblockingRequested() && !g713OnExecThread() && !dc2_g783::off(dc2_g783::OffGsNote))
+            dc2_g778::g782NoteTargetRegs(m_ctx[ci].frame.fbp, m_ctx[ci].frame.fbw,
+                                         m_ctx[ci].frame.psm, m_ctx[ci].zbuf);
+#endif
         break;
     }
     case GS_REG_ZBUF_1:
@@ -922,6 +974,11 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
     {
         int ci = (regAddr == GS_REG_ZBUF_2) ? 1 : 0;
         m_ctx[ci].zbuf = value;
+#if defined(PS2X_G777_NATIVE_GL)
+        if (dc2_g778::nonblockingRequested() && !g713OnExecThread() && !dc2_g783::off(dc2_g783::OffGsNote))
+            dc2_g778::g782NoteTargetRegs(m_ctx[ci].frame.fbp, m_ctx[ci].frame.fbw,
+                                         m_ctx[ci].frame.psm, m_ctx[ci].zbuf);
+#endif
         break;
     }
     case GS_REG_FBA_1:
@@ -971,6 +1028,12 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         m_trxdir = static_cast<uint32_t>(value & 0x3);
         m_hwregX = 0;
         m_hwregY = 0;
+#if defined(PS2X_G777_NATIVE_GL)
+        // G782: a local->local destination may become GPU-owned (G714 raw / G767 GPU l2l).
+        if (m_trxdir == 2u && dc2_g778::nonblockingRequested() && !g713OnExecThread() && !dc2_g783::off(dc2_g783::OffGsNote))
+            dc2_g778::g782NoteLocalCopy(m_bitbltbuf.dbp, m_bitbltbuf.dbw, m_bitbltbuf.dpsm,
+                                        m_trxpos.dsax, m_trxpos.dsay, m_trxreg.rrw, m_trxreg.rrh);
+#endif
         // G602: [F37:trxdir] moved out of line.
         if (G602_GATE_RG_QUALITY)
             g602ColdRegTrxdir(m_trxdir, m_bitbltbuf, m_trxreg);
@@ -1061,6 +1124,10 @@ void GS::writeRegister(uint8_t regAddr, uint64_t value)
         g_g364FogCol = static_cast<uint32_t>(value & 0x00FFFFFFu);
         break;
     case GS_REG_TEXFLUSH:
+        // G787 VERIFY: Begin2's header TEXFLUSH carries the shadow-oracle descriptor.
+        if ((value >> 48) == kG787MarkerMagic)
+            g787OnTexflushMarker(value);
+        break;
     case GS_REG_SCANMSK:
     case GS_REG_DIMX:
     case GS_REG_DTHE:

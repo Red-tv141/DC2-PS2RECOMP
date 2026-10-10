@@ -2,7 +2,8 @@
                 }
 
                 const bool autoProcessTransfers =
-                    (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) : true;
+                    (channelBase == 0x1000A000u) ? (m_gifPacketCallback || m_gifArbiter != nullptr) :
+                    (channelBase == 0x10009000u && !m_vifAsyncPending);
                 if (autoProcessTransfers)
                 {
                     processPendingTransfers();
@@ -27,8 +28,21 @@
     return false;
 }
 
+void PS2Memory::waitVIF1()
+{
+    if (m_vifTransport) m_vifTransport->fence();
+}
+
+void PS2Memory::stopVIF1()
+{
+    waitVIF1();
+    m_vifTransport.reset();
+}
+
 void PS2Memory::processPendingTransfers()
 {
+    waitVIF1(); // Guest-visible DMA completion, not GS/GPU completion.
+    const bool hadAsyncVif = m_vifAsyncPending;
     const bool hadGif = !m_pendingGifTransfers.empty();
     for (size_t idx = 0; idx < m_pendingGifTransfers.size(); ++idx)
     {
@@ -101,10 +115,13 @@ void PS2Memory::processPendingTransfers()
             g503ReleaseChainBuf(p.chainData);
     m_pendingGifTransfers.clear();
 
-    const bool hadVif1 = !m_pendingVif1Transfers.empty();
+    const bool hadVif1 = !m_pendingVif1Transfers.empty() || m_vifAsyncPending;
+    m_vifAsyncPending = false;
     for (auto &p : m_pendingVif1Transfers)
     {
-        if (!p.chainData.empty())
+        if (p.chainView)
+            processVIF1Data(*p.chainView);
+        else if (!p.chainData.empty())
         {
             uint32_t g136Seq = 0u;
             if (g136_trace_enabled())
@@ -220,6 +237,12 @@ void PS2Memory::processPendingTransfers()
         raiseDStatChannel(1u); // VIF1 channel
         m_ioRegisters[VIF1_CHANNEL + 0x00] &= ~0x100u;
         m_ioRegisters[VIF1_CHANNEL + 0x20] = 0;
+        // Async epochs queue their IRQ only after the consumer retires its pins.
+        // The copied/normal reference still completes here on the EE thread.
+        static const bool irq = [] { const char* v = std::getenv("DC2_G375_NO_DMAC_IRQ");
+            return !(v && v[0] && std::strcmp(v, "0")); }();
+        if (!hadAsyncVif && irq && (m_ioRegisters[VIF1_CHANNEL] & 0x80u))
+            ps2_syscalls::queueDmacCompletionIrq(1u);
     }
 }
 
@@ -417,11 +440,13 @@ static std::atomic<uint32_t> &g377SubmitOwner()
 
 void PS2Memory::submitGifPacket(GifPathId pathId, const uint8_t *data, uint32_t sizeBytes, bool drainImmediately, bool path2DirectHl)
 {
+    if (pathId == GifPathId::Path3) waitVIF1();
     G146PerfScope g146Scope(g_g146GifSubmitNs);
     G654LayerScope g654Scope(kG654LayerGifSubmit); // G654 P17, empty in the default build
 
     if (!data || sizeBytes < 16)
         return;
+
 
     // [G377] intermittent access violation during FMV playback faulted inside
     // GifArbiter::submit's source copy. Report (once per anomaly class) any submit whose
@@ -573,6 +598,13 @@ int PS2Memory::pollDmaRegisters()
 
 uint32_t PS2Memory::readIORegister(uint32_t address)
 {
+    // A nonblocking status poll must never turn into a subsystem fence. Retire
+    // completed epochs on the EE owner before exposing completion registers.
+    if (m_vifAsyncPending && (address == 0x1000e010u ||
+        (address >= 0x10009000u && address < 0x10009080u)) &&
+        m_vifTransport && m_vifTransport->ready())
+        processPendingTransfers();
+    if (address >= 0x10003000u && address < 0x10004000u) waitVIF1();
     if (isGsPrivReg(address))
     {
         if (uint64_t *reg = gsRegPtr(gs_regs, address))
@@ -618,6 +650,8 @@ uint32_t PS2Memory::readIORegister(uint32_t address)
         {
             if ((address & 0xFF) == 0x00)
             {
+                if (address == 0x10009000u && m_vifAsyncPending)
+                    return m_ioRegisters[address];
                 uint32_t channelStatus = m_ioRegisters[address] & ~0x100u;
                 m_ioRegisters[address] = channelStatus;
                 return channelStatus;

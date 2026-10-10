@@ -340,6 +340,11 @@ void VU1Interpreter::execute(uint8_t *vuCode, uint32_t codeSize,
     if(dc2_g778::bypassCore(m_state,false,startPC,itop)){g_g483LastRunCycles=0;return;}
     dc2_g778::observeCore(false);
 #endif
+#if defined(PS2X_G775_DIAG)
+    // Actual VU owner, after accepted native bypass. All program-0 families;
+    // this is a diagnostic upper envelope, not accepted-world-only work.
+    dc2_g788_econ::Scope g788Setup(dc2_g788_econ::VuSetup0,true,startPC==0u);
+#endif
     s_g65CurStartPC = startPC;
     s_g502Resume = false;   // G502: geometry kick (MSCAL)
     if (s_g215batch || s_g216clip || s_g216ForceGate || s_g217TagVu)

@@ -45,6 +45,10 @@
         else if (opcode == VIF_MSCNT)
         {
             g317_note_gif_fence(kG317VifMscnt);
+#if defined(PS2X_G777_NATIVE_GL)
+            if (g778Scope.active)
+                ++g778Scope.active->vifKicks; // G784: kick parity for the FLUSHA transport check
+#endif
             if (vu1_trace_enabled())
             {
                 const uint32_t n = s_f517Mscnt.fetch_add(1u, std::memory_order_relaxed);
@@ -190,8 +194,42 @@
             }
             if (qwCount > 0)
             {
+                if (g_g788Mode == 4 && qwCount == 1u)
+                {
+                    uint64_t g788TagHi = 0;
+                    ps2_dma::read(&g788TagHi, data + pos + 8u, 8u);
+                    dc2_g788_vifMarker(g788TagHi);
+                }
                 const bool directHl = (opcode == VIF_DIRECTHL);
                 const uint32_t originalQwCount = qwCount;
+#if defined(PS2X_G784_CENSUS)
+                // G784 census: the GS registers an E8B940 bucket's own DIRECTs write, and whether
+                // the DIRECT sits inside an open native group (between faces) or outside it.
+                if (dc2_g784::censusOn() && dc2_g775_capture::vifDraw.self == dc2_g784::kMeshSelf)
+                {
+                    const int g784B = dc2_g784::indexOf(dc2_g775_capture::vifDraw.bucket);
+                    static std::array<std::atomic<uint32_t>, 9> s_g784Logged{};
+                    if (s_g784Logged[g784B >= 0 ? size_t(g784B) : 8u].fetch_add(1u, std::memory_order_relaxed) < 64u)
+                    {
+                        uint64_t g784Tag[2]{};
+                        ps2_dma::read(g784Tag, data + pos, 16);
+                        char g784Buf[1024];
+                        int g784At = std::snprintf(g784Buf, sizeof(g784Buf),
+                            "[G784:direct] b=%s id=%llu sf=%u qw=%u inGroup=%u tag=%016llx:%016llx regs=",
+                            g784B >= 0 ? dc2_g784::kBuckets[size_t(g784B)].name : "none",
+                            (unsigned long long)dc2_g775_capture::vifDraw.id, dc2_g775_capture::vifDraw.sf, qwCount,
+                            g778Scope.active ? 1u : 0u, (unsigned long long)g784Tag[0], (unsigned long long)g784Tag[1]);
+                        for (uint32_t q = 1; q < qwCount && q < 16u && g784At > 0 && g784At < int(sizeof(g784Buf)) - 40; ++q)
+                        {
+                            uint64_t g784Ad[2]{};
+                            ps2_dma::read(g784Ad, data + pos + q * 16u, 16);
+                            g784At += std::snprintf(g784Buf + g784At, sizeof(g784Buf) - size_t(g784At), " %02llx=%016llx",
+                                                    (unsigned long long)(g784Ad[1] & 0xffu), (unsigned long long)g784Ad[0]);
+                        }
+                        std::fprintf(stderr, "%s\n", g784Buf);
+                    }
+                }
+#endif
                 if (g136Active && g136LoggedPayloads < g136_command_limit())
                 {
                     ++g136LoggedPayloads;
