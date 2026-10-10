@@ -19,6 +19,29 @@ static void g772NoteDepthRead(uint64_t bytes, uint64_t waitUs)
 }
 }
 
+// G786 (diagnostic, DC2_G786_OLCLASS=1): colour + depth readbacks and their blocking time, read by
+// the rasterizer's G720 per-class stage census around each flush.
+std::atomic<uint64_t> g_g786RbN{0}, g_g786RbUs{0};
+// G786 versioned outline merge directives + backend bookkeeping (ps2_g786_outline_api.inc).
+G786SnapDir g_g786Snap[kG786MaxSlots]{};
+int g_g786SnapN = 0;
+G786OvrDir g_g786Ovr[kG786MaxSlots]{};
+int g_g786OvrN = 0;
+uint64_t g_g786Consumed = 0, g_g786Copies = 0, g_g786OvrDraws = 0, g_g786OvrMiss = 0;
+uint32_t g_g786ReplReq = 0u;
+uint64_t g_g786Repl = 0, g_g786ReplMiss = 0, g_g786OvrStale = 0;
+static bool g786RbOn()
+{
+    static const bool on = std::getenv("DC2_G786_OLCLASS") != nullptr;
+    return on;
+}
+static void g786RbNote(std::chrono::steady_clock::time_point t0)
+{
+    g_g786RbN.fetch_add(1u, std::memory_order_relaxed);
+    g_g786RbUs.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now() - t0).count()), std::memory_order_relaxed);
+}
+
 bool g178_backend_ready()
 {
     if (!g178EnvEnabled())
@@ -242,8 +265,10 @@ bool g242_backend_read_depth(uint64_t depthKey, int width, int height,
     const uint64_t g770T0 = g770XTraceActive() ? g770XTraceNow() : 0u; // G770 trace
     const bool stat = g772DepthStat();
     const auto start = stat ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto g786T0 = g786RbOn() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool ok = G178Backend::instance().readDepth(depthKey, width, height,
                                                       depthY, depthRows, depthReadback);
+    if (g786RbOn()) g786RbNote(g786T0);
     if (stat && ok) g772NoteDepthRead(depthReadback.size() * sizeof(float),
         std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
     if (g770T0 != 0u)
@@ -261,7 +286,9 @@ bool g178_backend_read_color(uint32_t fbp, int width, int height, int glY, int r
                              std::vector<uint32_t> &out)
 {
     const uint64_t g770T0 = g770XTraceActive() ? g770XTraceNow() : 0u; // G770 trace
+    const auto g786T0 = g786RbOn() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool ok = G178Backend::instance().readColor(fbp, width, height, glY, rows, out);
+    if (g786RbOn()) g786RbNote(g786T0);
     if (g770T0 != 0u)
         g770XTrace('R', 0u, fbp, static_cast<uint32_t>(rows), g770T0);
     return ok;

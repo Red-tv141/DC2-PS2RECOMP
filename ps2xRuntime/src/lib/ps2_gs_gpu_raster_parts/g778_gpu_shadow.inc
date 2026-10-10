@@ -92,8 +92,8 @@ void g778ShadowRaster(const G178Batch& original,uint64_t depthKey,const std::vec
     if(!command)return;
     const auto fail=[&](unsigned reason){
         ++dc2_g778::counters.shadowErrors;++command->shadowFailures;
-        if(dc2_g778::statsRequested())std::fprintf(stderr,"[G778:raster] draw=%llu sf=%u refused=%u\n",
-            (unsigned long long)command->draw->invocation,command->draw->frame,reason);
+        if(dc2_g778::statsRequested())std::fprintf(stderr,"[G778:raster] draw=%llu sf=%u bucket=%x refused=%u\n",
+            (unsigned long long)command->draw->invocation,command->draw->frame,command->bucket,reason);
     };
     if(original.draws.size()!=1 || original.draws[0].srcFbp || !command->draw){fail(1);return;}
     constexpr uint32_t expectedKey=0x77810001,candidateKey=0x77810002;
@@ -155,8 +155,8 @@ void g778ShadowRaster(const G178Batch& original,uint64_t depthKey,const std::vec
     if(probe.sourceUploadBytes)++dc2_g778::counters.cacheMisses;else ++dc2_g778::counters.cacheHits;
     dc2_g778::counters.gpuDraws+=probe.gpuDraws;
     if(different || depthDifferent)++command->shadowFailures;
-    std::fprintf(stderr,"[G778:raster] draw=%llu sf=%u original_triangles=%zu native_triangles=%zu pixels=%zu touched=%zu colour_touched=%zu depth_touched=%zu clear_depth=%u seed_upload=%u/%u xyoffset=%d/%d tex=%llx src=%x blend=%u depth=%u/%u bilinear=%u fog=%u target=%x/%dx%d scissor=%d,%d,%d,%d colour_different=%zu depth_different=%zu gpuDraws=%u upload=%llu\n",
-        (unsigned long long)command->draw->invocation,command->draw->frame,original.verts.size()/3,probe.metadata.size(),
+    std::fprintf(stderr,"[G778:raster] draw=%llu sf=%u bucket=%x original_triangles=%zu native_triangles=%zu pixels=%zu touched=%zu colour_touched=%zu depth_touched=%zu clear_depth=%u seed_upload=%u/%u xyoffset=%d/%d tex=%llx src=%x blend=%u depth=%u/%u bilinear=%u fog=%u target=%x/%dx%d scissor=%d,%d,%d,%d colour_different=%zu depth_different=%zu gpuDraws=%u upload=%llu\n",
+        (unsigned long long)command->draw->invocation,command->draw->frame,command->bucket,original.verts.size()/3,probe.metadata.size(),
         before.size(),touched,colourTouched,depthTouched,unsigned(original.clearDepth),unsigned(original.uploadFb),unsigned(depthUpload!=nullptr),probe.offsetX,probe.offsetY,
         (unsigned long long)original.draws[0].texKey,original.draws[0].srcFbp,original.draws[0].blend,
         original.draws[0].depthFunc,unsigned(original.draws[0].depthWrite),unsigned(original.draws[0].bilinear),original.draws[0].fge,

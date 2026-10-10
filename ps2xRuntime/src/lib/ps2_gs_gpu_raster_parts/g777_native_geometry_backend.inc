@@ -18,6 +18,22 @@ G777GetBufferSubData m_g777GetBufferSubData=nullptr;
 using G778BufferSubData=void(APIENTRY*)(GLenum,GLsizeiptrLocal,GLsizeiptrLocal,const void*);
 G778BufferSubData m_g778BufferSubData=nullptr;
 size_t m_g778BufferCapacity=0;
+// G784: several native buckets of one E8B940 invocation now reach the executor back to back, and a
+// native RUN batch dispatches every probe's compute before its first raster draw. Each probe owns
+// one complete object set (scratch/output/indirect/VAO) for the whole batch, and sets rotate across
+// batches, so a dispatch never rewrites storage an earlier, possibly still in-flight draw reads
+// (no WAR hazard, no CPU wait). A run never exceeds the set count. m_g777* name the current set.
+struct G784NativeSet { GLuint constants=0,output=0,count=0,metadata=0,scratch=0,sizes=0,indirect=0,vao=0; size_t capacity=0; };
+std::array<G784NativeSet,8> m_g784Sets{};
+uint32_t m_g784Next=0,m_g784Current=0;
+void g784SelectSet(uint32_t index)
+{
+    m_g784Sets[m_g784Current].capacity=m_g778BufferCapacity;
+    m_g784Current=index%uint32_t(m_g784Sets.size());const auto& set=m_g784Sets[m_g784Current];
+    m_g777Constants=set.constants;m_g777Output=set.output;m_g777Count=set.count;m_g777Metadata=set.metadata;
+    m_g778Scratch=set.scratch;m_g778Sizes=set.sizes;m_g779Indirect=set.indirect;m_g777Vao=set.vao;
+    m_g778BufferCapacity=set.capacity;
+}
 
 void g777Destroy()
 {
@@ -25,9 +41,14 @@ void g777Destroy()
     for(auto& mesh:m_g777Meshes)if(mesh.buffer)m_f.glDeleteBuffers_(1,&mesh.buffer);
     m_g777Meshes.clear();
     m_g778BufferCapacity=0;
-    for(GLuint* buffer:{&m_g777Constants,&m_g777Output,&m_g777Count,&m_g777Metadata,&m_g778Scratch,&m_g778Sizes,&m_g779Indirect})
-        if(*buffer){m_f.glDeleteBuffers_(1,buffer);*buffer=0;}
-    if(m_g777Vao){m_f.glDeleteVertexArrays_(1,&m_g777Vao);m_g777Vao=0;}
+    for(auto& set:m_g784Sets){
+        for(GLuint* buffer:{&set.constants,&set.output,&set.count,&set.metadata,&set.scratch,&set.sizes,&set.indirect})
+            if(*buffer){m_f.glDeleteBuffers_(1,buffer);*buffer=0;}
+        if(set.vao){m_f.glDeleteVertexArrays_(1,&set.vao);set.vao=0;}
+        set.capacity=0;
+    }
+    m_g777Constants=m_g777Output=m_g777Count=m_g777Metadata=m_g778Scratch=m_g778Sizes=m_g779Indirect=m_g777Vao=0;
+    m_g784Next=m_g784Current=0;
     for(GLuint* program:{&m_g777Program,&m_g778CompactProgram,&m_g779IndirectProgram})if(*program){m_f.glDeleteProgram_(*program);*program=0;}
 }
 bool g777Initialize()
@@ -53,14 +74,18 @@ bool g777Initialize()
     if(!ok){char log[4096]{};m_f.glGetProgramInfoLog_(program,sizeof(log),nullptr,log);
         std::fprintf(stderr,"G777 native link: %s\n",log);g777Destroy();return false;}
     }
-    for(GLuint* buffer:{&m_g777Constants,&m_g777Output,&m_g777Count,&m_g777Metadata,&m_g778Scratch,&m_g778Sizes,&m_g779Indirect})m_f.glGenBuffers_(1,buffer);
-    m_f.glGenVertexArrays_(1,&m_g777Vao);m_f.glBindVertexArray_(m_g777Vao);
-    m_f.glBindBuffer_(GL158_ARRAY_BUFFER,m_g777Output);
-    m_f.glVertexAttribPointer_(0,3,GL_FLOAT,GL_FALSE,32,reinterpret_cast<void*>(0));
-    m_f.glVertexAttribPointer_(1,3,GL_FLOAT,GL_FALSE,32,reinterpret_cast<void*>(12));
-    m_f.glVertexAttribPointer_(2,4,GL_UNSIGNED_BYTE,GL_TRUE,32,reinterpret_cast<void*>(24));
-    m_f.glVertexAttribPointer_(3,4,GL_UNSIGNED_BYTE,GL_TRUE,32,reinterpret_cast<void*>(28));
-    for(unsigned at=0;at<4;++at)m_f.glEnableVertexAttribArray_(at);
+    for(auto& set:m_g784Sets){
+        for(GLuint* buffer:{&set.constants,&set.output,&set.count,&set.metadata,&set.scratch,&set.sizes,&set.indirect})m_f.glGenBuffers_(1,buffer);
+        m_f.glGenVertexArrays_(1,&set.vao);m_f.glBindVertexArray_(set.vao);
+        m_f.glBindBuffer_(GL158_ARRAY_BUFFER,set.output);
+        m_f.glVertexAttribPointer_(0,3,GL_FLOAT,GL_FALSE,32,reinterpret_cast<void*>(0));
+        m_f.glVertexAttribPointer_(1,3,GL_FLOAT,GL_FALSE,32,reinterpret_cast<void*>(12));
+        m_f.glVertexAttribPointer_(2,4,GL_UNSIGNED_BYTE,GL_TRUE,32,reinterpret_cast<void*>(24));
+        m_f.glVertexAttribPointer_(3,4,GL_UNSIGNED_BYTE,GL_TRUE,32,reinterpret_cast<void*>(28));
+        for(unsigned at=0;at<4;++at)m_f.glEnableVertexAttribArray_(at);
+        set.capacity=0;
+    }
+    m_g784Current=0;g784SelectSet(0);
     return true;
 }
 bool g782PrewarmNative()
@@ -76,25 +101,45 @@ bool g782PrewarmNative()
         m_f.glBufferData_(storage,bytes,nullptr,GL178_STREAM_DRAW);
         return glGetError()==GL_NO_ERROR;
     };
-    if(!reserve(m_g777Constants,23u*sizeof(dc2_native::Vector)) ||
-       !reserve(m_g778Scratch,capacity*sizeof(G178Vtx)) ||
-       !reserve(m_g777Count,4u*sizeof(uint32_t)) ||
-       !reserve(m_g777Metadata,(capacity/3u)*sizeof(std::array<uint32_t,4>)) ||
-       !reserve(m_g778Sizes,triangles*sizeof(std::array<uint32_t,2>)) ||
-       !reserve(m_g777Output,capacity*sizeof(G178Vtx)) ||
-       !reserve(m_g779Indirect,4u*sizeof(uint32_t)))return false;
-    m_g778BufferCapacity=capacity;
+    // G784: every rotating set (the largest bucket, E91F00, bounds them all).
+    for(uint32_t at=0;at<m_g784Sets.size();++at){
+        g784SelectSet(at);
+        if(!reserve(m_g777Constants,23u*sizeof(dc2_native::Vector)) ||
+           !reserve(m_g778Scratch,capacity*sizeof(G178Vtx)) ||
+           !reserve(m_g777Count,4u*sizeof(uint32_t)) ||
+           !reserve(m_g777Metadata,(capacity/3u)*sizeof(std::array<uint32_t,4>)) ||
+           !reserve(m_g778Sizes,triangles*sizeof(std::array<uint32_t,2>)) ||
+           !reserve(m_g777Output,capacity*sizeof(G178Vtx)) ||
+           !reserve(m_g779Indirect,4u*sizeof(uint32_t)))return false;
+        m_g778BufferCapacity=capacity;
+    }
+    g784SelectSet(0);m_g784Next=0;
     m_g782NativeReady.store(true,std::memory_order_release);
     return true;
 }
+// G784: one probe per draw (a native RUN batch chains them in draw order); every probe gets its own
+// rotating object set. A run batch is GPU-only (no geometry readback).
 bool g777Prepare(G178Batch& batch)
 {
+    size_t probes=0;
+    for(auto* p=batch.g777Native;p;p=p->next){p->readGeometry=!p->live || dc2_g778::statsRequested();++probes;}
+    if(!probes || probes!=batch.draws.size() || probes>m_g784Sets.size() ||
+       (probes>1 && batch.g777Native->readGeometry)){
+        if(batch.g777Native)batch.g777Native->error=10;
+        dc2_g778::g782LastPrepareError.store(10u,std::memory_order_relaxed);return false;
+    }
+    size_t index=0;
+    for(auto* p=batch.g777Native;p;p=p->next,++index)if(!g777PrepareOne(batch,*p,index,probes>1))return false;
+    return true;
+}
+bool g777PrepareOne(G178Batch& batch,G777NativeProbe& probe,size_t drawIndex,bool run)
+{
     using namespace dc2_native;
-    auto& probe=*batch.g777Native;probe.error=0;probe.gpuDraws=0;probe.sourceUploadBytes=0;
-    if(!probe.draw || !probe.draw->geometry || probe.draw->renderFlags&~3u || batch.draws.size()!=1 || !g777Initialize())
-        {probe.error=10;return false;}
-    if(probe.live && (batch.draws[0].srcFbp || batch.draws[0].blend>1 || batch.draws[0].screenSprite))
-        {probe.error=17;return false;}
+    probe.error=0;probe.gpuDraws=0;probe.sourceUploadBytes=0;
+    if(!probe.draw || !probe.draw->geometry || probe.draw->renderFlags&~3u || !g777Initialize())
+        {probe.error=10;dc2_g778::g782LastPrepareError.store(probe.error,std::memory_order_relaxed);return false;}
+    if(probe.live && (batch.draws[drawIndex].srcFbp || batch.draws[drawIndex].blend>1 || batch.draws[drawIndex].screenSprite))
+        {probe.error=17;dc2_g778::g782LastPrepareError.store(probe.error,std::memory_order_relaxed);return false;}
     probe.readGeometry=!probe.live || dc2_g778::statsRequested();
     probe.vertexCount=0;probe.cacheReplacements=0;
     const auto& draw=*probe.draw;G777MeshBuffer* cached=nullptr;
@@ -110,20 +155,23 @@ bool g777Prepare(G178Batch& batch)
             const auto& face=mesh.owner->faces[faceIndex];if(face.bucket!=probe.bucket)continue;
             if(face.material>=draw.materials.size() || (face.topology!=3 && face.topology!=4) ||
                (face.topology==4 && face.batchCorners && face.indices.size()>face.batchCorners) ||
-               (materialFound && mesh.material!=face.material)){probe.error=12;return false;}
+               (materialFound && mesh.material!=face.material)){probe.error=12;dc2_g778::g782LastPrepareError.store(probe.error,std::memory_order_relaxed);return false;}
             mesh.material=face.material;materialFound=true;
             for(uint32_t corner=2;corner<face.indices.size();++corner){
                 if(face.topology==3 && corner%3!=2)continue;
                 std::array<uint32_t,3> indices={corner-2,corner-1,corner};
-                if(face.topology==4 && (corner&1))std::swap(indices[0],indices[1]);
-                for(auto at:indices){if(face.indices[at]>=mesh.owner->vertices.size()){probe.error=13;return false;}
+                // G784: odd strip corners emit (c, c-1, c-2) — the order the original program and
+                // the proven CPU reference use (referencePrimitives). G778's [0]<->[1] swap was a
+                // rotation of it: same triangle unclipped, a different clipped fan triangulation.
+                if(face.topology==4 && (corner&1))std::swap(indices[0],indices[2]);
+                for(auto at:indices){if(face.indices[at]>=mesh.owner->vertices.size()){probe.error=13;dc2_g778::g782LastPrepareError.store(probe.error,std::memory_order_relaxed);return false;}
                     const auto& vertex=mesh.owner->vertices[face.indices[at]];
                     source.push_back(vertex.position);source.push_back(vertex.normal);source.push_back(vertex.uv);source.push_back(vertex.colour);}
                 source.push_back({float(faceIndex),float(corner),float(face.batchCorners?corner/face.batchCorners:0),float(face.topology)});
                 ++mesh.triangles;
             }
         }
-        if(!mesh.triangles || mesh.triangles>65536){probe.error=14;return false;}
+        if(!mesh.triangles || mesh.triangles>65536){probe.error=14;dc2_g778::g782LastPrepareError.store(probe.error,std::memory_order_relaxed);return false;}
         m_f.glGenBuffers_(1,&mesh.buffer);m_f.glBindBuffer_(storage,mesh.buffer);
         probe.sourceUploadBytes=source.size()*sizeof(Vector);
         m_f.glBufferData_(storage,static_cast<GLsizeiptrLocal>(probe.sourceUploadBytes),source.data(),0x88E4);
@@ -131,8 +179,10 @@ bool g777Prepare(G178Batch& batch)
     }
     std::array<Vector,23> constants{};
     if(!buildNativeConstants(draw,cached->material,cached->triangles,batch.fbW,batch.fbH,
-                             probe.offsetX,probe.offsetY,constants)){probe.error=17;return false;}
+                             probe.offsetX,probe.offsetY,constants)){probe.error=17;dc2_g778::g782LastPrepareError.store(probe.error,std::memory_order_relaxed);return false;}
     const uint32_t capacity=cached->triangles*30;probe.capacity=capacity;std::array<uint32_t,4> counts={0,0,capacity,0};
+    // G784: this draw's object set; its raster (same batch) re-selects it by probe.set.
+    g784SelectSet(m_g784Next++);probe.set=m_g784Current;
 #if defined(PS2X_G684_HOT_DIAG)
     static const bool g780Cpu=std::getenv("DC2_G780_GLCPU")!=nullptr;
     const auto g780BufStart=g780Cpu?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
@@ -173,18 +223,19 @@ bool g777Prepare(G178Batch& batch)
             double(bufferNs)/1e6/n,double(dispatchNs)/1e6/n);
     }
 #endif
-    batch.verts.clear();probe.metadata.clear();
+    if(!run || drawIndex==0)batch.verts.clear();
+    probe.metadata.clear();
     if(probe.readGeometry){
         m_f.glBindBuffer_(storage,m_g777Count);m_g777GetBufferSubData(storage,0,sizeof(counts),counts.data());
-        if(counts[1] || counts[0]>capacity || counts[0]%3){probe.error=counts[1]?counts[1]:15;return false;}
+        if(counts[1] || counts[0]>capacity || counts[0]%3){probe.error=counts[1]?counts[1]:15;dc2_g778::g782LastPrepareError.store(probe.error,std::memory_order_relaxed);return false;}
         probe.vertexCount=counts[0];
         batch.verts.resize(counts[0]);probe.metadata.resize(counts[0]/3);
         m_f.glBindBuffer_(storage,m_g777Output);if(counts[0])m_g777GetBufferSubData(storage,0,batch.verts.size()*sizeof(G178Vtx),batch.verts.data());
         m_f.glBindBuffer_(storage,m_g777Metadata);if(counts[0])m_g777GetBufferSubData(storage,0,probe.metadata.size()*sizeof(probe.metadata[0]),probe.metadata.data());
     }
-    batch.draws[0].firstVtx=0;batch.draws[0].vtxCount=probe.readGeometry?int(counts[0]):int(capacity);
-    if(probe.readGeometry && !counts[0])batch.draws.clear();
-    if(glGetError()!=GL_NO_ERROR){probe.error=16;return false;}
+    batch.draws[drawIndex].firstVtx=0;batch.draws[drawIndex].vtxCount=probe.readGeometry?int(counts[0]):int(capacity);
+    if(!run && probe.readGeometry && !counts[0])batch.draws.clear();
+    if(glGetError()!=GL_NO_ERROR){probe.error=16;dc2_g778::g782LastPrepareError.store(probe.error,std::memory_order_relaxed);return false;}
     return true;
 }
 #endif

@@ -1192,6 +1192,8 @@ void main()
             std::swap(slot->batch.texUploads, batch.texUploads);
             std::swap(slot->batch.verts, batch.verts);
             std::swap(slot->batch.draws, batch.draws);
+            std::swap(slot->batch.g788Jobs, batch.g788Jobs); // G788 (never admitted here; kept exact)
+            batch.g788Jobs.clear();
             slot->batch.readback.clear();
             // ⛔ The caller's `s_batch` is a STATIC reused across flushes. It now holds the slot's
             // recycled storage, whose contents belong to an older batch; leaving them would make
@@ -2013,6 +2015,7 @@ void main()
 private:
 #include "g777_native_geometry_backend.inc"
 #include "g778_gpu_shadow.inc"
+#include "g788_world_backend.inc" // G788: whole-world native FixMDT (resident source, GPU transform)
     // ===== G723: WHICH CALLER TAKES THE BLOCKING SUBMIT EDGE (default OFF, DC2_G723_SUB=1) =====
     //
     // WHY. `[G447:edge] backend-render` fires **44.3x/frame** on `dungeon1` while `[G415:stage]`
@@ -2132,6 +2135,8 @@ private:
         m_submitSeq.fetch_add(1u, std::memory_order_release);
         m_cvWork.notify_one();
         G447WaitScope g447Scope(0);
+        dc2_g788_econ::Scope econ(dc2_g788_econ::SubmitWait,true,
+            batch != nullptr && !batch->g788Jobs.empty());
         return wait.wait();
     }
 
@@ -2349,6 +2354,11 @@ private:
         // prepareCt24ViewOnWorker parameterises an m_texCache entry outside the draw loop, and it
         // records what it set.
         int g496MinF = 0, g496MagF = 0, g496WrapS = 0, g496WrapT = 0;
+        // ⭐ G786: the batch whose draws last (re)established the four records above. A record is
+        // trusted only inside that batch: another backend item between two batches can re-
+        // parameterise the GL object behind it (measured: legacy silhouette flushes sampled
+        // bilinear-requested T8 textures with GL_NEAREST — record LINEAR, object NEAREST).
+        uint64_t g786SamplerBatch = ~0ull;
     };
     struct FboEntry
     {
@@ -2536,6 +2546,7 @@ private:
 #if defined(PS2X_G777_NATIVE_GL)
         g777Destroy();
 #endif
+        g788Destroy();
         for (auto &kv : m_fbos)
             destroyFbo(kv.second);
         m_fbos.clear();
@@ -4583,6 +4594,7 @@ void main()
                             static_cast<GLint>(GL158_CLAMP_TO_EDGE));
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
                             static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            g786RecordNearestClamp(out); // G786: keep the TexEntry sampler record true
         }
         out.w = p.width;
         out.h = p.height;
@@ -4687,6 +4699,7 @@ void main()
                             static_cast<GLint>(GL158_CLAMP_TO_EDGE));
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
                             static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            g786RecordNearestClamp(out); // G786: keep the TexEntry sampler record true
         }
         out.w = p.width;
         out.h = p.height;
@@ -9553,6 +9566,12 @@ void main()
             std::fflush(stderr);
         }
 
+        if (dstFbp == kG310LogicalFbp)
+        {
+            m_g786AtlasCopyBatch = m_batchCounter; // G786 verify: when the atlas was last refreshed
+            m_g786AtlasCopySrc = srcFbp;
+            ++m_g786AtlasCopies;
+        }
         m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, src.fbo);
         glBindTexture(GL_TEXTURE_2D, dst.colorTex);
         if (src.physW != src.w || dst.physW != dst.w)
@@ -9741,6 +9760,9 @@ void main()
         g496PassBallast(); // G496 GPU derivative probe, `pass` site (idempotent re-issue)
         if (g494GetError(kG494CompErr) != GL_NO_ERROR)
             return fail("draw");
+        // G786: a versioned-merge composite batch's atlas refresh also replicates its slots.
+        if (outputFbp == kG310LogicalFbp && g_g786ReplReq != 0u && m_g786PendMask != 0u)
+            g786ReplicateAtlas(sourceTex, out);
 
         if (readback != nullptr)
         {
@@ -9924,6 +9946,7 @@ void main()
                             static_cast<GLint>(GL158_CLAMP_TO_EDGE));
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T,
                             static_cast<GLint>(GL158_CLAMP_TO_EDGE));
+            g786RecordNearestClamp(out); // G786: keep the TexEntry sampler record true
         }
         out.w = texW;
         out.h = texH;
@@ -10393,7 +10416,11 @@ void main()
 
         size_t validatedVertexCount=b.verts.size();
 #if defined(PS2X_G777_NATIVE_GL)
-        if(b.g777Native && !b.g777Native->readGeometry)validatedVertexCount=b.g777Native->capacity;
+        if(b.g777Native && !b.g777Native->readGeometry){
+            // G784: every draw of a native run reads its own set's output buffer from vertex 0.
+            validatedVertexCount=0;
+            for(const auto* p=b.g777Native;p;p=p->next)validatedVertexCount=std::max<size_t>(validatedVertexCount,p->capacity);
+        }
 #endif
         for (const G178Draw &d : b.draws)
         {
@@ -10590,16 +10617,643 @@ void main()
         std::fprintf(stderr, "\n");
     }
 
+    // ===== G786: VERSIONED OUTLINE MERGE — snapshot store (ps2_g786_outline_api.inc) =============
+    // Slot k holds W as it was right after silhouette k, over composite k's read rect, in two
+    // layouts: W's own FBO layout (a composite that binds W's FBO directly) and the 0x2720/tbw=8
+    // ATLAS layout (the G310 logical FBO, which 96 % of composite draws bind; W's pages sit at page
+    // offset wfbp - 0x139 in it). Same internal format and scale as the source, copied with the
+    // core glCopyTexSubImage2D from the bound framebuffer — bit-exact, no readback.
+    GLuint m_g786WTex[kG786MaxSlots]{};
+    int m_g786WW[kG786MaxSlots]{}, m_g786WH[kG786MaxSlots]{};
+    GLuint m_g786ATex[kG786MaxSlots]{};
+    int m_g786AW[kG786MaxSlots]{}, m_g786AH[kG786MaxSlots]{};
+    uint32_t m_g786WKey[kG786MaxSlots]{};
+    bool m_g786Valid[kG786MaxSlots]{};
+    // G786 verify (DC2_G786_VERIFY): physical GL rects written into each layout of each slot.
+    int m_g786WRect[kG786MaxSlots][4]{};
+    int m_g786ARect[kG786MaxSlots][2][4]{};
+    int m_g786ARectN[kG786MaxSlots]{};
+    uint64_t m_g786VerifyBatch[kG786MaxSlots]{};
+    static bool g786VerifyOn()
+    {
+        static const bool on = std::getenv("DC2_G786_VERIFY") != nullptr;
+        return on;
+    }
+    bool m_g786AtlasIsW[kG786MaxSlots]{};
+    // G786 verify v2 (DC2_G786_VERIFY): where and when each slot's snapshot was taken.
+    uint64_t m_g786SnapBatchNo[kG786MaxSlots]{};
+    GLint m_g786SnapReadFb[kG786MaxSlots]{};
+    GLuint m_g786SnapSrcFbo[kG786MaxSlots]{};
+    uint32_t m_g786SnapFbp[kG786MaxSlots]{}, m_g786SnapFboKey[kG786MaxSlots]{};
+    int m_g786SnapFbH[kG786MaxSlots]{}, m_g786SnapS[kG786MaxSlots]{};
+    int m_g786SnapGs[kG786MaxSlots][4]{};
+    int m_g786SnapDrawsDone[kG786MaxSlots]{}, m_g786SnapDrawsTotal[kG786MaxSlots]{};
+    uint64_t m_g786AtlasCopyBatch = 0u, m_g786AtlasCopies = 0u;
+    uint32_t m_g786AtlasCopySrc = 0u;
+    // Lifetime (run generation) + cost census (DC2_G786_STAT) + pricing ballast (DC2_G786_SNAP_BALLAST).
+    uint64_t m_g786RunNo = 1u, m_g786SlotRun[kG786MaxSlots]{};
+    bool m_g786LastArmedWasC = true;
+    uint64_t m_g786StatCopyPx = 0u, m_g786StatReplPx = 0u, m_g786StatSnapNs = 0u, m_g786StatReplNs = 0u;
+    static bool g786StatOn()
+    {
+        static const bool on = std::getenv("DC2_G786_STAT") != nullptr;
+        return on;
+    }
+    static int g786SnapBallast()
+    {
+        static const int n = [] {
+            const char *v = std::getenv("DC2_G786_SNAP_BALLAST");
+            return v ? std::max(0, std::atoi(v)) : 0;
+        }();
+        return n;
+    }
+    // Diagnostic (DC2_G786_DUMPSNAP=<firstRun>:<runs>): write each W-layout snapshot of those runs
+    // (the copied rect, GS orientation) to captures/g786snap_<DC2_FRAME_DUMP_TAG>_<run>_<slot>.ppm,
+    // so two arms (e.g. merged S* vs separate silhouette flushes) can be diffed per (run, slot).
+    void g786DumpSnap(int slot)
+    {
+        static const int s_lo = [] { const char *v = std::getenv("DC2_G786_DUMPSNAP"); return v ? std::atoi(v) : -1; }();
+        static const int s_n = [] {
+            const char *v = std::getenv("DC2_G786_DUMPSNAP");
+            const char *c = v ? std::strchr(v, ':') : nullptr;
+            return c ? std::atoi(c + 1) : 0;
+        }();
+        if (s_n <= 0 || static_cast<int64_t>(m_g786RunNo) < s_lo || static_cast<int64_t>(m_g786RunNo) >= s_lo + s_n)
+            return;
+        const int tw = m_g786WW[slot], th = m_g786WH[slot];
+        const int *R = m_g786WRect[slot];
+        if (tw <= 0 || th <= 0 || R[2] <= 0 || R[3] <= 0)
+            return;
+        static std::vector<uint8_t> px;
+        px.resize(static_cast<size_t>(tw) * th * 4u);
+        GLint prevUnit = 0, prevTex = 0;
+        glGetIntegerv(0x84E0 /* GL_ACTIVE_TEXTURE */, &prevUnit);
+        m_f.glActiveTexture_(GL158_TEXTURE0 + kG786PrivUnit);
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &prevTex);
+        glBindTexture(GL_TEXTURE_2D, m_g786WTex[slot]);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(prevTex));
+        m_f.glActiveTexture_(static_cast<GLenum>(prevUnit));
+        const char *tag = std::getenv("DC2_FRAME_DUMP_TAG");
+        char name[512];
+        std::snprintf(name, sizeof(name), "D:/ps2r/dc2/captures/g786snap_%s_%06llu_%02d.ppm", tag ? tag : "x",
+                      static_cast<unsigned long long>(m_g786RunNo), slot);
+        FILE *f = std::fopen(name, "wb");
+        if (f == nullptr)
+            return;
+        std::fprintf(f, "P6 %d %d 255%c", R[2], R[3], 10);
+        for (int y = R[1] + R[3] - 1; y >= R[1]; --y) // GL bottom-first -> top-first
+            for (int x = R[0]; x < R[0] + R[2]; ++x)
+            {
+                const uint8_t *p = &px[(static_cast<size_t>(y) * tw + x) * 4u];
+                std::fwrite(p, 1, 3, f);
+            }
+        std::fclose(f);
+        std::snprintf(name, sizeof(name), "D:/ps2r/dc2/captures/g786snap_%s_%06llu_%02d_a.pgm", tag ? tag : "x",
+                      static_cast<unsigned long long>(m_g786RunNo), slot);
+        f = std::fopen(name, "wb");
+        if (f == nullptr)
+            return;
+        std::fprintf(f, "P5 %d %d 255%c", R[2], R[3], 10);
+        for (int y = R[1] + R[3] - 1; y >= R[1]; --y)
+            for (int x = R[0]; x < R[0] + R[2]; ++x)
+                std::fputc(px[(static_cast<size_t>(y) * tw + x) * 4u + 3u], f);
+        std::fclose(f);
+    }
+    // ⭐ G786: a TexEntry whose GL object is re-parameterised OUTSIDE the draw loop must carry its sampler
+    // record with it, or the loop's per-object cache skips the next filter/wrap write (measured: the
+    // G281 T8 view re-specified its storage to NEAREST while the record still said LINEAR, so legacy
+    // silhouettes requested bilinear but sampled NEAREST). The G492 CT24, G767 and G768 view paths
+    // already did this; G281 (prepareT8ViewOnWorker), G630 and G634 did not.
+    static void g786RecordNearestClamp(TexEntry &t)
+    {
+        t.g496MinF = GL_NEAREST;
+        t.g496MagF = GL_NEAREST;
+        t.g496WrapS = static_cast<int>(GL158_CLAMP_TO_EDGE);
+        t.g496WrapT = static_cast<int>(GL158_CLAMP_TO_EDGE);
+    }
+    // G786: may this draw trust `t`'s sampler records? Only if they were (re)established earlier in
+    // this same batch; the first use per batch re-issues filter + wrap (and marks the batch).
+    // Rollback DC2_G786_NO_SAMPLER_EPOCH=1 (records trusted across batches, the pre-G786 rule).
+    bool g786SamplerRecOk(TexEntry &t, bool cacheOn)
+    {
+        // Opt-in since the writers keep their records (g786RecordNearestClamp): the epoch re-issue costs
+        // driver re-validation (≈0.6 ms/f on dungeon1, §8e). DC2_G786_SAMPLER_EPOCH=1 re-enables it.
+        static const bool s_on = std::getenv("DC2_G786_SAMPLER_EPOCH") != nullptr;
+        if (!s_on)
+            return cacheOn;
+        if (t.g786SamplerBatch == m_batchCounter)
+            return cacheOn;
+        // The ordinary textured site calls this once per draw, before its filter + wrap pair, and
+        // runs both with the cache off. (The G256/G287 exact sites use integer taps; they keep the
+        // plain cache because their sampler state never reaches a fetch.)
+        t.g786SamplerBatch = m_batchCounter;
+        return false;
+    }
+    bool g786DumpWindow() const
+    {
+        static const int s_lo = [] { const char *v = std::getenv("DC2_G786_DUMPSNAP"); return v ? std::atoi(v) : -1; }();
+        static const int s_n = [] {
+            const char *v = std::getenv("DC2_G786_DUMPSNAP");
+            const char *c = v ? std::strchr(v, ':') : nullptr;
+            return c ? std::atoi(c + 1) : 0;
+        }();
+        return s_n > 0 && static_cast<int64_t>(m_g786RunNo) >= s_lo && static_cast<int64_t>(m_g786RunNo) < s_lo + s_n;
+    }
+    // Diagnostic: the textured draw's sampler — the TexEntry record vs the texture's ACTUAL GL state.
+    void g786DumpSampler(const G178Draw &d, int recMin, int recMag, int recS, int recT)
+    {
+        GLint mn = 0, mg = 0, ws = 0, wt = 0, id = 0;
+        glGetIntegerv(GL_TEXTURE_BINDING_2D, &id);
+        glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, &mn);
+        glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, &mg);
+        glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, &ws);
+        glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, &wt);
+        std::fprintf(stderr, "[G786:smp] r=%llu key=%llx tex=%d bil=%u rec=%x/%x/%x/%x gl=%x/%x/%x/%x %s%c",
+                     (unsigned long long)m_g786RunNo, (unsigned long long)d.texKey, id, d.bilinear ? 1u : 0u, recMin,
+                     recMag, recS, recT, mn, mg, ws, wt,
+                     (mn != recMin || mg != recMag || ws != recS || wt != recT) ? "STALE" : "ok", 10);
+    }
+    // Diagnostic (DC2_G786_DUMPSNAP window): one line per 0x139 batch — its prologue inputs.
+    void g786DumpBatch(const G178Batch &b, uint64_t depthKey, bool depthUp, int depthY, int depthRows)
+    {
+        static const int s_lo = [] { const char *v = std::getenv("DC2_G786_DUMPSNAP"); return v ? std::atoi(v) : -1; }();
+        static const int s_n = [] {
+            const char *v = std::getenv("DC2_G786_DUMPSNAP");
+            const char *c = v ? std::strchr(v, ':') : nullptr;
+            return c ? std::atoi(c + 1) : 0;
+        }();
+        if (s_n <= 0 || static_cast<int64_t>(m_g786RunNo) < s_lo || static_cast<int64_t>(m_g786RunNo) >= s_lo + s_n)
+            return;
+        uint64_t h = 1469598103934665603ull;
+        for (const uint32_t p : b.fbPixels)
+            h = (h ^ p) * 1099511628211ull;
+        std::fprintf(stderr,
+                     "[G786:bat] r=%llu draws=%zu verts=%zu upload=%d fbPx=%zu fbHash=%016llx clearZ=%d zkey=%llx zup=%d zy=%d zrows=%d "
+                     "skipRb=%d rawA=%d fboKey=%x texUp=%zu seed=%zu snapN=%d ovrN=%d%c",
+                     (unsigned long long)m_g786RunNo, b.draws.size(), b.verts.size(), b.uploadFb ? 1 : 0,
+                     b.fbPixels.size(), (unsigned long long)h, b.clearDepth ? 1 : 0, (unsigned long long)depthKey,
+                     depthUp ? 1 : 0, depthY, depthRows, b.skipReadback ? 1 : 0, b.rttRawAlpha ? 1 : 0, b.fboKey,
+                     b.texUploads.size(), b.g716SeedPages.size(), g_g786SnapN, g_g786OvrN, 10);
+    }
+    void g786StatReport()
+    {
+        static uint64_t s_n = 0;
+        if ((++s_n % 1024u) != 0u)
+            return;
+        std::fprintf(stderr, "[G786:stat] repl=%llu copies=%llu copyPx=%llu replPx=%llu snapCpuNs=%llu replCpuNs=%llu stale=%llu\n",
+                     (unsigned long long)g_g786Repl, (unsigned long long)g_g786Copies,
+                     (unsigned long long)m_g786StatCopyPx, (unsigned long long)m_g786StatReplPx,
+                     (unsigned long long)m_g786StatSnapNs, (unsigned long long)m_g786StatReplNs,
+                     (unsigned long long)g_g786OvrStale);
+    }
+    // Atlas-layout replication (g786ReplicateAtlas): per-slot render target + readiness.
+    GLuint m_g786AFbo[kG786MaxSlots]{};
+    bool m_g786AtlasReady[kG786MaxSlots]{};
+    int m_g786ScaleOf[kG786MaxSlots]{};
+    uint32_t m_g786PendMask = 0u;
+
+    static constexpr GLenum kG786PrivUnit = 15u; // a texture unit no draw path binds
+    // (Re)allocates `tex` at w x h. Binds it on the CURRENT unit (callers select a private one).
+    void g786EnsureTex(GLuint &tex, int &curW, int &curH, int w, int h, bool cacheOn)
+    {
+        (void)cacheOn;
+        if (tex != 0u && curW == w && curH == h)
+            return;
+        if (tex == 0u)
+            glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        curW = w;
+        curH = h;
+    }
+
+    // Copy the GS-row/column rect [x0..x1] x [y0..y1] of the bound framebuffer (logical height
+    // srcH, scale S) to the bound texture at GS offset (dx, dy) of a logical-height dstH surface.
+    static void g786CopyRect(int S, int srcH, int dstH, int x0, int y0, int x1, int y1, int dx, int dy,
+                             int *outRect = nullptr)
+    {
+        if (x1 < x0 || y1 < y0)
+            return;
+        const int w = (x1 - x0 + 1) * S, h = (y1 - y0 + 1) * S;
+        glCopyTexSubImage2D(GL_TEXTURE_2D, 0, (x0 + dx) * S, (dstH - 1 - (y1 + dy)) * S, x0 * S,
+                            (srcH - 1 - y1) * S, w, h);
+        if (outRect != nullptr)
+        {
+            outRect[0] = (x0 + dx) * S;
+            outRect[1] = (dstH - 1 - (y1 + dy)) * S;
+            outRect[2] = w;
+            outRect[3] = h;
+        }
+    }
+
+    // Compare the texture a composite would have sampled with the snapshot, over the rects the
+    // snapshot wrote (both are the same layout and geometry by construction).
+    // Verify v2: over the rects the snapshot wrote, compare THREE textures pairwise — the snapshot,
+    // the texture the legacy composite samples (`srcTex`), and (W layout only) W's live FBO. With
+    // SNAPONLY nothing is reordered, so snapshot == src is the exactness oracle; the other two
+    // pairs say which side diverged. Also: how many batches ran between the snapshot and this
+    // composite, which framebuffer the copy actually read, and whether the draw's UV footprint
+    // (physical texels, +1) lies inside the copied rects.
+    void g786Verify(int slot, GLuint snapTex, int texW, int texH, GLuint srcTex, uint32_t srcFbp, bool cacheOn,
+                    const int *hull)
+    {
+        static uint64_t s_checks = 0, s_px = 0, s_badSS = 0, s_chkSS = 0, s_chkSW = 0, s_chkWS = 0,
+                        s_wChecks = 0, s_delta1 = 0, s_deltaN = 0, s_readFbBad = 0, s_hullOut = 0, s_hullN = 0,
+                        s_partial = 0, s_prints = 0;
+        // Footprint containment is checked on every overridden draw (cheap, no readback).
+        const bool atlas = snapTex == m_g786ATex[slot];
+        const int nr = atlas ? m_g786ARectN[slot] : 1;
+        if (hull != nullptr && hull[2] >= hull[0] && hull[3] >= hull[1])
+        {
+            ++s_hullN;
+            // Each corner of the hull (clamped to the texture: CLAMP reads the edge texel) must lie
+            // in some written rect (the hull may span the atlas split).
+            bool in = true;
+            const int cx[2] = {std::max(0, std::min(texW - 1, hull[0])), std::max(0, std::min(texW - 1, hull[2]))};
+            const int cy[2] = {std::max(0, std::min(texH - 1, hull[1])), std::max(0, std::min(texH - 1, hull[3]))};
+            for (int ci = 0; ci < 4 && in; ++ci)
+            {
+                const int px = cx[ci & 1], py = cy[ci >> 1];
+                bool any = false;
+                for (int r = 0; r < nr && !any; ++r)
+                {
+                    const int *R = atlas ? m_g786ARect[slot][r] : m_g786WRect[slot];
+                    any = px >= R[0] && px < R[0] + R[2] && py >= R[1] && py < R[1] + R[3];
+                }
+                in = any;
+            }
+            if (!in)
+            {
+                ++s_hullOut;
+                if (s_hullOut <= 8u)
+                {
+                    const int *R0 = atlas ? m_g786ARect[slot][0] : m_g786WRect[slot];
+                    std::fprintf(stderr,
+                                 "[G786:verify-hull] slot=%d atlas=%d hull=(%d,%d)-(%d,%d) rect0=(%d,%d %dx%d) nr=%d tex=%dx%d\n",
+                                 slot, atlas ? 1 : 0, hull[0], hull[1], hull[2], hull[3], R0[0], R0[1], R0[2], R0[3],
+                                 nr, texW, texH);
+                }
+            }
+        }
+        if (m_g786VerifyBatch[slot] == m_batchCounter)
+            return;
+        m_g786VerifyBatch[slot] = m_batchCounter;
+        static std::vector<uint8_t> a, c, w;
+        a.resize(static_cast<size_t>(texW) * texH * 4u);
+        c.resize(a.size());
+        g496BindTex(snapTex, cacheOn);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, a.data());
+        g496BindTex(srcTex, cacheOn);
+        glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, c.data());
+        // W's live FBO, when the snapshot is in W's own layout and W has the same geometry.
+        bool haveW = false;
+        GLuint wFbo = 0u;
+        if (!atlas)
+        {
+            const auto it = m_fbos.find(m_g786WKey[slot]);
+            if (it != m_fbos.end() && it->second.physW == texW && it->second.physH == texH && it->second.colorTex != 0u)
+            {
+                w.resize(a.size());
+                g496BindTex(it->second.colorTex, cacheOn);
+                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, w.data());
+                haveW = true;
+                wFbo = it->second.fbo;
+            }
+        }
+        uint64_t nSS = 0, nSW = 0, nWS = 0;
+        int ssx = -1, ssy = -1, swx = -1, swy = -1, wsx = -1, wsy = -1;
+        for (int r = 0; r < nr; ++r)
+        {
+            const int *R = atlas ? m_g786ARect[slot][r] : m_g786WRect[slot];
+            for (int y = R[1]; y < R[1] + R[3] && y < texH; ++y)
+                for (int x = R[0]; x < R[0] + R[2] && x < texW; ++x)
+                {
+                    const size_t o = (static_cast<size_t>(y) * texW + x) * 4u;
+                    ++s_px;
+                    if (std::memcmp(&a[o], &c[o], 4) != 0)
+                    {
+                        if (nSS == 0) { ssx = x; ssy = y; }
+                        ++nSS;
+                    }
+                    if (haveW)
+                    {
+                        if (std::memcmp(&a[o], &w[o], 4) != 0)
+                        {
+                            if (nSW == 0) { swx = x; swy = y; }
+                            ++nSW;
+                        }
+                        if (std::memcmp(&w[o], &c[o], 4) != 0)
+                        {
+                            if (nWS == 0) { wsx = x; wsy = y; }
+                            ++nWS;
+                        }
+                    }
+                }
+        }
+        {
+            // Per-class split: [W==0x139 ? 0 : 1][source kind: 0 atlas(logical), 1 W own FBO, 2 other].
+            static uint64_t s_cls[2][3][2]{};
+            const int wc = m_g786SnapFbp[slot] == 0x139u ? 0 : 1;
+            const int sk = srcFbp == kG310LogicalFbp ? 0 : (srcFbp == m_g786WKey[slot] ? 1 : 2);
+            ++s_cls[wc][sk][0];
+            s_cls[wc][sk][1] += nSS ? 1u : 0u;
+            static uint64_t s_clsN = 0;
+            if ((++s_clsN % 512u) == 1u)
+                std::fprintf(stderr,
+                             "[G786:verify-cls] w139:atlas=%llu/%llu own=%llu/%llu oth=%llu/%llu | wOther:atlas=%llu/%llu own=%llu/%llu oth=%llu/%llu (checks/bad)\n",
+                             (unsigned long long)s_cls[0][0][0], (unsigned long long)s_cls[0][0][1],
+                             (unsigned long long)s_cls[0][1][0], (unsigned long long)s_cls[0][1][1],
+                             (unsigned long long)s_cls[0][2][0], (unsigned long long)s_cls[0][2][1],
+                             (unsigned long long)s_cls[1][0][0], (unsigned long long)s_cls[1][0][1],
+                             (unsigned long long)s_cls[1][1][0], (unsigned long long)s_cls[1][1][1],
+                             (unsigned long long)s_cls[1][2][0], (unsigned long long)s_cls[1][2][1]);
+        }
+        const uint64_t delta = m_batchCounter - m_g786SnapBatchNo[slot];
+        const bool readFbBad = static_cast<GLuint>(m_g786SnapReadFb[slot]) != m_g786SnapSrcFbo[slot];
+        const bool partial = m_g786SnapDrawsDone[slot] != m_g786SnapDrawsTotal[slot];
+        ++s_checks;
+        s_badSS += nSS;
+        s_chkSS += nSS ? 1u : 0u;
+        s_wChecks += haveW ? 1u : 0u;
+        s_chkSW += nSW ? 1u : 0u;
+        s_chkWS += nWS ? 1u : 0u;
+        (delta == 1u ? s_delta1 : s_deltaN) += 1u;
+        s_readFbBad += readFbBad ? 1u : 0u;
+        s_partial += partial ? 1u : 0u;
+        static uint64_t s_printsOther = 0;
+        const bool printOk = m_g786SnapFbp[slot] == 0x139u ? s_prints < 24u : s_printsOther < 24u;
+        if ((nSS || readFbBad) && printOk)
+        {
+            ++(m_g786SnapFbp[slot] == 0x139u ? s_prints : s_printsOther);
+            auto px = [](const std::vector<uint8_t> &v, int x, int y, int tw) -> uint32_t {
+                if (x < 0) return 0u;
+                const size_t o = (static_cast<size_t>(y) * tw + x) * 4u;
+                return (uint32_t(v[o]) << 24) | (uint32_t(v[o + 1]) << 16) | (uint32_t(v[o + 2]) << 8) | v[o + 3];
+            };
+            const int *R0 = atlas ? m_g786ARect[slot][0] : m_g786WRect[slot];
+            std::fprintf(stderr,
+                         "[G786:verify-bad] slot=%d src=%x atlas=%d atlasIsW=%d delta=%llu snapBatch=%llu atlasCopyBatch=%llu atlasCopySrc=%x atlasCopies=%llu draws=%d/%d readFb=%d srcFbo=%u wFbo=%u "
+                         "fbp=%x fboKey=%x fbH=%d S=%d gs=(%d,%d)-(%d,%d) rect0=(%d,%d %dx%d) nr=%d tex=%dx%d "
+                         "SS=%llu@(%d,%d) snap=%08x src=%08x | SW=%llu@(%d,%d) snap=%08x w=%08x | WS=%llu@(%d,%d) w=%08x src=%08x\n",
+                         slot, srcFbp, atlas ? 1 : 0, m_g786AtlasIsW[slot] ? 1 : 0, (unsigned long long)delta,
+                         (unsigned long long)m_g786SnapBatchNo[slot], (unsigned long long)m_g786AtlasCopyBatch,
+                         m_g786AtlasCopySrc, (unsigned long long)m_g786AtlasCopies, m_g786SnapDrawsDone[slot], m_g786SnapDrawsTotal[slot], m_g786SnapReadFb[slot],
+                         m_g786SnapSrcFbo[slot], wFbo, m_g786SnapFbp[slot], m_g786SnapFboKey[slot], m_g786SnapFbH[slot],
+                         m_g786SnapS[slot], m_g786SnapGs[slot][0], m_g786SnapGs[slot][1], m_g786SnapGs[slot][2],
+                         m_g786SnapGs[slot][3], R0[0], R0[1], R0[2], R0[3], nr, texW, texH,
+                         (unsigned long long)nSS, ssx, ssy, px(a, ssx, ssy, texW), px(c, ssx, ssy, texW),
+                         (unsigned long long)nSW, swx, swy, haveW ? px(a, swx, swy, texW) : 0u,
+                         haveW ? px(w, swx, swy, texW) : 0u, (unsigned long long)nWS, wsx, wsy,
+                         haveW ? px(w, wsx, wsy, texW) : 0u, haveW ? px(c, wsx, wsy, texW) : 0u);
+        }
+        if ((s_checks % 512u) == 1u)
+            std::fprintf(stderr,
+                         "[G786:verify] checks=%llu px=%llu badPxSS=%llu chkSS=%llu wChecks=%llu chkSW=%llu chkWS=%llu "
+                         "delta1=%llu deltaN=%llu readFbBad=%llu partial=%llu hullN=%llu hullOut=%llu\n",
+                         (unsigned long long)s_checks, (unsigned long long)s_px, (unsigned long long)s_badSS,
+                         (unsigned long long)s_chkSS, (unsigned long long)s_wChecks, (unsigned long long)s_chkSW,
+                         (unsigned long long)s_chkWS, (unsigned long long)s_delta1, (unsigned long long)s_deltaN,
+                         (unsigned long long)s_readFbBad, (unsigned long long)s_partial,
+                         (unsigned long long)s_hullN, (unsigned long long)s_hullOut);
+    }
+
+    void g786TakeSnap(const FboEntry &fbo, const G178Batch &b, const G786SnapDir &d, bool cacheOn,
+                      int drawsDone)
+    {
+        const int slot = d.slot;
+        if (slot < 0 || slot >= kG786MaxSlots)
+        {
+            ++g_g786OvrMiss;
+            return;
+        }
+        m_g786Valid[slot] = false;
+        const int S = b.fbW > 0 ? fbo.physW / b.fbW : 0;
+        if (S <= 0 || fbo.physW != S * b.fbW || fbo.physH != S * b.fbH || b.fbW != 512 || b.fbH > 512 ||
+            d.wfbp < 0x139u || d.wfbp - 0x139u >= 128u)
+        {
+            ++g_g786OvrMiss;
+            return;
+        }
+        const int x0 = std::max(0, d.x0), y0 = std::max(0, d.y0);
+        const int x1 = std::min(b.fbW - 1, d.x1), y1 = std::min(b.fbH - 1, d.y1);
+        const auto g786T0 = g786StatOn() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (g786VerifyOn())
+        {
+            m_g786SnapBatchNo[slot] = m_batchCounter;
+            m_g786SnapReadFb[slot] = 0;
+            glGetIntegerv(0x8CAA /* GL_READ_FRAMEBUFFER_BINDING */, &m_g786SnapReadFb[slot]);
+            m_g786SnapSrcFbo[slot] = fbo.fbo;
+            m_g786SnapFbp[slot] = b.fbp;
+            m_g786SnapFboKey[slot] = b.fboKey;
+            m_g786SnapFbH[slot] = b.fbH;
+            m_g786SnapS[slot] = S;
+            m_g786SnapGs[slot][0] = x0; m_g786SnapGs[slot][1] = y0;
+            m_g786SnapGs[slot][2] = x1; m_g786SnapGs[slot][3] = y1;
+            m_g786SnapDrawsDone[slot] = drawsDone;
+            m_g786SnapDrawsTotal[slot] = static_cast<int>(b.draws.size());
+        }
+        // W layout: an exact copy of W over the read rect plus one texel on every side — the
+        // margin the atlas compositor's +0.5-texel bilinear tap reaches when it re-samples it.
+        // STATE-NEUTRAL: the copy may run between two draws of a merged silhouette batch, so it binds
+        // on a private texture unit no draw path uses and never touches the draw loop's units or its
+        // G496 state cache (cacheOn is deliberately unused). The loop's invariant is that unit 0 is
+        // active between draws (every branch that selects another unit restores GL_TEXTURE0), so the
+        // copy restores exactly that — no glGet round trip.
+        (void)cacheOn;
+        m_f.glActiveTexture_(GL158_TEXTURE0 + kG786PrivUnit);
+        g786EnsureTex(m_g786WTex[slot], m_g786WW[slot], m_g786WH[slot], fbo.physW, fbo.physH, false);
+        glBindTexture(GL_TEXTURE_2D, m_g786WTex[slot]);
+        for (int rep = 0; rep <= g786SnapBallast(); ++rep) // ballast: idempotent re-copies (pricing only)
+            g786CopyRect(S, b.fbH, b.fbH, std::max(0, x0 - 1), std::max(0, y0 - 1), std::min(b.fbW - 1, x1 + 1),
+                         std::min(b.fbH - 1, y1 + 1), 0, 0, m_g786WRect[slot]);
+        // A read rect touching GS row 0: the compositor maps physical row Y to gsY = 511 - (Y+0.5)/S, which is
+        // NEGATIVE for the top S rows, and `fract()` of a negative wraps the page-local row to 31 — legacy
+        // samples W rows 31..32 there (ridepod: 4 of 13,825 composites). Copy rows 30..33 of the rect's
+        // columns too, so the replicated atlas reads the same texels.
+        if (y0 - 1 < 0 && b.fbH > 33)
+            g786CopyRect(S, b.fbH, b.fbH, std::max(0, x0 - 1), 30, std::min(b.fbW - 1, x1 + 1), 33, 0, 0);
+        m_f.glActiveTexture_(GL158_TEXTURE0);
+        m_g786WKey[slot] = b.fboKey != 0u ? b.fboKey : b.fbp;
+        // Atlas layout: NOT copied. The legacy composite samples the G310 logical atlas, which the
+        // G309 compositor rebuilds from W at every consumer — re-sampled, not copied (§7). The slot's
+        // atlas image is produced by that same compositor pass, with this W copy standing in for W,
+        // when the composite batch's own atlas refresh runs (g786ReplicateAtlas). Here: its rects.
+        const uint32_t P = d.wfbp - 0x139u;
+        m_g786AtlasIsW[slot] = false;
+        m_g786AtlasReady[slot] = false;
+        m_g786ScaleOf[slot] = S;
+        {
+            const int colShift = static_cast<int>(P % 8u) * 64, rowShift = static_cast<int>(P / 8u) * 32;
+            const int split = 512 - colShift;
+            // piece A: same page row, columns shifted right; piece B: wraps to the next page row.
+            auto rectOf = [&](int ax0, int ay0, int ax1, int ay1, int dx, int dy, int *out) {
+                out[0] = (ax0 + dx) * S;
+                out[1] = (512 - 1 - (ay1 + dy)) * S;
+                out[2] = (ax1 - ax0 + 1) * S;
+                out[3] = (ay1 - ay0 + 1) * S;
+            };
+            const int ay1 = std::min(y1, 511 - rowShift);
+            m_g786ARectN[slot] = 0;
+            if (std::min(x1, split - 1) >= x0 && ay1 >= y0)
+                rectOf(x0, y0, std::min(x1, split - 1), ay1, colShift, rowShift,
+                       m_g786ARect[slot][m_g786ARectN[slot]++]);
+            const int by1 = std::min(y1, 511 - rowShift - 32);
+            if (x1 >= split && by1 >= y0)
+                rectOf(std::max(x0, split), y0, x1, by1, -split, rowShift + 32,
+                       m_g786ARect[slot][m_g786ARectN[slot]++]);
+        }
+        m_g786PendMask |= 1u << slot;
+        m_g786SlotRun[slot] = m_g786RunNo;
+        g786DumpSnap(slot);
+        m_g786Valid[slot] = true;
+        ++g_g786Copies;
+        if (g786StatOn())
+        {
+            m_g786StatCopyPx += static_cast<uint64_t>(m_g786WRect[slot][2]) * m_g786WRect[slot][3];
+            m_g786StatSnapNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g786T0).count());
+        }
+    }
+
+    // ⭐ G786: build each pending slot's ATLAS-layout snapshot with the G309 compositor — the exact
+    // pass that just rebuilt the logical atlas for this composite batch (same program, uniforms,
+    // page map, base texture and source bindings, all still bound by the caller) — with W's source
+    // unit re-pointed at the slot's W copy and the output scissored to the slot's read rects. So
+    // composite k samples bit-for-bit what the legacy composite k sampled: the atlas rebuilt from W
+    // as it was after silhouette k. Runs inside buildAuthoritativeCompositeOnWorker (worker thread),
+    // only for the logical-atlas output and only when the rasterizer flagged a versioned-merge
+    // composite flush (g_g786ReplReq). A slot whose W is not a G309 source cannot be replicated: it
+    // stays not-ready and any override of it is refused (ovrMiss).
+    void g786ReplicateAtlas(const GLuint *sourceTex, const FboEntry &out)
+    {
+        const auto g786T0 = g786StatOn() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const int outW = out.physW > 0 ? out.physW : 512, outH = out.physH > 0 ? out.physH : 512;
+        for (int slot = 0; slot < kG786MaxSlots; ++slot)
+        {
+            if ((m_g786PendMask & (1u << slot)) == 0u || !m_g786Valid[slot])
+                continue;
+            int unit = -1;
+            for (uint32_t t = 0u; t < kG309SourceCount; ++t)
+                if (kG309Sources[t] == m_g786WKey[slot])
+                    unit = static_cast<int>(t);
+            const auto wit = m_fbos.find(m_g786WKey[slot]);
+            if (unit < 0 || sourceTex[unit] == 0u || wit == m_fbos.end() ||
+                wit->second.colorTex != sourceTex[unit] || wit->second.physW != m_g786WW[slot] ||
+                wit->second.physH != m_g786WH[slot])
+            {
+                ++g_g786ReplMiss;
+                continue;
+            }
+            if (m_g786ATex[slot] == 0u || m_g786AW[slot] != outW || m_g786AH[slot] != outH)
+            {
+                if (m_g786ATex[slot] == 0u)
+                    glGenTextures(1, &m_g786ATex[slot]);
+                m_f.glActiveTexture_(GL158_TEXTURE0);
+                glBindTexture(GL_TEXTURE_2D, m_g786ATex[slot]);
+                glTexImage2D(GL_TEXTURE_2D, 0, GL158_RGBA8, outW, outH, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+                m_g786AW[slot] = outW;
+                m_g786AH[slot] = outH;
+                if (m_g786AFbo[slot] == 0u)
+                    m_f.glGenFramebuffers_(1, &m_g786AFbo[slot]);
+                m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g786AFbo[slot]);
+                m_f.glFramebufferTexture2D_(GL158_FRAMEBUFFER, GL158_COLOR_ATTACHMENT0, GL_TEXTURE_2D,
+                                            m_g786ATex[slot], 0);
+            }
+            m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, m_g786AFbo[slot]);
+            glViewport(0, 0, outW, outH);
+            // The W copy takes W's unit with W's own sampler state (the compositor set LINEAR filters;
+            // the wrap modes are whatever W's texture carries right now).
+            m_f.glActiveTexture_(GL158_TEXTURE0 + static_cast<GLenum>(unit));
+            GLint wrapS = 0, wrapT = 0;
+            glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, &wrapS);
+            glGetTexParameteriv(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, &wrapT);
+            glBindTexture(GL_TEXTURE_2D, m_g786WTex[slot]);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, wrapS);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, wrapT);
+            glEnable(GL_SCISSOR_TEST);
+            for (int r = 0; r < m_g786ARectN[slot]; ++r)
+            {
+                const int *R = m_g786ARect[slot][r];
+                glScissor(R[0], R[1], R[2], R[3]);
+                for (int rep = 0; rep <= g786SnapBallast(); ++rep) // ballast: idempotent (pricing only)
+                    glDrawArrays(GL_TRIANGLES, 0, 3);
+                m_g786StatReplPx += static_cast<uint64_t>(R[2]) * R[3];
+            }
+            glDisable(GL_SCISSOR_TEST);
+            glBindTexture(GL_TEXTURE_2D, sourceTex[unit]);
+            m_g786AtlasReady[slot] = true;
+            ++g_g786Repl;
+        }
+        m_g786PendMask = 0u;
+        m_f.glBindFramebuffer_(GL158_FRAMEBUFFER, out.fbo);
+        glViewport(0, 0, outW, outH);
+        if (g786StatOn())
+        {
+            m_g786StatReplNs += static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now() - g786T0).count());
+            g786StatReport();
+        }
+    }
+
+    // The texture a composite draw must sample instead of `src` (0 = no override).
+    GLuint g786OverrideTex(int slot, uint32_t realSrcFbp)
+    {
+        if (slot < 0 || slot >= kG786MaxSlots || !m_g786Valid[slot])
+        {
+            ++g_g786OvrMiss;
+            return 0u;
+        }
+        if (m_g786SlotRun[slot] != m_g786RunNo) // a version from another run: never sample it
+        {
+            ++g_g786OvrStale;
+            ++g_g786OvrMiss;
+            return 0u;
+        }
+        if (realSrcFbp == m_g786WKey[slot])
+        {
+            const auto it = m_fbos.find(realSrcFbp);
+            if (it == m_fbos.end() || it->second.physW != m_g786WW[slot] || it->second.physH != m_g786WH[slot])
+            {
+                ++g_g786OvrMiss;
+                return 0u;
+            }
+            return m_g786WTex[slot];
+        }
+        if (realSrcFbp == kG310LogicalFbp)
+        {
+            const auto it = m_fbos.find(realSrcFbp);
+            // Replicated by this batch's atlas refresh, with the same logical AND physical geometry
+            // as the atlas it stands in for (normalised coordinates must land on the same texels).
+            if (!m_g786AtlasReady[slot] || it == m_fbos.end() || it->second.w != 512 || it->second.h != 512 ||
+                it->second.physW != m_g786AW[slot] || it->second.physH != m_g786AH[slot])
+            {
+                ++g_g786OvrMiss;
+                return 0u;
+            }
+            return m_g786ATex[slot];
+        }
+        ++g_g786OvrMiss;
+        return 0u;
+    }
+
     bool renderBatch(G178Batch &b, uint64_t depthKey, const std::vector<float> *depthUpload,
                      int depthY, int depthRows,
                      std::vector<float> *fusedDepthReadback = nullptr,
                      int depthReadY = 0, int depthReadRows = 0,
                      const G415ColorWindow &g415Window = G415ColorWindow{})
     {
+        dc2_g788_econ::Scope econ(dc2_g788_econ::RenderBatch);
+        g788WorkerCpuNote();
 #if defined(PS2X_G777_NATIVE_GL)
         if(b.g778Shadow)g778ShadowRaster(b,depthKey,depthUpload,depthY,depthRows);
         if(b.g777Native && !g777Prepare(b))return false;
+        if (!b.g788Jobs.empty()) g788ShadowRaster(b, depthKey, depthUpload, depthY, depthRows);
 #endif
+        if (!b.g788Jobs.empty() && !g788Prepare(b)) // G788: one dispatch for the batch's native faces
+            return false;
         if (!validateBatchInputs(b, depthKey, depthUpload, depthY, depthRows))
             return false;
         // G415 stage census: attribute this batch's backend work to texture upload / FBO bind /
@@ -11324,6 +11978,7 @@ void main()
             glDisable(GL_BLEND);
         }
         g415Note(); // 5: program / VBO / uniform / exact-path state
+        g788GpuCost(1,true);
         // G496b: redundant GL state elision. The arm is read ONCE per batch (thread-level, block
         // held) and the non-texture cache is reset here, because the composite / T8 / CT24 / copy /
         // writecolor items that run between batches own all of this state. Both arms leave GL
@@ -11470,12 +12125,36 @@ void main()
         // Rollback: DC2_G647_NO_SRCPARAM=1. Census: DC2_G647_STAT=1 -> [G647:srcparam].
         GLuint g647ParamTex = 0u;
         GLint g647MinF = 0, g647MagF = 0, g647WrapS = 0, g647WrapT = 0;
+        // G786: a versioned outline merge armed this batch (ps2_g786_outline_api.inc).
+        const bool g786Armed = g_g786SnapN > 0 || g_g786OvrN > 0;
+        int g786SnapI = 0, g786OvrI = 0;
+        const bool g786DumpThis = b.fbp == 0x139u && g786DumpWindow(); // diagnostic, read once per batch
+        if (g786DumpThis)
+            g786DumpBatch(b, depthKey, depthUpload != nullptr, depthY, depthRows);
+        if (g786Armed)
+        {
+            ++g_g786Consumed;
+            // Lifetime: a run starts at the first snapshot batch after a composite batch; every
+            // snapshot carries its run and a composite may only sample slots of the current run.
+            if (g_g786SnapN > 0 && m_g786LastArmedWasC)
+                ++m_g786RunNo;
+            m_g786LastArmedWasC = g_g786OvrN > 0;
+        }
         for (size_t drawIndex = 0; drawIndex < b.draws.size(); ++drawIndex)
         {
             if (drawLimit >= 0 && s_globalDrawCount >= static_cast<uint64_t>(drawLimit))
                 break;
             ++s_globalDrawCount;
             const G178Draw &d = b.draws[drawIndex];
+            // G786: W as it is after silhouette k, before silhouette k+1's first draw.
+            if (g786Armed)
+                while (g786SnapI < g_g786SnapN && g_g786Snap[g786SnapI].vtx <= d.firstVtx)
+                {
+                    g786TakeSnap(fbo, b, g_g786Snap[g786SnapI++], g496GlCache, static_cast<int>(drawIndex));
+                    static const bool s_g786ExpReset = std::getenv("DC2_G786_EXP_RESET") != nullptr;
+                    if (s_g786ExpReset)
+                        g496GlReset(); // EXPERIMENT: forget the cached GL state at a silhouette boundary
+                }
             size_t g560RunEnd = drawIndex + 1u;
             const bool g658Overwrite = d.blend == 6u &&
                 (g658Mode6StageGpu() == 1 || g658Mode6StageGpu() == 2);
@@ -11483,6 +12162,8 @@ void main()
                 while (g560RunEnd < b.draws.size() &&
                        g570RunEqual(b.draws[g560RunEnd - 1u], b.draws[g560RunEnd]))
                     ++g560RunEnd;
+            if (g786Armed)
+                g560RunEnd = drawIndex + 1u; // G786: snapshot / override boundaries are per draw
             const int g560VtxCount = g560MultiDraw
                                          ? (b.draws[g560RunEnd - 1u].firstVtx +
                                             b.draws[g560RunEnd - 1u].vtxCount - d.firstVtx)
@@ -11827,12 +12508,50 @@ void main()
                     const uint32_t realSrcFbp = g289RealSourceFbp(d.srcFbp);
                     const FboEntry &src =
                         m_fbos.find(realSrcFbp)->second;
+                    // G786: composite k of a versioned outline merge samples snapshot k.
+                    GLuint g786Tex = 0u;
+                    if (g786Armed && g_g786OvrN > 0)
+                    {
+                        while (g786OvrI < g_g786OvrN && g_g786Ovr[g786OvrI].vtxEnd <= d.firstVtx)
+                            ++g786OvrI;
+                        if (g786OvrI < g_g786OvrN && g_g786Ovr[g786OvrI].vtxBegin <= d.firstVtx)
+                        {
+                            g786Tex = g786OverrideTex(g_g786Ovr[g786OvrI].slot, realSrcFbp);
+                            if (g786Tex != 0u)
+                            {
+                                ++g_g786OvrDraws;
+                                if (g786VerifyOn())
+                                {
+                                    const int vs = g_g786Ovr[g786OvrI].slot;
+                                    const bool va = g786Tex == m_g786ATex[vs];
+                                    const int tw = va ? m_g786AW[vs] : m_g786WW[vs];
+                                    const int th = va ? m_g786AH[vs] : m_g786WH[vs];
+                                    // UV footprint of this draw in physical texels (UVs are normalised
+                                    // to the bound source, GL bottom-first), +1 texel bilinear margin.
+                                    float mnU = 1e30f, mnV = 1e30f, mxU = -1e30f, mxV = -1e30f;
+                                    for (int vi = 0; vi < d.vtxCount; ++vi)
+                                    {
+                                        const G178Vtx &vx = b.verts[static_cast<size_t>(d.firstVtx + vi)];
+                                        const float iq = vx.iq != 0.0f ? vx.iq : 1.0f;
+                                        mnU = std::min(mnU, vx.sq / iq); mxU = std::max(mxU, vx.sq / iq);
+                                        mnV = std::min(mnV, vx.tq / iq); mxV = std::max(mxV, vx.tq / iq);
+                                    }
+                                    const int hull[4] = {static_cast<int>(std::floor(mnU * tw)) - 1,
+                                                         static_cast<int>(std::floor(mnV * th)) - 1,
+                                                         static_cast<int>(std::ceil(mxU * tw)),
+                                                         static_cast<int>(std::ceil(mxV * th))};
+                                    g786Verify(vs, g786Tex, tw, th, src.colorTex, realSrcFbp, g496GlCache, hull);
+                                }
+                            }
+                        }
+                    }
+                    const GLuint g786BindTex = g786Tex != 0u ? g786Tex : src.colorTex;
                     // G496b: the BIND is cached; the four sampler params are NOT. An FboEntry
                     // colour texture is re-parameterised by the T8, CT24, composite-source and
                     // spare-swap paths, so a per-object record here could go stale.
                     // G675: removed an ungated `[DC2_139_SAMPLE]` trace that ran a static counter
                     // and a branch on EVERY producer-surface draw in the hot loop (Rule 12c).
-                    g496BindTex(src.colorTex, g496GlCache);
+                    g496BindTex(g786BindTex, g496GlCache);
                     const GLint filter = d.bilinear ? GL_LINEAR : GL_NEAREST;
                     const bool ownerSource = g289SourceIsOwner(d.srcFbp);
                     const GLint wrapS = ownerSource && d.wrapU == 0u
@@ -11843,7 +12562,7 @@ void main()
                                             : static_cast<GLint>(GL158_CLAMP_TO_EDGE);
                     // G647: first sight of this texture inside this batch (or the rollback arm)
                     // issues all four exactly as before; a repeat issues only what changed.
-                    if (!g647SrcParamOn() || g647ParamTex != src.colorTex)
+                    if (!g647SrcParamOn() || g647ParamTex != g786BindTex)
                     {
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, filter);
                         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
@@ -11854,7 +12573,7 @@ void main()
                         // per-TexEntry record by design (G496b's own comment). `[G496:gl]
                         // texparam` therefore reads ~8 issued/frame while this site is unbounded.
                         g496GlNoteN(kG738GlRawParam, 4ull, 0ull);
-                        g647ParamTex = src.colorTex;
+                        g647ParamTex = g786BindTex;
                         g647MinF = filter;
                         g647MagF = filter;
                         g647WrapS = wrapS;
@@ -11932,11 +12651,14 @@ void main()
                 TexEntry *const texture = drawTextures[drawIndex];
                 g496BindTex(texture->id, g496GlCache);
                 const GLint filter = d.bilinear ? GL_LINEAR : GL_NEAREST;
-                g496TexFilter(texture->g496MinF, texture->g496MagF, filter, filter, g496GlCache);
+                const bool g786RecOk = g786SamplerRecOk(*texture, g496GlCache);
+                g496TexFilter(texture->g496MinF, texture->g496MagF, filter, filter, g786RecOk);
                 g496TexWrap(texture->g496WrapS, texture->g496WrapT,
                             d.wrapU == 0 ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE),
                             d.wrapV == 0 ? GL_REPEAT : static_cast<GLint>(GL158_CLAMP_TO_EDGE),
-                            g496GlCache);
+                            g786RecOk);
+                if (g786DumpThis)
+                    g786DumpSampler(d, texture->g496MinF, texture->g496MagF, texture->g496WrapS, texture->g496WrapT);
                 mode |= 1 | ((d.tfx & 3) << 1) | ((d.tcc & 1u) != 0u ? 8 : 0);
                 if (g362PointGuard)
                     mode |= 4096;
@@ -12107,6 +12829,17 @@ void main()
                             (d.screenSprite != 0u ? 1u << 21 : 0u) | (d.srcFbp != 0u ? 1u << 22 : 0u);
                 g767DrawGpuStamp(false, g767DgCls, g767DgPx);
             }
+            // G788: a native world face draws its GPU-transformed range from the batch's output set.
+            const bool g788Draw = d.g788Seq != 0u;
+            if (execDraw && g788Draw && d.g788Count == 0u)
+                execDraw = false; // stale job: nothing to draw
+            const GLint g788First = g788Draw ? static_cast<GLint>(d.g788Out) : d.firstVtx;
+            const GLsizei g788N = g788Draw ? static_cast<GLsizei>(d.g788Count) : d.vtxCount;
+            if (execDraw && g788Draw)
+            {
+                m_f.glBindVertexArray_(m_g788Out[m_g788OutCur].vao);
+                g_g788C.gDraws.fetch_add(1u, std::memory_order_relaxed);
+            }
             if (execDraw)
             {
                 if (!g560MultiDraw && g255RttAlpha && d.blend != 0u && !g767DualDraw)
@@ -12116,14 +12849,14 @@ void main()
                     // pass one with alpha masked, then overwrite alpha only with the raw source value.
                     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_FALSE);
                     g496Uniform1i(g496Uni, kG496UMode, locMode, mode, g496GlCache);
-                    glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
+                    glDrawArrays(GL_TRIANGLES, g788First, g788N);
                     // Routed through the cache so the record tracks the real GL state: this branch
                     // disables blending after g496BlendOn enabled it, and the next draw must not
                     // believe blending is still on.
                     g496BlendOff(g496GlCache);
                     glColorMask(GL_FALSE, GL_FALSE, GL_FALSE, GL_TRUE);
                     g496Uniform1i(g496Uni, kG496UMode, locMode, mode | 32, g496GlCache);
-                    glDrawArrays(GL_TRIANGLES, d.firstVtx, d.vtxCount);
+                    glDrawArrays(GL_TRIANGLES, g788First, g788N);
                     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
                     // ⭐ G738: the G255 RTT second alpha pass is 2 draws + 3 glColorMask for ONE
                     // logical draw. `[G559:runs]` measures physical - logical = 1,214 extra draws
@@ -12143,6 +12876,12 @@ void main()
                     g496Uniform1i(g496Uni, kG496UMode, locMode, mode, g496GlCache);
 #if defined(PS2X_G777_NATIVE_GL)
                     if(b.g777Native && !b.g777Native->readGeometry){
+                        // G784: draw i of a native run reads probe i's object set.
+                        const G777NativeProbe* g784Probe=b.g777Native;
+                        for(size_t k=0;k<drawIndex && g784Probe;++k)g784Probe=g784Probe->next;
+                        if(!g784Probe)return false;
+                        g784SelectSet(g784Probe->set);
+                        m_f.glBindVertexArray_(m_g777Vao);m_f.glBindBuffer_(GL158_ARRAY_BUFFER,m_g777Output);
                         m_f.glBindBuffer_(0x8F3F,m_g779Indirect); // GL_DRAW_INDIRECT_BUFFER
 #if defined(PS2X_G684_HOT_DIAG)
                         static const bool g780DrawCpu=std::getenv("DC2_G780_GLCPU")!=nullptr;
@@ -12162,9 +12901,13 @@ void main()
                         m_f.glBindBuffer_(0x8F3F,0);
                     }else
 #endif
-                    glDrawArrays(GL_TRIANGLES, d.firstVtx, g560VtxCount);
+                    glDrawArrays(GL_TRIANGLES, g788Draw ? g788First : d.firstVtx, g788Draw ? g788N : g560VtxCount);
 #if defined(PS2X_G777_NATIVE_GL)
-                    if(b.g777Native)++b.g777Native->gpuDraws;
+                    if(b.g777Native){
+                        G777NativeProbe* g784Probe=b.g777Native;
+                        for(size_t k=0;k<drawIndex && g784Probe->next;++k)g784Probe=g784Probe->next;
+                        ++g784Probe->gpuDraws;
+                    }
 #endif
                     g496GlNoteN(kG738GlDraw, 1ull, 0ull);
                     g738DrawBallastIssue();
@@ -12182,6 +12925,15 @@ void main()
                 // G738: the non-elidable price of a `uniform` call — the largest class in the
                 // corrected census (4,484 issued/frame). Issued after the draw, restores `mode`.
                 g738UniBallastIssue(g496Uni, locMode, mode);
+                if (g788Draw) // G788: back to the batch's own vertex array for the next draw
+                {
+#if defined(PS2X_G777_NATIVE_GL)
+                    if (b.g777Native)
+                        m_f.glBindVertexArray_(m_g777Vao);
+                    else
+#endif
+                        m_f.glBindVertexArray_(m_vao);
+                }
             }
             static uint32_t s_auditBatchCounter = 0;
             if (m_batchCounter <= 300 && (m_batchCounter % 60 == 0))
@@ -12203,6 +12955,9 @@ void main()
             if (g560MultiDraw)
                 drawIndex = g560RunEnd - 1u;
         }
+        if (g786Armed) // G786: snapshots after the batch's last draw (the run's final silhouette)
+            while (g786SnapI < g_g786SnapN)
+                g786TakeSnap(fbo, b, g_g786Snap[g786SnapI++], g496GlCache, static_cast<int>(b.draws.size()));
 
         // G496 GPU DERIVATIVE PROBE (diagnostic only — DC2_G419_AB=gpuslow / DC2_G496_FORCE=1).
         // Re-issue this batch's whole vertex range with an IDENTITY BLEND: dst = 0*src + 1*dst, with
@@ -12376,6 +13131,7 @@ void main()
                              static_cast<unsigned long long>(hist[8]));
             }
         }
+        g788GpuCost(1,false);
         g415Note(); // 6: draw loop (+ exact-path epilogue)
         // G767: fold this batch's rendered pages GPU->GPU into the resident FBOs that hold them
         // (armed by the front end INSTEAD of a colour readback; see g767_post_draw_fold.inc).
