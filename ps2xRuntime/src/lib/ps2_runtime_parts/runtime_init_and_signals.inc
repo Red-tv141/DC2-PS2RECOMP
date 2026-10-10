@@ -18,11 +18,27 @@ bool PS2Runtime::initialize(const char *title)
         InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
 #else
         const DC2NativeRenderConfig &renderCfg = getDC2NativeRenderConfig();
+        // DC2_FULLSCREEN=1: borderless fullscreen at the monitor's own resolution (the window
+        // covers the monitor; presentation letterboxes the frame into it, and the render scale
+        // still follows DC2_RESOLUTION_*). DC2_FULLSCREEN=exclusive: raylib exclusive mode at
+        // the monitor's current video mode. It used to be exclusive at the REQUESTED size,
+        // 640x448 when none was given, which asked the monitor for a 640x448 video mode.
+        // F11 toggles borderless fullscreen at run time (runtime_dispatch_and_memory.inc).
+        const char *fsMode = std::getenv("DC2_FULLSCREEN");
+        const bool fsExclusive = renderCfg.isFullscreen && fsMode != nullptr &&
+                                 (std::strcmp(fsMode, "exclusive") == 0 || std::strcmp(fsMode, "Exclusive") == 0);
         unsigned int windowFlags = FLAG_WINDOW_RESIZABLE;
-        if (renderCfg.isFullscreen)
+        if (fsExclusive)
             windowFlags |= FLAG_FULLSCREEN_MODE;
         SetConfigFlags(windowFlags);
-        InitWindow(renderCfg.requestedWidth, renderCfg.requestedHeight, title);
+        InitWindow(fsExclusive ? 0 : renderCfg.requestedWidth, fsExclusive ? 0 : renderCfg.requestedHeight, title);
+        if (renderCfg.isFullscreen && !fsExclusive)
+            ToggleBorderlessWindowed();
+        if (renderCfg.isFullscreen)
+            HideCursor();
+        std::fprintf(stderr, "[G793:window] %s %dx%d (render target %dx%d)\n",
+                     !renderCfg.isFullscreen ? "windowed" : (fsExclusive ? "fullscreen-exclusive" : "fullscreen-borderless"),
+                     GetScreenWidth(), GetScreenHeight(), renderCfg.requestedWidth, renderCfg.requestedHeight);
         InitAudioDevice();
         m_audioBackend.setAudioReady(IsAudioDeviceReady());
 #endif
@@ -61,8 +77,17 @@ bool PS2Runtime::initialize(const char *title)
             const char *v = std::getenv("DC2_G769_VBLANK_US");
             const long us = v != nullptr ? std::strtol(v, nullptr, 10) : 0L;
             const char *uncapped = std::getenv("DC2_G775_UNCAPPED");
-            SetTargetFPS(uncapped && std::atoi(uncapped) == 1 ? 0 :
-                         ((us >= 2000L && us <= 100000L) ? static_cast<int>(1000000L / us) : 60));
+            int targetFps = (us >= 2000L && us <= 100000L) ? static_cast<int>(1000000L / us) : 60;
+            // G793: DC2_FRAMERATE=72/120/144/240 (61..360) presents at that rate; the guest frame is
+            // paced on the host clock by g793_dynamic_framerate.inc.
+            if (const char *fr = std::getenv("DC2_FRAMERATE"))
+            {
+                char *frEnd = nullptr;
+                const long fps = std::strtol(fr, &frEnd, 10);
+                if (frEnd != fr && fps > 60L && fps <= 360L)
+                    targetFps = static_cast<int>(fps);
+            }
+            SetTargetFPS(uncapped && std::atoi(uncapped) == 1 ? 0 : targetFps);
         }
 
         return true;

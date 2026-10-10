@@ -160,6 +160,7 @@ struct G297KickItem
     std::vector<G297VuWrite> writes;               // ordered VU-RAM writes preceding this kick
     std::vector<uint8_t> writeBytes;               // concatenated payloads, in `writes` order
     uint32_t startPC = 0u;
+    uint32_t g788Face = 0u;
     uint32_t itop = 0u;
     uint32_t top = 0u;       // VIF1 double-buffer DATA top (XTOP), snapshotted at MSCAL/MSCNT
     uint32_t budget = 0u;
@@ -520,12 +521,14 @@ public:
         item->g782Command=(dc2_g778::vifScope && dc2_g778::vifScope->active &&
                            dc2_g778::vifScope->active->g782Group)
             ?dc2_g778::vifScope->active:std::shared_ptr<dc2_g778::Command>{};
+        if(dc2_g783::timelineOn())dc2_g783::kicksEnq.fetch_add(1u,std::memory_order_relaxed);
 #endif
         item->writes.swap(m_pendWrites);               // EE-local until pushed: swap, never copy
         item->writeBytes.swap(m_pendWriteBytes);
         m_pendWrites.clear();                          // swapped-in buffers → empty + capacity kept
         m_pendWriteBytes.clear();
         item->startPC = startPC;
+        item->g788Face = g_g788Mode == 4 ? dc2_g788_vuFace() : 0u;
         item->itop = itop;
         item->top = top;
         item->budget = budget;
@@ -808,6 +811,90 @@ public:
             }
             if (m_stop)
                 return;
+#if defined(PS2X_G777_NATIVE_GL)
+            // G783: a NativeCommitted group's cores before the MTVU deadline ran the original
+            // program (MTVU decides only at the deadline core); native draws the whole bucket at
+            // its ordered G713 position, so their Path1 output is dropped. The decision is final
+            // here: the group's G150 apply precedes this window in the G150 FIFO.
+            // G784: per-bucket group size and deadline; deadline == kicks (GS-only) drops every
+            // item of a NativeCommitted group and the MTVU never consults the token.
+            if (item->g782Command && item->g782Command->g782Group)
+            {
+                auto &command = *item->g782Command;
+                const uint32_t ordinal = command.g783Collected++;
+                const auto decision = command.g782Commit->decision();
+                if (decision == dc2_g782::Decision::Pending)
+                {
+                    std::fprintf(stderr, "[G783:deadline] FATAL group collected while pending ordinal=%u bucket=%x\n", ordinal, command.bucket);
+                    std::abort();
+                }
+                const bool nat = decision == dc2_g782::Decision::NativeCommitted;
+                if (ordinal >= command.kicks || (nat && ordinal >= command.deadline && !item->packets.empty()))
+                {
+                    // Release-safe: a group never has more than `kicks` items and a bypassed
+                    // suffix core never produces Path1 output.
+                    std::fprintf(stderr, "[G783:deadline] FATAL group shape ordinal=%u kicks=%u deadline=%u packets=%zu bucket=%x\n",
+                                 ordinal, command.kicks, command.deadline, item->packets.size(), command.bucket);
+                    std::abort();
+                }
+                auto &g784Count = dc2_g784::counters[command.bucketIndex];
+                if (ordinal + 1u == command.kicks)
+                {
+                    g784Count.groups.fetch_add(1u, std::memory_order_relaxed);
+                    (nat ? g784Count.native : g784Count.legacy).fetch_add(1u, std::memory_order_relaxed);
+                }
+#if defined(PS2X_G775_DIAG)
+                {
+                    // G150 thread only. Per-group tallies, printed every 256 completed groups.
+                    static uint64_t nGroups = 0, nNative = 0, nativePrefix = 0, nativeSuffix = 0, legacyItems = 0,
+                                    legacyPackets = 0, nativeSuffixPackets = 0;
+                    if (nat && ordinal >= command.deadline) { ++nativeSuffix; nativeSuffixPackets += item->packets.size(); }
+                    if (nat && ordinal < command.deadline) ++nativePrefix;
+                    if (!nat) { ++legacyItems; legacyPackets += item->packets.size(); }
+                    if (ordinal + 1u == command.kicks)
+                    {
+                        ++nGroups; nNative += nat;
+                        if ((nGroups % 256u) == 0u)
+                            std::fprintf(stderr, "[G783:diag-collect] groups=%llu native=%llu nativePrefixItems=%llu nativeSuffixItems=%llu nativeSuffixPackets=%llu legacyItems=%llu legacyPackets=%llu\n",
+                                (unsigned long long)nGroups, (unsigned long long)nNative, (unsigned long long)nativePrefix,
+                                (unsigned long long)nativeSuffix, (unsigned long long)nativeSuffixPackets,
+                                (unsigned long long)legacyItems, (unsigned long long)legacyPackets);
+                    }
+                }
+#endif
+                if (nat && ordinal < command.deadline)
+                {
+                    uint64_t bytes = 0;
+                    for (const auto &pk : item->packets)
+                        bytes += pk.size();
+                    dc2_g778::counters.g783PrefixItems.fetch_add(1u, std::memory_order_relaxed);
+                    dc2_g778::counters.g783PrefixPackets.fetch_add(item->packets.size(), std::memory_order_relaxed);
+                    g784Count.droppedItems.fetch_add(1u, std::memory_order_relaxed);
+                    g784Count.droppedPackets.fetch_add(item->packets.size(), std::memory_order_relaxed);
+                    g784Count.droppedBytes.fetch_add(bytes, std::memory_order_relaxed);
+                    continue;
+                }
+                // G785 NOKICK ablation (timing probe only): legacy item, parsed in full, drawing kicks
+                // rewritten to their no-kick registers.
+                if (!nat && command.g785NoKick.load(std::memory_order_acquire))
+                {
+                    uint64_t slots = 0;
+                    for (auto &pk : item->packets)
+                        slots += dc2_g784::g785StripKicks(pk);
+                    g784Count.droppedPackets.fetch_add(slots, std::memory_order_relaxed); // reused: stripped kick slots
+                }
+            }
+#endif
+#if defined(PS2X_G784_CENSUS)
+            // G784 census: tag every Path1 packet with its E8B940 bucket (index + 1) for the G150
+            // parse attribution in processWindow. Same order as `out`.
+            if (dc2_g784::censusOn())
+            {
+                const int b = item->g775Draw.self == dc2_g784::kMeshSelf ? dc2_g784::indexOf(item->g775Draw.bucket) : -1;
+                for (size_t i = 0; i < item->packets.size(); ++i)
+                    dc2_g784::collectTags.push_back(uint8_t(b + 1));
+            }
+#endif
             for (auto &pk : item->packets)
                 out.push_back(std::move(pk));
         }
@@ -987,6 +1074,9 @@ private:
 #if defined(PS2X_G775_DIAG)
             const uint32_t g775Entry=item->isResume?m_vu1->state().pc:item->startPC*8u;
 #endif
+            if (item->g788Face)
+                dc2_g788_captureVu(item->g788Face, m_workerVuData, m_vu1->state().vf,
+                                   item->startPC, item->isResume);
             const bool g566AuthorityKick = item->g566Authority &&
                 m_g566Authority.submit(*item, m_vu1->state(), m_workerVuCode, m_workerVuData,
                                        item->g566Authority);
@@ -1063,6 +1153,21 @@ private:
             const bool instr = g303InstrOn();
             const auto twBusy0 = instr ? std::chrono::steady_clock::now()
                                        : std::chrono::steady_clock::time_point{};
+#if defined(PS2X_G777_NATIVE_GL)
+            dc2_g783::Timeline* g783Tl=(dc2_g783::timelineOn() && dc2_g778::coreCommand &&
+                dc2_g778::coreCommand->g782Group)?dc2_g778::coreCommand->g783Timeline.get():nullptr;
+            const uint32_t g783Ord=g783Tl?g783Tl->core++:0u;
+            if(g783Tl && g783Ord<32u){
+                g783Tl->coreStart[g783Ord]=dc2_g783::ticks();
+                if(!g783Ord)g783Tl->prevEnd=dc2_g783::mtvuLastEnd;
+            }
+#endif
+#if defined(PS2X_G784_CENSUS)
+            // G784 census: this item's E8B940 bucket (narrow association), VU time around the core.
+            const int g784B = (dc2_g784::censusOn() && item->g775Draw.self == dc2_g784::kMeshSelf)
+                                  ? dc2_g784::indexOf(item->g775Draw.bucket) : -1;
+            const uint64_t g784T0 = g784B >= 0 ? dc2_g783::ticks() : 0ull;
+#endif
             if (!g566AuthorityKick)
             {
                 if (item->isResume)
@@ -1073,6 +1178,63 @@ private:
                                    PS2_VU1_DATA_SIZE, *m_gs, m_mem, item->startPC, item->itop,
                                    item->budget);
             }
+#if defined(PS2X_G777_NATIVE_GL)
+            if(dc2_g783::timelineOn()){
+                const uint64_t g783End=dc2_g783::ticks();
+                if(g783Tl && g783Ord<32u){
+                    g783Tl->coreEnd[g783Ord]=g783End;g783Tl->kicks[g783Ord]=uint32_t(item->packets.size());
+                    uint32_t bytes=0;for(const auto& packet:item->packets)bytes+=uint32_t(packet.size());
+                    g783Tl->bytes[g783Ord]=bytes;
+                    if(g783Ord+1u==dc2_g778::coreCommand->kicks)dc2_g783::timelineFinish(*g783Tl,dc2_g778::coreCommand->association.id,dc2_g778::coreCommand->association.sf);
+                }
+                dc2_g783::mtvuLastEnd=g783End;dc2_g783::kicksDone.fetch_add(1u,std::memory_order_relaxed);
+            }
+#endif
+#if defined(PS2X_G784_CENSUS)
+            if (g784B >= 0)
+            {
+                const uint64_t ticks = dc2_g783::ticks() - g784T0;
+                auto &cen = dc2_g784::census[size_t(g784B)];
+                // Group = consecutive items of one (invocation, bucket); worker-thread state.
+                thread_local uint64_t lastId = 0;
+                thread_local int lastB = -1;
+                thread_local uint32_t ordinal = 0, groupDraw = 0;
+                const bool fresh = item->g775Draw.id != lastId || g784B != lastB ||
+                                   ordinal + 1u >= dc2_g784::kBuckets[size_t(g784B)].kicks;
+                if (fresh)
+                {
+                    if (lastB >= 0 && groupDraw)
+                        dc2_g784::census[size_t(lastB)].nonempty.fetch_add(1u, std::memory_order_relaxed);
+                    ordinal = 0; groupDraw = 0;
+                    cen.groups.fetch_add(1u, std::memory_order_relaxed);
+                }
+                else
+                    ++ordinal;
+                lastId = item->g775Draw.id; lastB = g784B;
+                uint32_t loops = 0, draw = 0, nodraw = 0;
+                uint64_t bytes = 0;
+                for (const auto &packet : item->packets)
+                {
+                    bytes += packet.size();
+                    dc2_g784::gifVerts(packet.data(), packet.size(), loops, draw, nodraw);
+                }
+                groupDraw += draw;
+                cen.items.fetch_add(1u, std::memory_order_relaxed);
+                (item->isResume ? cen.resumes : cen.starts).fetch_add(1u, std::memory_order_relaxed);
+                cen.pairs.fetch_add(dc2_g483_last_run_cycles(), std::memory_order_relaxed);
+                cen.vuTicks.fetch_add(ticks, std::memory_order_relaxed);
+                cen.packets.fetch_add(item->packets.size(), std::memory_order_relaxed);
+                cen.gifBytes.fetch_add(bytes, std::memory_order_relaxed);
+                cen.gifLoops.fetch_add(loops, std::memory_order_relaxed);
+                cen.drawVerts.fetch_add(draw, std::memory_order_relaxed);
+                cen.nodrawVerts.fetch_add(nodraw, std::memory_order_relaxed);
+                if (ordinal < 32u)
+                {
+                    cen.ordinalTicks[ordinal].fetch_add(ticks, std::memory_order_relaxed);
+                    cen.ordinalItems[ordinal].fetch_add(1u, std::memory_order_relaxed);
+                }
+            }
+#endif
             if (g652CriticalTraceOn)
                 g652CriticalTrace(12u, static_cast<uint64_t>(item->budget));
 #if defined(PS2X_G777_NATIVE_GL)

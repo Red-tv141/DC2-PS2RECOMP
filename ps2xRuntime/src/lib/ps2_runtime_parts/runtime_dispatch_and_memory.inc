@@ -861,7 +861,16 @@ void PS2Runtime::run()
 
         static bool s_forceBlank = false;
         if (IsKeyPressed(KEY_F11)) {
-            s_forceBlank = !s_forceBlank;
+            if (IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT)) {
+                s_forceBlank = !s_forceBlank; // diagnostic dump blanking (was plain F11)
+            } else if (!IsWindowFullscreen()) {
+                // G793: F11 = borderless fullscreen on/off (an exclusive-mode window stays put).
+                ToggleBorderlessWindowed();
+                if (IsWindowState(FLAG_BORDERLESS_WINDOWED_MODE))
+                    HideCursor();
+                else
+                    ShowCursor();
+            }
         }
         static const uint64_t s_frameDumpEvery = []() -> uint64_t {
             const char *e = std::getenv("DC2_FRAME_DUMP_EVERY");

@@ -353,6 +353,9 @@ namespace
 
     // Resolve one stick from its four direction bindings into 0x80-centred bytes.
     // curve: from the launcher config (0 = use fallbackCurve from global env vars).
+    // G792: the launcher dead zone is applied by the shared model -- under the default
+    // PCSX2 model it is PCSX2's non-rescaling radial dead zone, so the launcher's 10 %
+    // default no longer shrinks the stick range on top of the game's own dead zone.
     void g449Stick(const G449ControllerConfig &c, int gamepad, int up, int down,
                    int left, int right, float dead, float curve, float fallbackCurve,
                    uint8_t *outX, uint8_t *outY)
@@ -362,16 +365,10 @@ namespace
         float y = g449BindingAxis(c.bind[down], gamepad) -
                   g449BindingAxis(c.bind[up], gamepad);
 
-        const auto &sp = getStickParams();
-        if (sp.linear) {
-            auto p = processStickLinear(x, y, dead);
-            *outX = p.first; *outY = p.second;
-        } else {
-            // Use launcher-config curve if set, else fall back to global env var.
-            const float effCurve = (curve > 0.f) ? curve : fallbackCurve;
-            auto p = processStick(x, y, dead, sp.outerDead, effCurve);
-            *outX = p.first; *outY = p.second;
-        }
+        // Use launcher-config curve if set, else fall back to global env var.
+        const float effCurve = (curve > 0.f) ? curve : fallbackCurve;
+        auto p = convertStick(x, y, dead, effCurve, dead);
+        *outX = p.first; *outY = p.second;
     }
 
     // Full poll under a launcher config. Returns false when no config is active, so the
