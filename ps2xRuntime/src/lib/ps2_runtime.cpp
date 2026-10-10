@@ -1,5 +1,7 @@
 #include "runtime/dc2_g778_native.h"
+#include "runtime/dc2_g788_diagnostic.h"
 // G764 leased GPU presentation snapshots, revision 3.
+// G793 frame-rate modes + borderless fullscreen / F11 (runtime_init_and_signals.inc, runtime_dispatch_and_memory.inc), revision 2.
 // G776: bounded dependency capture retains unowned producers between logical draws.
 #include "ps2_dma_view.h"
 #include "runtime/dc2_g775_capture.h"
@@ -9,6 +11,7 @@
 // G566: exact GPU-authoritative VU1 command producer and asynchronous packet-result handoff (v1).
 // G545: incremental CPU-authoritative VU1 worker -> persistent GPU shadow stream (v2 trace).
 // G478: runtime_mtvu_and_env.inc now arms the G446 PC sampler on the MTVU worker thread.
+// G785: runtime_mtvu_and_env.inc's collect applies the E91F00 NOKICK ablation (dc2_g784_buckets.h).
 // G483: it also splits [G441:kick]'s exec bucket by kick kind ([G483:kind]) and by stop reason
 // ([G483:stop]).
 #include "ps2_runtime_parts/dc2_logger.inc"

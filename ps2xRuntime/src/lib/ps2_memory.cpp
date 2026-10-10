@@ -1,7 +1,9 @@
 #include <chrono>
+#include "runtime/dc2_g788_economics.h" // G788 wire diagnostics, revision 2
 #include "ps2_syscalls.h"
 #include "ps2_dma_view.h"
 #include "runtime/dc2_g775_capture.h"
+#include "runtime/dc2_g788_diagnostic.h"
 #include "ps2_g674_hot_flag.inc"
 // G736: A/B arm selectors as compile-time `-1` in shipping builds (no out-of-line call).
 #include "ps2_g736_ab_arm_stubs.inc"

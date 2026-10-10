@@ -1,4 +1,6 @@
 #include "runtime/dc2_g778_native.h"
+#include "runtime/dc2_g788_economics.h" // G788 wire/unpack diagnostics, revision 2
+#include "runtime/dc2_g788_diagnostic.h"
 #include <chrono>
 #include "ps2_dma_view.h"
 #include "runtime/dc2_g775_capture.h"

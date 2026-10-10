@@ -1,3 +1,5 @@
+// G788 revision: 11 -- explicit GPU reference refusal coverage (force-recompile marker, G359 trap)
+#include "runtime/dc2_g788_economics.h"
 #include "runtime/dc2_g778_native.h"
 // G774 native color handoff, alpha contract, ranged host observer and empty-debt guards, revision 10.
 #include "ps2_asset_texcache.h"
@@ -276,6 +278,9 @@ void (*g_g630UploadCompleteHook)(uint8_t *, uint32_t, uint32_t, uint32_t,
 // internal-linkage variable that is never defined (C7631; the G568 linkage lesson).
 #include <atomic>
 extern std::atomic<uint32_t> g_dc2ScriptFrame;
+// G786 (diagnostic): readbacks issued by the GPU backend, counted only under DC2_G786_OLCLASS.
+extern std::atomic<uint64_t> g_g786RbN, g_g786RbUs;
+#include "ps2_g786_outline_api.inc" // G786: versioned outline merge (rasterizer <-> backend)
 
 // G604: which framebuffer pages are G527-DISCOVERED targets admitted under the non-persistent
 // transient contract, published as a 512-bit set for the GPU backend TU.
@@ -330,6 +335,14 @@ std::atomic<uint64_t> g_g604RawAlphaFbpBits[8] = {};
 
 
 #include "ps2_gs_rasterizer_parts/rasterizer_tilebinning_and_probes.inc"
+// G787: native outline composite (markers, macro entries). Needs G144Entry; global scope.
+// G787 §9 (`_d`): draw-collapse lever DC2_G787_COLLAPSE + DC2_G787_DCENSUS, used by
+// rasterizer_vram_materialization.inc — content edit here forces both .inc edits to be consumed.
+#include "ps2_g787_composite_api.inc"
+#include "ps2_gs_rasterizer_parts/g787_native_composite.inc"
+// G788 revision: 1 — whole-world native FixMDT (marker consumer). Global scope.
+#include "ps2_g788_world_api.inc"
+#include "ps2_gs_rasterizer_parts/g788_world_native.inc"
 
 // G527 revision: 1 — the runtime render-target registry. MUST follow tilebinning (it reads
 // g248TargetIndex to keep the legacy five out of the wide set) and MUST precede the command graph,
@@ -1103,8 +1116,18 @@ bool dc2_g778::orderedNative(GS* gs,std::shared_ptr<Command> command)
 bool dc2_g778::orderedNativeNonblocking(GS* gs,std::shared_ptr<Command> command)
 {
     if(!gs || !command || !nonblockingAvailable())return false;
+    const bool g782Timed=g782ReportRequested();
+    const auto g782EeT0=g782Timed?std::chrono::steady_clock::now():std::chrono::steady_clock::time_point{};
     command->g782Commit=std::make_shared<dc2_g782::CommitToken>(command->association.id);
     command->g782Group=true;
+    if(const auto& tl=command->g783Timeline){
+        tl->hook=dc2_g783::ticks();
+        tl->backlog=dc2_g783::kicksEnq.load(std::memory_order_relaxed)-dc2_g783::kicksDone.load(std::memory_order_relaxed);
+    }
+    if(g782NoMarker()){ // decomposition: everything but the ordered marker
+        if(command->g782Commit->reject())++counters.g782ParseReject;
+        return true;
+    }
     auto apply=[gs,command](){
 #if defined(PS2X_G684_HOT_DIAG)
         static const int delayUs=[](){const char* v=std::getenv("DC2_G782_PARSE_DELAY_US");return v?std::atoi(v):0;}();
@@ -1114,6 +1137,18 @@ bool dc2_g778::orderedNativeNonblocking(GS* gs,std::shared_ptr<Command> command)
             std::this_thread::sleep_for(std::chrono::microseconds(delayUs));
 #endif
         auto& token=*command->g782Commit;
+        // G783 timeline: when G150 reaches its admission state, whether or not it still can win.
+        struct G783Done{std::shared_ptr<Command> c;~G783Done(){if(c && c->g783Timeline){const auto& tl=c->g783Timeline;
+            tl->decision=uint32_t(c->g782Commit->decision());dc2_g783::timelineFinish(*tl,c->association.id,c->association.sf);}}};
+        G783Done g783Done{command->g783Timeline?command:std::shared_ptr<Command>{}};
+        if(const auto& tl=command->g783Timeline){
+            tl->apply=dc2_g783::ticks();dc2_g783::timelineAtApply(*tl);
+            tl->pending=token.decision()==dc2_g782::Decision::Pending;
+            if(!tl->pending){
+                std::shared_ptr<const G780NativeItem> probe;
+                tl->contractOk=gs->captureNativeE91F00(command,probe,true);tl->ready=dc2_g783::ticks();
+            }
+        }
         if(token.decision()!=dc2_g782::Decision::Pending){
             ++dc2_g778::counters.g782LostRace;
             return;
@@ -1128,8 +1163,52 @@ bool dc2_g778::orderedNativeNonblocking(GS* gs,std::shared_ptr<Command> command)
 #endif
         std::shared_ptr<const G780NativeItem> item;
         try{
-            if(!gs->captureNativeE91F00(command,item,true)){
+            const bool g783Ok=gs->captureNativeE91F00(command,item,true);
+            if(const auto& tl=command->g783Timeline){tl->ready=dc2_g783::ticks();tl->contractOk=g783Ok;}
+            auto& g784Count=dc2_g784::counters[command->bucketIndex];
+            if(!g783Ok){
+                if(token.reject()){++dc2_g778::counters.g782ParseReject;++g784Count.parseReject;}
+                return;
+            }
+            ++g784Count.eligible;
+            // G785 SPLIT ablation (timing probe): close the open parse batch into G713 exactly as the
+            // native commit below does, then stay legacy (or drop, with DC2_G785_E91F00_DROP).
+            if(((dc2_g784::e91f00Split() || dc2_g784::e91f00ExecPoint()) && command->bucketIndex==dc2_g784::kE91F00) ||
+               dc2_g784::splitAll()){
+                g713ParseFlushOpen();
+                // EXECPOINT: the native node's exec-thread drain (g778FlushExec), without the native draw.
+                if(dc2_g784::e91f00ExecPoint())g713PostCall(&g785ExecPoint,nullptr);
+                if(!dc2_g784::e91f00Drop() || command->bucketIndex!=dc2_g784::kE91F00){
+                    if(token.reject())++dc2_g778::counters.g782ParseReject;
+                    return;
+                }
+            }
+            // G785 NOKICK ablation (timing probe): stay legacy, but the collect strips every drawing
+            // kick from this group's Path1 (parsed in full, nothing drawn).
+            if(dc2_g784::e91f00NoKick() && command->bucketIndex==dc2_g784::kE91F00){
+                command->g785NoKick.store(true,std::memory_order_release);
                 if(token.reject())++dc2_g778::counters.g782ParseReject;
+                return;
+            }
+            // G784 census: the contract was evaluated on the exact ordered state; stay legacy.
+            if(dc2_g784::forceLegacy()){
+                if(token.reject())++dc2_g778::counters.g782ParseReject;
+                return;
+            }
+            // G784 CEILING PROBE (DC2_G784_CEILING_DROP, timing arm only, renders the group NOWHERE):
+            // a GS-only group commits, so G150 drops its whole Path1 output, but no native node is
+            // posted and the open parse batch is not split. The frame-time difference to the arm that
+            // keeps legacy is the most any native implementation of those buckets can delete.
+            // G785: DC2_G785_E91F00_DROP is the same probe for the default-native bucket itself (its
+            // legacy drop ceiling, plans/phase-G785-ledger.md); GS-only deadline required, as above.
+            if(command->deadline>=command->kicks &&
+               ((dc2_g784::ceilingDrop() && command->bucketIndex!=dc2_g784::kE91F00) ||
+                (dc2_g784::e91f00Drop() && command->bucketIndex==dc2_g784::kE91F00))){
+                if(!token.tryNative()){++dc2_g778::counters.g782LostRace;return;}
+                gs->commitNativeE91F00();
+                gsDirty.store(31u,std::memory_order_release);
+                ++dc2_g778::counters.g782NativeCommit;++dc2_g778::counters.nativeCommands;
+                ++dc2_g778::counters.g782NativeComplete;
                 return;
             }
             // All earlier parse batches enter G713 ahead of this reserved node.
@@ -1157,6 +1236,10 @@ bool dc2_g778::orderedNativeNonblocking(GS* gs,std::shared_ptr<Command> command)
         command->g782Group=false;
         return false;
     }
+    // The EE's whole native-specific cost: token + one FIFO enqueue (the diagnostic lead
+    // sleep below is a test stimulus and is excluded).
+    if(g782Timed)g782NoteCost(counters.g782EeNs,counters.g782EeCalls,counters.g782EeMaxNs,
+        uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-g782EeT0).count()));
 #if defined(PS2X_G684_HOT_DIAG)
     static const int eeLeadUs=[](){const char* v=std::getenv("DC2_G782_EE_AFTER_ENQUEUE_US");return v?std::atoi(v):0;}();
     if(eeLeadUs>0)std::this_thread::sleep_for(std::chrono::microseconds(eeLeadUs));

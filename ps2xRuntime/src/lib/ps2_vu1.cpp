@@ -1,4 +1,6 @@
 #include "runtime/dc2_g778_native.h"
+#include "runtime/dc2_g788_economics.h"
+// G788 revision 2: owner-side Path1 bytes and program-0 cost.
 #if defined(PS2X_G777_NATIVE_GL)
 extern thread_local uint64_t g_g483LastRunCycles;
 #endif

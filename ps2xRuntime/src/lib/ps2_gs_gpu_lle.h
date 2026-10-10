@@ -18,6 +18,7 @@
 #include "runtime/dc2_g778_native.h"
 struct G777NativeProbe;
 #endif
+#include "ps2_g788_world_api.inc" // G788: native world face jobs (G178Draw / G178Batch fields)
 
 // One translated vertex. x/y are screen pixels (GS window coords minus XYOFFSET, pixel centers at
 // +0.5 like the CPU rasterizer); z is the raw GS Z value (uint bits, normalized on the GPU).
@@ -87,6 +88,12 @@ struct G178Draw
     // to exactly the population that carries the 1x-calibrated UV shift.
     uint8_t screenSprite = 0;
     uint16_t scX0 = 0, scY0 = 0, scX1 = 0, scY1 = 0; // GS scissor (inclusive, top-origin)
+    // G788: a native world face. firstVtx/vtxCount address a 3-vertex zero placeholder in `verts`
+    // (every legacy-space consumer sees a degenerate triangle); the GL worker draws
+    // [g788Out, g788Out + g788Count) of the batch's GPU-transformed output instead.
+    uint32_t g788Seq = 0, g788Out = 0, g788Count = 0;
+    uint16_t g788Ofx = 0, g788Ofy = 0;
+    uint8_t g788Flags = 0; // 1 TME, 2 IIP
 };
 
 // A texture the backend must (re)upload before drawing this batch (decoded RGBA8, linear,
@@ -130,6 +137,7 @@ struct G178Batch
     std::vector<G178TexUpload> texUploads;
     std::vector<G178Vtx> verts;
     std::vector<G178Draw> draws;
+    std::vector<G788BatchJob> g788Jobs; // G788: native world faces, in draw order (output ranges)
     std::vector<uint32_t> readback;     // out (resized by the backend; empty under skipReadback)
 };
 #if defined(PS2X_G777_NATIVE_GL)
@@ -144,6 +152,10 @@ struct G777NativeProbe
     bool live=false;
     uint32_t vertexCount=0,capacity=0,cacheReplacements=0;
     bool readGeometry=true;
+    // G784: a native RUN batch carries one probe per draw, in draw order (draws[i] <-> i-th probe);
+    // `set` is the rotating GPU object set g777Prepare chose for this probe's compute + raster.
+    G777NativeProbe* next=nullptr;
+    uint32_t set=0;
 };
 #endif
 

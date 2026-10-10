@@ -1,3 +1,5 @@
+// G788 revision: 9 -- explicit GPU reference refusal coverage (force-recompile marker, G359 trap)
+#include "runtime/dc2_g788_economics.h"
 // G774 rejected integer-combine trial removed; native backend unchanged, revision 2.
 // G764 mapped asset upload ownership, revision 1.
 #include <cstdint>
@@ -135,6 +137,7 @@ extern std::atomic<uint32_t> g_dc2RenderedFrame;
 // counters live in g496_gl_state_cache.inc and the formatting in ps2_g738_glcall.inc, so no
 // formatting text enters this hot TU (G710: +0.362 ms/f for compile-time-dead text here).
 #include "ps2_g738_glcall_api.inc"
+#include "ps2_g786_outline_api.inc" // G786: versioned outline merge (rasterizer <-> backend)
 
 #include "ps2_gs_gpu_raster_parts/gpu_raster_infrastructure.inc"
 #include "ps2_gs_gpu_raster_parts/persistent_t8_decoder.inc"

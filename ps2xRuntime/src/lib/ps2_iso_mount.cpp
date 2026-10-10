@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <map>
+#include <unordered_set>
 
 // ---- constants ---------------------------------------------------------------
 
@@ -515,6 +517,124 @@ Ps2IsoMount& getGlobalIsoMount()
 
 static constexpr uint32_t kFolderLbaBase = 32; // clear of the PVD/AVDP region (16, 256 are ISO's)
 
+// ---- G793 mods: a file in the mods folder replaces the game file with the same path ----------
+//
+// With DC2_MODS_ENABLED=1 (the launcher's Mods option) a file under DC2_MODS_DIR (default "Mods")
+// whose relative path names a game file -- compared case-insensitively -- is served instead:
+//   * a disc file:      Mods/MOVIE/RUSH.PSS replaces DATA/MOVIE/RUSH.PSS;
+//   * a DATA.DAT entry: Mods/menu/cmenu.img replaces the archive entry "menu\cmenu.img".
+// Either may have any size. The game loads archive entries through DATA.HD3 (16-byte records:
+// name, size, first sector, sector count; InitCDFile / CDRead) and the runtime's own sceOpen
+// fallback through DATA.HD2 (32-byte records, the byte offset at +0x10). A replaced entry gets a
+// sector range of its own right after DATA.DAT (so HD2's 32-bit byte offsets stay small), and both
+// indexes are served patched from memory. With mods off, or no file matching, the layout is
+// unchanged.
+namespace
+{
+    struct ModIndex
+    {
+        std::map<std::string, std::string> files; // lower-case "a/b.ext" -> host path
+        bool on = false;
+    };
+
+    std::string modKey(std::string s)
+    {
+        for (char& c : s)
+        {
+            if (c == '\\') c = '/';
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        while (!s.empty() && s.front() == '/') s.erase(s.begin());
+        return s;
+    }
+
+    ModIndex loadModIndex()
+    {
+        ModIndex m;
+        const char* en = std::getenv("DC2_MODS_ENABLED");
+        if (en == nullptr || *en == '\0' || std::strcmp(en, "0") == 0)
+            return m;
+        const char* d = std::getenv("DC2_MODS_DIR");
+        const std::filesystem::path root = (d != nullptr && *d != '\0') ? d : "Mods";
+        std::error_code ec;
+        if (!std::filesystem::is_directory(root, ec))
+        {
+            std::cout << "[MODS] mods folder not found: " << root.string() << std::endl;
+            return m;
+        }
+        for (auto it = std::filesystem::recursive_directory_iterator(
+                 root, std::filesystem::directory_options::skip_permission_denied, ec);
+             !ec && it != std::filesystem::recursive_directory_iterator(); it.increment(ec))
+        {
+            if (it.depth() == 0 && it->is_directory(ec))
+            {
+                // Texture packs and caches live here too and never name a game file.
+                const std::string top = modKey(it->path().filename().string());
+                if (top == "hd texture" || top == "texture dump" || top == "texcache")
+                    it.disable_recursion_pending();
+                continue;
+            }
+            if (!it->is_regular_file(ec) || ec) { ec.clear(); continue; }
+            std::string rel = std::filesystem::relative(it->path(), root, ec).generic_string();
+            if (ec) { ec.clear(); continue; }
+            m.files.emplace(modKey(rel), it->path().string());
+        }
+        m.on = true;
+        return m;
+    }
+
+    bool readWholeFile(const std::string& path, std::vector<uint8_t>& out)
+    {
+        std::ifstream f(path, std::ios::binary);
+        if (!f) return false;
+        f.seekg(0, std::ios::end);
+        const std::streamoff n = f.tellg();
+        if (n <= 0) return false;
+        out.resize(static_cast<size_t>(n));
+        f.seekg(0, std::ios::beg);
+        return static_cast<bool>(f.read(reinterpret_cast<char*>(out.data()), n));
+    }
+
+    void w32(std::vector<uint8_t>& b, size_t o, uint32_t v)
+    {
+        b[o] = static_cast<uint8_t>(v);
+        b[o + 1] = static_cast<uint8_t>(v >> 8);
+        b[o + 2] = static_cast<uint8_t>(v >> 16);
+        b[o + 3] = static_cast<uint8_t>(v >> 24);
+    }
+
+    // Calls f(recordOffset, lowerCaseName) for every named record of an HD2/HD3 index. The first
+    // record's name offset is where the name table starts, i.e. the end of the record table.
+    template <class F>
+    void forEachIndexRecord(const std::vector<uint8_t>& b, uint32_t recSize, F&& f)
+    {
+        if (b.size() < recSize) return;
+        const uint32_t first = r32(b.data(), 0);
+        if (first < recSize || first > b.size()) return;
+        for (uint32_t off = 0; off + recSize <= first; off += recSize)
+        {
+            const uint32_t no = r32(b.data(), off);
+            if (no < first || no >= b.size() || b[no] == 0) continue;
+            const char* name = reinterpret_cast<const char*>(&b[no]);
+            const void* end = std::memchr(name, 0, b.size() - no);
+            if (end == nullptr) continue;
+            f(off, modKey(std::string(name, static_cast<const char*>(end))));
+        }
+    }
+
+    // Patched indexes served from memory, keyed by their FolderExtent path tag.
+    std::unordered_map<std::string, std::vector<uint8_t>> g_modMem;
+    constexpr const char kModMemTag[] = "\x01mods:";
+    // Disc paths ("/DATA.HD3") the mount serves differently from the host copy under DC2_DATA_DIR.
+    std::unordered_set<std::string> g_modOverridden;
+}
+
+// sceOpen fopen()s the host copy of a cdrom0: path first; for these it must read the mount instead.
+bool dc2ModsOverridesDiscPath(const std::string& isoPath)
+{
+    return !g_modOverridden.empty() && g_modOverridden.count(isoPath) != 0u;
+}
+
 bool Ps2IsoMount::openFolder(const std::string& dir)
 {
     std::error_code ec;
@@ -541,10 +661,77 @@ bool Ps2IsoMount::openFolder(const std::string& dir)
     m_extents.reserve(files.size());
     m_iso9660Files.clear();
     m_rootEntries.clear();
+    g_modMem.clear();
+    g_modOverridden.clear();
+
+    // G793 mods: which host file serves each disc path, and which DATA.DAT entries are replaced.
+    const ModIndex mods = loadModIndex();
+    auto relOf = [&](const std::filesystem::path& f) {
+        std::string rel = std::filesystem::relative(f, root, ec).generic_string();
+        if (ec) { ec.clear(); rel = f.filename().generic_string(); }
+        return rel;
+    };
+    auto hostFor = [&](const std::filesystem::path& f, const std::string& rel) {
+        if (mods.on)
+        {
+            const auto it = mods.files.find(modKey(rel));
+            if (it != mods.files.end())
+                return it->second;
+        }
+        return f.string();
+    };
+    struct ArchiveMod
+    {
+        std::string host;
+        uint64_t size = 0;
+        std::vector<uint32_t> hd3Recs, hd2Recs;
+    };
+    std::map<std::string, ArchiveMod> archiveMods; // by lower-case entry name, a stable order
+    std::vector<uint8_t> hd3, hd2;
+    uint32_t discMods = 0;
+    if (mods.on)
+    {
+        for (const auto& f : files)
+        {
+            const std::string rel = relOf(f);
+            const std::string host = hostFor(f, rel);
+            if (host != f.string())
+            {
+                ++discMods;
+                g_modOverridden.insert(toUpper("/" + rel));
+                std::cout << "[MODS]   disc    " << rel << " <- " << host << std::endl;
+            }
+            const std::string key = toUpper("/" + rel);
+            if (key == "/DATA.HD3") readWholeFile(host, hd3);
+            else if (key == "/DATA.HD2") readWholeFile(host, hd2);
+        }
+        auto claim = [&](uint32_t off, const std::string& name, bool isHd3) {
+            const auto it = mods.files.find(name);
+            if (it == mods.files.end()) return;
+            ArchiveMod& am = archiveMods[name];
+            if (am.host.empty())
+            {
+                const uintmax_t msz = std::filesystem::file_size(it->second, ec);
+                if (ec) { ec.clear(); archiveMods.erase(name); return; }
+                am.host = it->second;
+                am.size = static_cast<uint64_t>(msz);
+            }
+            (isHd3 ? am.hd3Recs : am.hd2Recs).push_back(off);
+        };
+        forEachIndexRecord(hd3, 16u, [&](uint32_t off, const std::string& n) { claim(off, n, true); });
+        forEachIndexRecord(hd2, 32u, [&](uint32_t off, const std::string& n) { claim(off, n, false); });
+    }
+    uint32_t datLba = 0;
 
     for (const auto& f : files)
     {
-        const uintmax_t sz = std::filesystem::file_size(f, ec);
+        // Key form must match the ISO path exactly: "/DATA.HD2", "/MOVIE/RUSH.PSS".
+        // findFile() upper-cases its argument, so store upper-cased keys here too.
+        const std::string rel = relOf(f);
+        const std::string key = toUpper("/" + rel);
+        const std::string host = hostFor(f, rel);
+
+        const uintmax_t sz = std::filesystem::file_size(host, ec);
         if (ec) { ec.clear(); continue; }
 
         const uint32_t sectors =
@@ -554,14 +741,14 @@ bool Ps2IsoMount::openFolder(const std::string& dir)
         ex.lba = nextLba;
         ex.sectors = (sectors > 0u) ? sectors : 1u; // a 0-byte file still owns one sector
         ex.size = static_cast<uint64_t>(sz);
-        ex.path = f.string();
+        ex.path = host;
+        if (!archiveMods.empty() && ((key == "/DATA.HD3" && !hd3.empty()) ||
+                                     (key == "/DATA.HD2" && !hd2.empty())))
+        {
+            ex.path = kModMemTag + key; // patched below, served from g_modMem
+            g_modOverridden.insert(key);
+        }
         m_extents.push_back(ex);
-
-        // Key form must match the ISO path exactly: "/DATA.HD2", "/MOVIE/RUSH.PSS".
-        // findFile() upper-cases its argument, so store upper-cased keys here too.
-        std::string rel = std::filesystem::relative(f, root, ec).generic_string();
-        if (ec) { ec.clear(); rel = f.filename().generic_string(); }
-        const std::string key = toUpper("/" + rel);
 
         IsoFileInfo info{};
         info.lba = ex.lba;
@@ -573,7 +760,55 @@ bool Ps2IsoMount::openFolder(const std::string& dir)
             m_rootEntries.push_back(toUpper(rel));
 
         nextLba += ex.sectors;
+
+        if (key == "/DATA.DAT" && !archiveMods.empty())
+        {
+            // Replaced archive entries: own extents right after DATA.DAT, addressed relative to it.
+            datLba = ex.lba;
+            g_modOverridden.insert(key);
+            for (auto& [name, am] : archiveMods)
+            {
+                const uint32_t msec = std::max<uint32_t>(1u,
+                    static_cast<uint32_t>((am.size + SECTOR_SIZE - 1) / SECTOR_SIZE));
+                FolderExtent mx;
+                mx.lba = nextLba;
+                mx.sectors = msec;
+                mx.size = am.size;
+                mx.path = am.host;
+                m_extents.push_back(mx);
+
+                const uint32_t relSector = mx.lba - datLba;
+                const uint32_t size32 = static_cast<uint32_t>(std::min<uint64_t>(am.size, 0xFFFFFFFFull));
+                for (uint32_t off : am.hd3Recs)
+                {
+                    w32(hd3, off + 4u, size32);
+                    w32(hd3, off + 8u, relSector);
+                    w32(hd3, off + 12u, msec);
+                }
+                for (uint32_t off : am.hd2Recs)
+                {
+                    w32(hd2, off + 0x10u, relSector * SECTOR_SIZE);
+                    w32(hd2, off + 0x14u, size32);
+                    w32(hd2, off + 0x18u, relSector);
+                    w32(hd2, off + 0x1Cu, msec);
+                }
+                std::cout << "[MODS]   archive " << name << " <- " << am.host << " (" << am.size
+                          << " bytes, sector " << relSector << ")" << std::endl;
+                nextLba += msec;
+            }
+        }
     }
+    if (!archiveMods.empty())
+    {
+        if (datLba == 0u)
+            std::cerr << "[MODS] DATA.DAT not found: archive replacements cannot be placed" << std::endl;
+        g_modMem[std::string(kModMemTag) + "/DATA.HD3"] = std::move(hd3);
+        g_modMem[std::string(kModMemTag) + "/DATA.HD2"] = std::move(hd2);
+    }
+    if (mods.on)
+        std::cout << "[MODS] " << mods.files.size() << " file(s) in the mods folder: " << discMods
+                  << " replace disc files, " << archiveMods.size() << " replace DATA.DAT entries"
+                  << std::endl;
 
     // Directory entries, so a findFile() on a folder answers is_dir like ISO9660 does.
     for (auto it = std::filesystem::recursive_directory_iterator(
@@ -652,10 +887,6 @@ bool Ps2IsoMount::readSectorFolder(uint32_t lba, uint32_t count, void* dst) cons
             out += bytes; i += gap;
             continue;
         }
-        std::ifstream* s = streamFor(*ex);
-        if (s == nullptr)
-            return false;
-
         const uint64_t off = static_cast<uint64_t>(lba + i - ex->lba) * SECTOR_SIZE;
         const uint32_t sectors = std::min(count - i, ex->sectors - (lba + i - ex->lba));
         const size_t bytes = size_t(sectors) * SECTOR_SIZE;
@@ -664,6 +895,22 @@ bool Ps2IsoMount::readSectorFolder(uint32_t lba, uint32_t count, void* dst) cons
 
         if (avail < bytes)
             std::memset(out + avail, 0, bytes - static_cast<size_t>(avail));
+
+        if (ex->path.compare(0, sizeof(kModMemTag) - 1, kModMemTag) == 0)
+        {
+            // G793 mods: an archive index patched in memory.
+            const auto mit = g_modMem.find(ex->path);
+            if (mit == g_modMem.end() || (avail != 0u && off + avail > mit->second.size()))
+                return false;
+            if (avail != 0u)
+                std::memcpy(out, mit->second.data() + off, static_cast<size_t>(avail));
+            out += bytes; i += sectors;
+            continue;
+        }
+
+        std::ifstream* s = streamFor(*ex);
+        if (s == nullptr)
+            return false;
 
         s->clear();
         s->seekg(static_cast<std::streamoff>(off), std::ios::beg);

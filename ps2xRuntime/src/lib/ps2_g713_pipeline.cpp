@@ -271,6 +271,12 @@ uint32_t s_adaptHot = 0u;
 bool s_armed = false;
 thread_local bool t_onExec = false;
 
+} // namespace
+// G784: a pending native RUN (g778_ordered_native.inc) is flushed before any other node executes
+// and before the executor publishes the tail of the last visible node. Executor thread only.
+bool g_g784RunPending = false;
+void (*g_g784NativeBarrier)() = nullptr;
+namespace {
 void g713RunNode(G713Ring &r, G713Node &n)
 {
     switch (n.kind)
@@ -345,6 +351,8 @@ void g713Consume(G713Ring &r, uint64_t head, bool threaded)
             while (std::chrono::steady_clock::now() < spinUntil) { /* executor only */ }
         }
         G713Node &n = r.node[r.tailC & (kNodeCap - 1u)];
+        if (g_g784RunPending && n.kind != kNodeNative && g_g784NativeBarrier)
+            g_g784NativeBarrier();
         if (stat)
         {
             const auto k0 = std::chrono::steady_clock::now();
@@ -365,6 +373,8 @@ void g713Consume(G713Ring &r, uint64_t head, bool threaded)
             g713RunNode(r, n);
         if (n.kind == kNodeImage)
             r.payTailC = n.payOff + n.payLen;
+        if (g_g784RunPending && r.tailC + 1u == head && g_g784NativeBarrier)
+            g_g784NativeBarrier(); // last visible node: the run lands before the tail is published
         ++r.tailC;
         if (threaded && ((r.tailC & 63u) == 0u || r.tailC == head))
         {
@@ -805,6 +815,8 @@ bool g713PostNativeCommit(void (*fn)(void *), void *immutableItem,
     {
         const bool won = token->tryNative();
         fn(immutableItem);
+        if (g_g784RunPending && g_g784NativeBarrier)
+            g_g784NativeBarrier(); // inline (nested) post: no later node will flush it
         return won;
     }
     G713Node &n = g713Acquire(r);

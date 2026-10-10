@@ -1,4 +1,6 @@
 #include "runtime/ps2_gif_arbiter.h"
+#include "runtime/dc2_g783_prof.h"
+#include "runtime/dc2_g784_buckets.h"
 #include "runtime/ps2_gs_gpu.h"
 #include "ps2_log.h"
 #include "ps2_g674_hot_flag.inc"
@@ -1778,9 +1780,14 @@ namespace
 
         void processWindow(std::vector<GifArbiterPacket> &q, bool g317HadQueuedSuccessor)
         {
+#if defined(PS2X_G784_CENSUS)
+            static thread_local std::vector<uint8_t> g784Tags; // G784 census, see the collect below
+#endif
             const bool g316On = g316TimingOn();
             const bool g316Record = g316RecordOn();
             const bool g316Sample = g316On && m_g316LeafSample;
+            if (dc2_g783::timelineOn())
+                dc2_g783::gsWindow.fetch_add(1u, std::memory_order_relaxed);
             const auto g316WindowT0 = g316On ? std::chrono::steady_clock::now()
                                               : std::chrono::steady_clock::time_point{};
             // G297 MTVU: pull this window's off-thread VU1 XGKICK output (Path1) and merge it into
@@ -1809,7 +1816,28 @@ namespace
                 const bool g447On = g447EdgeOn();
                 const auto g447CollectT0 = g447On ? std::chrono::steady_clock::now()
                                                   : std::chrono::steady_clock::time_point{};
+#if defined(PS2X_G784_CENSUS)
+                const size_t g784Q0 = q.size();
+                dc2_g784::collectTags.clear();
+#endif
                 g297CollectWindowPackets(g297pk);
+#if defined(PS2X_G784_CENSUS)
+                // G784 census: Path1 packets keep kick order and sort ahead of Path2/3 (no Path1
+                // was queued under MTVU), so tag i belongs to q[i] after the stable sort.
+                g784Tags.clear();
+                if (dc2_g784::censusOn() && g784Q0 == 0u && dc2_g784::collectTags.size() == g297pk.size())
+                    g784Tags.swap(dc2_g784::collectTags);
+                else if (dc2_g784::censusOn() && dc2_g784::collectTags.size() == g297pk.size())
+                {
+                    bool path1Before = false;
+                    for (size_t i = 0; i < g784Q0; ++i)
+                        path1Before |= q[i].pathId == GifPathId::Path1;
+                    if (!path1Before)
+                        g784Tags.swap(dc2_g784::collectTags);
+                }
+                if (dc2_g784::censusOn())
+                    dc2_g784::windows.fetch_add(1u, std::memory_order_relaxed);
+#endif
                 if (g447On)
                     g447NoteWait(5, static_cast<unsigned long long>(
                         std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1856,8 +1884,45 @@ namespace
             {
                 // Default and non-sampled diagnostic frames retain the original dispatch loop.
                 bool g317FirstEligibleInWindow = true;
+#if defined(PS2X_G784_CENSUS)
+                size_t g784Index = 0;
+#endif
                 for (auto &pkt : q)
                 {
+#if defined(PS2X_G784_CENSUS)
+                    const bool g784Census = dc2_g784::censusOn();
+                    const uint32_t g784Tag = (g784Census && g784Index < g784Tags.size()) ? g784Tags[g784Index] : 0u;
+                    ++g784Index;
+                    const uint64_t g784T0 = g784Census ? dc2_g783::ticks() : 0ull;
+                    const uint64_t g784B0 = dc2_g784::parseBatchesPosted, g784E0 = dc2_g784::parseEntriesPosted;
+                    struct G784ParseClock {
+                        bool on; uint32_t tag; GifPathId path; uint64_t t0, b0, e0;
+                        ~G784ParseClock()
+                        {
+                            if (!on)
+                                return;
+                            const uint64_t t = dc2_g783::ticks() - t0;
+                            if (tag)
+                            {
+                                auto &cen = dc2_g784::census[tag - 1u];
+                                cen.parsePackets.fetch_add(1u, std::memory_order_relaxed);
+                                cen.parseTicks.fetch_add(t, std::memory_order_relaxed);
+                                cen.parseBatches.fetch_add(dc2_g784::parseBatchesPosted - b0, std::memory_order_relaxed);
+                                cen.parseEntries.fetch_add(dc2_g784::parseEntriesPosted - e0, std::memory_order_relaxed);
+                            }
+                            else if (path == GifPathId::Path1)
+                            {
+                                dc2_g784::otherPath1Packets.fetch_add(1u, std::memory_order_relaxed);
+                                dc2_g784::otherPath1Ticks.fetch_add(t, std::memory_order_relaxed);
+                            }
+                            else
+                            {
+                                dc2_g784::otherPath23Packets.fetch_add(1u, std::memory_order_relaxed);
+                                dc2_g784::otherPath23Ticks.fetch_add(t, std::memory_order_relaxed);
+                            }
+                        }
+                    } g784Clock{g784Census, g784Tag, pkt.pathId, g784T0, g784B0, g784E0};
+#endif
                     if (g317FenceCensusOn())
                     {
                         if (g317ObservePacket(pkt, g317FirstEligibleInWindow, g317HadQueuedSuccessor))
@@ -1867,6 +1932,8 @@ namespace
                     {
                         g370ScanPacket(static_cast<int>(pkt.pathId), pkt.data.data(),
                                        static_cast<uint32_t>(pkt.data.size()), nullptr);
+                        if (dc2_g783::timelineOn())
+                            dc2_g783::gsPath = static_cast<uint32_t>(pkt.pathId);
                         m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
                     }
                 }
@@ -1894,6 +1961,8 @@ namespace
                         {
                             g370ScanPacket(static_cast<int>(pkt.pathId), pkt.data.data(),
                                            static_cast<uint32_t>(pkt.data.size()), nullptr);
+                            if (dc2_g783::timelineOn())
+                                dc2_g783::gsPath = static_cast<uint32_t>(pkt.pathId);
                             m_processFn(pkt.data.data(), static_cast<uint32_t>(pkt.data.size()));
                             ++g316PathPackets;
                         }

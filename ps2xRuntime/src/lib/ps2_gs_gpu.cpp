@@ -1,3 +1,4 @@
+// G788 revision: 5 -- compiled state component diagnostics (force-recompile marker, G359 trap)
 #include "runtime/dc2_g778_native.h"
 // G774 local-to-host ranged color observer, revision 4.
 #include <cstdint>
@@ -81,6 +82,10 @@ extern std::atomic<uint32_t> g_dc2ScriptFrame;
 // G713 PIPELINE: the transfer/IMAGE producer's snapshot latches and its exec-side bodies. Must
 // precede gpu_gif_and_registers.inc (the TRXDIR seam + the three IMAGE call sites).
 #include "ps2_gs_gpu_parts/g713_pipe_gs.inc"
+#include "ps2_g787_composite_api.inc" // G787: native outline composite markers
+#include "ps2_g788_world_api.inc"     // G788: whole-world native FixMDT face markers
+#include "ps2_g791_shadow_api.inc"    // G791: native ShadowMDT face markers
+#include "ps2_g791_shadow_gs.inc"     // G791: parse-side injection (+ the verify oracle in diagnostic builds)
 #include "ps2_gs_gpu_parts/gpu_gif_and_registers.inc"
 // G424: run-based host->local IMAGE upload writer, PROMOTED default-on
 // (-2.45 ms/f, -4.69%); kill DC2_G424_NO_FAST_IMAGE=1.
